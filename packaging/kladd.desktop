@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Kladd
+GenericName=Texteditor
+Comment=Skriv och redigera text, Markdown och kod
+Exec=kladd %F
+Icon=kladd
+Terminal=false
+Categories=Utility;TextEditor;
+StartupWMClass=kladd
+StartupNotify=true
+Keywords=text;editor;texteditor;markdown;anteckningar;kod;code;anteckning;
+MimeType=text/plain;text/markdown;text/x-markdown;text/x-rust;text/x-python;text/x-python3;application/json;application/toml;application/x-yaml;text/x-yaml;text/html;text/css;text/javascript;application/javascript;application/x-shellscript;text/x-shellscript;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-java;text/x-go;application/xml;text/xml;text/csv;text/x-log;text/x-ini;text/x-tex;text/x-sql;text/x-lua;text/x-ruby;application/x-php;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=Nytt fönster
+Exec=kladd --new-window
