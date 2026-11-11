@@ -378,6 +378,8 @@ struct Fmt {
     bold: bool,
     italic: bool,
     strike: bool,
+    /// Direkt understrykning (`w:u`), skrivs som `<u>…</u>`.
+    underline: bool,
     code: bool,
 }
 
@@ -779,6 +781,8 @@ fn parse_body(
                     b"b" | b"bCs" if in_rpr => fmt.bold = on_off(e),
                     b"i" | b"iCs" if in_rpr => fmt.italic = on_off(e),
                     b"strike" | b"dstrike" if in_rpr => fmt.strike = on_off(e),
+                    // Saknas `w:val` är det enkel understrykning; "none" slår av den.
+                    b"u" if in_rpr => fmt.underline = on_off(e),
                     b"rStyle" if in_rpr => {
                         let s = attr(e, b"val").unwrap_or_default().to_lowercase();
                         if s.contains("code") || s.contains("kod") {
@@ -1048,6 +1052,14 @@ fn inline_md(run: &Run) -> String {
         if run.fmt.bold {
             s = wrap(&s, "**");
         }
+        if run.fmt.underline {
+            // Ytterst, så att fet+understruken blir `<u>**x**</u>`.
+            let start = s.len() - s.trim_start().len();
+            let end = s.trim_end().len();
+            if start < end {
+                s = format!("{}<u>{}</u>{}", &s[..start], &s[start..end], &s[end..]);
+            }
+        }
         if let Some(url) = &run.link {
             s = format!("[{s}]({})", url.replace(' ', "%20").replace(')', "%29"));
         }
@@ -1181,6 +1193,7 @@ struct WFmt {
     bold: u32,
     italic: u32,
     strike: u32,
+    underline: u32,
     link: Option<String>,
 }
 
@@ -1324,6 +1337,9 @@ impl Writer {
         }
         if self.fmt.strike > 0 {
             rpr.push_str("<w:strike/>");
+        }
+        if self.fmt.underline > 0 {
+            rpr.push_str("<w:u w:val=\"single\"/>");
         }
         let mut xml = String::from("<w:r>");
         if !rpr.is_empty() {
@@ -1549,6 +1565,10 @@ fn body_from_markdown(md: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Writ
                 let s = t.to_string();
                 if s.trim().eq_ignore_ascii_case("<br>") || s.trim().eq_ignore_ascii_case("<br/>") {
                     w.line_break();
+                } else if s.trim().eq_ignore_ascii_case("<u>") {
+                    w.fmt.underline += 1;
+                } else if s.trim().eq_ignore_ascii_case("</u>") {
+                    w.fmt.underline = w.fmt.underline.saturating_sub(1);
                 } else {
                     w.run(s.trim_end_matches('\n'), false);
                 }
@@ -1809,6 +1829,64 @@ mod tests {
         .unwrap();
         assert!(w2.missing_images.is_empty());
         assert_eq!(read(&w2.bytes).unwrap().markdown, back.markdown);
+    }
+
+    /// Skriver om `word/document.xml` i ett dokument (för att prova läsningen av handgjord XML).
+    fn patch_document(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+        let mut src = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut out);
+            let opts = zip::write::SimpleFileOptions::default();
+            for i in 0..src.len() {
+                let mut file = src.by_index(i).unwrap();
+                let name = file.name().to_owned();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut data).unwrap();
+                if name == "word/document.xml" {
+                    data = f(&String::from_utf8(data).unwrap()).into_bytes();
+                }
+                zw.start_file(name, opts).unwrap();
+                zw.write_all(&data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        out.into_inner()
+    }
+
+    #[test]
+    fn underline_roundtrip() {
+        let md = "En <u>under</u> och <u>**båda**</u> här.\n";
+        let w = write(md, "x", &|_| None).unwrap();
+        let back = read(&w.bytes).unwrap();
+        assert_eq!(back.markdown, md);
+        let xml = patch_document(&w.bytes, |x| x.to_owned());
+        let mut z = zip::ZipArchive::new(Cursor::new(xml)).unwrap();
+        let mut doc = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut doc).unwrap();
+        assert!(doc.contains("<w:u w:val=\"single\"/>"));
+        assert!(!doc.contains("&lt;u&gt;") && !doc.contains("<u>"));
+        // Schemaordning: b, i, strike före u.
+        assert!(doc.contains("<w:b/><w:u w:val=\"single\"/>"));
+    }
+
+    #[test]
+    fn reads_underline_from_runs() {
+        let w = write("a b c\n", "x", &|_| None).unwrap();
+        let patched = patch_document(&w.bytes, |x| {
+            let run = |rpr: &str, t: &str| format!("<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space=\"preserve\">{t}</w:t></w:r>");
+            let start = x.find("<w:r>").unwrap();
+            let end = x.rfind("</w:r>").unwrap() + "</w:r>".len();
+            let runs = [
+                run("<w:u w:val=\"single\"/>", "ett "),
+                run("<w:u w:val=\"none\"/>", "två "),
+                run("<w:u/>", "tre"),
+            ]
+            .concat();
+            format!("{}{}{}", &x[..start], runs, &x[end..])
+        });
+        let back = read(&patched).unwrap();
+        assert_eq!(back.markdown, "<u>ett</u> två <u>tre</u>\n");
     }
 
     #[test]
