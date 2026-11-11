@@ -113,3 +113,5 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 ## Licens
 
 Kladd är licensierat under MIT, se [LICENSE](LICENSE). Typsnitten IBM Plex Sans och IBM Plex Mono används under SIL Open Font License.
+
+Typsnittet Carlito (metriskt lika Calibri) används för dokumentläget under SIL Open Font License.

@@ -49,6 +49,36 @@ pub struct Palette {
     pub match_bg: Color32,
     pub match_current_bg: Color32,
     pub error: Color32,
+    /// Dokumentläget: grå arbetsyta runt sidan.
+    #[allow(dead_code)]
+    pub desk: Color32,
+    /// Dokumentläget: sidans bakgrund.
+    #[allow(dead_code)]
+    pub page: Color32,
+    /// Dokumentläget: skugga under sidan.
+    #[allow(dead_code)]
+    pub page_shadow: Color32,
+    /// Dokumentläget: brödtext.
+    #[allow(dead_code)]
+    pub page_text: Color32,
+    /// Dokumentläget: dämpad text.
+    #[allow(dead_code)]
+    pub page_muted: Color32,
+    /// Dokumentläget: rubriker.
+    #[allow(dead_code)]
+    pub page_heading: Color32,
+    /// Dokumentläget: huvudrubrik.
+    #[allow(dead_code)]
+    pub page_heading1: Color32,
+    /// Dokumentläget: länkar.
+    #[allow(dead_code)]
+    pub page_link: Color32,
+    /// Dokumentläget: bakgrund för kodblock.
+    #[allow(dead_code)]
+    pub page_code_bg: Color32,
+    /// Dokumentläget: markdown-syntax som döljs eller nedtonas.
+    #[allow(dead_code)]
+    pub page_markup: Color32,
     pub syntax: Syntax,
 }
 
@@ -79,6 +109,16 @@ pub fn skymning() -> Palette {
         match_bg: rgba(0x79B8E8, 46),
         match_current_bg: rgba(0xF0B44C, 110),
         error: rgb(0xEF7C7C),
+        desk: rgb(0x0C1118),
+        page: rgb(0x1B2330),
+        page_shadow: Color32::from_black_alpha(120),
+        page_text: rgb(0xE3E7EE),
+        page_muted: rgb(0xA3ACBA),
+        page_heading: rgb(0x8AB4F8),
+        page_heading1: rgb(0xA8C7FA),
+        page_link: rgb(0x7CACF8),
+        page_code_bg: rgb(0x243041),
+        page_markup: rgb(0x5C6878),
         syntax: Syntax {
             keyword: rgb(0xC6A0F2),
             string: rgb(0xA3CF8F),
@@ -112,6 +152,16 @@ pub fn gryning() -> Palette {
         match_bg: rgba(0x2F7BC4, 40),
         match_current_bg: rgba(0xE8A23A, 140),
         error: rgb(0xC0392B),
+        desk: rgb(0xE6E6E6),
+        page: rgb(0xFFFFFF),
+        page_shadow: Color32::from_black_alpha(34),
+        page_text: rgb(0x1F1F1F),
+        page_muted: rgb(0x595959),
+        page_heading: rgb(0x2F5496),
+        page_heading1: rgb(0x1F3864),
+        page_link: rgb(0x0563C1),
+        page_code_bg: rgb(0xF2F2F2),
+        page_markup: rgb(0xA0A7B4),
         syntax: Syntax {
             keyword: rgb(0x7A3FB8),
             string: rgb(0x3B7A2A),
@@ -151,6 +201,24 @@ pub const PLEX_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/IBMPlexSan
 pub const PLEX_MONO: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
 pub const PLEX_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf");
 
+pub const CARLITO: &[u8] = include_bytes!("../assets/fonts/Carlito-Regular.ttf");
+pub const CARLITO_BOLD: &[u8] = include_bytes!("../assets/fonts/Carlito-Bold.ttf");
+pub const CARLITO_ITALIC: &[u8] = include_bytes!("../assets/fonts/Carlito-Italic.ttf");
+pub const CARLITO_BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/Carlito-BoldItalic.ttf");
+
+/// Typsnittet för dokumentläget (Carlito, metriskt lika Calibri).
+pub fn doc_font(bold: bool, italic: bool) -> FontFamily {
+    FontFamily::Name(
+        match (bold, italic) {
+            (false, false) => "carlito",
+            (true, false) => "carlito-bold",
+            (false, true) => "carlito-italic",
+            (true, true) => "carlito-bold-italic",
+        }
+        .into(),
+    )
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let data = [
@@ -159,6 +227,10 @@ pub fn install_fonts(ctx: &egui::Context) {
         (SEMIBOLD, PLEX_SANS_SEMIBOLD),
         ("plex-mono", PLEX_MONO),
         (MONO_MEDIUM, PLEX_MONO_MEDIUM),
+        ("carlito", CARLITO),
+        ("carlito-bold", CARLITO_BOLD),
+        ("carlito-italic", CARLITO_ITALIC),
+        ("carlito-bold-italic", CARLITO_BOLD_ITALIC),
     ];
     for (name, bytes) in data {
         fonts
@@ -188,6 +260,19 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(mono_medium(), with_fallback(MONO_MEDIUM, &mono_fallback));
+    fonts
+        .families
+        .insert(doc_font(false, false), with_fallback("carlito", &prop_fallback));
+    fonts
+        .families
+        .insert(doc_font(true, false), with_fallback("carlito-bold", &prop_fallback));
+    fonts
+        .families
+        .insert(doc_font(false, true), with_fallback("carlito-italic", &prop_fallback));
+    fonts.families.insert(
+        doc_font(true, true),
+        with_fallback("carlito-bold-italic", &prop_fallback),
+    );
 
     ctx.set_fonts(fonts);
 }

@@ -60,5 +60,6 @@ assets = [
     ["packaging/icons/128/kladd.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["packaging/icons/256/kladd.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["assets/fonts/OFL.txt", "usr/share/doc/kladd/FONT-LICENSE", "644"],
+    ["assets/fonts/Carlito-OFL.txt", "usr/share/doc/kladd/CARLITO-FONT-LICENSE", "644"],
     ["README.md", "usr/share/doc/kladd/README.md", "644"],
 ]
