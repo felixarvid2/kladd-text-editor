@@ -27,8 +27,21 @@ const MAX_FILE_BYTES: usize = 512 * 1024 * 1024;
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
+/// En bild i ett Word-dokument.
+#[derive(Clone, Debug)]
+pub struct Image {
+    pub bytes: Vec<u8>,
+    /// Storleken i originalet (EMU), om den är känd.
+    pub extent: Option<(i64, i64)>,
+}
+
+/// Prefix för bilder som finns inbäddade i dokumentet, t.ex. `![Sol](bild:image1.png)`.
+pub const IMAGE_SCHEME: &str = "bild:";
+
 pub struct Loaded {
     pub markdown: String,
+    /// Inbäddade bilder: namn → bild, i dokumentordning.
+    pub images: Vec<(String, Image)>,
     /// Saker i originalet som Kladd inte kan visa eller spara, i läsbar form.
     pub dropped: Vec<&'static str>,
 }
@@ -81,6 +94,20 @@ struct Package<'a> {
 
 impl Package<'_> {
     fn part(&mut self, name: &str) -> Result<Option<String>, String> {
+        let Some(buf) = self.part_bytes(name)? else { return Ok(None) };
+        // XML i OOXML är UTF-8 (ibland med BOM) eller UTF-16 med BOM.
+        let text = if buf.starts_with(&[0xFF, 0xFE]) {
+            encoding_rs::UTF_16LE.decode_with_bom_removal(&buf).0.into_owned()
+        } else if buf.starts_with(&[0xFE, 0xFF]) {
+            encoding_rs::UTF_16BE.decode_with_bom_removal(&buf).0.into_owned()
+        } else {
+            let b = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&buf);
+            String::from_utf8_lossy(b).into_owned()
+        };
+        Ok(Some(text))
+    }
+
+    fn part_bytes(&mut self, name: &str) -> Result<Option<Vec<u8>>, String> {
         let name = name.trim_start_matches('/');
         // Delnamn jämförs utan hänsyn till skiftläge (som i WordCraft).
         let real = if self.zip.index_for_name(name).is_some() {
@@ -104,16 +131,7 @@ impl Package<'_> {
         if buf.len() as u64 > room {
             return Err("En del av Word-dokumentet är för stor för att öppnas.".into());
         }
-        // XML i OOXML är UTF-8 (ibland med BOM) eller UTF-16 med BOM.
-        let text = if buf.starts_with(&[0xFF, 0xFE]) {
-            encoding_rs::UTF_16LE.decode_with_bom_removal(&buf).0.into_owned()
-        } else if buf.starts_with(&[0xFE, 0xFF]) {
-            encoding_rs::UTF_16BE.decode_with_bom_removal(&buf).0.into_owned()
-        } else {
-            let b = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&buf);
-            String::from_utf8_lossy(b).into_owned()
-        };
-        Ok(Some(text))
+        Ok(Some(buf))
     }
 }
 
@@ -368,6 +386,8 @@ struct Run {
     text: String,
     fmt: Fmt,
     link: Option<String>,
+    /// Färdig Markdown (t.ex. en bild) som inte ska skyddas med `\`.
+    raw: bool,
 }
 
 #[derive(Clone)]
@@ -386,6 +406,7 @@ enum Block {
 #[derive(Default)]
 struct Dropped {
     images: bool,
+    linked: bool,
     notes: bool,
     comments: bool,
     textboxes: bool,
@@ -398,7 +419,10 @@ impl Dropped {
     fn list(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.images {
-            v.push("bilder");
+            v.push("diagram och former");
+        }
+        if self.linked {
+            v.push("länkade bilder");
         }
         if self.textboxes {
             v.push("textrutor och former");
@@ -491,8 +515,83 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         dropped.headers = any_text;
     }
 
-    let blocks = parse_body(&doc_xml, &styles, &numbering, &rels, &mut dropped)?;
-    Ok(Loaded { markdown: to_markdown(&blocks, &numbering), dropped: dropped.list() })
+    let mut found: Vec<FoundImage> = Vec::new();
+    let blocks = parse_body(&doc_xml, &styles, &numbering, &rels, &mut dropped, &mut found, dir)?;
+
+    // Packa upp bilderna som dokumentet faktiskt använder.
+    let mut images: Vec<(String, Image)> = Vec::new();
+    let mut by_target: HashMap<String, String> = HashMap::new();
+    let mut markdown = to_markdown(&blocks, &numbering);
+    for f in found {
+        let name = if let Some(n) = by_target.get(&f.target) {
+            n.clone()
+        } else {
+            let Some(bytes) = pkg.part_bytes(&f.target)? else {
+                markdown = markdown.replace(&f.placeholder, "");
+                dropped.images = true;
+                continue;
+            };
+            if !is_supported_image(&bytes) {
+                markdown = markdown.replace(&f.placeholder, "");
+                dropped.images = true;
+                continue;
+            }
+            let base = f.target.rsplit('/').next().unwrap_or("bild").to_owned();
+            let mut name = base.clone();
+            let mut n = 2;
+            while images.iter().any(|(m, _)| *m == name) {
+                name = format!("{n}-{base}");
+                n += 1;
+            }
+            images.push((name.clone(), Image { bytes, extent: f.extent }));
+            by_target.insert(f.target.clone(), name.clone());
+            name
+        };
+        let alt = escape_alt(&f.alt);
+        markdown = markdown.replace(&f.placeholder, &format!("![{alt}]({IMAGE_SCHEME}{})", name.replace(' ', "%20")));
+    }
+    Ok(Loaded { markdown, images, dropped: dropped.list() })
+}
+
+/// En bild som hittats i texten; platshållaren byts mot `![…](bild:…)` när bilden lästs.
+struct FoundImage {
+    placeholder: String,
+    target: String,
+    alt: String,
+    extent: Option<(i64, i64)>,
+}
+
+#[derive(Default)]
+struct Drawing {
+    depth: usize,
+    blip: Option<String>,
+    linked: bool,
+    alt: String,
+    title: String,
+    extent: Option<(i64, i64)>,
+}
+
+fn escape_alt(s: &str) -> String {
+    s.replace(['\n', '\r'], " ").replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]")
+}
+
+pub fn is_supported_image(bytes: &[u8]) -> bool {
+    image_ext(bytes).is_some()
+}
+
+/// Filändelse för de bildformat Word kan visa, utifrån innehållet.
+pub fn image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpeg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else {
+        None
+    }
 }
 
 fn parse_body(
@@ -501,8 +600,11 @@ fn parse_body(
     numbering: &HashMap<String, Vec<bool>>,
     rels: &HashMap<String, (String, String, bool)>,
     dropped: &mut Dropped,
+    found: &mut Vec<FoundImage>,
+    dir: &str,
 ) -> Result<Vec<Block>, String> {
     let _ = numbering;
+    let mut drawing: Option<Drawing> = None;
     let mut r = Reader::from_str(xml);
     let mut blocks: Vec<Block> = Vec::new();
 
@@ -523,12 +625,12 @@ fn parse_body(
     let push_text = |para: &mut Option<Para>, text: &str, fmt: &Fmt, link: &Option<String>| {
         let p = para.get_or_insert_with(|| Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new() });
         if let Some(last) = p.runs.last_mut() {
-            if last.fmt == *fmt && last.link == *link {
+            if !last.raw && last.fmt == *fmt && last.link == *link {
                 last.text.push_str(text);
                 return;
             }
         }
-        p.runs.push(Run { text: text.to_owned(), fmt: fmt.clone(), link: link.clone() });
+        p.runs.push(Run { text: text.to_owned(), fmt: fmt.clone(), link: link.clone(), raw: false });
     };
     let hidden = |field_depth: &Vec<bool>| field_depth.iter().any(|&in_instr| in_instr);
 
@@ -545,12 +647,56 @@ fn parse_body(
                     }
                     continue;
                 }
+                // Inuti en bild: leta bara efter bilddata, beskrivning och storlek.
+                if let Some(d) = drawing.as_mut() {
+                    if !empty {
+                        d.depth += 1;
+                    }
+                    match name.as_slice() {
+                        b"blip" | b"imagedata" => {
+                            if let Some(id) = attr(e, b"embed").or_else(|| attr(e, b"id")) {
+                                if let Some((t, _, ext)) = rels.get(&id) {
+                                    if *ext {
+                                        d.linked = true;
+                                    } else if d.blip.is_none() {
+                                        d.blip = Some(t.clone());
+                                    }
+                                }
+                            } else if attr(e, b"link").is_some() {
+                                d.linked = true;
+                            }
+                        }
+                        b"docPr" => {
+                            d.alt = attr(e, b"descr").unwrap_or_default();
+                            d.title = attr(e, b"title").unwrap_or_default();
+                        }
+                        b"extent" if d.extent.is_none() => {
+                            let cx = attr(e, b"cx").and_then(|v| v.parse::<i64>().ok());
+                            let cy = attr(e, b"cy").and_then(|v| v.parse::<i64>().ok());
+                            if let (Some(cx), Some(cy)) = (cx, cy) {
+                                if cx > 0 && cy > 0 {
+                                    d.extent = Some((cx, cy));
+                                }
+                            }
+                        }
+                        b"txbxContent" => {
+                            dropped.textboxes = true;
+                            if !empty {
+                                d.depth -= 1;
+                                skip = 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match name.as_slice() {
-                    // Innehåll som inte går att visa som text.
+                    // Bilder: samla ihop till ett `![…](bild:…)` när elementet tar slut.
                     b"drawing" | b"pict" | b"object" => {
-                        dropped.images = true;
                         if !empty {
-                            skip = 1;
+                            drawing = Some(Drawing { depth: 1, ..Default::default() });
+                        } else {
+                            dropped.images = true;
                         }
                     }
                     b"txbxContent" => {
@@ -719,6 +865,31 @@ fn parse_body(
                     skip -= 1;
                     continue;
                 }
+                if let Some(d) = drawing.as_mut() {
+                    d.depth -= 1;
+                    if d.depth > 0 {
+                        continue;
+                    }
+                    let d = drawing.take().unwrap_or_default();
+                    match d.blip {
+                        Some(target) if !hidden(&field_depth) => {
+                            let placeholder = format!("\u{E000}kladd-bild-{}\u{E001}", found.len());
+                            let alt = if d.alt.trim().is_empty() { d.title } else { d.alt };
+                            let p = para.get_or_insert_with(|| Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new() });
+                            p.runs.push(Run { text: placeholder.clone(), fmt: Fmt::default(), link: None, raw: true });
+                            found.push(FoundImage {
+                                placeholder,
+                                target: resolve_target(dir, &target),
+                                alt: alt.trim().to_owned(),
+                                extent: d.extent,
+                            });
+                        }
+                        Some(_) => {}
+                        None if d.linked => dropped.linked = true,
+                        None => dropped.images = true,
+                    }
+                    continue;
+                }
                 match local(e.name().as_ref()) {
                     b"pPr" => in_ppr = false,
                     b"rPr" => in_rpr = false,
@@ -805,7 +976,7 @@ fn parse_body(
 }
 
 /// Skyddar tecken som annars skulle tolkas som Markdown.
-fn escape_inline(s: &str) -> String {
+pub(crate) fn escape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~') {
@@ -817,7 +988,7 @@ fn escape_inline(s: &str) -> String {
 }
 
 /// Skyddar början av en rad som annars blir en rubrik, lista, citat osv.
-fn escape_line_start(line: &str) -> String {
+pub(crate) fn escape_line_start(line: &str) -> String {
     let trimmed = line.trim_start_matches(' ');
     let indent = &line[..line.len() - trimmed.len()];
     let first = trimmed.chars().next();
@@ -839,7 +1010,7 @@ fn escape_line_start(line: &str) -> String {
     line.to_owned()
 }
 
-fn wrap(text: &str, marker: &str) -> String {
+pub(crate) fn wrap(text: &str, marker: &str) -> String {
     // Markörer får inte ligga mot mellanslag: flytta ut dem.
     let start = text.len() - text.trim_start().len();
     let end = text.trim_end().len();
@@ -850,6 +1021,9 @@ fn wrap(text: &str, marker: &str) -> String {
 }
 
 fn inline_md(run: &Run) -> String {
+    if run.raw {
+        return run.text.clone();
+    }
     let mut parts = Vec::new();
     for (i, piece) in run.text.split('\n').enumerate() {
         if i > 0 {
@@ -1025,6 +1199,12 @@ struct Writer {
     heading: Option<u8>,
     table: Option<TableState>,
     in_code_block: bool,
+    /// Bild som håller på att läsas: (källa, alt-text).
+    image: Option<(String, String)>,
+    /// Inbäddade bilder: (relations-id, filnamn i word/media, data).
+    media: Vec<(String, String, Vec<u8>)>,
+    /// Bilder som inte kunde bäddas in.
+    missing: Vec<String>,
 }
 
 struct TableState {
@@ -1047,7 +1227,34 @@ impl Writer {
             heading: None,
             table: None,
             in_code_block: false,
+            image: None,
+            media: Vec::new(),
+            missing: Vec::new(),
         }
+    }
+
+    /// Bäddar in en bild som en egen körning i aktuellt stycke.
+    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str) {
+        let Some(ext) = image_ext(&bytes) else { return };
+        // Samma bild flera gånger bäddas bara in en gång.
+        let existing = self.media.iter().find(|(_, _, b)| *b == bytes).map(|(id, _, _)| id.clone());
+        let n = self.media.len() + 1;
+        let (cx, cy) = image_extent(&bytes, extent);
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = format!("rIdImg{n}");
+                self.media.push((id.clone(), format!("image{n}.{ext}"), bytes));
+                id
+            }
+        };
+        let doc_pr = self.body.matches("<wp:docPr ").count() + 1;
+        let mut alt_x = String::new();
+        xml_escape(alt, &mut alt_x);
+        self.open_para();
+        self.body.push_str(&format!(
+            r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+        ));
     }
 
     fn para_props(&self) -> String {
@@ -1174,7 +1381,7 @@ fn heading_num(level: HeadingLevel) -> u8 {
     }
 }
 
-fn body_from_markdown(md: &str) -> Writer {
+fn body_from_markdown(md: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Writer {
     let mut w = Writer::new();
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -1255,7 +1462,9 @@ fn body_from_markdown(md: &str) -> Writer {
                         w.fmt.link = Some(url);
                     }
                 }
-                Tag::Image { .. } => {}
+                Tag::Image { dest_url, .. } => {
+                    w.image = Some((dest_url.to_string(), String::new()));
+                }
                 _ => {}
             },
             MdEvent::End(tag) => match tag {
@@ -1302,8 +1511,31 @@ fn body_from_markdown(md: &str) -> Writer {
                 TagEnd::Strong => w.fmt.bold = w.fmt.bold.saturating_sub(1),
                 TagEnd::Strikethrough => w.fmt.strike = w.fmt.strike.saturating_sub(1),
                 TagEnd::Link => w.fmt.link = None,
+                TagEnd::Image => {
+                    if let Some((src, alt)) = w.image.take() {
+                        match resolve(&src) {
+                            Some(img) if is_supported_image(&img.bytes) => w.picture(img.bytes, img.extent, &alt),
+                            _ => {
+                                w.missing.push(src.clone());
+                                // Behåll åtminstone texten.
+                                let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
+                                w.run(&label, false);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             },
+            MdEvent::Text(t) if w.image.is_some() => {
+                if let Some((_, alt)) = w.image.as_mut() {
+                    alt.push_str(&t);
+                }
+            }
+            MdEvent::Code(t) if w.image.is_some() => {
+                if let Some((_, alt)) = w.image.as_mut() {
+                    alt.push_str(&t);
+                }
+            }
             MdEvent::Text(t) => {
                 if w.in_code_block {
                     let t = t.to_string();
@@ -1335,8 +1567,26 @@ fn body_from_markdown(md: &str) -> Writer {
     w
 }
 
+/// Textytans bredd på en A4-sida med 2,54 cm marginaler, i EMU.
+const MAX_IMAGE_WIDTH_EMU: i64 = 9026 * 635;
+const EMU_PER_PIXEL: i64 = 9525; // 96 dpi
+
+fn image_extent(bytes: &[u8], extent: Option<(i64, i64)>) -> (i64, i64) {
+    let (mut cx, mut cy) = extent.unwrap_or_else(|| match imagesize::blob_size(bytes) {
+        Ok(sz) => (sz.width as i64 * EMU_PER_PIXEL, sz.height as i64 * EMU_PER_PIXEL),
+        Err(_) => (MAX_IMAGE_WIDTH_EMU / 2, MAX_IMAGE_WIDTH_EMU / 3),
+    });
+    cx = cx.max(1);
+    cy = cy.max(1);
+    if cx > MAX_IMAGE_WIDTH_EMU {
+        cy = cy * MAX_IMAGE_WIDTH_EMU / cx;
+        cx = MAX_IMAGE_WIDTH_EMU;
+    }
+    (cx, cy.max(1))
+}
+
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#;
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#;
 
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#;
@@ -1436,9 +1686,16 @@ fn core_xml(title: &str, created: &str) -> String {
 const APP_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Kladd</Application><DocSecurity>0</DocSecurity></Properties>"#;
 
+/// Resultatet av att spara: filens innehåll och bilder som inte kunde bäddas in.
+pub struct Written {
+    pub bytes: Vec<u8>,
+    pub missing_images: Vec<String>,
+}
+
 /// Bygger ett komplett .docx-paket av Markdown-text.
-pub fn write(markdown: &str, title: &str) -> Result<Vec<u8>, String> {
-    let w = body_from_markdown(markdown);
+/// `resolve` hämtar bilddata för en bildkälla (`bild:namn`, en sökväg …).
+pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+    let w = body_from_markdown(markdown, resolve);
     let mut body = w.body;
     // Ett dokument som slutar med en tabell måste ha ett stycke efter den.
     if body.is_empty() || body.ends_with("</w:tbl>") {
@@ -1446,7 +1703,7 @@ pub fn write(markdown: &str, title: &str) -> Result<Vec<u8>, String> {
     }
     let document = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}"><w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:cols w:space="708"/></w:sectPr></w:body></w:document>"#
+<w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:cols w:space="708"/></w:sectPr></w:body></w:document>"#
     );
     let mut doc_rels = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -1457,6 +1714,11 @@ pub fn write(markdown: &str, title: &str) -> Result<Vec<u8>, String> {
         xml_escape(url, &mut u);
         doc_rels.push_str(&format!(
             r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{u}" TargetMode="External"/>"#
+        ));
+    }
+    for (id, file, _) in &w.media {
+        doc_rels.push_str(&format!(
+            r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/{file}"/>"#
         ));
     }
     doc_rels.push_str("</Relationships>");
@@ -1483,9 +1745,15 @@ pub fn write(markdown: &str, title: &str) -> Result<Vec<u8>, String> {
             zip.start_file(name, opts).map_err(|e| e.to_string())?;
             zip.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
         }
+        // Bilder är redan komprimerade och lagras som de är.
+        let stored = opts.compression_method(zip::CompressionMethod::Stored).compression_level(None);
+        for (_, file, bytes) in &w.media {
+            zip.start_file(format!("word/media/{file}"), stored).map_err(|e| e.to_string())?;
+            zip.write_all(bytes).map_err(|e| e.to_string())?;
+        }
         zip.finish().map_err(|e| e.to_string())?;
     }
-    Ok(buf.into_inner())
+    Ok(Written { bytes: buf.into_inner(), missing_images: w.missing })
 }
 
 #[cfg(test)]
@@ -1496,7 +1764,7 @@ mod tests {
 
     #[test]
     fn roundtrip_keeps_structure() {
-        let bytes = write(SAMPLE, "Test").unwrap();
+        let bytes = write(SAMPLE, "Test", &|_| None).unwrap().bytes;
         let back = read(&bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
         assert_eq!(back.markdown, SAMPLE, "\n--- fick ---\n{}", back.markdown);
@@ -1505,9 +1773,42 @@ mod tests {
     #[test]
     fn plain_text_survives() {
         let text = "Rad ett\nRad två med tab\there\n\nNytt stycke & <tecken> \"citat\"\n";
-        let bytes = write(text, "x").unwrap();
+        let bytes = write(text, "x", &|_| None).unwrap().bytes;
         let back = read(&bytes).unwrap();
         assert_eq!(back.markdown, "Rad ett\nRad två med tab\there\n\nNytt stycke & \\<tecken> \"citat\"\n");
+    }
+
+    #[test]
+    fn images_roundtrip() {
+        // En liten giltig PNG (1x1 pixel).
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0,
+            5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let md = "# Bilder\n\nFöre ![En sol](sol.png) efter.\n\n![](saknas.png)\n\n![Igen](sol.png)\n";
+        let p2 = png.clone();
+        let w = write(md, "x", &move |src| (src == "sol.png").then(|| Image { bytes: p2.clone(), extent: None })).unwrap();
+        assert_eq!(w.missing_images, vec!["saknas.png".to_owned()]);
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.images.len(), 1, "samma bild bäddas in en gång");
+        assert_eq!(back.images[0].1.bytes, png);
+        assert!(back.images[0].1.extent.is_some());
+        let name = &back.images[0].0;
+        assert_eq!(
+            back.markdown,
+            format!("# Bilder\n\nFöre ![En sol](bild:{name}) efter.\n\n\\[bild: saknas.png\\]\n\n![Igen](bild:{name})\n")
+        );
+        // Och tillbaka igen med bilderna från dokumentet.
+        let imgs = back.images.clone();
+        let w2 = write(&back.markdown, "x", &move |src| {
+            let n = src.strip_prefix(IMAGE_SCHEME)?;
+            imgs.iter().find(|(m, _)| m == n).map(|(_, i)| i.clone())
+        })
+        .unwrap();
+        assert!(w2.missing_images.is_empty());
+        assert_eq!(read(&w2.bytes).unwrap().markdown, back.markdown);
     }
 
     #[test]
@@ -1536,14 +1837,25 @@ mod manual {
             for f in p.split(':') {
                 let r = super::read(&std::fs::read(f).unwrap());
                 match r {
-                    Ok(l) => println!("===== {f} (tappat: {:?})\n{}", l.dropped, l.markdown),
+                    Ok(l) => println!(
+                        "===== {f} (tappat: {:?}, bilder: {:?})\n{}",
+                        l.dropped,
+                        l.images.iter().map(|(n, i)| (n.clone(), i.bytes.len(), i.extent)).collect::<Vec<_>>(),
+                        l.markdown
+                    ),
                     Err(e) => println!("===== {f}: FEL {e}"),
                 }
             }
         }
         if let (Ok(i), Ok(o)) = (std::env::var("KLADD_MD_IN"), std::env::var("KLADD_DOCX_OUT")) {
             let md = std::fs::read_to_string(i).unwrap();
-            std::fs::write(o, super::write(&md, "Prov").unwrap()).unwrap();
+            let dir = std::path::Path::new(&o).parent().unwrap().to_path_buf();
+            let w = super::write(&md, "Prov", &|src| {
+                std::fs::read(dir.join(src)).ok().map(|bytes| super::Image { bytes, extent: None })
+            })
+            .unwrap();
+            println!("saknade bilder: {:?}", w.missing_images);
+            std::fs::write(o, w.bytes).unwrap();
         }
     }
 }
