@@ -131,3 +131,53 @@ interpunktion) i `assets/fonts/`.
 - **Dolt i dokumentläget**: radnummer, förhandsvisningsknappen och förhandsvisningspanelen.
 - **Kortkommandon**: Ctrl+B fet, Ctrl+I kursiv, Ctrl+U understruken, Ctrl+Alt+1/2/3 rubrik,
   Ctrl+Alt+0 brödtext, Ctrl+plus/minus/0 zoomar sidan.
+
+## Stavningskontroll (bara i dokumentläget)
+
+Studerat: Wordcraft (egen motor `craft-proof`, Hunspell-ordlistor som läses vid körning,
+ordet som skrivs får ingen våglinje förrän markören lämnat det), FreeWord och MiniPad
+(`spellbook` 0.4, ordlista laddas i en bakgrundstråd, ordcache, högerklicksmeny med upp till
+8 förslag, "Ignorera alla" för sessionen, egen ordlista som textfil), LibreOffice (Hunspell,
+röd våglinje medan man skriver, högerklick med förslag, Ignorera alla, Lägg till i ordlistan;
+på Ubuntu läses systemets ordlistor i `/usr/share/hunspell`).
+
+Beslut:
+
+- Motor: `spellbook` 0.4 (ren Rust, Hunspell-format, MPL-2.0). Testat med `sv_SE` från
+  `hunspell-sv`: laddning ≈ 0,1 s, kontroll några µs per ord, sammansättningar fungerar,
+  förslag 30–160 ms (räknas bara vid högerklick).
+- Ordlistor buntas **inte** (sv_SE är LGPL-3, stora filer). De läses från `$DICPATH`,
+  `~/.local/share/kladd/ordlistor`, `/usr/share/hunspell` och `/usr/share/myspell`.
+  `.deb`-paketet rekommenderar `hunspell-sv, hunspell-en-us`.
+- Språk: inställningen `spell_lang`; standard `sv_SE` om den finns, annars språket i `$LANG`,
+  annars `en_US`, annars första hittade. Visas i statusraden ("Svenska"), klick öppnar en
+  lista med installerade språk och växeln "Stavningskontroll".
+- Bara dokumentläget (`.docx`). Kod, länkar, bilder, markup och tabeller kontrolleras inte.
+  Ordet som markören står i får ingen våglinje.
+- Ordregler: bokstäver och siffror (åäö ingår), inre `'`, `’` och `-` ingår om en bokstav
+  följer. Hoppa över ord kortare än 2 tecken, ord med siffror, ord med bara versaler,
+  webbadresser/e-post/sökvägar. Bindestrecksord godkänns om alla delar godkänns.
+- Våglinje i `palette.error`, amplitud ≈ 1,2 px, period ≈ 4 px, under textens baslinje.
+- Högerklick på ett felstavat ord: upp till 6 förslag, "Ignorera alla" (sessionen),
+  "Lägg till i ordlistan" (sparas i `~/.config/kladd/ordlista.txt`, ett ord per rad).
+
+### `crate::spell`
+
+```rust
+pub struct Speller { /* bakgrundsladdad spellbook::Dictionary, ordcache, ignorerade ord, egen ordlista */ }
+impl Speller {
+    pub fn new(lang: Option<&str>) -> Self;          // börjar ladda i bakgrunden
+    pub fn languages(&self) -> &[Lang];              // installerade ordlistor
+    pub fn lang(&self) -> Option<&Lang>;
+    pub fn set_lang(&mut self, code: &str);
+    pub fn ready(&mut self) -> bool;                 // ordlistan är laddad
+    pub fn generation(&self) -> u64;                 // ökar när språk/ordlista/ignorerade ändras
+    pub fn check_word(&mut self, word: &str) -> bool;
+    pub fn misspelled(&mut self, text: &str, ranges: &[std::ops::Range<usize>]) -> Vec<std::ops::Range<usize>>;
+    pub fn suggest(&self, word: &str) -> Vec<String>; // högst 6
+    pub fn ignore_all(&mut self, word: &str);
+    pub fn add_to_dictionary(&mut self, word: &str);
+}
+pub struct Lang { pub code: String /* "sv_SE" */, pub name: String /* "Svenska" */, pub aff: PathBuf, pub dic: PathBuf }
+pub fn words(text: &str, range: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>>; // ordregler ovan
+```
