@@ -8,6 +8,7 @@ mod pdf_write;
 mod highlight;
 mod icons;
 mod single;
+mod spell;
 mod theme;
 
 use std::path::PathBuf;
