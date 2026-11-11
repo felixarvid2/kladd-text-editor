@@ -34,10 +34,11 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 
 ## Kom igång
 
-Kladd är ett öppet hobbyprojekt och har ännu inget färdigt releasepaket. Bygg det från källkoden:
+Kladd är ett öppet källkodsprojekt och har ännu inget färdigt releasepaket. Bygg det från källkoden:
 
 ```bash
 cargo build --release
+./target/release/kladd
 ```
 
 Har du redan ett färdigt `.deb`-paket installerar du det med:
