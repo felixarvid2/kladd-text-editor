@@ -330,9 +330,21 @@ fn kind_for_style(styles: &HashMap<String, StyleInfo>, id: &str) -> ParaKind {
     ParaKind::Normal
 }
 
-/// numId → för varje nivå: är listan numrerad (inte punktlista)?
-fn parse_numbering(xml: &str) -> HashMap<String, Vec<bool>> {
+/// Listdefinitioner per numId.
+#[derive(Default)]
+struct Numbering {
+    /// För varje nivå: är listan numrerad (inte punktlista)?
+    ordered: HashMap<String, Vec<bool>>,
+    /// För varje nivå: första numret (`w:start`, ersatt av `w:startOverride`).
+    starts: HashMap<String, Vec<u64>>,
+}
+
+/// numId → format och startnummer per nivå.
+fn parse_numbering(xml: &str) -> Numbering {
     let mut abstract_fmt: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut abstract_start: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut overrides: HashMap<(String, usize), u64> = HashMap::new();
+    let mut ovr_lvl: usize = 0;
     let mut num_to_abs: HashMap<String, String> = HashMap::new();
     let mut r = Reader::from_str(xml);
     let mut cur_abs: Option<String> = None;
@@ -348,6 +360,17 @@ fn parse_numbering(xml: &str) -> HashMap<String, Vec<bool>> {
                         let ordered = !matches!(attr(&e, b"val").as_deref(), Some("bullet" | "none") | None);
                         let v = abstract_fmt.entry(a.clone()).or_insert_with(|| vec![false; 9]);
                         v[cur_lvl] = ordered;
+                    }
+                }
+                b"start" => {
+                    if let (Some(a), Some(v)) = (&cur_abs, attr(&e, b"val").and_then(|v| v.parse().ok())) {
+                        abstract_start.entry(a.clone()).or_insert_with(|| vec![1; 9])[cur_lvl] = v;
+                    }
+                }
+                b"lvlOverride" => ovr_lvl = attr(&e, b"ilvl").and_then(|v| v.parse().ok()).unwrap_or(0).min(8),
+                b"startOverride" => {
+                    if let (Some(n), Some(v)) = (&cur_num, attr(&e, b"val").and_then(|v| v.parse().ok())) {
+                        overrides.insert((n.clone(), ovr_lvl), v);
                     }
                 }
                 b"num" => cur_num = attr(&e, b"numId"),
@@ -367,10 +390,19 @@ fn parse_numbering(xml: &str) -> HashMap<String, Vec<bool>> {
             _ => {}
         }
     }
-    num_to_abs
-        .into_iter()
-        .filter_map(|(n, a)| abstract_fmt.get(&a).map(|v| (n, v.clone())))
-        .collect()
+    let mut out = Numbering::default();
+    for (n, a) in num_to_abs {
+        let Some(fmt) = abstract_fmt.get(&a) else { continue };
+        let mut starts = abstract_start.get(&a).cloned().unwrap_or_else(|| vec![1; 9]);
+        for (lvl, st) in starts.iter_mut().enumerate() {
+            if let Some(v) = overrides.get(&(n.clone(), lvl)) {
+                *st = *v;
+            }
+        }
+        out.ordered.insert(n.clone(), fmt.clone());
+        out.starts.insert(n, starts);
+    }
+    out
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -493,7 +525,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     };
     let numbering = match find_part("/numbering") {
         Some(p) => pkg.part(&p)?.map(|x| parse_numbering(&x)).unwrap_or_default(),
-        None => HashMap::new(),
+        None => Numbering::default(),
     };
     let mut dropped = Dropped {
         headers: rels.values().any(|(_, k, _)| k.ends_with("/header") || k.ends_with("/footer")),
@@ -599,7 +631,7 @@ pub fn image_ext(bytes: &[u8]) -> Option<&'static str> {
 fn parse_body(
     xml: &str,
     styles: &HashMap<String, StyleInfo>,
-    numbering: &HashMap<String, Vec<bool>>,
+    numbering: &Numbering,
     rels: &HashMap<String, (String, String, bool)>,
     dropped: &mut Dropped,
     found: &mut Vec<FoundImage>,
@@ -1075,11 +1107,13 @@ fn para_md(p: &Para) -> String {
     s.trim_matches('\n').to_owned()
 }
 
-fn to_markdown(blocks: &[Block], numbering: &HashMap<String, Vec<bool>>) -> String {
+fn to_markdown(blocks: &[Block], numbering: &Numbering) -> String {
     let mut out = String::new();
     let mut prev_list = false;
     // numId för den yttersta listan: en ny lista på nivå 0 får en tom rad före sig.
     let mut top_num: Option<String> = None;
+    // Räknare per (numId, nivå); fortsätter när samma lista återupptas efter ett avbrott.
+    let mut counters: HashMap<(String, usize), u64> = HashMap::new();
     for b in blocks {
         match b {
             Block::Para(p) => {
@@ -1108,9 +1142,18 @@ fn to_markdown(blocks: &[Block], numbering: &HashMap<String, Vec<bool>>) -> Stri
                         out.push_str(&format!("{} {}", "#".repeat(n as usize), one_line.trim()));
                     }
                     (_, Some((num, lvl))) => {
-                        let ordered = numbering.get(num).map(|v| v[*lvl as usize]).unwrap_or(false);
-                        let indent = "    ".repeat(*lvl as usize);
-                        let marker = if ordered { "1. " } else { "- " };
+                        let l = *lvl as usize;
+                        let ordered = numbering.ordered.get(num).map(|v| v[l]).unwrap_or(false);
+                        let indent = "    ".repeat(l);
+                        let marker = if ordered {
+                            // Ett objekt nollställer räknarna för djupare nivåer i samma lista.
+                            counters.retain(|(n, d), _| n != num || *d <= l);
+                            let start = numbering.starts.get(num).map(|v| v[l]).unwrap_or(1);
+                            let c = counters.entry((num.clone(), l)).and_modify(|c| *c += 1).or_insert(start);
+                            format!("{c}. ")
+                        } else {
+                            "- ".to_owned()
+                        };
                         let cont = format!("{indent}{}", " ".repeat(marker.len()));
                         let mut lines = text.lines();
                         let first = lines.next().unwrap_or("");
@@ -1780,7 +1823,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "# Planering för fritids\n\nVi ska **baka** och *måla* i dag, se [Skolverket](https://www.skolverket.se).\n\n## Att ta med\n\n- Förkläde\n- Mjöl\n    - Vetemjöl\n\n1. Värm ugnen\n1. Blanda\n\n> Kom ihåg att tvätta händerna.\n\n| Dag | Aktivitet |\n| --- | --- |\n| Måndag | Bakning |\n| Tisdag | Utflykt |\n\nPris: 5\\*3 kr och `kod` här.\n";
+    const SAMPLE: &str = "# Planering för fritids\n\nVi ska **baka** och *måla* i dag, se [Skolverket](https://www.skolverket.se).\n\n## Att ta med\n\n- Förkläde\n- Mjöl\n    - Vetemjöl\n\n1. Värm ugnen\n2. Blanda\n\n> Kom ihåg att tvätta händerna.\n\n| Dag | Aktivitet |\n| --- | --- |\n| Måndag | Bakning |\n| Tisdag | Utflykt |\n\nPris: 5\\*3 kr och `kod` här.\n";
 
     #[test]
     fn roundtrip_keeps_structure() {
@@ -1788,6 +1831,44 @@ mod tests {
         let back = read(&bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
         assert_eq!(back.markdown, SAMPLE, "\n--- fick ---\n{}", back.markdown);
+    }
+
+    fn rt(md: &str) -> String {
+        let bytes = write(md, "T", &|_| None).unwrap().bytes;
+        read(&bytes).unwrap().markdown
+    }
+
+    #[test]
+    fn numbered_list_keeps_numbers() {
+        assert_eq!(rt("1. a\n2. b\n3. c\n"), "1. a\n2. b\n3. c\n");
+        assert_eq!(rt("3. c\n4. d\n"), "3. c\n4. d\n");
+    }
+
+    #[test]
+    fn numbered_list_after_interruption_keeps_start() {
+        let md = "1. a\n2. b\n\nEtt stycke.\n\n3. c\n";
+        assert_eq!(rt(md), md);
+    }
+
+    #[test]
+    fn nested_numbers_restart_per_parent() {
+        let md = "1. a\n    1. x\n    2. y\n2. b\n    1. z\n";
+        assert_eq!(rt(md), md);
+    }
+
+    #[test]
+    fn numbering_resets_deeper_levels_and_resumes() {
+        let numbering = parse_numbering(
+            r#"<w:numbering xmlns:w="w"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="5"/><w:numFmt w:val="decimal"/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        let item = |t: &str, l: u8| Block::Para(Para {
+            style: None,
+            runs: vec![Run { text: t.into(), fmt: Fmt::default(), link: None, raw: false }],
+            kind: ParaKind::Normal,
+            list: Some(("1".into(), l)),
+        });
+        let blocks = vec![item("a", 0), item("x", 1), item("y", 1), item("b", 0), item("z", 1)];
+        assert_eq!(to_markdown(&blocks, &numbering), "5. a\n    1. x\n    2. y\n6. b\n    1. z\n");
     }
 
     #[test]
