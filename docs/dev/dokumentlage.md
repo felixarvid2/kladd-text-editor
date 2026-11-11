@@ -94,6 +94,7 @@ pub struct Params<'a> {
     pub reveal: std::ops::Range<usize>,  // från markup::reveal_range
     pub query: &'a str, pub case_sensitive: bool, pub current_match: Option<usize>,
     pub image_size: &'a dyn Fn(&str) -> Option<egui::Vec2>, // src -> visningsstorlek i px vid zoom
+    pub measure: &'a dyn Fn(&str, egui::FontId) -> f32,     // textbredd, för tabellkolumner och listindrag
 }
 pub fn layout_job(text: &str, a: &markup::Analysis, p: &Params) -> egui::text::LayoutJob;
 ```
@@ -125,7 +126,12 @@ interpunktion) i `assets/fonts/`.
   tonad bakgrund med accentkant.
 - **Sidan**: A4 (794 × 1123 px vid 100 %), marginaler 96 px, vit på grått, skugga. Sidan blir
   lika lång som texten men minst en sida. Ungefärliga sidbrytningar markeras med en
-  streckad linje och "Sida N" i marginalen.
+  streckad linje mellan två rader och "Sida N" i marginalen.
+- **Listor** dras in som i Word (punkt vid 0,25 tum, text vid 0,5 tum, +0,25 tum per nivå);
+  punkterna ritas ovanpå den dolda `- `-markeringen.
+- **Tabeller** visas som ett rutnät (Table Grid) med fet rubrikrad. Står markören i tabellen
+  visas hela tabellen som Markdown så att den går att redigera.
+- **Dold markup** ritas med teckenstorlek 0,01 px och blir därmed i praktiken noll bred.
 - **Statusrad**: "Sida x av y", "N ord", zoom. Kodspecifika fält (rad/kolumn, kodning,
   radslut) döljs.
 - **Dolt i dokumentläget**: radnummer, förhandsvisningsknappen och förhandsvisningspanelen.

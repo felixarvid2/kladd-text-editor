@@ -788,6 +788,7 @@ impl KladdApp {
                 if let Some(t) = target {
                     out.response.context_menu(|ui| {
                         ui.set_min_width(210.0);
+                        ui.set_max_width(260.0);
                         ui.spacing_mut().item_spacing.y = 0.0;
                         if t.suggestions.is_empty() {
                             ui.add_enabled(false, egui::Label::new("Inga förslag"));
