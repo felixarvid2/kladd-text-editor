@@ -10,6 +10,7 @@ use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
+    Color32,
     Align, Align2, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
     Modifiers, Key, Panel, Popup, Rect, RectAlign, ScrollArea, Sense, Shape, Stroke, TextBuffer, TextEdit, Ui,
     UiBuilder, Vec2, pos2, vec2,
@@ -19,7 +20,7 @@ use super::layout::{self, MARGIN_PT, PAGE_H_PT, PAGE_W_PT, px};
 use super::markup::{self, Block, Inline};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
-use crate::theme::{self, Palette};
+use crate::theme::Palette;
 
 const BAR_H: f32 = 40.0;
 const MIN_ZOOM: f32 = 0.5;
@@ -100,6 +101,34 @@ fn divider(ui: &mut Ui, p: &Palette) {
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line));
     ui.add_space(4.0);
+}
+
+/// Radgränserna (y i px från galleriets överkant) där en ny sida börjar. `rows` är (topp, botten)
+/// för varje rad. Varje sida rymmer så många hela rader som får plats på `page_h`, minst en, och
+/// brytlinjen läggs mellan sista raden och nästa, så den aldrig skär en rad.
+fn page_breaks(rows: &[(f32, f32)], page_h: f32) -> Vec<f32> {
+    let mut out = Vec::new();
+    if page_h <= 0.0 || rows.is_empty() {
+        return out;
+    }
+    let mut i = 0;
+    while i < rows.len() {
+        let limit = rows[i].0 + page_h + 0.01;
+        let mut j = i;
+        while j + 1 < rows.len() && rows[j + 1].1 <= limit {
+            j += 1;
+        }
+        if j + 1 >= rows.len() {
+            break;
+        }
+        out.push((rows[j].1 + rows[j + 1].0) / 2.0);
+        i = j + 1;
+    }
+    out
+}
+
+fn overlaps_strict(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
 }
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -423,6 +452,11 @@ impl KladdApp {
                 }
             }
             let image_size = |src: &str| sizes.get(src).copied();
+            // Textbredd för tabellkolumner och listindrag. Mäts före och utanför layout_job, så
+            // ingen fonts-lås hålls när det anropas.
+            let measure = |s: &str, f: FontId| -> f32 {
+                ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x)
+            };
 
             // Stavningskontroll.
             let text_hash = hash_text(&self.docs[self.active].text);
@@ -468,6 +502,9 @@ impl KladdApp {
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
             let reveal = if focused { markup::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
+            // Står markören i en tabell visas hela tabellen som rå Markdown.
+            let tabs = layout::tables(&self.docs[self.active].text, &analysis);
+            let reveal = layout::reveal_whole_tables(&tabs, reveal);
 
             let (query, case_sensitive) = if self.find.open {
                 (self.find.query.clone(), self.find.case_sensitive)
@@ -507,6 +544,7 @@ impl KladdApp {
                     case_sensitive,
                     current_match,
                     image_size: &image_size,
+                    measure: &measure,
                 };
                 let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
                     let mut job = word.job(doc_id, buf.as_str(), &params);
@@ -557,7 +595,6 @@ impl KladdApp {
 
                 let clip = ui.clip_rect();
                 let painter = ui.painter().clone();
-                let body = FontId::new(px(z, 11.0), theme::doc_font(false, false));
 
                 // Byte -> teckenindex, framåt i en svep (bitarna ligger i ordning).
                 let mut conv = ByteToChar::new(text);
@@ -576,11 +613,25 @@ impl KladdApp {
                 };
                 for pc in &analysis.pieces {
                     let shown = overlaps(&pc.range, &reveal);
-                    if pc.list_marker && pc.markup && !shown {
-                        let ci = conv.at(pc.range.start);
+                    if pc.list_marker && pc.markup && !shown && !edited {
+                        // Punkten ritas 12 pt före textens början (markören efter dold markör).
+                        let ci = conv.at(pc.range.end);
                         let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
                         if r.bottom() >= clip.top() && r.top() <= clip.bottom() {
-                            painter.text(r.min, Align2::LEFT_TOP, "•", body.clone(), p.page_text);
+                            let level = layout::list_level(text, pc.range.start);
+                            let c = pos2(r.left() - px(z, 12.0), r.center().y + 0.5);
+                            let rad = (2.6 * z).max(1.8);
+                            match level {
+                                0 => {
+                                    painter.circle_filled(c, rad, p.page_text);
+                                }
+                                1 => {
+                                    painter.circle_stroke(c, rad - 0.4, Stroke::new(1.2, p.page_text));
+                                }
+                                _ => {
+                                    painter.rect_filled(Rect::from_center_size(c, Vec2::splat(rad * 1.6)), 0.0, p.page_text);
+                                }
+                            }
                         }
                     }
                     if pc.block == Block::Quote && !shown && pc.range.end > pc.range.start {
@@ -618,15 +669,47 @@ impl KladdApp {
                 }
                 flush_bar(&mut bar);
 
-                // Sidbrytningar (ungefärliga).
+                // Tabellrutnät: 1 px kantlinjer vid de dolda pipornas lägen och radgränserna.
+                if !edited {
+                    let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
+                    let snap = |v: f32| (v - 0.5).round() + 0.5;
+                    let mut conv = ByteToChar::new(text);
+                    for t in tabs.iter().filter(|t| !overlaps_strict(&t.region, &reveal)) {
+                        for (ri, row) in t.rows.iter().enumerate() {
+                            let (Some(&first), Some(&last)) = (row.pipes.first(), row.pipes.last()) else { continue };
+                            if row.delimiter || first == last {
+                                continue;
+                            }
+                            let at = |conv: &mut ByteToChar, b: usize| {
+                                galley.pos_from_cursor(CCursor::new(conv.at(b))).translate(gpos.to_vec2())
+                            };
+                            let rs = at(&mut conv, row.line.start);
+                            let re = at(&mut conv, row.line.end);
+                            let (y0, y1) = (rs.top(), re.bottom());
+                            if y1 < clip.top() || y0 > clip.bottom() {
+                                continue;
+                            }
+                            let xs: Vec<f32> = row.pipes.iter().map(|&b| snap(at(&mut conv, b).left())).collect();
+                            for &x in &xs {
+                                painter.line_segment([pos2(x, snap(y0)), pos2(x, snap(y1))], stroke);
+                            }
+                            let (x0, x1) = (xs[0], xs[xs.len() - 1]);
+                            if ri == 0 {
+                                painter.line_segment([pos2(x0, snap(y0)), pos2(x1, snap(y0))], stroke);
+                            }
+                            painter.line_segment([pos2(x0, snap(y1)), pos2(x1, snap(y1))], stroke);
+                        }
+                    }
+                }
+
+                // Sidbrytningar (ungefärliga): vid radgränser, aldrig genom en rad.
                 let top_of_text = gpos.y;
-                let bottom = gpos.y + galley.size().y;
-                let mut total = 1usize;
+                let rows: Vec<(f32, f32)> = galley.rows.iter().map(|r| (r.min_y(), r.max_y())).collect();
+                let breaks = page_breaks(&rows, text_h_page);
+                let total = breaks.len() + 1;
                 let right_x = page_left + page_w - margin + 8.0;
-                let mut k = 1usize;
-                while top_of_text + k as f32 * text_h_page < bottom {
-                    let y = top_of_text + k as f32 * text_h_page;
-                    total += 1;
+                for (k, by) in breaks.iter().enumerate() {
+                    let y = top_of_text + by;
                     if y >= clip.top() - 20.0 && y <= clip.bottom() + 20.0 {
                         painter.extend(Shape::dashed_line(
                             &[pos2(page_left, y), pos2(page_left + page_w, y)],
@@ -635,19 +718,18 @@ impl KladdApp {
                             4.0,
                         ));
                         painter.text(
-                            pos2(right_x, y - 2.0),
-                            Align2::LEFT_BOTTOM,
-                            format!("Sida {}", k + 1),
+                            pos2(right_x, y),
+                            Align2::LEFT_CENTER,
+                            format!("Sida {}", k + 2),
                             FontId::new(10.0, FontFamily::Proportional),
                             p.page_muted,
                         );
                     }
-                    k += 1;
                 }
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
-                let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y + gpos.y - top_of_text;
-                let cur = ((caret_y / text_h_page).floor().max(0.0) as usize + 1).min(total);
-                pages = (cur, total);
+                let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
+                let cur = breaks.iter().filter(|b| **b <= caret_y + 0.5).count() + 1;
+                pages = (cur.min(total), total);
 
                 // Röd våglinje under felstavade ord.
                 if !misspelled.is_empty() {
@@ -840,4 +922,29 @@ impl<'a> ByteToChar<'a> {
 
 fn image_uri(src: &str, doc_id: u64) -> String {
     format!("bytes://kladd-doc/{doc_id}/{}", src.replace(' ', "%20"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_breaks;
+
+    #[test]
+    fn sidbrytning_mellan_rader() {
+        // Rader på 20 px; sidan rymmer 100 px = 5 rader.
+        let rows: Vec<(f32, f32)> = (0..12).map(|i| (i as f32 * 20.0, i as f32 * 20.0 + 20.0)).collect();
+        let b = page_breaks(&rows, 100.0);
+        assert_eq!(b, vec![100.0, 200.0]);
+        // Aldrig genom en rad.
+        for y in &b {
+            assert!(rows.iter().all(|r| !(r.0 < *y && *y < r.1)), "{y}");
+        }
+        // Sidan rymmer inte en hel rad till: brytningen hamnar före den.
+        let b = page_breaks(&rows, 110.0);
+        assert_eq!(b[0], 100.0);
+        // En rad högre än sidan får en egen sida.
+        let tall = [(0.0, 20.0), (20.0, 400.0), (400.0, 420.0)];
+        assert_eq!(page_breaks(&tall, 100.0).len(), 2);
+        assert!(page_breaks(&rows[..5], 100.0).is_empty());
+        assert!(page_breaks(&[], 100.0).is_empty());
+    }
 }

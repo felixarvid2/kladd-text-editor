@@ -452,6 +452,9 @@ fn mark_fenced(text: &str, st: &mut [St], r: &Range<usize>) {
 
 fn mark_item(text: &str, st: &mut [St], at: usize) {
     let b = text.as_bytes();
+    // Ett nästlat objekts intervall kan börja på radbrytningen före (tabb) eller på radens indrag.
+    let at = if b.get(at) == Some(&b'\n') { at + 1 } else { at };
+    let at = at + ws_run(b, at);
     let Some(&c) = b.get(at) else { return };
     let (marker_len, bullet) = if matches!(c, b'-' | b'*' | b'+') {
         (1, true)
@@ -1297,6 +1300,17 @@ mod tests {
     }
 
     #[test]
+    fn nästlad_lista_med_fyra_blanksteg_eller_tabb() {
+        for t in ["- a\n    - b\n", "- a\n\t- b\n"] {
+            let a = analyze(t);
+            let i = t.find("- b").unwrap();
+            let m = piece_at(&a, i).unwrap();
+            assert!(m.markup && m.list_marker, "{t:?}: {a:?}");
+            covers(t);
+        }
+    }
+
+    #[test]
     fn nästlad_lista_indrag_är_vanligt() {
         let t = "- a\n  - b\n";
         let a = analyze(t);
@@ -1950,3 +1964,4 @@ mod tests {
         assert_eq!(reveal_range(t, 8..9), 7..10);
     }
 }
+
