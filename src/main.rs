@@ -10,6 +10,7 @@ mod icons;
 mod single;
 mod spell;
 mod theme;
+mod word;
 
 use std::path::PathBuf;
 
