@@ -50,6 +50,11 @@ pub struct Document {
     pub docx: bool,
     /// Sant om filen är en PDF vars text visas som Markdown.
     pub pdf: bool,
+    /// Originalfilen för en PDF (för att visa sidorna) och dess lösenord.
+    pub pdf_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    pub pdf_password: Option<String>,
+    /// Innehållslista för en PDF.
+    pub outline: Vec<crate::pdf_read::OutlineEntry>,
     /// Meddelande att visa när filen har öppnats (t.ex. vad som inte kommer med).
     pub open_note: Option<String>,
     /// Innehåll i ett öppnat Word-dokument som Kladd inte kan spara tillbaka.
@@ -154,6 +159,9 @@ impl Document {
             docx: false,
             pdf: false,
             open_note: None,
+            pdf_bytes: None,
+            pdf_password: None,
+            outline: Vec::new(),
             docx_dropped: Vec::new(),
             images: Vec::new(),
             saved_hash: hash_text(""),
@@ -200,6 +208,9 @@ impl Document {
                 dirty: false,
                 docx: false,
                 pdf: true,
+                pdf_password: password.filter(|p| !p.is_empty()).map(str::to_owned),
+                outline: loaded.outline,
+                pdf_bytes: Some(std::sync::Arc::new(bytes)),
                 open_note,
                 docx_dropped: loaded.dropped,
                 images: loaded.images,
@@ -225,6 +236,9 @@ impl Document {
                 dirty: false,
                 docx: true,
                 pdf: false,
+                pdf_bytes: None,
+                pdf_password: None,
+                outline: Vec::new(),
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     format!("{name} innehåller {} som inte visas i Kladd", join_sv(&loaded.dropped))
@@ -259,6 +273,9 @@ impl Document {
             docx: false,
             pdf: false,
             open_note: None,
+            pdf_bytes: None,
+            pdf_password: None,
+            outline: Vec::new(),
             docx_dropped: Vec::new(),
             images: Vec::new(),
             untitled_index: 0,
@@ -300,6 +317,17 @@ impl Document {
             encode(&text, self.encoding)?
         };
         write_atomic(path, &bytes).map_err(|e| describe_io_error(&e, path))?;
+        if to_pdf {
+            self.outline = match crate::pdf_read::read(&bytes, None) {
+                Ok(l) => l.outline,
+                Err(_) => Vec::new(),
+            };
+            self.pdf_bytes = Some(std::sync::Arc::new(bytes));
+            self.pdf_password = None;
+        } else {
+            self.pdf_bytes = None;
+            self.outline.clear();
+        }
         self.docx = to_word;
         self.pdf = to_pdf;
         self.docx_dropped.clear();

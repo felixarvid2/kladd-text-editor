@@ -4,6 +4,7 @@ mod app;
 mod doc;
 mod docx;
 mod pdf_read;
+mod pdf_view;
 mod pdf_write;
 mod highlight;
 mod icons;
