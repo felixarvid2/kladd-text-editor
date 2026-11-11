@@ -47,7 +47,7 @@ copyright = "2026, Felix"
 section = "editors"
 priority = "optional"
 depends = "$auto, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland-egl1"
-recommends = "zenity, xdg-desktop-portal"
+recommends = "zenity, xdg-desktop-portal, hunspell-sv, hunspell-en-us"
 extended-description = """\
 Kladd är en enkel och snygg texteditor för Ubuntu. Den öppnar och sparar \
 vanliga textformat som .txt, .md, Word-dokument (.docx), PDF, .rs, .py, .json, .toml, .yaml, .html, \
