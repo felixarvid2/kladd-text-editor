@@ -46,6 +46,12 @@ pub struct Settings {
     pub preview: bool,
     pub line_numbers: bool,
     pub recent: Vec<PathBuf>,
+    /// Zoom för sidan i dokumentläget (1.0 = 100 %).
+    pub word_zoom: f32,
+    /// Stavningskontroll i dokumentläget.
+    pub spell: bool,
+    /// Vald ordlista (t.ex. "sv_SE"); `None` = automatiskt.
+    pub spell_lang: Option<String>,
 }
 
 impl Default for Settings {
@@ -57,6 +63,9 @@ impl Default for Settings {
             preview: true,
             line_numbers: true,
             recent: Vec::new(),
+            word_zoom: 1.0,
+            spell: true,
+            spell_lang: None,
         }
     }
 }
@@ -88,15 +97,15 @@ struct PendingClose {
 }
 
 #[derive(Default)]
-struct Find {
-    open: bool,
-    replace: bool,
-    query: String,
-    replacement: String,
-    case_sensitive: bool,
+pub(crate) struct Find {
+    pub(crate) open: bool,
+    pub(crate) replace: bool,
+    pub(crate) query: String,
+    pub(crate) replacement: String,
+    pub(crate) case_sensitive: bool,
     /// Byte-start för den aktuella träffen.
-    current: Option<usize>,
-    focus_query: bool,
+    pub(crate) current: Option<usize>,
+    pub(crate) focus_query: bool,
 }
 
 struct Toast {
@@ -112,14 +121,14 @@ enum Seek {
 }
 
 pub struct KladdApp {
-    docs: Vec<Document>,
-    active: usize,
+    pub(crate) docs: Vec<Document>,
+    pub(crate) active: usize,
     next_id: u64,
     untitled_counter: usize,
-    settings: Settings,
+    pub(crate) settings: Settings,
     hl: Highlighter,
     md_cache: CommonMarkCache,
-    find: Find,
+    pub(crate) find: Find,
     dialog: Option<Receiver<DialogResult>>,
     pending_close: Option<PendingClose>,
     pending_docx: Option<PendingDocx>,
@@ -127,25 +136,28 @@ pub struct KladdApp {
     allow_exit: bool,
     toast: Option<Toast>,
     cursor: (usize, usize, usize),
-    scroll_to_char: Option<usize>,
-    focus_editor: bool,
-    editor_rect: Rect,
+    pub(crate) scroll_to_char: Option<usize>,
+    pub(crate) focus_editor: bool,
+    pub(crate) editor_rect: Rect,
     last_title: String,
     last_active_id: Option<u64>,
     incoming: Option<Receiver<Incoming>>,
     preview_images: std::collections::HashSet<String>,
     owns_socket: bool,
+    pub(crate) word: crate::word::layout::Cache,
+    pub(crate) speller: Option<crate::spell::Speller>,
+    pub(crate) wv: crate::word::view::State,
 }
 
-fn editor_id(doc_id: u64) -> Id {
+pub(crate) fn editor_id(doc_id: u64) -> Id {
     Id::unique(("kladd-editor", doc_id))
 }
 
-fn char_to_byte(text: &str, ci: usize) -> usize {
+pub(crate) fn char_to_byte(text: &str, ci: usize) -> usize {
     text.char_indices().nth(ci).map_or(text.len(), |(b, _)| b)
 }
 
-fn byte_to_char(text: &str, b: usize) -> usize {
+pub(crate) fn byte_to_char(text: &str, b: usize) -> usize {
     text[..b.min(text.len())].chars().count()
 }
 
@@ -230,6 +242,9 @@ impl KladdApp {
             incoming: None,
             preview_images: std::collections::HashSet::new(),
             owns_socket: false,
+            word: Default::default(),
+            speller: None,
+            wv: Default::default(),
         };
         if single_instance {
             let (tx, rx) = channel();
@@ -244,15 +259,15 @@ impl KladdApp {
         app
     }
 
-    fn palette(&self) -> Palette {
+    pub(crate) fn palette(&self) -> Palette {
         theme::palette(self.settings.dark)
     }
 
-    fn now(ctx: &egui::Context) -> f64 {
+    pub(crate) fn now(ctx: &egui::Context) -> f64 {
         ctx.input(|i| i.time)
     }
 
-    fn notify(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
+    pub(crate) fn notify(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
         let secs = if error { 6.0 } else { 2.5 };
         self.toast = Some(Toast { text: text.into(), until: Self::now(ctx) + secs, error });
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(secs + 0.05));
@@ -312,6 +327,7 @@ impl KladdApp {
                 if replace {
                     let old = self.docs[self.active].id;
                     self.hl.forget(old);
+                    self.word.forget(old);
                     self.docs[self.active] = doc;
                 } else {
                     self.docs.push(doc);
@@ -404,7 +420,7 @@ impl KladdApp {
         });
     }
 
-    fn request_insert_image(&mut self, ctx: &egui::Context) {
+    pub(crate) fn request_insert_image(&mut self, ctx: &egui::Context) {
         if self.dialog.is_some() || self.docs.is_empty() {
             return;
         }
@@ -529,6 +545,7 @@ impl KladdApp {
         }
         let doc = self.docs.remove(idx);
         self.hl.forget(doc.id);
+        self.word.forget(doc.id);
         if self.docs.is_empty() {
             self.active = 0;
             self.untitled_counter = 0;
@@ -787,20 +804,24 @@ impl KladdApp {
                 self.seek(ctx, Seek::Next);
             }
         }
+        let word = self.word_mode();
+        if word {
+            self.word_shortcuts(ctx);
+        }
         if hit(ctrl, Key::Plus) || hit(ctrl, Key::Equals) {
-            self.zoom(1.0);
+            if word { self.word_zoom_step(1.0) } else { self.zoom(1.0) }
         }
         if hit(ctrl, Key::Minus) {
-            self.zoom(-1.0);
+            if word { self.word_zoom_step(-1.0) } else { self.zoom(-1.0) }
         }
         if hit(ctrl, Key::Num0) {
-            self.settings.font_size = DEFAULT_FONT_SIZE;
+            if word { self.settings.word_zoom = 1.0 } else { self.settings.font_size = DEFAULT_FONT_SIZE }
         }
         if hit(Modifiers::ALT, Key::Z) {
             self.settings.wrap = !self.settings.wrap;
         }
         if hit(ctrl_shift, Key::M) {
-            self.settings.preview = !self.settings.preview;
+            if !word { self.settings.preview = !self.settings.preview; }
         }
         if hit(ctrl_shift, Key::L) {
             self.toggle_theme(ctx);
@@ -871,7 +892,7 @@ impl KladdApp {
                 if bar.double_clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                 }
-                let show_preview_btn = self.docs.get(self.active).is_some_and(Document::is_markdown);
+                let show_preview_btn = self.docs.get(self.active).is_some_and(Document::is_markdown) && !self.word_mode();
                 let right_w = if show_preview_btn { 3.0 * 34.0 } else { 2.0 * 34.0 } + WINDOW_CONTROLS_W;
                 let left = Rect::from_min_max(full.min, pos2(full.right() - right_w - 8.0, full.bottom()));
                 let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
@@ -1102,7 +1123,8 @@ impl KladdApp {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     if let Some(doc) = self.docs.get(self.active) {
-                        ui.label(RichText::new(doc.language()).font(font.clone()).color(p.muted));
+                        let lang = if doc.word_view { "Word".to_owned() } else { doc.language() };
+                        ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
                     let now = Self::now(&ctx);
                     if let Some(t) = &self.toast {
@@ -1114,6 +1136,10 @@ impl KladdApp {
                         }
                     }
 
+                    if self.word_mode() {
+                        self.word_status(ui, p, &font);
+                        return;
+                    }
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1123,7 +1149,13 @@ impl KladdApp {
                             } else {
                                 ("Word-dokument", "Visas som Markdown och sparas som .docx")
                             };
+                            if doc.docx && !doc.pdf {
+                                if status_button(ui, p, "Visa som dokument", "Visa som Word-dokument med sidor och formateringsrad").clicked() {
+                                    doc.word_view = true;
+                                }
+                            } else {
                             ui.label(RichText::new(label).font(font.clone()).color(p.muted)).on_hover_text(tip);
+                            }
                         } else {
                         let le = status_button(ui, p, doc.line_ending.label(), "Radslut när filen sparas");
                         if le.clicked() {
@@ -1169,7 +1201,7 @@ impl KladdApp {
 
     fn preview(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(doc) = self.docs.get(self.active) else { return };
-        if !(self.settings.preview && doc.is_markdown()) {
+        if !(self.settings.preview && doc.is_markdown()) || self.word_mode() {
             return;
         }
         let width = ui.available_width();
@@ -1221,6 +1253,10 @@ impl KladdApp {
     }
 
     fn editor(&mut self, ui: &mut Ui, p: &Palette) {
+        if self.word_mode() {
+            self.word_page(ui, p);
+            return;
+        }
         CentralPanel::default()
             .frame(Frame::NONE.fill(p.editor))
             .show(ui, |ui| {
@@ -1837,19 +1873,19 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-fn quiet_button(text: &str, p: &Palette) -> egui::Button<'static> {
+pub(crate) fn quiet_button(text: &str, p: &Palette) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(p.text))
         .fill(p.surface_hover)
         .stroke(Stroke::NONE)
 }
 
-fn menu_divider(ui: &mut Ui, p: &Palette) {
+pub(crate) fn menu_divider(ui: &mut Ui, p: &Palette) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 11.0), Sense::hover());
     ui.painter().hline(r.x_range().shrink(6.0), r.center().y, Stroke::new(1.0, p.line));
 }
 
 /// En menyrad: valfri bock, etikett och kortkommando.
-fn menu_item(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, checked: Option<bool>, enabled: bool) -> bool {
+pub(crate) fn menu_item(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, checked: Option<bool>, enabled: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if enabled { Sense::click() } else { Sense::hover() });
     if !ui.is_rect_visible(rect) {
         return false;
@@ -1883,7 +1919,7 @@ fn menu_item(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, checked: Opt
     clicked
 }
 
-fn status_button(ui: &mut Ui, p: &Palette, text: &str, tooltip: &str) -> Response {
+pub(crate) fn status_button(ui: &mut Ui, p: &Palette, text: &str, tooltip: &str) -> Response {
     let font = FontId::new(12.0, FontFamily::Proportional);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, p.muted);
     let size = vec2(galley.size().x + 14.0, 20.0);
@@ -1950,6 +1986,7 @@ impl eframe::App for KladdApp {
         self.handle_shortcuts(&ctx);
 
         self.top_bar(ui, &p);
+        self.word_bar(ui, &p);
         self.status_bar(ui, &p);
         self.preview(ui, &p);
         self.editor(ui, &p);

@@ -48,6 +48,8 @@ pub struct Document {
     pub dirty: bool,
     /// Sant om filen är ett Word-dokument som visas som Markdown.
     pub docx: bool,
+    /// Sant när ett Word-dokument visas i dokumentläget (sida, formateringsrad) i stället för som Markdown-text.
+    pub word_view: bool,
     /// Sant om filen är en PDF vars text visas som Markdown.
     pub pdf: bool,
     /// Meddelande att visa när filen har öppnats (t.ex. vad som inte kommer med).
@@ -152,6 +154,7 @@ impl Document {
             line_ending: LineEnding::Lf,
             dirty: false,
             docx: false,
+            word_view: false,
             pdf: false,
             open_note: None,
             docx_dropped: Vec::new(),
@@ -199,6 +202,7 @@ impl Document {
                 line_ending: LineEnding::Lf,
                 dirty: false,
                 docx: false,
+                word_view: false,
                 pdf: true,
                 open_note,
                 docx_dropped: loaded.dropped,
@@ -224,6 +228,7 @@ impl Document {
                 line_ending: LineEnding::Lf,
                 dirty: false,
                 docx: true,
+                word_view: true,
                 pdf: false,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -257,6 +262,7 @@ impl Document {
             line_ending,
             dirty: false,
             docx: false,
+            word_view: false,
             pdf: false,
             open_note: None,
             docx_dropped: Vec::new(),

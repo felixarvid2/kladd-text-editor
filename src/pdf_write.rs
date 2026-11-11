@@ -112,6 +112,7 @@ struct Style {
     italic: bool,
     code: bool,
     strike: bool,
+    underline: bool,
     link: Option<String>,
 }
 
@@ -154,6 +155,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
     let mut bold = 0u32;
     let mut italic = 0u32;
     let mut strike = 0u32;
+    let mut underline = 0u32;
     let mut heading: Option<u8> = None;
     let mut quote = 0u8;
     // Listor: nästa nummer (None = punktlista)
@@ -201,6 +203,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         style.bold = bold > 0;
         style.italic = italic > 0;
         style.strike = strike > 0;
+        style.underline = underline > 0;
         match ev {
             MdEvent::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -322,6 +325,10 @@ fn parse_blocks(md: &str) -> Vec<Block> {
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 if t.trim().eq_ignore_ascii_case("<br>") || t.trim().eq_ignore_ascii_case("<br/>") {
                     push_text(&mut spans, "\n", &style);
+                } else if t.trim().eq_ignore_ascii_case("<u>") {
+                    underline += 1;
+                } else if t.trim().eq_ignore_ascii_case("</u>") {
+                    underline = underline.saturating_sub(1);
                 } else {
                     push_text(&mut spans, t.trim_end_matches('\n'), &style);
                 }
@@ -558,6 +565,10 @@ impl Layout<'_> {
                 self.page().ops.push(Op::Text { x: rx, y: baseline, face, size: sz, text, color: c, italic: st.italic || italic_all });
                 if st.link.is_some() {
                     self.page().ops.push(Op::Line { x1: rx, y1: baseline + 1.6, x2: rx + w, y2: baseline + 1.6, width: 0.6, color: LINK });
+                }
+                if st.underline && st.link.is_none() {
+                    let uy = baseline + 1.6;
+                    self.page().ops.push(Op::Line { x1: rx, y1: uy, x2: rx + w, y2: uy, width: 0.6, color: c });
                 }
                 if st.strike {
                     let sy = baseline - sz * 0.3;
@@ -971,6 +982,17 @@ mod tests {
         let w = write(md, "Test", &|_| None).unwrap();
         assert!(w.bytes.starts_with(b"%PDF-"));
         assert_eq!(w.missing_images, vec!["finns-inte.png".to_owned()]);
+    }
+
+    #[test]
+    fn underline_tags_are_not_literal() {
+        let w = write("En <u>understruken</u> text.\n", "Test", &|_| None).unwrap();
+        assert!(w.bytes.starts_with(b"%PDF-"));
+        let blocks = parse_blocks("En <u>understruken</u> text.\n");
+        let Some(Block::Para { spans, .. }) = blocks.first() else { panic!("inget stycke") };
+        assert!(spans.iter().all(|s| !s.text.contains("<u>") && !s.text.contains("</u>")));
+        let under: String = spans.iter().filter(|s| s.style.underline).map(|s| s.text.as_str()).collect();
+        assert_eq!(under, "understruken");
     }
 
     #[test]

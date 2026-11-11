@@ -73,7 +73,7 @@ fn build_theme(p: &Palette) -> Theme {
 }
 
 /// Hittar alla träffar av `needle` i `text` som byte-intervall.
-pub fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+pub(crate) fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     if needle.is_empty() {
         return out;
@@ -238,7 +238,7 @@ impl Highlighter {
         if !p.query.is_empty() {
             let matches = find_all(text, p.query, p.case_sensitive);
             if !matches.is_empty() {
-                apply_backgrounds(&mut job, &matches, p);
+                apply_backgrounds(&mut job, &matches, p.palette, p.current_match);
             }
         }
         job
@@ -246,7 +246,12 @@ impl Highlighter {
 }
 
 /// Delar upp sektionerna så att sökträffar får bakgrundsfärg.
-fn apply_backgrounds(job: &mut LayoutJob, matches: &[(usize, usize)], p: &Params<'_>) {
+pub(crate) fn apply_backgrounds(
+    job: &mut LayoutJob,
+    matches: &[(usize, usize)],
+    palette: &Palette,
+    current_match: Option<usize>,
+) {
     let mut out = Vec::with_capacity(job.sections.len() + matches.len() * 2);
     let mut mi = 0;
     for sec in job.sections.drain(..) {
@@ -259,10 +264,10 @@ fn apply_backgrounds(job: &mut LayoutJob, matches: &[(usize, usize)], p: &Params
         while pos < e {
             let (next, bg) = match matches.get(k) {
                 Some(&(ma, mb)) if ma <= pos => {
-                    let bg = if p.current_match == Some(ma) {
-                        p.palette.match_current_bg
+                    let bg = if current_match == Some(ma) {
+                        palette.match_current_bg
                     } else {
-                        p.palette.match_bg
+                        palette.match_bg
                     };
                     (mb.min(e), Some(bg))
                 }

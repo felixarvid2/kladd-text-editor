@@ -31,6 +31,8 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
 - **Dra och släpp** filer direkt i fönstret.
 - **Ett fönster** – filer som öppnas från filhanteraren eller terminalen läggs som nya flikar i det Kladd-fönster som redan är öppet. Använd `kladd --new-window` för ett separat fönster.
+- **Dokumentläge** – Word-dokument visas som ett dokument med A4-sida, formateringsfält och sidnummer. Se [Word-dokument](#word-dokument).
+- **Stavningskontroll** i dokumentläget, med svenska och engelska ordlistor från systemet.
 
 ## Kom igång
 
@@ -61,12 +63,28 @@ Avinstallera med `sudo apt remove kladd`.
 
 ## Word-dokument
 
-Kladd öppnar `.docx` och visar dokumentet som Markdown, så att formateringen syns i texten och i förhandsvisningen. När du sparar som `.docx` blir det ett riktigt Word-dokument som öppnas i Word, LibreOffice och Google Dokument. Med *Spara som* kan vilken flik som helst sparas som `.docx`.
+Kladd öppnar `.docx` i dokumentläge, som liknar ett Word-dokument. När du sparar som `.docx` blir det ett riktigt Word-dokument som öppnas i Word, LibreOffice och Google Dokument. Med *Spara som* kan vilken flik som helst sparas som `.docx`.
+
+### Dokumentläge
+
+![Ett Word-dokument i Kladds dokumentläge](docs/dokumentlage-ljust.png)
+
+Ett öppnat `.docx` visas på en vit A4-sida mot grå bakgrund, med typografi som liknar Word. Typsnittet är Carlito, som är metriskt likt Calibri. Listor är indragna, tabeller ritas som rutnät, bilder visas i texten och sidbrytningar markeras med "Sida N". Markdown-koden är dold; den visas nedtonad bara på raden där markören står.
+
+Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, infoga bild och tabell, ångra och gör om samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
+
+Vill du se dokumentet som vanlig Markdown-text klickar du på *Markdown* i formateringsfältet. Klicka på *Visa som dokument* i statusfältet för att gå tillbaka.
+
+### Stavningskontroll
+
+I dokumentläget markeras felstavade ord med ett rött vågigt understreck medan du skriver. Högerklicka på ett ord för att se förslag, välja *Ignorera alla* eller *Lägg till i ordlistan*. Tillagda ord sparas i `~/.config/kladd/ordlista.txt`.
+
+Kladd använder de Hunspell-ordlistor som finns i `/usr/share/hunspell`, samma som LibreOffice använder på Ubuntu. Installera svenska med `sudo apt install hunspell-sv`; .deb-paketet föreslår `hunspell-sv` och `hunspell-en-us`. Språk och på/av väljer du genom att klicka på språket i statusfältet. Standardspråket är svenska när det är installerat.
 
 | I Word | I Kladd |
 |---|---|
 | Rubriker och titel | `#` … `######` |
-| Fetstil, kursiv, genomstruken | `**fet**`, `*kursiv*`, `~~struken~~` |
+| Fetstil, kursiv, understruken, genomstruken | `**fet**`, `*kursiv*`, `<u>understruken</u>`, `~~struken~~` |
 | Punktlistor och numrerade listor | `-` och `1.` |
 | Citat | `>` |
 | Tabeller | `\| kolumn \| kolumn \|` |
@@ -104,7 +122,11 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+F` / `Ctrl+H` | Sök / ersätt |
 | `F3` / `Shift+F3` | Nästa / föregående träff |
 | `Esc` | Stäng sökning |
-| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Textstorlek |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Textstorlek (i dokumentläge: zoom av sidan) |
+| `Ctrl+Scroll` | Zoom (endast dokumentläge) |
+| `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | Fet / kursiv / understruken (endast dokumentläge) |
+| `Ctrl+Alt+1` / `Ctrl+Alt+2` / `Ctrl+Alt+3` | Rubrik 1 / 2 / 3 (endast dokumentläge) |
+| `Ctrl+Alt+0` | Brödtext (endast dokumentläge) |
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Markdownförhandsvisning |
 | `Ctrl+Shift+L` | Byt tema |
@@ -113,3 +135,5 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 ## Licens
 
 Kladd är licensierat under MIT, se [LICENSE](LICENSE). Typsnitten IBM Plex Sans och IBM Plex Mono används under SIL Open Font License.
+
+Typsnittet Carlito (metriskt lika Calibri) används för dokumentläget under SIL Open Font License.
