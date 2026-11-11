@@ -82,13 +82,15 @@ Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.co
 
 ## PDF
 
-Kladd läser texten i en PDF och visar den som Markdown: rubriker, stycken, punkt- och numrerade listor, tabeller, fetstil, kursiv och bilder. Läsordningen följer spalterna, avstavning vid radslut tas bort, sidnummer i sidhuvud och sidfot hoppas över och stycken som fortsätter på nästa sida fogas ihop. Lösenordsskyddade PDF:er öppnas efter att du skrivit lösenordet.
+När du öppnar en PDF visas själva sidorna, med en innehållslista till vänster som bygger på PDF:ens bokmärken (eller på rubrikerna om bokmärken saknas). Klicka i listan för att hoppa dit; den rubrik du läser markeras. Zooma med `Ctrl++`, `Ctrl+-` och `Ctrl+0`.
+
+Tryck **Redigera** (`Ctrl+E`) för att redigera texten. Kladd läser då texten i PDF:en och visar den som Markdown: rubriker, stycken, punkt- och numrerade listor, tabeller, fetstil, kursiv och bilder. Läsordningen följer spalterna, avstavning vid radslut tas bort, sidnummer i sidhuvud och sidfot hoppas över och stycken som fortsätter på nästa sida fogas ihop. Lösenordsskyddade PDF:er öppnas efter att du skrivit lösenordet.
 
 Spara som `.pdf` för att få en A4-PDF med inbäddade typsnitt (IBM Plex), sökbar text, klickbara länkar, bokmärken från rubrikerna, bilder och sidnummer.
 
 En PDF är byggd för utskrift, inte för redigering. När du sparar en öppnad PDF skapar Kladd därför en ny PDF av texten, och originalets sidlayout och typsnitt ersätts. Kladd frågar innan originalet skrivs över. Sidor som bara består av bilder (skannade sidor) har ingen text att läsa; Kladd säger till när det gäller.
 
-Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/pdfcraft) och skrivningen på samma upplägg som [WordCraft](https://github.com/storytold/wordcraft) (båda MIT/Apache-2.0), med [lopdf](https://crates.io/crates/lopdf) och [krilla](https://crates.io/crates/krilla).
+Sidorna renderas med [hayro](https://crates.io/crates/hayro). Läsningen och visningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/pdfcraft) och skrivningen på samma upplägg som [WordCraft](https://github.com/storytold/wordcraft) (båda MIT/Apache-2.0), med [lopdf](https://crates.io/crates/lopdf) och [krilla](https://crates.io/crates/krilla).
 
 ## Kortkommandon
 
@@ -101,6 +103,7 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+W` | Stäng flik |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Nästa / föregående flik |
 | `Ctrl+Shift+I` | Infoga bild |
+| `Ctrl+E` | Växla mellan att visa och redigera en PDF |
 | `Ctrl+F` / `Ctrl+H` | Sök / ersätt |
 | `F3` / `Shift+F3` | Nästa / föregående träff |
 | `Esc` | Stäng sökning |

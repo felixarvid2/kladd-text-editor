@@ -1,5 +1,6 @@
 //! Kladds fönster: flikar, editor, sök, förhandsvisning och dialoger.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
@@ -46,6 +47,8 @@ pub struct Settings {
     pub preview: bool,
     pub line_numbers: bool,
     pub recent: Vec<PathBuf>,
+    /// Innehållslistan bredvid PDF-sidor.
+    pub pdf_outline: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +60,7 @@ impl Default for Settings {
             preview: true,
             line_numbers: true,
             recent: Vec::new(),
+            pdf_outline: true,
         }
     }
 }
@@ -134,6 +138,11 @@ pub struct KladdApp {
     last_active_id: Option<u64>,
     incoming: Option<Receiver<Incoming>>,
     preview_images: std::collections::HashSet<String>,
+    /// Öppna PDF-visningar per dokument.
+    pdf_views: HashMap<u64, crate::pdf_view::PdfView>,
+    /// PDF-dokument som visas som sidor (inte som redigerbar text).
+    pdf_viewing: std::collections::HashSet<u64>,
+    pdf_view_error: HashMap<u64, String>,
     owns_socket: bool,
 }
 
@@ -229,6 +238,9 @@ impl KladdApp {
             last_active_id: None,
             incoming: None,
             preview_images: std::collections::HashSet::new(),
+            pdf_views: HashMap::new(),
+            pdf_viewing: std::collections::HashSet::new(),
+            pdf_view_error: HashMap::new(),
             owns_socket: false,
         };
         if single_instance {
@@ -319,6 +331,9 @@ impl KladdApp {
                 }
                 self.remember(&canonical);
                 self.focus_editor = true;
+                if self.docs[self.active].pdf {
+                    self.pdf_viewing.insert(self.docs[self.active].id);
+                }
                 if let Some(note) = self.docs[self.active].open_note.take() {
                     self.notify(ctx, note, false);
                 }
@@ -491,6 +506,9 @@ impl KladdApp {
         match doc.save_to(path) {
             Ok(warnings) => {
                 let title = doc.title();
+                let id = doc.id;
+                self.pdf_views.remove(&id);
+                self.pdf_view_error.remove(&id);
                 if was_md != doc.is_markdown() || doc.extension().is_empty() {
                     self.hl.forget(doc.id);
                 }
@@ -529,6 +547,9 @@ impl KladdApp {
         }
         let doc = self.docs.remove(idx);
         self.hl.forget(doc.id);
+        self.pdf_views.remove(&doc.id);
+        self.pdf_viewing.remove(&doc.id);
+        self.pdf_view_error.remove(&doc.id);
         if self.docs.is_empty() {
             self.active = 0;
             self.untitled_counter = 0;
@@ -541,6 +562,43 @@ impl KladdApp {
 
     fn index_of(&self, doc_id: u64) -> Option<usize> {
         self.docs.iter().position(|d| d.id == doc_id)
+    }
+
+    // ---------------------------------------------------------------- PDF-visning
+
+    fn is_viewing_pdf(&self) -> bool {
+        self.docs.get(self.active).is_some_and(|d| d.pdf && d.pdf_bytes.is_some() && self.pdf_viewing.contains(&d.id))
+    }
+
+    /// Växlar mellan att visa PDF:en och att redigera dess text.
+    fn toggle_pdf_edit(&mut self) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        if !doc.pdf || doc.pdf_bytes.is_none() {
+            return;
+        }
+        let id = doc.id;
+        if !self.pdf_viewing.remove(&id) {
+            self.pdf_viewing.insert(id);
+        } else {
+            self.focus_editor = true;
+        }
+    }
+
+    fn pdf_view(&mut self, ctx: &egui::Context) -> Option<&mut crate::pdf_view::PdfView> {
+        let doc = self.docs.get(self.active)?;
+        let id = doc.id;
+        if !self.pdf_views.contains_key(&id) && !self.pdf_view_error.contains_key(&id) {
+            let bytes = doc.pdf_bytes.clone()?;
+            match crate::pdf_view::open(ctx, id, bytes, doc.pdf_password.clone()) {
+                Ok(v) => {
+                    self.pdf_views.insert(id, v);
+                }
+                Err(e) => {
+                    self.pdf_view_error.insert(id, e);
+                }
+            }
+        }
+        self.pdf_views.get_mut(&id)
     }
 
     // ---------------------------------------------------------------- sök
@@ -772,9 +830,15 @@ impl KladdApp {
             self.request_insert_image(ctx);
         }
         if hit(ctrl, Key::F) {
+            if self.is_viewing_pdf() {
+                self.toggle_pdf_edit();
+            }
             self.open_find(ctx, false);
         }
         if hit(ctrl, Key::H) {
+            if self.is_viewing_pdf() {
+                self.toggle_pdf_edit();
+            }
             self.open_find(ctx, true);
         }
         if self.find.open {
@@ -787,14 +851,37 @@ impl KladdApp {
                 self.seek(ctx, Seek::Next);
             }
         }
+        if hit(ctrl, Key::E) {
+            self.toggle_pdf_edit();
+        }
+        let viewing = self.is_viewing_pdf();
+        let now = Self::now(ctx);
         if hit(ctrl, Key::Plus) || hit(ctrl, Key::Equals) {
-            self.zoom(1.0);
+            if viewing {
+                if let Some(v) = self.pdf_view(ctx) {
+                    v.zoom_in(now);
+                }
+            } else {
+                self.zoom(1.0);
+            }
         }
         if hit(ctrl, Key::Minus) {
-            self.zoom(-1.0);
+            if viewing {
+                if let Some(v) = self.pdf_view(ctx) {
+                    v.zoom_out(now);
+                }
+            } else {
+                self.zoom(-1.0);
+            }
         }
         if hit(ctrl, Key::Num0) {
-            self.settings.font_size = DEFAULT_FONT_SIZE;
+            if viewing {
+                if let Some(v) = self.pdf_view(ctx) {
+                    v.set_zoom(1.0, now);
+                }
+            } else {
+                self.settings.font_size = DEFAULT_FONT_SIZE;
+            }
         }
         if hit(Modifiers::ALT, Key::Z) {
             self.settings.wrap = !self.settings.wrap;
@@ -871,8 +958,11 @@ impl KladdApp {
                 if bar.double_clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                 }
-                let show_preview_btn = self.docs.get(self.active).is_some_and(Document::is_markdown);
-                let right_w = if show_preview_btn { 3.0 * 34.0 } else { 2.0 * 34.0 } + WINDOW_CONTROLS_W;
+                let active_pdf = self.docs.get(self.active).is_some_and(|d| d.pdf && d.pdf_bytes.is_some());
+                let viewing = self.is_viewing_pdf();
+                let show_preview_btn = !active_pdf && self.docs.get(self.active).is_some_and(Document::is_markdown);
+                let extra = if active_pdf { 116.0 + if viewing { 34.0 } else { 0.0 } } else if show_preview_btn { 34.0 } else { 0.0 };
+                let right_w = 2.0 * 34.0 + extra + WINDOW_CONTROLS_W;
                 let left = Rect::from_min_max(full.min, pos2(full.right() - right_w - 8.0, full.bottom()));
                 let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
 
@@ -934,6 +1024,19 @@ impl KladdApp {
                         };
                         if icons::button(ui, p, icon, 30.0, false, tip, p.chrome).clicked() {
                             self.toggle_theme(&ctx);
+                        }
+                        if active_pdf {
+                            if viewing {
+                                let tip = if self.settings.pdf_outline { "Dölj innehållet" } else { "Visa innehållet" };
+                                if icons::button(ui, p, Icon::Sidebar, 30.0, self.settings.pdf_outline, tip, p.chrome).clicked() {
+                                    self.settings.pdf_outline = !self.settings.pdf_outline;
+                                }
+                                if icons::pill(ui, p, Icon::Pencil, "Redigera", "Redigera texten (Ctrl+E)", p.chrome).clicked() {
+                                    self.toggle_pdf_edit();
+                                }
+                            } else if icons::pill(ui, p, Icon::Page, "Visa PDF", "Visa sidorna (Ctrl+E)", p.chrome).clicked() {
+                                self.toggle_pdf_edit();
+                            }
                         }
                         if show_preview_btn {
                             let tip = if self.settings.preview {
@@ -1086,6 +1189,18 @@ impl KladdApp {
 
     fn status_bar(&mut self, ui: &mut Ui, p: &Palette) {
         let ctx = ui.ctx().clone();
+        let viewing_info = if self.is_viewing_pdf() {
+            let doc = &self.docs[self.active];
+            self.pdf_views.get(&doc.id).map(|v| {
+                let mut s = format!("Sida {} av {}     {} %", v.current_page + 1, v.page_count(), (v.zoom * 100.0).round());
+                if doc.dirty {
+                    s = format!("Visar senast sparade versionen     {s}");
+                }
+                s
+            })
+        } else {
+            None
+        };
         Panel::bottom("kladd-status")
             .exact_size(STATUS_H)
             .resizable(false)
@@ -1155,6 +1270,10 @@ impl KladdApp {
                         let words = if words == 1 { "1 ord".to_owned() } else { format!("{words} ord") };
                         ui.label(RichText::new(words).font(font.clone()).color(p.muted));
                         ui.add_space(10.0);
+                        if let Some(v) = viewing_info {
+                            ui.label(RichText::new(v).font(font.clone()).color(p.muted));
+                            return;
+                        }
                         let (line, col, sel) = self.cursor;
                         let pos = if sel > 0 {
                             format!("Rad {line}, kolumn {col}  ({sel} markerade)")
@@ -1169,7 +1288,7 @@ impl KladdApp {
 
     fn preview(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(doc) = self.docs.get(self.active) else { return };
-        if !(self.settings.preview && doc.is_markdown()) {
+        if !(self.settings.preview && doc.is_markdown()) || doc.pdf {
             return;
         }
         let width = ui.available_width();
@@ -1365,6 +1484,106 @@ impl KladdApp {
                     self.find.current = None;
                 }
             });
+    }
+
+    /// Innehållslistan till vänster om PDF-sidorna.
+    fn pdf_outline(&mut self, ui: &mut Ui, p: &Palette) {
+        if !self.settings.pdf_outline {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let outline = doc.outline.clone();
+        let Some(view) = self.pdf_view(&ctx) else { return };
+        let pages = view.page_count();
+        let (rp, rf) = view.reading;
+        let mut goto = None;
+        Panel::left("kladd-pdf-outline")
+            .resizable(true)
+            .default_size(250.0)
+            .size_range(170.0..=420.0)
+            .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin { left: 10, right: 8, top: 14, bottom: 10 }))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Innehåll").font(FontId::new(12.5, theme::medium())).color(p.muted));
+                ui.add_space(8.0);
+                ScrollArea::vertical().id_salt("kladd-outline-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    // Aktuell rubrik: den sista som ligger före läspositionen.
+                    let entries: Vec<(usize, String, usize, f32)> = if outline.is_empty() {
+                        (0..pages).map(|i| (1, format!("Sida {}", i + 1), i, 0.0)).collect()
+                    } else {
+                        outline.iter().map(|e| (e.level, e.title.clone(), e.page, e.y)).collect()
+                    };
+                    let active = entries.iter().rposition(|(_, _, pg, y)| (*pg, *y) <= (rp, rf + 0.02)).unwrap_or(0);
+                    let w = ui.available_width();
+                    for (i, (level, title, page, y)) in entries.iter().enumerate() {
+                        let indent = 12.0 * (level.saturating_sub(1).min(5)) as f32;
+                        let font = if *level <= 1 && !outline.is_empty() {
+                            FontId::new(13.0, theme::medium())
+                        } else {
+                            FontId::new(12.5, FontFamily::Proportional)
+                        };
+                        let is_active = i == active;
+                        let color = if is_active { p.text } else { p.muted };
+                        let num_w = 26.0;
+                        let galley = ui.painter().layout(title.clone(), font, color, w - indent - num_w - 18.0);
+                        let h = galley.size().y.max(16.0) + 10.0;
+                        let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+                        let hovered = resp.hovered();
+                        if is_active || hovered {
+                            ui.painter().rect_filled(rect, 6.0, if is_active { p.surface } else { p.surface_hover.gamma_multiply(0.6) });
+                        }
+                        if is_active {
+                            ui.painter().rect_filled(
+                                Rect::from_min_size(pos2(rect.left(), rect.top() + 6.0), vec2(2.5, h - 12.0)),
+                                1.0,
+                                p.accent,
+                            );
+                        }
+                        ui.painter().galley(pos2(rect.left() + 10.0 + indent, rect.top() + 5.0), galley, color);
+                        if !outline.is_empty() {
+                            ui.painter().text(
+                                pos2(rect.right() - 6.0, rect.top() + 5.0),
+                                Align2::RIGHT_TOP,
+                                (page + 1).to_string(),
+                                FontId::new(11.5, FontFamily::Proportional),
+                                p.faint,
+                            );
+                        }
+                        if resp.clicked() {
+                            goto = Some((*page, *y));
+                        }
+                    }
+                });
+            });
+        if let (Some((page, y)), Some(view)) = (goto, self.pdf_views.get_mut(&self.docs[self.active].id)) {
+            view.go_to(page, y);
+        }
+    }
+
+    /// PDF-sidorna, renderade.
+    fn pdf_pages(&mut self, ui: &mut Ui, p: &Palette) {
+        let ctx = ui.ctx().clone();
+        // Bakgrund som får de vita sidorna att lyfta.
+        let bg = if p.dark { Color32::from_rgb(0x0C, 0x11, 0x18) } else { Color32::from_rgb(0xD5, 0xDC, 0xE5) };
+        CentralPanel::default().frame(Frame::NONE.fill(bg)).show(ui, |ui| {
+            self.editor_rect = ui.max_rect();
+            if self.pdf_view(&ctx).is_none() {
+                let msg = self
+                    .docs
+                    .get(self.active)
+                    .and_then(|d| self.pdf_view_error.get(&d.id))
+                    .cloned()
+                    .unwrap_or_else(|| "PDF:en kan inte visas.".into());
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new(format!("{msg}\nTryck Redigera för att se texten.")).color(p.muted));
+                });
+                return;
+            }
+            if let Some(view) = self.pdf_view(&ctx) {
+                view.show(ui, p);
+            }
+        });
     }
 
     fn welcome(&mut self, ui: &mut Ui, p: &Palette) {
@@ -1952,7 +2171,12 @@ impl eframe::App for KladdApp {
         self.top_bar(ui, &p);
         self.status_bar(ui, &p);
         self.preview(ui, &p);
-        self.editor(ui, &p);
+        if self.is_viewing_pdf() {
+            self.pdf_outline(ui, &p);
+            self.pdf_pages(ui, &p);
+        } else {
+            self.editor(ui, &p);
+        }
         self.find_bar(&ctx, &p);
         self.close_dialog(&ctx, &p);
         self.docx_dialog(&ctx, &p);

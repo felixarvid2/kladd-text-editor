@@ -39,8 +39,20 @@ pub enum ReadError {
     Other(String),
 }
 
+/// En rad i innehållslistan: nivå (1 = överst), rubrik, sida (0-baserad)
+/// och läge på sidan som andel uppifrån (0.0–1.0).
+#[derive(Clone, Debug)]
+pub struct OutlineEntry {
+    pub level: usize,
+    pub title: String,
+    pub page: usize,
+    pub y: f32,
+}
+
 pub struct Loaded {
     pub markdown: String,
+    /// Bokmärken ur PDF:en, eller rubriker som Kladd hittat om bokmärken saknas.
+    pub outline: Vec<OutlineEntry>,
     pub images: Vec<(String, DocImage)>,
     /// Saker i originalet som inte kommer med, i läsbar form.
     pub dropped: Vec<&'static str>,
@@ -177,7 +189,10 @@ fn font_info<'a>(doc: &'a Document, font: &'a Dictionary) -> FontInfo<'a> {
     let subtype = font.get(b"Subtype").map(name_str).unwrap_or_default();
     let base = font.get(b"BaseFont").map(|o| name_str(resolve(doc, o))).unwrap_or_default();
     let lower = base.to_lowercase();
-    let bold = ["bold", "black", "heavy", "semibold", "demi"].iter().any(|k| lower.contains(k));
+    // Typsnittsnamn förkortas ibland: "SmBld", "Bd", "Medm" (IBM Plex m.fl.).
+    let style_part = lower.rsplit(['-', ',']).next().unwrap_or("");
+    let bold = ["bold", "black", "heavy", "semibold", "demi", "smbld", "bld"].iter().any(|k| lower.contains(k))
+        || matches!(style_part, "bd" | "sb" | "smbd" | "bdit");
     let italic = lower.contains("italic") || lower.contains("oblique");
     let mono = ["mono", "courier", "consol", "code"].iter().any(|k| lower.contains(k));
     let two_byte = subtype == "Type0";
@@ -496,6 +511,9 @@ impl<'a> Collector<'a> {
             return;
         }
         self.text_bytes += text.len();
+        // Lutad text (falsk kursiv) känns igen på textmatrisens skjuvning.
+        let m = trm_scale(tm).0;
+        let slanted = m[3].abs() > 0.01 && (m[2] / m[3]).abs() > 0.12;
         self.runs.push(Run {
             x,
             y,
@@ -503,7 +521,7 @@ impl<'a> Collector<'a> {
             size: eff_size.max(0.1),
             text,
             bold: font.bold,
-            italic: font.italic,
+            italic: font.italic || slanted,
             mono: font.mono,
             invisible: ts.render == 3,
         });
@@ -1021,13 +1039,14 @@ fn is_page_furniture(item: &Item, page_h: f32) -> bool {
 
 struct PageOut {
     items: Vec<Item>,
+    height: f32,
 }
 
-fn to_markdown(pages: &[PageOut], body: f32) -> String {
+fn to_markdown(pages: &[PageOut], body: f32, headings: &mut Vec<OutlineEntry>) -> String {
     let mut out: Vec<String> = Vec::new();
     // Ett stycke som fortsätter på nästa sida fogas ihop.
     let mut prev_open_para = false;
-    for page in pages {
+    for (pi, page) in pages.iter().enumerate() {
         for (ii, it) in page.items.iter().enumerate() {
             match it {
                 Item::Image(img) => {
@@ -1067,6 +1086,12 @@ fn to_markdown(pages: &[PageOut], body: f32) -> String {
                         None
                     };
                     if let Some(h) = level {
+                        headings.push(OutlineEntry {
+                            level: h,
+                            title: plain.split_whitespace().collect::<Vec<_>>().join(" "),
+                            page: pi,
+                            y: ((page.height - it.top()) / page.height.max(1.0)).clamp(0.0, 1.0),
+                        });
                         out.push(format!("{} {}", "#".repeat(h), segs_md(&segs, false).replace('\n', " ").trim()));
                         prev_open_para = false;
                         continue;
@@ -1229,12 +1254,33 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> Result<Loaded, ReadError> {
         let items = build_items(lines, images);
         let mut items = reading_order(items);
         items.retain(|it| !is_page_furniture(it, page_h));
-        page_out.push(PageOut { items });
+        page_out.push(PageOut { items, height: page_h });
     }
 
     // Brödtextens storlek: den storlek som flest tecken har.
     let body = size_hist.iter().max_by_key(|(_, n)| **n).map(|(b, _)| *b as f32 / 2.0).unwrap_or(11.0);
-    let markdown = to_markdown(&page_out, body);
+    let mut headings = Vec::new();
+    let markdown = to_markdown(&page_out, body, &mut headings);
+    // PDF:ens egna bokmärken går före rubrikerna Kladd hittat.
+    let outline = match doc.get_toc() {
+        Ok(toc) if !toc.toc.is_empty() => toc
+            .toc
+            .iter()
+            .map(|t| {
+                let title = t.title.trim().to_owned();
+                let page = t.page.saturating_sub(1).min(page_out.len().saturating_sub(1));
+                // Bokmärken saknar läge här: ta det från rubriken med samma text på sidan.
+                let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                let y = headings
+                    .iter()
+                    .find(|h| h.page == page && norm(&h.title) == norm(&title))
+                    .map_or(0.0, |h| h.y);
+                OutlineEntry { level: t.level.max(1), title, page, y }
+            })
+            .filter(|e| !e.title.is_empty())
+            .collect(),
+        _ => headings,
+    };
 
     // En PDF som Kladd själv har skapat förlorar inget när den sparas om.
     let producer = doc
@@ -1263,7 +1309,7 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> Result<Loaded, ReadError> {
     if undecodable {
         dropped.push("text i typsnitt som inte kan avkodas");
     }
-    Ok(Loaded { markdown, images: found_images, dropped, pages_without_text, page_count: page_out.len() })
+    Ok(Loaded { markdown, outline, images: found_images, dropped, pages_without_text, page_count: page_out.len() })
 }
 
 #[cfg(test)]
