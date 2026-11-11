@@ -2,6 +2,7 @@
 
 mod app;
 mod doc;
+mod docx;
 mod highlight;
 mod icons;
 mod single;

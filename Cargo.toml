@@ -1,6 +1,6 @@
 [package]
 name = "kladd"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2024"
 description = "Kladd – en lugn och snygg texteditor för txt, Markdown och kod"
 authors = ["Felix"]
@@ -24,6 +24,9 @@ egui_commonmark = { version = "0.26", default-features = false, features = ["pul
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
 encoding_rs = "0.8"
+quick-xml = "0.41"
+zip = { version = "3", default-features = false, features = ["deflate"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 
 [profile.release]
@@ -41,7 +44,7 @@ depends = "$auto, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland
 recommends = "zenity, xdg-desktop-portal"
 extended-description = """\
 Kladd är en enkel och snygg texteditor för Ubuntu. Den öppnar och sparar \
-vanliga textformat som .txt, .md, .rs, .py, .json, .toml, .yaml, .html, \
+vanliga textformat som .txt, .md, Word-dokument (.docx), .rs, .py, .json, .toml, .yaml, .html, \
 .css, .js, .sh, .ini och .csv, med flikar, radnummer, syntaxfärgning, \
 sök och ersätt samt förhandsvisning av Markdown."""
 assets = [

@@ -59,6 +59,13 @@ enum DialogResult {
 }
 
 #[derive(Clone, Copy)]
+struct PendingDocx {
+    doc_id: u64,
+    then_close: bool,
+    exit: bool,
+}
+
+#[derive(Clone, Copy)]
 struct PendingClose {
     doc_id: u64,
     exit: bool,
@@ -99,6 +106,7 @@ pub struct KladdApp {
     find: Find,
     dialog: Option<Receiver<DialogResult>>,
     pending_close: Option<PendingClose>,
+    pending_docx: Option<PendingDocx>,
     allow_exit: bool,
     toast: Option<Toast>,
     cursor: (usize, usize, usize),
@@ -190,6 +198,7 @@ impl KladdApp {
             find: Find::default(),
             dialog: None,
             pending_close: None,
+            pending_docx: None,
             allow_exit: false,
             toast: None,
             cursor: (1, 1, 0),
@@ -271,6 +280,11 @@ impl KladdApp {
                 }
                 self.remember(&canonical);
                 self.focus_editor = true;
+                let doc = &self.docs[self.active];
+                if !doc.docx_dropped.is_empty() {
+                    let msg = format!("{} innehåller {} som inte visas i Kladd", doc.title(), join_sv(&doc.docx_dropped));
+                    self.notify(ctx, msg, false);
+                }
             }
             Err(e) => {
                 self.settings.recent.retain(|p| p != &canonical);
@@ -300,7 +314,8 @@ impl KladdApp {
             let mut dlg = rfd::FileDialog::new()
                 .set_title("Öppna fil")
                 .add_filter("Alla filer", &["*"])
-                .add_filter("Textfiler", TEXT_EXTENSIONS);
+                .add_filter("Text och Word", TEXT_EXTENSIONS)
+                .add_filter("Word-dokument", &["docx", "docm", "dotx"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -320,7 +335,10 @@ impl KladdApp {
         self.dialog = Some(rx);
         let ctx = ctx.clone();
         let doc_id = doc.id;
-        let name = if doc.path.is_some() {
+        let name = if doc.needs_save_as() {
+            let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
+            format!("{}.docx", stem.unwrap_or_else(|| doc.title()))
+        } else if doc.path.is_some() {
             doc.title()
         } else {
             format!("{}.txt", doc.title())
@@ -336,7 +354,8 @@ impl KladdApp {
                 .set_file_name(name)
                 .add_filter("Alla filer", &["*"])
                 .add_filter("Text", &["txt"])
-                .add_filter("Markdown", &["md"]);
+                .add_filter("Markdown", &["md"])
+                .add_filter("Word-dokument", &["docx"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -348,10 +367,16 @@ impl KladdApp {
 
     /// Sparar dokumentet. Öppnar "Spara som" om det saknar sökväg.
     fn save_doc(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
-        let Some(path) = self.docs.get(idx).and_then(|d| d.path.clone()) else {
+        let Some(doc) = self.docs.get(idx) else { return };
+        let Some(path) = doc.path.clone().filter(|_| !doc.needs_save_as()) else {
             self.request_save_as(ctx, idx, then_close, exit);
             return;
         };
+        // Att spara över ett Word-dokument med bilder m.m. kräver ett aktivt val.
+        if doc.docx && !doc.docx_dropped.is_empty() {
+            self.pending_docx = Some(PendingDocx { doc_id: doc.id, then_close, exit });
+            return;
+        }
         self.write_doc(ctx, idx, &path, then_close, exit);
     }
 
@@ -594,7 +619,7 @@ impl KladdApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() {
+        if self.pending_close.is_some() || self.pending_docx.is_some() {
             return;
         }
         let ctrl = Modifiers::CTRL;
@@ -971,6 +996,10 @@ impl KladdApp {
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        if doc.docx {
+                            ui.label(RichText::new("Word-dokument").font(font.clone()).color(p.muted))
+                                .on_hover_text("Visas som Markdown och sparas som .docx");
+                        } else {
                         let le = status_button(ui, p, doc.line_ending.label(), "Radslut när filen sparas");
                         if le.clicked() {
                             doc.line_ending = match doc.line_ending {
@@ -995,6 +1024,7 @@ impl KladdApp {
                                 }
                             }
                         });
+                        }
                         ui.add_space(10.0);
                         let words = doc.text.split_whitespace().count();
                         let words = if words == 1 { "1 ord".to_owned() } else { format!("{words} ord") };
@@ -1369,6 +1399,80 @@ impl KladdApp {
             });
     }
 
+    /// Frågar innan ett Word-dokument med bilder, kommentarer m.m. skrivs över.
+    fn docx_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(pending) = self.pending_docx else { return };
+        let Some(idx) = self.index_of(pending.doc_id) else {
+            self.pending_docx = None;
+            return;
+        };
+        let title = self.docs[idx].title();
+        let lost = join_sv(&self.docs[idx].docx_dropped);
+        let mut choice = None;
+        let modal = egui::Modal::new(Id::unique("kladd-docx-overwrite"))
+            .backdrop_color(Color32::from_black_alpha(if p.dark { 140 } else { 70 }))
+            .frame(
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.line))
+                    .corner_radius(14)
+                    .inner_margin(Margin::same(24))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(
+                    RichText::new(format!("Spara över {title}?"))
+                        .font(FontId::new(17.0, theme::semibold()))
+                        .color(p.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Kladd sparar text, rubriker, listor, tabeller, länkar, fetstil och kursiv. {} i originalet försvinner.",
+                        capitalize(&lost)
+                    ))
+                    .color(p.muted),
+                );
+                ui.add_space(22.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let over = egui::Button::new(
+                        RichText::new("Spara över").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                    )
+                    .fill(p.accent)
+                    .stroke(Stroke::NONE)
+                    .min_size(vec2(96.0, 32.0));
+                    if ui.add(over).clicked() {
+                        choice = Some(0);
+                    }
+                    if ui.add(quiet_button("Spara som ny fil…", p).min_size(vec2(0.0, 32.0))).clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                        choice = Some(2);
+                    }
+                });
+            });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(2);
+        }
+        match choice {
+            Some(0) => {
+                self.pending_docx = None;
+                if let Some(path) = self.docs[idx].path.clone() {
+                    self.write_doc(ctx, idx, &path, pending.then_close, pending.exit);
+                }
+            }
+            Some(1) => {
+                self.pending_docx = None;
+                self.request_save_as(ctx, idx, pending.then_close, pending.exit);
+            }
+            Some(_) => self.pending_docx = None,
+            None => {}
+        }
+    }
+
     fn close_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(pending) = self.pending_close else { return };
         let Some(idx) = self.index_of(pending.doc_id) else {
@@ -1505,6 +1609,23 @@ impl KladdApp {
     }
 }
 
+/// "bilder", "bilder och kommentarer", "bilder, fotnoter och kommentarer".
+fn join_sv(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [a] => (*a).to_owned(),
+        [rest @ .., last] => format!("{} och {last}", rest.join(", ")),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
 fn quiet_button(text: &str, p: &Palette) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(p.text))
         .fill(p.surface_hover)
@@ -1623,6 +1744,7 @@ impl eframe::App for KladdApp {
         self.editor(ui, &p);
         self.find_bar(&ctx, &p);
         self.close_dialog(&ctx, &p);
+        self.docx_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);

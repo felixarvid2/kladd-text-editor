@@ -23,7 +23,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 ## Funktioner
 
 - **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
-- **Öppna och spara** `.txt`, `.md` och många kodformat.
+- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`) och många kodformat.
 - **Syntaxfärgning** och radnummer.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
@@ -58,6 +58,24 @@ cargo deb                          # skapar paketet i target/debian/
 Avinstallera med `sudo apt remove kladd`.
 
 </details>
+
+## Word-dokument
+
+Kladd öppnar `.docx` och visar dokumentet som Markdown, så att formateringen syns i texten och i förhandsvisningen. När du sparar som `.docx` blir det ett riktigt Word-dokument som öppnas i Word, LibreOffice och Google Dokument. Med *Spara som* kan vilken flik som helst sparas som `.docx`.
+
+| I Word | I Kladd |
+|---|---|
+| Rubriker och titel | `#` … `######` |
+| Fetstil, kursiv, genomstruken | `**fet**`, `*kursiv*`, `~~struken~~` |
+| Punktlistor och numrerade listor | `-` och `1.` |
+| Citat | `>` |
+| Tabeller | `\| kolumn \| kolumn \|` |
+| Länkar | `[text](https://…)` |
+| Kod | `` `kod` `` och kodblock |
+
+Bilder, kommentarer, fotnoter, sidhuvuden och spårade ändringar visas inte. Kladd säger till när ett dokument innehåller sådant och frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
+
+Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
 
 ## Kortkommandon
 
