@@ -46,6 +46,10 @@ pub struct Document {
     pub encoding: TextEncoding,
     pub line_ending: LineEnding,
     pub dirty: bool,
+    /// Sant om filen är ett Word-dokument som visas som Markdown.
+    pub docx: bool,
+    /// Innehåll i ett öppnat Word-dokument som Kladd inte kan spara tillbaka.
+    pub docx_dropped: Vec<&'static str>,
     saved_hash: u64,
     saved_meta: (TextEncoding, LineEnding),
     untitled_index: usize,
@@ -53,7 +57,7 @@ pub struct Document {
 
 /// Filtyper som visas i öppna/spara-dialogerna.
 pub const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
+    "txt", "md", "markdown", "docx", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
     "yml", "html", "htm", "css", "scss", "xml", "svg", "sh", "bash", "zsh", "c", "h", "cpp",
     "hpp", "cc", "java", "kt", "go", "rb", "php", "lua", "sql", "ini", "conf", "cfg", "env",
     "csv", "tsv", "log", "tex", "rst", "org", "srt", "desktop", "service",
@@ -141,6 +145,8 @@ impl Document {
             encoding: TextEncoding::Utf8,
             line_ending: LineEnding::Lf,
             dirty: false,
+            docx: false,
+            docx_dropped: Vec::new(),
             saved_hash: hash_text(""),
             saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
             untitled_index,
@@ -149,6 +155,27 @@ impl Document {
 
     pub fn load(id: u64, path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| describe_io_error(&e, path))?;
+        let ext = ext_of(path);
+        // Word-dokument känns igen på filändelsen och på innehållet (zip-signaturen).
+        if is_word_ext(&ext) || (bytes.starts_with(b"PK\x03\x04") && ext == "doc") {
+            let loaded = crate::docx::read(&bytes)?;
+            return Ok(Self {
+                id,
+                path: Some(path.to_path_buf()),
+                saved_hash: hash_text(&loaded.markdown),
+                saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
+                text: loaded.markdown,
+                encoding: TextEncoding::Utf8,
+                line_ending: LineEnding::Lf,
+                dirty: false,
+                docx: true,
+                docx_dropped: loaded.dropped,
+                untitled_index: 0,
+            });
+        }
+        if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+            return Err("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.".into());
+        }
         let (mut text, encoding) = decode(&bytes)?;
         let crlf = text.matches("\r\n").count();
         let lf = text.matches('\n').count();
@@ -168,17 +195,32 @@ impl Document {
             encoding,
             line_ending,
             dirty: false,
+            docx: false,
+            docx_dropped: Vec::new(),
             untitled_index: 0,
         })
     }
 
     pub fn save_to(&mut self, path: &Path) -> Result<(), String> {
-        let text = match self.line_ending {
-            LineEnding::Lf => std::borrow::Cow::Borrowed(self.text.as_str()),
-            LineEnding::CrLf => std::borrow::Cow::Owned(self.text.replace('\n', "\r\n")),
+        let to_word = ext_of(path) == "docx";
+        let bytes = if to_word {
+            let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            crate::docx::write(&self.text, &title)?
+        } else {
+            if self.docx {
+                // Från Word till vanlig text: spara som UTF-8.
+                self.encoding = TextEncoding::Utf8;
+                self.line_ending = LineEnding::Lf;
+            }
+            let text = match self.line_ending {
+                LineEnding::Lf => std::borrow::Cow::Borrowed(self.text.as_str()),
+                LineEnding::CrLf => std::borrow::Cow::Owned(self.text.replace('\n', "\r\n")),
+            };
+            encode(&text, self.encoding)?
         };
-        let bytes = encode(&text, self.encoding)?;
         write_atomic(path, &bytes).map_err(|e| describe_io_error(&e, path))?;
+        self.docx = to_word;
+        self.docx_dropped.clear();
         self.path = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         self.saved_hash = hash_text(&self.text);
         self.saved_meta = (self.encoding, self.line_ending);
@@ -212,10 +254,18 @@ impl Document {
     }
 
     pub fn is_markdown(&self) -> bool {
-        matches!(self.extension().as_str(), "md" | "markdown" | "mdown" | "mkd")
+        self.docx || matches!(self.extension().as_str(), "md" | "markdown" | "mdown" | "mkd")
+    }
+
+    /// Word-filer som inte kan sparas tillbaka i samma format (makron, mallar).
+    pub fn needs_save_as(&self) -> bool {
+        self.docx && matches!(self.extension().as_str(), "docm" | "dotx" | "dotm" | "doc")
     }
 
     pub fn language(&self) -> String {
+        if self.docx {
+            return "Word".to_owned();
+        }
         let ext = self.extension();
         let name = match ext.as_str() {
             "" | "txt" | "text" => "Text",
@@ -257,6 +307,9 @@ impl Document {
 
     /// Namn som syntect kan slå upp en syntax med.
     pub fn syntax_hint(&self) -> String {
+        if self.docx {
+            return "md".into();
+        }
         match self.extension().as_str() {
             "ts" | "tsx" | "mjs" | "cjs" | "jsx" => "js".into(),
             "htm" => "html".into(),
@@ -269,6 +322,14 @@ impl Document {
     }
 }
 
+fn ext_of(path: &Path) -> String {
+    path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
+}
+
+fn is_word_ext(ext: &str) -> bool {
+    matches!(ext, "docx" | "docm" | "dotx" | "dotm")
+}
+
 /// Skriver till en temporär fil bredvid målet och byter sedan namn,
 /// så att en krasch eller full disk aldrig lämnar en halvskriven fil.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -277,7 +338,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.kladd-{}.tmp", std::process::id()));
     let result = (|| {
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            std::io::Write::write_all(&mut f, bytes)?;
+            f.sync_all()?;
+        }
         if let Ok(meta) = std::fs::metadata(&target) {
             std::fs::set_permissions(&tmp, meta.permissions())?;
         }
@@ -330,6 +395,27 @@ mod tests {
         let (back, detected) = decode(&latin).unwrap();
         assert_eq!(back, text);
         assert_eq!(detected, TextEncoding::Windows1252);
+    }
+
+    #[test]
+    fn docx_document_roundtrip() {
+        let dir = std::env::temp_dir().join("kladd-test-docx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("brev.docx");
+        let mut d = Document::new_untitled(1, 1);
+        d.text = "# Hej\n\nEn **fet** rad.\n".into();
+        d.save_to(&p).unwrap();
+        assert!(d.docx && !d.dirty);
+        let back = Document::load(2, &p).unwrap();
+        assert!(back.docx);
+        assert_eq!(back.text, "# Hej\n\nEn **fet** rad.\n");
+        assert_eq!(back.language(), "Word");
+        // Spara samma dokument som vanlig text
+        let mut back = back;
+        let txt = dir.join("brev.md");
+        back.save_to(&txt).unwrap();
+        assert!(!back.docx);
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), "# Hej\n\nEn **fet** rad.\n");
     }
 
     #[test]
