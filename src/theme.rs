@@ -145,14 +145,20 @@ pub fn mono_medium() -> FontFamily {
     FontFamily::Name(MONO_MEDIUM.into())
 }
 
+pub const PLEX_SANS: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
+pub const PLEX_SANS_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf");
+pub const PLEX_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf");
+pub const PLEX_MONO: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
+pub const PLEX_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf");
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let data = [
-        ("plex-sans", &include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf")[..]),
-        (MEDIUM, &include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf")[..]),
-        (SEMIBOLD, &include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf")[..]),
-        ("plex-mono", &include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf")[..]),
-        (MONO_MEDIUM, &include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf")[..]),
+        ("plex-sans", PLEX_SANS),
+        (MEDIUM, PLEX_SANS_MEDIUM),
+        (SEMIBOLD, PLEX_SANS_SEMIBOLD),
+        ("plex-mono", PLEX_MONO),
+        (MONO_MEDIUM, PLEX_MONO_MEDIUM),
     ];
     for (name, bytes) in data {
         fonts

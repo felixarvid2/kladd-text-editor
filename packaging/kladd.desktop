@@ -10,7 +10,7 @@ Categories=Utility;TextEditor;
 StartupWMClass=kladd
 StartupNotify=true
 Keywords=text;editor;texteditor;markdown;anteckningar;kod;code;anteckning;
-MimeType=text/plain;text/markdown;text/x-markdown;text/x-rust;text/x-python;text/x-python3;application/json;application/toml;application/x-yaml;text/x-yaml;text/html;text/css;text/javascript;application/javascript;application/x-shellscript;text/x-shellscript;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-java;text/x-go;application/xml;text/xml;text/csv;text/x-log;text/x-ini;text/x-tex;text/x-sql;text/x-lua;text/x-ruby;application/x-php;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.ms-word.document.macroEnabled.12;application/vnd.openxmlformats-officedocument.wordprocessingml.template;
+MimeType=text/plain;text/markdown;text/x-markdown;text/x-rust;text/x-python;text/x-python3;application/json;application/toml;application/x-yaml;text/x-yaml;text/html;text/css;text/javascript;application/javascript;application/x-shellscript;text/x-shellscript;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-java;text/x-go;application/xml;text/xml;text/csv;text/x-log;text/x-ini;text/x-tex;text/x-sql;text/x-lua;text/x-ruby;application/x-php;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.ms-word.document.macroEnabled.12;application/vnd.openxmlformats-officedocument.wordprocessingml.template;application/pdf;
 Actions=new-window;
 
 [Desktop Action new-window]

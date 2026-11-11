@@ -23,7 +23,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 ## Funktioner
 
 - **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
-- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`) och många kodformat.
+- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), PDF och många kodformat.
 - **Syntaxfärgning** och radnummer.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
@@ -72,10 +72,23 @@ Kladd öppnar `.docx` och visar dokumentet som Markdown, så att formateringen s
 | Tabeller | `\| kolumn \| kolumn \|` |
 | Länkar | `[text](https://…)` |
 | Kod | `` `kod` `` och kodblock |
+| Bilder (PNG, JPEG, GIF, BMP) | `![text](bild:image1.png)` |
 
-Bilder, kommentarer, fotnoter, sidhuvuden och spårade ändringar visas inte. Kladd säger till när ett dokument innehåller sådant och frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
+Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
+
+Diagram, former, textrutor, kommentarer, fotnoter, sidhuvuden och spårade ändringar visas inte. Kladd säger till när ett dokument innehåller sådant och frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
 
 Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
+
+## PDF
+
+Kladd läser texten i en PDF och visar den som Markdown: rubriker, stycken, punkt- och numrerade listor, tabeller, fetstil, kursiv och bilder. Läsordningen följer spalterna, avstavning vid radslut tas bort, sidnummer i sidhuvud och sidfot hoppas över och stycken som fortsätter på nästa sida fogas ihop. Lösenordsskyddade PDF:er öppnas efter att du skrivit lösenordet.
+
+Spara som `.pdf` för att få en A4-PDF med inbäddade typsnitt (IBM Plex), sökbar text, klickbara länkar, bokmärken från rubrikerna, bilder och sidnummer.
+
+En PDF är byggd för utskrift, inte för redigering. När du sparar en öppnad PDF skapar Kladd därför en ny PDF av texten, och originalets sidlayout och typsnitt ersätts. Kladd frågar innan originalet skrivs över. Sidor som bara består av bilder (skannade sidor) har ingen text att läsa; Kladd säger till när det gäller.
+
+Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/pdfcraft) och skrivningen på samma upplägg som [WordCraft](https://github.com/storytold/wordcraft) (båda MIT/Apache-2.0), med [lopdf](https://crates.io/crates/lopdf) och [krilla](https://crates.io/crates/krilla).
 
 ## Kortkommandon
 
@@ -87,6 +100,7 @@ Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.co
 | `Ctrl+Shift+S` | Spara som |
 | `Ctrl+W` | Stäng flik |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Nästa / föregående flik |
+| `Ctrl+Shift+I` | Infoga bild |
 | `Ctrl+F` / `Ctrl+H` | Sök / ersätt |
 | `F3` / `Shift+F3` | Nästa / föregående träff |
 | `Esc` | Stäng sökning |

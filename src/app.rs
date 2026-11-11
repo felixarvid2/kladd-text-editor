@@ -14,7 +14,15 @@ use egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{Document, LineEnding, TEXT_EXTENSIONS, TextEncoding};
+use crate::doc::{Document, LineEnding, LoadError, TEXT_EXTENSIONS, TextEncoding, join_sv};
+
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
+
+fn is_image_path(p: &Path) -> bool {
+    p.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()) || e == "webp")
+}
 use crate::highlight::{Highlighter, Params, find_all};
 use crate::icons::{self, Icon};
 use crate::single::{self, Incoming};
@@ -55,7 +63,15 @@ impl Default for Settings {
 
 enum DialogResult {
     Open(Vec<PathBuf>),
+    InsertImage { doc_id: u64, path: Option<PathBuf> },
     SaveAs { doc_id: u64, path: Option<PathBuf>, then_close: bool, exit: bool },
+}
+
+struct PendingPassword {
+    path: PathBuf,
+    input: String,
+    wrong: bool,
+    focus: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +123,7 @@ pub struct KladdApp {
     dialog: Option<Receiver<DialogResult>>,
     pending_close: Option<PendingClose>,
     pending_docx: Option<PendingDocx>,
+    pending_password: Option<PendingPassword>,
     allow_exit: bool,
     toast: Option<Toast>,
     cursor: (usize, usize, usize),
@@ -116,6 +133,7 @@ pub struct KladdApp {
     last_title: String,
     last_active_id: Option<u64>,
     incoming: Option<Receiver<Incoming>>,
+    preview_images: std::collections::HashSet<String>,
     owns_socket: bool,
 }
 
@@ -179,6 +197,7 @@ impl KladdApp {
         let ctx = &cc.egui_ctx;
         theme::install_fonts(ctx);
         theme::install_styles(ctx);
+        egui_extras::install_image_loaders(ctx);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
         let settings: Settings = cc
@@ -199,6 +218,7 @@ impl KladdApp {
             dialog: None,
             pending_close: None,
             pending_docx: None,
+            pending_password: None,
             allow_exit: false,
             toast: None,
             cursor: (1, 1, 0),
@@ -208,6 +228,7 @@ impl KladdApp {
             last_title: String::new(),
             last_active_id: None,
             incoming: None,
+            preview_images: std::collections::HashSet::new(),
             owns_socket: false,
         };
         if single_instance {
@@ -262,7 +283,25 @@ impl KladdApp {
             self.focus_editor = true;
             return;
         }
-        match Document::load(self.next_id, &canonical) {
+        self.load_into_tab(ctx, &canonical, None);
+    }
+
+    fn load_into_tab(&mut self, ctx: &egui::Context, canonical: &Path, password: Option<&str>) {
+        let canonical = canonical.to_path_buf();
+        let loaded = Document::load_with_password(self.next_id, &canonical, password);
+        let loaded = match loaded {
+            Err(LoadError::NeedsPassword) => {
+                self.pending_password = Some(PendingPassword { path: canonical, input: String::new(), wrong: false, focus: true });
+                return;
+            }
+            Err(LoadError::WrongPassword) => {
+                self.pending_password = Some(PendingPassword { path: canonical, input: String::new(), wrong: true, focus: true });
+                return;
+            }
+            Err(LoadError::Message(m)) => Err(m),
+            Ok(d) => Ok(d),
+        };
+        match loaded {
             Ok(doc) => {
                 self.next_id += 1;
                 // Ersätt en tom, orörd namnlös flik i stället för att lägga till en ny.
@@ -280,10 +319,8 @@ impl KladdApp {
                 }
                 self.remember(&canonical);
                 self.focus_editor = true;
-                let doc = &self.docs[self.active];
-                if !doc.docx_dropped.is_empty() {
-                    let msg = format!("{} innehåller {} som inte visas i Kladd", doc.title(), join_sv(&doc.docx_dropped));
-                    self.notify(ctx, msg, false);
+                if let Some(note) = self.docs[self.active].open_note.take() {
+                    self.notify(ctx, note, false);
                 }
             }
             Err(e) => {
@@ -315,7 +352,8 @@ impl KladdApp {
                 .set_title("Öppna fil")
                 .add_filter("Alla filer", &["*"])
                 .add_filter("Text och Word", TEXT_EXTENSIONS)
-                .add_filter("Word-dokument", &["docx", "docm", "dotx"]);
+                .add_filter("Word-dokument", &["docx", "docm", "dotx"])
+                .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -355,7 +393,8 @@ impl KladdApp {
                 .add_filter("Alla filer", &["*"])
                 .add_filter("Text", &["txt"])
                 .add_filter("Markdown", &["md"])
-                .add_filter("Word-dokument", &["docx"]);
+                .add_filter("Word-dokument", &["docx"])
+                .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -363,6 +402,65 @@ impl KladdApp {
             let _ = tx.send(DialogResult::SaveAs { doc_id, path, then_close, exit });
             ctx.request_repaint();
         });
+    }
+
+    fn request_insert_image(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() || self.docs.is_empty() {
+            return;
+        }
+        let doc_id = self.docs[self.active].id;
+        let (tx, rx) = channel();
+        self.dialog = Some(rx);
+        let ctx = ctx.clone();
+        let dir = self.start_dir();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title("Infoga bild")
+                .add_filter("Bilder", IMAGE_EXTENSIONS);
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let path = dlg.pick_file();
+            let _ = tx.send(DialogResult::InsertImage { doc_id, path });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Lägger in `![namn](sökväg)` vid markören i den aktiva fliken.
+    fn insert_image(&mut self, ctx: &egui::Context, path: &Path) {
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        if std::fs::read(path).ok().and_then(|b| crate::docx::image_ext(&b)).is_none() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.notify(ctx, format!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF eller BMP)."), true);
+            return;
+        }
+        // Relativ sökväg om bilden ligger i dokumentets mapp, annars absolut.
+        let src = match doc.base_dir().and_then(|b| path.strip_prefix(&b).ok().map(Path::to_path_buf)) {
+            Some(rel) => rel,
+            None => path.to_path_buf(),
+        };
+        let src = src.to_string_lossy().replace(' ', "%20");
+        let alt = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = editor_id(doc.id);
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        let ci = state.cursor.char_range().map_or(doc.text.chars().count(), |r| r.primary.index.0);
+        let at = char_to_byte(&doc.text, ci);
+        let before = &doc.text[..at];
+        let lead = if before.is_empty() || before.ends_with("\n\n") {
+            ""
+        } else if before.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let snippet = format!("{lead}![{}]({src})\n", alt.replace(['[', ']'], ""));
+        doc.text.insert_str(at, &snippet);
+        doc.on_edited();
+        let after = byte_to_char(&doc.text, at + snippet.len());
+        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(after))));
+        state.store(ctx, id);
+        self.focus_editor = true;
+        self.scroll_to_char = Some(after);
     }
 
     /// Sparar dokumentet. Öppnar "Spara som" om det saknar sökväg.
@@ -373,7 +471,7 @@ impl KladdApp {
             return;
         };
         // Att spara över ett Word-dokument med bilder m.m. kräver ett aktivt val.
-        if doc.docx && !doc.docx_dropped.is_empty() {
+        if (doc.docx || doc.pdf) && !doc.docx_dropped.is_empty() {
             self.pending_docx = Some(PendingDocx { doc_id: doc.id, then_close, exit });
             return;
         }
@@ -391,13 +489,19 @@ impl KladdApp {
         let doc = &mut self.docs[idx];
         let was_md = doc.is_markdown();
         match doc.save_to(path) {
-            Ok(()) => {
+            Ok(warnings) => {
                 let title = doc.title();
                 if was_md != doc.is_markdown() || doc.extension().is_empty() {
                     self.hl.forget(doc.id);
                 }
                 self.remember(path);
-                self.notify(ctx, format!("Sparade {title}"), false);
+                if warnings.is_empty() {
+                    self.notify(ctx, format!("Sparade {title}"), false);
+                } else {
+                    let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
+                    let what = if list.len() == 1 { "bilden" } else { "bilderna" };
+                    self.notify(ctx, format!("Sparade {title}, men hittade inte {what} {}", join_sv(&list)), true);
+                }
                 if then_close {
                     self.close_tab_now(idx);
                 }
@@ -574,6 +678,12 @@ impl KladdApp {
                     self.open_path(ctx, &f);
                 }
             }
+            DialogResult::InsertImage { doc_id, path } => {
+                if let (Some(path), Some(idx)) = (path, self.index_of(doc_id)) {
+                    self.active = idx;
+                    self.insert_image(ctx, &path);
+                }
+            }
             DialogResult::SaveAs { doc_id, path, then_close, exit } => {
                 if let (Some(path), Some(idx)) = (path, self.index_of(doc_id)) {
                     let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -612,14 +722,19 @@ impl KladdApp {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
             let p = f.path().to_path_buf();
-            if !p.as_os_str().is_empty() {
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            if is_image_path(&p) && !self.docs.is_empty() {
+                self.insert_image(ctx, &p);
+            } else {
                 self.open_path(ctx, &p);
             }
         }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.pending_docx.is_some() {
+        if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() {
             return;
         }
         let ctrl = Modifiers::CTRL;
@@ -652,6 +767,9 @@ impl KladdApp {
         } else if (hit(ctrl, Key::Tab) || hit(ctrl, Key::PageDown)) && !self.docs.is_empty() {
             self.active = (self.active + 1) % self.docs.len();
             self.focus_editor = true;
+        }
+        if hit(ctrl_shift, Key::I) && !self.docs.is_empty() {
+            self.request_insert_image(ctx);
         }
         if hit(ctrl, Key::F) {
             self.open_find(ctx, false);
@@ -928,6 +1046,9 @@ impl KladdApp {
             self.request_close_tab(self.active);
         }
         menu_divider(ui, p);
+        if menu_item(ui, p, "Infoga bild…", "Ctrl+Shift+I", None, has_doc) {
+            self.request_insert_image(ctx);
+        }
         if menu_item(ui, p, "Sök", "Ctrl+F", None, has_doc) {
             self.open_find(ctx, false);
         }
@@ -996,9 +1117,13 @@ impl KladdApp {
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        if doc.docx {
-                            ui.label(RichText::new("Word-dokument").font(font.clone()).color(p.muted))
-                                .on_hover_text("Visas som Markdown och sparas som .docx");
+                        if doc.docx || doc.pdf {
+                            let (label, tip) = if doc.pdf {
+                                ("PDF-dokument", "Texten visas som Markdown och sparas som en ny PDF")
+                            } else {
+                                ("Word-dokument", "Visas som Markdown och sparas som .docx")
+                            };
+                            ui.label(RichText::new(label).font(font.clone()).color(p.muted)).on_hover_text(tip);
                         } else {
                         let le = status_button(ui, p, doc.line_ending.label(), "Radslut när filen sparas");
                         if le.clicked() {
@@ -1066,7 +1191,30 @@ impl KladdApp {
                         st.spacing.item_spacing.y = 8.0;
                         st.visuals.override_text_color = Some(p.text);
                         ui.set_max_width(680.0f32.min(ui.available_width()));
-                        CommonMarkViewer::new().show(ui, &mut self.md_cache, &doc.text);
+                        // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
+                        let mut text = std::borrow::Cow::Borrowed(doc.text.as_str());
+                        for (name, img) in &doc.images {
+                            let enc = name.replace(' ', "%20");
+                            let uri = format!("bytes://kladd/{}/{enc}", doc.id);
+                            if self.preview_images.insert(uri.clone()) {
+                                ui.ctx().include_bytes(uri.clone(), img.bytes.clone());
+                            }
+                            let from = format!("]({}{enc})", crate::docx::IMAGE_SCHEME);
+                            if text.contains(&from) {
+                                text = std::borrow::Cow::Owned(text.replace(&from, &format!("]({uri})")));
+                            }
+                        }
+                        if let Some(home) = home_dir() {
+                            if text.contains("](~/") {
+                                text = std::borrow::Cow::Owned(text.replace("](~/", &format!("](file://{}/", home.display())));
+                            }
+                        }
+                        let base = doc.base_dir().or_else(home_dir).unwrap_or_default();
+                        let max_w = ui.available_width() as usize;
+                        CommonMarkViewer::new()
+                            .default_implicit_uri_scheme(format!("file://{}/", base.display()))
+                            .max_image_width(Some(max_w))
+                            .show(ui, &mut self.md_cache, &text);
                         ui.add_space(40.0);
                     });
             });
@@ -1428,10 +1576,11 @@ impl KladdApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new(format!(
-                        "Kladd sparar text, rubriker, listor, tabeller, länkar, fetstil och kursiv. {} i originalet försvinner.",
-                        capitalize(&lost)
-                    ))
+                    RichText::new(if self.docs[idx].pdf {
+                        format!("Kladd skapar en ny PDF av texten, med rubriker, listor, tabeller, länkar och bilder. {} i originalet ersätts.", capitalize(&lost))
+                    } else {
+                        format!("Kladd sparar text, rubriker, listor, tabeller, länkar, fetstil och kursiv. {} i originalet försvinner.", capitalize(&lost))
+                    })
                     .color(p.muted),
                 );
                 ui.add_space(22.0);
@@ -1469,6 +1618,77 @@ impl KladdApp {
                 self.request_save_as(ctx, idx, pending.then_close, pending.exit);
             }
             Some(_) => self.pending_docx = None,
+            None => {}
+        }
+    }
+
+    /// Frågar efter lösenord till en skyddad PDF.
+    fn password_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(pending) = self.pending_password.as_mut() else { return };
+        let name = pending.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut choice = None;
+        let modal = egui::Modal::new(Id::unique("kladd-pdf-password"))
+            .backdrop_color(Color32::from_black_alpha(if p.dark { 140 } else { 70 }))
+            .frame(
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.line))
+                    .corner_radius(14)
+                    .inner_margin(Margin::same(24))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(
+                    RichText::new(format!("{name} är lösenordsskyddad"))
+                        .font(FontId::new(17.0, theme::semibold()))
+                        .color(p.text),
+                );
+                ui.add_space(6.0);
+                let hint = if pending.wrong { "Lösenordet stämde inte. Försök igen." } else { "Skriv lösenordet för att öppna dokumentet." };
+                ui.label(RichText::new(hint).color(if pending.wrong { p.error } else { p.muted }));
+                ui.add_space(14.0);
+                let field = ui.add(
+                    TextEdit::singleline(&mut pending.input)
+                        .password(true)
+                        .hint_text("Lösenord")
+                        .desired_width(f32::INFINITY)
+                        .margin(Margin::symmetric(10, 7)),
+                );
+                if pending.focus {
+                    field.request_focus();
+                    pending.focus = false;
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    choice = Some(0);
+                }
+                ui.add_space(20.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let open = egui::Button::new(
+                        RichText::new("Öppna").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                    )
+                    .fill(p.accent)
+                    .stroke(Stroke::NONE)
+                    .min_size(vec2(84.0, 32.0));
+                    if ui.add(open).clicked() {
+                        choice = Some(0);
+                    }
+                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                        choice = Some(1);
+                    }
+                });
+            });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(1);
+        }
+        match choice {
+            Some(0) => {
+                if let Some(pending) = self.pending_password.take() {
+                    self.load_into_tab(ctx, &pending.path, Some(&pending.input));
+                }
+            }
+            Some(_) => self.pending_password = None,
             None => {}
         }
     }
@@ -1609,15 +1829,6 @@ impl KladdApp {
     }
 }
 
-/// "bilder", "bilder och kommentarer", "bilder, fotnoter och kommentarer".
-fn join_sv(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [a] => (*a).to_owned(),
-        [rest @ .., last] => format!("{} och {last}", rest.join(", ")),
-    }
-}
-
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -1745,6 +1956,7 @@ impl eframe::App for KladdApp {
         self.find_bar(&ctx, &p);
         self.close_dialog(&ctx, &p);
         self.docx_dialog(&ctx, &p);
+        self.password_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);
