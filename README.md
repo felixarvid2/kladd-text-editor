@@ -24,6 +24,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 
 - **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
 - **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), PDF och många kodformat.
+- **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller via PDF.
 - **Syntaxfärgning** och radnummer.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
@@ -128,6 +129,7 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+O` | Öppna fil |
 | `Ctrl+S` | Spara |
 | `Ctrl+Shift+S` | Spara som |
+| `Ctrl+P` | Skriv ut |
 | `Ctrl+W` | Stäng flik |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Nästa / föregående flik |
 | `Ctrl+Shift+I` | Infoga bild |

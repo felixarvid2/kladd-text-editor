@@ -149,6 +149,7 @@ pub struct KladdApp {
     pub(crate) doc_fonts: crate::word::fonts::DocFonts,
     pub(crate) speller: Option<crate::spell::Speller>,
     pub(crate) wv: crate::word::view::State,
+    pub(crate) print: crate::print::PrintState,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -248,6 +249,7 @@ impl KladdApp {
             doc_fonts: crate::word::fonts::DocFonts::new(),
             speller: None,
             wv: Default::default(),
+            print: Default::default(),
         };
         if single_instance {
             let (tx, rx) = channel();
@@ -754,7 +756,7 @@ impl KladdApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() {
+        if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() {
             return;
         }
         let ctrl = Modifiers::CTRL;
@@ -765,6 +767,9 @@ impl KladdApp {
 
         if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
             self.new_tab();
+        }
+        if hit(ctrl, Key::P) {
+            self.open_print(ctx);
         }
         if hit(ctrl, Key::O) {
             self.request_open(ctx);
@@ -1065,6 +1070,9 @@ impl KladdApp {
         }
         if menu_item(ui, p, "Spara som…", "Ctrl+Shift+S", None, has_doc) {
             self.request_save_as(ctx, self.active, false, false);
+        }
+        if menu_item(ui, p, "Skriv ut…", "Ctrl+P", None, has_doc) {
+            self.open_print(ctx);
         }
         if menu_item(ui, p, "Stäng flik", "Ctrl+W", None, has_doc) {
             self.request_close_tab(self.active);
@@ -1998,6 +2006,7 @@ impl eframe::App for KladdApp {
         self.close_dialog(&ctx, &p);
         self.docx_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
+        self.print_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);

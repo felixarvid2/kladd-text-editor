@@ -6,6 +6,7 @@ mod docx;
 mod pdf_read;
 mod pdf_write;
 mod preview;
+mod print;
 mod highlight;
 mod icons;
 mod single;

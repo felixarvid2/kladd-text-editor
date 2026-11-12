@@ -1,0 +1,361 @@
+//! Utskrift: dialogruta (Ctrl+P) och hjälpfunktioner för CUPS (`lpstat`/`lp`).
+//! Dokumentet renderas till en tillfällig PDF med `pdf_write` som skickas till `lp`.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, SystemTime};
+
+use egui::{Align, Color32, FontId, Frame, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, vec2};
+
+use crate::app::{KladdApp, quiet_button};
+use crate::doc::{Document, resolve_image};
+use crate::theme::{self, Palette};
+
+/// Tillfälliga PDF-filer som är äldre än så här tas bort.
+const MAX_AGE: Duration = Duration::from_secs(600);
+
+type Printers = (Vec<String>, Option<String>);
+
+/// Dialogens tillstånd.
+struct PrintDialog {
+    /// `None` medan skrivarna söks.
+    printers: Option<Printers>,
+    lookup: Option<Receiver<Printers>>,
+    printer: String,
+    copies: u32,
+    all_pages: bool,
+    range: String,
+    duplex: bool,
+}
+
+/// Fältet i `KladdApp`.
+#[derive(Default)]
+pub struct PrintState {
+    dialog: Option<PrintDialog>,
+    /// Svar från `lp`-tråden: Ok(skrivare) eller felmeddelande.
+    result: Option<Receiver<Result<String, String>>>,
+}
+
+impl PrintState {
+    pub fn is_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+}
+
+impl PrintDialog {
+    fn new(ctx: &egui::Context) -> Self {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(find_printers());
+            ctx.request_repaint();
+        });
+        Self {
+            printers: None,
+            lookup: Some(rx),
+            printer: String::new(),
+            copies: 1,
+            all_pages: true,
+            range: String::new(),
+            duplex: false,
+        }
+    }
+}
+
+// ------------------------------------------------------------ rena hjälpfunktioner
+
+/// Skrivarnamn ur `lpstat -e` (ett per rad).
+pub fn parse_printers(out: &str) -> Vec<String> {
+    out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// Standardskrivaren ur `lpstat -d` ("system default destination: NAME").
+pub fn parse_default(out: &str) -> Option<String> {
+    let rest = out.lines().find_map(|l| l.split_once("default destination:"))?.1.trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Sidintervall som "1-3,5": bara siffror, kommatecken och bindestreck, med giltiga delar.
+pub fn valid_range(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let num = |x: &str| x.trim().parse::<u32>().ok().filter(|n| *n > 0 && x.trim().bytes().all(|c| c.is_ascii_digit()));
+    s.split(',').all(|part| match part.split_once('-') {
+        None => num(part).is_some(),
+        Some((a, b)) => matches!((num(a), num(b)), (Some(a), Some(b)) if a <= b),
+    })
+}
+
+/// Argumentlistan till `lp`.
+pub fn lp_args(printer: &str, copies: u32, range: Option<&str>, duplex: bool, title: &str, file: &Path) -> Vec<String> {
+    let mut a = vec!["-d".to_string(), printer.to_string(), "-n".into(), copies.clamp(1, 99).to_string()];
+    if let Some(r) = range {
+        a.push("-P".into());
+        a.push(r.split_whitespace().collect());
+    }
+    if duplex {
+        a.push("-o".into());
+        a.push("sides=two-sided-long-edge".into());
+    }
+    a.push("-t".into());
+    a.push(title.to_string());
+    a.push(file.to_string_lossy().into_owned());
+    a
+}
+
+/// Lägger text i ett kodblock (staket längre än alla backtick-följder i texten) så att den skrivs ut ordagrant.
+pub fn fence_code(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{}\n{fence}\n", text.trim_end_matches('\n'))
+}
+
+/// Markdown att rendera för dokumentet: Word/PDF/Markdown som det är, övrig text som kodblock.
+fn printable_text(doc: &Document) -> String {
+    if doc.is_markdown() { doc.text.clone() } else { fence_code(&doc.text) }
+}
+
+// ------------------------------------------------------------ system
+
+fn run_out(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn find_printers() -> Printers {
+    let list = run_out("lpstat", &["-e"]).map(|o| parse_printers(&o)).unwrap_or_default();
+    let default = run_out("lpstat", &["-d"]).and_then(|o| parse_default(&o));
+    (list, default)
+}
+
+fn temp_dir() -> PathBuf {
+    std::env::temp_dir().join("kladd-print")
+}
+
+/// Skriver dokumentet till en tillfällig PDF och rensar gamla.
+fn render_pdf(doc: &Document) -> Result<PathBuf, String> {
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let age = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok());
+            if age.is_some_and(|d| d > MAX_AGE) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let title = doc.title();
+    let base = doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
+    let images = &doc.images;
+    let written = crate::pdf_write::write(&printable_text(doc), &title, &|src| resolve_image(src, &base, images))?;
+    let stem: String = title.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let path = dir.join(format!("{stem}-{stamp}.pdf"));
+    std::fs::write(&path, written.bytes).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+// ------------------------------------------------------------ dialog
+
+enum Action {
+    Print,
+    OpenPdf,
+    Cancel,
+}
+
+impl KladdApp {
+    /// Öppnar utskriftsdialogen för aktiv flik.
+    pub(crate) fn open_print(&mut self, ctx: &egui::Context) {
+        if self.docs.is_empty() || self.print.dialog.is_some() {
+            return;
+        }
+        self.print.dialog = Some(PrintDialog::new(ctx));
+    }
+
+    pub(crate) fn print_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        if let Some(rx) = &self.print.result
+            && let Ok(res) = rx.try_recv()
+        {
+            self.print.result = None;
+            match res {
+                Ok(name) => self.notify(ctx, format!("Skickat till {name}"), false),
+                Err(e) => self.notify(ctx, e, true),
+            }
+        }
+        let Some(d) = self.print.dialog.as_mut() else { return };
+        if let Some(rx) = &d.lookup
+            && let Ok(found) = rx.try_recv()
+        {
+            d.printer = found.1.clone().filter(|n| found.0.contains(n)).or_else(|| found.0.first().cloned()).unwrap_or_default();
+            d.printers = Some(found);
+            d.lookup = None;
+        }
+        let have_printer = d.printers.as_ref().is_some_and(|(l, _)| !l.is_empty());
+        let range_ok = d.all_pages || valid_range(&d.range);
+        let mut action = None;
+        let modal = egui::Modal::new(Id::unique("kladd-print"))
+            .backdrop_color(Color32::from_black_alpha(if p.dark { 140 } else { 70 }))
+            .frame(
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.line))
+                    .corner_radius(14)
+                    .inner_margin(Margin::same(24))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new("Skriv ut").font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.add_space(14.0);
+                egui::Grid::new("kladd-print-grid").num_columns(2).spacing(vec2(14.0, 10.0)).show(ui, |ui| {
+                    ui.label(RichText::new("Skrivare").color(p.muted));
+                    match &d.printers {
+                        None => {
+                            ui.label(RichText::new("Söker skrivare…").color(p.muted));
+                        }
+                        Some((list, _)) if list.is_empty() => {
+                            ui.label(RichText::new("Ingen skrivare hittades").color(p.error));
+                        }
+                        Some((list, _)) => {
+                            egui::ComboBox::from_id_salt("kladd-print-printer")
+                                .selected_text(d.printer.clone())
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    for name in list {
+                                        ui.selectable_value(&mut d.printer, name.clone(), name);
+                                    }
+                                });
+                        }
+                    }
+                    ui.end_row();
+                    ui.label(RichText::new("Kopior").color(p.muted));
+                    ui.add(egui::DragValue::new(&mut d.copies).range(1..=99).speed(0.2));
+                    ui.end_row();
+                    ui.label(RichText::new("Sidor").color(p.muted));
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut d.all_pages, true, "Alla");
+                        ui.radio_value(&mut d.all_pages, false, "Sidor:");
+                        ui.add_enabled(
+                            !d.all_pages,
+                            TextEdit::singleline(&mut d.range).hint_text("1-3,5").desired_width(110.0).margin(Margin::symmetric(8, 5)),
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut d.duplex, "Dubbelsidigt");
+                    ui.end_row();
+                });
+                if !range_ok && !d.range.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Ogiltigt sidintervall. Använd t.ex. 1-3,5.").color(p.error));
+                }
+                ui.add_space(20.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let print = egui::Button::new(
+                        RichText::new("Skriv ut").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                    )
+                    .fill(p.accent)
+                    .stroke(Stroke::NONE)
+                    .min_size(vec2(84.0, 32.0));
+                    let can = have_printer && range_ok;
+                    if ui.add_enabled(can, print).clicked() || (can && ui.input(|i| i.key_pressed(Key::Enter))) {
+                        action = Some(Action::Print);
+                    }
+                    if ui.add(quiet_button("Öppna som PDF", p).min_size(vec2(0.0, 32.0))).clicked() {
+                        action = Some(Action::OpenPdf);
+                    }
+                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                        action = Some(Action::Cancel);
+                    }
+                });
+            });
+        if modal.should_close() && action.is_none() {
+            action = Some(Action::Cancel);
+        }
+        let Some(action) = action else { return };
+        let Some(d) = self.print.dialog.take() else { return };
+        if matches!(action, Action::Cancel) {
+            return;
+        }
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let title = doc.title();
+        let pdf = match render_pdf(doc) {
+            Ok(f) => f,
+            Err(e) => return self.notify(ctx, format!("Kunde inte skapa PDF: {e}"), true),
+        };
+        if matches!(action, Action::OpenPdf) {
+            if let Err(e) = Command::new("xdg-open").arg(&pdf).spawn() {
+                self.notify(ctx, format!("Kunde inte öppna PDF: {e}"), true);
+            }
+            return;
+        }
+        let range = (!d.all_pages).then(|| d.range.clone());
+        let args = lp_args(&d.printer, d.copies, range.as_deref(), d.duplex, &title, &pdf);
+        let printer = d.printer.clone();
+        let (tx, rx) = channel();
+        self.print.result = Some(rx);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let res = match Command::new("lp").args(&args).output() {
+                Ok(o) if o.status.success() => Ok(printer),
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    Err(if err.is_empty() { "Utskriften misslyckades".to_string() } else { err })
+                }
+                Err(e) => Err(format!("Kunde inte köra lp: {e}")),
+            };
+            let _ = tx.send(res);
+            repaint.request_repaint();
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lpstat() {
+        assert_eq!(parse_printers("HP_1\n\n Kontor \n"), vec!["HP_1", "Kontor"]);
+        assert!(parse_printers("").is_empty());
+        assert_eq!(parse_default("system default destination: HP_1\n").as_deref(), Some("HP_1"));
+        assert_eq!(parse_default("no system default destination\n"), None);
+    }
+
+    #[test]
+    fn validates_ranges() {
+        for ok in ["1", "1-3,5", "2-2", " 1 , 4-6 "] {
+            assert!(valid_range(ok), "{ok}");
+        }
+        for bad in ["", "a", "1-", "-3", "3-1", "1,,2", "0", "1-2-3", "1;2", "1,"] {
+            assert!(!valid_range(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn builds_lp_args() {
+        let a = lp_args("HP", 2, Some("1-3, 5"), true, "Brev", Path::new("/t/a.pdf"));
+        assert_eq!(a, ["-d", "HP", "-n", "2", "-P", "1-3,5", "-o", "sides=two-sided-long-edge", "-t", "Brev", "/t/a.pdf"]);
+        let b = lp_args("HP", 1, None, false, "X", Path::new("f"));
+        assert_eq!(b, ["-d", "HP", "-n", "1", "-t", "X", "f"]);
+    }
+
+    #[test]
+    fn fences_longer_than_backticks() {
+        assert_eq!(fence_code("a\n"), "```\na\n```\n");
+        assert!(fence_code("x ```` y").starts_with("`````\n"));
+    }
+}
