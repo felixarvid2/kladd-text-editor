@@ -404,7 +404,7 @@ impl Styles {
     /// Dokumentets grundformat: typsnitt och storlek hos Normal (docDefaults + Normal).
     fn base(&self) -> DocDefaults {
         let p = self.para_props(None);
-        DocDefaults { font_family: p.font, font_size: p.size }
+        DocDefaults { font_family: p.font, font_size: p.size, ..Default::default() }
     }
 }
 

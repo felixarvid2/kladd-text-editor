@@ -210,3 +210,23 @@ GitHub. Allt tolkas och skrivs med `src/style.rs`:
 Dokumentläget lägger ut varje stycke för sig (egen radbredd, justering och hängande indrag)
 och fogar ihop styckena med `Galley::concat`. Marginaljustering fördelar utrymmet på
 mellanrummen i alla rader utom styckets sista.
+
+## 1.6: förlustfri Word, sidor, inklistring, tabeller, bilder, utskrift, ODT
+
+Gemensamma format (alla moduler ska använda dessa):
+
+- **Sida, sidhuvud och sidfot** står i grundformatskommentaren (`style::DocDefaults`):
+  `<!-- kladd: page-size: A4; page-margin: 25mm 20mm; header: "Rapport"; header-align: right;
+  footer: "Sida {sida} av {sidor}"; footer-align: center -->`. Standard är A4 med en tums
+  marginaler och inget sidhuvud eller sidfot. `style::fill_fields` fyller i `{sida}`/`{sidor}`.
+- **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
+  CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
+  skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
+- **Okända Word-objekt** (fotnotsreferenser, kommentarsankare, bokmärken, fält, textrutor,
+  former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
+  `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda
+  (noll bredd); i Markdown-förhandsvisningen tas de bort.
+- **Förlustfri .docx**: originalpaketet sparas i `Document`. Vid sparning kopieras alla delar
+  som Kladd inte skriver om (sidhuvuden, sidfötter, fotnoter, kommentarer, inställningar, tema,
+  typsnittstabell …), `w:sectPr` behålls, och varje stycke vars Markdown inte har ändrats skrivs
+  tillbaka med sin ursprungliga XML.
