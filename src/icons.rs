@@ -364,7 +364,7 @@ pub fn button(
     base: Color32,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
-    let response = response.on_hover_text(tooltip);
+    let response = response.on_hover_text(crate::keys::shortcut(tooltip));
     let hovered = response.hovered();
     let bg = if hovered { p.surface_hover } else { Color32::TRANSPARENT };
     if ui.is_rect_visible(rect) {
@@ -393,7 +393,7 @@ pub fn button(
 /// Fönsterknapp i titelraden. Stäng-knappen blir röd när man hovrar.
 pub fn window_button(ui: &mut Ui, p: &Palette, icon: Icon, tooltip: &str, danger: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(36.0, 30.0), Sense::click());
-    let response = response.on_hover_text(tooltip);
+    let response = response.on_hover_text(crate::keys::shortcut(tooltip));
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let pressed = response.is_pointer_button_down_on();
@@ -424,7 +424,7 @@ pub enum GlyphStyle {
 /// Gemensam ritning för formateringsradens växlingsknappar (28x28).
 fn toggle_frame(ui: &mut Ui, p: &Palette, active: bool, tooltip: &str) -> (Rect, Response, Color32) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-    let response = response.on_hover_text(tooltip);
+    let response = response.on_hover_text(crate::keys::shortcut(tooltip));
     let hovered = response.hovered();
     if ui.is_rect_visible(rect) {
         let fill = if active {
@@ -537,8 +537,8 @@ pub fn color_button(
     let (r1, main_resp) = ui.allocate_exact_size(main, Sense::click());
     let (r2, arrow_resp) = ui.allocate_exact_size(arrow, Sense::click());
     ui.spacing_mut().item_spacing.x = space;
-    let main_resp = main_resp.on_hover_text(tooltip);
-    let arrow_resp = arrow_resp.on_hover_text(arrow_tooltip);
+    let main_resp = main_resp.on_hover_text(crate::keys::shortcut(tooltip));
+    let arrow_resp = arrow_resp.on_hover_text(crate::keys::shortcut(arrow_tooltip));
     if ui.is_rect_visible(r1) {
         for (r, resp, round) in [
             (r1, &main_resp, CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }),

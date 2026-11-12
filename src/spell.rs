@@ -41,35 +41,105 @@ fn lang_name(code: &str) -> String {
         .unwrap_or_else(|| code.to_string())
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Os {
+    Linux,
+    Mac,
+    Windows,
 }
 
-fn env_dir(var: &str) -> Option<PathBuf> {
+const OS: Os = if cfg!(target_os = "macos") {
+    Os::Mac
+} else if cfg!(windows) {
+    Os::Windows
+} else {
+    Os::Linux
+};
+
+/// Slår upp en miljövariabel som sökväg (tom variabel räknas som osatt).
+type Env<'a> = &'a dyn Fn(&str) -> Option<PathBuf>;
+
+fn real_env(var: &str) -> Option<PathBuf> {
     std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-/// Mappar där ordlistor letas, i prioritetsordning.
-fn default_dirs() -> Vec<PathBuf> {
+fn home(env: Env) -> Option<PathBuf> {
+    env("HOME").or_else(|| env("USERPROFILE")).or_else(crate::platform::home_dir)
+}
+
+/// Mappen dit hämtade ordlistor sparas (Kladds datamapp, se `platform::data_dir`).
+fn install_dir() -> PathBuf {
+    crate::platform::data_dir().join("ordlistor")
+}
+
+/// Mappar som innehåller LibreOffice-tillägg (`dict-*`) med ordlistor.
+fn libreoffice_ext_parents(os: Os, env: Env) -> Vec<PathBuf> {
+    match os {
+        Os::Linux => Vec::new(),
+        Os::Mac => vec![PathBuf::from("/Applications/LibreOffice.app/Contents/Resources/extensions")],
+        Os::Windows => {
+            let mut v = Vec::new();
+            for (var, fallback) in [("ProgramFiles", "C:\\Program Files"), ("ProgramFiles(x86)", "C:\\Program Files (x86)")] {
+                let base = env(var).unwrap_or_else(|| PathBuf::from(fallback));
+                v.push(base.join("LibreOffice").join("share").join("extensions"));
+            }
+            if let Some(l) = env("LOCALAPPDATA") {
+                v.push(l.join("Programs").join("LibreOffice").join("share").join("extensions"));
+            }
+            v
+        }
+    }
+}
+
+/// `dict-*`-undermapparna i `parents`.
+fn expand_dict_dirs(parents: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for parent in parents {
+        let Ok(rd) = std::fs::read_dir(parent) else { continue };
+        let mut subs: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("dict-")))
+            .collect();
+        subs.sort();
+        out.extend(subs);
+    }
+    out
+}
+
+/// Mappar där ordlistor letas, i prioritetsordning (utan LibreOffices `dict-*`-mappar).
+fn dict_dirs(os: Os, env: Env, install: PathBuf) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(p) = std::env::var_os("DICPATH") {
+    if let Some(p) = env("DICPATH") {
         dirs.extend(std::env::split_paths(&p).filter(|d| !d.as_os_str().is_empty()));
     }
-    if let Some(d) = env_dir("XDG_DATA_HOME").or_else(|| home().map(|h| h.join(".local/share"))) {
-        dirs.push(d.join("kladd").join("ordlistor"));
-    }
-    for d in ["/usr/share/hunspell", "/usr/share/myspell", "/usr/share/myspell/dicts"] {
-        dirs.push(PathBuf::from(d));
+    dirs.push(install);
+    match os {
+        Os::Linux => {
+            for d in ["/usr/share/hunspell", "/usr/share/myspell", "/usr/share/myspell/dicts"] {
+                dirs.push(PathBuf::from(d));
+            }
+        }
+        Os::Mac => {
+            dirs.push(PathBuf::from("/Library/Spelling"));
+            if let Some(h) = home(env) {
+                dirs.push(h.join("Library").join("Spelling"));
+            }
+        }
+        Os::Windows => {}
     }
     dirs
 }
 
+/// Alla mappar där ordlistor letas på den här datorn.
+fn default_dirs() -> Vec<PathBuf> {
+    let mut dirs = dict_dirs(OS, &real_env, install_dir());
+    dirs.extend(expand_dict_dirs(&libreoffice_ext_parents(OS, &real_env)));
+    dirs
+}
+
 fn default_user_dict() -> PathBuf {
-    env_dir("XDG_CONFIG_HOME")
-        .or_else(|| home().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("kladd")
-        .join("ordlista.txt")
+    crate::platform::config_dir().join("ordlista.txt")
 }
 
 /// Hittar installerade ordlistor i `dirs`. Första träffen per kod vinner.
@@ -104,14 +174,44 @@ fn discover(dirs: &[PathBuf]) -> Vec<Lang> {
     out
 }
 
-/// Väljer standardspråk: sv_SE, annars `$LANG`, annars en_US, annars första.
-fn default_index(langs: &[Lang]) -> Option<usize> {
+/// Gör om en språketikett (`sv-SE`, `sv_SE.UTF-8`, `en-US-u-hc-h12`) till Hunspell-kod (`sv_SE`).
+/// `C`/`POSIX` ger `None`.
+fn locale_to_code(tag: &str) -> Option<String> {
+    let tag = tag.split(['.', '@']).next().unwrap_or("");
+    let mut parts = tag.split(['-', '_']);
+    let lang = parts.next().unwrap_or("");
+    if lang.len() < 2 || !lang.chars().all(|c| c.is_ascii_alphabetic()) || lang == "POSIX" {
+        return None;
+    }
+    let lang = lang.to_ascii_lowercase();
+    match parts.next() {
+        // Skript (Latn) hoppas över; region är två bokstäver eller tre siffror.
+        Some(r) if r.len() == 2 && r.chars().all(|c| c.is_ascii_alphabetic()) => {
+            Some(format!("{lang}_{}", r.to_ascii_uppercase()))
+        }
+        Some(s) if s.len() == 4 => match parts.next() {
+            Some(r) if r.len() == 2 => Some(format!("{lang}_{}", r.to_ascii_uppercase())),
+            _ => Some(lang),
+        },
+        _ => Some(lang),
+    }
+}
+
+/// Språkkod från miljön: `$LANG`, annars operativsystemets språk.
+fn system_locale_code() -> Option<String> {
+    std::env::var("LANG")
+        .ok()
+        .and_then(|l| locale_to_code(&l))
+        .or_else(|| sys_locale::get_locale().and_then(|l| locale_to_code(&l)))
+}
+
+/// Väljer standardspråk: sv_SE, annars systemspråket `locale`, annars en_US, annars första.
+fn default_index_for(langs: &[Lang], locale: Option<&str>) -> Option<usize> {
     let find = |c: &str| langs.iter().position(|l| l.code == c);
     if let Some(i) = find("sv_SE") {
         return Some(i);
     }
-    if let Ok(l) = std::env::var("LANG") {
-        let code = l.split(['.', '@']).next().unwrap_or("");
+    if let Some(code) = locale {
         if let Some(i) = find(code) {
             return Some(i);
         }
@@ -123,6 +223,10 @@ fn default_index(langs: &[Lang]) -> Option<usize> {
         }
     }
     find("en_US").or(if langs.is_empty() { None } else { Some(0) })
+}
+
+fn default_index(langs: &[Lang]) -> Option<usize> {
+    default_index_for(langs, system_locale_code().as_deref())
 }
 
 /// Teckenkodning enligt `SET` i .aff (UTF-8 om den saknas eller är okänd).
@@ -172,6 +276,114 @@ fn load_dictionary(aff: &Path, dic: &Path) -> Option<spellbook::Dictionary> {
     spellbook::Dictionary::new(&aff_text, &dic_text).ok()
 }
 
+/// En ordlista som kan hämtas från LibreOffices ordlistearkiv.
+pub struct Download {
+    /// Språkkod den sparas som, t.ex. "sv_SE".
+    pub code: &'static str,
+    /// Visningsnamn i hämtningslistan.
+    pub name: &'static str,
+    /// Sökvägar i arkivet (efter `DICT_BASE`).
+    pub aff: &'static str,
+    pub dic: &'static str,
+    /// README/licensfil att hämta bredvid, om arkivet har någon.
+    pub license: Option<&'static str>,
+}
+
+pub const DICT_BASE: &str = "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/";
+
+/// Licensanmärkning som visas vid hämtning.
+pub const LICENSE_NOTE: &str = "Ordlistan kommer från LibreOffice och har egen licens (LGPL/MPL …)";
+
+pub const DOWNLOADS: &[Download] = &[
+    Download {
+        code: "sv_SE",
+        name: "Svenska",
+        aff: "sv_SE/dictionaries/sv_SE.aff",
+        dic: "sv_SE/dictionaries/sv_SE.dic",
+        license: Some("sv_SE/LICENSE_en_US.txt"),
+    },
+    Download {
+        code: "en_US",
+        name: "Engelska (USA)",
+        aff: "en/en_US.aff",
+        dic: "en/en_US.dic",
+        license: Some("en/README_en_US.txt"),
+    },
+    Download {
+        code: "en_GB",
+        name: "Engelska (Storbritannien)",
+        aff: "en/en_GB.aff",
+        dic: "en/en_GB.dic",
+        license: Some("en/README_en_GB.txt"),
+    },
+    Download {
+        code: "nb_NO",
+        name: "Norska",
+        aff: "no/nb_NO.aff",
+        dic: "no/nb_NO.dic",
+        license: Some("no/README_NO.txt"),
+    },
+    Download {
+        code: "da_DK",
+        name: "Danska",
+        aff: "da_DK/da_DK.aff",
+        dic: "da_DK/da_DK.dic",
+        license: Some("da_DK/README_da_DK.txt"),
+    },
+    Download {
+        code: "de_DE",
+        name: "Tyska",
+        aff: "de/de_DE_frami.aff",
+        dic: "de/de_DE_frami.dic",
+        license: Some("de/README_de_DE_frami.txt"),
+    },
+    Download {
+        code: "fr_FR",
+        name: "Franska",
+        aff: "fr_FR/dictionaries/fr.aff",
+        dic: "fr_FR/dictionaries/fr.dic",
+        license: Some("fr_FR/dictionaries/README_dict_fr.txt"),
+    },
+    Download { code: "es_ES", name: "Spanska", aff: "es/es_ES.aff", dic: "es/es_ES.dic", license: None },
+];
+
+fn http_get(agent: &ureq::Agent, path: &str) -> Result<Vec<u8>, String> {
+    let url = format!("{DICT_BASE}{path}");
+    let mut resp = agent.get(&url).call().map_err(|e| format!("{e}"))?;
+    resp.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec().map_err(|e| format!("{e}"))
+}
+
+/// Hämtar `d` till `dir` som `<kod>.aff`/`<kod>.dic` (+ `<kod>.LICENSE.txt`). Filerna skrivs
+/// först under tillfälligt namn så att en avbruten hämtning inte lämnar halva ordlistor.
+fn download_to(d: &Download, dir: &Path) -> Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(120)))
+        .build()
+        .into();
+    std::fs::create_dir_all(dir).map_err(|e| format!("kunde inte skapa {}: {e}", dir.display()))?;
+    let aff = http_get(&agent, d.aff)?;
+    let dic = http_get(&agent, d.dic)?;
+    let save = |name: String, bytes: &[u8]| -> Result<(), String> {
+        let tmp = dir.join(format!("{name}.part"));
+        std::fs::write(&tmp, bytes).map_err(|e| format!("kunde inte spara {name}: {e}"))?;
+        std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("kunde inte spara {name}: {e}"))
+    };
+    // Licensen är bara en bonus: misslyckas den får ordlistan ändå användas.
+    if let Some(lic) = d.license {
+        if let Ok(b) = http_get(&agent, lic) {
+            let _ = save(format!("{}.LICENSE.txt", d.code), &b);
+        }
+    }
+    save(format!("{}.aff", d.code), &aff)?;
+    save(format!("{}.dic", d.code), &dic)
+}
+
+/// Hämtar ordlistan `code` till `dir` (blockerar; kör i egen tråd).
+pub fn download_dictionary(code: &str, dir: &Path) -> Result<(), String> {
+    let d = DOWNLOADS.iter().find(|d| d.code == code).ok_or_else(|| format!("okänt språk: {code}"))?;
+    download_to(d, dir)
+}
+
 pub struct Speller {
     langs: Vec<Lang>,
     cur: Option<usize>,
@@ -182,11 +394,17 @@ pub struct Speller {
     user: HashSet<String>,
     user_path: PathBuf,
     generation: u64,
+    dirs: Vec<PathBuf>,
+    install_dir: PathBuf,
+    /// Pågående hämtning: (språkkod, visningsnamn, kanal med resultatet).
+    download: Option<(String, String, Receiver<Result<(), String>>)>,
 }
 
 impl Speller {
     pub fn new(lang: Option<&str>) -> Self {
-        Self::with_paths(default_dirs(), default_user_dict(), lang)
+        let mut s = Self::with_paths(default_dirs(), default_user_dict(), lang);
+        s.install_dir = install_dir();
+        s
     }
 
     pub fn with_paths(dirs: Vec<PathBuf>, user_dict: PathBuf, lang: Option<&str>) -> Self {
@@ -207,6 +425,9 @@ impl Speller {
             user,
             user_path: user_dict,
             generation: 0,
+            install_dir: dirs.first().cloned().unwrap_or_default(),
+            dirs,
+            download: None,
         };
         s.start_loading();
         s
@@ -227,6 +448,58 @@ impl Speller {
     fn bump(&mut self) {
         self.generation += 1;
         self.cache.clear();
+    }
+
+    /// Hämtar ordlistan `code` i bakgrunden till Kladds ordlistemapp.
+    pub fn start_download(&mut self, code: &str) {
+        if self.download.is_some() {
+            return;
+        }
+        let Some(d) = DOWNLOADS.iter().find(|d| d.code == code) else { return };
+        let (tx, rx) = mpsc::channel();
+        let dir = self.install_dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(download_to(d, &dir));
+        });
+        self.download = Some((d.code.to_string(), d.name.to_string(), rx));
+    }
+
+    /// Visningsnamnet på ordlistan som hämtas just nu.
+    pub fn downloading(&self) -> Option<&str> {
+        self.download.as_ref().map(|d| d.1.as_str())
+    }
+
+    /// Är hämtningen klar? Då söks ordlistorna om och den nya väljs; `Ok` ger visningsnamnet,
+    /// `Err` ett felmeddelande.
+    pub fn poll_download(&mut self) -> Option<Result<String, String>> {
+        let (code, name, rx) = self.download.as_ref()?;
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err("hämtningen avbröts".to_owned()),
+        };
+        let (code, name) = (code.clone(), name.clone());
+        self.download = None;
+        Some(res.and_then(|()| {
+            self.rescan();
+            let i = self
+                .langs
+                .iter()
+                .position(|l| l.code == code)
+                .ok_or("ordlistan hittades inte efter hämtningen")?;
+            self.cur = Some(i);
+            self.start_loading();
+            self.bump();
+            Ok(name)
+        }))
+    }
+
+    /// Söker igenom ordlistemapparna på nytt och behåller valt språk om det finns kvar.
+    pub fn rescan(&mut self) {
+        let keep = self.lang().map(|l| l.code.clone());
+        self.langs = discover(&self.dirs);
+        self.cur =
+            keep.and_then(|c| self.langs.iter().position(|l| l.code == c)).or_else(|| default_index(&self.langs));
     }
 
     pub fn languages(&self) -> &[Lang] {
@@ -627,5 +900,134 @@ mod tests {
         assert!(s.check_word("sjukhusparkeringen"));
         assert!(!s.check_word("dokumnet"));
         assert!(s.suggest("dokumnet").iter().any(|w| w == "dokument"));
+    }
+
+    fn fake_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<PathBuf> + 'a {
+        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| PathBuf::from(v))
+    }
+
+    #[test]
+    fn mappar_per_os() {
+        let inst = PathBuf::from("/data/Kladd/ordlistor");
+        // Linux.
+        let env = fake_env(&[("HOME", "/home/a")]);
+        let d = dict_dirs(Os::Linux, &env, inst.clone());
+        assert_eq!(d[0], inst);
+        assert!(d.contains(&PathBuf::from("/usr/share/hunspell")));
+        let env = fake_env(&[("HOME", "/h"), ("DICPATH", "/dic")]);
+        assert_eq!(dict_dirs(Os::Linux, &env, inst.clone())[..2], [PathBuf::from("/dic"), inst.clone()]);
+
+        // macOS.
+        let env = fake_env(&[("HOME", "/Users/a")]);
+        let d = dict_dirs(Os::Mac, &env, inst.clone());
+        assert_eq!(d[0], inst);
+        assert!(d.contains(&PathBuf::from("/Library/Spelling")));
+        assert!(d.contains(&PathBuf::from("/Users/a/Library/Spelling")));
+        assert_eq!(
+            libreoffice_ext_parents(Os::Mac, &env),
+            vec![PathBuf::from("/Applications/LibreOffice.app/Contents/Resources/extensions")]
+        );
+
+        // Windows.
+        let env = fake_env(&[("LOCALAPPDATA", "C:\\Users\\a\\AppData\\Local"), ("ProgramFiles", "C:\\Program Files")]);
+        assert_eq!(dict_dirs(Os::Windows, &env, inst.clone()), vec![inst]);
+        let lo = libreoffice_ext_parents(Os::Windows, &env);
+        assert_eq!(lo.len(), 3);
+        assert!(lo[0].starts_with("C:\\Program Files") && lo[0].ends_with("extensions"));
+        assert!(lo[1].to_string_lossy().contains("Program Files (x86)"));
+        assert!(lo[2].to_string_lossy().contains("Programs"));
+    }
+
+    #[test]
+    fn libreoffice_tillagg_hittas() {
+        let root = tmp("lo");
+        let ext = root.join("extensions");
+        for (sub, code) in [("dict-sv", "sv_SE"), ("dict-en", "en_US")] {
+            std::fs::create_dir_all(ext.join(sub)).unwrap();
+            make_dict(&ext.join(sub), code, &["hej"]);
+        }
+        std::fs::create_dir_all(ext.join("other")).unwrap();
+        make_dict(&ext.join("other"), "xx_XX", &["a"]);
+        let dirs = expand_dict_dirs(&[ext.clone(), root.join("saknas")]);
+        assert_eq!(dirs, vec![ext.join("dict-en"), ext.join("dict-sv")]);
+        let codes: Vec<_> = discover(&dirs).into_iter().map(|l| l.code).collect();
+        assert_eq!(codes, vec!["en_US", "sv_SE"]); // sorterat på namn: Engelska, Svenska
+    }
+
+    #[test]
+    fn sprakkod_fran_locale() {
+        assert_eq!(locale_to_code("sv-SE").as_deref(), Some("sv_SE"));
+        assert_eq!(locale_to_code("en-US").as_deref(), Some("en_US"));
+        assert_eq!(locale_to_code("sv_SE.UTF-8").as_deref(), Some("sv_SE"));
+        assert_eq!(locale_to_code("de_DE@euro").as_deref(), Some("de_DE"));
+        assert_eq!(locale_to_code("en-US-u-hc-h12").as_deref(), Some("en_US"));
+        assert_eq!(locale_to_code("zh-Hans-CN").as_deref(), Some("zh_CN"));
+        assert_eq!(locale_to_code("nb").as_deref(), Some("nb"));
+        assert_eq!(locale_to_code("C"), None);
+        assert_eq!(locale_to_code("POSIX"), None);
+        assert_eq!(locale_to_code(""), None);
+    }
+
+    #[test]
+    fn standardsprak() {
+        let mk = |c: &str| Lang { code: c.into(), name: c.into(), aff: PathBuf::new(), dic: PathBuf::new() };
+        let langs = vec![mk("da_DK"), mk("en_US"), mk("sv_SE")];
+        assert_eq!(default_index_for(&langs, Some("da_DK")), Some(2)); // svenska först
+        let langs = vec![mk("da_DK"), mk("en_GB"), mk("en_US"), mk("nb_NO")];
+        assert_eq!(default_index_for(&langs, Some("nb_NO")), Some(3));
+        assert_eq!(default_index_for(&langs, Some("en_GB")), Some(1));
+        assert_eq!(default_index_for(&langs, Some("da")), Some(0)); // bara språkdelen
+        assert_eq!(default_index_for(&langs, Some("ja_JP")), Some(2)); // en_US
+        assert_eq!(default_index_for(&langs, None), Some(2));
+        assert_eq!(default_index_for(&langs[..1], Some("ja_JP")), Some(0));
+        assert_eq!(default_index_for(&[], Some("sv_SE")), None);
+    }
+
+    #[test]
+    fn hamtningslistan_ar_hel() {
+        let mut codes = HashSet::new();
+        for d in DOWNLOADS {
+            assert!(codes.insert(d.code), "dubblett: {}", d.code);
+            assert!(d.aff.ends_with(".aff") && d.dic.ends_with(".dic"), "{}", d.code);
+            // aff och dic ligger i samma mapp och har samma namn.
+            assert_eq!(d.aff.trim_end_matches(".aff"), d.dic.trim_end_matches(".dic"), "{}", d.code);
+            assert!(!d.name.is_empty());
+            for path in [Some(d.aff), Some(d.dic), d.license].into_iter().flatten() {
+                assert!(!path.starts_with('/') && !path.contains(".."), "{path}");
+            }
+        }
+        for c in ["sv_SE", "en_US", "en_GB", "nb_NO", "da_DK", "de_DE", "fr_FR", "es_ES"] {
+            assert!(codes.contains(c), "saknar {c}");
+        }
+        assert!(DICT_BASE.starts_with("https://") && DICT_BASE.ends_with('/'));
+        // Hämtade filer måste kunna hittas av `discover` under koden.
+        assert!(download_dictionary("finns_ej", Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn rescan_hittar_nyinstallerad() {
+        let d = tmp("rescan");
+        make_dict(&d, "aa_AA", &["hej"]);
+        let mut s = Speller::with_paths(vec![d.clone()], d.join("u.txt"), None);
+        assert_eq!(s.languages().len(), 1);
+        make_dict(&d, "bb_BB", &["tja"]);
+        s.rescan();
+        assert_eq!(s.languages().len(), 2);
+        assert_eq!(s.lang().unwrap().code, "aa_AA"); // valt språk behålls
+    }
+
+    /// Hämtar svenska från LibreOffices arkiv. Kräver nät: `cargo test -- --ignored hamta_svensk`.
+    #[test]
+    #[ignore]
+    fn hamta_svensk_ordlista() {
+        let d = tmp("hamta");
+        download_dictionary("sv_SE", &d).unwrap();
+        assert!(d.join("sv_SE.aff").is_file() && d.join("sv_SE.dic").is_file());
+        assert!(d.join("sv_SE.LICENSE.txt").is_file());
+        let mut s = Speller::with_paths(vec![d.clone()], d.join("u.txt"), None);
+        wait(&mut s);
+        assert_eq!(s.lang().unwrap().code, "sv_SE");
+        assert!(s.check_word("sjukhusparkeringen"));
+        assert!(!s.check_word("dokumnet"));
     }
 }

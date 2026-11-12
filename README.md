@@ -37,15 +37,27 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Dra och släpp** filer direkt i fönstret.
 - **Ett fönster** – filer som öppnas från filhanteraren eller terminalen läggs som nya flikar i det Kladd-fönster som redan är öppet. Använd `kladd --new-window` för ett separat fönster.
 - **Dokumentläge** – Word- och OpenDocument-dokument visas som ett dokument med riktiga sidor, formateringsfält och sidnummer. Se [Word-dokument](#word-dokument).
-- **Stavningskontroll** i dokumentläget, med svenska och engelska ordlistor från systemet.
+- **Stavningskontroll** i dokumentläget, med svenska och engelska ordlistor från systemet, eller hämtade i Kladd på Windows och macOS.
 
 ## Kom igång
 
-Ladda ner det senaste `.deb`-paketet från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest) och installera det med:
+Ladda ner det senaste paketet för ditt system från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest).
+
+**Linux (Ubuntu/Debian)** – installera `.deb`-paketet:
 
 ```bash
 sudo apt install ./kladd_*.deb
 ```
+
+**Windows** – kör `Kladd-<version>-windows-x64-setup.exe`. Installationen sker för din användare och kräver inte administratör (dialogen låter dig välja installation för alla). Du kan lägga till en genväg på skrivbordet och låta Kladd synas under *Öppna med* för `.docx`, `.odt`, `.md` och `.txt`. Vill du slippa installera finns även `Kladd-<version>-windows-x64.zip`: packa upp och kör `kladd.exe`. Programmet är inte signerat, så Windows SmartScreen varnar vid första starten: välj *Mer information* och sedan *Kör ändå*.
+
+**macOS** (11 eller nyare, Apple Silicon och Intel) – öppna `Kladd-<version>-macos-universal.dmg` och dra Kladd till mappen Program. Programmet är inte notariserat, så första gången måste du högerklicka på Kladd och välja *Öppna* (och bekräfta). Alternativt tar du bort karantänmärkningen i Terminalen:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Kladd.app
+```
+
+På macOS går det ännu inte att öppna filer från Finder med *Öppna med* eller genom att dra dem till ikonen i Dock. Öppna dem i stället med *Öppna…* i menyn (`⌘O`) eller genom att dra dem till Kladd-fönstret.
 
 Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
 
@@ -121,9 +133,14 @@ Vill du se dokumentet som vanlig Markdown-text klickar du på *Markdown* i forma
 
 ### Stavningskontroll
 
-I dokumentläget markeras felstavade ord med ett rött vågigt understreck medan du skriver. Högerklicka på ett ord för att se förslag, välja *Ignorera alla* eller *Lägg till i ordlistan*. Tillagda ord sparas i `~/.config/kladd/ordlista.txt`.
+I dokumentläget markeras felstavade ord med ett rött vågigt understreck medan du skriver. Högerklicka på ett ord för att se förslag, välja *Ignorera alla* eller *Lägg till i ordlistan*. Tillagda ord sparas i `~/.config/kladd/ordlista.txt` (på Windows och macOS i `ordlista.txt` i Kladds mapp, se nedan).
 
-Kladd använder de Hunspell-ordlistor som finns i `/usr/share/hunspell`, samma som LibreOffice använder på Ubuntu. Installera svenska med `sudo apt install hunspell-sv`; .deb-paketet föreslår `hunspell-sv` och `hunspell-en-us`. Språk och på/av väljer du genom att klicka på språket i statusfältet. Standardspråket är svenska när det är installerat.
+Kladd använder Hunspell-ordlistor (`.aff` och `.dic`). Språk och på/av väljer du genom att klicka på språket i statusfältet. Standardspråket är svenska när det är installerat, annars systemets språk (`$LANG` eller operativsystemets inställning).
+
+- **Linux:** ordlistorna i `/usr/share/hunspell`, samma som LibreOffice använder på Ubuntu. Installera svenska med `sudo apt install hunspell-sv`; .deb-paketet föreslår `hunspell-sv` och `hunspell-en-us`.
+- **Windows och macOS:** det finns inga ordlistor i systemet, så Kladd erbjuder att hämta dem. Finns ingen ordlista visar statusfältet *Ingen ordlista*; klicka där och välj *Hämta svensk ordlista* (eller *Hämta fler språk…* för engelska, norska, danska, tyska, franska och spanska). Kladd hämtar `.aff`- och `.dic`-filerna från [LibreOffices ordlistearkiv](https://github.com/LibreOffice/dictionaries) i bakgrunden och väljer språket när det är klart. Ordlistan har egen licens (LGPL/MPL …); licenstexten sparas bredvid den. Hämtningen följer `HTTPS_PROXY`. Ordlistorna hamnar i `~/Library/Application Support/Kladd/ordlistor` (macOS) respektive `%APPDATA%\Kladd\ordlistor` (Windows). Är LibreOffice installerat används dess ordlistor också, liksom `/Library/Spelling` och `~/Library/Spelling` på macOS.
+
+Ordlistor i mappen som `$DICPATH` pekar på hittas på alla system.
 
 | I Word | I Kladd |
 |---|---|
@@ -159,6 +176,8 @@ En PDF är byggd för utskrift, inte för redigering. När du sparar en öppnad 
 Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/pdfcraft) och skrivningen på samma upplägg som [WordCraft](https://github.com/storytold/wordcraft) (båda MIT/Apache-2.0), med [lopdf](https://crates.io/crates/lopdf) och [krilla](https://crates.io/crates/krilla).
 
 ## Kortkommandon
+
+På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 
 | Kommando | Funktion |
 |---|---|

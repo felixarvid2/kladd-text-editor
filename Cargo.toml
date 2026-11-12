@@ -1,11 +1,12 @@
 [package]
 name = "kladd"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 description = "Kladd – en lugn och snygg texteditor för txt, Markdown och kod"
 authors = ["Felix"]
 license = "MIT"
 readme = "README.md"
+build = "build.rs"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = [
@@ -30,20 +31,36 @@ rfd = "0.18"
 arboard = { version = "3.6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-libc = "0.2"
+
 encoding_rs = "0.8"
 spellbook = "0.4"
+fontdb = "0.24"
 quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 regex = "1"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+ureq = "3.5.2"
+sys-locale = "0.3.2"
+interprocess = "2.4.8"
+dirs = "7.0.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+# Bara på Windows-värdar: bäddar in ikon och versionsinfo i kladd.exe.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [package.metadata.deb]
 maintainer = "Felix <felix@localhost>"

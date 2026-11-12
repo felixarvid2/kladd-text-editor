@@ -102,12 +102,7 @@ fn content_hash(doc: &Document) -> u64 {
 
 /// Mappen där ögonblicksbilderna ligger.
 pub fn default_dir() -> PathBuf {
-    let var = |v: &str| std::env::var_os(v).filter(|x| !x.is_empty()).map(PathBuf::from);
-    var("XDG_DATA_HOME")
-        .or_else(|| var("HOME").map(|h| h.join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("kladd")
-        .join("återställning")
+    crate::platform::data_dir().join("återställning")
 }
 
 fn json_path(dir: &Path, pid: u32, id: u64) -> PathBuf {
@@ -306,14 +301,7 @@ impl Recovery {
     }
 }
 
-/// Lever processen med det här numret?
-pub fn pid_alive(pid: u32) -> bool {
-    // En zombie (avslutad men ännu inte inhämtad av sin förälder) räknas som död.
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat.rsplit(')').next().and_then(|r| r.trim().chars().next()) != Some('Z'),
-        Err(_) => false,
-    }
-}
+pub use crate::platform::pid_alive;
 
 pub struct Found {
     pub json: PathBuf,
@@ -407,29 +395,28 @@ pub enum Choice {
     Later,
 }
 
-fn local_tm(t: u64) -> libc::tm {
-    // SAFETY: localtime_r skriver bara till vår egen nollställda tm.
-    unsafe {
-        let secs = t as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        tm
-    }
+/// Lokal tid (år, dag på året, timme, minut, dag i månaden, månad 0-11) för en unix-tid.
+type Tm = (i32, u32, u32, u32, u32, usize);
+
+fn local_tm(t: u64) -> Tm {
+    use chrono::{DateTime, Datelike, Local, Timelike};
+    let dt = DateTime::from_timestamp(t as i64, 0).unwrap_or_default().with_timezone(&Local);
+    (dt.year(), dt.ordinal(), dt.hour(), dt.minute(), dt.day(), dt.month0() as usize)
 }
 
 /// "i dag 14:32", "i går 09:05" eller "3 nov 14:32".
 pub fn when(t: u64, now: u64) -> String {
     const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "maj", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
     let (a, n) = (local_tm(t), local_tm(now));
-    let clock = format!("{:02}:{:02}", a.tm_hour, a.tm_min);
-    let day = |tm: &libc::tm| (tm.tm_year, tm.tm_yday);
+    let clock = format!("{:02}:{:02}", a.2, a.3);
+    let day = |tm: &Tm| (tm.0, tm.1);
     let yesterday = local_tm(now.saturating_sub(86_400));
     if day(&a) == day(&n) {
         format!("i dag {clock}")
     } else if day(&a) == day(&yesterday) {
         format!("i går {clock}")
     } else {
-        format!("{} {} {clock}", a.tm_mday, MONTHS[(a.tm_mon as usize).min(11)])
+        format!("{} {} {clock}", a.4, MONTHS[a.5.min(11)])
     }
 }
 
@@ -547,7 +534,7 @@ mod tests {
     #[test]
     fn snapshot_round_trip() {
         let mut d = dirty_doc(7, "Hej ![x](bild:a%20b.png) världen åäö");
-        d.path = Some(PathBuf::from("/tmp/x.docx"));
+        d.path = Some(std::env::temp_dir().join("x.docx"));
         d.docx = true;
         d.word_view = true;
         d.encoding = TextEncoding::Utf16Le;
