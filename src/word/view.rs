@@ -17,12 +17,38 @@ use egui::{
 };
 
 use super::layout::{self, MARGIN_PT, PAGE_H_PT, PAGE_W_PT, px};
-use super::markup::{self, Block, Inline};
+use super::markup::{self, Block, Inline, SpanProp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
 use crate::theme::Palette;
 
-const BAR_H: f32 = 40.0;
+/// Storlekarna (pt) i storleksväljaren, som i Word.
+const SIZES: [f32; 17] = [8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0];
+/// Words standardfärger för text (första raden) och en rad grå/temafärger.
+const TEXT_COLORS: [[u32; 10]; 2] = [
+    [0xC00000, 0xFF0000, 0xFFC000, 0xFFFF00, 0x92D050, 0x00B050, 0x00B0F0, 0x0070C0, 0x002060, 0x7030A0],
+    [0x000000, 0x404040, 0x7F7F7F, 0xBFBFBF, 0xFFFFFF, 0x44546A, 0x4472C4, 0xED7D31, 0xA5A5A5, 0x70AD47],
+];
+const DEFAULT_TEXT_COLOR: [u8; 3] = [0xC0, 0x00, 0x00];
+const DEFAULT_HIGHLIGHT: [u8; 3] = [0xFF, 0xFF, 0x00];
+/// Markeringsfärgerna (Words `w:highlight`) med svenska namn.
+const HIGHLIGHTS: [(&str, &str); 15] = [
+    ("yellow", "Gul"),
+    ("green", "Grön"),
+    ("cyan", "Turkos"),
+    ("magenta", "Rosa"),
+    ("blue", "Blå"),
+    ("red", "Röd"),
+    ("darkBlue", "Mörkblå"),
+    ("darkCyan", "Mörk turkos"),
+    ("darkGreen", "Mörkgrön"),
+    ("darkMagenta", "Violett"),
+    ("darkRed", "Mörkröd"),
+    ("darkYellow", "Mörkgul"),
+    ("darkGray", "Mörkgrå"),
+    ("lightGray", "Ljusgrå"),
+    ("black", "Svart"),
+];
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 3.0;
 /// Luft mellan skrivbordets kant och sidan, och ovanför/under den.
@@ -62,6 +88,9 @@ pub struct State {
     target: Option<SpellTarget>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
+    /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
+    text_color: Option<[u8; 3]>,
+    highlight: Option<[u8; 3]>,
 }
 
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
@@ -76,6 +105,10 @@ enum BarAct {
     Zoom(f32),
     ZoomReset,
     ToMarkdown,
+    Span(SpanProp),
+    Align(markup::Align),
+    TextColor(Option<[u8; 3]>),
+    Highlight(Option<[u8; 3]>),
 }
 
 fn hash_text(text: &str) -> u64 {
@@ -94,6 +127,61 @@ fn block_label(b: Block) -> String {
         Block::Code => "Kod".into(),
         Block::Table => "Tabell".into(),
     }
+}
+
+fn fmt_size(pt: f32) -> String {
+    if pt.fract() == 0.0 { format!("{pt}") } else { format!("{pt}").replace('.', ",") }
+}
+
+/// Nästa storlek i listan (`dir` = 1 större, -1 mindre) som i Words Ctrl+Shift+>/<.
+fn step_size(cur: f32, dir: i32) -> f32 {
+    if dir > 0 {
+        SIZES.iter().copied().find(|s| *s > cur + 0.01).unwrap_or(cur + 10.0)
+    } else {
+        SIZES.iter().rev().copied().find(|s| *s < cur - 0.01).unwrap_or(SIZES[0])
+    }
+}
+
+fn rgb_color(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// Färgväljare i en meny: "ingen färg"-rad och rader med 16 px stora rutor. `Some(val)` när
+/// något valts (`val` = `None` för den första raden).
+fn color_popup(
+    ui: &mut Ui,
+    p: &Palette,
+    none_label: &str,
+    rows: &[Vec<(String, [u8; 3])>],
+    current: Option<[u8; 3]>,
+) -> Option<Option<[u8; 3]>> {
+    let mut pick = None;
+    ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+    if menu_item(ui, p, none_label, "", Some(current.is_none()), true) {
+        pick = Some(None);
+    }
+    for row in rows {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            for (name, c) in row {
+                let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+                let resp = resp.on_hover_text(name);
+                ui.painter().rect_filled(r, 2.0, rgb_color(*c));
+                ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
+                if current == Some(*c) {
+                    ui.painter().rect_stroke(r.expand(2.0), 3.0, Stroke::new(1.5, p.accent), egui::StrokeKind::Outside);
+                } else if resp.hovered() {
+                    ui.painter().rect_stroke(r.expand(1.0), 2.0, Stroke::new(1.0, p.muted), egui::StrokeKind::Outside);
+                }
+                if resp.clicked() {
+                    pick = Some(Some(*c));
+                    ui.close();
+                }
+            }
+        });
+    }
+    ui.add_space(3.0);
+    pick
 }
 
 fn divider(ui: &mut Ui, p: &Palette) {
@@ -208,6 +296,18 @@ impl KladdApp {
         self.word_edit(ctx, |t, s| markup::toggle_inline(t, s, m));
     }
 
+    /// Större/mindre text ett steg i storlekslistan.
+    fn word_font_step(&mut self, ctx: &egui::Context, dir: i32) {
+        self.word_edit(ctx, |t, s| {
+            let a = markup::analyze(t);
+            let act = markup::active(t, &a, s.clone());
+            let cur = act.span.font_size.unwrap_or(a.defaults.size());
+            let next = step_size(cur, dir);
+            let prop = if (next - a.defaults.size()).abs() < 0.01 { None } else { Some(next) };
+            markup::set_span_prop(t, s, SpanProp::FontSize(prop))
+        });
+    }
+
     fn word_block(&mut self, ctx: &egui::Context, b: Block) {
         self.word_edit(ctx, |t, s| markup::set_block(t, s, b));
     }
@@ -237,6 +337,24 @@ impl KladdApp {
         if hit(ctrl, Key::U) {
             self.word_toggle(ctx, Inline::Underline);
         }
+        for (k, a) in [
+            (Key::L, markup::Align::Left),
+            (Key::E, markup::Align::Center),
+            (Key::R, markup::Align::Right),
+            (Key::J, markup::Align::Justify),
+        ] {
+            if hit(ctrl, k) {
+                self.word_edit(ctx, |t, s| markup::set_align(t, s, a));
+            }
+        }
+        // Teckenstorlek ett steg: Words Ctrl+Shift+> / < (på svenskt tangentbord Ctrl+Shift+<
+        // som ger `Comma`/`Period` i egui) samt Ctrl+] / Ctrl+[.
+        if hit(ctrl | Modifiers::SHIFT, Key::Period) || hit(ctrl, Key::CloseBracket) {
+            self.word_font_step(ctx, 1);
+        }
+        if hit(ctrl | Modifiers::SHIFT, Key::Comma) || hit(ctrl, Key::OpenBracket) {
+            self.word_font_step(ctx, -1);
+        }
         for (k, b) in [
             (Key::Num1, Block::Heading(1)),
             (Key::Num2, Block::Heading(2)),
@@ -265,25 +383,36 @@ impl KladdApp {
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
 
         let mut acts: Vec<BarAct> = Vec::new();
-        Panel::top("kladd-wordbar")
-            .exact_size(BAR_H)
+        // Typsnitt i dokumentet (grundtypsnittet först), och de som är installerade.
+        let default_font = analysis.defaults.font().to_owned();
+        let default_size = analysis.defaults.size();
+        let mut used_fonts = vec![default_font.clone()];
+        for pc in &analysis.pieces {
+            if let Some(f) = pc.span.as_ref().and_then(|s| s.font_family.as_ref()) {
+                if !used_fonts.iter().any(|u| u.eq_ignore_ascii_case(f)) {
+                    used_fonts.push(f.clone());
+                }
+            }
+        }
+        used_fonts[1..].sort_by_key(|f| f.to_lowercase());
+        let cur_font = act.span.font_family.clone().unwrap_or_else(|| default_font.clone());
+        let cur_size = act.span.font_size.unwrap_or(default_size);
+        let text_color = self.wv.text_color.unwrap_or(DEFAULT_TEXT_COLOR);
+        let highlight = self.wv.highlight.unwrap_or(DEFAULT_HIGHLIGHT);
+        let panel = Panel::top("kladd-wordbar")
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 0)))
+            .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
             .show(ui, |ui| {
                 let full = ui.max_rect();
-                ui.painter().hline(
-                    (full.left() - 12.0)..=(full.right() + 12.0),
-                    full.bottom() - 0.5,
-                    Stroke::new(1.0, p.line),
-                );
-                let right_w = 250.0;
-                let left = Rect::from_min_max(full.min, pos2((full.right() - right_w - 8.0).max(full.left()), full.bottom()));
-                let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
+                let right_w = 200.0;
+                let left_w = (full.width() - right_w - 8.0).max(200.0);
+                let right = Rect::from_min_size(pos2(full.right() - right_w, full.top()), vec2(right_w, 28.0));
+                ui.set_min_height(28.0);
 
-                ui.scope_builder(UiBuilder::new().max_rect(left).layout(Layout::left_to_right(Align::Center)), |ui| {
-                    ui.set_clip_rect(left.expand2(vec2(0.0, 2.0)));
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                // Vänster del: bryts till en andra rad när fönstret är smalt.
+                ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                     // Stil
                     egui::ComboBox::from_id_salt("kladd-word-style")
                         .width(130.0)
@@ -301,7 +430,42 @@ impl KladdApp {
                                 }
                             }
                         });
-                    divider(ui, p);
+                    // Typsnitt och storlek
+                    egui::ComboBox::from_id_salt("kladd-word-font")
+                        .width(150.0)
+                        .selected_text(cur_font.clone())
+                        .show_ui(ui, |ui| {
+                            let pick = |f: &str| {
+                                BarAct::Span(SpanProp::FontFamily(
+                                    (!f.eq_ignore_ascii_case(&default_font)).then(|| f.to_owned()),
+                                ))
+                            };
+                            for f in &used_fonts {
+                                if ui.selectable_label(f.eq_ignore_ascii_case(&cur_font), f).clicked() {
+                                    acts.push(pick(f));
+                                }
+                            }
+                            ui.separator();
+                            for f in self.doc_fonts.installed() {
+                                if used_fonts.iter().any(|u| u.eq_ignore_ascii_case(f)) {
+                                    continue;
+                                }
+                                if ui.selectable_label(false, f).clicked() {
+                                    acts.push(pick(f));
+                                }
+                            }
+                        });
+                    egui::ComboBox::from_id_salt("kladd-word-size")
+                        .width(56.0)
+                        .selected_text(fmt_size(cur_size))
+                        .show_ui(ui, |ui| {
+                            for sz in SIZES {
+                                if ui.selectable_label((sz - cur_size).abs() < 0.01, fmt_size(sz)).clicked() {
+                                    let v = ((sz - default_size).abs() > 0.01).then_some(sz);
+                                    acts.push(BarAct::Span(SpanProp::FontSize(v)));
+                                }
+                            }
+                        });
                     // Tecken
                     for (glyph, style, on, tip, m) in [
                         ("F", GlyphStyle::Bold, act.bold, "Fetstil (Ctrl+B)", Inline::Bold),
@@ -311,6 +475,73 @@ impl KladdApp {
                     ] {
                         if icons::glyph_toggle(ui, p, glyph, style, on, tip).clicked() {
                             acts.push(BarAct::Inline(m));
+                        }
+                    }
+                    divider(ui, p);
+                    // Färger
+                    let (main, arrow) = icons::color_button(
+                        ui,
+                        p,
+                        Icon::TextColor,
+                        rgb_color(text_color),
+                        "Textfärg",
+                        "Välj textfärg",
+                    );
+                    if main.clicked() {
+                        acts.push(BarAct::Span(SpanProp::Color(Some(text_color))));
+                    }
+                    Popup::menu(&arrow).gap(4.0).width(214.0).show(|ui| {
+                        let rows: Vec<Vec<(String, [u8; 3])>> = TEXT_COLORS
+                            .iter()
+                            .map(|r| {
+                                r.iter()
+                                    .map(|c| {
+                                        let rgb = [(c >> 16) as u8, (c >> 8) as u8, *c as u8];
+                                        (crate::style::hex(rgb), rgb)
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        if let Some(c) = color_popup(ui, p, "Automatisk", &rows, act.span.color) {
+                            acts.push(BarAct::Span(SpanProp::Color(c)));
+                            acts.push(BarAct::TextColor(c));
+                        }
+                    });
+                    let (main, arrow) = icons::color_button(
+                        ui,
+                        p,
+                        Icon::Highlight,
+                        rgb_color(highlight),
+                        "Markera text",
+                        "Välj markeringsfärg",
+                    );
+                    if main.clicked() {
+                        acts.push(BarAct::Span(SpanProp::Background(Some(highlight))));
+                    }
+                    Popup::menu(&arrow).gap(4.0).width(214.0).show(|ui| {
+                        let all: Vec<(String, [u8; 3])> = HIGHLIGHTS
+                            .iter()
+                            .filter_map(|(id, name)| {
+                                let rgb = crate::style::highlight_rgb(id)?;
+                                Some((format!("{name} ({})", crate::style::hex(rgb)), rgb))
+                            })
+                            .collect();
+                        let rows = vec![all[..8].to_vec(), all[8..].to_vec()];
+                        if let Some(c) = color_popup(ui, p, "Ingen färg", &rows, act.span.background) {
+                            acts.push(BarAct::Span(SpanProp::Background(c)));
+                            acts.push(BarAct::Highlight(c));
+                        }
+                    });
+                    divider(ui, p);
+                    // Justering
+                    for (icon, al, tip) in [
+                        (Icon::AlignLeft, markup::Align::Left, "Vänsterjustera (Ctrl+L)"),
+                        (Icon::AlignCenter, markup::Align::Center, "Centrera (Ctrl+E)"),
+                        (Icon::AlignRight, markup::Align::Right, "Högerjustera (Ctrl+R)"),
+                        (Icon::AlignJustify, markup::Align::Justify, "Marginaljustera (Ctrl+J)"),
+                    ] {
+                        if icons::toggle_button(ui, p, icon, act.align == al, tip).clicked() {
+                            acts.push(BarAct::Align(al));
                         }
                     }
                     divider(ui, p);
@@ -358,6 +589,8 @@ impl KladdApp {
                     }
                 });
             });
+        let bar = panel.response.rect;
+        ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, p.line));
 
         for a in acts {
             match a {
@@ -367,6 +600,10 @@ impl KladdApp {
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
+                BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
+                BarAct::Align(al) => self.word_edit(&ctx, |t, s| markup::set_align(t, s, al)),
+                BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
+                BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
                 BarAct::Zoom(d) => self.word_zoom_step(d),
                 BarAct::ZoomReset => self.settings.word_zoom = 1.0,
                 BarAct::ToMarkdown => {
@@ -927,7 +1164,7 @@ fn image_uri(src: &str, doc_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::page_breaks;
+    use super::{page_breaks, step_size};
 
     #[test]
     fn sidbrytning_mellan_rader() {
@@ -947,5 +1184,15 @@ mod tests {
         assert_eq!(page_breaks(&tall, 100.0).len(), 2);
         assert!(page_breaks(&rows[..5], 100.0).is_empty());
         assert!(page_breaks(&[], 100.0).is_empty());
+    }
+
+    #[test]
+    fn size_steps_follow_the_list() {
+        assert_eq!(step_size(11.0, 1), 12.0);
+        assert_eq!(step_size(10.0, 1), 10.5);
+        assert_eq!(step_size(11.0, -1), 10.5);
+        assert_eq!(step_size(8.0, -1), 8.0);
+        assert_eq!(step_size(72.0, 1), 82.0);
+        assert_eq!(step_size(13.0, 1), 14.0);
     }
 }

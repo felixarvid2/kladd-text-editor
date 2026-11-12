@@ -80,7 +80,7 @@ Kladd öppnar `.docx` i dokumentläge, som liknar ett Word-dokument. När du spa
 
 Ett öppnat `.docx` visas på en vit A4-sida mot grå bakgrund, med typografi som liknar Word. Typsnittet är Carlito, som är metriskt likt Calibri. Listor är indragna, tabeller ritas som rutnät, bilder visas i texten och sidbrytningar markeras med "Sida N". Markdown-koden är dold; den visas nedtonad bara på raden där markören står.
 
-Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, infoga bild och tabell, ångra och gör om samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
+Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, infoga bild och tabell, ångra och gör om samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
 
 Vill du se dokumentet som vanlig Markdown-text klickar du på *Markdown* i formateringsfältet. Klicka på *Visa som dokument* i statusfältet för att gå tillbaka.
 
@@ -136,6 +136,8 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | Fet / kursiv / understruken (endast dokumentläge) |
 | `Ctrl+Alt+1` / `Ctrl+Alt+2` / `Ctrl+Alt+3` | Rubrik 1 / 2 / 3 (endast dokumentläge) |
 | `Ctrl+Alt+0` | Brödtext (endast dokumentläge) |
+| `Ctrl+L` / `Ctrl+E` / `Ctrl+R` / `Ctrl+J` | Vänster-, center-, höger- och marginaljustera (endast dokumentläge) |
+| `Ctrl+Shift+>` / `Ctrl+Shift+<` (eller `Ctrl+]` / `Ctrl+[`) | Större / mindre text, ett steg (endast dokumentläge) |
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Markdownförhandsvisning |
 | `Ctrl+Shift+L` | Byt tema |
