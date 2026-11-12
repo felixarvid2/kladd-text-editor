@@ -41,11 +41,23 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 
 ## Kom igång
 
-Ladda ner det senaste `.deb`-paketet från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest) och installera det med:
+Ladda ner det senaste paketet för ditt system från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest).
+
+**Linux (Ubuntu/Debian)** – installera `.deb`-paketet:
 
 ```bash
 sudo apt install ./kladd_*.deb
 ```
+
+**Windows** – kör `Kladd-<version>-windows-x64-setup.exe`. Installationen sker för din användare och kräver inte administratör (dialogen låter dig välja installation för alla). Du kan lägga till en genväg på skrivbordet och låta Kladd synas under *Öppna med* för `.docx`, `.odt`, `.md` och `.txt`. Vill du slippa installera finns även `Kladd-<version>-windows-x64.zip`: packa upp och kör `kladd.exe`. Programmet är inte signerat, så Windows SmartScreen varnar vid första starten: välj *Mer information* och sedan *Kör ändå*.
+
+**macOS** (11 eller nyare, Apple Silicon och Intel) – öppna `Kladd-<version>-macos-universal.dmg` och dra Kladd till mappen Program. Programmet är inte notariserat, så första gången måste du högerklicka på Kladd och välja *Öppna* (och bekräfta). Alternativt tar du bort karantänmärkningen i Terminalen:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Kladd.app
+```
+
+På macOS skickar Finder inte filen till programmet när du väljer *Öppna med → Kladd* på en fil. Öppna filerna i stället med *Arkiv → Öppna* eller genom att dra dem till Kladd-fönstret eller ikonen i Dock.
 
 Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
 

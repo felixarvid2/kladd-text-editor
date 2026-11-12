@@ -15,7 +15,12 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-22.04
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 

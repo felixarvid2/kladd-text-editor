@@ -1,4 +1,5 @@
-# Bygger ett .deb-paket och skapar en GitHub-release.
+# Bygger paket för Linux (.deb), Windows (installationsprogram och zip) och
+# macOS (.dmg, universell) och skapar en GitHub-release med alla.
 #
 # Två sätt att släppa en ny version (höj först `version` i Cargo.toml):
 #   1. Pusha en tagg:  git tag v1.4.0 && git push origin v1.4.0
@@ -6,7 +7,7 @@
 #   2. Kör workflowen för hand (Actions → Release → Run workflow) med
 #      "Publicera release" ikryssat. Då skapas taggen v<version> på den valda
 #      grenens senaste commit.
-# Körs workflowen för hand utan kryss byggs paketet bara som en artefakt.
+# Körs workflowen för hand utan kryss byggs paketen bara som artefakter.
 # Release-anteckningarna hämtas från avsnittet för versionen i CHANGELOG.md
 # (annars genereras de automatiskt). För en redan publicerad release: kör
 # workflowen för hand med "update_notes" ifylld (t.ex. v1.5.0); då byts bara
@@ -58,10 +59,13 @@ jobs:
           printf '\nFullständig ändringslogg: https://github.com/%s/blob/main/CHANGELOG.md\n' "$GITHUB_REPOSITORY" >> notes.md
           gh release edit "$TAG" --notes-file notes.md
 
-  deb:
+  meta:
+    # Läser versionen och kontrollerar taggen en gång för alla byggjobb.
     if: github.event_name != 'workflow_dispatch' || inputs.update_notes == ''
-    # 22.04 ger ett paket som också fungerar på nyare Ubuntu (äldre glibc).
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +81,13 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  deb:
+    needs: meta
+    # 22.04 ger ett paket som också fungerar på nyare Ubuntu (äldre glibc).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -96,14 +107,121 @@ jobs:
         with:
           name: kladd-deb
           path: target/debian/*.deb
+          if-no-files-found: error
+
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bygg
+        run: cargo build --release --locked
+
+      - name: Zip
+        run: |
+          name="Kladd-${VERSION}-windows-x64"
+          mkdir -p "dist/$name/licenses"
+          cp target/release/kladd.exe README.md LICENSE "dist/$name/"
+          cp assets/fonts/OFL.txt "dist/$name/licenses/FONT-LICENSE.txt"
+          cp assets/fonts/Carlito-OFL.txt "dist/$name/licenses/CARLITO-FONT-LICENSE.txt"
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist/$name' -DestinationPath 'dist/$name.zip'"
+          rm -rf "dist/$name"
+
+      - name: Installera Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Bygg installationsprogram
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" packaging\windows\kladd.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kladd-windows
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+
+  macos:
+    needs: meta
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bygg för Apple Silicon och Intel
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Bygg Kladd.app
+        run: |
+          app="dist/dmg/Kladd.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/licenses"
+          lipo -create -output "$app/Contents/MacOS/kladd" \
+            target/aarch64-apple-darwin/release/kladd \
+            target/x86_64-apple-darwin/release/kladd
+          lipo -info "$app/Contents/MacOS/kladd"
+          sed "s/@VERSION@/${VERSION}/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          cp packaging/icons/kladd.icns "$app/Contents/Resources/kladd.icns"
+          cp LICENSE README.md "$app/Contents/Resources/licenses/"
+          cp assets/fonts/OFL.txt "$app/Contents/Resources/licenses/FONT-LICENSE.txt"
+          cp assets/fonts/Carlito-OFL.txt "$app/Contents/Resources/licenses/CARLITO-FONT-LICENSE.txt"
+          # Ad hoc-signering (ingen utvecklarfil) krävs för att appen ska starta på Apple Silicon.
+          codesign --force --deep -s - "$app"
+          codesign --verify --deep --strict "$app"
+
+      - name: Skapa .dmg
+        run: |
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname Kladd -srcfolder dist/dmg -ov -format UDZO \
+            "dist/Kladd-${VERSION}-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kladd-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [meta, deb, windows, macos]
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Skapa release
-        if: github.ref_type == 'tag' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
+          ls -l artifacts
           # Anteckningarna är avsnittet för versionen i CHANGELOG.md, utan rubrikraden.
           awk -v v="$VERSION" '
             /^## \[/ { if (on) exit; on = (index($0, "## [" v "]") == 1); next }
@@ -115,7 +233,7 @@ jobs:
             echo "::warning::CHANGELOG.md har inget avsnitt för $VERSION, genererar anteckningar automatiskt"
             notes=(--generate-notes)
           fi
-          gh release create "$TAG" target/debian/*.deb \
+          gh release create "$TAG" artifacts/* \
             --target "$GITHUB_SHA" \
             --title "Kladd $VERSION" \
             "${notes[@]}"

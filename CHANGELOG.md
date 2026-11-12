@@ -4,6 +4,13 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **Kladd för Windows och macOS.** Varje release innehåller nu ett installationsprogram och en zip för Windows (x64) samt en universell `.dmg` för macOS (Apple Silicon och Intel), förutom `.deb` för Linux. Paketen är inte signerade; se "Kom igång" i README för hur första starten går till.
+- Windows-installationsprogrammet installerar per användare utan administratörsrättigheter, lägger Kladd i Startmenyn, kan lägga en genväg på skrivbordet och kan visa Kladd under *Öppna med* för `.docx`, `.odt`, `.md` och `.txt`. Det finns på svenska och engelska.
+- Ikon och versionsinformation (Kladd, version, upphovsman) finns i `kladd.exe`, och Kladd har en macOS-ikon (`kladd.icns`).
+- Testerna körs nu på Linux, Windows och macOS i CI.
+
 ## [1.7.0] – 2026-11-12
 
 ### Nytt
