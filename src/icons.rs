@@ -24,6 +24,13 @@ pub enum Icon {
     Quote,
     Image,
     Table,
+    TableRowAbove,
+    TableRowBelow,
+    TableColLeft,
+    TableColRight,
+    TableDelRow,
+    TableDelCol,
+    TableDelete,
     /// Ett pappersark med vikt hörn.
     Page,
     Undo,
@@ -181,6 +188,46 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             painter.rect_stroke(r, 1.5, s, egui::StrokeKind::Middle);
             painter.line_segment([pos2(c.x, r.top()), pos2(c.x, r.bottom())], s);
             painter.line_segment([pos2(r.left(), c.y), pos2(r.right(), c.y)], s);
+        }
+        Icon::TableRowAbove | Icon::TableRowBelow | Icon::TableColLeft | Icon::TableColRight => {
+            // Litet rutnät med ett plustecken på den sida där det nya kommer.
+            let (dx, dy, w, h, px_, py_) = match icon {
+                Icon::TableRowAbove => (0.0, 2.5, 14.0, 8.0, 0.0, -5.5),
+                Icon::TableRowBelow => (0.0, -2.5, 14.0, 8.0, 0.0, 5.5),
+                Icon::TableColLeft => (2.5, 0.0, 8.0, 12.0, -5.5, 0.0),
+                _ => (-2.5, 0.0, 8.0, 12.0, 5.5, 0.0),
+            };
+            let r = Rect::from_center_size(c + vec2(dx, dy), vec2(w, h));
+            let s1 = Stroke::new(1.2, color);
+            painter.rect_stroke(r, 1.0, s1, egui::StrokeKind::Middle);
+            painter.line_segment([pos2(r.center().x, r.top()), pos2(r.center().x, r.bottom())], s1);
+            painter.line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], s1);
+            let pc = c + vec2(px_, py_);
+            painter.line_segment([pc + vec2(-2.5, 0.0), pc + vec2(2.5, 0.0)], s);
+            painter.line_segment([pc + vec2(0.0, -2.5), pc + vec2(0.0, 2.5)], s);
+        }
+        Icon::TableDelRow | Icon::TableDelCol | Icon::TableDelete => {
+            // Rutnät; den borttagna raden/kolumnen fylld, hela tabellen överstruken.
+            let r = Rect::from_center_size(c, vec2(14.0, 12.0));
+            let s1 = Stroke::new(1.2, color);
+            match icon {
+                Icon::TableDelRow => {
+                    let band = Rect::from_min_max(pos2(r.left(), r.center().y - 2.0), pos2(r.right(), r.center().y + 2.0));
+                    painter.rect_filled(band, 0.0, color.gamma_multiply(0.5));
+                }
+                Icon::TableDelCol => {
+                    let band = Rect::from_min_max(pos2(r.center().x - 2.5, r.top()), pos2(r.center().x + 2.5, r.bottom()));
+                    painter.rect_filled(band, 0.0, color.gamma_multiply(0.5));
+                }
+                _ => {}
+            }
+            painter.rect_stroke(r, 1.0, s1, egui::StrokeKind::Middle);
+            painter.line_segment([pos2(c.x, r.top()), pos2(c.x, r.bottom())], s1);
+            painter.line_segment([pos2(r.left(), c.y), pos2(r.right(), c.y)], s1);
+            if matches!(icon, Icon::TableDelete) {
+                painter.line_segment([c + vec2(-6.0, -6.0), c + vec2(6.0, 6.0)], s);
+                painter.line_segment([c + vec2(6.0, -6.0), c + vec2(-6.0, 6.0)], s);
+            }
         }
         Icon::Page => {
             let r = Rect::from_center_size(c, vec2(11.0, 14.0));

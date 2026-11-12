@@ -172,6 +172,8 @@ pub const HIDDEN_PX: f32 = 0.01;
 
 /// Cellmarginal i tabeller (pt).
 const CELL_PAD_PT: f32 = 5.4;
+/// Minsta bredd (em) på en kolumn där alla celler är tomma.
+const EMPTY_COL_EM: f32 = 3.0;
 
 fn hidden_format(family: FontFamily) -> TextFormat {
     TextFormat {
@@ -486,21 +488,6 @@ pub fn tables(text: &str, a: &Analysis) -> Vec<Table> {
     out
 }
 
-/// Utvidgar `reveal` så att en tabell som markören står i visas helt (rå Markdown).
-pub fn reveal_whole_tables(tables: &[Table], reveal: Range<usize>) -> Range<usize> {
-    if reveal.is_empty() {
-        return reveal;
-    }
-    let mut r = reveal;
-    for t in tables {
-        if intersects(&t.region, &r) {
-            r.start = r.start.min(t.region.start);
-            r.end = r.end.max(t.region.end);
-        }
-    }
-    r
-}
-
 /// Sektionsbyggare: delar bitar vid `cuts` och lägger över `marks` (egna format för intervall).
 struct Builder {
     secs: Vec<(Range<usize>, TextFormat)>,
@@ -596,7 +583,11 @@ fn grid_table(
     }
     let mut col_x = vec![0.0f32; ncols + 1];
     for j in 0..ncols {
-        let w = rows.iter().filter_map(|(_, c)| c.get(j)).map(|c| c.w).fold(0.0, f32::max);
+        let mut w = rows.iter().filter_map(|(_, c)| c.get(j)).map(|c| c.w).fold(0.0, f32::max);
+        // En helt tom kolumn får minst 3 em så att cellerna går att klicka i.
+        if w == 0.0 {
+            w = EMPTY_COL_EM * size;
+        }
         col_x[j + 1] = col_x[j] + w + 2.0 * pad;
     }
     let hid = hidden_format(theme::doc_font(false, false));
@@ -607,7 +598,10 @@ fn grid_table(
             let trail_ws = s.len() - s.trim_end().len();
             if lead_ws == s.len() {
                 if !s.is_empty() {
-                    bld.marks.push((c.start..c.end, hid.clone()));
+                    // Tom cell: behåll radhöjden så att en helt tom rad inte kollapsar.
+                    let mut f = hid.clone();
+                    f.line_height = Some(size * 1.4);
+                    bld.marks.push((c.start..c.end, f));
                 }
             } else {
                 if lead_ws > 0 {
@@ -637,9 +631,9 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
     let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new() };
     let mut leads: BTreeMap<usize, f32> = BTreeMap::new();
 
-    // Tabeller som inte visas rått blir rutnät.
-    let tabs = tables(text, a);
-    let grid: Vec<&Table> = tabs.iter().filter(|t| !intersects(&t.region, &p.reveal)).collect();
+    // Tabeller är alltid rutnät, också med markören i dem: bara inline-markup i markörens cell
+    // visas (via `reveal`), aldrig pipor eller avgränsarrad.
+    let grid = tables(text, a);
     for t in &grid {
         grid_table(text, a, t, p, &mut bld, &mut leads);
     }
@@ -665,7 +659,9 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
         }
         let revealed = intersects(&r, &p.reveal);
         let hide = !revealed;
-        let grid_hdr = if pc.block == Block::Table && !revealed {
+        // Tabellpipor förblir dolda också när markören står i cellen bredvid.
+        let hide = hide || (pc.block == Block::Table && pc.markup && &text[r.clone()] == "|");
+        let grid_hdr = if pc.block == Block::Table {
             grid.iter()
                 .find(|t| t.region.start <= r.start && r.start < t.region.end)
                 .map(|t| t.rows.first().is_some_and(|row| r.start <= row.line.end))
@@ -1160,13 +1156,34 @@ mod tests {
     }
 
     #[test]
-    fn table_raw_when_revealed() {
-        let t = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+    fn table_stays_grid_with_caret_inside() {
+        let pal = theme::palette(false);
+        let t = "| a | **b** |\n|---|---|\n| 1 | 2 |\n";
+        // Markören i cellen "b": bara dess `**` visas, pipor och avgränsarrad förblir dolda.
+        let b = t.find('b').unwrap();
+        let job = build(t, b - 2..b + 3, "");
+        assert_eq!(sec_at(&job, 0).format.color, Color32::TRANSPARENT);
+        assert_eq!(sec_at(&job, b - 2).format.color, pal.page_markup);
+        assert_eq!(sec_at(&job, t.find("|---").unwrap()).format.color, Color32::TRANSPARENT);
+        assert_ne!(sec_at(&job, t.find('1').unwrap()).format.font_id.family, FontFamily::Monospace);
+        // Rutnätet finns kvar (cellmarginalen före texten).
+        assert!(job.sections.iter().any(|s| s.leading_space > 0.0));
+        // Även en markering över hela tabellen avslöjar inga pipor.
         let job = build(t, 0..t.len(), "");
-        let s = sec_at(&job, 0);
-        assert_eq!(s.format.font_id.family, FontFamily::Monospace);
-        assert_ne!(s.format.color, Color32::TRANSPARENT);
-        assert!(job.sections.iter().all(|s| s.leading_space == 0.0));
+        assert_eq!(sec_at(&job, 0).format.color, Color32::TRANSPARENT);
+        assert!(job.sections.iter().any(|s| s.leading_space > 0.0));
+    }
+
+    #[test]
+    fn empty_columns_keep_a_minimum_width() {
+        let t = "| a |  |\n| --- | --- |\n| 1 |  |\n";
+        let job = build(t, 0..0, "");
+        // Pipan efter den tomma cellen skjuts ut minst 3 em.
+        let last = t.find("|\n|").unwrap();
+        assert!(sec_at(&job, last).leading_space >= 3.0 * px(1.0, 11.0), "{}", sec_at(&job, last).leading_space);
+        // Den tomma cellen behåller radhöjden så att en helt tom rad syns.
+        let blank = t.rfind("|  |").unwrap() + 1;
+        assert!(sec_at(&job, blank).format.line_height.unwrap_or(0.0) >= px(1.0, 11.0));
     }
 
     #[test]

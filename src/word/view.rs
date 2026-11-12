@@ -19,6 +19,7 @@ use egui::{
 use super::layout::{self, px};
 use super::pages;
 use super::markup::{self, Block, Inline, SpanProp};
+use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
 use crate::theme::Palette;
@@ -103,6 +104,7 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    TableOp(TableOp),
     PageSetup,
     Undo,
     Redo,
@@ -195,10 +197,6 @@ fn divider(ui: &mut Ui, p: &Palette) {
     ui.add_space(4.0);
 }
 
-fn overlaps_strict(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start < b.end && b.start < a.end
-}
-
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end || (a.start == a.end && b.start <= a.start && a.start < b.end)
 }
@@ -210,7 +208,7 @@ impl KladdApp {
     }
 
     /// Markeringen i den aktiva flikens editor, som byteintervall.
-    fn word_selection(&self, ctx: &egui::Context) -> Range<usize> {
+    pub(crate) fn word_selection(&self, ctx: &egui::Context) -> Range<usize> {
         let Some(doc) = self.docs.get(self.active) else { return 0..0 };
         let state = TextEditState::load(ctx, editor_id(doc.id)).unwrap_or_default();
         match state.cursor.char_range() {
@@ -332,6 +330,7 @@ impl KladdApp {
                 return;
             }
         }
+        self.word_table_keys(ctx);
         self.word_paste_html(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
@@ -391,6 +390,7 @@ impl KladdApp {
         }
         let sel = self.word_selection(&ctx);
         let doc = &self.docs[self.active];
+        let in_table = markup::table_at(&doc.text, sel.start).is_some();
         let analysis = self.word.analysis(doc.id, &doc.text);
         let act = markup::active(&doc.text, &analysis, sel);
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
@@ -576,6 +576,12 @@ impl KladdApp {
                     if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
                         acts.push(BarAct::Table);
                     }
+                    if in_table {
+                        divider(ui, p);
+                        if let Some(op) = tables::bar_group(ui, p) {
+                            acts.push(BarAct::TableOp(op));
+                        }
+                    }
                     if icons::button(ui, p, Icon::Page, 28.0, false, "Sidinställningar", p.chrome).clicked() {
                         acts.push(BarAct::PageSetup);
                     }
@@ -613,6 +619,7 @@ impl KladdApp {
                 BarAct::Inline(m) => self.word_toggle(&ctx, m),
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
+                BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::Undo => self.word_undo(&ctx, false),
@@ -756,10 +763,8 @@ impl KladdApp {
             // Markupen visas bara på markörens rader när editorn har fokus.
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
-            let reveal = if focused { markup::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
-            // Står markören i en tabell visas hela tabellen som rå Markdown.
+            let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
             let tabs = layout::tables(&self.docs[self.active].text, &analysis);
-            let reveal = layout::reveal_whole_tables(&tabs, reveal);
 
             let (query, case_sensitive) = if self.find.open {
                 (self.find.query.clone(), self.find.case_sensitive)
@@ -791,6 +796,8 @@ impl KladdApp {
             let mut edited = false;
             let mut spell_act: Option<SpellAct> = None;
             let mut new_target: Option<Option<SpellTarget>> = None;
+            let mut table_menu: Option<bool> = None;
+            let mut table_act: Option<TableOp> = None;
             let mut page_pos = (1usize, 1usize);
             let mut open_page_dlg = false;
 
@@ -849,6 +856,8 @@ impl KladdApp {
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
+                // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
+                tables::fix_caret(ui.ctx(), id, text);
 
                 // Ett ark per sida, med luft emellan.
                 let total = pages::page_count(&galley, &geom);
@@ -956,7 +965,7 @@ impl KladdApp {
                     let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
                     let mut conv = ByteToChar::new(text);
-                    for t in tabs.iter().filter(|t| !overlaps_strict(&t.region, &reveal)) {
+                    for t in tabs.iter() {
                         for (ri, row) in t.rows.iter().enumerate() {
                             let (Some(&first), Some(&last)) = (row.pipes.first(), row.pipes.last()) else { continue };
                             if row.delimiter || first == last {
@@ -1037,30 +1046,40 @@ impl KladdApp {
                         }
                     }
                     new_target = Some(found);
+                    table_menu = Some(tables::on_secondary_click(ui.ctx(), id, text, ui.ctx().pointer_interact_pos().map(|pos| char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0))));
                 }
                 let target = match &new_target {
                     Some(t) => t.clone(),
                     None => secondary_target.clone(),
                 };
-                if let Some(t) = target {
+                let in_table_menu = table_menu.unwrap_or_else(|| tables::menu_open(ui.ctx()));
+                if target.is_some() || in_table_menu {
                     out.response.context_menu(|ui| {
                         ui.set_min_width(210.0);
                         ui.set_max_width(260.0);
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        if t.suggestions.is_empty() {
-                            ui.add_enabled(false, egui::Label::new("Inga förslag"));
-                        }
-                        for s in t.suggestions.iter().take(6) {
-                            if menu_item(ui, p, s, "", None, true) {
-                                spell_act = Some(SpellAct::Replace(t.range.clone(), s.clone()));
+                        if let Some(t) = &target {
+                            if t.suggestions.is_empty() {
+                                ui.add_enabled(false, egui::Label::new("Inga förslag"));
+                            }
+                            for s in t.suggestions.iter().take(6) {
+                                if menu_item(ui, p, s, "", None, true) {
+                                    spell_act = Some(SpellAct::Replace(t.range.clone(), s.clone()));
+                                }
+                            }
+                            menu_divider(ui, p);
+                            if menu_item(ui, p, "Ignorera alla", "", None, true) {
+                                spell_act = Some(SpellAct::Ignore(t.word.clone()));
+                            }
+                            if menu_item(ui, p, "Lägg till i ordlistan", "", None, true) {
+                                spell_act = Some(SpellAct::Add(t.word.clone()));
+                            }
+                            if in_table_menu {
+                                menu_divider(ui, p);
                             }
                         }
-                        menu_divider(ui, p);
-                        if menu_item(ui, p, "Ignorera alla", "", None, true) {
-                            spell_act = Some(SpellAct::Ignore(t.word.clone()));
-                        }
-                        if menu_item(ui, p, "Lägg till i ordlistan", "", None, true) {
-                            spell_act = Some(SpellAct::Add(t.word.clone()));
+                        if in_table_menu {
+                            table_act = tables::menu_items(ui, p);
                         }
                     });
                 }
@@ -1080,6 +1099,9 @@ impl KladdApp {
             }
             if edited {
                 self.find.current = None;
+            }
+            if let Some(op) = table_act {
+                self.word_table_op(&ctx, op);
             }
             match spell_act {
                 Some(SpellAct::Replace(r, s)) => {
