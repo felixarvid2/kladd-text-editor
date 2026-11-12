@@ -106,6 +106,7 @@ struct DocState {
     analysis: Arc<Analysis>,
     tables: Option<Arc<Vec<Table>>>,
     images: Option<Arc<Vec<markup::ImageRef>>>,
+    headings: Option<Arc<Vec<super::nav::Heading>>>,
     fonts: Option<Arc<BTreeSet<(String, bool, bool)>>>,
     /// Hela galleriet för förra bildrutan, med nyckeln det byggdes med.
     frame: Option<(u64, Arc<Galley>)>,
@@ -142,6 +143,7 @@ impl Cache {
             analysis: Arc::new(markup::analyze(text)),
             tables: None,
             images: None,
+            headings: None,
             fonts: None,
             frame: None,
             units: HashMap::new(),
@@ -154,6 +156,7 @@ impl Cache {
             st.analysis = Arc::new(markup::analyze(text));
             st.tables = None;
             st.images = None;
+            st.headings = None;
             st.fonts = None;
         }
         st
@@ -176,6 +179,13 @@ impl Cache {
     /// Bilderna i ordning (räknas om bara när texten ändrats).
     pub fn images(&mut self, doc_id: u64, text: &str) -> Arc<Vec<markup::ImageRef>> {
         self.state(doc_id, text).images()
+    }
+
+    /// Rubrikerna i ordning (räknas om bara när texten ändrats).
+    pub fn headings(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::nav::Heading>> {
+        let st = self.state(doc_id, text);
+        let (t, a) = (&st.text, &st.analysis);
+        st.headings.get_or_insert_with(|| Arc::new(super::nav::headings(t, a))).clone()
     }
 
     /// Typsnitten dokumentet använder (räknas om bara när texten ändrats).
@@ -296,6 +306,7 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         }
         para.image_w.to_bits().hash(&mut h);
         para.collapse.hash(&mut h);
+        para.toc_h.to_bits().hash(&mut h);
     }
     // Markörens rader i förhållande till fönstret.
     if intersects(&p.reveal, w) {
@@ -1100,6 +1111,8 @@ struct Para {
     image_w: f32,
     /// Dold taggrad (div, standardkommentaren) eller tom rad intill en: ~0 höjd.
     collapse: bool,
+    /// Innehållsförteckning (`<!-- kladd: toc -->`, dold): radens höjd i px, annars 0.
+    toc_h: f32,
 }
 
 /// Styckena i texten. En avslutande `\n` ger ett tomt sista stycke.
@@ -1107,6 +1120,8 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
     // 0 = vanligt stycke, 1 = dold öppningstagg/kommentar, 2 = dold stängningstagg.
     let mut tag: Vec<u8> = Vec::new();
     let mut out: Vec<Para> = Vec::new();
+    // Innehållsförteckningens höjd räknas först när en sådan rad hittas (beror på rubrikerna).
+    let mut toc_h: Option<f32> = None;
     let mut s = 0;
     loop {
         let e = text[s..].find('\n').map_or(text.len(), |i| s + i);
@@ -1149,7 +1164,16 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             .filter_map(|img| (p.image_size)(&super::images::size_key(img)))
             .map(|sz| sz.x)
             .sum();
-        out.push(Para { range, align, list, image_w, collapse: tag.last() != Some(&0) });
+        let collapse = tag.last() != Some(&0);
+        let toc = if collapse && t == super::nav::TOC_LINE {
+            Some(*toc_h.get_or_insert_with(|| {
+                let n = super::nav::toc_entries(&super::nav::headings(text, a)).len();
+                super::nav::toc_size_for(p.zoom, &a.defaults, n).1
+            }))
+        } else {
+            None
+        };
+        out.push(Para { range, align, list, image_w, collapse, toc_h: toc.unwrap_or(0.0) });
         if e >= text.len() {
             break;
         }
@@ -1291,7 +1315,13 @@ fn justify_row(
 fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: f32, ppp: f32) -> Arc<Galley> {
     let mut pj = clip_job(full, para.range.clone());
     if para.collapse {
-        let h = if para.range.is_empty() { 1.0 } else { HIDDEN_PX };
+        let h = if para.toc_h > 0.0 {
+            para.toc_h
+        } else if para.range.is_empty() {
+            1.0
+        } else {
+            HIDDEN_PX
+        };
         for s in &mut pj.sections {
             s.format.line_height = Some(h);
         }
@@ -1817,6 +1847,70 @@ mod tests {
         let at = t.find("<div").unwrap();
         let (_, d2, ..) = heights(at..at + 20);
         assert!(d2 > 10.0, "{d2}");
+    }
+
+    #[test]
+    fn toc_line_reserves_height_and_headings_map_to_pages() {
+        use crate::word::{nav, pages};
+        let filler = "Brödtext som fyller sidan. ".repeat(12);
+        let mut t = format!("# Början\n\n{}\n\n", nav::TOC_LINE);
+        for i in 0..4 {
+            t.push_str(&format!("## Avsnitt {i}\n\n"));
+            for _ in 0..14 {
+                t.push_str(&format!("{filler}\n\n"));
+            }
+        }
+        t.push_str("### Slut\n\nsista\n");
+        let a = markup::analyze(&t);
+        let heads = nav::headings(&t, &a);
+        let n = nav::toc_entries(&heads).len();
+        assert_eq!(n, 6);
+        let want = nav::toc_size_for(1.0, &a.defaults, n).1;
+        let geom = pages::Geom::new(1.0, &a.defaults);
+        let pg = theme::palette(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let img = |_: &str| None;
+        let run = |reveal: Range<usize>| {
+            let p = Params {
+                palette: &pg,
+                zoom: 1.0,
+                reveal,
+                matches: &[],
+                image_size: &img,
+                measure: &measure,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let job = layout_job(&t, &a, &p);
+            let mut res = None;
+            for _ in 0..2 {
+                let out = ctx.run_ui(Default::default(), |ui| {
+                    let mut g = ui.ctx().fonts_mut(|fo| layout_galley(fo, job.clone(), &a, &p, geom.text_w(), 1.0));
+                    pages::paginate(&mut g, &geom, 1.0);
+                    let row_h = |needle: &str| {
+                        let c = egui::text::CCursor::new(ci(&t, needle));
+                        g.rows[g.layout_from_cursor(c).row].height()
+                    };
+                    let page_of = |h: &nav::Heading| {
+                        let c = egui::text::CCursor::new(t[..h.start].chars().count());
+                        geom.page_of(g.pos_from_cursor(c).min.y)
+                    };
+                    res = Some((row_h("<!-- kladd"), heads.iter().map(page_of).collect::<Vec<_>>()));
+                });
+                std::mem::forget(out);
+            }
+            res.unwrap()
+        };
+        let (h, pages_of) = run(0..0);
+        assert!((h - want).abs() < 0.5, "{h} != {want}");
+        assert_eq!(pages_of[0], 0);
+        assert!(pages_of.windows(2).all(|w| w[0] <= w[1]), "{pages_of:?}");
+        assert!(*pages_of.last().unwrap() >= 3, "{pages_of:?}");
+        // Markören på raden visar kommentaren i stället (vanlig radhöjd).
+        let at = t.find("<!-- kladd").unwrap();
+        let (h2, _) = run(at..at + 5);
+        assert!(h2 < 40.0, "{h2}");
     }
 
     #[test]

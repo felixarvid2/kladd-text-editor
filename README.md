@@ -31,6 +31,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Syntaxfärgning** och radnummer.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`, med alternativ för versaler, hela ord och reguljära uttryck (`$1` och `${namn}` fungerar i ersättningen). I dokumentläget söker Kladd i den synliga texten, så "fet text" hittar `**fet** text`. Du kan också söka på formatering (fetstil, kursiv, färg, markering, rubrik) och låta *Ersätt* lägga på eller ta bort formatering på träffarna.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
+- **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
 - **Två teman** – *Gryning* och *Skymning*.
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
 - **Dra och släpp** filer direkt i fönstret.
@@ -93,6 +94,12 @@ Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat)
 ### Förlustfri sparning
 
 Kladd behåller alla delar av originalfilen, som sidhuvud, sidfot, fotnoter, kommentarer, teman och inställningar. Vid sparning skrivs bara de stycken om som du har ändrat; oförändrade stycken sparas exakt som de var. Objekt som Kladd inte kan visa, till exempel fotnotsreferenser, kommentarer, fält och textrutor, blir osynliga markörer `<!--k:N-->` i Markdown-texten och skrivs tillbaka när du sparar. Det enda som kan försvinna är spårade ändringar i stycken som du ändrar.
+
+### Navigering och innehållsförteckning
+
+Navigeringsfönstret (`Ctrl+Shift+O`, knappen längst upp till höger eller *Navigeringsfönster* i menyn) visar rubrikerna i Word-, ODT-, PDF- och Markdown-flikar, i både dokumentläge och textläge. Klicka på en rubrik för att flytta markören dit; pilen fäller ihop underrubriker och fältet *Sök i rubriker* filtrerar listan.
+
+*Infoga innehållsförteckning* (formateringsfältet eller menyn) sätter in raden `<!-- kladd: toc -->` vid markören. I dokumentläget visas rubrikerna H1–H3 med sidnummer; klicka på en post för att hoppa dit. Står markören på raden visas själva kommentaren. Sparas dokumentet som `.docx` blir det ett innehållsförteckningsfält som Word uppdaterar när filen öppnas (Word frågar då om fälten ska uppdateras), som `.odt` en `text:table-of-content` och som PDF en förteckning med riktiga sidnummer och länkar. Förteckningar som redan finns i ett öppnat Word- eller OpenDocument-dokument visas som samma rad.
 
 ### Sidor och utskrift
 
@@ -178,6 +185,7 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+Shift+>` / `Ctrl+Shift+<` (eller `Ctrl+]` / `Ctrl+[`) | Större / mindre text, ett steg (endast dokumentläge) |
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Markdownförhandsvisning |
+| `Ctrl+Shift+O` | Navigeringsfönster (rubrikträd) på/av |
 | `Ctrl+Shift+L` | Byt tema |
 | `Ctrl+Q` | Avsluta |
 

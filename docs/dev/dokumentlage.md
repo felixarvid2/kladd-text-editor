@@ -280,6 +280,12 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
   sidnummer (klickbara); Word skriver ett TOC-fält, ODT `text:table-of-content`, PDF/HTML/EPUB en
   lista med rubrikerna.
+  Dokumentläget reserverar raden (`Para::toc_h`, höjd efter antalet H1–H3-rubriker, högst en sida)
+  och ritar posterna ovanpå (`navui::paint_toc`); sidnumret är rubrikens sida i det redan
+  sidbrutna galleriet, så en passage räcker. PDF gör två passager (`pdf_write::lay_out`).
+- **Navigeringsfönster** (`word::nav`, `word::navui`): rubriker ur den cachade analysen
+  (`layout::Cache::headings`, dokumentläget) eller en radskanning (`nav::headings_scan`, textläget)
+  som görs om bara när texten ändrats.
 
 ## Prestanda
 

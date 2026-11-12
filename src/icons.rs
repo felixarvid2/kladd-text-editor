@@ -44,6 +44,10 @@ pub enum Icon {
     TextColor,
     /// Markeringspenna; färgstapeln under ritas av `color_button`.
     Highlight,
+    /// Rubrikträd (navigeringsfönstret).
+    Outline,
+    /// Innehållsförteckning: rader med sidnummer till höger.
+    Toc,
 }
 
 pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32) {
@@ -138,6 +142,21 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             }
             painter.line_segment([c + vec2(-3.5, -1.0), c + vec2(-5.5, 3.5)], s);
             painter.line_segment([c + vec2(-5.5, 3.5), c + vec2(0.5, 3.0)], s);
+        }
+        Icon::Outline => {
+            // Indragna rader: rubrik, underrubrik, underrubrik, rubrik.
+            for (dx, w, dy) in [(0.0, 11.0, -5.0), (3.5, 7.5, -1.7), (3.5, 7.5, 1.7), (0.0, 11.0, 5.0)] {
+                let x0 = -6.0 + dx;
+                painter.line_segment([c + vec2(x0, dy), c + vec2(x0 + w, dy)], s);
+            }
+        }
+        Icon::Toc => {
+            // Rader med punktlinjer och korta sidnummer längst till höger.
+            for dy in [-4.5, 0.0, 4.5] {
+                painter.line_segment([c + vec2(-6.5, dy), c + vec2(0.5, dy)], s);
+                painter.circle_filled(c + vec2(2.5, dy + 0.6), 0.6, color);
+                painter.line_segment([c + vec2(4.5, dy), c + vec2(6.5, dy)], s);
+            }
         }
         Icon::BulletList => {
             for dy in [-4.5, 0.0, 4.5] {

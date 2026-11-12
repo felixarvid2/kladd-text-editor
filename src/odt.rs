@@ -824,13 +824,18 @@ impl<'s, 'b> Rd<'s, 'b> {
                 let p = self.build_para(n, None);
                 self.emit(p);
             }
+            // Innehållsförteckningen blir raden `<!-- kladd: toc -->`; innehållet byggs om av Kladd.
+            "text:table-of-content" => {
+                let run = Run { text: crate::word::nav::TOC_LINE.to_owned(), fmt: Fmt::default(), link: None, raw: true };
+                self.blocks.push(Block::Para(Para { kind: Kind::Normal, runs: vec![run], align: Align::Left, list: None }));
+            }
             "text:list" => {
                 self.list_id += 1;
                 let id = self.list_id;
                 self.list(n, 0, None, id);
             }
             "table:table" => self.table(n),
-            "text:section" | "text:table-of-content" | "text:alphabetical-index" | "text:illustration-index"
+            "text:section" | "text:alphabetical-index" | "text:illustration-index"
             | "text:table-index" | "text:object-index" | "text:user-index" | "text:bibliography" | "text:index-body"
             | "text:index-title" => {
                 for c in n.els() {
@@ -1479,6 +1484,8 @@ struct W<'a> {
     media: Vec<(String, Vec<u8>, &'static str)>,
     missing: Vec<String>,
     text_w: f32,
+    /// Rubrikerna H1–H3 (nivå, text, uppskattad sida) till innehållsförteckningen.
+    toc: Vec<(u8, String, usize)>,
 }
 
 fn heading_num(level: HeadingLevel) -> u8 {
@@ -1548,6 +1555,7 @@ impl<'a> W<'a> {
             media: Vec::new(),
             missing: Vec::new(),
             text_w,
+            toc: Vec::new(),
         }
     }
 
@@ -1801,10 +1809,33 @@ impl<'a> W<'a> {
         self.after_space = false;
     }
 
+    /// Skriver innehållsförteckningen: `text:table-of-content` med rubriknivåer 1–3 och en
+    /// färdig förteckning (LibreOffice uppdaterar den via Verktyg > Uppdatera).
+    fn toc(&mut self) {
+        let mut x = String::from("<text:table-of-content text:protected=\"true\" text:name=\"Innehåll1\"><text:table-of-content-source text:outline-level=\"3\"><text:index-title-template text:style-name=\"Contents_20_Heading\">Innehåll</text:index-title-template>");
+        for n in 1..=3 {
+            x.push_str(&format!(
+                "<text:table-of-content-entry-template text:outline-level=\"{n}\" text:style-name=\"Contents_20_{n}\"><text:index-entry-link-start text:style-name=\"Internet_20_link\"/><text:index-entry-chapter/><text:index-entry-text/><text:index-entry-tab-stop style:type=\"right\" style:leader-char=\".\"/><text:index-entry-page-number/><text:index-entry-link-end/></text:table-of-content-entry-template>"
+            ));
+        }
+        x.push_str("</text:table-of-content-source><text:index-body><text:index-title text:name=\"Innehåll1_Head\"><text:p text:style-name=\"Contents_20_Heading\">Innehåll</text:p></text:index-title>");
+        for (level, text, page) in &self.toc {
+            x.push_str(&format!(
+                "<text:p text:style-name=\"Contents_20_{level}\">{}<text:tab/>{page}</text:p>",
+                esc(text)
+            ));
+        }
+        x.push_str("</text:index-body></text:table-of-content>");
+        self.body.push_str(&x);
+    }
+
     fn html(&mut self, s: &str) {
         let t = s.trim();
         let single_line = t.lines().count() == 1;
-        if t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />") {
+        if t == crate::word::nav::TOC_LINE {
+            self.close_para();
+            self.toc();
+        } else if t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />") {
             self.line_break();
         } else if let Some(style) = style::parse_span_open(s) {
             let merged = self.spans.last().map_or(style.clone(), |outer| outer.merged(&style));
@@ -1853,6 +1884,14 @@ impl<'a> W<'a> {
 
 fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: f32) -> W<'a> {
     let mut w = W::new(resolve, text_w);
+    if md.contains(crate::word::nav::TOC_LINE) {
+        let heads = crate::word::nav::headings_scan(md);
+        w.toc = crate::word::nav::toc_entries(&heads)
+            .into_iter()
+            // Grov uppskattning: ca 3 000 tecken per sida (LibreOffice räknar om vid uppdatering).
+            .map(|h| (h.level, h.text.clone(), 1 + md[..h.start].chars().count() / 3000))
+            .collect();
+    }
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -2118,6 +2157,16 @@ fn styles_xml(d: &DocDefaults) -> String {
             "<style:style style:name=\"Heading_20_{n}\" style:display-name=\"Heading {n}\" style:family=\"paragraph\" style:parent-style-name=\"Heading\" style:next-style-name=\"Text_20_body\" style:default-outline-level=\"{n}\" style:class=\"text\"><style:text-properties fo:font-size=\"{size}pt\" fo:color=\"#{color}\"/></style:style>"
         ));
     }
+    // Innehållsförteckningen: rubrik och tre nivåer med högerställd flik med prickar.
+    let text_w_pt = (pw - m[1] - m[3]).max(36.0);
+    named.push_str("<style:style style:name=\"Contents_20_Heading\" style:display-name=\"Contents Heading\" style:family=\"paragraph\" style:parent-style-name=\"Heading\" style:class=\"index\"><style:paragraph-properties fo:margin-top=\"0.423cm\" fo:margin-bottom=\"0.212cm\"/><style:text-properties fo:font-size=\"18pt\" fo:color=\"#1F3864\"/></style:style>");
+    for (n, indent_pt) in [(1, 0.0f32), (2, 14.17), (3, 28.35)] {
+        let (indent, tab) = (cm(indent_pt), cm((text_w_pt - indent_pt).max(36.0)));
+        named.push_str(&format!(
+            "<style:style style:name=\"Contents_20_{n}\" style:display-name=\"Contents {n}\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\"><style:paragraph-properties fo:margin-left=\"{indent}\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.1cm\"><style:tab-stops><style:tab-stop style:position=\"{tw}\" style:type=\"right\" style:leader-style=\"dotted\" style:leader-text=\".\"/></style:tab-stops></style:paragraph-properties></style:style>",
+            tw = tab
+        ));
+    }
     named.push_str("<style:style style:name=\"Quotations\" style:display-name=\"Quotations\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-left=\"1cm\" fo:margin-right=\"0cm\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.247cm\" fo:padding-left=\"0.3cm\" fo:border-left=\"1.5pt solid #A6A6A6\" fo:border-top=\"none\" fo:border-bottom=\"none\" fo:border-right=\"none\"/><style:text-properties fo:color=\"#404040\"/></style:style>");
     named.push_str("<style:style style:name=\"Preformatted_20_Text\" style:display-name=\"Preformatted Text\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0cm\"/><style:text-properties style:font-name=\"Liberation Mono\" fo:font-size=\"10pt\"/></style:style>");
     named.push_str("<style:style style:name=\"Source_20_Text\" style:display-name=\"Source Text\" style:family=\"text\"><style:text-properties style:font-name=\"Liberation Mono\"/></style:style>");
@@ -2344,6 +2393,22 @@ Slut.
         let missing = write("![x](saknas.png)\n", "T", &|_| None).unwrap();
         assert_eq!(missing.missing_images, vec!["saknas.png".to_owned()]);
         assert_eq!(read(&missing.bytes).unwrap().markdown, "\\[bild: x\\]\n");
+    }
+
+    #[test]
+    fn toc_line_roundtrips_as_table_of_content() {
+        let md = "# Ett\n\n<!-- kladd: toc -->\n\n## Två\n\n#### Fyra\n\nSlut.\n";
+        let w = write(md, "T", &|_| None).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&w.bytes)).unwrap();
+        let mut content = String::new();
+        z.by_name("content.xml").unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("<text:table-of-content "), "{content}");
+        assert!(content.contains("text:outline-level=\"3\""));
+        assert!(content.contains(">Två<text:tab/>1</text:p>"), "{content}");
+        assert!(!content.contains("Fyra</text:p><text:tab"), "H4 ska inte vara med");
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
     }
 
     #[test]

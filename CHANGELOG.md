@@ -4,6 +4,11 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **Navigeringsfönster.** En panel till vänster visar rubrikerna (H1–H6) som ett träd med hopfällbara nivåer, markerar rubriken där markören står och har ett filter ("Sök i rubriker"). Klicka på en rubrik för att hoppa dit, i både dokumentläge och textläge. Slå på och av med knappen i titelraden, *Navigeringsfönster* i menyn eller `Ctrl+Shift+O`; valet sparas.
+- **Innehållsförteckning.** *Infoga innehållsförteckning* (knappen i formateringsfältet eller menyn) sätter in raden `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna H1–H3 med prickad ledlinje och sidnummer, och posterna är klickbara. Word sparas som ett riktigt innehållsförteckningsfält (`TOC`) som Word uppdaterar när filen öppnas, OpenDocument som `text:table-of-content` och PDF med riktiga sidnummer och länkar till rubrikerna. En innehållsförteckning i ett öppnat `.docx` eller `.odt` visas som samma rad.
+
 ## [1.6.0] – 2026-11-12
 
 ### Nytt

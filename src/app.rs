@@ -57,6 +57,8 @@ pub struct Settings {
     pub spell_lang: Option<String>,
     /// Säkerhetskopiera osparade flikar regelbundet så att de kan återställas efter en krasch.
     pub autosave_recovery: bool,
+    /// Navigeringsfönstret (rubrikträd) för Markdown-baserade flikar.
+    pub nav_pane: bool,
 }
 
 impl Default for Settings {
@@ -72,6 +74,7 @@ impl Default for Settings {
             spell: true,
             spell_lang: None,
             autosave_recovery: true,
+            nav_pane: false,
         }
     }
 }
@@ -180,6 +183,7 @@ pub struct KladdApp {
     pub(crate) speller: Option<crate::spell::Speller>,
     pub(crate) wv: crate::word::view::State,
     pub(crate) print: crate::print::PrintState,
+    pub(crate) nav: crate::word::navui::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -284,6 +288,7 @@ impl KladdApp {
             speller: None,
             wv: Default::default(),
             print: Default::default(),
+            nav: Default::default(),
         };
         if single_instance {
             let (tx, rx) = channel();
@@ -919,7 +924,10 @@ impl KladdApp {
         if hit(ctrl, Key::P) {
             self.open_print(ctx);
         }
-        if hit(ctrl, Key::O) {
+        // Ctrl+Skift+O före Ctrl+O: `consume_shortcut` bryr sig inte om extra Skift.
+        if hit(ctrl_shift, Key::O) {
+            self.settings.nav_pane = !self.settings.nav_pane;
+        } else if hit(ctrl, Key::O) {
             self.request_open(ctx);
         }
         if hit(ctrl_shift, Key::S) {
@@ -1049,7 +1057,9 @@ impl KladdApp {
                     ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                 }
                 let show_preview_btn = self.docs.get(self.active).is_some_and(Document::is_markdown) && !self.word_mode();
-                let right_w = if show_preview_btn { 3.0 * 34.0 } else { 2.0 * 34.0 } + WINDOW_CONTROLS_W;
+                let show_nav_btn = self.docs.get(self.active).is_some_and(Document::is_markdown);
+                let buttons = 2 + usize::from(show_preview_btn) + usize::from(show_nav_btn);
+                let right_w = buttons as f32 * 34.0 + WINDOW_CONTROLS_W;
                 let left = Rect::from_min_max(full.min, pos2(full.right() - right_w - 8.0, full.bottom()));
                 let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
 
@@ -1111,6 +1121,16 @@ impl KladdApp {
                         };
                         if icons::button(ui, p, icon, 30.0, false, tip, p.chrome).clicked() {
                             self.toggle_theme(&ctx);
+                        }
+                        if show_nav_btn {
+                            let tip = if self.settings.nav_pane {
+                                "Dölj navigeringsfönstret (Ctrl+Shift+O)"
+                            } else {
+                                "Visa navigeringsfönstret (Ctrl+Shift+O)"
+                            };
+                            if icons::button(ui, p, Icon::Outline, 30.0, self.settings.nav_pane, tip, p.chrome).clicked() {
+                                self.settings.nav_pane = !self.settings.nav_pane;
+                            }
                         }
                         if show_preview_btn {
                             let tip = if self.settings.preview {
@@ -1229,6 +1249,9 @@ impl KladdApp {
         if menu_item(ui, p, "Infoga bild…", "Ctrl+Shift+I", None, has_doc) {
             self.request_insert_image(ctx);
         }
+        if menu_item(ui, p, "Infoga innehållsförteckning", "", None, self.docs.get(self.active).is_some_and(Document::is_markdown)) {
+            self.insert_toc(ctx);
+        }
         if menu_item(ui, p, "Sök", "Ctrl+F", None, has_doc) {
             self.open_find(ctx, false);
         }
@@ -1241,6 +1264,10 @@ impl KladdApp {
         }
         if menu_item(ui, p, "Radnummer", "", Some(self.settings.line_numbers), true) {
             self.settings.line_numbers = !self.settings.line_numbers;
+        }
+        let md = self.docs.get(self.active).is_some_and(Document::is_markdown);
+        if menu_item(ui, p, "Navigeringsfönster", "Ctrl+Shift+O", Some(self.settings.nav_pane), md) {
+            self.settings.nav_pane = !self.settings.nav_pane;
         }
         if menu_item(ui, p, "Förhandsvisa Markdown", "Ctrl+Shift+M", Some(self.settings.preview), true) {
             self.settings.preview = !self.settings.preview;
@@ -2346,6 +2373,7 @@ impl eframe::App for KladdApp {
         self.top_bar(ui, &p);
         self.word_bar(ui, &p);
         self.status_bar(ui, &p);
+        self.nav_pane(ui, &p);
         self.preview(ui, &p);
         self.editor(ui, &p);
         self.find_bar(&ctx, &p);

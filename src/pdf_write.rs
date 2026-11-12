@@ -128,6 +128,8 @@ enum Block {
     Table { rows: Vec<Vec<Vec<Span>>> },
     Rule,
     Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align },
+    /// Innehållsförteckning (`<!-- kladd: toc -->`).
+    Toc,
 }
 
 /// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
@@ -412,6 +414,9 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                         // `<img>` med storlek blir ett eget bildblock, justerat av omgivande `<div align>`.
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align });
+                    } else if tag == crate::word::nav::TOC_LINE {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::Toc);
                     } else if tag.starts_with("<!--") && tag.ends_with("-->") {
                         // Kommentarer (också grundformatraden) skrivs inte ut.
                     } else {
@@ -445,6 +450,8 @@ enum Op {
     Line { x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: (u8, u8, u8) },
     Image { x: f32, y: f32, w: f32, h: f32, index: usize },
     Link { x: f32, y: f32, w: f32, h: f32, url: String },
+    /// Intern länk till en plats i dokumentet (sida från 0, y).
+    Goto { x: f32, y: f32, w: f32, h: f32, page: usize, to_y: f32 },
 }
 
 struct PageOps {
@@ -482,6 +489,10 @@ struct Layout<'a> {
     mb: f32,
     ml: f32,
     cw: f32,
+    /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
+    /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
+    toc_entries: Vec<(u8, String)>,
+    toc_pos: Vec<(usize, f32)>,
 }
 
 /// En färdigbruten rad. `hard` = raden slutar med radbrytning (ska inte marginaljusteras).
@@ -604,7 +615,66 @@ impl<'a> Layout<'a> {
             mb,
             ml,
             cw,
+            toc_entries: Vec::new(),
+            toc_pos: Vec::new(),
         }
+    }
+
+    /// Ritar innehållsförteckningen: rubriken "Innehåll" och en rad per rubrik med prickad
+    /// ledlinje, sidnummer till höger och en intern länk till rubriken.
+    fn toc(&mut self) {
+        let size = 20.0 * self.scale;
+        self.ensure(size * LINE + self.body * LINE * 3.0);
+        let (ml, cw, body) = (self.ml, self.cw, self.body);
+        let title = vec![Span { text: "Innehåll".to_owned(), style: Style::default() }];
+        self.text_block(&title, ml, cw, Face::SansSemi, size, INK, false, None);
+        self.y += 6.0;
+        let face = self.base;
+        let line_h = body * LINE;
+        let entries = self.toc_entries.clone();
+        if entries.is_empty() {
+            let spans = vec![Span { text: "Inga rubriker i dokumentet".to_owned(), style: Style::default() }];
+            self.text_block(&spans, ml, cw, face, body, MUTED, true, None);
+            self.y += PARA_GAP;
+            return;
+        }
+        for (i, (level, text)) in entries.iter().enumerate() {
+            self.ensure(line_h);
+            let indent = f32::from(level.saturating_sub(1)) * 14.0;
+            let baseline = self.y + body * 1.08;
+            let num = self.toc_pos.get(i).map(|(p, _)| (p + 1).to_string()).unwrap_or_default();
+            let num_w = self.m.width(face, body, &num);
+            let x = ml + indent;
+            // Titeln kortas med "…" om den inte ryms bredvid sidnumret.
+            let avail = (cw - indent - num_w - 16.0).max(20.0);
+            let mut title = text.clone();
+            if self.m.width(face, body, &title) > avail {
+                while !title.is_empty() && self.m.width(face, body, &format!("{title}…")) > avail {
+                    title.pop();
+                }
+                title.push('…');
+            }
+            let title_w = self.m.width(face, body, &title);
+            let dot = self.m.width(face, body, ". ").max(1.0);
+            let gap = cw - indent - title_w - num_w - 12.0;
+            let dots = if gap > dot { ". ".repeat((gap / dot) as usize) } else { String::new() };
+            let dots_w = self.m.width(face, body, &dots);
+            let page = self.pages.len() - 1;
+            let ops = &mut self.page().ops;
+            ops.push(Op::Text { x, y: baseline, face, size: body, text: title, color: INK, italic: false });
+            if !dots.is_empty() {
+                ops.push(Op::Text { x: ml + cw - num_w - 6.0 - dots_w, y: baseline, face, size: body, text: dots, color: MUTED, italic: false });
+            }
+            if !num.is_empty() {
+                ops.push(Op::Text { x: ml + cw - num_w, y: baseline, face, size: body, text: num, color: INK, italic: false });
+            }
+            if let Some((p, y)) = self.toc_pos.get(i).copied() {
+                let top = self.y;
+                self.pages[page].ops.push(Op::Goto { x, y: top, w: cw - indent, h: line_h, page: p, to_y: y });
+            }
+            self.y += line_h + 2.0;
+        }
+        self.y += PARA_GAP;
     }
 
     /// Sidhuvud och sidfot för sida `page` (1-baserad) av `total`, som ritinstruktioner.
@@ -1065,6 +1135,7 @@ impl<'a> Layout<'a> {
                     self.y += 16.0;
                 }
                 Block::Image { src, alt, indent, size, align } => self.image(src, alt, *indent, *size, *align),
+                Block::Toc => self.toc(),
             }
         }
     }
@@ -1105,13 +1176,42 @@ fn doc_defaults(md: &str) -> DocDefaults {
     DocDefaults::from_comment(first).unwrap_or_default()
 }
 
+/// Lägger ut alla block. Med en innehållsförteckning görs två passager: förteckningens höjd beror
+/// bara på antalet rubriker, så sidnumren från första passet stämmer i det andra.
+fn lay_out<'a>(blocks: &[Block], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
+    // Rubrikerna H1–H3 till en eventuell innehållsförteckning (samma urval som bokmärkena).
+    let toc_entries: Vec<(u8, String)> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Heading(l, spans, _) if *l <= 3 => {
+                let t: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
+                (!t.trim().is_empty()).then(|| (*l, t.trim().to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut lay = Layout::new(resolve, defaults);
+    lay.toc_entries = toc_entries.clone();
+    lay.new_page();
+    lay.run(blocks);
+    if blocks.iter().any(|b| matches!(b, Block::Toc)) {
+        let pos: Vec<(usize, f32)> =
+            lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
+        let mut second = Layout::new(resolve, defaults);
+        second.toc_entries = toc_entries;
+        second.toc_pos = pos;
+        second.new_page();
+        second.run(blocks);
+        lay = second;
+    }
+    lay
+}
+
 /// Bygger en PDF av Markdown-text.
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
     let blocks = parse_blocks(markdown);
     let defaults = doc_defaults(markdown);
-    let mut lay = Layout::new(resolve, &defaults);
-    lay.new_page();
-    lay.run(&blocks);
+    let mut lay = lay_out(&blocks, &defaults, resolve);
 
     let fonts: HashMap<Face, Font> = [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium]
         .into_iter()
@@ -1126,6 +1226,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     for (pi, page_ops) in lay.pages.iter().enumerate() {
         let mut page = doc.start_page_with(PageSettings::from_wh(lay.pw, lay.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
+        let mut gotos = Vec::new();
         {
             let mut s = page.surface();
             for op in page_ops.ops.iter().chain(extras[pi].iter()) {
@@ -1179,6 +1280,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                         }
                     }
                     Op::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
+                    Op::Goto { x, y, w, h, page, to_y } => gotos.push((*x, *y, *w, *h, *page, *to_y)),
                 }
             }
             s.finish();
@@ -1186,6 +1288,13 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
         for (x, y, w, h, url) in links {
             if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
                 let target = krilla::annotation::Target::Action(krilla::action::Action::Link(krilla::action::LinkAction::new(url)));
+                page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
+            }
+        }
+        for (x, y, w, h, to_page, to_y) in gotos {
+            if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
+                let dest = krilla::destination::XyzDestination::new(to_page, Point::from_xy(lay.ml, to_y));
+                let target = krilla::annotation::Target::Destination(krilla::destination::Destination::Xyz(dest));
                 page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
             }
         }
@@ -1238,6 +1347,36 @@ mod tests {
         let w = write(md, "Test", &|_| None).unwrap();
         assert!(w.bytes.starts_with(b"%PDF-"));
         assert_eq!(w.missing_images, vec!["finns-inte.png".to_owned()]);
+    }
+
+    #[test]
+    fn toc_has_title_entries_and_real_page_numbers() {
+        let mut md = String::from("<!-- kladd: toc -->\n\n");
+        for i in 1..=4 {
+            md.push_str(&format!("# Kapitel {i}\n\n"));
+            for _ in 0..22 {
+                md.push_str("Brödtext som fyller ut sidan så att kapitlen hamnar på olika sidor i dokumentet. Och lite till så att raden bryts.\n\n");
+            }
+            md.push_str(&format!("## Avsnitt {i}\n\nKort.\n\n"));
+        }
+        let w = write(&md, "T", &|_| None).unwrap();
+        // Rubrikernas riktiga sidor, ur layouten.
+        let blocks = parse_blocks(&md);
+        assert!(blocks.iter().any(|b| matches!(b, Block::Toc)));
+        let lay = lay_out(&blocks, &doc_defaults(&md), &|_| None);
+        let pages: Vec<usize> = lay.headings.iter().map(|h| h.page + 1).collect();
+        assert_eq!(pages.len(), 8);
+        assert!(pages.last().unwrap() > &2, "{pages:?}");
+        // PDF:en innehåller förteckningen med de sidnummer rubrikerna faktiskt fick.
+        let back = crate::pdf_read::read(&w.bytes, None).ok().expect("läsbar PDF");
+        assert!(back.markdown.contains("Innehåll"), "{}", back.markdown);
+        for (name, page) in ["Kapitel 1", "Avsnitt 1", "Kapitel 2", "Avsnitt 2", "Kapitel 3", "Avsnitt 3", "Kapitel 4", "Avsnitt 4"].iter().zip(&pages) {
+            let at = back.markdown.find(&format!("{name} .")).unwrap_or_else(|| panic!("{name} saknas i förteckningen:\n{}", back.markdown));
+            let rest = back.markdown[at + name.len()..].trim_start_matches([' ', '.']);
+            let num: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            assert_eq!(num, page.to_string(), "{name}:\n{}", back.markdown);
+        }
+        assert!(back.page_count >= 3);
     }
 
     #[test]

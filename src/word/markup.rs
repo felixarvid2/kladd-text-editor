@@ -422,6 +422,9 @@ fn parse(text: &str) -> Parsed {
                                 }),
                             }
                         }
+                    } else if t == super::nav::TOC_LINE {
+                        // Innehållsförteckningen: en dold rad som dokumentläget ersätter med rubrikerna.
+                        fill(&mut st, tr, |s| s.markup = true);
                     } else if ls == 0 {
                         if let Some(d) = DocDefaults::from_comment(t) {
                             defaults = d;

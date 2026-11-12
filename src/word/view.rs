@@ -20,6 +20,7 @@ use super::images;
 use super::layout::{self, px};
 use super::pages;
 use super::markup::{self, Block, Inline, SpanProp};
+use super::nav;
 use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
@@ -111,6 +112,7 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    Toc,
     TableOp(TableOp),
     PageSetup,
     Undo,
@@ -577,6 +579,9 @@ impl KladdApp {
                     if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
                         acts.push(BarAct::Table);
                     }
+                    if icons::button(ui, p, Icon::Toc, 28.0, false, "Infoga innehållsförteckning", p.chrome).clicked() {
+                        acts.push(BarAct::Toc);
+                    }
                     if in_table {
                         divider(ui, p);
                         if let Some(op) = tables::bar_group(ui, p) {
@@ -620,6 +625,7 @@ impl KladdApp {
                 BarAct::Inline(m) => self.word_toggle(&ctx, m),
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
+                BarAct::Toc => self.insert_toc(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
                 BarAct::PageSetup => self.open_page_dialog(),
@@ -786,6 +792,8 @@ impl KladdApp {
             let sel_now = self.word_selection(&ctx);
             let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
             let tabs = self.word.tables(doc_id, &self.docs[self.active].text);
+            let heads = self.word.headings(doc_id, &self.docs[self.active].text);
+            let mut toc_click: Option<usize> = None;
 
             let matches = self.search_highlights();
             let scroll_to = self.scroll_to_char.take();
@@ -1000,6 +1008,51 @@ impl KladdApp {
                 }
                 flush_bar(&mut bar);
 
+                // Innehållsförteckningar: raden är dold och har reserverat höjden; posterna
+                // ritas här med sidnumren från galleriet (sidbrytningen är redan gjord, så en
+                // enda passage räcker: förteckningens höjd beror bara på antalet rubriker).
+                if text.contains("kladd: toc") {
+                    let from = text[..vis.start].rfind('\n').map_or(0, |i| i + 1);
+                    let to = text[vis.end..].find('\n').map_or(text.len(), |i| vis.end + i);
+                    let entries = nav::toc_entries(&heads);
+                    let (shown, toc_h) = nav::toc_size_for(z, &analysis.defaults, entries.len());
+                    for (k, line) in nav::toc_lines(&text[from..to]).into_iter().enumerate() {
+                        let line = line.start + from..line.end + from;
+                        if overlaps(&line, &reveal) {
+                            continue;
+                        }
+                        let top = galley
+                            .pos_from_cursor(CCursor::new(text[..line.start].chars().count()))
+                            .translate(gpos.to_vec2())
+                            .min;
+                        let rect = Rect::from_min_size(pos2(gpos.x, top.y), vec2(text_w, toc_h));
+                        if rect.bottom() < clip.top() || rect.top() > clip.bottom() {
+                            continue;
+                        }
+                        let mut c2 = ByteToChar::new(text);
+                        let page_nums: Vec<usize> = entries
+                            .iter()
+                            .take(shown)
+                            .map(|h| geom.page_of(galley.pos_from_cursor(CCursor::new(c2.at(h.start))).min.y) + 1)
+                            .collect();
+                        let fam = |bold: bool| font_family(Some(analysis.defaults.font()), bold, false);
+                        if let Some(b) = super::navui::paint_toc(
+                            ui,
+                            p,
+                            z,
+                            &analysis.defaults,
+                            &fam,
+                            rect,
+                            egui::Id::unique(("kladd-toc", doc_id, k)),
+                            &entries,
+                            &page_nums,
+                            shown,
+                        ) {
+                            toc_click = Some(b);
+                        }
+                    }
+                }
+
                 // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
                 let max_w = text_w;
                 img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p);
@@ -1137,6 +1190,9 @@ impl KladdApp {
             });
 
             self.wv.pages = page_pos;
+            if let Some(b) = toc_click {
+                self.goto_byte(&ctx, b);
+            }
             let img_range = imgs.range.clone();
             self.wv.img = imgs;
             if let (Some(act), Some(r)) = (img_act, img_range) {
