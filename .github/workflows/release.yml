@@ -1,0 +1,59 @@
+# Bygger ett .deb-paket och skapar en GitHub-release när en versionstagg pushas.
+#
+#   git tag v1.4.0 && git push origin v1.4.0
+#
+# Taggen måste stämma med versionen i Cargo.toml. Workflowen kan också köras för
+# hand (Actions → Release → Run workflow); då byggs paketet bara som en artefakt.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    # 22.04 ger ett paket som också fungerar på nyare Ubuntu (äldre glibc).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kontrollera att taggen stämmer med Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Taggen $GITHUB_REF_NAME stämmer inte med versionen $version i Cargo.toml"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Bygg .deb
+        run: cargo deb --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kladd-deb
+          path: target/debian/*.deb
+
+      - name: Skapa release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/debian/*.deb \
+            --title "Kladd ${GITHUB_REF_NAME#v}" \
+            --generate-notes
