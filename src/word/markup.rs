@@ -8,8 +8,12 @@
 #![allow(dead_code)]
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
+
+use crate::style::{div_open, is_div_close, is_span_close, parse_div_open, parse_span_open};
+pub use crate::style::{Align, DocDefaults, SpanStyle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Block {
@@ -52,20 +56,51 @@ pub struct Piece {
     /// "- " / "1. " i början av ett listobjekt (`markup` är sann bara för "- ").
     pub list_marker: bool,
     pub image: Option<ImageRef>,
+    /// Sammanslaget stilvärde för alla omslutande `<span style="…">` (den inre vinner); `None` om ingen.
+    pub span: Option<Arc<SpanStyle>>,
+    /// Justering från omslutande `<div align>`; `Left` annars.
+    pub align: Align,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Analysis {
     pub pieces: Vec<Piece>,
+    /// Dokumentets grundformat från kommentaren `<!-- kladd: … -->` på första raden.
+    pub defaults: DocDefaults,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Active {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
     pub block: Block,
+    /// Varje egenskap är `Some` bara om den är enhetlig över markeringen (eller vid markören).
+    pub span: SpanStyle,
+    /// Justeringen på markörens rad (markeringens början).
+    pub align: Align,
+}
+
+/// En egenskap hos `<span style>` som `set_span_prop` ändrar. `None` tar bort egenskapen.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanProp {
+    FontFamily(Option<String>),
+    FontSize(Option<f32>),
+    Color(Option<[u8; 3]>),
+    Background(Option<[u8; 3]>),
+}
+
+impl SpanProp {
+    fn apply(&self, s: &mut SpanStyle) {
+        match self {
+            SpanProp::FontFamily(v) => s.font_family = v.clone(),
+            // Samma avrundning som `SpanStyle::to_css` skriver, så att jämförelser stämmer med texten.
+            SpanProp::FontSize(v) => s.font_size = v.map(|x| (x * 2.0).round() / 2.0),
+            SpanProp::Color(v) => s.color = *v,
+            SpanProp::Background(v) => s.background = *v,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +124,8 @@ struct St {
     markup: bool,
     list_marker: bool,
     image: Option<u32>,
+    span: Option<u32>,
+    align: Align,
 }
 
 impl Default for St {
@@ -104,6 +141,8 @@ impl Default for St {
             markup: false,
             list_marker: false,
             image: None,
+            span: None,
+            align: Align::Left,
         }
     }
 }
@@ -116,9 +155,28 @@ struct Span {
     close: Range<usize>,
 }
 
+/// Ett parat `<span style>`-par med taggarnas lägen och stilen.
+#[derive(Debug, Clone)]
+struct HSpan {
+    open: Range<usize>,
+    close: Range<usize>,
+    style: SpanStyle,
+}
+
 struct Parsed {
     pieces: Vec<Piece>,
     spans: Vec<Span>,
+    hspans: Vec<HSpan>,
+    defaults: DocDefaults,
+}
+
+/// Ger `s` ett löpnummer i tabellen (lika stilar delar nummer, så att bitar slås ihop rätt).
+fn intern(styles: &mut Vec<Arc<SpanStyle>>, s: SpanStyle) -> u32 {
+    if let Some(i) = styles.iter().position(|x| **x == s) {
+        return i as u32;
+    }
+    styles.push(Arc::new(s));
+    (styles.len() - 1) as u32
 }
 
 fn fill(st: &mut [St], r: Range<usize>, f: impl Fn(&mut St)) {
@@ -159,6 +217,12 @@ fn parse(text: &str) -> Parsed {
     // Pågående länk: (område, typ, slutet på senaste barnet).
     let mut link: Option<(Range<usize>, LinkType, usize)> = None;
     let mut html_u: Vec<Range<usize>> = Vec::new();
+    // Öppna `<span>`/`<div>` som väntar på sin stängning.
+    let mut span_stack: Vec<(Range<usize>, SpanStyle)> = Vec::new();
+    let mut hspans: Vec<HSpan> = Vec::new();
+    let mut div_stack: Vec<(Range<usize>, Align)> = Vec::new();
+    let mut divs: Vec<(Range<usize>, Range<usize>, Align)> = Vec::new();
+    let mut defaults = DocDefaults::default();
     let mut image_depth = 0usize;
     let mut in_code_block = false;
     let mut last_text_end = 0usize;
@@ -193,7 +257,10 @@ fn parse(text: &str) -> Parsed {
             Event::Start(tag) => {
                 match &tag {
                     Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. } => {}
-                    _ => html_u.clear(),
+                    _ => {
+                        html_u.clear();
+                        span_stack.clear();
+                    }
                 }
                 match tag {
                     Tag::Heading { level, .. } => {
@@ -249,7 +316,10 @@ fn parse(text: &str) -> Parsed {
             Event::End(end) => {
                 match &end {
                     TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link | TagEnd::Image => {}
-                    _ => html_u.clear(),
+                    _ => {
+                        html_u.clear();
+                        span_stack.clear();
+                    }
                 }
                 match end {
                     TagEnd::CodeBlock => in_code_block = false,
@@ -283,6 +353,42 @@ fn parse(text: &str) -> Parsed {
                         fill(&mut st, r.clone(), |s| s.markup = true);
                         spans.push(Span { kind: Inline::Underline, open, close: r.clone() });
                     }
+                } else if let Some(style) = parse_span_open(t) {
+                    span_stack.push((r.clone(), style));
+                } else if is_span_close(t) {
+                    if let Some((open, style)) = span_stack.pop() {
+                        fill(&mut st, open.clone(), |s| s.markup = true);
+                        fill(&mut st, r.clone(), |s| s.markup = true);
+                        hspans.push(HSpan { open, close: r.clone(), style });
+                    }
+                }
+            }
+            Event::Html(_) => {
+                // Hela HTML-blocket kan komma som en händelse: gå igenom det rad för rad.
+                let mut off = r.start;
+                for line in text[r.clone()].split_inclusive('\n') {
+                    let ls = off;
+                    off += line.len();
+                    let t = line.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    let ts = ls + (line.len() - line.trim_start().len());
+                    let tr = ts..ts + t.len();
+                    if t.matches('>').count() == 1 && parse_div_open(t).is_some() {
+                        div_stack.push((tr, parse_div_open(t).unwrap_or_default()));
+                    } else if is_div_close(t) {
+                        if let Some((open, a)) = div_stack.pop() {
+                            fill(&mut st, open.clone(), |s| s.markup = true);
+                            fill(&mut st, tr.clone(), |s| s.markup = true);
+                            divs.push((open, tr, a));
+                        }
+                    } else if ls == 0 {
+                        if let Some(d) = DocDefaults::from_comment(t) {
+                            defaults = d;
+                            fill(&mut st, tr, |s| s.markup = true);
+                        }
+                    }
                 }
             }
             Event::Text(t) => {
@@ -305,6 +411,30 @@ fn parse(text: &str) -> Parsed {
         }
     }
 
+    // Spans och divar läggs på efter att alla händelser lästs: yttre först, så att den inre vinner.
+    let mut styles: Vec<Arc<SpanStyle>> = Vec::new();
+    hspans.sort_by_key(|h| h.open.start);
+    for h in &hspans {
+        let mut cache: Vec<(Option<u32>, u32)> = Vec::new();
+        for i in h.open.end..h.close.start.min(n) {
+            let old = st[i].span;
+            let new = match cache.iter().find(|c| c.0 == old) {
+                Some(c) => c.1,
+                None => {
+                    let base = old.map(|o| (*styles[o as usize]).clone()).unwrap_or_default();
+                    let id = intern(&mut styles, base.merged(&h.style));
+                    cache.push((old, id));
+                    id
+                }
+            };
+            st[i].span = Some(new);
+        }
+    }
+    divs.sort_by_key(|d| d.0.start);
+    for (open, close, a) in &divs {
+        fill(&mut st, open.end..close.start, |s| s.align = *a);
+    }
+
     // Bitar: sammanhängande tecken med samma stil, aldrig delade mitt i ett tecken.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut cur: Option<(usize, St)> = None;
@@ -312,19 +442,19 @@ fn parse(text: &str) -> Parsed {
         match cur {
             Some((_, s)) if s == st[i] => {}
             Some((start, s)) => {
-                pieces.push(make_piece(start..i, &s, &images));
+                pieces.push(make_piece(start..i, &s, &images, &styles));
                 cur = Some((i, st[i]));
             }
             None => cur = Some((i, st[i])),
         }
     }
     if let Some((start, s)) = cur {
-        pieces.push(make_piece(start..n, &s, &images));
+        pieces.push(make_piece(start..n, &s, &images, &styles));
     }
-    Parsed { pieces, spans }
+    Parsed { pieces, spans, hspans, defaults }
 }
 
-fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef]) -> Piece {
+fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>]) -> Piece {
     Piece {
         range,
         block: s.block,
@@ -337,6 +467,8 @@ fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef]) -> Piece {
         markup: s.markup,
         list_marker: s.list_marker,
         image: s.image.and_then(|i| images.get(i as usize).cloned()),
+        span: s.span.and_then(|i| styles.get(i as usize).cloned()),
+        align: s.align,
     }
 }
 
@@ -507,7 +639,8 @@ fn mark_table(text: &str, st: &mut [St], r: &Range<usize>) {
 }
 
 pub fn analyze(text: &str) -> Analysis {
-    Analysis { pieces: parse(text).pieces }
+    let p = parse(text);
+    Analysis { pieces: p.pieces, defaults: p.defaults }
 }
 
 // ============================================================== aktiv formatering
@@ -561,7 +694,15 @@ pub fn active(text: &str, a: &Analysis, sel: Range<usize>) -> Active {
     let (s, e) = norm_sel(text, &sel);
     let ls = line_start(text, s);
     let block = block_of_line(a, text, ls);
-    let mut r = Active { bold: false, italic: false, underline: false, strike: false, block };
+    let mut r = Active {
+        bold: false,
+        italic: false,
+        underline: false,
+        strike: false,
+        block,
+        span: SpanStyle::default(),
+        align: piece_at(a, ls).map_or(Align::Left, |p| p.align),
+    };
     let all = [Inline::Bold, Inline::Italic, Inline::Underline, Inline::Strike];
     let set = |r: &mut Active, m: Inline, v: bool| match m {
         Inline::Bold => r.bold = v,
@@ -581,11 +722,13 @@ pub fn active(text: &str, a: &Analysis, sel: Range<usize>) -> Active {
             for m in all {
                 set(&mut r, m, flag_of(p, m));
             }
+            r.span = p.span.as_deref().cloned().unwrap_or_default();
         }
         return r;
     }
     let mut seen = false;
     let mut flags = [true; 4];
+    let mut span: Option<SpanStyle> = None;
     for p in &a.pieces {
         if p.range.end <= s {
             continue;
@@ -605,6 +748,19 @@ pub fn active(text: &str, a: &Analysis, sel: Range<usize>) -> Active {
         for (i, m) in all.iter().enumerate() {
             flags[i] &= flag_of(p, *m);
         }
+        let sty = p.span.as_deref().cloned().unwrap_or_default();
+        span = Some(match span {
+            None => sty,
+            Some(u) => SpanStyle {
+                font_family: if u.font_family == sty.font_family { u.font_family } else { None },
+                font_size: if u.font_size == sty.font_size { u.font_size } else { None },
+                color: if u.color == sty.color { u.color } else { None },
+                background: if u.background == sty.background { u.background } else { None },
+            },
+        });
+    }
+    if let Some(u) = span {
+        r.span = u;
     }
     if seen {
         for (i, m) in all.iter().enumerate() {
@@ -821,7 +977,7 @@ pub fn toggle_inline(text: &str, sel: Range<usize>, m: Inline) -> Edit {
         }
     }
     let parsed = parse(text);
-    let a = Analysis { pieces: parsed.pieces.clone() };
+    let a = Analysis { pieces: parsed.pieces.clone(), defaults: parsed.defaults.clone() };
     let act = active(text, &a, s..e);
     let on = match m {
         Inline::Bold => act.bold,
@@ -858,8 +1014,9 @@ fn remove_fmt(text: &str, parsed: &Parsed, m: Inline, s: usize, e: usize) -> Edi
     apply(text, edits, s, e)
 }
 
-fn add_fmt(text: &str, parsed: &Parsed, a: &Analysis, m: Inline, s: usize, e: usize) -> Edit {
-    let (open, close) = delims(m);
+/// Innehållet som en formatering på `s..e` berör: en trimmad bit per rad (per cell i tabeller),
+/// efter blockprefix och utan kodrader och tabellens avgränsarrad.
+fn content_segments(text: &str, a: &Analysis, s: usize, e: usize) -> Vec<Range<usize>> {
     let mut segs: Vec<Range<usize>> = Vec::new();
     let mut ls = line_start(text, s);
     while ls <= e {
@@ -901,6 +1058,12 @@ fn add_fmt(text: &str, parsed: &Parsed, a: &Analysis, m: Inline, s: usize, e: us
         }
         ls = le + 1;
     }
+    segs
+}
+
+fn add_fmt(text: &str, parsed: &Parsed, a: &Analysis, m: Inline, s: usize, e: usize) -> Edit {
+    let (open, close) = delims(m);
+    let mut segs = content_segments(text, a, s, e);
     if segs.is_empty() {
         return Edit { text: text.to_string(), sel: s..e };
     }
@@ -1059,6 +1222,538 @@ pub fn insert_table(text: &str, at: usize) -> Edit {
     Edit { text: t, sel: caret..caret }
 }
 
+// ============================================================== spans (typsnitt, storlek, färg)
+
+/// Delar som inte får få en taggräns mitt i sig: bilder, inline-kod (med backtecken),
+/// länkadresser `](url)` och autolänkar.
+fn atoms(text: &str, a: &Analysis) -> Vec<Range<usize>> {
+    let ps = &a.pieces;
+    let mut v = Vec::new();
+    for (i, p) in ps.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|j| &ps[j]);
+        let next = ps.get(i + 1);
+        if p.image.is_some() {
+            v.push(p.range.clone());
+        } else if p.code && p.block != Block::Code {
+            let mut r = p.range.clone();
+            if let Some(pm) = prev.filter(|x| x.markup && text[x.range.clone()].ends_with('`')) {
+                r.start = pm.range.start;
+            }
+            if let Some(nm) = next.filter(|x| x.markup && text[x.range.clone()].starts_with('`')) {
+                r.end = nm.range.end;
+            }
+            v.push(r);
+        } else if p.link {
+            let auto_open = prev.filter(|x| x.markup && text[x.range.clone()].ends_with('<'));
+            let auto_close = next.filter(|x| x.markup && text[x.range.clone()].starts_with('>'));
+            if let (Some(pm), Some(nm)) = (auto_open, auto_close) {
+                v.push(pm.range.start..nm.range.end);
+            } else if let Some(nm) = next.filter(|x| x.markup && text[x.range.clone()].starts_with(']')) {
+                v.push(nm.range.clone());
+            }
+        }
+    }
+    v
+}
+
+/// Blanksteg bakåt från `x` (högst ner till `floor`). Radbrytning passeras bara om raden
+/// efter den saknar blockprefix, annars skulle prefixet hamna fel.
+fn ws_before(text: &str, x: usize, floor: usize) -> usize {
+    let b = text.as_bytes();
+    let mut p = x;
+    while p > floor {
+        if is_ws(b[p - 1]) {
+            p -= 1;
+        } else if b[p - 1] == b'\n' && p - 1 > floor && prefix_len(&text[p..line_end(text, p)]) == 0 {
+            p -= 1;
+            if p > floor && b[p - 1] == b'\r' {
+                p -= 1;
+            }
+        } else {
+            break;
+        }
+    }
+    p
+}
+
+/// Som [`ws_before`] men framåt, högst till `ceil`.
+fn ws_after(text: &str, x: usize, ceil: usize) -> usize {
+    let b = text.as_bytes();
+    let mut p = x;
+    while p < ceil {
+        if is_ws(b[p]) || b[p] == b'\r' && b.get(p + 1) == Some(&b'\n') {
+            p += 1;
+        } else if b[p] == b'\n' && p + 1 < ceil && prefix_len(&text[p + 1..line_end(text, p + 1)]) == 0 {
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    p
+}
+
+/// Sätter (eller tar bort) en teckenegenskap på markeringen genom att skriva om `<span style>`-taggarna
+/// runt den. Spans som rör markeringen plattas ut till en följd av spans med enhetlig stil,
+/// tomma spans försvinner och intilliggande spans med samma stil slås ihop. Spans läggs utanför
+/// `**`, `*`, `<u>` och `~~`; skär en gräns genom en sådan stängs den och öppnas igen runt gränsen.
+pub fn set_span_prop(text: &str, sel: Range<usize>, prop: SpanProp) -> Edit {
+    let (mut s, mut e) = norm_sel(text, &sel);
+    let unchanged = |s: usize, e: usize| Edit { text: text.to_string(), sel: s..e };
+    if s == e {
+        match word_around(text, s) {
+            Some(w) => {
+                s = w.start;
+                e = w.end;
+            }
+            None => return unchanged(s, e),
+        }
+    }
+    let parsed = parse(text);
+    let a = Analysis { pieces: parsed.pieces.clone(), defaults: parsed.defaults.clone() };
+    let mut segs: Vec<Range<usize>> = content_segments(text, &a, s, e)
+        .into_iter()
+        // Rader som bara är markup (div-taggar, kommentarer) får ingen formatering.
+        .filter(|g| !piece_at(&a, g.start).is_some_and(|p| p.markup && p.range.end >= g.end))
+        .collect();
+    if segs.is_empty() {
+        return unchanged(s, e);
+    }
+    // Bilder, kod och länkadresser tas med hela.
+    let atoms = atoms(text, &a);
+    for g in &mut segs {
+        for at in &atoms {
+            if at.start < g.start && g.start < at.end {
+                g.start = at.start;
+            }
+            if at.start < g.end && g.end < at.end {
+                g.end = at.end;
+            }
+        }
+    }
+    segs.sort_by_key(|g| g.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for g in segs {
+        match merged.last_mut() {
+            Some(l) if g.start < l.end => l.end = l.end.max(g.end),
+            _ => merged.push(g),
+        }
+    }
+    let segs = merged;
+    let from = segs[0].start;
+    let to = segs.last().map_or(from, |g| g.end);
+
+    // Spans som berör eller överlappar markeringen skrivs om (och de som överlappar dem).
+    let hs = &parsed.hspans;
+    let mut inc: Vec<usize> = (0..hs.len())
+        .filter(|&i| segs.iter().any(|g| hs[i].open.start <= g.end && g.start <= hs[i].close.end))
+        .collect();
+    loop {
+        let more: Vec<usize> = (0..hs.len())
+            .filter(|i| !inc.contains(i))
+            .filter(|&i| inc.iter().any(|&j| hs[i].open.start < hs[j].close.end && hs[j].open.start < hs[i].close.end))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        inc.extend(more);
+    }
+    inc.sort_by_key(|&i| hs[i].open.start);
+
+    // Zoner: sammanhängande områden av markeringen och de omskrivna spansen.
+    let mut ivs: Vec<Range<usize>> = segs.clone();
+    ivs.extend(inc.iter().map(|&i| hs[i].open.start..hs[i].close.end));
+    ivs.sort_by_key(|r| r.start);
+    let mut zones: Vec<Range<usize>> = Vec::new();
+    for r in ivs {
+        match zones.last_mut() {
+            Some(z) if r.start <= z.end => z.end = z.end.max(r.end),
+            _ => zones.push(r),
+        }
+    }
+    let mut dels: Vec<Range<usize>> = Vec::new();
+    for &i in &inc {
+        dels.push(hs[i].open.clone());
+        dels.push(hs[i].close.clone());
+    }
+    let tags = dels.clone();
+    let deleted = |j: usize| tags.iter().any(|d| d.start <= j && j < d.end);
+    let style_at = |j: usize| {
+        let mut st = SpanStyle::default();
+        for &i in &inc {
+            if hs[i].open.end <= j && j < hs[i].close.start {
+                st = st.merged(&hs[i].style);
+            }
+        }
+        if segs.iter().any(|g| g.start <= j && j < g.end) {
+            prop.apply(&mut st);
+        }
+        st
+    };
+    // Flytta en gräns ut ur avgränsare (`**`, `<u>`, …) så att den aldrig hamnar mitt i dem.
+    let snap = |mut x: usize| {
+        for _ in 0..16 {
+            let mut changed = false;
+            for em in &parsed.spans {
+                if em.open.start < x && x <= em.open.end {
+                    x = em.open.start;
+                    changed = true;
+                } else if em.close.start <= x && x < em.close.end {
+                    x = em.close.end;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        x
+    };
+
+    let mut ins: Vec<(usize, String)> = Vec::new();
+    let mut tag_pos: Vec<usize> = Vec::new();
+    for z in &zones {
+        // Gränser där stilen byter: (läge, stil före, stil efter).
+        let mut bounds: Vec<(usize, SpanStyle, SpanStyle)> = Vec::new();
+        let mut prev = SpanStyle::default();
+        for (i, _) in text[z.clone()].char_indices() {
+            let pos = z.start + i;
+            // Avgränsare och borttagna taggar följer sina grannar: bara innehållet avgör stilen.
+            if deleted(pos) || parsed.spans.iter().any(|em| em.open.contains(&pos) || em.close.contains(&pos)) {
+                continue;
+            }
+            let cur = style_at(pos);
+            if cur != prev {
+                bounds.push((pos, std::mem::replace(&mut prev, cur.clone()), cur));
+            }
+        }
+        if !prev.is_empty() {
+            bounds.push((z.end, prev, SpanStyle::default()));
+        }
+        let mut norm: Vec<(usize, SpanStyle, SpanStyle)> = Vec::new();
+        for (x, before, after) in bounds {
+            let x = snap(x).max(norm.last().map_or(0, |n| n.0));
+            match norm.last_mut() {
+                Some(l) if l.0 == x => l.2 = after,
+                _ => norm.push((x, before, after)),
+            }
+        }
+        norm.retain(|n| n.1 != n.2);
+        for (k, (x, before, after)) in norm.iter().enumerate() {
+            let mut across: Vec<&Span> =
+                parsed.spans.iter().filter(|em| em.open.start < *x && *x < em.close.end).collect();
+            across.sort_by_key(|em| em.open.start);
+            let prev_x = if k > 0 { norm[k - 1].0 } else { 0 };
+            let next_x = norm.get(k + 1).map_or(text.len(), |n| n.0);
+            let floor = across.iter().map(|em| em.open.end).max().unwrap_or(0).max(prev_x).min(*x);
+            let ceil = across.iter().map(|em| em.close.start).min().unwrap_or(text.len()).min(next_x).max(*x);
+            let (xc, xo) = if across.is_empty() { (*x, *x) } else { (ws_before(text, *x, floor), ws_after(text, *x, ceil)) };
+            let closers: String = across.iter().rev().map(|em| &text[em.close.clone()]).collect();
+            let reopen: String = across.iter().map(|em| &text[em.open.clone()]).collect();
+            let mut tag = String::new();
+            if !before.is_empty() {
+                tag.push_str("</span>");
+            }
+            if !after.is_empty() {
+                tag.push_str(&after.open_tag());
+            }
+            ins.push((xc, closers));
+            ins.push((*x, tag));
+            ins.push((xo, reopen));
+            tag_pos.push(*x);
+        }
+    }
+
+    // När span-taggarna försvunnit kan två lika betoningar mötas (`**a****b**`): slå ihop dem.
+    for e1 in &parsed.spans {
+        for e2 in &parsed.spans {
+            if e1.kind != e2.kind
+                || e1.close.end >= e2.open.start
+                || text[e1.close.clone()] != text[e2.open.clone()]
+                || tag_pos.iter().any(|x| (e1.close.end..=e2.open.start).contains(x))
+            {
+                continue;
+            }
+            if (e1.close.end..e2.open.start).all(deleted) {
+                dels.push(e1.close.clone());
+                dels.push(e2.open.clone());
+            }
+        }
+    }
+
+    ins.sort_by_key(|i| i.0);
+    let mut edits: Vec<(Range<usize>, Vec<Part>)> = Vec::new();
+    for (pos, lit) in ins {
+        if lit.is_empty() {
+            continue;
+        }
+        match edits.last_mut() {
+            Some((r, parts)) if r.start == pos => parts.push(Part::Lit(lit)),
+            _ => edits.push((pos..pos, vec![Part::Lit(lit)])),
+        }
+    }
+    // Infogningar först: vid samma läge ska de komma före en borttagning som börjar där.
+    dels.sort_by_key(|d| d.start);
+    dels.dedup();
+    for d in dels {
+        edits.push((d, vec![]));
+    }
+    apply(text, edits, from, to)
+}
+
+// ============================================================== justering
+
+#[derive(Clone, Copy, PartialEq)]
+enum ItemKind {
+    /// Ett stycke, en lista, en rubrik …
+    Content,
+    /// Grundformatkommentaren på första raden.
+    Meta,
+    DivOpen(Align),
+    DivClose,
+}
+
+/// Ett block på översta nivån (eller en `<div>`-rad).
+struct Item {
+    range: Range<usize>,
+    kind: ItemKind,
+}
+
+/// Blocken på översta nivån i ordning. Varje `<div>`/`</div>`-rad är ett eget block; en
+/// `<div>` utan motsvarande stängning (eller tvärtom) räknas som vanlig text.
+fn top_items(text: &str) -> Vec<Item> {
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut items: Vec<Item> = Vec::new();
+    let mut depth = 0usize;
+    let trimmed = |r: Range<usize>| -> Option<Range<usize>> {
+        let start = if text.as_bytes()[line_start(text, r.start)..r.start].iter().all(|c| is_ws(*c)) {
+            line_start(text, r.start)
+        } else {
+            r.start
+        };
+        let end = start + text[start..r.end.max(start)].trim_end().len();
+        (end > start).then_some(start..end)
+    };
+    for (ev, r) in Parser::new_ext(text, opts).into_offset_iter() {
+        let r = r.start.min(text.len())..r.end.min(text.len());
+        match ev {
+            Event::Start(tag) => {
+                if depth == 0 {
+                    if matches!(tag, Tag::HtmlBlock) {
+                        // Rad för rad: div-taggarna är egna block, resten ett block.
+                        let mut off = r.start;
+                        let mut other: Option<Range<usize>> = None;
+                        let flush = |items: &mut Vec<Item>, other: &mut Option<Range<usize>>| {
+                            if let Some(o) = other.take() {
+                                if let Some(t) = trimmed(o) {
+                                    let meta = t.start == 0 && DocDefaults::from_comment(&text[t.clone()]).is_some();
+                                    items.push(Item { range: t, kind: if meta { ItemKind::Meta } else { ItemKind::Content } });
+                                }
+                            }
+                        };
+                        for line in text[r.clone()].split_inclusive('\n') {
+                            let ls = off;
+                            off += line.len();
+                            let t = line.trim();
+                            if t.is_empty() {
+                                continue;
+                            }
+                            let ts = ls + (line.len() - line.trim_start().len());
+                            let tr = ts..ts + t.len();
+                            let kind = if t.matches('>').count() == 1 && parse_div_open(t).is_some() {
+                                Some(ItemKind::DivOpen(parse_div_open(t).unwrap_or_default()))
+                            } else if is_div_close(t) {
+                                Some(ItemKind::DivClose)
+                            } else {
+                                None
+                            };
+                            match kind {
+                                Some(k) => {
+                                    flush(&mut items, &mut other);
+                                    items.push(Item { range: tr, kind: k });
+                                }
+                                None => match other.as_mut() {
+                                    Some(o) => o.end = tr.end,
+                                    None => other = Some(tr),
+                                },
+                            }
+                        }
+                        flush(&mut items, &mut other);
+                    } else if let Some(t) = trimmed(r) {
+                        items.push(Item { range: t, kind: ItemKind::Content });
+                    }
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Rule if depth == 0 => {
+                if let Some(t) = trimmed(r) {
+                    items.push(Item { range: t, kind: ItemKind::Content });
+                }
+            }
+            _ => {}
+        }
+    }
+    // Parar ihop div-rader; oparade blir vanlig text.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut matched = vec![false; items.len()];
+    for i in 0..items.len() {
+        match items[i].kind {
+            ItemKind::DivOpen(_) => stack.push(i),
+            ItemKind::DivClose => {
+                if let Some(o) = stack.pop() {
+                    matched[o] = true;
+                    matched[i] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, it) in items.iter_mut().enumerate() {
+        if matches!(it.kind, ItemKind::DivOpen(_) | ItemKind::DivClose) && !matched[i] {
+            it.kind = ItemKind::Content;
+        }
+    }
+    items
+}
+
+/// Ändrar justeringen på alla block (stycken, listor, rubriker …) som markeringen berör.
+/// Justering skrivs som `<div align="…">` med tomma rader runt; ligger blocken redan i en div
+/// ändras den (delas om den täcker fler block), `Left` tar bort divven. Intilliggande divar med
+/// samma justering slås ihop. Divar inuti divar plattas ut (den inre vinner).
+pub fn set_align(text: &str, sel: Range<usize>, align: Align) -> Edit {
+    let (s, e) = norm_sel(text, &sel);
+    let unchanged = || Edit { text: text.to_string(), sel: s..e };
+    let items = top_items(text);
+    let n = items.len();
+    // Pardiv: för varje open/close-rad index till den andra raden.
+    let mut pair: Vec<Option<usize>> = vec![None; n];
+    // De omslutande divarnas öppningsrader (yttersta först) för varje block.
+    let mut encl: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        match it.kind {
+            ItemKind::DivOpen(_) => stack.push(i),
+            ItemKind::DivClose => {
+                if let Some(o) = stack.pop() {
+                    pair[o] = Some(i);
+                    pair[i] = Some(o);
+                }
+            }
+            _ => encl[i] = stack.clone(),
+        }
+    }
+    let old_align = |i: usize| match encl[i].last().map(|&o| items[o].kind) {
+        Some(ItemKind::DivOpen(a)) => a,
+        _ => Align::Left,
+    };
+    // Markeringen som slutar i början av en rad räknas inte med den raden.
+    let e_eff = if e > s && text.as_bytes()[e - 1] == b'\n' { e - 1 } else { e };
+    let touched: Vec<usize> = (0..n)
+        .filter(|&i| items[i].kind == ItemKind::Content)
+        .filter(|&i| items[i].range.start <= e_eff && s <= items[i].range.end)
+        .collect();
+    if touched.is_empty() || touched.iter().all(|&i| old_align(i) == align) {
+        return unchanged();
+    }
+    let new_align = |i: usize| if touched.contains(&i) { align } else { old_align(i) };
+
+    // Området som skrivs om: de berörda blocken och hela deras yttre divar.
+    let mut lo = n;
+    let mut hi = 0;
+    for &i in &touched {
+        let first = encl[i].first().copied().unwrap_or(i);
+        let last = encl[i].first().and_then(|&o| pair[o]).unwrap_or(i);
+        lo = lo.min(first);
+        hi = hi.max(last);
+    }
+    let content_in = |a: usize, b: usize| -> Vec<usize> { (a..=b).filter(|&i| items[i].kind == ItemKind::Content).collect() };
+    // En angränsande div med samma justering som kanten dras med.
+    loop {
+        let mut grew = false;
+        let inner = content_in(lo, hi);
+        if lo > 0 && items[lo - 1].kind == ItemKind::DivClose {
+            if let Some(o) = pair[lo - 1] {
+                let last = content_in(o, lo - 1).last().copied();
+                if let (Some(l), Some(&f)) = (last, inner.first()) {
+                    if old_align(l) == new_align(f) && new_align(f) != Align::Left {
+                        lo = o;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if hi + 1 < n && matches!(items[hi + 1].kind, ItemKind::DivOpen(_)) {
+            if let Some(c) = pair[hi + 1] {
+                let first = content_in(hi + 1, c).first().copied();
+                if let (Some(f), Some(&l)) = (first, inner.last()) {
+                    if old_align(f) == new_align(l) && new_align(l) != Align::Left {
+                        hi = c;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Gruppera blocken efter justering och skriv dem.
+    let mut groups: Vec<(Align, Vec<usize>)> = Vec::new();
+    for i in content_in(lo, hi) {
+        let a = new_align(i);
+        match groups.last_mut() {
+            Some((ga, v)) if *ga == a => v.push(i),
+            _ => groups.push((a, vec![i])),
+        }
+    }
+    let mut out = String::new();
+    let mut new_start = vec![0usize; n];
+    for (a, v) in &groups {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        if *a != Align::Left {
+            out.push_str(&div_open(*a));
+            out.push_str("\n\n");
+        }
+        for (k, &i) in v.iter().enumerate() {
+            if k > 0 {
+                out.push_str("\n\n");
+            }
+            new_start[i] = out.len();
+            out.push_str(&text[items[i].range.clone()]);
+        }
+        if *a != Align::Left {
+            out.push_str("\n\n</div>");
+        }
+    }
+    let r0 = items[lo].range.start;
+    let r1 = items[hi].range.end;
+    let before = &text[..r0];
+    let pad_before = if before.is_empty() || before.ends_with("\n\n") { "" } else { "\n" };
+    let rest = &text[r1..];
+    let lead = rest.bytes().take_while(|c| *c == b'\n').count();
+    let pad_after = if rest.trim().is_empty() || lead >= 2 { "" } else if lead == 1 { "\n" } else { "\n\n" };
+    let mut t = String::with_capacity(text.len() + out.len());
+    t.push_str(before);
+    t.push_str(pad_before);
+    let base = t.len();
+    t.push_str(&out);
+    t.push_str(pad_after);
+    t.push_str(rest);
+    // Markeringen följer med blocken.
+    let map = |pos: usize, i: usize| {
+        let it = &items[i].range;
+        base + new_start[i] + pos.clamp(it.start, it.end) - it.start
+    };
+    let first = touched.iter().copied().find(|&i| items[i].range.end >= s).unwrap_or(touched[0]);
+    let last = touched.iter().rev().copied().find(|&i| items[i].range.start <= e).unwrap_or(touched[touched.len() - 1]);
+    let ns = map(s, first);
+    let ne = map(e, last).max(ns);
+    Edit { text: t, sel: ns..ne }
+}
+
 // ============================================================== räkning
 
 pub fn count(_text: &str, a: &Analysis) -> (usize, usize) {
@@ -1128,6 +1823,8 @@ mod tests {
                 && x.markup == y.markup
                 && x.list_marker == y.list_marker
                 && x.image == y.image
+                && x.span == y.span
+                && x.align == y.align
                 && x.image.is_none();
             assert!(!same, "obearbetade grannar i {text:?}");
         }
@@ -1424,6 +2121,11 @@ mod tests {
             "1. a\n\n   fortsättning\n\n2. b\n",
             "<b>html</b> &amp; åäö\n",
             "Text utan slutradbrytning **fet",
+            "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt -->\n\n<span style=\"color: #FF0000\">röd <u>**åäö**</u></span> och <span style=\"font-size: 14pt\">stor</span>\n",
+            "<div align=\"center\">\n\nMitt\n\n<div align=\"right\">\n\nHöger\n\n</div>\n\n</div>\n\nSlut\n",
+            "<div align=\"center\">\ntext utan tomma rader\n</div>\n",
+            "<span>oparad\n\n</span> <div>oparad\n\n</div>\n\n</div>",
+            "<span style=\"color: red\">a\n\nb</span>\n\n- <span style=\"color: blue\">punkt</span>\n",
         ];
         for d in docs {
             covers(d);
@@ -1963,5 +2665,652 @@ mod tests {
         assert_eq!(reveal_range(t, 2..2), 0..6);
         assert_eq!(reveal_range(t, 8..9), 7..10);
     }
-}
 
+    // ---- spans, justering och grundformat (1.5)
+
+    const RED: &str = "<span style=\"color: #FF0000\">";
+
+    fn red() -> SpanStyle {
+        SpanStyle { color: Some([255, 0, 0]), ..Default::default() }
+    }
+
+    /// Texten med varje sammanhängande bit av `needle`-stil avgränsad, för att läsa av resultat.
+    fn color_of(t: &str, needle: &str) -> Option<[u8; 3]> {
+        pc(t, needle).span.and_then(|s| s.color)
+    }
+
+    #[test]
+    fn analys_span_markup_och_stil() {
+        let t = format!("a {RED}röd</span> b");
+        let p = pc(&t, "röd");
+        assert_eq!(p.span.as_deref(), Some(&red()));
+        assert!(!p.markup);
+        assert!(pc(&t, RED).markup && pc(&t, "</span>").markup);
+        assert_eq!(markup_str(&t), format!("{RED}|</span>"));
+        assert_eq!(pc(&t, "a ").span, None);
+        assert_eq!(pc(&t, " b").span, None);
+        covers(&t);
+    }
+
+    #[test]
+    fn analys_span_nästlade_slås_ihop_och_inre_vinner() {
+        let t = "<span style=\"color: #FF0000; font-size: 12pt\">a <span style=\"color: #0000FF\">b</span> c</span>";
+        let a = pc(t, "a ").span.unwrap();
+        assert_eq!((a.color, a.font_size), (Some([255, 0, 0]), Some(12.0)));
+        let b = pc(t, "b").span.unwrap();
+        assert_eq!((b.color, b.font_size), (Some([0, 0, 255]), Some(12.0)));
+        let c = pc(t, " c").span.unwrap();
+        assert_eq!(c.color, Some([255, 0, 0]));
+        assert_eq!(analyze(t).pieces.iter().filter(|p| p.markup).count(), 4);
+        covers(t);
+    }
+
+    #[test]
+    fn analys_span_med_betoning_och_oparad_span() {
+        let t = format!("{RED}<u>**x**</u></span>");
+        let p = pc(&t, "x");
+        assert!(p.bold && p.underline && p.span.is_some() && !p.markup);
+        assert_eq!(markup_str(&t), format!("{RED}|<u>|**|**|</u>|</span>"));
+        // Oparad span är vanlig text.
+        let t = format!("{RED}x");
+        assert_eq!(pc(&t, "x").span, None);
+        assert!(!analyze(&t).pieces.iter().any(|p| p.markup));
+        // Span utan style ger en tom stil men är ändå markup.
+        let t = "<span>x</span>";
+        assert!(pc(t, "x").span.is_some_and(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn analys_span_över_rader_och_i_lista() {
+        let t = format!("- {RED}punkt</span>\n- annan\n");
+        assert_eq!(color_of(&t, "punkt"), Some([255, 0, 0]));
+        assert!(pc(&t, "annan").span.is_none());
+        assert_eq!(pc(&t, "punkt").block, Block::Bullet);
+        covers(&t);
+    }
+
+    #[test]
+    fn analys_div_justering() {
+        let t = "före\n\n<div align=\"center\">\n\nmitten\n\n</div>\n\nefter\n";
+        assert_eq!(pc(t, "mitten").align, Align::Center);
+        assert_eq!(pc(t, "före").align, Align::Left);
+        assert_eq!(pc(t, "efter").align, Align::Left);
+        let o = pc(t, "<div align=\"center\">");
+        assert!(o.markup && o.block == Block::Normal);
+        assert!(pc(t, "</div>").markup);
+        assert_eq!(markup_str(t), "<div align=\"center\">|</div>");
+        covers(t);
+    }
+
+    #[test]
+    fn analys_div_nästlade_innersta_vinner() {
+        let t = "<div align=\"center\">\n\nA\n\n<div align=\"right\">\n\nB\n\n</div>\n\nC\n\n</div>\n";
+        assert_eq!(pc(t, "A").align, Align::Center);
+        assert_eq!(pc(t, "B").align, Align::Right);
+        assert_eq!(pc(t, "C").align, Align::Center);
+        assert_eq!(analyze(t).pieces.iter().filter(|p| p.markup).count(), 4);
+        covers(t);
+    }
+
+    #[test]
+    fn analys_div_utan_tomma_rader_och_oparad() {
+        let t = "<div align=\"right\">\nrad ett\nrad två\n</div>\n";
+        assert_eq!(pc(t, "rad ett").align, Align::Right);
+        assert!(pc(t, "<div align=\"right\">").markup);
+        // Oparad div är vanlig text.
+        let t = "<div align=\"right\">\n\ntext\n";
+        assert_eq!(pc(t, "text").align, Align::Left);
+        assert!(!analyze(t).pieces.iter().any(|p| p.markup));
+        let t = "text\n\n</div>\n";
+        assert!(!analyze(t).pieces.iter().any(|p| p.markup));
+    }
+
+    #[test]
+    fn analys_grundformat_i_kommentar() {
+        let t = "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt -->\n\ntext\n";
+        let a = analyze(t);
+        assert_eq!(a.defaults.font_family.as_deref(), Some("Times New Roman"));
+        assert_eq!(a.defaults.font_size, Some(12.0));
+        assert!(a.pieces[0].markup);
+        assert_eq!(markup_str(t), "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt -->");
+        covers(t);
+        // Saknas raden är det standard; andra kommentarer och andra rader är vanlig text.
+        assert!(analyze("text\n").defaults.is_empty());
+        let t = "<!-- en annan kommentar -->\n\ntext\n";
+        assert!(analyze(t).defaults.is_empty());
+        assert!(!analyze(t).pieces.iter().any(|p| p.markup));
+        let t = "text\n\n<!-- kladd: font-size: 20pt -->\n";
+        assert!(analyze(t).defaults.is_empty());
+        assert!(!analyze(t).pieces.iter().any(|p| p.markup));
+    }
+
+    #[test]
+    fn räkna_ignorerar_nya_taggar() {
+        let t = format!("<!-- kladd: font-size: 12pt -->\n\n<div align=\"center\">\n\n{RED}två ord</span>\n\n</div>\n");
+        let (words, chars) = count(&t, &analyze(&t));
+        assert_eq!(words, 2);
+        assert_eq!(chars, "två ord".chars().count());
+    }
+
+    #[test]
+    fn active_span_enhetlig_och_blandad() {
+        let t = format!("{RED}röd</span> och {RED}röd2</span>");
+        let a = analyze(&t);
+        // Vid markören.
+        let i = t.find("röd").unwrap() + 2;
+        assert_eq!(active(&t, &a, i..i).span.color, Some([255, 0, 0]));
+        let j = t.find("och").unwrap() + 1;
+        assert_eq!(active(&t, &a, j..j).span.color, None);
+        // Enhetlig över markeringen (ordet, utan det mellanliggande).
+        let w = t.find("röd").unwrap()..t.find("</span>").unwrap();
+        assert_eq!(active(&t, &a, w).span, red());
+        // Blandad: röd + ingen stil.
+        let all = 0..t.len();
+        assert_eq!(active(&t, &a, all).span.color, None);
+        // Två olika färger men samma storlek.
+        let t = "<span style=\"color: #FF0000; font-size: 12pt\">a</span><span style=\"color: #0000FF; font-size: 12pt\">b</span>";
+        let a = analyze(t);
+        let sp = active(t, &a, 0..t.len()).span;
+        assert_eq!((sp.color, sp.font_size), (None, Some(12.0)));
+    }
+
+    #[test]
+    fn active_justering_på_markörens_rad() {
+        let t = "vänster\n\n<div align=\"center\">\n\nmitten\n\n</div>\n";
+        let a = analyze(t);
+        let i = t.find("mitten").unwrap() + 2;
+        assert_eq!(active(t, &a, i..i).align, Align::Center);
+        assert_eq!(active(t, &a, 2..2).align, Align::Left);
+        // Markeringens början avgör.
+        assert_eq!(active(t, &a, i..t.len()).align, Align::Center);
+        assert_eq!(active(t, &a, 0..i).align, Align::Left);
+    }
+
+    // ---- set_span_prop
+
+    fn sp_edit(t: &str, needle: &str, prop: SpanProp) -> Edit {
+        let i = t.find(needle).unwrap();
+        set_span_prop(t, i..i + needle.len(), prop)
+    }
+
+    #[test]
+    fn span_sätt_färg_på_markering() {
+        let t = "ab cd ef";
+        let r = sp_edit(t, "cd", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("ab {RED}cd</span> ef"));
+        assert_eq!(&r.text[r.sel.clone()], "cd");
+        assert_eq!(color_of(&r.text, "cd"), Some([255, 0, 0]));
+        covers(&r.text);
+    }
+
+    #[test]
+    fn span_tom_markering_tar_ordet() {
+        let t = "ab cd ef";
+        let r = set_span_prop(t, 4..4, SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("ab {RED}cd</span> ef"));
+        // Inget ord: oförändrad.
+        let r = set_span_prop("ab  cd", 3..3, SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, "ab  cd");
+        let r = set_span_prop("", 0..0, SpanProp::FontSize(Some(14.0)));
+        assert_eq!(r.text, "");
+    }
+
+    #[test]
+    fn span_flera_egenskaper_i_en_tagg() {
+        let t = "ab";
+        let r = set_span_prop(t, 0..2, SpanProp::FontFamily(Some("Times New Roman".into())));
+        let r = set_span_prop(&r.text, r.sel, SpanProp::FontSize(Some(14.0)));
+        let r = set_span_prop(&r.text, r.sel, SpanProp::Background(Some([255, 255, 0])));
+        assert_eq!(
+            r.text,
+            "<span style=\"font-family: 'Times New Roman'; font-size: 14pt; background-color: #FFFF00\">ab</span>"
+        );
+        assert_eq!(&r.text[r.sel.clone()], "ab");
+    }
+
+    #[test]
+    fn span_dela_befintlig_span() {
+        let t = format!("{RED}ab</span>");
+        let r = sp_edit(&t, "b", SpanProp::FontSize(Some(14.0)));
+        assert_eq!(
+            r.text,
+            format!("{RED}a</span><span style=\"font-size: 14pt; color: #FF0000\">b</span>")
+        );
+        assert_eq!(&r.text[r.sel.clone()], "b");
+        covers(&r.text);
+        // Mitten av tre.
+        let t = format!("{RED}abc</span>");
+        let r = sp_edit(&t, "b", SpanProp::Color(Some([0, 0, 255])));
+        assert_eq!(
+            r.text,
+            format!("{RED}a</span><span style=\"color: #0000FF\">b</span>{RED}c</span>")
+        );
+    }
+
+    #[test]
+    fn span_byt_värde_på_hel_span() {
+        let t = format!("x {RED}ab</span> y");
+        let r = sp_edit(&t, "ab", SpanProp::Color(Some([0, 0, 255])));
+        assert_eq!(r.text, "x <span style=\"color: #0000FF\">ab</span> y");
+    }
+
+    #[test]
+    fn span_ta_bort_egenskap_packar_upp_tom_span() {
+        let t = format!("x {RED}ab</span> y");
+        let r = sp_edit(&t, "ab", SpanProp::Color(None));
+        assert_eq!(r.text, "x ab y");
+        assert_eq!(&r.text[r.sel.clone()], "ab");
+        assert!(analyze(&r.text).pieces.iter().all(|p| !p.markup));
+        // En kvarvarande egenskap behåller spanen.
+        let t = "<span style=\"font-size: 14pt; color: #FF0000\">ab</span>";
+        let r = sp_edit(t, "ab", SpanProp::Color(None));
+        assert_eq!(r.text, "<span style=\"font-size: 14pt\">ab</span>");
+        // Ta bort ur en del: resten behåller stilen.
+        let r = sp_edit(&format!("{RED}abc</span>"), "b", SpanProp::Color(None));
+        assert_eq!(r.text, format!("{RED}a</span>b{RED}c</span>"));
+    }
+
+    #[test]
+    fn span_intilliggande_med_samma_stil_slås_ihop() {
+        let t = format!("{RED}a</span>b");
+        let r = sp_edit(&t, "b", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}ab</span>"));
+        let t = format!("a{RED}b</span>");
+        let r = sp_edit(&t, "a", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}ab</span>"));
+        // Mellan två lika spans.
+        let t = format!("{RED}a</span>b{RED}c</span>");
+        let r = sp_edit(&t, "b", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}abc</span>"));
+    }
+
+    #[test]
+    fn span_ligger_utanför_betoning_som_ryms() {
+        let t = "a **fet** b";
+        let r = set_span_prop(t, 2..9, SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("a {RED}**fet**</span> b"));
+        // Bara ordet inuti: spanen utanför.
+        let r = sp_edit(t, "fet", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("a {RED}**fet**</span> b"));
+        assert_eq!(&r.text[r.sel.clone()], "fet");
+        let p = pc(&r.text, "fet");
+        assert!(p.bold && p.span.is_some());
+        covers(&r.text);
+        // Understruken och genomstruken.
+        let r = sp_edit("<u>x</u> ~~y~~", "y", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("<u>x</u> {RED}~~y~~</span>"));
+    }
+
+    #[test]
+    fn span_skär_genom_betoning() {
+        let t = "**xqw**";
+        let r = sp_edit(t, "q", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("**x**{RED}**q**</span>**w**"));
+        assert_eq!(&r.text[r.sel.clone()], "q");
+        for (n, c) in [("x", false), ("q", true), ("w", false)] {
+            let p = pc(&r.text, n);
+            assert!(p.bold, "{n}");
+            assert_eq!(p.span.is_some(), c, "{n}");
+        }
+        // Början och slutet.
+        let r = sp_edit(t, "xq", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}**xq**</span>**w**"));
+        let r = sp_edit(t, "qw", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("**x**{RED}**qw**</span>"));
+        // Hela innehållet.
+        let r = sp_edit(t, "xqw", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}**xqw**</span>"));
+    }
+
+    #[test]
+    fn span_skär_genom_betoning_med_blanksteg() {
+        // Stängningen flyttas före blanksteget så att `**` fortfarande är en giltig stängning.
+        let t = "**xq wk**";
+        let r = sp_edit(t, "wk", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("**xq** {RED}**wk**</span>"));
+        assert!(pc(&r.text, "xq").bold && pc(&r.text, "wk").bold);
+        let r = sp_edit(t, "xq", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}**xq**</span> **wk**"));
+        assert!(pc(&r.text, "wk").bold && pc(&r.text, "wk").span.is_none());
+        // Kursiv inuti fet.
+        let t = "**x *q* w**";
+        let r = sp_edit(t, "q", SpanProp::Color(Some([255, 0, 0])));
+        let p = pc(&r.text, "q");
+        assert!(p.bold && p.italic && p.span.is_some());
+        assert!(!pc(&r.text, "x").italic && pc(&r.text, "x").span.is_none());
+        assert!(pc(&r.text, "w").bold && pc(&r.text, "w").span.is_none());
+    }
+
+    #[test]
+    fn span_rundtur_med_betoning() {
+        let t = "**xqw**";
+        let r = sp_edit(t, "q", SpanProp::Color(Some([255, 0, 0])));
+        let r2 = set_span_prop(&r.text, r.sel.clone(), SpanProp::Color(None));
+        assert_eq!(r2.text, t);
+        assert_eq!(&r2.text[r2.sel.clone()], "q");
+    }
+
+    #[test]
+    fn span_rundtur_enkel() {
+        for (t, n) in [("ab cd ef", "cd"), ("åäö ÅÄÖ", "ÅÄÖ"), ("ett *två* tre", "två"), ("- punkt ett\n- punkt två\n", "ett")] {
+            let i = t.find(n).unwrap();
+            let r = set_span_prop(t, i..i + n.len(), SpanProp::Color(Some([255, 0, 0])));
+            assert_ne!(r.text, t);
+            assert_eq!(&r.text[r.sel.clone()], n);
+            assert!(analyze(&r.text).pieces.iter().any(|p| p.span.is_some()));
+            let back = set_span_prop(&r.text, r.sel.clone(), SpanProp::Color(None));
+            assert_eq!(back.text, t, "rundtur {t:?}");
+            assert_eq!(&back.text[back.sel.clone()], n);
+        }
+    }
+
+    #[test]
+    fn span_flera_rader() {
+        let t = "ett\ntvå\ntre";
+        let r = set_span_prop(t, 0..t.len(), SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}ett</span>\n{RED}två</span>\n{RED}tre</span>"));
+        assert_eq!(&r.text[r.sel.clone()], format!("ett</span>\n{RED}två</span>\n{RED}tre"));
+        covers(&r.text);
+        // Hoppar över blockprefix.
+        let t = "# Rubrik\n\n- punkt\n\n> citat\n";
+        let r = set_span_prop(t, 0..t.len(), SpanProp::FontSize(Some(16.0)));
+        let sz = "<span style=\"font-size: 16pt\">";
+        assert_eq!(
+            r.text,
+            format!("# {sz}Rubrik</span>\n\n- {sz}punkt</span>\n\n> {sz}citat</span>\n")
+        );
+        assert_eq!(pc(&r.text, "Rubrik").block, Block::Heading(1));
+        assert_eq!(pc(&r.text, "punkt").span.as_ref().and_then(|s| s.font_size), Some(16.0));
+    }
+
+    #[test]
+    fn span_markering_över_span_gräns() {
+        // Börjar före en span och slutar mitt i den.
+        let t = format!("x {RED}qw</span> k");
+        let r = set_span_prop(&t, 0..t.find('w').unwrap(), SpanProp::FontSize(Some(14.0)));
+        let a = analyze(&r.text);
+        let sz = |n: &str| pc(&r.text, n).span.as_ref().and_then(|s| s.font_size);
+        assert_eq!(sz("x"), Some(14.0));
+        assert_eq!(sz("q"), Some(14.0));
+        assert_eq!(color_of(&r.text, "q"), Some([255, 0, 0]));
+        assert_eq!(color_of(&r.text, "x"), None);
+        assert_eq!(sz("w"), None);
+        assert_eq!(color_of(&r.text, "w"), Some([255, 0, 0]));
+        assert_eq!(sz("k"), None);
+        assert!(a.pieces.len() > 4);
+        covers(&r.text);
+    }
+
+    #[test]
+    fn span_nästlade_plattas_ut() {
+        let t = "<span style=\"color: #FF0000\">x <span style=\"font-size: 12pt\">q</span> w</span>";
+        let r = sp_edit(t, "q", SpanProp::Color(Some([0, 0, 255])));
+        let p = |n: &str| pc(&r.text, n).span.clone().map(|s| (s.color, s.font_size));
+        assert_eq!(p("x "), Some((Some([255, 0, 0]), None)));
+        assert_eq!(p("q"), Some((Some([0, 0, 255]), Some(12.0))));
+        assert_eq!(p(" w"), Some((Some([255, 0, 0]), None)));
+        covers(&r.text);
+    }
+
+    #[test]
+    fn span_i_tabell_per_cell_och_hoppar_över_kod() {
+        let t = "| a | b |\n| --- | --- |\n| c | d |\n";
+        let r = set_span_prop(t, 0..t.len(), SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(
+            r.text,
+            format!("| {RED}a</span> | {RED}b</span> |\n| --- | --- |\n| {RED}c</span> | {RED}d</span> |\n")
+        );
+        assert_eq!(analyze(&r.text).pieces.iter().filter(|p| p.block == Block::Table && p.span.is_some() && !p.markup).count(), 4);
+        let t = "```\nkod\n```\n";
+        assert_eq!(set_span_prop(t, 0..t.len(), SpanProp::Color(Some([255, 0, 0]))).text, t);
+    }
+
+    #[test]
+    fn span_rör_inte_inline_kod_länkar_eller_div_rader() {
+        // Delad kod tas med hel.
+        let t = "se `kod` här";
+        let r = set_span_prop(t, 5..7, SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("se {RED}`kod`</span> här"));
+        // Länkadress delas inte.
+        let t = "[länk](http://x.se) slut";
+        let r = set_span_prop(t, 0..t.find("http").unwrap() + 2, SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("{RED}[länk](http://x.se)</span> slut"));
+        // Div-rader formateras inte.
+        let t = "<div align=\"center\">\n\ntext\n\n</div>\n";
+        let r = set_span_prop(t, 0..t.len(), SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("<div align=\"center\">\n\n{RED}text</span>\n\n</div>\n"));
+        assert_eq!(pc(&r.text, "text").align, Align::Center);
+    }
+
+    #[test]
+    fn span_åäö_och_felaktiga_offset() {
+        let t = "åäö ÖÄÅ";
+        let r = set_span_prop(t, 1..1, SpanProp::Color(Some([255, 0, 0]))); // mitt i å: ordet
+        assert_eq!(r.text, format!("{RED}åäö</span> ÖÄÅ"));
+        let r = set_span_prop(t, 1..4, SpanProp::Color(Some([255, 0, 0]))); // börjar mitt i å
+        assert_eq!(r.text, format!("{RED}åä</span>ö ÖÄÅ"));
+        let r = set_span_prop(t, 100..200, SpanProp::Color(Some([255, 0, 0])));
+        assert!(analyze(&r.text).pieces.len() >= 1);
+        covers(&r.text);
+    }
+
+    // ---- set_align
+
+    fn al(t: &str, needle: &str, a: Align) -> Edit {
+        let i = t.find(needle).unwrap();
+        set_align(t, i..i + needle.len(), a)
+    }
+
+    const CENTER: &str = "<div align=\"center\">";
+
+    #[test]
+    fn align_omslut_stycke() {
+        let t = "a\n\nb\n\nc";
+        let r = al(t, "b", Align::Center);
+        assert_eq!(r.text, format!("a\n\n{CENTER}\n\nb\n\n</div>\n\nc"));
+        assert_eq!(&r.text[r.sel.clone()], "b");
+        assert_eq!(pc(&r.text, "b").align, Align::Center);
+        assert_eq!(pc(&r.text, "a").align, Align::Left);
+        covers(&r.text);
+        // Markör i stycket, i början och i slutet av texten.
+        let r = set_align("hej", 1..1, Align::Right);
+        assert_eq!(r.text, "<div align=\"right\">\n\nhej\n\n</div>");
+        assert_eq!(r.sel, r.text.find("hej").unwrap() + 1..r.text.find("hej").unwrap() + 1);
+    }
+
+    #[test]
+    fn align_flera_stycken_en_div() {
+        let t = "a\n\nb\n\nc\n\nd";
+        let i = t.find('b').unwrap();
+        let j = t.find('c').unwrap() + 1;
+        let r = set_align(t, i..j, Align::Justify);
+        assert_eq!(r.text, "a\n\n<div align=\"justify\">\n\nb\n\nc\n\n</div>\n\nd");
+        assert_eq!(&r.text[r.sel.clone()], "b\n\nc");
+    }
+
+    #[test]
+    fn align_byt_befintlig() {
+        let t = format!("{CENTER}\n\nmitten\n\n</div>\n");
+        let r = al(&t, "mitten", Align::Right);
+        assert_eq!(r.text, "<div align=\"right\">\n\nmitten\n\n</div>\n");
+        assert_eq!(&r.text[r.sel.clone()], "mitten");
+        assert_eq!(pc(&r.text, "mitten").align, Align::Right);
+        // Samma justering: oförändrat.
+        let r = al(&t, "mitten", Align::Center);
+        assert_eq!(r.text, t);
+    }
+
+    #[test]
+    fn align_vänster_tar_bort_div() {
+        let t = format!("före\n\n{CENTER}\n\nmitten\n\n</div>\n\nefter\n");
+        let r = al(&t, "mitten", Align::Left);
+        assert_eq!(r.text, "före\n\nmitten\n\nefter\n");
+        assert!(analyze(&r.text).pieces.iter().all(|p| !p.markup));
+        assert_eq!(&r.text[r.sel.clone()], "mitten");
+        // Vänster på vanlig text är ingen åtgärd.
+        assert_eq!(al("a\n\nb", "b", Align::Left).text, "a\n\nb");
+    }
+
+    #[test]
+    fn align_dela_div() {
+        let t = format!("{CENTER}\n\nxa\n\nxb\n\nxc\n\n</div>\n");
+        let r = al(&t, "xb", Align::Right);
+        assert_eq!(
+            r.text,
+            format!("{CENTER}\n\nxa\n\n</div>\n\n<div align=\"right\">\n\nxb\n\n</div>\n\n{CENTER}\n\nxc\n\n</div>\n")
+        );
+        assert_eq!(&r.text[r.sel.clone()], "xb");
+        let al_of = |n: &str| pc(&r.text, n).align;
+        assert_eq!((al_of("xa"), al_of("xb"), al_of("xc")), (Align::Center, Align::Right, Align::Center));
+        covers(&r.text);
+        // Första stycket tas ut: ingen tom före-del.
+        let r = al(&t, "xa", Align::Left);
+        assert_eq!(r.text, format!("xa\n\n{CENTER}\n\nxb\n\nxc\n\n</div>\n"));
+        // Sista stycket.
+        let r = al(&t, "xc", Align::Left);
+        assert_eq!(r.text, format!("{CENTER}\n\nxa\n\nxb\n\n</div>\n\nxc\n"));
+    }
+
+    #[test]
+    fn align_slå_ihop_med_intilliggande() {
+        let t = format!("{CENTER}\n\na\n\n</div>\n\nb\n\n{CENTER}\n\nc\n\n</div>\n");
+        let r = al(&t, "b", Align::Center);
+        assert_eq!(r.text, format!("{CENTER}\n\na\n\nb\n\nc\n\n</div>\n"));
+        assert_eq!(&r.text[r.sel.clone()], "b");
+        covers(&r.text);
+        // Bara ena sidan.
+        let t = format!("{CENTER}\n\na\n\n</div>\n\nb\n\nc");
+        let r = al(&t, "b", Align::Center);
+        assert_eq!(r.text, format!("{CENTER}\n\na\n\nb\n\n</div>\n\nc"));
+        // Något annat emellan: ingen sammanslagning.
+        let t = format!("{CENTER}\n\na\n\n</div>\n\nx\n\nb");
+        let r = al(&t, "b", Align::Center);
+        assert_eq!(r.text, format!("{CENTER}\n\na\n\n</div>\n\nx\n\n{CENTER}\n\nb\n\n</div>"));
+        // Annan justering slås inte ihop.
+        let t = format!("{CENTER}\n\na\n\n</div>\n\nb");
+        let r = al(&t, "b", Align::Right);
+        assert_eq!(r.text, format!("{CENTER}\n\na\n\n</div>\n\n<div align=\"right\">\n\nb\n\n</div>"));
+    }
+
+    #[test]
+    fn align_lista_är_ett_block() {
+        let t = "text\n\n- ett\n- två\n- tre\n\nslut";
+        // Markeringen rör bara ett objekt, hela listan omsluts.
+        let r = al(t, "två", Align::Center);
+        assert_eq!(r.text, format!("text\n\n{CENTER}\n\n- ett\n- två\n- tre\n\n</div>\n\nslut"));
+        assert_eq!(&r.text[r.sel.clone()], "två");
+        assert_eq!(pc(&r.text, "tre").align, Align::Center);
+        assert_eq!(pc(&r.text, "tre").block, Block::Bullet);
+        assert_eq!(pc(&r.text, "slut").align, Align::Left);
+        // Lös lista (tomma rader mellan objekt) är fortfarande ett block.
+        let t = "1. a\n\n2. b\n\nslut";
+        let r = al(t, "a", Align::Right);
+        assert_eq!(r.text, "<div align=\"right\">\n\n1. a\n\n2. b\n\n</div>\n\nslut");
+    }
+
+    #[test]
+    fn align_rubrik_citat_och_blanka_rader() {
+        let t = "# Rubrik\n\n> citat\n\ntext";
+        let r = al(t, "Rubrik", Align::Center);
+        assert_eq!(r.text, format!("{CENTER}\n\n# Rubrik\n\n</div>\n\n> citat\n\ntext"));
+        assert_eq!(pc(&r.text, "Rubrik").block, Block::Heading(1));
+        assert_eq!(pc(&r.text, "Rubrik").align, Align::Center);
+        assert_eq!(pc(&r.text, "citat").align, Align::Left);
+        // Rubrik direkt följd av stycke utan tom rad: tomma rader runt divven.
+        let t = "# Rubrik\ntext\n";
+        let r = al(t, "text", Align::Right);
+        assert_eq!(r.text, "# Rubrik\n\n<div align=\"right\">\n\ntext\n\n</div>\n");
+        // Markering i tomrad mellan stycken berör inget.
+        let t = "a\n\n\n\nb";
+        assert_eq!(set_align(t, 2..2, Align::Center).text, t);
+    }
+
+    #[test]
+    fn align_nästlad_div_ändrar_den_innersta() {
+        let t = format!("{CENTER}\n\nA\n\n<div align=\"right\">\n\nB\n\n</div>\n\n</div>\n");
+        let r = al(&t, "B", Align::Left);
+        // Vänster betyder verkligen vänster: B hamnar utanför den yttre divven.
+        assert_eq!(r.text, format!("{CENTER}\n\nA\n\n</div>\n\nB\n"));
+        assert_eq!(pc(&r.text, "B").align, Align::Left);
+        assert_eq!(pc(&r.text, "A").align, Align::Center);
+    }
+
+    #[test]
+    fn align_markering_över_flera_block_med_div_emellan() {
+        let t = format!("a\n\n{CENTER}\n\nb\n\n</div>\n\nc\n");
+        let r = set_align(&t, 0..t.rfind('c').unwrap() + 1, Align::Right);
+        assert_eq!(r.text, "<div align=\"right\">\n\na\n\nb\n\nc\n\n</div>\n");
+        assert_eq!(&r.text[r.sel.clone()], "a\n\nb\n\nc");
+        covers(&r.text);
+    }
+
+    #[test]
+    fn align_grundformatkommentaren_rörs_inte() {
+        let t = "<!-- kladd: font-size: 12pt -->\n\ntext\n";
+        let r = al(t, "text", Align::Center);
+        assert_eq!(r.text, format!("<!-- kladd: font-size: 12pt -->\n\n{CENTER}\n\ntext\n\n</div>\n"));
+        assert_eq!(analyze(&r.text).defaults.font_size, Some(12.0));
+        // Markering som bara täcker kommentaren: ingen åtgärd.
+        assert_eq!(set_align(t, 0..5, Align::Center).text, t);
+    }
+
+    #[test]
+    fn align_rundtur_och_omanalys() {
+        for a in [Align::Center, Align::Right, Align::Justify] {
+            let t = "ett\n\ntvå **fet**\n\ntre";
+            let r = al(t, "två", a);
+            assert_eq!(pc(&r.text, "två").align, a);
+            assert!(pc(&r.text, "fet").bold);
+            let back = set_align(&r.text, r.sel.clone(), Align::Left);
+            assert_eq!(back.text, t);
+            assert_eq!(&back.text[back.sel.clone()], "två");
+        }
+    }
+
+    #[test]
+    fn align_åäö_och_felaktiga_offset() {
+        let t = "åäö\n\nöl";
+        let r = set_align(t, 1..1, Align::Center);
+        assert_eq!(r.text, format!("{CENTER}\n\nåäö\n\n</div>\n\nöl"));
+        assert!(r.text.is_char_boundary(r.sel.start));
+        assert_eq!(set_align("", 0..0, Align::Center).text, "");
+        let r = set_align(t, 100..200, Align::Center);
+        covers(&r.text);
+    }
+
+    #[test]
+    fn span_och_justering_tillsammans() {
+        let t = "a\n\nb";
+        let r = al(t, "b", Align::Center);
+        let r = sp_edit(&r.text, "b", SpanProp::Color(Some([255, 0, 0])));
+        assert_eq!(r.text, format!("a\n\n{CENTER}\n\n{RED}b</span>\n\n</div>"));
+        let p = pc(&r.text, "b");
+        assert!(p.span.is_some() && p.align == Align::Center);
+        let a = active(&r.text, &analyze(&r.text), r.sel.clone());
+        assert_eq!((a.span, a.align), (red(), Align::Center));
+    }
+
+    #[test]
+    fn nya_åtgärder_tål_alla_markeringar() {
+        let docs = [
+            "**abc** *d* <u>e f</u>\n\n- punkt `kod` [l](http://x.se)\n\n| a | b |\n| - | - |\n| c | d |\n",
+            "<div align=\"center\">\n\nåäö <span style=\"color: #FF0000\">r**ö**d</span>\n\n</div>\n\n> citat ![b](x.png)\n",
+            "<!-- kladd: font-size: 12pt -->\n\n**ab\ncd** ef\n\n```\nkod\n```\n",
+        ];
+        for d in docs {
+            let idx: Vec<usize> = d.char_indices().map(|(i, _)| i).chain([d.len()]).collect();
+            for &s in &idx {
+                for &e in idx.iter().filter(|&&e| e >= s) {
+                    let r = set_span_prop(d, s..e, SpanProp::Color(Some([1, 2, 3])));
+                    covers(&r.text);
+                    assert!(r.text.is_char_boundary(r.sel.start) && r.text.is_char_boundary(r.sel.end));
+                    let r = set_span_prop(d, s..e, SpanProp::FontSize(None));
+                    covers(&r.text);
+                    let r = set_align(d, s..e, Align::Right);
+                    covers(&r.text);
+                    assert!(r.text.is_char_boundary(r.sel.start) && r.sel.start <= r.sel.end);
+                }
+            }
+        }
+    }
+}
