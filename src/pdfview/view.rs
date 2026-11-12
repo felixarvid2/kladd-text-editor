@@ -1365,7 +1365,8 @@ impl PdfView {
             }
             Nav::Frac { page, frac } => {
                 let r = layout.rects[page.min(layout.rects.len() - 1)];
-                r.top() + frac * r.height()
+                // Överst på sidan: visa lite av mellanrummet ovanför, som vid hopp.
+                r.top() + frac * r.height() - if frac <= 0.0 { 6.0 } else { 0.0 }
             }
         };
         clamp_offset(vec2(self.scroll.x, y), layout.size, vp)

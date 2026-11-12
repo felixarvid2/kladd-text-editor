@@ -205,7 +205,11 @@ fn render_pdf(doc: &Document) -> Result<PathBuf, String> {
     let title = doc.title();
     // En PDF i visaren skrivs ut som originalfilen, inte som en omrendering av texten.
     let bytes = match &doc.pdfv {
-        Some(tab) => tab.view.bytes().as_ref().clone(),
+        Some(tab) => match tab.password.as_deref() {
+            // Skrivaren kan inte lösenordet: skriv ut en avkrypterad kopia.
+            Some(pw) => decrypted_pdf(tab.view.bytes(), pw).unwrap_or_else(|| tab.view.bytes().as_ref().clone()),
+            None => tab.view.bytes().as_ref().clone(),
+        },
         None => {
             let base = doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
             let images = &doc.images;
@@ -217,6 +221,21 @@ fn render_pdf(doc: &Document) -> Result<PathBuf, String> {
     let path = dir.join(format!("{stem}-{stamp}.pdf"));
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// En lösenordsskyddad PDF utan kryptering, för utskrift. None om det inte går.
+pub fn decrypted_pdf(bytes: &[u8], password: &str) -> Option<Vec<u8>> {
+    let mut opts = lopdf::LoadOptions::default();
+    opts.password = Some(password.to_owned());
+    let mut doc = lopdf::Document::load_mem_with_options(bytes, opts).ok()?;
+    if doc.is_encrypted() {
+        doc.decrypt(password).ok()?;
+    }
+    doc.trailer.remove(b"Encrypt");
+    doc.encryption_state = None;
+    let mut out = Vec::new();
+    doc.save_to(&mut out).ok()?;
+    Some(out)
 }
 
 // ------------------------------------------------------------ dialog
@@ -391,6 +410,18 @@ impl KladdApp {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn decrypted_copy_opens_without_password() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/krypterad.pdf")).unwrap();
+        let ctx = egui::Context::default();
+        assert!(crate::pdfview::engine::PdfEngine::open(std::sync::Arc::new(bytes.clone()), None, ctx.clone()).is_err());
+        let plain = decrypted_pdf(&bytes, "hemligt").expect("avkrypterad kopia");
+        let engine = crate::pdfview::engine::PdfEngine::open(std::sync::Arc::new(plain), None, ctx).expect("öppnas utan lösenord");
+        assert!(engine.page_count() > 0);
+        assert!(crate::pdf_read::read(&decrypted_pdf(&bytes, "hemligt").unwrap(), None).ok().unwrap().markdown.trim().len() > 0);
+    }
+
     use super::*;
 
     #[test]

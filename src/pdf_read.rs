@@ -754,6 +754,18 @@ fn merge_detached_markers(lines: Vec<Line>) -> Vec<Line> {
             let t = t.trim();
             let is_marker = is_list_marker(&format!("{t} x")).is_some() && t.chars().count() <= 4;
             let same_line = (prev.y - l.y).abs() <= prev.size * 0.3;
+            // Ett nummer som delats i två textbitar ("1" + "1. Text" = "11. Text").
+            let split_number = !t.is_empty()
+                && t.len() <= 2
+                && t.chars().all(|c| c.is_ascii_digit())
+                && l.text().starts_with(|c: char| c.is_ascii_digit());
+            if split_number && same_line && l.x0 >= prev.x1 - 1.0 && l.x0 - prev.x1 < prev.size * 0.2 {
+                let mut segs = vec![Seg { text: t.to_owned(), bold: false, italic: false, mono: false }];
+                segs.extend(l.segs);
+                prev.segs = segs;
+                prev.x1 = l.x1;
+                continue;
+            }
             if is_marker && same_line && l.x0 > prev.x1 && l.x0 - prev.x1 < prev.size * 6.0 {
                 let mut segs = vec![Seg { text: format!("{t} "), bold: false, italic: false, mono: false }];
                 segs.extend(l.segs);
@@ -1292,6 +1304,17 @@ mod tests {
     #[test]
     fn rejects_non_pdf() {
         assert!(matches!(read(b"hej", None), Err(ReadError::Other(_))));
+    }
+
+    #[test]
+    fn split_list_number_is_joined() {
+        let mk = |x0: f32, x1: f32, t: &str| Line { x0, x1, y: 100.0, size: 12.0, segs: vec![Seg { text: t.into(), bold: false, italic: false, mono: false }] };
+        let out = merge_detached_markers(vec![mk(10.0, 16.0, "1"), mk(16.5, 26.0, "1. Elva")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text(), "11. Elva");
+        // Ett nummer långt till vänster är inte en del av nästa tal.
+        let out = merge_detached_markers(vec![mk(10.0, 16.0, "3"), mk(200.0, 220.0, "4 st")]);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]

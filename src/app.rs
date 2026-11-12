@@ -1407,7 +1407,7 @@ impl KladdApp {
                             } else {
                                 ("Word-dokument", "Visas som Markdown och sparas som .docx")
                             };
-                            if doc.docx && !doc.pdf {
+                            if doc.docx || doc.pdf {
                                 if status_button(ui, p, "Visa som dokument", "Visa som Word-dokument med sidor och formateringsrad").clicked() {
                                     doc.word_view = true;
                                 }
@@ -2258,6 +2258,11 @@ impl KladdApp {
                 return;
             }
             Err(OpenError::Invalid(m)) => {
+                // Visaren klarar inte filen: försök med textkonverteringen som reserv.
+                if let Ok(doc) = Document::from_pdf_text(self.next_id, path, &bytes, password) {
+                    self.install_doc(ctx, doc, path);
+                    return;
+                }
                 self.settings.recent.retain(|p| p != path);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.notify(ctx, format!("{name} kunde inte öppnas: {m}"), true);

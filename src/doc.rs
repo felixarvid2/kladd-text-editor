@@ -215,7 +215,7 @@ impl Document {
             line_ending: LineEnding::Lf,
             dirty: false,
             docx: false,
-            word_view: false,
+            word_view: true,
             pdf: true,
             pdfv: None,
             open_note,
