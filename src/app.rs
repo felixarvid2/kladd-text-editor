@@ -374,6 +374,7 @@ impl KladdApp {
                 .add_filter("Alla filer", &["*"])
                 .add_filter("Text och Word", TEXT_EXTENSIONS)
                 .add_filter("Word-dokument", &["docx", "docm", "dotx"])
+                .add_filter("OpenDocument-text", &["odt", "ott"])
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -396,7 +397,8 @@ impl KladdApp {
         let doc_id = doc.id;
         let name = if doc.needs_save_as() {
             let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-            format!("{}.docx", stem.unwrap_or_else(|| doc.title()))
+            let ext = if doc.extension() == "ott" { "odt" } else { "docx" };
+            format!("{}.{ext}", stem.unwrap_or_else(|| doc.title()))
         } else if doc.path.is_some() {
             doc.title()
         } else {
@@ -415,6 +417,7 @@ impl KladdApp {
                 .add_filter("Text", &["txt"])
                 .add_filter("Markdown", &["md"])
                 .add_filter("Word-dokument", &["docx"])
+                .add_filter("OpenDocument-text (.odt)", &["odt"])
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -1134,7 +1137,7 @@ impl KladdApp {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     if let Some(doc) = self.docs.get(self.active) {
-                        let lang = if doc.word_view { "Word".to_owned() } else { doc.language() };
+                        let lang = doc.language();
                         ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
                     let now = Self::now(&ctx);
@@ -1157,6 +1160,8 @@ impl KladdApp {
                         if doc.docx || doc.pdf {
                             let (label, tip) = if doc.pdf {
                                 ("PDF-dokument", "Texten visas som Markdown och sparas som en ny PDF")
+                            } else if doc.language() == "OpenDocument" {
+                                ("OpenDocument-text", "Visas som Markdown och sparas som .odt")
                             } else {
                                 ("Word-dokument", "Visas som Markdown och sparas som .docx")
                             };

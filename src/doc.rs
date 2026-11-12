@@ -65,7 +65,7 @@ pub struct Document {
 
 /// Filtyper som visas i öppna/spara-dialogerna.
 pub const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "docx", "pdf", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
+    "txt", "md", "markdown", "docx", "odt", "pdf", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
     "yml", "html", "htm", "css", "scss", "xml", "svg", "sh", "bash", "zsh", "c", "h", "cpp",
     "hpp", "cc", "java", "kt", "go", "rb", "php", "lua", "sql", "ini", "conf", "cfg", "env",
     "csv", "tsv", "log", "tex", "rst", "org", "srt", "desktop", "service",
@@ -239,6 +239,30 @@ impl Document {
                 untitled_index: 0,
             });
         }
+        // OpenDocument-text visas i samma dokumentläge som Word.
+        if is_odt_ext(&ext) {
+            let loaded = crate::odt::read(&bytes)?;
+            return Ok(Self {
+                id,
+                path: Some(path.to_path_buf()),
+                saved_hash: hash_text(&loaded.markdown),
+                saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
+                text: loaded.markdown,
+                encoding: TextEncoding::Utf8,
+                line_ending: LineEnding::Lf,
+                dirty: false,
+                docx: true,
+                word_view: true,
+                pdf: false,
+                open_note: (!loaded.dropped.is_empty()).then(|| {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    format!("{name} innehåller {} som inte visas i Kladd", join_sv(&loaded.dropped))
+                }),
+                docx_dropped: loaded.dropped,
+                images: loaded.images,
+                untitled_index: 0,
+            });
+        }
         if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
             return Err("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.".into());
         }
@@ -274,6 +298,7 @@ impl Document {
     /// Sparar dokumentet. Returnerar varningar (t.ex. bilder som inte hittades).
     pub fn save_to(&mut self, path: &Path) -> Result<Vec<String>, String> {
         let to_word = ext_of(path) == "docx";
+        let to_odt = ext_of(path) == "odt";
         let to_pdf = ext_of(path) == "pdf";
         let mut warnings = Vec::new();
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -281,6 +306,12 @@ impl Document {
             let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let images = &self.images;
             let written = crate::pdf_write::write(&self.text, &title, &|src| resolve_image(src, &base, images))?;
+            warnings.extend(written.missing_images);
+            written.bytes
+        } else if to_odt {
+            let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let images = &self.images;
+            let written = crate::odt::write(&self.text, &title, &|src| resolve_image(src, &base, images))?;
             warnings.extend(written.missing_images);
             written.bytes
         } else if to_word {
@@ -306,7 +337,7 @@ impl Document {
             encode(&text, self.encoding)?
         };
         write_atomic(path, &bytes).map_err(|e| describe_io_error(&e, path))?;
-        self.docx = to_word;
+        self.docx = to_word || to_odt;
         self.pdf = to_pdf;
         self.docx_dropped.clear();
         self.path = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
@@ -373,12 +404,12 @@ impl Document {
 
     /// Word-filer som inte kan sparas tillbaka i samma format (makron, mallar).
     pub fn needs_save_as(&self) -> bool {
-        self.docx && matches!(self.extension().as_str(), "docm" | "dotx" | "dotm" | "doc")
+        self.docx && matches!(self.extension().as_str(), "docm" | "dotx" | "dotm" | "doc" | "ott")
     }
 
     pub fn language(&self) -> String {
         if self.docx {
-            return "Word".to_owned();
+            return if is_odt_ext(&self.extension()) { "OpenDocument" } else { "Word" }.to_owned();
         }
         if self.pdf {
             return "PDF".to_owned();
@@ -491,6 +522,10 @@ fn ext_of(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
 }
 
+fn is_odt_ext(ext: &str) -> bool {
+    matches!(ext, "odt" | "ott")
+}
+
 fn is_word_ext(ext: &str) -> bool {
     matches!(ext, "docx" | "docm" | "dotx" | "dotm")
 }
@@ -582,6 +617,27 @@ mod tests {
         back.save_to(&txt).unwrap();
         assert!(!back.docx);
         assert_eq!(std::fs::read_to_string(&txt).unwrap(), "# Hej\n\nEn **fet** rad.\n");
+    }
+
+    #[test]
+    fn odt_document_roundtrip() {
+        let dir = std::env::temp_dir().join("kladd-test-odt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("brev.odt");
+        let mut d = Document::new_untitled(1, 1);
+        d.text = "# Hej\n\nEn **fet** rad.\n".into();
+        d.save_to(&p).unwrap();
+        assert!(d.docx && !d.dirty);
+        let back = Document::load(2, &p).unwrap();
+        assert!(back.docx && back.word_view && !back.needs_save_as());
+        assert_eq!(back.text, "# Hej\n\nEn **fet** rad.\n");
+        assert_eq!(back.language(), "OpenDocument");
+        // Och vidare som vanlig text.
+        let mut back = back;
+        let md = dir.join("brev.md");
+        back.save_to(&md).unwrap();
+        assert!(!back.docx);
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# Hej\n\nEn **fet** rad.\n");
     }
 
     #[test]

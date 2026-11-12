@@ -247,3 +247,15 @@ resultatet med `paste::insert` (block får tomma rader runt sig, ett inline-styc
 direkt). Ctrl+Skift+V och urklipp utan HTML går som förut. egui skickar `Paste` bara när
 urklippet också har vanlig text, vilket Word, LibreOffice, Google Dokument och webbläsare alltid
 lägger dit.
+
+### OpenDocument-text (.odt)
+
+`src/odt.rs` läser och skriver `.odt` (LibreOffice) med samma Markdown-dialekt och dokumentläge som
+`.docx`: `odt::read(bytes) -> docx::Loaded` och `odt::write(markdown, titel, resolve) -> docx::Written`.
+Formatmallar (`office:styles` och `office:automatic-styles` i `styles.xml`/`content.xml`) löses längs
+`style:parent-style-name`; bara det som skiljer sig från grundformatet (standardstycket + Standard)
+blir `<span style>`. Fotnoter, kommentarer, former/diagram och länkade bilder tas bort och rapporteras
+som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/sidfot (`text:page-number`
+→ `{sida}`, `text:page-count` → `{sidor}`) hamnar i grundformatskommentaren. Vid skrivning ligger
+`mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
+`language()` visar "OpenDocument".
