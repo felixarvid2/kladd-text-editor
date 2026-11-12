@@ -1,15 +1,23 @@
-# Bygger ett .deb-paket och skapar en GitHub-release när en versionstagg pushas.
+# Bygger ett .deb-paket och skapar en GitHub-release.
 #
-#   git tag v1.4.0 && git push origin v1.4.0
-#
-# Taggen måste stämma med versionen i Cargo.toml. Workflowen kan också köras för
-# hand (Actions → Release → Run workflow); då byggs paketet bara som en artefakt.
+# Två sätt att släppa en ny version (höj först `version` i Cargo.toml):
+#   1. Pusha en tagg:  git tag v1.4.0 && git push origin v1.4.0
+#      Taggen måste stämma med versionen i Cargo.toml.
+#   2. Kör workflowen för hand (Actions → Release → Run workflow) med
+#      "Publicera release" ikryssat. Då skapas taggen v<version> på den valda
+#      grenens senaste commit.
+# Körs workflowen för hand utan kryss byggs paketet bara som en artefakt.
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publicera release (skapar taggen v<version> från Cargo.toml)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -21,14 +29,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Kontrollera att taggen stämmer med Cargo.toml
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Bestäm version och tagg
+        id: version
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Taggen $GITHUB_REF_NAME stämmer inte med versionen $version i Cargo.toml"
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::Taggen $GITHUB_REF_NAME stämmer inte med versionen $version i Cargo.toml"
+              exit 1
+            fi
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -50,10 +62,13 @@ jobs:
           path: target/debian/*.deb
 
       - name: Skapa release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.ref_type == 'tag' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          gh release create "$GITHUB_REF_NAME" target/debian/*.deb \
-            --title "Kladd ${GITHUB_REF_NAME#v}" \
+          gh release create "$TAG" target/debian/*.deb \
+            --target "$GITHUB_SHA" \
+            --title "Kladd $VERSION" \
             --generate-notes
