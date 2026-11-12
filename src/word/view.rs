@@ -194,10 +194,10 @@ fn color_popup(
 }
 
 fn divider(ui: &mut Ui, p: &Palette) {
-    ui.add_space(4.0);
+    ui.add_space(3.0);
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line));
-    ui.add_space(4.0);
+    ui.add_space(3.0);
 }
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -421,7 +421,7 @@ impl KladdApp {
             .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
             .show(ui, |ui| {
                 let full = ui.max_rect();
-                let right_w = 186.0;
+                let right_w = 218.0;
                 let left_w = (full.width() - right_w - 8.0).max(200.0);
                 let right = Rect::from_min_size(pos2(full.right() - right_w, full.top()), vec2(right_w, 28.0));
                 ui.set_min_height(28.0);
@@ -431,7 +431,7 @@ impl KladdApp {
                     ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
                     // Stil
                     egui::ComboBox::from_id_salt("kladd-word-style")
-                        .width(106.0)
+                        .width(98.0)
                         .selected_text(block_label(act.block))
                         .show_ui(ui, |ui| {
                             for b in [
@@ -448,7 +448,7 @@ impl KladdApp {
                         });
                     // Typsnitt och storlek
                     egui::ComboBox::from_id_salt("kladd-word-font")
-                        .width(126.0)
+                        .width(112.0)
                         .selected_text(cur_font.clone())
                         .show_ui(ui, |ui| {
                             let pick = |f: &str| {
@@ -585,9 +585,6 @@ impl KladdApp {
                             acts.push(BarAct::TableOp(op));
                         }
                     }
-                    if icons::button(ui, p, Icon::Page, 28.0, false, "Sidinställningar", p.chrome).clicked() {
-                        acts.push(BarAct::PageSetup);
-                    }
                     divider(ui, p);
                     if icons::button(ui, p, Icon::Undo, 28.0, false, "Ångra (Ctrl+Z)", p.chrome).clicked() {
                         acts.push(BarAct::Undo);
@@ -601,6 +598,9 @@ impl KladdApp {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     if status_button(ui, p, "Markdown", "Visa dokumentet som Markdown-text").clicked() {
                         acts.push(BarAct::ToMarkdown);
+                    }
+                    if icons::button(ui, p, Icon::Page, 28.0, false, "Sidinställningar", p.chrome).clicked() {
+                        acts.push(BarAct::PageSetup);
                     }
                     divider(ui, p);
                     if icons::button(ui, p, Icon::Plus, 28.0, false, "Zooma in (Ctrl+plus)", p.chrome).clicked() {
