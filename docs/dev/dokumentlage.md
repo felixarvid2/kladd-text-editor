@@ -187,3 +187,26 @@ impl Speller {
 pub struct Lang { pub code: String /* "sv_SE" */, pub name: String /* "Svenska" */, pub aff: PathBuf, pub dic: PathBuf }
 pub fn words(text: &str, range: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>>; // ordregler ovan
 ```
+
+## Typsnitt, storlekar, färger och justering (1.5)
+
+Formatet i Markdown-texten är HTML, så att det också fungerar i andra Markdown-program och på
+GitHub. Allt tolkas och skrivs med `src/style.rs`:
+
+- Tecken: `<span style="font-family: Arial; font-size: 14pt; color: #C00000; background-color: #FFFF00">…</span>`.
+  Bara egenskaper som skiljer sig från dokumentets grundformat skrivs. Markering
+  (`w:highlight`) och skuggning (`w:shd`) blir båda `background-color`; vid skrivning blir en
+  exakt markeringsfärg `w:highlight`, annars `w:shd`. Spans ligger ytterst:
+  `<span …><u>**x**</u></span>`.
+- Stycken: `<div align="center">`, tom rad, styckena, tom rad, `</div>` (som GitHub-README:s).
+  `left` skrivs aldrig. Intilliggande stycken med samma justering delar en div.
+- Grundformat: första raden `<!-- kladd: font-family: "Times New Roman"; font-size: 12pt -->`
+  när dokumentets standardtypsnitt (docDefaults + formatmallen Normal) inte är Calibri 11 pt.
+- Typsnitt hämtas från systemet med fontconfig (`fc-match`), så Arial blir Liberation Sans och
+  Times New Roman Liberation Serif på Ubuntu precis som i LibreOffice. Hittas inget används
+  Carlito (sans) eller systemets serif/monospace efter namnet.
+- Mörkt tema: dokumentfärger med för låg kontrast mot sidan ljusas upp (som Words mörka läge).
+
+Dokumentläget lägger ut varje stycke för sig (egen radbredd, justering och hängande indrag)
+och fogar ihop styckena med `Galley::concat`. Marginaljustering fördelar utrymmet på
+mellanrummen i alla rader utom styckets sista.
