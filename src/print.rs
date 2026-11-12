@@ -203,13 +203,19 @@ fn render_pdf(doc: &Document) -> Result<PathBuf, String> {
         }
     }
     let title = doc.title();
-    let base = doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
-    let images = &doc.images;
-    let written = crate::pdf_write::write(&printable_text(doc), &title, &|src| resolve_image(src, &base, images))?;
+    // En PDF i visaren skrivs ut som originalfilen, inte som en omrendering av texten.
+    let bytes = match &doc.pdfv {
+        Some(tab) => tab.view.bytes().as_ref().clone(),
+        None => {
+            let base = doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
+            let images = &doc.images;
+            crate::pdf_write::write(&printable_text(doc), &title, &|src| resolve_image(src, &base, images))?.bytes
+        }
+    };
     let stem: String = title.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let path = dir.join(format!("{stem}-{stamp}.pdf"));
-    std::fs::write(&path, written.bytes).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
