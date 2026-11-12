@@ -4,12 +4,23 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [1.8.0] – 2026-11-12
+
 ### Nytt
 
 - **Kladd för Windows och macOS.** Varje release innehåller nu ett installationsprogram och en zip för Windows (x64) samt en universell `.dmg` för macOS (Apple Silicon och Intel), förutom `.deb` för Linux. Paketen är inte signerade; se "Kom igång" i README för hur första starten går till.
 - Windows-installationsprogrammet installerar per användare utan administratörsrättigheter, lägger Kladd i Startmenyn, kan lägga en genväg på skrivbordet och kan visa Kladd under *Öppna med* för `.docx`, `.odt`, `.md` och `.txt`. Det finns på svenska och engelska.
 - Ikon och versionsinformation (Kladd, version, upphovsman) finns i `kladd.exe`, och Kladd har en macOS-ikon (`kladd.icns`).
 - Testerna körs nu på Linux, Windows och macOS i CI.
+- **⌘ på Mac.** Kortkommandon, menyer och verktygstips använder ⌘ och ⌥ på Mac och Ctrl och Alt på Linux och Windows.
+- **Stavningskontroll på Windows och macOS.** Kladd hittar LibreOffices ordlistor och kan hämta ordlistor (svenska, engelska, norska, danska, tyska, franska, spanska) direkt i appen. Språket väljs efter systemets inställning.
+- **Dokumentens typsnitt på Windows och macOS**, från systemets egna typsnitt (Arial, Times New Roman, Calibri om Office finns …).
+- **Utskrift på Windows** via systemets skrivare och PDF-läsaren. På macOS och Linux används CUPS som tidigare.
+
+### Ändrat
+
+- Egen ordlista, hämtade ordlistor och säkerhetskopior ligger i `%APPDATA%\Kladd` på Windows och `~/Library/Application Support/Kladd` på macOS. Linux är oförändrat.
+
 
 ## [1.7.0] – 2026-11-12
 
