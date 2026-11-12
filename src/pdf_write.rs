@@ -21,6 +21,7 @@ use krilla::image::Image;
 use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::docx::Image as DocImage;
+use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::theme;
 
 // --- sidmått i punkter (1/72 tum) -------------------------------------------
@@ -114,6 +115,8 @@ struct Style {
     strike: bool,
     underline: bool,
     link: Option<String>,
+    /// Färg, bakgrund, storlek och typsnittsklass från omgivande `<span style="…">`.
+    span: SpanStyle,
 }
 
 #[derive(Clone)]
@@ -123,9 +126,9 @@ struct Span {
 }
 
 enum Block {
-    Heading(u8, Vec<Span>),
-    Para { spans: Vec<Span>, indent: f32, quote: u8 },
-    Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8 },
+    Heading(u8, Vec<Span>, Align),
+    Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align },
+    Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
     Code { text: String, indent: f32 },
     Table { rows: Vec<Vec<Vec<Span>>> },
     Rule,
@@ -156,6 +159,9 @@ fn parse_blocks(md: &str) -> Vec<Block> {
     let mut italic = 0u32;
     let mut strike = 0u32;
     let mut underline = 0u32;
+    // Öppna `<span style>` (inre ovanpå yttre) och `<div align>` (innersta gäller).
+    let mut span_stack: Vec<SpanStyle> = Vec::new();
+    let mut aligns: Vec<Align> = Vec::new();
     let mut heading: Option<u8> = None;
     let mut quote = 0u8;
     // Listor: nästa nummer (None = punktlista)
@@ -173,7 +179,8 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                  heading: Option<u8>,
                  pending_marker: &mut Option<String>,
                  lists: &Vec<Option<u64>>,
-                 quote: u8| {
+                 quote: u8,
+                 align: Align| {
         if spans.iter().all(|s| s.text.trim().is_empty()) && pending_marker.is_none() {
             spans.clear();
             return;
@@ -181,11 +188,11 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         let taken = std::mem::take(spans);
         let indent = indent_now(lists, quote);
         if let Some(h) = heading {
-            blocks.push(Block::Heading(h, taken));
+            blocks.push(Block::Heading(h, taken, align));
         } else if let Some(m) = pending_marker.take() {
-            blocks.push(Block::Item { spans: taken, indent, marker: m, quote });
+            blocks.push(Block::Item { spans: taken, indent, marker: m, quote, align });
         } else {
-            blocks.push(Block::Para { spans: taken, indent, quote });
+            blocks.push(Block::Para { spans: taken, indent, quote, align });
         }
     };
 
@@ -200,6 +207,8 @@ fn parse_blocks(md: &str) -> Vec<Block> {
     };
 
     for ev in Parser::new_ext(md, opts) {
+        let align = aligns.last().copied().unwrap_or_default();
+        style.span = span_stack.iter().fold(SpanStyle::default(), |acc, s| acc.merged(s));
         style.bold = bold > 0;
         style.italic = italic > 0;
         style.strike = strike > 0;
@@ -207,28 +216,28 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         match ev {
             MdEvent::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     heading = Some(heading_num(level));
                 }
                 Tag::Paragraph => {
                     if pending_marker.is_none() {
-                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     }
                 }
                 Tag::BlockQuote(_) => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     quote += 1;
                 }
                 Tag::CodeBlock(_) => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     code = Some(String::new());
                 }
                 Tag::List(start) => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     lists.push(start);
                 }
                 Tag::Item => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     let depth = lists.len().saturating_sub(1);
                     pending_marker = Some(match lists.last_mut() {
                         Some(Some(n)) => {
@@ -236,11 +245,11 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                             *n += 1;
                             m
                         }
-                        _ => ["•", "◦", "▪"][depth % 3].to_owned(),
+                        _ => ["•", "–", "·"][depth % 3].to_owned(),
                     });
                 }
                 Tag::Table(_) => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     table = Some(Vec::new());
                 }
                 Tag::TableHead | Tag::TableRow => row = Vec::new(),
@@ -261,12 +270,12 @@ fn parse_blocks(md: &str) -> Vec<Block> {
             },
             MdEvent::End(tag) => match tag {
                 TagEnd::Heading(_) => {
-                    flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, align);
                     heading = None;
                 }
-                TagEnd::Paragraph => flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote),
+                TagEnd::Paragraph => flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align),
                 TagEnd::BlockQuote(_) => {
-                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                    flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     quote = quote.saturating_sub(1);
                 }
                 TagEnd::CodeBlock => {
@@ -277,7 +286,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                         });
                     }
                 }
-                TagEnd::Item => flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote),
+                TagEnd::Item => flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align),
                 TagEnd::List(_) => {
                     lists.pop();
                 }
@@ -301,7 +310,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                 TagEnd::Image => {
                     if let Some((src, alt)) = image.take() {
                         // En bild i en tabellcell eller mitt i text ritas som eget block efter stycket.
-                        flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote);
+                        flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote) });
                     }
                 }
@@ -323,18 +332,44 @@ fn parse_blocks(md: &str) -> Vec<Block> {
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => push_text(&mut spans, "\n", &style),
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
-                if t.trim().eq_ignore_ascii_case("<br>") || t.trim().eq_ignore_ascii_case("<br/>") {
-                    push_text(&mut spans, "\n", &style);
-                } else if t.trim().eq_ignore_ascii_case("<u>") {
-                    underline += 1;
-                } else if t.trim().eq_ignore_ascii_case("</u>") {
-                    underline = underline.saturating_sub(1);
-                } else {
-                    push_text(&mut spans, t.trim_end_matches('\n'), &style);
+                // Ett HTML-block kan ha flera rader; varje rad som är en känd tagg tolkas för sig.
+                let mut first = true;
+                for line in t.split('\n') {
+                    let tag = line.trim();
+                    if tag.is_empty() {
+                        continue;
+                    }
+                    if tag.eq_ignore_ascii_case("<br>") || tag.eq_ignore_ascii_case("<br/>") {
+                        push_text(&mut spans, "\n", &style);
+                    } else if tag.eq_ignore_ascii_case("<u>") {
+                        underline += 1;
+                    } else if tag.eq_ignore_ascii_case("</u>") {
+                        underline = underline.saturating_sub(1);
+                    } else if let Some(st) = style::parse_span_open(tag) {
+                        span_stack.push(st);
+                        style.span = span_stack.iter().fold(SpanStyle::default(), |acc, s| acc.merged(s));
+                    } else if style::is_span_close(tag) {
+                        span_stack.pop();
+                        style.span = span_stack.iter().fold(SpanStyle::default(), |acc, s| acc.merged(s));
+                    } else if let Some(a) = style::parse_div_open(tag) {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        aligns.push(a);
+                    } else if style::is_div_close(tag) {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        aligns.pop();
+                    } else if tag.starts_with("<!--") && tag.ends_with("-->") {
+                        // Kommentarer (också grundformatraden) skrivs inte ut.
+                    } else {
+                        if !first {
+                            push_text(&mut spans, "\n", &style);
+                        }
+                        push_text(&mut spans, line.trim_end_matches('\r'), &style);
+                        first = false;
+                    }
                 }
             }
             MdEvent::Rule => {
-                flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote);
+                flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                 blocks.push(Block::Rule);
             }
             MdEvent::TaskListMarker(done) => push_text(&mut spans, if done { "☑ " } else { "☐ " }, &style),
@@ -342,7 +377,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
             MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => push_text(&mut spans, &t, &style),
         }
     }
-    flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote);
+    flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, aligns.last().copied().unwrap_or_default());
     blocks
 }
 
@@ -376,6 +411,48 @@ struct Layout<'a> {
     images: Vec<Image>,
     resolve: &'a dyn Fn(&str) -> Option<DocImage>,
     missing: Vec<String>,
+    /// Brödtextens storlek (dokumentets grundstorlek) och faktorn mot `BODY_SIZE`
+    /// som rubriker, tabeller och kod skalas med.
+    body: f32,
+    scale: f32,
+    /// Grundtypsnitt för brödtext (Mono om dokumentets typsnitt är ett monospace).
+    base: Face,
+    /// Justering för blocket som läggs ut just nu.
+    align: Align,
+}
+
+/// En färdigbruten rad. `hard` = raden slutar med radbrytning (ska inte marginaljusteras).
+struct Line {
+    pieces: Vec<Piece>,
+    hard: bool,
+}
+
+/// Typsnittsklass av ett typsnittsnamn från Word.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Family {
+    Sans,
+    Serif,
+    Mono,
+}
+
+/// Grov klassning på namnet: Kladd bäddar bara in IBM Plex Sans och Mono.
+fn classify_family(name: &str) -> Family {
+    let n = name.to_ascii_lowercase();
+    const MONO: [&str; 8] = ["courier", "consolas", "mono", "menlo", "monaco", "lucida console", "typewriter", "fixed"];
+    const SERIF: [&str; 14] = [
+        "times", "georgia", "garamond", "cambria", "serif", "book", "palatino", "minion", "baskerville", "century",
+        "didot", "constantia", "caslon", "roman",
+    ];
+    if MONO.iter().any(|m| n.contains(m)) {
+        Family::Mono
+    } else if n.contains("sans") {
+        // "sans-serif" ska inte bli serif.
+        Family::Sans
+    } else if SERIF.iter().any(|m| n.contains(m)) {
+        Family::Serif
+    } else {
+        Family::Sans
+    }
 }
 
 /// Ett ord eller mellanslag med sin stil, klart att placera på en rad.
@@ -390,16 +467,42 @@ struct Piece {
 }
 
 fn face_for(style: &Style, base: Face) -> Face {
-    if style.code {
-        if style.bold { Face::MonoMedium } else { Face::Mono }
-    } else if style.bold {
-        match base {
-            Face::Sans => Face::SansSemi,
-            f => f,
-        }
-    } else {
-        base
+    let base_mono = matches!(base, Face::Mono | Face::MonoMedium);
+    let mono = style.code
+        || match style.span.font_family.as_deref().map(classify_family) {
+            Some(Family::Mono) => true,
+            Some(_) => false,
+            None => base_mono,
+        };
+    if mono {
+        return if style.bold { Face::MonoMedium } else { Face::Mono };
     }
+    // Ingen serif är inbäddad: serif-namn behåller sans.
+    let base = if base_mono { Face::Sans } else { base };
+    match (style.bold, base) {
+        (true, Face::Sans) => Face::SansSemi,
+        _ => base,
+    }
+}
+
+/// Fördelar överskottet till `width` på mellanrummen i raden (marginaljustering).
+fn justify(pieces: &mut [Piece], width: f32) {
+    let total: f32 = pieces.iter().map(|p| p.width).sum();
+    let gaps = pieces.iter().filter(|p| p.space).count();
+    let extra = width - total;
+    if gaps == 0 || extra <= 0.0 {
+        return;
+    }
+    let add = extra / gaps as f32;
+    for p in pieces.iter_mut().filter(|p| p.space) {
+        p.width += add;
+    }
+}
+
+/// Radens höjdgivande storlek: den största spannen på raden.
+fn line_size(l: &Line, size: f32) -> f32 {
+    let m = l.pieces.iter().map(|p| p.size).fold(0.0, f32::max);
+    if m > 0.0 { m } else { size }
 }
 
 impl Layout<'_> {
@@ -423,7 +526,8 @@ impl Layout<'_> {
         let mut out = Vec::new();
         for s in spans {
             let face = face_for(&s.style, base);
-            let sz = if s.style.code { size * 0.9 } else { size };
+            let sz = s.style.span.font_size.unwrap_or(size);
+            let sz = if s.style.code { sz * 0.9 } else { sz };
             for (li, line) in s.text.split('\n').enumerate() {
                 if li > 0 {
                     out.push(Piece { text: String::new(), face, size: sz, width: 0.0, style: s.style.clone(), space: false, newline: true });
@@ -476,6 +580,38 @@ impl Layout<'_> {
         out
     }
 
+    /// Bryter stycket i rader som ryms i `width`. Efterföljande mellanslag tas bort.
+    fn break_lines(&mut self, spans: &[Span], base: Face, size: f32, width: f32) -> Vec<Line> {
+        let pieces = self.pieces(spans, base, size);
+        let mut lines = vec![Line { pieces: Vec::new(), hard: false }];
+        let mut line_w = 0.0;
+        for p in pieces {
+            if p.newline {
+                lines.last_mut().unwrap().hard = true;
+                lines.push(Line { pieces: Vec::new(), hard: false });
+                line_w = 0.0;
+                continue;
+            }
+            for p in self.split_long(p, width) {
+                if !p.space && line_w + p.width > width && lines.last().is_some_and(|l| !l.pieces.is_empty()) {
+                    lines.push(Line { pieces: Vec::new(), hard: false });
+                    line_w = 0.0;
+                }
+                if p.space && lines.last().is_some_and(|l| l.pieces.is_empty()) {
+                    continue; // inget mellanslag först på en rad
+                }
+                line_w += p.width;
+                lines.last_mut().unwrap().pieces.push(p);
+            }
+        }
+        for l in &mut lines {
+            while l.pieces.last().is_some_and(|p| p.space) {
+                l.pieces.pop();
+            }
+        }
+        lines
+    }
+
     /// Lägger ut text i en ruta. Returnerar höjden som användes.
     #[allow(clippy::too_many_arguments)]
     fn text_block(
@@ -489,31 +625,13 @@ impl Layout<'_> {
         italic_all: bool,
         first_line_extra: Option<(String, Face)>,
     ) {
-        let line_h = size * LINE;
-        let pieces = self.pieces(spans, base, size);
-        let mut lines: Vec<Vec<Piece>> = vec![Vec::new()];
-        let mut line_w = 0.0;
-        for p in pieces {
-            if p.newline {
-                lines.push(Vec::new());
-                line_w = 0.0;
-                continue;
-            }
-            for p in self.split_long(p, width) {
-                if !p.space && line_w + p.width > width && lines.last().is_some_and(|l| !l.is_empty()) {
-                    lines.push(Vec::new());
-                    line_w = 0.0;
-                }
-                if p.space && lines.last().is_some_and(Vec::is_empty) {
-                    continue; // inget mellanslag först på en rad
-                }
-                line_w += p.width;
-                lines.last_mut().unwrap().push(p);
-            }
-        }
-        for (i, line) in lines.into_iter().enumerate() {
+        let lines = self.break_lines(spans, base, size, width);
+        let n = lines.len();
+        for (i, mut line) in lines.into_iter().enumerate() {
+            let msz = line_size(&line, size);
+            let line_h = msz * LINE;
             self.ensure(line_h);
-            let baseline = self.y + size * 1.08;
+            let baseline = self.y + msz * 1.08;
             if i == 0 {
                 if let Some((marker, mface)) = &first_line_extra {
                     let mw = self.m.width(*mface, size, marker);
@@ -528,20 +646,25 @@ impl Layout<'_> {
                     });
                 }
             }
+            let lw: f32 = line.pieces.iter().map(|p| p.width).sum();
+            let mut dx = 0.0;
+            let mut stretched = false;
+            match self.align {
+                Align::Center => dx = ((width - lw) / 2.0).max(0.0),
+                Align::Right => dx = (width - lw).max(0.0),
+                Align::Justify if i + 1 < n && !line.hard => {
+                    justify(&mut line.pieces, width);
+                    stretched = true;
+                }
+                _ => {}
+            }
             // Slå ihop ord med samma stil till en körning.
-            let mut cx = x;
+            let mut cx = x + dx;
             let mut run: Option<(f32, String, Face, f32, Style, f32)> = None;
             let mut runs = Vec::new();
-            let trimmed: Vec<Piece> = {
-                let mut l = line;
-                while l.last().is_some_and(|p| p.space) {
-                    l.pop();
-                }
-                l
-            };
-            for p in trimmed {
+            for p in line.pieces {
                 match run.as_mut() {
-                    Some((_, text, f, sz, st, w)) if *f == p.face && *sz == p.size && *st == p.style => {
+                    Some((_, text, f, sz, st, w)) if !stretched && *f == p.face && *sz == p.size && *st == p.style => {
                         text.push_str(&p.text);
                         *w += p.width;
                     }
@@ -561,7 +684,14 @@ impl Layout<'_> {
                 if st.code {
                     self.page().ops.push(Op::Rect { x: rx - 1.5, y: baseline - sz * 0.95, w: w + 3.0, h: sz * 1.3, color: CODE_BG });
                 }
-                let c = if st.link.is_some() { LINK } else { color };
+                if let Some(bg) = st.span.background {
+                    self.page().ops.push(Op::Rect { x: rx, y: baseline - sz * 0.9, w, h: sz * 1.2, color: (bg[0], bg[1], bg[2]) });
+                }
+                let c = match (st.link.is_some(), st.span.color) {
+                    (true, _) => LINK,
+                    (false, Some(sc)) => (sc[0], sc[1], sc[2]),
+                    (false, None) => color,
+                };
                 self.page().ops.push(Op::Text { x: rx, y: baseline, face, size: sz, text, color: c, italic: st.italic || italic_all });
                 if st.link.is_some() {
                     self.page().ops.push(Op::Line { x1: rx, y1: baseline + 1.6, x2: rx + w, y2: baseline + 1.6, width: 0.6, color: LINK });
@@ -588,7 +718,7 @@ impl Layout<'_> {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
             let spans = vec![Span { text: label, style: Style::default() }];
-            self.text_block(&spans, MARGIN_X + indent, CONTENT_W - indent, Face::Sans, BODY_SIZE, MUTED, false, None);
+            self.text_block(&spans, MARGIN_X + indent, CONTENT_W - indent, self.base, self.body, MUTED, false, None);
             return;
         };
         let Some(image) = make_image(&img.bytes) else {
@@ -621,14 +751,14 @@ impl Layout<'_> {
 
     fn table(&mut self, rows: &[Vec<Vec<Span>>]) {
         let cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
-        let size = BODY_SIZE * 0.95;
+        let size = self.body * 0.95;
         let pad = 5.0;
         // Kolumnbredd efter innehållets naturliga bredd, inom sidbredden.
         let mut natural = vec![24.0f32; cols];
         for r in rows {
             for (i, cell) in r.iter().enumerate() {
                 let text: String = cell.iter().map(|s| s.text.as_str()).collect();
-                let w = self.m.width(Face::Sans, size, &text) + 2.0 * pad + 2.0;
+                let w = self.m.width(self.base, size, &text) + 2.0 * pad + 2.0;
                 natural[i] = natural[i].max(w.min(CONTENT_W));
             }
         }
@@ -643,8 +773,8 @@ impl Layout<'_> {
             // Mät radens höjd genom att lägga ut cellerna på en provsida.
             let mut heights = Vec::new();
             for (ci, cell) in r.iter().enumerate() {
-                let n = self.count_lines(cell, widths[ci] - 2.0 * pad, size, if ri == 0 { Face::SansSemi } else { Face::Sans });
-                heights.push(n as f32 * line_h);
+                let base = if ri == 0 { Face::SansSemi } else { self.base };
+                heights.push(self.cell_height(cell, widths[ci] - 2.0 * pad, size, base));
             }
             let row_h = heights.iter().copied().fold(line_h, f32::max) + 2.0 * pad;
             self.ensure(row_h);
@@ -656,7 +786,7 @@ impl Layout<'_> {
             for (ci, w) in widths.iter().enumerate() {
                 if let Some(cell) = r.get(ci) {
                     self.y = top + pad;
-                    let face = if ri == 0 { Face::SansSemi } else { Face::Sans };
+                    let face = if ri == 0 { Face::SansSemi } else { self.base };
                     self.text_block(cell, x + pad, w - 2.0 * pad, face, size, INK, false, None);
                 }
                 x += w;
@@ -676,29 +806,13 @@ impl Layout<'_> {
         self.y += PARA_GAP;
     }
 
-    fn count_lines(&mut self, spans: &[Span], width: f32, size: f32, base: Face) -> usize {
-        let pieces = self.pieces(spans, base, size);
-        let mut lines = 1;
-        let mut w = 0.0;
-        for p in pieces {
-            if p.newline {
-                lines += 1;
-                w = 0.0;
-                continue;
-            }
-            for p in self.split_long(p, width) {
-                if !p.space && w + p.width > width && w > 0.0 {
-                    lines += 1;
-                    w = 0.0;
-                }
-                w += p.width;
-            }
-        }
-        lines
+    /// Höjden en cell får när texten bryts i `width`.
+    fn cell_height(&mut self, spans: &[Span], width: f32, size: f32, base: Face) -> f32 {
+        self.break_lines(spans, base, size, width).iter().map(|l| line_size(l, size) * LINE).sum()
     }
 
     fn code(&mut self, text: &str, indent: f32) {
-        let size = BODY_SIZE * 0.86;
+        let size = self.body * 0.86;
         let line_h = size * 1.45;
         let pad = 8.0;
         let x = MARGIN_X + indent;
@@ -741,19 +855,22 @@ impl Layout<'_> {
 
     fn run(&mut self, blocks: &[Block]) {
         for (bi, b) in blocks.iter().enumerate() {
+            self.align = Align::Left;
             match b {
-                Block::Heading(level, spans) => {
+                Block::Heading(level, spans, align) => {
+                    self.align = *align;
                     let (size, face, before) = match level {
                         1 => (22.0, Face::SansSemi, 14.0),
                         2 => (16.5, Face::SansSemi, 14.0),
                         3 => (13.5, Face::SansSemi, 10.0),
                         _ => (11.5, Face::SansSemi, 8.0),
                     };
+                    let size = size * self.scale;
                     if bi > 0 && self.y > MARGIN_TOP + 0.5 {
                         self.y += before;
                     }
                     // Håll ihop rubriken med minst två rader text efter.
-                    self.ensure(size * LINE + BODY_SIZE * LINE * 2.0);
+                    self.ensure(size * LINE + self.body * LINE * 2.0);
                     let text: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
                     self.headings.push(Heading { level: *level, text: text.trim().to_owned(), page: self.pages.len() - 1, y: self.y });
                     let spans: Vec<Span> = spans.iter().map(|s| Span { text: s.text.replace('\n', " "), style: s.style.clone() }).collect();
@@ -766,11 +883,12 @@ impl Layout<'_> {
                         self.y += 3.0;
                     }
                 }
-                Block::Para { spans, indent, quote } => {
+                Block::Para { spans, indent, quote, align } => {
+                    self.align = *align;
                     let top = self.y;
                     let page_before = self.pages.len();
                     let (color, italic) = if *quote > 0 { (MUTED, true) } else { (INK, false) };
-                    self.text_block(spans, MARGIN_X + indent, CONTENT_W - indent, Face::Sans, BODY_SIZE, color, italic, None);
+                    self.text_block(spans, MARGIN_X + indent, CONTENT_W - indent, self.base, self.body, color, italic, None);
                     if *quote > 0 {
                         let x = MARGIN_X + indent - 9.0;
                         let start = if self.pages.len() == page_before { top } else { MARGIN_TOP };
@@ -779,10 +897,11 @@ impl Layout<'_> {
                     }
                     self.y += PARA_GAP;
                 }
-                Block::Item { spans, indent, marker, quote } => {
+                Block::Item { spans, indent, marker, quote, align } => {
+                    self.align = *align;
                     let mface = if marker.ends_with('.') { Face::Sans } else { Face::SansMedium };
                     let color = if *quote > 0 { MUTED } else { INK };
-                    self.text_block(spans, MARGIN_X + indent + 4.0, CONTENT_W - indent - 4.0, Face::Sans, BODY_SIZE, color, *quote > 0, Some((marker.clone(), mface)));
+                    self.text_block(spans, MARGIN_X + indent + 4.0, CONTENT_W - indent - 4.0, self.base, self.body, color, *quote > 0, Some((marker.clone(), mface)));
                     let next_is_item = matches!(blocks.get(bi + 1), Some(Block::Item { .. }));
                     self.y += if next_is_item { 2.0 } else { PARA_GAP };
                 }
@@ -829,9 +948,21 @@ pub struct Written {
     pub missing_images: Vec<String>,
 }
 
+/// Dokumentets grundformat från första raden (`<!-- kladd: … -->`).
+fn doc_defaults(md: &str) -> DocDefaults {
+    let first = md.trim_start_matches('\u{feff}').lines().next().unwrap_or("");
+    DocDefaults::from_comment(first).unwrap_or_default()
+}
+
 /// Bygger en PDF av Markdown-text.
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
     let blocks = parse_blocks(markdown);
+    let defaults = doc_defaults(markdown);
+    let body = defaults.font_size.unwrap_or(BODY_SIZE);
+    let base = match defaults.font_family.as_deref().map(classify_family) {
+        Some(Family::Mono) => Face::Mono,
+        _ => Face::Sans,
+    };
     let mut lay = Layout {
         m: Measurer::new(),
         pages: Vec::new(),
@@ -840,6 +971,10 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
         images: Vec::new(),
         resolve,
         missing: Vec::new(),
+        body,
+        scale: body / BODY_SIZE,
+        base,
+        align: Align::Left,
     };
     lay.new_page();
     lay.run(&blocks);
@@ -993,6 +1128,145 @@ mod tests {
         assert!(spans.iter().all(|s| !s.text.contains("<u>") && !s.text.contains("</u>")));
         let under: String = spans.iter().filter(|s| s.style.underline).map(|s| s.text.as_str()).collect();
         assert_eq!(under, "understruken");
+    }
+
+    fn all_spans(blocks: &[Block]) -> Vec<&Span> {
+        let mut out = Vec::new();
+        for b in blocks {
+            match b {
+                Block::Heading(_, s, _) | Block::Para { spans: s, .. } | Block::Item { spans: s, .. } => out.extend(s.iter()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    const FULL: &str = "<!-- kladd: font-family: \"Courier New\"; font-size: 12pt -->\n\n# Rubrik\n\n<div align=\"center\">\n\nMitten med <span style=\"color: #C00000; font-size: 20pt\">röd stor</span> text.\n\n</div>\n\n<div align=\"justify\">\n\nEtt <span style=\"background-color: #FFFF00\">gult <span style=\"font-family: Times New Roman\">inre</span></span> stycke som är långt nog att bryta över flera rader så att marginaljusteringen får något att göra med mellanrummen.\n\n- punkt i <span style=\"font-family: Consolas\">mono</span>\n\n</div>\n\n<div align=\"right\">\n\nHöger\n\n</div>\n\n<!-- annan kommentar -->\n\nSlut.\n";
+
+    #[test]
+    fn span_colour_size_background_are_carried() {
+        let blocks = parse_blocks("A <span style=\"color: #C00000; font-size: 20pt; background-color: #FFFF00\">röd <b>x</b></span> B.\n");
+        let spans = all_spans(&blocks);
+        let red: Vec<_> = spans.iter().filter(|s| s.style.span.color.is_some()).collect();
+        assert!(!red.is_empty());
+        for s in &red {
+            assert_eq!(s.style.span.color, Some([0xC0, 0, 0]));
+            assert_eq!(s.style.span.font_size, Some(20.0));
+            assert_eq!(s.style.span.background, Some([0xFF, 0xFF, 0]));
+        }
+        assert!(spans.iter().any(|s| s.style.span.is_empty() && s.text.contains('B')));
+    }
+
+    #[test]
+    fn nested_spans_merge_and_pop() {
+        let blocks = parse_blocks("<span style=\"color: red\">a <span style=\"font-size: 9pt\">b</span> c</span> d\n");
+        let spans = all_spans(&blocks);
+        let b = spans.iter().find(|s| s.text.contains('b')).unwrap();
+        assert_eq!(b.style.span.color, Some([255, 0, 0]));
+        assert_eq!(b.style.span.font_size, Some(9.0));
+        let c = spans.iter().find(|s| s.text.contains('c')).unwrap();
+        assert_eq!(c.style.span.font_size, None);
+        let d = spans.iter().find(|s| s.text.contains('d')).unwrap();
+        assert!(d.style.span.is_empty());
+    }
+
+    #[test]
+    fn div_alignment_is_carried_and_tags_hidden() {
+        let blocks = parse_blocks(FULL);
+        let mut aligns = Vec::new();
+        for b in &blocks {
+            match b {
+                Block::Heading(_, _, a) | Block::Para { align: a, .. } | Block::Item { align: a, .. } => aligns.push(*a),
+                _ => {}
+            }
+        }
+        // rubrik, mitten, justerat stycke, punkt, höger, slut
+        assert_eq!(aligns, vec![Align::Left, Align::Center, Align::Justify, Align::Justify, Align::Right, Align::Left]);
+        for s in all_spans(&blocks) {
+            for bad in ["<span", "</span", "<div", "</div", "<!--", "-->"] {
+                assert!(!s.text.contains(bad), "{bad} i {:?}", s.text);
+            }
+        }
+    }
+
+    #[test]
+    fn family_classification() {
+        assert_eq!(classify_family("Times New Roman"), Family::Serif);
+        assert_eq!(classify_family("Georgia"), Family::Serif);
+        assert_eq!(classify_family("Courier New"), Family::Mono);
+        assert_eq!(classify_family("Consolas"), Family::Mono);
+        assert_eq!(classify_family("Arial"), Family::Sans);
+        assert_eq!(classify_family("Noto Sans"), Family::Sans);
+        let mut st = Style::default();
+        st.span.font_family = Some("Courier New".into());
+        assert_eq!(face_for(&st, Face::Sans), Face::Mono);
+        st.span.font_family = Some("Georgia".into());
+        assert_eq!(face_for(&st, Face::Sans), Face::Sans);
+    }
+
+    #[test]
+    fn doc_defaults_from_first_line() {
+        let d = doc_defaults(FULL);
+        assert_eq!(d.font_size, Some(12.0));
+        assert_eq!(d.font_family.as_deref(), Some("Courier New"));
+        assert!(doc_defaults("# Hej\n").is_empty());
+    }
+
+    fn test_layout(resolve: &dyn Fn(&str) -> Option<DocImage>) -> Layout<'_> {
+        Layout {
+            m: Measurer::new(),
+            pages: Vec::new(),
+            y: MARGIN_TOP,
+            headings: Vec::new(),
+            images: Vec::new(),
+            resolve,
+            missing: Vec::new(),
+            body: BODY_SIZE,
+            scale: 1.0,
+            base: Face::Sans,
+            align: Align::Left,
+        }
+    }
+
+    #[test]
+    fn justify_fills_every_line_but_the_last() {
+        let resolve = |_: &str| None;
+        let mut lay = test_layout(&resolve);
+        let text = "Det här är en ganska lång mening som måste brytas på flera rader för att vi ska kunna mäta hur marginaljusteringen fördelar utrymmet.";
+        let spans = vec![Span { text: text.into(), style: Style::default() }];
+        let width = 200.0;
+        let lines = lay.break_lines(&spans, Face::Sans, BODY_SIZE, width);
+        assert!(lines.len() >= 3);
+        let n = lines.len();
+        for (i, mut l) in lines.into_iter().enumerate() {
+            let before: f32 = l.pieces.iter().map(|p| p.width).sum();
+            assert!(before <= width + 0.01);
+            if i + 1 < n && !l.hard {
+                justify(&mut l.pieces, width);
+                let after: f32 = l.pieces.iter().map(|p| p.width).sum();
+                assert!((after - width).abs() < 0.01, "rad {i}: {after}");
+            }
+        }
+    }
+
+    #[test]
+    fn bigger_span_raises_the_line() {
+        let resolve = |_: &str| None;
+        let mut lay = test_layout(&resolve);
+        let mut big = Style::default();
+        big.span.font_size = Some(24.0);
+        let spans = vec![Span { text: "liten ".into(), style: Style::default() }, Span { text: "stor".into(), style: big }];
+        let lines = lay.break_lines(&spans, Face::Sans, BODY_SIZE, 400.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_size(&lines[0], BODY_SIZE), 24.0);
+    }
+
+    #[test]
+    fn document_with_all_features_makes_a_pdf() {
+        let w = write(FULL, "Allt", &|_| None).unwrap();
+        assert!(w.bytes.starts_with(b"%PDF"));
+        let w = write("<div align=\"justify\">\n\nEn <span style=\"background-color: #FF0\">gul</span> rad.\n\n</div>\n", "x", &|_| None).unwrap();
+        assert!(w.bytes.starts_with(b"%PDF"));
     }
 
     #[test]

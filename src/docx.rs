@@ -17,6 +17,8 @@ use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEn
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
+use crate::style::{self, Align, DocDefaults, SpanStyle};
+
 /// Högsta antal poster i ett paket (WordCraft: zip_guard).
 const MAX_ENTRIES: u64 = 20_000;
 /// Största uppackade storlek för en enskild XML-del.
@@ -214,6 +216,130 @@ fn resolve_target(base_dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
+/// Teckenegenskaper från Word, så som de står i XML:en. `None` = inte angivet (ärvs).
+#[derive(Default, Clone, PartialEq, Debug)]
+struct RProps {
+    font: Option<String>,
+    /// Punkter.
+    size: Option<f32>,
+    color: Option<[u8; 3]>,
+    /// `w:highlight`; `Some(None)` är `none` (slår av en ärvd markering).
+    highlight: Option<Option<[u8; 3]>>,
+    /// `w:shd w:fill`.
+    shading: Option<[u8; 3]>,
+}
+
+impl RProps {
+    /// `inner` ovanpå `self` (det mer specifika vinner).
+    fn over(&self, inner: &RProps) -> RProps {
+        RProps {
+            font: inner.font.clone().or_else(|| self.font.clone()),
+            size: inner.size.or(self.size),
+            color: inner.color.or(self.color),
+            highlight: inner.highlight.or(self.highlight),
+            shading: inner.shading.or(self.shading),
+        }
+    }
+
+    /// Bakgrundsfärgen: markering ligger ovanpå skuggning, som i Word.
+    fn background(&self) -> Option<[u8; 3]> {
+        match self.highlight {
+            Some(h) => h.or(self.shading),
+            None => self.shading,
+        }
+    }
+}
+
+/// Temats typsnitt (`word/theme/theme1.xml`).
+#[derive(Default, Clone)]
+struct Theme {
+    major: Option<String>,
+    minor: Option<String>,
+}
+
+impl Theme {
+    /// `minorHAnsi`, `majorAscii` … → typsnittets namn.
+    fn font(&self, theme_name: &str) -> Option<String> {
+        let n = theme_name.to_ascii_lowercase();
+        if n.starts_with("major") {
+            self.major.clone()
+        } else if n.starts_with("minor") {
+            self.minor.clone()
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_theme(xml: &str) -> Theme {
+    let mut t = Theme::default();
+    let mut r = Reader::from_str(xml);
+    // 0 = utanför, 1 = majorFont, 2 = minorFont
+    let mut cur = 0u8;
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) => match local(e.name().as_ref()) {
+                b"majorFont" => cur = 1,
+                b"minorFont" => cur = 2,
+                b"latin" => theme_latin(&mut t, cur, &e),
+                _ => {}
+            },
+            Ok(Event::Empty(e)) if local(e.name().as_ref()) == b"latin" => theme_latin(&mut t, cur, &e),
+            Ok(Event::End(e)) if matches!(local(e.name().as_ref()), b"majorFont" | b"minorFont") => cur = 0,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    t
+}
+
+fn theme_latin(t: &mut Theme, cur: u8, e: &BytesStart<'_>) {
+    let face = attr(e, b"typeface").filter(|f| !f.trim().is_empty());
+    match cur {
+        1 => t.major = face,
+        2 => t.minor = face,
+        _ => {}
+    }
+}
+
+/// Läser ett element i en `w:rPr` (typsnitt, storlek, färg, markering, skuggning) in i `rp`.
+fn apply_rpr_elem(rp: &mut RProps, name: &[u8], e: &BytesStart<'_>, theme: &Theme) {
+    match name {
+        b"rFonts" => {
+            let themed = attr(e, b"asciiTheme").or_else(|| attr(e, b"hAnsiTheme")).and_then(|t| theme.font(&t));
+            let named = || attr(e, b"ascii").or_else(|| attr(e, b"hAnsi")).filter(|f| !f.trim().is_empty());
+            if let Some(f) = themed.or_else(named) {
+                rp.font = Some(f);
+            }
+        }
+        b"color" => {
+            if let Some(c) = attr(e, b"val").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| style::parse_color(&v)) {
+                rp.color = Some(c);
+            }
+        }
+        b"sz" => {
+            if let Some(half) = attr(e, b"val").and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0) {
+                rp.size = Some(half / 2.0);
+            }
+        }
+        b"highlight" => match attr(e, b"val").as_deref() {
+            Some("none") => rp.highlight = Some(None),
+            Some(n) => {
+                if let Some(c) = style::highlight_rgb(n) {
+                    rp.highlight = Some(Some(c));
+                }
+            }
+            None => {}
+        },
+        b"shd" => {
+            if let Some(c) = attr(e, b"fill").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| style::parse_color(&v)) {
+                rp.shading = Some(c);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Default, Clone)]
 struct StyleInfo {
     name: String,
@@ -221,33 +347,137 @@ struct StyleInfo {
     outline: Option<u8>,
     /// Lista som formatmallen själv har (t.ex. Words "Punktlista").
     num: Option<(String, u8)>,
+    /// Teckenegenskaper (`w:rPr`) i formatmallen.
+    rpr: RProps,
+    /// Justering (`w:jc`) i formatmallen.
+    jc: Option<Align>,
 }
 
-fn parse_styles(xml: &str) -> HashMap<String, StyleInfo> {
-    let mut out = HashMap::new();
+/// Formatmallarna i `styles.xml`: stycke- och teckenmallar plus dokumentets standardvärden.
+#[derive(Default)]
+struct Styles {
+    map: HashMap<String, StyleInfo>,
+    /// `w:docDefaults/w:rPrDefault`.
+    defaults: RProps,
+    /// Standardstyckemallen (`w:default="1"`, oftast `Normal`).
+    default_para: String,
+}
+
+impl Styles {
+    /// Egenskaperna i en formatmall och de den bygger på (utan docDefaults).
+    fn rchain(&self, id: &str) -> RProps {
+        let mut chain = Vec::new();
+        let mut cur = Some(id);
+        while let Some(sid) = cur {
+            if chain.len() >= 10 {
+                break;
+            }
+            let Some(info) = self.map.get(sid) else { break };
+            chain.push(&info.rpr);
+            cur = info.based_on.as_deref();
+        }
+        chain.into_iter().rev().fold(RProps::default(), |acc, r| acc.over(r))
+    }
+
+    fn para_id<'a>(&'a self, style: Option<&'a str>) -> &'a str {
+        style.unwrap_or(if self.default_para.is_empty() { "Normal" } else { &self.default_para })
+    }
+
+    /// docDefaults + stycketypens formatmall (eller standardmallen).
+    fn para_props(&self, style: Option<&str>) -> RProps {
+        self.defaults.over(&self.rchain(self.para_id(style)))
+    }
+
+    /// Justering som formatmallen (eller den den bygger på) anger.
+    fn jc(&self, style: Option<&str>) -> Option<Align> {
+        let mut cur = Some(self.para_id(style));
+        for _ in 0..10 {
+            let info = self.map.get(cur?)?;
+            if info.jc.is_some() {
+                return info.jc;
+            }
+            cur = info.based_on.as_deref();
+        }
+        None
+    }
+
+    /// Dokumentets grundformat: typsnitt och storlek hos Normal (docDefaults + Normal).
+    fn base(&self) -> DocDefaults {
+        let p = self.para_props(None);
+        DocDefaults { font_family: p.font, font_size: p.size }
+    }
+}
+
+fn parse_styles(xml: &str, theme: &Theme) -> Styles {
+    let mut out = Styles::default();
     let mut r = Reader::from_str(xml);
     let mut cur: Option<(String, StyleInfo)> = None;
+    let mut cur_default_para = false;
+    let mut in_defaults = false;
+    let mut in_rpr = false;
+    let mut in_ppr = false;
     loop {
-        match r.read_event() {
-            Ok(Event::Start(e)) if local(e.name().as_ref()) == b"style" => {
-                let is_para = attr(&e, b"type").is_none_or(|t| t == "paragraph");
-                cur = is_para.then(|| (attr(&e, b"styleId").unwrap_or_default(), StyleInfo::default()));
+        let ev = r.read_event();
+        let (e, empty) = match &ev {
+            Ok(Event::Start(e)) => (e, false),
+            Ok(Event::Empty(e)) => (e, true),
+            Ok(Event::End(e)) => {
+                match local(e.name().as_ref()) {
+                    b"style" => {
+                        if let Some((id, info)) = cur.take() {
+                            if cur_default_para {
+                                out.default_para = id.clone();
+                            }
+                            out.map.insert(id, info);
+                        }
+                    }
+                    b"rPrDefault" => in_defaults = false,
+                    b"pPr" => in_ppr = false,
+                    b"rPr" => in_rpr = false,
+                    _ => {}
+                }
+                continue;
             }
-            Ok(Event::Start(e) | Event::Empty(e)) => {
+            Ok(Event::Eof) | Err(_) => break,
+            _ => continue,
+        };
+        let qname = e.name();
+        let name = local(qname.as_ref());
+        if name == b"style" && !empty {
+            let ty = attr(e, b"type");
+            let is_para = ty.as_deref().is_none_or(|t| t == "paragraph");
+            let keep = is_para || ty.as_deref() == Some("character");
+            cur_default_para = is_para && attr(e, b"default").is_some_and(|d| d == "1" || d == "true");
+            cur = keep.then(|| (attr(e, b"styleId").unwrap_or_default(), StyleInfo::default()));
+            continue;
+        }
+        match name {
+            b"rPrDefault" => in_defaults = !empty,
+            b"pPr" => in_ppr = !empty,
+            b"rPr" if !in_ppr => in_rpr = !empty,
+            _ if in_rpr => {
                 if let Some((_, info)) = cur.as_mut() {
-                    match local(e.name().as_ref()) {
-                        b"name" => info.name = attr(&e, b"val").unwrap_or_default().to_lowercase(),
-                        b"basedOn" => info.based_on = attr(&e, b"val"),
+                    apply_rpr_elem(&mut info.rpr, name, e, theme);
+                } else if in_defaults {
+                    apply_rpr_elem(&mut out.defaults, name, e, theme);
+                }
+            }
+            _ => {
+                if let Some((_, info)) = cur.as_mut() {
+                    match name {
+                        b"name" => info.name = attr(e, b"val").unwrap_or_default().to_lowercase(),
+                        b"basedOn" => info.based_on = attr(e, b"val"),
+                        b"jc" if in_ppr => info.jc = attr(e, b"val").map(|v| Align::from_jc(&v)),
                         b"outlineLvl" => {
-                            info.outline = attr(&e, b"val").and_then(|v| v.parse::<u8>().ok()).filter(|&v| v < 9)
+                            info.outline = attr(e, b"val").and_then(|v| v.parse::<u8>().ok()).filter(|&v| v < 9)
                         }
                         b"numId" => {
-                            let id = attr(&e, b"val").unwrap_or_default();
+                            let id = attr(e, b"val").unwrap_or_default();
                             let lvl = info.num.as_ref().map_or(0, |n| n.1);
                             info.num = (id != "0").then_some((id, lvl));
                         }
                         b"ilvl" => {
-                            let lvl = attr(&e, b"val").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0).min(8);
+                            let lvl = attr(e, b"val").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0).min(8);
                             let id = info.num.as_ref().map(|n| n.0.clone()).unwrap_or_default();
                             info.num = Some((id, lvl));
                         }
@@ -255,13 +485,6 @@ fn parse_styles(xml: &str) -> HashMap<String, StyleInfo> {
                     }
                 }
             }
-            Ok(Event::End(e)) if local(e.name().as_ref()) == b"style" => {
-                if let Some((id, info)) = cur.take() {
-                    out.insert(id, info);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
         }
     }
     out
@@ -413,6 +636,8 @@ struct Fmt {
     /// Direkt understrykning (`w:u`), skrivs som `<u>…</u>`.
     underline: bool,
     code: bool,
+    /// Typsnitt, storlek och färger som avviker från grundformatet (`<span style="…">`).
+    span: SpanStyle,
 }
 
 #[derive(Clone)]
@@ -430,6 +655,16 @@ struct Para {
     kind: ParaKind,
     list: Option<(String, u8)>,
     runs: Vec<Run>,
+    /// Justering (`w:jc`), ärvd från formatmallen om stycket inte anger någon.
+    align: Align,
+    /// Justering som stycket anger själv.
+    direct_align: Option<Align>,
+}
+
+impl Para {
+    fn new() -> Para {
+        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None }
+    }
 }
 
 enum Block {
@@ -519,9 +754,12 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
             .find(|(_, kind, ext)| !ext && kind.ends_with(suffix))
             .map(|(t, _, _)| resolve_target(dir, t))
     };
+    // Temats typsnitt behövs för `w:asciiTheme` i formatmallarna och texten.
+    let theme_part = find_part("/theme").unwrap_or_else(|| "word/theme/theme1.xml".to_owned());
+    let theme = pkg.part(&theme_part)?.map(|x| parse_theme(&x)).unwrap_or_default();
     let styles = match find_part("/styles") {
-        Some(p) => pkg.part(&p)?.map(|x| parse_styles(&x)).unwrap_or_default(),
-        None => HashMap::new(),
+        Some(p) => pkg.part(&p)?.map(|x| parse_styles(&x, &theme)).unwrap_or_default(),
+        None => Styles::default(),
     };
     let numbering = match find_part("/numbering") {
         Some(p) => pkg.part(&p)?.map(|x| parse_numbering(&x)).unwrap_or_default(),
@@ -550,12 +788,17 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     }
 
     let mut found: Vec<FoundImage> = Vec::new();
-    let blocks = parse_body(&doc_xml, &styles, &numbering, &rels, &mut dropped, &mut found, dir)?;
+    let blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir)?;
 
     // Packa upp bilderna som dokumentet faktiskt använder.
     let mut images: Vec<(String, Image)> = Vec::new();
     let mut by_target: HashMap<String, String> = HashMap::new();
     let mut markdown = to_markdown(&blocks, &numbering);
+    // Grundformatet (typsnitt och storlek hos Normal) står först när det avviker från Calibri 11 pt.
+    let comment = styles.base().to_comment();
+    if !comment.is_empty() {
+        markdown = format!("{comment}\n\n{markdown}");
+    }
     for f in found {
         let name = if let Some(n) = by_target.get(&f.target) {
             n.clone()
@@ -628,9 +871,53 @@ pub fn image_ext(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Det som skiljer en körning från dokumentets grundformat och från det som styckets slag redan ger.
+/// Rubriker och citat jämförs med sin egen formatmall (Kladd ritar dem med egna formatmallar),
+/// vanliga stycken med grundformatet (typsnitt och storlek hos Normal, ingen färg).
+fn run_span(
+    styles: &Styles,
+    base: &DocDefaults,
+    para: Option<&Para>,
+    direct: &RProps,
+    rstyle: Option<&str>,
+    linked: bool,
+    code: bool,
+) -> SpanStyle {
+    let style = para.and_then(|p| p.style.as_deref());
+    let para_eff = styles.para_props(style);
+    let mut eff = para_eff.clone();
+    if let Some(rs) = rstyle {
+        eff = eff.over(&styles.rchain(rs));
+    }
+    let eff = eff.over(direct);
+    let mut reference = match para.map_or(ParaKind::Normal, |p| p.kind) {
+        ParaKind::Heading(_) | ParaKind::Quote => para_eff,
+        _ => RProps { font: Some(base.font().to_owned()), size: Some(base.size()), ..Default::default() },
+    };
+    // Länkar har Words länkfärg; den ska inte bli en span.
+    if linked || rstyle == Some("Hyperlink") {
+        reference.color = styles.rchain("Hyperlink").color;
+    }
+    if code {
+        // Kod får sitt typsnitt och sin bakgrund av teckenmallen.
+        if let Some(rs) = rstyle {
+            reference = reference.over(&styles.rchain(rs));
+        }
+    }
+    let ref_font = reference.font.as_deref().unwrap_or(style::DEFAULT_FONT);
+    let ref_size = reference.size.unwrap_or(style::DEFAULT_SIZE);
+    SpanStyle {
+        font_family: eff.font.clone().filter(|f| !code && !f.eq_ignore_ascii_case(ref_font)),
+        font_size: eff.size.filter(|s| (s - ref_size).abs() > 0.01),
+        color: eff.color.filter(|c| Some(*c) != reference.color),
+        background: eff.background().filter(|c| Some(*c) != reference.background()),
+    }
+}
+
 fn parse_body(
     xml: &str,
-    styles: &HashMap<String, StyleInfo>,
+    styles: &Styles,
+    theme: &Theme,
     numbering: &Numbering,
     rels: &HashMap<String, (String, String, bool)>,
     dropped: &mut Dropped,
@@ -644,6 +931,10 @@ fn parse_body(
 
     let mut para: Option<Para> = None;
     let mut fmt = Fmt::default();
+    // Körningens egna egenskaper (`w:rPr`) och teckenmall (`w:rStyle`).
+    let mut direct = RProps::default();
+    let mut run_rstyle: Option<String> = None;
+    let base = styles.base();
     let mut in_rpr = false;
     let mut in_t = false;
     let mut link: Vec<Option<String>> = Vec::new();
@@ -657,7 +948,7 @@ fn parse_body(
     let mut alt_depth: Vec<bool> = Vec::new(); // AlternateContent: har Choice använts?
 
     let push_text = |para: &mut Option<Para>, text: &str, fmt: &Fmt, link: &Option<String>| {
-        let p = para.get_or_insert_with(|| Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new() });
+        let p = para.get_or_insert_with(Para::new);
         if let Some(last) = p.runs.last_mut() {
             if !last.raw && last.fmt == *fmt && last.link == *link {
                 last.text.push_str(text);
@@ -724,6 +1015,9 @@ fn parse_body(
                     }
                     continue;
                 }
+                if in_rpr {
+                    apply_rpr_elem(&mut direct, &name, e, theme);
+                }
                 match name.as_slice() {
                     // Bilder: samla ihop till ett `![…](bild:…)` när elementet tar slut.
                     b"drawing" | b"pict" | b"object" => {
@@ -777,12 +1071,12 @@ fn parse_body(
                         }
                     }
                     b"p" => {
-                        para = Some(Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new() });
+                        para = Some(Para::new());
                     }
                     b"pPr" => in_ppr = !empty,
                     b"pStyle" if in_ppr => {
                         if let (Some(p), Some(id)) = (para.as_mut(), attr(e, b"val")) {
-                            p.kind = kind_for_style(styles, &id);
+                            p.kind = kind_for_style(&styles.map, &id);
                             p.style = Some(id);
                         }
                     }
@@ -808,14 +1102,26 @@ fn parse_body(
                             p.list = (id != "0").then_some((id, lvl));
                         }
                     }
+                    b"jc" if in_ppr => {
+                        if let Some(p) = para.as_mut() {
+                            p.direct_align = attr(e, b"val").map(|v| Align::from_jc(&v));
+                        }
+                    }
                     b"rPr" if !in_ppr => in_rpr = !empty,
-                    b"r" => fmt = Fmt::default(),
+                    b"r" => {
+                        fmt = Fmt::default();
+                        direct = RProps::default();
+                        run_rstyle = None;
+                        let linked = link.last().is_some_and(Option::is_some);
+                        fmt.span = run_span(styles, &base, para.as_ref(), &direct, None, linked, false);
+                    }
                     b"b" | b"bCs" if in_rpr => fmt.bold = on_off(e),
                     b"i" | b"iCs" if in_rpr => fmt.italic = on_off(e),
                     b"strike" | b"dstrike" if in_rpr => fmt.strike = on_off(e),
                     // Saknas `w:val` är det enkel understrykning; "none" slår av den.
                     b"u" if in_rpr => fmt.underline = on_off(e),
                     b"rStyle" if in_rpr => {
+                        run_rstyle = attr(e, b"val");
                         let s = attr(e, b"val").unwrap_or_default().to_lowercase();
                         if s.contains("code") || s.contains("kod") {
                             fmt.code = true;
@@ -911,7 +1217,7 @@ fn parse_body(
                         Some(target) if !hidden(&field_depth) => {
                             let placeholder = format!("\u{E000}kladd-bild-{}\u{E001}", found.len());
                             let alt = if d.alt.trim().is_empty() { d.title } else { d.alt };
-                            let p = para.get_or_insert_with(|| Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new() });
+                            let p = para.get_or_insert_with(Para::new);
                             p.runs.push(Run { text: placeholder.clone(), fmt: Fmt::default(), link: None, raw: true });
                             found.push(FoundImage {
                                 placeholder,
@@ -928,7 +1234,13 @@ fn parse_body(
                 }
                 match local(e.name().as_ref()) {
                     b"pPr" => in_ppr = false,
-                    b"rPr" => in_rpr = false,
+                    b"rPr" => {
+                        if in_rpr {
+                            in_rpr = false;
+                            let linked = link.last().is_some_and(Option::is_some);
+                            fmt.span = run_span(styles, &base, para.as_ref(), &direct, run_rstyle.as_deref(), linked, fmt.code);
+                        }
+                    }
                     b"t" => in_t = false,
                     b"r" => fmt = Fmt::default(),
                     b"hyperlink" => {
@@ -939,12 +1251,13 @@ fn parse_body(
                     }
                     b"p" => {
                         if let Some(mut p) = para.take() {
+                            p.align = p.direct_align.or_else(|| styles.jc(p.style.as_deref())).unwrap_or(Align::Left);
                             if p.list.is_none() {
-                                p.list = p.style.as_deref().and_then(|s| list_for_style(styles, s));
+                                p.list = p.style.as_deref().and_then(|s| list_for_style(&styles.map, s));
                             } else if p.list.as_ref().is_some_and(|l| l.0.is_empty()) {
                                 // Bara nivå angiven: numId kommer från formatmallen.
                                 let lvl = p.list.as_ref().map_or(0, |l| l.1);
-                                p.list = p.style.as_deref().and_then(|s| list_for_style(styles, s)).map(|(n, _)| (n, lvl));
+                                p.list = p.style.as_deref().and_then(|s| list_for_style(&styles.map, s)).map(|(n, _)| (n, lvl));
                             }
                             if let Some(t) = tables.last_mut() {
                                 // Stycke i en tabellcell: lägg texten i cellen.
@@ -1056,6 +1369,16 @@ pub(crate) fn wrap(text: &str, marker: &str) -> String {
     format!("{}{marker}{}{marker}{}", &text[..start], &text[start..end], &text[end..])
 }
 
+/// Omger texten med en HTML-tagg; mellanslag i kanterna stannar utanför, som i [`wrap`].
+fn wrap_tag(text: &str, open: &str, close: &str) -> String {
+    let start = text.len() - text.trim_start().len();
+    let end = text.trim_end().len();
+    if start >= end {
+        return text.to_owned();
+    }
+    format!("{}{open}{}{close}{}", &text[..start], &text[start..end], &text[end..])
+}
+
 fn inline_md(run: &Run) -> String {
     if run.raw {
         return run.text.clone();
@@ -1085,12 +1408,12 @@ fn inline_md(run: &Run) -> String {
             s = wrap(&s, "**");
         }
         if run.fmt.underline {
-            // Ytterst, så att fet+understruken blir `<u>**x**</u>`.
-            let start = s.len() - s.trim_start().len();
-            let end = s.trim_end().len();
-            if start < end {
-                s = format!("{}<u>{}</u>{}", &s[..start], &s[start..end], &s[end..]);
-            }
+            // Utanför fetstil/kursiv, så att fet+understruken blir `<u>**x**</u>`.
+            s = wrap_tag(&s, "<u>", "</u>");
+        }
+        if !run.fmt.span.is_empty() {
+            // Ytterst: `<span …><u>**x**</u></span>`.
+            s = wrap_tag(&s, &run.fmt.span.open_tag(), "</span>");
         }
         if let Some(url) = &run.link {
             s = format!("[{s}]({})", url.replace(' ', "%20").replace(')', "%29"));
@@ -1114,6 +1437,8 @@ fn to_markdown(blocks: &[Block], numbering: &Numbering) -> String {
     let mut top_num: Option<String> = None;
     // Räknare per (numId, nivå); fortsätter när samma lista återupptas efter ett avbrott.
     let mut counters: HashMap<(String, usize), u64> = HashMap::new();
+    // Justeringen hos den `<div>` som är öppen just nu (`Left` = ingen).
+    let mut cur_align = Align::Left;
     for b in blocks {
         match b {
             Block::Para(p) => {
@@ -1121,13 +1446,18 @@ fn to_markdown(blocks: &[Block], numbering: &Numbering) -> String {
                 if text.trim().is_empty() {
                     continue;
                 }
+                // Kodblock justeras inte.
+                let align = if p.kind == ParaKind::Code { Align::Left } else { p.align };
                 let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_));
                 let same_list = match &p.list {
                     Some((num, 0)) => top_num.as_deref() == Some(num.as_str()),
                     Some(_) => true,
                     None => false,
                 };
-                if !out.is_empty() {
+                if align != cur_align {
+                    // Ny div (eller slut på den förra) i stället för en vanlig styckegräns.
+                    set_align(&mut out, &mut cur_align, align);
+                } else if !out.is_empty() {
                     out.push_str(if is_list && prev_list && same_list { "\n" } else { "\n\n" });
                 }
                 if let Some((num, 0)) = &p.list {
@@ -1192,7 +1522,10 @@ fn to_markdown(blocks: &[Block], numbering: &Numbering) -> String {
                     }
                 }
                 let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
-                if !out.is_empty() {
+                // Tabeller justeras inte.
+                if cur_align != Align::Left {
+                    set_align(&mut out, &mut cur_align, Align::Left);
+                } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
                 let row_md = |r: &Vec<String>| {
@@ -1210,8 +1543,32 @@ fn to_markdown(blocks: &[Block], numbering: &Numbering) -> String {
             }
         }
     }
+    if cur_align != Align::Left {
+        out.push_str("\n\n</div>");
+    }
     out.push('\n');
     out
+}
+
+/// Byter öppen `<div>`: stänger den förra och öppnar en ny, och lämnar `out` redo för nästa block
+/// (avslutad med tom rad).
+fn set_align(out: &mut String, cur: &mut Align, new: Align) {
+    if *cur == new {
+        return;
+    }
+    if *cur != Align::Left {
+        out.push_str("\n\n</div>");
+    }
+    if new != Align::Left {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&style::div_open(new));
+        out.push_str("\n\n");
+    } else if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    *cur = new;
 }
 
 // ============================================================== skrivning
@@ -1261,6 +1618,10 @@ struct Writer {
     media: Vec<(String, String, Vec<u8>)>,
     /// Bilder som inte kunde bäddas in.
     missing: Vec<String>,
+    /// Öppna `<span style="…">`, var och en sammanslagen med de utanför.
+    spans: Vec<SpanStyle>,
+    /// Öppna `<div align="…">`.
+    aligns: Vec<Align>,
 }
 
 struct TableState {
@@ -1286,6 +1647,8 @@ impl Writer {
             image: None,
             media: Vec::new(),
             missing: Vec::new(),
+            spans: Vec::new(),
+            aligns: Vec::new(),
         }
     }
 
@@ -1337,6 +1700,12 @@ impl Writer {
                 }
             }
         }
+        // Justering från en omgivande `<div>`; inte i tabeller eller kodblock.
+        if let Some(a) = self.aligns.last().filter(|a| **a != Align::Left) {
+            if self.table.is_none() && !self.in_code_block {
+                ppr.push_str(&format!("<w:jc w:val=\"{}\"/>", a.as_jc()));
+            }
+        }
         ppr
     }
 
@@ -1372,6 +1741,13 @@ impl Writer {
         } else if code {
             rpr.push_str("<w:rStyle w:val=\"CodeChar\"/>");
         }
+        // Ordningen följer schemat: rStyle, rFonts, b, i, strike, color, sz, szCs, highlight, u, shd.
+        let span = self.spans.last().cloned().unwrap_or_default();
+        if let Some(f) = &span.font_family {
+            let mut name = String::new();
+            xml_escape(f, &mut name);
+            rpr.push_str(&format!("<w:rFonts w:ascii=\"{name}\" w:hAnsi=\"{name}\" w:cs=\"{name}\" w:eastAsia=\"{name}\"/>"));
+        }
         if self.fmt.bold > 0 || self.table.as_ref().is_some_and(|t| t.in_head) {
             rpr.push_str("<w:b/>");
         }
@@ -1381,8 +1757,26 @@ impl Writer {
         if self.fmt.strike > 0 {
             rpr.push_str("<w:strike/>");
         }
+        if let Some(c) = span.color {
+            rpr.push_str(&format!("<w:color w:val=\"{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
+        }
+        if let Some(pt) = span.font_size {
+            let half = (pt * 2.0).round().max(1.0) as u32;
+            rpr.push_str(&format!("<w:sz w:val=\"{half}\"/><w:szCs w:val=\"{half}\"/>"));
+        }
+        // Exakt en av Words markeringsfärger blir markering, annars skuggning.
+        let shading = span.background.and_then(|bg| match style::highlight_name(bg) {
+            Some(name) => {
+                rpr.push_str(&format!("<w:highlight w:val=\"{name}\"/>"));
+                None
+            }
+            None => Some(bg),
+        });
         if self.fmt.underline > 0 {
             rpr.push_str("<w:u w:val=\"single\"/>");
+        }
+        if let Some(c) = shading {
+            rpr.push_str(&format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
         }
         let mut xml = String::from("<w:r>");
         if !rpr.is_empty() {
@@ -1606,8 +2000,20 @@ fn body_from_markdown(md: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Writ
             MdEvent::Code(t) => w.run(&t, true),
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 let s = t.to_string();
+                let single_line = s.trim().lines().count() == 1;
                 if s.trim().eq_ignore_ascii_case("<br>") || s.trim().eq_ignore_ascii_case("<br/>") {
                     w.line_break();
+                } else if let Some(style) = style::parse_span_open(&s) {
+                    let merged = w.spans.last().map_or(style.clone(), |outer| outer.merged(&style));
+                    w.spans.push(merged);
+                } else if style::is_span_close(&s) {
+                    w.spans.pop();
+                } else if let Some(align) = style::parse_div_open(&s).filter(|_| single_line) {
+                    w.close_para();
+                    w.aligns.push(align);
+                } else if single_line && style::is_div_close(&s) {
+                    w.close_para();
+                    w.aligns.pop();
                 } else if s.trim().eq_ignore_ascii_case("<u>") {
                     w.fmt.underline += 1;
                 } else if s.trim().eq_ignore_ascii_case("</u>") {
@@ -1665,10 +2071,20 @@ fn heading_style(n: u8, size: u32, color: &str) -> String {
     )
 }
 
-fn styles_xml() -> String {
-    let mut s = String::from(
+fn styles_xml(defaults: &DocDefaults) -> String {
+    // Dokumentets grundformat: ett namngivet typsnitt ersätter temats, och storleken räknas i halvpunkter.
+    let fonts = match &defaults.font_family {
+        Some(f) => {
+            let mut name = String::new();
+            xml_escape(f, &mut name);
+            format!("<w:rFonts w:ascii=\"{name}\" w:eastAsia=\"{name}\" w:hAnsi=\"{name}\" w:cs=\"{name}\"/>")
+        }
+        None => r#"<w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/>"#.to_owned(),
+    };
+    let half = (defaults.size() * 2.0).round().max(1.0) as u32;
+    let mut s = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/><w:sz w:val="22"/><w:szCs w:val="22"/><w:lang w:val="sv-SE" w:eastAsia="en-US" w:bidi="ar-SA"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"><w:name w:val="Default Paragraph Font"/><w:uiPriority w:val="1"/><w:semiHidden/><w:unhideWhenUsed/></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style><w:style w:type="numbering" w:default="1" w:styleId="NoList"><w:name w:val="No List"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/></w:style>"#,
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr>{fonts}<w:sz w:val="{half}"/><w:szCs w:val="{half}"/><w:lang w:val="sv-SE" w:eastAsia="en-US" w:bidi="ar-SA"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"><w:name w:val="Default Paragraph Font"/><w:uiPriority w:val="1"/><w:semiHidden/><w:unhideWhenUsed/></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style><w:style w:type="numbering" w:default="1" w:styleId="NoList"><w:name w:val="No List"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/></w:style>"#,
     );
     let heads = [(1, 36, "1F3864"), (2, 30, "2F5496"), (3, 26, "2F5496"), (4, 24, "2F5496"), (5, 22, "2F5496"), (6, 22, "404040")];
     for (n, size, color) in heads {
@@ -1758,6 +2174,12 @@ pub struct Written {
 /// Bygger ett komplett .docx-paket av Markdown-text.
 /// `resolve` hämtar bilddata för en bildkälla (`bild:namn`, en sökväg …).
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+    // Första raden kan vara dokumentets grundformat; den är inte text i dokumentet.
+    let first = markdown.lines().next().unwrap_or("");
+    let (defaults, markdown) = match DocDefaults::from_comment(first) {
+        Some(d) => (d, markdown[first.len()..].trim_start_matches(['\n', '\r'])),
+        None => (DocDefaults::default(), markdown),
+    };
     let w = body_from_markdown(markdown, resolve);
     let mut body = w.body;
     // Ett dokument som slutar med en tabell måste ha ett stycke efter den.
@@ -1793,7 +2215,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         ("word/_rels/document.xml.rels", doc_rels),
         ("docProps/core.xml", core_xml(title, "")),
         ("docProps/app.xml", APP_XML.to_owned()),
-        ("word/styles.xml", styles_xml()),
+        ("word/styles.xml", styles_xml(&defaults)),
         ("word/numbering.xml", numbering_xml(&w.ordered_nums)),
         ("word/settings.xml", SETTINGS.to_owned()),
     ];
@@ -1866,6 +2288,7 @@ mod tests {
             runs: vec![Run { text: t.into(), fmt: Fmt::default(), link: None, raw: false }],
             kind: ParaKind::Normal,
             list: Some(("1".into(), l)),
+            ..Para::new()
         });
         let blocks = vec![item("a", 0), item("x", 1), item("y", 1), item("b", 0), item("z", 1)];
         assert_eq!(to_markdown(&blocks, &numbering), "5. a\n    1. x\n    2. y\n6. b\n    1. z\n");
@@ -1912,27 +2335,44 @@ mod tests {
         assert_eq!(read(&w2.bytes).unwrap().markdown, back.markdown);
     }
 
-    /// Skriver om `word/document.xml` i ett dokument (för att prova läsningen av handgjord XML).
-    fn patch_document(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+    /// Skriver om en del (t.ex. `word/styles.xml`) i ett dokument; finns den inte läggs den till
+    /// (då får `f` en tom sträng).
+    fn patch_part(bytes: &[u8], part: &str, f: impl Fn(&str) -> String) -> Vec<u8> {
         let mut src = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut out = Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut out);
             let opts = zip::write::SimpleFileOptions::default();
+            let mut found = false;
             for i in 0..src.len() {
                 let mut file = src.by_index(i).unwrap();
                 let name = file.name().to_owned();
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data).unwrap();
-                if name == "word/document.xml" {
+                if name == part {
+                    found = true;
                     data = f(&String::from_utf8(data).unwrap()).into_bytes();
                 }
                 zw.start_file(name, opts).unwrap();
                 zw.write_all(&data).unwrap();
             }
+            if !found {
+                zw.start_file(part, opts).unwrap();
+                zw.write_all(f("").as_bytes()).unwrap();
+            }
             zw.finish().unwrap();
         }
         out.into_inner()
+    }
+
+    /// Skriver om `word/document.xml` i ett dokument (för att prova läsningen av handgjord XML).
+    fn patch_document(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+        patch_part(bytes, "word/document.xml", f)
+    }
+
+    /// Skriver om `word/styles.xml`.
+    fn patch_styles(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+        patch_part(bytes, "word/styles.xml", f)
     }
 
     #[test]
@@ -1968,6 +2408,175 @@ mod tests {
         });
         let back = read(&patched).unwrap();
         assert_eq!(back.markdown, "<u>ett</u> två <u>tre</u>\n");
+    }
+
+    /// Läser en del som text ur ett skrivet dokument.
+    fn part_text(bytes: &[u8], name: &str) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut z.by_name(name).unwrap(), &mut out).unwrap();
+        out
+    }
+
+    const STYLED: &str = "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt -->
+
+<div align=\"center\">
+
+# Rubrik
+
+Mitten med <span style=\"font-size: 20pt\">stor</span> text.
+
+</div>
+
+Typsnitt <span style=\"font-family: Arial\">Arial</span>, <span style=\"font-family: 'Gill Sans MT'\">Gill</span>, <span style=\"color: #C00000\">röd</span>, <span style=\"font-size: 14.5pt\">större</span>, <span style=\"background-color: #FFFF00\">gul</span> och <span style=\"background-color: #123456\">skuggad</span>.
+
+Alla: <span style=\"font-family: Arial; font-size: 14pt; color: #C00000; background-color: #FFFF00\">allt</span> och <span style=\"color: #00AA00\"><u>**fet understruken**</u></span> samt <span style=\"color: #0000FF\">*kursiv*</span> och <span style=\"color: #0000FF\">`kod`</span>.
+
+# <span style=\"color: #C00000\">Röd rubrik</span>
+
+<div align=\"right\">
+
+- ett
+- två
+    - tre
+
+</div>
+
+<div align=\"justify\">
+
+En lång mening som justeras.
+
+Och en till.
+
+</div>
+
+Sist vänster.
+";
+
+    #[test]
+    fn styles_roundtrip() {
+        let w = write(STYLED, "x", &|_| None).unwrap();
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, STYLED, "\n--- fick ---\n{}", back.markdown);
+        // Kommentarraden och taggarna får inte bli text i dokumentet.
+        let doc = part_text(&w.bytes, "word/document.xml");
+        assert!(!doc.contains("kladd:") && !doc.contains("&lt;span") && !doc.contains("&lt;div"), "{doc}");
+        // Grundformatet hamnar i docDefaults.
+        let styles = part_text(&w.bytes, "word/styles.xml");
+        assert!(styles.contains(r#"<w:rFonts w:ascii="Times New Roman" w:eastAsia="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman"/><w:sz w:val="24"/><w:szCs w:val="24"/>"#), "{styles}");
+    }
+
+    #[test]
+    fn writes_span_properties_in_schema_order() {
+        let md = "<span style=\"font-family: Arial; font-size: 14pt; color: #C00000; background-color: #FFFF00\"><u>**x**</u></span> <span style=\"background-color: #123456\"><u>y</u></span>\n\n<div align=\"center\">\n\n# Mitt\n\n</div>\n";
+        let doc = part_text(&write(md, "x", &|_| None).unwrap().bytes, "word/document.xml");
+        assert!(doc.contains(r#"<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial" w:eastAsia="Arial"/><w:b/><w:color w:val="C00000"/><w:sz w:val="28"/><w:szCs w:val="28"/><w:highlight w:val="yellow"/><w:u w:val="single"/></w:rPr>"#), "{doc}");
+        assert!(doc.contains(r#"<w:u w:val="single"/><w:shd w:val="clear" w:color="auto" w:fill="123456"/></w:rPr>"#), "{doc}");
+        assert!(doc.contains(r#"<w:pPr><w:pStyle w:val="Heading1"/><w:jc w:val="center"/></w:pPr>"#), "{doc}");
+    }
+
+    #[test]
+    fn plain_documents_get_no_comment_or_spans() {
+        // Standardformatet (Calibri 11 pt) ger varken kommentarrad eller spans, även med länk, citat och kod.
+        let md = "# Rubrik\n\nText med [länk](https://example.com) och `kod`.\n\n> Citat med **fet**.\n\n```\nkod\n```\n\n- punkt\n";
+        assert_eq!(rt(md), md);
+    }
+
+    #[test]
+    fn html_lookalikes_in_text_are_escaped() {
+        let md = "\\<span style=\"color: red\"> och \\<div align=\"center\"> slut.\n\n\\</div>\n";
+        let bytes = write(md, "x", &|_| None).unwrap().bytes;
+        let doc = part_text(&bytes, "word/document.xml");
+        assert!(doc.contains("&lt;span style=&quot;color: red&quot;&gt;") && doc.contains("&lt;div align=&quot;center&quot;&gt;"), "{doc}");
+        assert!(!doc.contains("<w:jc") && !doc.contains("<w:color"), "{doc}");
+        assert_eq!(read(&bytes).unwrap().markdown, md);
+    }
+
+    const THEME: &str = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="X"><a:majorFont><a:latin typeface="Georgia"/><a:ea typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Cambria"/><a:ea typeface=""/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#;
+
+    const HAND_STYLES: &str = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi"/><w:sz w:val="24"/></w:rPr></w:rPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Rubrik1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="2F5496"/><w:sz w:val="40"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Mitt"><w:name w:val="Centered"/><w:basedOn w:val="Normal"/><w:pPr><w:jc w:val="center"/><w:shd w:val="clear" w:color="auto" w:fill="EEEEEE"/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="MittBla"><w:name w:val="Centered Blue"/><w:basedOn w:val="Mitt"/><w:rPr><w:rFonts w:ascii="Verdana" w:hAnsi="Verdana"/><w:color w:val="0000FF"/></w:rPr></w:style>
+<w:style w:type="character" w:styleId="Rod"><w:name w:val="Red"/><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style>
+<w:style w:type="table" w:styleId="Tabell"><w:name w:val="Tabell"/><w:rPr><w:color w:val="123456"/></w:rPr></w:style>
+</w:styles>"#;
+
+    #[test]
+    fn reads_fonts_sizes_colors_and_alignment() {
+        let w = write("x\n", "x", &|_| None).unwrap();
+        let bytes = patch_part(&w.bytes, "word/theme/theme1.xml", |_| THEME.to_owned());
+        let bytes = patch_styles(&bytes, |_| HAND_STYLES.to_owned());
+        let bytes = patch_document(&bytes, |x| {
+            let start = x.find("<w:body>").unwrap() + "<w:body>".len();
+            let end = x.find("<w:sectPr>").unwrap();
+            let run = |rpr: &str, t: &str| format!("<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space=\"preserve\">{t}</w:t></w:r>");
+            let para = |ppr: &str, runs: &str| format!("<w:p><w:pPr>{ppr}</w:pPr>{runs}</w:p>");
+            let body = [
+                // Rubrik: formatmallens färg, storlek och typsnitt ger ingen span.
+                para("<w:pStyle w:val=\"Rubrik1\"/>", &run("", "Titel")),
+                // ... men direkt färg på rubriken ger det.
+                para("<w:pStyle w:val=\"Rubrik1\"/>", &run("<w:color w:val=\"FF0000\"/>", "Röd")),
+                // Direkt färg, storlek och markering; samma format i två körningar slås ihop.
+                para(
+                    "",
+                    &[
+                        run("", "vanlig "),
+                        run("<w:color w:val=\"C00000\"/><w:sz w:val=\"28\"/><w:highlight w:val=\"yellow\"/>", "stor"),
+                        run("<w:color w:val=\"C00000\"/><w:sz w:val=\"28\"/><w:highlight w:val=\"yellow\"/>", " röd"),
+                        run("<w:color w:val=\"auto\"/><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"auto\"/>", " auto"),
+                        run("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"123456\"/>", " skugga"),
+                        run("<w:rStyle w:val=\"Rod\"/>", " mall"),
+                        run("<w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\"/><w:sz w:val=\"24\"/>", " arial"),
+                    ]
+                    .concat(),
+                ),
+                // Justering ärvd genom basedOn (Mitt <- MittBla), plus typsnitt och färg från mallen.
+                para("<w:pStyle w:val=\"Mitt\"/>", &run("", "Mitt")),
+                para("<w:pStyle w:val=\"MittBla\"/>", &run("", "Blå mitt")),
+                // Direkt jc slår formatmallens.
+                para("<w:pStyle w:val=\"Mitt\"/><w:jc w:val=\"left\"/>", &run("", "Vänster")),
+                para("<w:jc w:val=\"right\"/>", &run("", "Höger")),
+                para("<w:jc w:val=\"both\"/>", &run("", "Marginal")),
+            ]
+            .concat();
+            format!("{}{}{}", &x[..start], body, &x[end..])
+        });
+        let back = read(&bytes).unwrap();
+        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt -->
+
+# Titel
+
+# <span style=\"color: #FF0000\">Röd</span>
+
+vanlig <span style=\"font-size: 14pt; color: #C00000; background-color: #FFFF00\">stor röd</span> auto <span style=\"background-color: #123456\">skugga</span> <span style=\"color: #FF0000\">mall</span> <span style=\"font-family: Arial\">arial</span>
+
+<div align=\"center\">
+
+Mitt
+
+<span style=\"font-family: Verdana; color: #0000FF\">Blå mitt</span>
+
+</div>
+
+Vänster
+
+<div align=\"right\">
+
+Höger
+
+</div>
+
+<div align=\"justify\">
+
+Marginal
+
+</div>
+";
+        assert_eq!(back.markdown, expected, "\n--- fick ---\n{}", back.markdown);
     }
 
     #[test]

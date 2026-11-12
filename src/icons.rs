@@ -1,11 +1,9 @@
 //! Små ikoner som ritas direkt med linjer, så de blir skarpa i alla storlekar.
 
-use egui::{Color32, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
 use crate::theme::Palette;
 
-// De nya ikonerna för formateringsraden används först när dokumentläget kopplas in.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum Icon {
     Plus,
@@ -29,6 +27,14 @@ pub enum Icon {
     Undo,
     Redo,
     Minus,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignJustify,
+    /// Bokstaven A; färgstapeln under ritas av `color_button`.
+    TextColor,
+    /// Markeringspenna; färgstapeln under ritas av `color_button`.
+    Highlight,
 }
 
 pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32) {
@@ -94,6 +100,35 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
         }
         Icon::Minus => {
             painter.line_segment([c + vec2(-5.5, 0.0), c + vec2(5.5, 0.0)], s);
+        }
+        Icon::AlignLeft | Icon::AlignCenter | Icon::AlignRight | Icon::AlignJustify => {
+            // Fyra linjer; längden och förskjutningen skiljer sig mellan justeringarna.
+            let (full, short) = (13.0, 8.0);
+            for (i, dy) in [-5.25, -1.75, 1.75, 5.25].into_iter().enumerate() {
+                let w = if i % 2 == 1 && !matches!(icon, Icon::AlignJustify) { short } else { full };
+                let x0 = match icon {
+                    Icon::AlignCenter => -w / 2.0,
+                    Icon::AlignRight => full / 2.0 - w,
+                    _ => -full / 2.0,
+                };
+                painter.line_segment([c + vec2(x0, dy), c + vec2(x0 + w, dy)], s);
+            }
+        }
+        Icon::TextColor => {
+            // A med tvärstreck.
+            let apex = c + vec2(0.0, -6.0);
+            painter.line_segment([c + vec2(-4.8, 4.0), apex], s);
+            painter.line_segment([apex, c + vec2(4.8, 4.0)], s);
+            painter.line_segment([c + vec2(-2.8, 0.6), c + vec2(2.8, 0.6)], s);
+        }
+        Icon::Highlight => {
+            // Snedställd penna: kropp, spets och ett streck vid spetsen.
+            let body = [c + vec2(2.0, -6.5), c + vec2(6.0, -2.5), c + vec2(0.5, 3.0), c + vec2(-3.5, -1.0)];
+            for i in 0..4 {
+                painter.line_segment([body[i], body[(i + 1) % 4]], s);
+            }
+            painter.line_segment([c + vec2(-3.5, -1.0), c + vec2(-5.5, 3.5)], s);
+            painter.line_segment([c + vec2(-5.5, 3.5), c + vec2(0.5, 3.0)], s);
         }
         Icon::BulletList => {
             for dy in [-4.5, 0.0, 4.5] {
@@ -238,7 +273,6 @@ pub fn window_button(ui: &mut Ui, p: &Palette, icon: Icon, tooltip: &str, danger
 }
 
 /// Hur bokstaven i en `glyph_toggle` ritas.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GlyphStyle {
     Bold,
@@ -283,7 +317,6 @@ fn toggle_frame(ui: &mut Ui, p: &Palette, active: bool, tooltip: &str) -> (Rect,
 }
 
 /// Knapp med en bokstav (F, K, U, S) för formateringsraden. `active` ger tonad bakgrund med accentkant.
-#[allow(dead_code)]
 pub fn glyph_toggle(
     ui: &mut Ui,
     p: &Palette,
@@ -333,7 +366,6 @@ pub fn glyph_toggle(
 }
 
 /// Ikonknapp som kan vara intryckt (28x28) för formateringsraden.
-#[allow(dead_code)]
 pub fn toggle_button(ui: &mut Ui, p: &Palette, icon: Icon, active: bool, tooltip: &str) -> Response {
     let (rect, response, color) = toggle_frame(ui, p, active, tooltip);
     if ui.is_rect_visible(rect) {
@@ -347,4 +379,45 @@ pub fn toggle_button(ui: &mut Ui, p: &Palette, icon: Icon, active: bool, tooltip
         paint(ui.painter(), icon, rect.center(), color, under);
     }
     response
+}
+
+/// Delad knapp för text- och markeringsfärg: själva knappen (ikon med färgstapel under) och en
+/// liten pil som öppnar färgväljaren. Returnerar (knapp, pil).
+pub fn color_button(
+    ui: &mut Ui,
+    p: &Palette,
+    icon: Icon,
+    color: Color32,
+    tooltip: &str,
+    arrow_tooltip: &str,
+) -> (Response, Response) {
+    let (main, arrow) = (vec2(26.0, 28.0), vec2(13.0, 28.0));
+    let space = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = 0.0;
+    let (r1, main_resp) = ui.allocate_exact_size(main, Sense::click());
+    let (r2, arrow_resp) = ui.allocate_exact_size(arrow, Sense::click());
+    ui.spacing_mut().item_spacing.x = space;
+    let main_resp = main_resp.on_hover_text(tooltip);
+    let arrow_resp = arrow_resp.on_hover_text(arrow_tooltip);
+    if ui.is_rect_visible(r1) {
+        for (r, resp, round) in [
+            (r1, &main_resp, CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }),
+            (r2, &arrow_resp, CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 }),
+        ] {
+            let open = resp.is_pointer_button_down_on() || (resp.hovered() && ui.input(|i| i.pointer.any_down()));
+            if resp.hovered() || open {
+                ui.painter().rect_filled(r, round, p.surface_hover);
+            }
+        }
+        let under = if main_resp.hovered() { p.surface_hover } else { p.chrome };
+        let c = r1.center() + vec2(1.0, -2.0);
+        paint(ui.painter(), icon, c, p.text, under);
+        let bar = Rect::from_center_size(pos2(r1.center().x + 1.0, r1.bottom() - 4.5), vec2(14.0, 3.0));
+        ui.painter().rect_filled(bar, 0.5, color);
+        // Vita och mycket ljusa färger behöver en kant för att synas mot knappen.
+        ui.painter().rect_stroke(bar, 0.5, Stroke::new(0.5, p.line), egui::StrokeKind::Outside);
+        let ac = r2.center() + vec2(-1.0, 0.0);
+        paint(ui.painter(), Icon::ChevronDown, ac, p.muted, under);
+    }
+    (main_resp, arrow_resp)
 }

@@ -9,6 +9,7 @@ mod highlight;
 mod icons;
 mod single;
 mod spell;
+mod style;
 mod theme;
 mod word;
 
