@@ -66,6 +66,8 @@ git tag v1.4.0
 git push origin v1.4.0
 ```
 
+Det går också att köra workflowen *Release* för hand under Actions och kryssa i *Publicera release*. Då skapas taggen från versionen i `Cargo.toml`.
+
 </details>
 
 ## Word-dokument
