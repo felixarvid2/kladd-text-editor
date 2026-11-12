@@ -43,20 +43,30 @@ pub fn open(target: &Path) -> std::io::Result<()> {
         c.arg(target);
         c
     };
+    // Windows: ShellExecuteW direkt, så att tecken som `&` och `^` i sökvägen inte tolkas av cmd.
     #[cfg(windows)]
-    let mut cmd = {
-        // `start` är inbyggt i cmd; den tomma titeln hindrar att sökvägen tolkas som fönstertitel.
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(target);
-        c
-    };
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let verb = wide(std::ffi::OsStr::new("open"));
+        let file = wide(target.as_os_str());
+        // SAFETY: alla strängar är nollterminerade UTF-16 och lever under anropet.
+        let r = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        // Värden ≤ 32 betyder fel enligt dokumentationen.
+        return if r as isize > 32 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
+    }
     #[cfg(not(any(target_os = "macos", windows)))]
     let mut cmd = {
         let mut c = Command::new("xdg-open");
         c.arg(target);
         c
     };
-    quiet(&mut cmd).spawn().map(|_| ())
+    #[cfg(not(windows))]
+    return quiet(&mut cmd).spawn().map(|_| ());
 }
 
 /// Lever processen med det här numret?
