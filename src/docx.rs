@@ -867,7 +867,12 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     // Packa upp bilderna som dokumentet faktiskt använder.
     let mut images: Vec<(String, Image)> = Vec::new();
     let mut by_target: HashMap<String, String> = HashMap::new();
-    let (mut markdown, units) = to_markdown_units(&blocks, &numbering);
+    let text_w = {
+        let (w, _) = page.page();
+        let m = page.margins();
+        Some(((w - m[1] - m[3]) * 20.0) as f64)
+    };
+    let (mut markdown, units) = to_markdown_units(&blocks, &numbering, text_w);
     let mut keys: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
     // Grundformatet (typsnitt, storlek och sida) står först när det avviker från standard.
     let mut base = styles.base();
@@ -2275,10 +2280,12 @@ struct MdUnit {
 
 #[cfg(test)]
 fn to_markdown(blocks: &[Block], numbering: &Numbering) -> String {
-    to_markdown_units(blocks, numbering).0
+    to_markdown_units(blocks, numbering, None).0
 }
 
-fn to_markdown_units(blocks: &[Block], numbering: &Numbering) -> (String, Vec<MdUnit>) {
+/// `text_w` är textytans bredd i twips: tabeller som är klart smalare får automatisk bredd i
+/// stället för proportionella kolumner (som annars fyller hela bredden).
+fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64>) -> (String, Vec<MdUnit>) {
     let mut units: Vec<MdUnit> = Vec::new();
     let mut out = String::new();
     let mut prev_list = false;
@@ -2390,7 +2397,9 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering) -> (String, Vec<Md
                     out.push_str("\n\n");
                 }
                 let start = out.len();
-                out.push_str(&markup::table_markdown(&rows, &tbl.spans, &tbl.widths));
+                let narrow = text_w.is_some_and(|tw| tw > 0.0 && tbl.widths.iter().sum::<f64>() < tw * 0.9);
+                let widths: &[f64] = if narrow { &[] } else { &tbl.widths };
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, widths));
                 units.push(MdUnit { origin: *origin, desc: "t|left".to_owned(), key: norm(&out[start..]) });
             }
         }
@@ -5671,6 +5680,22 @@ Marginal
         // Lodrätt sammanfogad fortsättningscell blir en tom cell.
         assert!(md.contains("| Lodrät | b | c |"), "{md}");
         assert!(md.contains("|   | e | f |"), "{md}");
+    }
+
+    #[test]
+    fn narrow_word_tables_keep_auto_width() {
+        // En smal tabell (som LibreOffice skriver) ska inte bli proportionell över hela bredden.
+        let w = write("x\n", "x", &|_| None, None).unwrap();
+        let patched = patch_document(&w.bytes, |x| {
+            let tbl = "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"1201\"/><w:gridCol w:w=\"991\"/></w:tblGrid>\
+                       <w:tr><w:tc><w:p><w:r><w:t>Område</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Resultat</w:t></w:r></w:p></w:tc></w:tr>\
+                       <w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+            let start = x.find("<w:p>").unwrap();
+            let end = x.rfind("</w:p>").unwrap() + "</w:p>".len();
+            format!("{}{tbl}<w:p/>{}", &x[..start], &x[end..])
+        });
+        let md = read(&patched).unwrap().markdown;
+        assert!(md.contains("| --- | --- |"), "{md}");
     }
 
 }

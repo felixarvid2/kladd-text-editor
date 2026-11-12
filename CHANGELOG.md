@@ -4,14 +4,29 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [1.7.0] – 2026-11-12
+
 ### Nytt
 
+- **Automatisk säkerhetskopia.** Osparade ändringar sparas undan var 30:e sekund. Kraschar Kladd erbjuds du att återställa dem nästa gång programmet startar.
+- **Exportera till HTML och EPUB** med *Spara som*. Formatering, bilder, tabeller, fotnoter och innehållsförteckning följer med, och EPUB-filerna klarar epubcheck.
+- **Bättre sök och ersätt.** Hela ord, reguljära uttryck med `$1` i ersättningen, och i dokumentläget sökning i den synliga texten, sökning efter formatering (fetstil, färg, markering …) och ersättning som formaterar träffarna.
 - **Tabeller som i Word.** Långa celler bryts inuti sin kolumn och raden blir lika hög som den högsta cellen. Enter (och Skift+Enter) i en cell lägger in en radbrytning (`<br>`), och Upp/Ned flyttar mellan cellens rader och mellan celler. Dra i en kolumnkant för att ändra bredden: den skrivs som olika antal bindestreck i avgränsarraden (`| ------ | -- |`), en linje visar var kanten hamnar och ändringen är ett ångra-steg. Verktygsraden och högerklicksmenyn har *Sammanfoga celler* och *Dela cell* (`| Rubrik över två ||`). Word (`w:gridSpan`, `w:tblGrid`, `w:br`), OpenDocument, PDF, HTML och EPUB har sammanfogade celler, kolumnbredder och radbrytningar; lodrätt sammanfogade Word-celler läses som tomma celler.
 - **Navigeringsfönster.** En panel till vänster visar rubrikerna (H1–H6) som ett träd med hopfällbara nivåer, markerar rubriken där markören står och har ett filter ("Sök i rubriker"). Klicka på en rubrik för att hoppa dit, i både dokumentläge och textläge. Slå på och av med knappen i titelraden, *Navigeringsfönster* i menyn eller `Ctrl+Shift+O`; valet sparas.
-- **Innehållsförteckning.** *Infoga innehållsförteckning* (knappen i formateringsfältet eller menyn) sätter in raden `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna H1–H3 med prickad ledlinje och sidnummer, och posterna är klickbara. Word sparas som ett riktigt innehållsförteckningsfält (`TOC`) som Word uppdaterar när filen öppnas, OpenDocument som `text:table-of-content` och PDF med riktiga sidnummer och länkar till rubrikerna. En innehållsförteckning i ett öppnat `.docx` eller `.odt` visas som samma rad.
+- **Innehållsförteckning.** *Infoga → Innehållsförteckning* (i formateringsfältet eller huvudmenyn) sätter in raden `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna H1–H3 med prickad ledlinje och sidnummer, och posterna är klickbara. Word sparas som ett riktigt innehållsförteckningsfält (`TOC`) som Word uppdaterar när filen öppnas, OpenDocument som `text:table-of-content` och PDF med riktiga sidnummer och länkar till rubrikerna. En innehållsförteckning i ett öppnat `.docx` eller `.odt` visas som samma rad.
 - **Fotnoter som går att se och redigera.** Fotnotsreferenser visas som små upphöjda siffror och fotnoterna under en skiljelinje sist i dokumentet. *Infoga fotnot* (`Ctrl+Alt+F`) numrerar om automatiskt, Ctrl+klick på numret hoppar mellan referens och fotnot, och Backspace efter en referens tar bort hela fotnoten. Word (`footnotes.xml`), OpenDocument (`text:note`), PDF (längst ned på sidan), HTML och EPUB har fotnoter.
 - **Flytta bilder genom att dra.** Dra en markerad bild till ett annat ställe: en linje visar var den hamnar (före eller efter stycket under pekaren), för flytande bilder också bildens ruta vid kanten. Esc eller släpp utanför sidan avbryter. Ett steg att ångra.
 - **Text som flyter runt bilder.** Verktygsraden vid en bild har tre knappar för radbrytning: *I texten*, *Vänster* och *Höger*. Med vänster eller höger flyter stycken efter bilden runt den, rad för rad. Flytande bilder läses och skrivs som förankrade bilder med textomflöde i `.docx`, som ramar med omflöde i `.odt` och som CSS-flöde i HTML, EPUB och PDF.
+
+### Ändrat
+
+- **Stora dokument går snabbt.** Bara de stycken som ändras läggs ut på nytt, så skrivande och markörflyttar i dokument på hundratals sidor är snabba igen, i både dokumentläge och textläge.
+- **Menyn *Infoga*** i formateringsfältet samlar bild, tabell, fotnot och innehållsförteckning.
+- **Release-anteckningar på svenska**, hämtade ur den här filen.
+
+### Rättat
+
+- Smala tabeller från Word och LibreOffice behåller sin bredd i stället för att fylla hela sidan.
 
 ## [1.6.0] – 2026-11-12
 

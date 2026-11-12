@@ -22,9 +22,13 @@ pub enum Icon {
     BulletList,
     NumberedList,
     Quote,
+    // Bild, tabell, fotnot och innehållsförteckning ligger i menyn Infoga, ikonerna sparas.
+    #[allow(dead_code)]
     Image,
+    #[allow(dead_code)]
     Table,
     /// Fotnot: ett stort A med en upphöjd etta.
+    #[allow(dead_code)]
     Footnote,
     TableRowAbove,
     TableRowBelow,
@@ -55,6 +59,7 @@ pub enum Icon {
     /// Rubrikträd (navigeringsfönstret).
     Outline,
     /// Innehållsförteckning: rader med sidnummer till höger.
+    #[allow(dead_code)]
     Toc,
 }
 

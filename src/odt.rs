@@ -1221,7 +1221,8 @@ fn set_align(out: &mut String, cur: &mut Align, new: Align) {
     *cur = new;
 }
 
-fn render(blocks: &[Block]) -> String {
+/// `text_w` är textytans bredd i pt: tabeller som är klart smalare får automatisk bredd.
+fn render(blocks: &[Block], text_w: Option<f64>) -> String {
     let mut out = String::new();
     let mut prev_list: Option<usize> = None;
     let mut cur_align = Align::Left;
@@ -1306,7 +1307,9 @@ fn render(blocks: &[Block]) -> String {
                 } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
-                out.push_str(&markup::table_markdown(&rows, &tbl.spans, &tbl.widths));
+                let narrow = text_w.is_some_and(|tw| tw > 0.0 && tbl.widths.iter().sum::<f64>() < tw * 0.9);
+                let widths: &[f64] = if narrow { &[] } else { &tbl.widths };
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, widths));
             }
         }
     }
@@ -1462,16 +1465,21 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     for c in body.els() {
         rd.walk(c);
     }
-    let mut markdown = render(&rd.blocks);
+    let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
+    if let Some(s) = &sroot {
+        read_page(&st, s, &mut defaults);
+    }
+    let text_w = {
+        let (w, _) = defaults.page();
+        let m = defaults.margins();
+        f64::from(w - m[1] - m[3])
+    };
+    let mut markdown = render(&rd.blocks, Some(text_w));
     if !rd.notes.is_empty() {
         markdown.push('\n');
         for (i, n) in rd.notes.iter().enumerate() {
             markdown.push_str(&format!("[^{}]: {n}\n", i + 1));
         }
-    }
-    let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
-    if let Some(s) = &sroot {
-        read_page(&st, s, &mut defaults);
     }
     let comment = defaults.to_comment();
     if !comment.is_empty() {

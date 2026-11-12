@@ -641,18 +641,23 @@ impl KladdApp {
                         }
                     }
                     divider(ui, p);
-                    if icons::button(ui, p, Icon::Image, 28.0, false, "Infoga bild", p.chrome).clicked() {
-                        acts.push(BarAct::Image);
-                    }
-                    if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
-                        acts.push(BarAct::Table);
-                    }
-                    if icons::button(ui, p, Icon::Footnote, 28.0, false, "Infoga fotnot (Ctrl+Alt+F)", p.chrome).clicked() {
-                        acts.push(BarAct::Footnote);
-                    }
-                    if icons::button(ui, p, Icon::Toc, 28.0, false, "Infoga innehållsförteckning", p.chrome).clicked() {
-                        acts.push(BarAct::Toc);
-                    }
+                    // Infoga: bild, tabell, fotnot och innehållsförteckning i en meny, som i Word.
+                    let insert = crate::app::status_button(ui, p, "Infoga \u{25BE}", "Infoga bild, tabell, fotnot eller innehållsförteckning");
+                    Popup::menu(&insert).gap(4.0).width(230.0).show(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        if crate::app::menu_item(ui, p, "Bild…", "Ctrl+Shift+I", None, true) {
+                            acts.push(BarAct::Image);
+                        }
+                        if crate::app::menu_item(ui, p, "Tabell", "", None, true) {
+                            acts.push(BarAct::Table);
+                        }
+                        if crate::app::menu_item(ui, p, "Fotnot", "Ctrl+Alt+F", None, true) {
+                            acts.push(BarAct::Footnote);
+                        }
+                        if crate::app::menu_item(ui, p, "Innehållsförteckning", "", None, true) {
+                            acts.push(BarAct::Toc);
+                        }
+                    });
                     if in_table {
                         divider(ui, p);
                         if let Some(op) = tables::bar_group(ui, p) {
