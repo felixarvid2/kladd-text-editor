@@ -11,12 +11,13 @@ use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
     Color32,
-    Align, Align2, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
+    Align, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
     Modifiers, Key, Panel, Popup, Rect, RectAlign, ScrollArea, Sense, Shape, Stroke, TextBuffer, TextEdit, Ui,
     UiBuilder, Vec2, pos2, vec2,
 };
 
-use super::layout::{self, MARGIN_PT, PAGE_H_PT, PAGE_W_PT, px};
+use super::layout::{self, px};
+use super::pages;
 use super::markup::{self, Block, Inline, SpanProp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
@@ -88,6 +89,8 @@ pub struct State {
     target: Option<SpellTarget>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
+    /// Öppen dialog "Sidinställningar".
+    pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
@@ -100,6 +103,7 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    PageSetup,
     Undo,
     Redo,
     Zoom(f32),
@@ -189,30 +193,6 @@ fn divider(ui: &mut Ui, p: &Palette) {
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line));
     ui.add_space(4.0);
-}
-
-/// Radgränserna (y i px från galleriets överkant) där en ny sida börjar. `rows` är (topp, botten)
-/// för varje rad. Varje sida rymmer så många hela rader som får plats på `page_h`, minst en, och
-/// brytlinjen läggs mellan sista raden och nästa, så den aldrig skär en rad.
-fn page_breaks(rows: &[(f32, f32)], page_h: f32) -> Vec<f32> {
-    let mut out = Vec::new();
-    if page_h <= 0.0 || rows.is_empty() {
-        return out;
-    }
-    let mut i = 0;
-    while i < rows.len() {
-        let limit = rows[i].0 + page_h + 0.01;
-        let mut j = i;
-        while j + 1 < rows.len() && rows[j + 1].1 <= limit {
-            j += 1;
-        }
-        if j + 1 >= rows.len() {
-            break;
-        }
-        out.push((rows[j].1 + rows[j + 1].0) / 2.0);
-        i = j + 1;
-    }
-    out
 }
 
 fn overlaps_strict(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -596,6 +576,9 @@ impl KladdApp {
                     if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
                         acts.push(BarAct::Table);
                     }
+                    if icons::button(ui, p, Icon::Page, 28.0, false, "Sidinställningar", p.chrome).clicked() {
+                        acts.push(BarAct::PageSetup);
+                    }
                     divider(ui, p);
                     if icons::button(ui, p, Icon::Undo, 28.0, false, "Ångra (Ctrl+Z)", p.chrome).clicked() {
                         acts.push(BarAct::Undo);
@@ -631,6 +614,7 @@ impl KladdApp {
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
+                BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
                 BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
@@ -676,7 +660,7 @@ impl KladdApp {
         }
     }
 
-    /// Sidvyn: grått skrivbord, en vit A4-sida med text, sidbrytningar och stavningsmarkering.
+    /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
         CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
             self.editor_rect = ui.max_rect();
@@ -691,20 +675,21 @@ impl KladdApp {
                 self.settings.word_zoom = (self.settings.word_zoom * zd).clamp(MIN_ZOOM, MAX_ZOOM);
             }
 
-            let avail_w = ui.available_width();
-            let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-            if avail_w < px(z, PAGE_W_PT) + 2.0 * GAP {
-                z = ((avail_w - 2.0 * GAP) / px(1.0, PAGE_W_PT)).max(0.4);
-            }
-            let page_w = px(z, PAGE_W_PT);
-            let margin = px(z, MARGIN_PT);
-            let text_w = page_w - 2.0 * margin;
-            let text_h_page = px(z, PAGE_H_PT - 2.0 * MARGIN_PT);
-            let area_w = avail_w.max(page_w + 2.0 * GAP);
-
             let doc_id = self.docs[self.active].id;
             let id = editor_id(doc_id);
             let analysis = self.word.analysis(doc_id, &self.docs[self.active].text);
+
+            // Sidans mått kommer från dokumentets grundformat; zoomen anpassas så att sidan ryms.
+            let avail_w = ui.available_width();
+            let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+            let geom1 = pages::Geom::new(1.0, &analysis.defaults);
+            if avail_w < geom1.page_w * z + 2.0 * GAP {
+                z = ((avail_w - 2.0 * GAP) / geom1.page_w).max(0.4);
+            }
+            let geom = pages::Geom::new(z, &analysis.defaults);
+            let page_w = geom.page_w;
+            let text_w = geom.text_w();
+            let area_w = avail_w.max(page_w + 2.0 * GAP);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
             let srcs: Vec<String> = analysis
@@ -716,7 +701,7 @@ impl KladdApp {
             for src in srcs {
                 self.word_image(&ctx, &src);
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, src.clone())) {
-                    let max_w = px(1.0, PAGE_W_PT - 2.0 * MARGIN_PT);
+                    let max_w = geom1.text_w();
                     let k = (max_w / info.size.x).min(1.0);
                     sizes.insert(src, info.size * k * z);
                 }
@@ -806,7 +791,8 @@ impl KladdApp {
             let mut edited = false;
             let mut spell_act: Option<SpellAct> = None;
             let mut new_target: Option<Option<SpellTarget>> = None;
-            let mut pages = (1usize, 1usize);
+            let mut page_pos = (1usize, 1usize);
+            let mut open_page_dlg = false;
 
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id)).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -817,7 +803,7 @@ impl KladdApp {
                 let page_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
-                    pos2(page_left + margin, page_top + margin),
+                    pos2(page_left + geom.left, page_top + geom.top),
                     vec2(text_w, f32::INFINITY),
                 );
                 let params = layout::Params {
@@ -833,9 +819,9 @@ impl KladdApp {
                     fonts_gen,
                 };
                 let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
-                    word.galley(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width)
+                    word.galley_paged(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width, Some(&geom))
                 };
-                let min_h = (px(z, PAGE_H_PT) - 2.0 * margin).max(0.0);
+                let min_h = geom.text_h();
                 let out = ui
                     .scope_builder(UiBuilder::new().max_rect(text_rect), |ui| {
                         TextEdit::multiline(&mut doc.text)
@@ -864,20 +850,32 @@ impl KladdApp {
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
 
-                // Sidan och skuggan, i höjd med texten.
-                let page_h = px(z, PAGE_H_PT).max(2.0 * margin + te_rect.height());
-                let page_rect = Rect::from_min_size(pos2(page_left, page_top), vec2(page_w, page_h));
-                ui.painter().set(
-                    shadow_slot,
-                    Shape::rect_filled(page_rect.translate(vec2(0.0, 2.0)).expand(1.5), 2.0, p.page_shadow),
-                );
-                ui.painter().set(page_slot, Shape::rect_filled(page_rect, 1.0, p.page));
+                // Ett ark per sida, med luft emellan.
+                let total = pages::page_count(&galley, &geom);
+                let clip = ui.clip_rect();
+                let (shadows, sheets) = pages::sheet_shapes(p, &geom, page_left, page_top, total, clip);
+                ui.painter().set(shadow_slot, shadows);
+                ui.painter().set(page_slot, sheets);
+                let last_bottom = pages::sheet_rect(&geom, page_left, page_top, total - 1).bottom();
                 ui.allocate_rect(
-                    Rect::from_min_max(origin, pos2(origin.x + area_w, page_rect.bottom() + GAP)),
+                    Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),
                     Sense::hover(),
                 );
-
-                let clip = ui.clip_rect();
+                // Sidhuvud och sidfot (skrivskyddade här; dubbelklick öppnar sidinställningarna).
+                let hf_font = pages::header_font(
+                    z,
+                    &analysis.defaults,
+                    font_family(Some(analysis.defaults.font()), false, false),
+                );
+                for k in 0..total {
+                    let sheet = pages::sheet_rect(&geom, page_left, page_top, k);
+                    if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
+                        continue;
+                    }
+                    if pages::header_footer(ui, p, &geom, sheet, k, total, &analysis.defaults, hf_font.clone(), doc_id) {
+                        open_page_dlg = true;
+                    }
+                }
                 let painter = ui.painter().clone();
 
                 // Byte -> teckenindex, framåt i en svep (bitarna ligger i ordning).
@@ -986,34 +984,9 @@ impl KladdApp {
                     }
                 }
 
-                // Sidbrytningar (ungefärliga): vid radgränser, aldrig genom en rad.
-                let top_of_text = gpos.y;
-                let rows: Vec<(f32, f32)> = galley.rows.iter().map(|r| (r.min_y(), r.max_y())).collect();
-                let breaks = page_breaks(&rows, text_h_page);
-                let total = breaks.len() + 1;
-                let right_x = page_left + page_w - margin + 8.0;
-                for (k, by) in breaks.iter().enumerate() {
-                    let y = top_of_text + by;
-                    if y >= clip.top() - 20.0 && y <= clip.bottom() + 20.0 {
-                        painter.extend(Shape::dashed_line(
-                            &[pos2(page_left, y), pos2(page_left + page_w, y)],
-                            Stroke::new(1.0, p.page_markup),
-                            5.0,
-                            4.0,
-                        ));
-                        painter.text(
-                            pos2(right_x, y),
-                            Align2::LEFT_CENTER,
-                            format!("Sida {}", k + 2),
-                            FontId::new(10.0, FontFamily::Proportional),
-                            p.page_muted,
-                        );
-                    }
-                }
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
-                let cur = breaks.iter().filter(|b| **b <= caret_y + 0.5).count() + 1;
-                pages = (cur.min(total), total);
+                page_pos = ((geom.page_of(caret_y) + 1).min(total), total);
 
                 // Röd våglinje under felstavade ord.
                 if !misspelled.is_empty() {
@@ -1098,7 +1071,10 @@ impl KladdApp {
                 }
             });
 
-            self.wv.pages = pages;
+            self.wv.pages = page_pos;
+            if open_page_dlg {
+                self.open_page_dialog();
+            }
             if let Some(t) = new_target {
                 self.wv.target = t;
             }
@@ -1211,27 +1187,7 @@ fn image_uri(src: &str, doc_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_breaks, step_size};
-
-    #[test]
-    fn sidbrytning_mellan_rader() {
-        // Rader på 20 px; sidan rymmer 100 px = 5 rader.
-        let rows: Vec<(f32, f32)> = (0..12).map(|i| (i as f32 * 20.0, i as f32 * 20.0 + 20.0)).collect();
-        let b = page_breaks(&rows, 100.0);
-        assert_eq!(b, vec![100.0, 200.0]);
-        // Aldrig genom en rad.
-        for y in &b {
-            assert!(rows.iter().all(|r| !(r.0 < *y && *y < r.1)), "{y}");
-        }
-        // Sidan rymmer inte en hel rad till: brytningen hamnar före den.
-        let b = page_breaks(&rows, 110.0);
-        assert_eq!(b[0], 100.0);
-        // En rad högre än sidan får en egen sida.
-        let tall = [(0.0, 20.0), (20.0, 400.0), (400.0, 420.0)];
-        assert_eq!(page_breaks(&tall, 100.0).len(), 2);
-        assert!(page_breaks(&rows[..5], 100.0).is_empty());
-        assert!(page_breaks(&[], 100.0).is_empty());
-    }
+    use super::step_size;
 
     #[test]
     fn size_steps_follow_the_list() {

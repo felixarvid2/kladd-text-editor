@@ -24,6 +24,8 @@ pub enum Icon {
     Quote,
     Image,
     Table,
+    /// Ett pappersark med vikt hörn.
+    Page,
     Undo,
     Redo,
     Minus,
@@ -179,6 +181,16 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             painter.rect_stroke(r, 1.5, s, egui::StrokeKind::Middle);
             painter.line_segment([pos2(c.x, r.top()), pos2(c.x, r.bottom())], s);
             painter.line_segment([pos2(r.left(), c.y), pos2(r.right(), c.y)], s);
+        }
+        Icon::Page => {
+            let r = Rect::from_center_size(c, vec2(11.0, 14.0));
+            let fold = 4.0;
+            painter.add(egui::Shape::closed_line(
+                vec![r.left_top(), pos2(r.right() - fold, r.top()), pos2(r.right(), r.top() + fold), r.right_bottom(), r.left_bottom()],
+                s,
+            ));
+            painter.line_segment([pos2(r.right() - fold, r.top()), pos2(r.right() - fold, r.top() + fold)], s);
+            painter.line_segment([pos2(r.right() - fold, r.top() + fold), pos2(r.right(), r.top() + fold)], s);
         }
         Icon::Undo | Icon::Redo => {
             // Redo är Undo speglad i x.

@@ -18,10 +18,6 @@ use super::markup::{self, Align, Analysis, Block, DocDefaults, Piece};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
-pub const PAGE_W_PT: f32 = 595.0; // A4
-pub const PAGE_H_PT: f32 = 842.0;
-pub const MARGIN_PT: f32 = 72.0; // 1 tum
-
 /// Punkter till pixlar vid zoom (96 dpi).
 pub fn px(zoom: f32, pt: f32) -> f32 {
     pt * 96.0 / 72.0 * zoom
@@ -90,8 +86,24 @@ impl Cache {
     /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag). Jobbet
     /// byggs först (`p.measure` tar fonts-låset, så det måste ske utanför `fonts_mut`).
     pub fn galley(&mut self, ctx: &egui::Context, doc_id: u64, text: &str, p: &Params, wrap_width: f32) -> Arc<Galley> {
+        self.galley_paged(ctx, doc_id, text, p, wrap_width, None)
+    }
+
+    /// Som `galley`, men med raderna uppdelade på sidor enligt `pages` (se `pages::paginate`).
+    pub fn galley_paged(
+        &mut self,
+        ctx: &egui::Context,
+        doc_id: u64,
+        text: &str,
+        p: &Params,
+        wrap_width: f32,
+        pages: Option<&super::pages::Geom>,
+    ) -> Arc<Galley> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         Self::job_key(text, p).hash(&mut h);
+        if let Some(g) = pages {
+            g.hash_into(&mut h);
+        }
         wrap_width.to_bits().hash(&mut h);
         ctx.pixels_per_point().to_bits().hash(&mut h);
         // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
@@ -105,7 +117,11 @@ impl Cache {
         let job = self.job(doc_id, text, p);
         let a = self.analysis(doc_id, text);
         let ppp = ctx.pixels_per_point();
-        let g = Arc::new(ctx.fonts_mut(|f| layout_galley(f, job, &a, p, wrap_width, ppp)));
+        let mut g = ctx.fonts_mut(|f| layout_galley(f, job, &a, p, wrap_width, ppp));
+        if let Some(geom) = pages {
+            super::pages::paginate(&mut g, geom, ppp);
+        }
+        let g = Arc::new(g);
         self.galleys.insert(doc_id, (key, g.clone()));
         g
     }
