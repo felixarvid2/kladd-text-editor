@@ -4,7 +4,7 @@
 //! `docs/dev/dokumentlage.md`): `TextEdit` med samma id, så markör och ångra överlever växlingen.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::ops::Range;
 
 use egui::text::{CCursor, CCursorRange};
@@ -65,9 +65,13 @@ struct ImgInfo {
 
 struct SpellCache {
     doc_id: u64,
-    text_hash: u64,
+    /// Dokumentrevisionen resultatet gäller.
+    rev: u64,
     generation: u64,
-    ranges: Vec<Range<usize>>,
+    ranges: Arc<Vec<Range<usize>>>,
+    /// Felstavade ord per textstycke (hash av stycket -> lägen relativt styckets början), så att
+    /// en ändring bara kontrollerar de stycken som ändrats.
+    per_range: HashMap<u64, Vec<Range<usize>>>,
 }
 
 /// Ordet som högerklickades, med förslag (beräknade en gång när menyn öppnas).
@@ -118,12 +122,6 @@ enum BarAct {
     Align(markup::Align),
     TextColor(Option<[u8; 3]>),
     Highlight(Option<[u8; 3]>),
-}
-
-fn hash_text(text: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
 }
 
 fn block_label(b: Block) -> String {
@@ -721,10 +719,10 @@ impl KladdApp {
             let area_w = avail_w.max(page_w + 2.0 * GAP);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
-            let refs: Vec<markup::ImageRef> = analysis.pieces.iter().filter_map(|pc| pc.image.clone()).collect();
+            let refs = self.word.images(doc_id, &self.docs[self.active].text);
             let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
-            for img in refs {
+            for img in refs.iter().cloned() {
                 self.word_image(&ctx, &img.src);
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
                     let max_w = geom1.text_w();
@@ -738,10 +736,10 @@ impl KladdApp {
                 ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x)
             };
 
-            // Stavningskontroll.
-            let text_hash = hash_text(&self.docs[self.active].text);
+            // Stavningskontroll: en gång per ändring, och bara för stycken som ändrats.
+            let rev = self.word.rev(doc_id, &self.docs[self.active].text);
             let spell_on = self.settings.spell;
-            let mut misspelled: Vec<Range<usize>> = Vec::new();
+            let mut misspelled: Arc<Vec<Range<usize>>> = Arc::default();
             if spell_on {
                 if let Some(sp) = self.speller.as_mut() {
                     if sp.ready() {
@@ -750,10 +748,10 @@ impl KladdApp {
                             .wv
                             .spell
                             .as_ref()
-                            .is_some_and(|c| c.doc_id == doc_id && c.text_hash == text_hash && c.generation == gen_);
+                            .is_some_and(|c| c.doc_id == doc_id && c.rev == rev && c.generation == gen_);
                         if !fresh {
                             let text = &self.docs[self.active].text;
-                            let mut ranges: Vec<Range<usize>> = Vec::new();
+                            let mut spans: Vec<Range<usize>> = Vec::new();
                             for pc in &analysis.pieces {
                                 if pc.markup
                                     || pc.code
@@ -763,13 +761,18 @@ impl KladdApp {
                                 {
                                     continue;
                                 }
-                                match ranges.last_mut() {
+                                match spans.last_mut() {
                                     Some(last) if last.end == pc.range.start => last.end = pc.range.end,
-                                    _ => ranges.push(pc.range.clone()),
+                                    _ => spans.push(pc.range.clone()),
                                 }
                             }
-                            let found = sp.misspelled(text, &ranges);
-                            self.wv.spell = Some(SpellCache { doc_id, text_hash, generation: gen_, ranges: found });
+                            let mut per_range = match self.wv.spell.take() {
+                                Some(c) if c.doc_id == doc_id && c.generation == gen_ => c.per_range,
+                                _ => HashMap::new(),
+                            };
+                            let found = sp.misspelled_cached(text, &spans, &mut per_range);
+                            self.wv.spell =
+                                Some(SpellCache { doc_id, rev, generation: gen_, ranges: Arc::new(found), per_range });
                         }
                         misspelled = self.wv.spell.as_ref().map(|c| c.ranges.clone()).unwrap_or_default();
                     } else {
@@ -782,7 +785,7 @@ impl KladdApp {
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
             let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
-            let tabs = layout::tables(&self.docs[self.active].text, &analysis);
+            let tabs = self.word.tables(doc_id, &self.docs[self.active].text);
 
             let matches = self.search_highlights();
             let scroll_to = self.scroll_to_char.take();
@@ -797,7 +800,8 @@ impl KladdApp {
             // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
             // bara slår upp dem (en okänd familj kraschar egui).
             let mut fam_map: HashMap<(String, bool, bool), FontFamily> = HashMap::new();
-            for (name, bold, italic) in layout::needed_fonts(&analysis) {
+            let needed = self.word.fonts(doc_id, &self.docs[self.active].text);
+            for (name, bold, italic) in needed.iter().cloned() {
                 let fam = self.doc_fonts.family(&ctx, Some(&name), bold, italic);
                 fam_map.insert((name, bold, italic), fam);
             }
@@ -918,7 +922,18 @@ impl KladdApp {
                         );
                     }
                 };
-                for pc in &analysis.pieces {
+                // Bara det som syns (med marginal) behöver ritas om: sökväg via galleriets rader.
+                let vis = {
+                    let lo = galley.cursor_from_pos(vec2(0.0, clip.top() - gpos.y - 300.0)).index.0;
+                    let hi = galley.cursor_from_pos(vec2(0.0, clip.bottom() - gpos.y + 300.0)).index.0;
+                    char_to_byte(text, lo)..char_to_byte(text, hi)
+                };
+                let i0 = analysis.pieces.partition_point(|pc| pc.range.end <= vis.start);
+                let i1 = i0 + analysis.pieces[i0..].partition_point(|pc| pc.range.start < vis.end);
+                if !refs.is_empty() {
+                    img_index = analysis.pieces[..i0].iter().filter(|pc| pc.image.is_some()).count();
+                }
+                for pc in &analysis.pieces[i0..i1] {
                     let shown = overlaps(&pc.range, &reveal);
                     if pc.list_marker && pc.markup && !shown && !edited {
                         // Punkten ritas 12 pt före textens början (markören efter dold markör).
@@ -994,7 +1009,8 @@ impl KladdApp {
                     let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
                     let mut conv = ByteToChar::new(text);
-                    for t in tabs.iter() {
+                    let t0 = tabs.partition_point(|t| t.region.end <= vis.start);
+                    for t in tabs[t0..].iter().take_while(|t| t.region.start < vis.end) {
                         for (ri, row) in t.rows.iter().enumerate() {
                             let (Some(&first), Some(&last)) = (row.pipes.first(), row.pipes.last()) else { continue };
                             if row.delimiter || first == last {
@@ -1032,7 +1048,8 @@ impl KladdApp {
                     let mut conv = ByteToChar::new(text);
                     let amp = 1.2 * z.max(0.8);
                     let half = 2.0 * z.max(0.8);
-                    for r in &misspelled {
+                    let m0 = misspelled.partition_point(|r| r.end < vis.start);
+                    for r in misspelled[m0..].iter().take_while(|r| r.start <= vis.end) {
                         if focused && r.start <= caret_b && caret_b <= r.end {
                             continue;
                         }

@@ -325,6 +325,34 @@ impl Speller {
         out
     }
 
+    /// Som `misspelled`, men med en cache per stycke (hash av styckets text -> felstavade ord
+    /// relativt styckets början): oförändrade stycken kontrolleras inte om. `cache` ersätts med
+    /// de stycken som användes, så att den inte växer.
+    pub fn misspelled_cached(
+        &mut self,
+        text: &str,
+        ranges: &[Range<usize>],
+        cache: &mut HashMap<u64, Vec<Range<usize>>>,
+    ) -> Vec<Range<usize>> {
+        let mut fresh: HashMap<u64, Vec<Range<usize>>> = HashMap::with_capacity(ranges.len());
+        let mut found = Vec::new();
+        for r in ranges {
+            let key = crate::word::layout::fast_hash(&text[r.clone()]);
+            let rel = match fresh.get(&key).or_else(|| cache.get(&key)) {
+                Some(v) => v.clone(),
+                None => self
+                    .misspelled(text, std::slice::from_ref(r))
+                    .into_iter()
+                    .map(|w| w.start - r.start..w.end - r.start)
+                    .collect(),
+            };
+            found.extend(rel.iter().map(|w| w.start + r.start..w.end + r.start));
+            fresh.insert(key, rel);
+        }
+        *cache = fresh;
+        found
+    }
+
     pub fn suggest(&self, word: &str) -> Vec<String> {
         let Some(dict) = &self.dict else { return Vec::new() };
         let word = word.replace('\u{2019}', "'");

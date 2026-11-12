@@ -41,36 +41,154 @@ pub struct Params<'a> {
     pub fonts_gen: u64,
 }
 
+/// Snabb, enkel hashfunktion (FxHash) för cachenycklar: SipHash är för långsam för att hasha
+/// hela texten och alla bitar varje gång något ändras.
 #[derive(Default)]
-pub struct Cache {
-    analyses: HashMap<u64, (u64, Arc<Analysis>)>,
-    jobs: HashMap<u64, (u64, LayoutJob)>,
-    galleys: HashMap<u64, (u64, Arc<Galley>)>,
+struct Fx(u64);
+
+impl Fx {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
 }
 
-fn hash_of<T: Hash + ?Sized>(v: &T) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.hash(&mut h);
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(buf) ^ ((rest.len() as u64) << 56));
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Snabb hash av en sträng (för cachenycklar).
+pub fn fast_hash(s: &str) -> u64 {
+    let mut h = Fx::default();
+    s.hash(&mut h);
     h.finish()
 }
 
-impl Cache {
-    pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
-        let th = hash_of(text);
-        if let Some((k, a)) = self.analyses.get(&doc_id) {
-            if *k == th {
-                return a.clone();
-            }
-        }
-        let a = Arc::new(markup::analyze(text));
-        self.analyses.insert(doc_id, (th, a.clone()));
-        a
+/// Ett stycke eller en hel tabell som läggs ut och cachas för sig.
+struct Unit {
+    galleys: Arc<Vec<Arc<Galley>>>,
+    /// Bildruta då enheten senast användes (oanvända enheter rensas).
+    used: u64,
+}
+
+/// Allt som cachas för ett dokument.
+struct DocState {
+    /// Senast sedda texten: ändringsdetektorn är en jämförelse (memcmp), inte en hash.
+    text: String,
+    /// Räknas upp varje gång texten ändrats.
+    rev: u64,
+    analysis: Arc<Analysis>,
+    tables: Option<Arc<Vec<Table>>>,
+    images: Option<Arc<Vec<markup::ImageRef>>>,
+    fonts: Option<Arc<BTreeSet<(String, bool, bool)>>>,
+    /// Hela galleriet för förra bildrutan, med nyckeln det byggdes med.
+    frame: Option<(u64, Arc<Galley>)>,
+    /// Utlagda stycken, nycklade på allt som påverkar dem.
+    units: HashMap<u64, Unit>,
+    tick: u64,
+}
+
+#[derive(Default)]
+pub struct Cache {
+    docs: HashMap<u64, DocState>,
+    jobs: HashMap<u64, (u64, LayoutJob)>,
+}
+
+impl DocState {
+    fn tables(&mut self) -> Arc<Vec<Table>> {
+        let (text, a) = (&self.text, &self.analysis);
+        self.tables.get_or_insert_with(|| Arc::new(tables(text, a))).clone()
     }
 
-    /// Nyckeln: texthash, reveal, zoom, dark, sökträffar, typsnittsgeneration.
-    fn job_key(text: &str, p: &Params) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut h);
+    fn images(&mut self) -> Arc<Vec<markup::ImageRef>> {
+        let a = &self.analysis;
+        self.images.get_or_insert_with(|| Arc::new(a.pieces.iter().filter_map(|pc| pc.image.clone()).collect())).clone()
+    }
+}
+
+impl Cache {
+    /// Håller dokumentets tillstånd i takt med texten. En ändring kostar en jämförelse av
+    /// texten och en ny analys; är texten oförändrad görs ingenting.
+    fn state(&mut self, doc_id: u64, text: &str) -> &mut DocState {
+        let st = self.docs.entry(doc_id).or_insert_with(|| DocState {
+            text: text.to_owned(),
+            rev: 0,
+            analysis: Arc::new(markup::analyze(text)),
+            tables: None,
+            images: None,
+            fonts: None,
+            frame: None,
+            units: HashMap::new(),
+            tick: 0,
+        });
+        if st.text != text {
+            st.text.clear();
+            st.text.push_str(text);
+            st.rev += 1;
+            st.analysis = Arc::new(markup::analyze(text));
+            st.tables = None;
+            st.images = None;
+            st.fonts = None;
+        }
+        st
+    }
+
+    /// Revisionsnummer: ändras exakt när texten ändrats sedan förra anropet.
+    pub fn rev(&mut self, doc_id: u64, text: &str) -> u64 {
+        self.state(doc_id, text).rev
+    }
+
+    pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
+        self.state(doc_id, text).analysis.clone()
+    }
+
+    /// Dokumentets tabeller (räknas om bara när texten ändrats).
+    pub fn tables(&mut self, doc_id: u64, text: &str) -> Arc<Vec<Table>> {
+        self.state(doc_id, text).tables()
+    }
+
+    /// Bilderna i ordning (räknas om bara när texten ändrats).
+    pub fn images(&mut self, doc_id: u64, text: &str) -> Arc<Vec<markup::ImageRef>> {
+        self.state(doc_id, text).images()
+    }
+
+    /// Typsnitten dokumentet använder (räknas om bara när texten ändrats).
+    pub fn fonts(&mut self, doc_id: u64, text: &str) -> Arc<BTreeSet<(String, bool, bool)>> {
+        let st = self.state(doc_id, text);
+        let a = &st.analysis;
+        st.fonts.get_or_insert_with(|| Arc::new(needed_fonts(a))).clone()
+    }
+
+    /// Nyckeln: revision, reveal, zoom, dark, sökträffar, typsnittsgeneration.
+    fn job_key(rev: u64, p: &Params) -> u64 {
+        let mut h = Fx::default();
+        rev.hash(&mut h);
         p.reveal.start.hash(&mut h);
         p.reveal.end.hash(&mut h);
         p.zoom.to_bits().hash(&mut h);
@@ -80,13 +198,16 @@ impl Cache {
         h.finish()
     }
 
-    /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag). Jobbet
-    /// byggs först (`p.measure` tar fonts-låset, så det måste ske utanför `fonts_mut`).
+    /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag).
     pub fn galley(&mut self, ctx: &egui::Context, doc_id: u64, text: &str, p: &Params, wrap_width: f32) -> Arc<Galley> {
         self.galley_paged(ctx, doc_id, text, p, wrap_width, None)
     }
 
     /// Som `galley`, men med raderna uppdelade på sidor enligt `pages` (se `pages::paginate`).
+    ///
+    /// Oförändrad bildruta: en jämförelse av texten och en hash av parametrarna. Efter en
+    /// ändring läggs bara de stycken ut som ändrats (eller vars parametrar ändrats); övriga
+    /// hämtas ur styckecachen. Sedan fogas styckena ihop och sidbryts.
     pub fn galley_paged(
         &mut self,
         ctx: &egui::Context,
@@ -96,52 +217,232 @@ impl Cache {
         wrap_width: f32,
         pages: Option<&super::pages::Geom>,
     ) -> Arc<Galley> {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        Self::job_key(text, p).hash(&mut h);
+        let ppp = ctx.pixels_per_point();
+        // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
+        let families = ctx.fonts(|f| f.families().len());
+        let st = self.state(doc_id, text);
+
+        // Parametrar som gäller alla stycken.
+        let mut e = Fx::default();
+        p.zoom.to_bits().hash(&mut e);
+        format!("{:?}", p.palette).hash(&mut e);
+        p.fonts_gen.hash(&mut e);
+        wrap_width.to_bits().hash(&mut e);
+        ppp.to_bits().hash(&mut e);
+        families.hash(&mut e);
+        let env = e.finish();
+
+        let mut h = Fx::default();
+        env.hash(&mut h);
+        st.rev.hash(&mut h);
+        p.reveal.start.hash(&mut h);
+        p.reveal.end.hash(&mut h);
+        p.matches.hash(&mut h);
         if let Some(g) = pages {
             g.hash_into(&mut h);
         }
-        wrap_width.to_bits().hash(&mut h);
-        ctx.pixels_per_point().to_bits().hash(&mut h);
-        // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
-        ctx.fonts(|f| f.families().len()).hash(&mut h);
+        // Bildstorlekar kan bli kända först efter att bilden lästs in.
+        for img in st.images().iter() {
+            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        }
         let key = h.finish();
-        if let Some((k, g)) = self.galleys.get(&doc_id) {
+        if let Some((k, g)) = &st.frame {
             if *k == key {
                 return g.clone();
             }
         }
-        let job = self.job(doc_id, text, p);
-        let a = self.analysis(doc_id, text);
-        let ppp = ctx.pixels_per_point();
-        let mut g = ctx.fonts_mut(|f| layout_galley(f, job, &a, p, wrap_width, ppp));
-        if let Some(geom) = pages {
-            super::pages::paginate(&mut g, geom, ppp);
-        }
-        let g = Arc::new(g);
-        self.galleys.insert(doc_id, (key, g.clone()));
+
+        let g = Arc::new(relayout(st, ctx, text, p, wrap_width, ppp, env, pages));
+        st.frame = Some((key, g.clone()));
         g
     }
 
     pub fn job(&mut self, doc_id: u64, text: &str, p: &Params) -> LayoutJob {
-        let key = Self::job_key(text, p);
-
+        let st = self.state(doc_id, text);
+        let key = Self::job_key(st.rev, p);
+        let a = st.analysis.clone();
         if let Some((k, job)) = self.jobs.get(&doc_id) {
             if *k == key {
                 return job.clone();
             }
         }
-        let a = self.analysis(doc_id, text);
         let job = layout_job(text, &a, p);
         self.jobs.insert(doc_id, (key, job.clone()));
         job
     }
 
     pub fn forget(&mut self, doc_id: u64) {
-        self.analyses.remove(&doc_id);
+        self.docs.remove(&doc_id);
         self.jobs.remove(&doc_id);
-        self.galleys.remove(&doc_id);
     }
+}
+
+/// Hashar det som påverkar hur ett fönster av texten ser ut efter layout: texten, styckenas
+/// geometri, bitarna (relativt fönstret) och hur markören/sökträffarna träffar dem.
+fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, paras: &[Para]) -> u64 {
+    let mut h = Fx(env);
+    text[w.clone()].hash(&mut h);
+    for para in paras {
+        (para.range.start - w.start.min(para.range.start)).hash(&mut h);
+        para.range.len().hash(&mut h);
+        (para.align as u8).hash(&mut h);
+        match para.list {
+            Some(l) => {
+                1u8.hash(&mut h);
+                l.text_x.to_bits().hash(&mut h);
+                l.marker_chars.hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        para.image_w.to_bits().hash(&mut h);
+        para.collapse.hash(&mut h);
+    }
+    // Markörens rader i förhållande till fönstret.
+    if intersects(&p.reveal, w) {
+        (p.reveal.start.max(w.start) - w.start).hash(&mut h);
+        (p.reveal.end.min(w.end) - w.start).hash(&mut h);
+    }
+    for m in matches_in(p.matches, w) {
+        (m.0.max(w.start) - w.start, m.1.min(w.end) - w.start, m.2).hash(&mut h);
+    }
+    for pc in pieces_in(a, w) {
+        (pc.range.start.max(w.start) - w.start).hash(&mut h);
+        (pc.range.end.min(w.end) - w.start).hash(&mut h);
+        let flags = u16::from(pc.bold)
+            | u16::from(pc.italic) << 1
+            | u16::from(pc.underline) << 2
+            | u16::from(pc.strike) << 3
+            | u16::from(pc.code) << 4
+            | u16::from(pc.link) << 5
+            | u16::from(pc.markup) << 6
+            | u16::from(pc.list_marker) << 7
+            | u16::from(pc.range.start < w.start) << 8
+            | u16::from(pc.range.end > w.end) << 9
+            | u16::from(intersects(&pc.range, &p.reveal)) << 10
+            | u16::from(pc.image.is_some()) << 11
+            | (pc.align as u16) << 12;
+        flags.hash(&mut h);
+        match pc.block {
+            Block::Normal => 0u8,
+            Block::Heading(n) => 10 + n,
+            Block::Quote => 1,
+            Block::Bullet => 2,
+            Block::Numbered => 3,
+            Block::Code => 4,
+            Block::Table => 5,
+        }
+        .hash(&mut h);
+        pc.object.hash(&mut h);
+        if let Some(s) = &pc.span {
+            s.font_family.hash(&mut h);
+            s.font_size.map(f32::to_bits).hash(&mut h);
+            s.color.hash(&mut h);
+            s.background.hash(&mut h);
+        }
+        if let Some(img) = &pc.image {
+            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Lägger ut dokumentet från styckecachen och fogar ihop det. `env` = hash av parametrarna
+/// som gäller alla stycken.
+#[allow(clippy::too_many_arguments)]
+fn relayout(
+    st: &mut DocState,
+    ctx: &egui::Context,
+    text: &str,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    env: u64,
+    pages: Option<&super::pages::Geom>,
+) -> Galley {
+    st.tick += 1;
+    let tick = st.tick;
+    let a = st.analysis.clone();
+    let grid = st.tables();
+    let env = {
+        let mut h = Fx(env);
+        format!("{:?}", a.defaults).hash(&mut h);
+        h.finish()
+    };
+    let paras = paragraphs(text, &a, p);
+
+    // Grupper av stycken som läggs ut tillsammans: ett vanligt stycke, eller alla rader i en tabell.
+    let mut groups: Vec<(Range<usize>, Range<usize>)> = Vec::new(); // (styckesindex, textfönster)
+    let mut ti = 0;
+    let mut i = 0;
+    while i < paras.len() {
+        let r = &paras[i].range;
+        while ti < grid.len() && grid[ti].region.end <= r.start {
+            ti += 1;
+        }
+        let mut last = i + 1;
+        if let Some(t) = grid.get(ti).filter(|t| t.region.start < r.end && r.start < t.region.end) {
+            while last < paras.len() && paras[last].range.start < t.region.end {
+                last += 1;
+            }
+        }
+        let start = paras[i].range.start;
+        let end = (paras[last - 1].range.end + 1).min(text.len());
+        // En avslutande tom rad hämtar formatet från radbrytningen före.
+        let start = if start == text.len() && start > 0 { start - 1 } else { start };
+        groups.push((i..last, start..end.max(start)));
+        i = last;
+    }
+
+    let mut slots: Vec<Arc<Vec<Arc<Galley>>>> = Vec::with_capacity(groups.len());
+    // Stycken att lägga ut: (plats, nyckel, jobb för fönstret, styckena relativt fönstret).
+    let mut pending: Vec<(usize, u64, LayoutJob, Vec<Para>)> = Vec::new();
+    for (gi, (pr, w)) in groups.iter().enumerate() {
+        let key = unit_key(env, text, &a, p, w, &paras[pr.clone()]);
+        if let Some(u) = st.units.get_mut(&key) {
+            u.used = tick;
+            slots.push(u.galleys.clone());
+            continue;
+        }
+        let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
+        job.sections = build_sections(text, &a, p, &grid, w.clone());
+        for s in &mut job.sections {
+            s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
+        }
+        let rel: Vec<Para> = paras[pr.clone()]
+            .iter()
+            .map(|q| Para { range: q.range.start - w.start..q.range.end - w.start, ..q.clone() })
+            .collect();
+        pending.push((gi, key, job, rel));
+        slots.push(Arc::new(Vec::new()));
+    }
+    if !pending.is_empty() {
+        let laid: Vec<Vec<Arc<Galley>>> = ctx.fonts_mut(|f| {
+            pending
+                .iter()
+                .map(|(_, _, job, rel)| rel.iter().map(|q| layout_para(f, job, q, wrap_width, ppp)).collect())
+                .collect()
+        });
+        for ((gi, key, _, _), gs) in pending.into_iter().zip(laid) {
+            let gs = Arc::new(gs);
+            slots[gi] = gs.clone();
+            st.units.insert(key, Unit { galleys: gs, used: tick });
+        }
+    }
+    st.units.retain(|_, u| u.used == tick);
+
+    let all: Vec<Arc<Galley>> = slots.iter().flat_map(|s| s.iter().cloned()).collect();
+    let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
+    job.wrap.max_width = wrap_width;
+    job.sections.push(LayoutSection {
+        leading_space: 0.0,
+        byte_range: ByteIndex(0)..ByteIndex(text.len()),
+        format: TextFormat::default(),
+    });
+    let mut g = Galley::concat(Arc::new(job), &all, ppp);
+    if let Some(geom) = pages {
+        super::pages::paginate(&mut g, geom, ppp);
+    }
+    g
 }
 
 /// Storlek (pt) för blockets text; `body` = dokumentets brödtextstorlek.
@@ -490,10 +791,16 @@ struct Builder {
     secs: Vec<(Range<usize>, TextFormat)>,
     cuts: BTreeSet<usize>,
     marks: Vec<(Range<usize>, TextFormat)>,
+    /// Bara sektioner inom fönstret byggs (hela texten för `layout_job`, ett stycke för cachen).
+    win: Range<usize>,
 }
 
 impl Builder {
     fn push(&mut self, r: Range<usize>, f: &TextFormat) {
+        let r = r.start.max(self.win.start)..r.end.min(self.win.end);
+        if r.start >= r.end {
+            return;
+        }
         let mut start = r.start;
         let cuts: Vec<usize> = self.cuts.range(r.start + 1..r.end).copied().collect();
         for end in cuts.into_iter().chain([r.end]) {
@@ -624,20 +931,41 @@ fn grid_table(
 }
 
 pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
-    let bytes = text.as_bytes();
-    let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new() };
-    let mut leads: BTreeMap<usize, f32> = BTreeMap::new();
+    let grid = tables(text, a);
+    let secs = build_sections(text, a, p, &grid, 0..text.len());
+    LayoutJob { text: text.to_owned(), sections: secs, ..Default::default() }
+}
 
+/// Sökträffarna (sorterade på start) som överlappar `w`.
+fn matches_in<'a>(m: &'a [(usize, usize, bool)], w: &Range<usize>) -> &'a [(usize, usize, bool)] {
+    let i = m.partition_point(|x| x.1 <= w.start);
+    let n = m[i..].partition_point(|x| x.0 < w.end);
+    &m[i..i + n]
+}
+
+/// Bitarna som överlappar `w`.
+fn pieces_in<'a>(a: &'a Analysis, w: &Range<usize>) -> &'a [Piece] {
+    let i = a.pieces.partition_point(|pc| pc.range.end <= w.start);
+    let n = a.pieces[i..].partition_point(|pc| pc.range.start < w.end);
+    &a.pieces[i..i + n]
+}
+
+/// Sektionerna (med byteoffset i hela texten) för fönstret `win`, som måste börja och sluta
+/// på radgränser (eller täcka hela tabeller). Samma kod bygger hela dokumentet och ett enskilt
+/// stycke; bitar som sticker ut ur fönstret beskärs men bedöms med sitt hela intervall.
+fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Range<usize>) -> Vec<LayoutSection> {
+    let bytes = text.as_bytes();
+    let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new(), win: win.clone() };
+    let mut leads: BTreeMap<usize, f32> = BTreeMap::new();
+    let pcs = pieces_in(a, &win);
     // Tabeller är alltid rutnät, också med markören i dem: bara inline-markup i markörens cell
     // visas (via `reveal`), aldrig pipor eller avgränsarrad.
-    let grid = tables(text, a);
-    for t in &grid {
+    for t in grid.iter().filter(|t| intersects(&t.region, &win)) {
         grid_table(text, a, t, p, &mut bld, &mut leads);
     }
-
     // Listor: indraget före markören döljs. Själva hängande indraget (texten börjar 0,5" in,
     // +0,25" per nivå) görs i `layout_galley` när stycket läggs ut.
-    for pc in &a.pieces {
+    for pc in pcs {
         if !pc.list_marker || pc.range.is_empty() || intersects(&pc.range, &p.reveal) {
             continue;
         }
@@ -649,7 +977,7 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
     bld.marks.sort_by_key(|m| m.0.start);
     bld.cuts.extend(leads.keys().copied());
 
-    for pc in &a.pieces {
+    for pc in pcs {
         let r = pc.range.clone();
         if r.is_empty() {
             continue;
@@ -700,9 +1028,10 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
 
         let fmt = piece_format(pc, hide, grid_hdr, p, &a.defaults);
         // Tomradsbrytningar blir egna sektioner med 8 pt radhöjd.
-        let mut start = r.start;
-        for (off, c) in text[r.clone()].char_indices() {
-            let i = r.start + off;
+        let rc = r.start.max(win.start)..r.end.min(win.end);
+        let mut start = rc.start;
+        for (off, c) in text[rc.clone()].char_indices() {
+            let i = rc.start + off;
             if c == '\n' && (i == 0 || bytes[i - 1] == b'\n') {
                 if start < i {
                     bld.push(start..i, &fmt);
@@ -711,13 +1040,13 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
                 start = i + 1;
             }
         }
-        if start < r.end {
-            bld.push(start..r.end, &fmt);
+        if start < rc.end {
+            bld.push(start..rc.end, &fmt);
         }
     }
 
     // Slå ihop angränsande sektioner med samma format (inte där en sektion har leading_space).
-    let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
+    let mut job = LayoutJob { text: String::new(), ..Default::default() };
     for (range, format) in bld.secs {
         let lead = leads.get(&range.start).copied().unwrap_or(0.0);
         if lead == 0.0 {
@@ -736,7 +1065,7 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
     }
 
     {
-        let matches = p.matches;
+        let matches = matches_in(p.matches, &win);
         if !matches.is_empty() {
             highlight::apply_backgrounds(&mut job, matches, p.palette);
             // apply_backgrounds nollar leading_space: sätt tillbaka den.
@@ -745,7 +1074,7 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
             }
         }
     }
-    job
+    job.sections
 }
 
 
@@ -1604,7 +1933,7 @@ mod tests {
         }
         assert_eq!(res, vec![true, false]);
         c.forget(1);
-        assert!(c.galleys.is_empty());
+        assert!(c.docs.is_empty());
     }
 
     #[test]
@@ -1689,5 +2018,131 @@ mod tests {
         assert_ne!(a.sections[1].format.color, d.sections[1].format.color);
         c.forget(1);
         assert!(c.jobs.is_empty());
+    }
+
+    /// Rad för rad: (position, antal tecken, ends_with_newline).
+    fn shape(g: &Galley) -> Vec<(i32, i32, usize, bool)> {
+        g.rows
+            .iter()
+            .map(|r| {
+                (
+                    (r.pos.x * 100.0).round() as i32,
+                    (r.pos.y * 100.0).round() as i32,
+                    r.char_count_including_newline().0,
+                    r.ends_with_newline,
+                )
+            })
+            .collect()
+    }
+
+    const EXTRA: &str = "> Ett citat\n> andra raden\n\n```\nkod ** inte fet\n\nkod två\n```\n\n<div align=\"center\">\n\nMitten **fet**\n\n</div>\n\n<div align=\"justify\">\n\nLorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua\n\n</div>\n\n1. ett\n2. två\n    - nästlat\n\n";
+
+    /// Det inkrementella galleriet (styckecache, med markörrader och sökträffar) ska vara
+    /// identiskt med en full omläggning efter slumpmässiga ändringar.
+    #[test]
+    fn incremental_layout_equals_full_layout() {
+        use super::super::{bench, pages};
+        let pal = theme::palette(false);
+        let img = |_: &str| None;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut rng = bench::Rng(12345);
+        let mut text = format!("{EXTRA}{}", bench::big_markdown(40_000, 3));
+        let mut cache = Cache::default();
+        let geom = pages::Geom::new(1.0, &markup::analyze(&text).defaults);
+        let mut checked = 0;
+        for step in 0..40 {
+            if step > 0 {
+                // Slumpad ändring: infoga, ta bort eller klistra in en strukturtecken-rad.
+                let mut at = rng.below(text.len());
+                while !text.is_char_boundary(at) {
+                    at += 1;
+                }
+                match rng.below(5) {
+                    0 => text.insert(at, 'x'),
+                    1 => text.insert_str(at, "**"),
+                    2 => text.insert_str(at, "\n\n"),
+                    3 => text.insert_str(at, "\n| a | b |\n| - | - |\n| c | d |\n"),
+                    _ => {
+                        if let Some(c) = text[at..].chars().next() {
+                            text.replace_range(at..at + c.len_utf8(), "");
+                        }
+                    }
+                }
+            }
+            let mut rv = rng.below(text.len());
+            while !text.is_char_boundary(rv) {
+                rv += 1;
+            }
+            let reveal = if step % 3 == 0 { 0..0 } else { super::super::tables::reveal_range(&text, rv..rv) };
+            let mut ms = highlight::find_all(&text, "dokument", false);
+            ms.truncate(50);
+            let matches: Vec<(usize, usize, bool)> = ms.iter().enumerate().map(|(i, m)| (m.0, m.1, i == 3)).collect();
+            let measure_fn = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal,
+                matches: &matches,
+                image_size: &img,
+                measure: &measure_fn,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let a = markup::analyze(&text);
+            let wrap = geom.text_w();
+            let mut inc = None;
+            let mut full = None;
+            let out = ctx.run_ui(Default::default(), |_| {
+                let g = cache.galley_paged(&ctx, 1, &text, &p, wrap, Some(&geom));
+                // Andra anropet i samma läge ska träffa bildrutecachen.
+                assert!(Arc::ptr_eq(&g, &cache.galley_paged(&ctx, 1, &text, &p, wrap, Some(&geom))));
+                inc = Some(shape(&g));
+                let job = layout_job(&text, &a, &p);
+                let mut f = ctx.fonts_mut(|fo| layout_galley(fo, job, &a, &p, wrap, 1.0));
+                pages::paginate(&mut f, &geom, 1.0);
+                full = Some(shape(&f));
+            });
+            std::mem::forget(out);
+            assert_eq!(inc, full, "steg {step}");
+            checked += 1;
+        }
+        assert_eq!(checked, 40);
+    }
+
+    /// Markören som byter rad ska bara lägga om de berörda styckena.
+    #[test]
+    fn caret_move_relayouts_only_two_paragraphs() {
+        let pal = theme::palette(false);
+        let img = |_: &str| None;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let text = (0..200).map(|i| format!("Stycke {i} med **fetstil** och text\n\n")).collect::<String>();
+        let mut cache = Cache::default();
+        let measure_fn = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
+        let mut counts = Vec::new();
+        for reveal in [0..0, 40..41, 80..81] {
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal,
+                matches: &[],
+                image_size: &img,
+                measure: &measure_fn,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let before: Vec<u64> = cache.docs.get(&1).map(|d| d.units.keys().copied().collect()).unwrap_or_default();
+            let out = ctx.run_ui(Default::default(), |_| {
+                cache.galley_paged(&ctx, 1, &text, &p, 500.0, None);
+            });
+            std::mem::forget(out);
+            let after: Vec<u64> = cache.docs[&1].units.keys().copied().collect();
+            counts.push(after.iter().filter(|k| !before.contains(k)).count());
+        }
+        // Första gången läggs allt ut; sedan en ny enhet per berört stycke (det nya, markörens).
+        assert!(counts[0] > 150);
+        assert!(counts[1] <= 3, "{counts:?}");
+        assert!(counts[2] <= 3, "{counts:?}");
     }
 }

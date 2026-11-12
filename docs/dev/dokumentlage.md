@@ -280,3 +280,45 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
   sidnummer (klickbara); Word skriver ett TOC-fält, ODT `text:table-of-content`, PDF/HTML/EPUB en
   lista med rubrikerna.
+
+## Prestanda
+
+Mätt med `cargo test [--release] -- --ignored bench --nocapture --test-threads=1`
+(`src/word/bench.rs`): ett genererat dokument på 600 KB / 249 sidor (rubriker, fetstil,
+listor, tabeller) i dokumentläget och 300 KB Markdown i textläget.
+
+| Mätning | Release före | Release efter | Debug före | Debug efter |
+|---|---|---|---|---|
+| (a) kall full layout (analys + galleri + sidbrytning) | 342 ms | 340–380 ms | 8 770 ms | 8 980 ms |
+| (b) ett tecken i mitten | 81 ms | 35–44 ms | 357 ms | 137 ms |
+| (b2) markören byter rad | 42 ms | 7–10 ms | 262 ms | 41 ms |
+| (c) oförändrad bildruta | 2,0 ms | 0,1 ms | 10,8 ms | 0,1 ms |
+| (d) stavning efter ett tecken | 12 ms | 4–8 ms | 90 ms | 27 ms |
+| (e) textläge, kall färgning + layout | 622 ms | 540–590 ms | 10 173 ms | 8 950 ms |
+| (e) textläge, ett tecken | 350 ms | 12 ms | 3 646 ms | 105 ms |
+| (e) textläge, oförändrad bildruta | 3,7 ms | 0,0 ms | 34,8 ms | 0,0 ms |
+
+Hur det fungerar:
+
+- **Ändringsdetektor.** `layout::Cache` håller en kopia av texten per dokument och jämför
+  (memcmp) i stället för att hasha 600 KB varje bildruta. Ändrad text ger ny revision, ny
+  analys och nya listor över tabeller, bilder och typsnitt; annars görs ingenting.
+- **Styckecache.** `galley_paged` lägger ut dokumentet stycke för stycke (en tabell är ett
+  stycke). Nyckeln är styckets text, dess bitar (relativt styckets början), geometri
+  (justering, listindrag), markörens träff och sökträffar, plus parametrar som zoom, tema,
+  bredd och typsnittsgeneration. Efter en ändring läggs bara berörda stycken om; markören som
+  byter rad berör två. Sedan fogas styckena ihop (`Galley::concat`) och sidbryts. Cachen
+  rensas på stycken som inte användes i senaste bildrutan.
+- **Ritning.** Punkter, citatstreck, bilder, tabellkanter och våglinjer itereras bara för det
+  som är synligt (bitarna slås upp med binärsökning från galleriets synliga tecken).
+- **Stavning.** Resultatet cachas per revision och per stycke.
+- **Textläge.** `highlight::Highlighter` sparar syntects tillstånd före varje rad. En ändring
+  färgar om raderna från den ändrade tills tillståndet efter en rad är lika med det förra
+  (då gäller resten av färgningen), och färdigt galleri cachas per revision och bredd.
+- **Analysen** (`markup::analyze`, ca 28 ms release / 85 ms debug för 600 KB) görs fortfarande
+  om för hela texten efter varje ändring; den är nu det som dominerar. Inkrementell analys per
+  block bedömdes osäker (spann och dividrar går över styckegränser) och är inte gjord.
+
+Testerna `incremental_layout_equals_full_layout` och `incremental_highlight_equals_full`
+kontrollerar att det inkrementella resultatet är identiskt med full omläggning efter
+slumpmässiga ändringar (deterministiskt frö).

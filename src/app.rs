@@ -666,7 +666,7 @@ impl KladdApp {
         let spec = self.find.spec(word);
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (doc.id, word).hash(&mut h);
-        doc.text.hash(&mut h);
+        crate::word::layout::fast_hash(&doc.text).hash(&mut h);
         spec.hash(&mut h);
         let key = h.finish();
         if let Some((k, r)) = &self.find.cache {
@@ -1452,7 +1452,8 @@ impl KladdApp {
                     .show(ui, |ui| {
                         let viewport_h = ui.clip_rect().height();
                         let num_font = FontId::new((font_size * 0.82).round(), FontFamily::Monospace);
-                        let lines = doc.text.bytes().filter(|&b| b == b'\n').count() + 1;
+                        let line_params = Params { doc_id, syntax_hint: &hint, palette: p, font_size, matches: &matches };
+                        let lines = hl.newlines(&doc.text, &line_params) + 1;
                         let digits = lines.to_string().len().max(2) as f32;
                         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&num_font, '0'));
                         let gutter_w = if line_numbers { digits * char_w + 40.0 } else { 22.0 };
@@ -1471,9 +1472,7 @@ impl KladdApp {
                                 matches: &matches,
                             };
                             let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
-                                let mut job = hl.layout(buf.as_str(), &params);
-                                job.wrap.max_width = if wrap { wrap_width } else { f32::INFINITY };
-                                ui.ctx().fonts_mut(|f| f.layout_job(job))
+                                hl.galley(ui.ctx(), buf.as_str(), &params, if wrap { wrap_width } else { f32::INFINITY })
                             };
                             let avail_w = ui.available_width();
                             let out = TextEdit::multiline(&mut doc.text)
