@@ -536,7 +536,7 @@ pub fn image_path(src: &str, base: &Path) -> Option<PathBuf> {
     }
     let src = src.strip_prefix("file://").unwrap_or(src).replace("%20", " ");
     let path = if let Some(rest) = src.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME")?).join(rest)
+        crate::platform::home_dir()?.join(rest)
     } else {
         let p = PathBuf::from(&src);
         if p.is_absolute() { p } else { base.join(p) }

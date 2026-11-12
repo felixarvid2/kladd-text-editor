@@ -1,5 +1,8 @@
 //! Kladd – en lugn och snygg texteditor.
 
+// Ingen konsol på Windows i release (i debug behålls den så att stderr syns).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod doc;
 mod docx;
@@ -15,6 +18,7 @@ mod highlight;
 mod icons;
 mod keys;
 mod paste;
+mod platform;
 mod single;
 mod spell;
 mod style;

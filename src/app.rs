@@ -226,7 +226,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::platform::home_dir()
 }
 
 fn pretty_dir(path: &Path) -> String {

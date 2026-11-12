@@ -1,5 +1,6 @@
-//! Utskrift: dialogruta (Ctrl+P) och hjälpfunktioner för CUPS (`lpstat`/`lp`).
-//! Dokumentet renderas till en tillfällig PDF med `pdf_write` som skickas till `lp`.
+//! Utskrift: dialogruta (Ctrl+P) och hjälpfunktioner för CUPS (`lpstat`/`lp`) på Linux och macOS
+//! samt PowerShell på Windows. Dokumentet renderas till en tillfällig PDF med `pdf_write`
+//! som skickas till `lp` (Windows: PDF-läsarens utskriftsverb).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,12 +9,16 @@ use std::time::{Duration, SystemTime};
 
 use egui::{Align, Color32, FontId, Frame, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, vec2};
 
+use crate::platform;
 use crate::app::{KladdApp, quiet_button};
 use crate::doc::{Document, resolve_image};
 use crate::theme::{self, Palette};
 
 /// Tillfälliga PDF-filer som är äldre än så här tas bort.
 const MAX_AGE: Duration = Duration::from_secs(600);
+
+/// Windows kan inte styra kopior, sidor eller dubbelsidigt via skalets utskriftsverb.
+const WINDOWS: bool = cfg!(windows);
 
 type Printers = (Vec<String>, Option<String>);
 
@@ -76,6 +81,30 @@ pub fn parse_default(out: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
+/// Radlista från PowerShell (ett skrivarnamn per rad), `Get-Printer | Select -ExpandProperty Name`.
+/// Samma format som `lpstat -e`.
+pub fn parse_ps_printers(out: &str) -> Vec<String> {
+    parse_printers(out)
+}
+
+/// Text i ett PowerShell-literal med enkla citattecken (`'` dubbleras).
+pub fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// PowerShell-skriptet som skriver ut PDF:en. Utan skrivare används standardskrivaren (`Print`).
+pub fn ps_print_script(printer: Option<&str>, file: &Path) -> String {
+    let f = ps_quote(&file.to_string_lossy());
+    match printer {
+        Some(p) => {
+            // PrintTo vill ha skrivarnamnet inom dubbla citattecken.
+            let arg = ps_quote(&format!("\"{p}\""));
+            format!("Start-Process -FilePath {f} -Verb PrintTo -ArgumentList {arg}")
+        }
+        None => format!("Start-Process -FilePath {f} -Verb Print"),
+    }
+}
+
 /// Sidintervall som "1-3,5": bara siffror, kommatecken och bindestreck, med giltiga delar.
 pub fn valid_range(s: &str) -> bool {
     let s = s.trim();
@@ -130,11 +159,28 @@ fn printable_text(doc: &Document) -> String {
 // ------------------------------------------------------------ system
 
 fn run_out(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
+    let out = platform::quiet(Command::new(cmd).args(args)).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn powershell(script: &str) -> Command {
+    let mut c = Command::new("powershell");
+    c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    c
+}
+
+fn run_ps(script: &str) -> Option<String> {
+    let out = platform::quiet(&mut powershell(script)).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn find_printers() -> Printers {
+    if WINDOWS {
+        let list = run_ps("Get-Printer | Select-Object -ExpandProperty Name").map(|o| parse_ps_printers(&o)).unwrap_or_default();
+        let default = run_ps("(Get-CimInstance Win32_Printer -Filter \"Default=true\").Name")
+            .and_then(|o| parse_printers(&o).into_iter().next());
+        return (list, default);
+    }
     let list = run_out("lpstat", &["-e"]).map(|o| parse_printers(&o)).unwrap_or_default();
     let default = run_out("lpstat", &["-d"]).and_then(|o| parse_default(&o));
     (list, default)
@@ -203,7 +249,7 @@ impl KladdApp {
             d.lookup = None;
         }
         let have_printer = d.printers.as_ref().is_some_and(|(l, _)| !l.is_empty());
-        let range_ok = d.all_pages || valid_range(&d.range);
+        let range_ok = WINDOWS || d.all_pages || valid_range(&d.range);
         let mut action = None;
         let modal = egui::Modal::new(Id::unique("kladd-print"))
             .backdrop_color(Color32::from_black_alpha(if p.dark { 140 } else { 70 }))
@@ -240,21 +286,28 @@ impl KladdApp {
                         }
                     }
                     ui.end_row();
+                    // På Windows väljs kopior och sidor i PDF-läsarens utskriftsdialog.
+                    let hint = "Välj kopior och sidor i PDF-läsarens utskriftsdialog";
                     ui.label(RichText::new("Kopior").color(p.muted));
-                    ui.add(egui::DragValue::new(&mut d.copies).range(1..=99).speed(0.2));
+                    ui.add_enabled(!WINDOWS, egui::DragValue::new(&mut d.copies).range(1..=99).speed(0.2))
+                        .on_disabled_hover_text(hint);
                     ui.end_row();
                     ui.label(RichText::new("Sidor").color(p.muted));
-                    ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!WINDOWS, |ui| {
+                      ui.horizontal(|ui| {
                         ui.radio_value(&mut d.all_pages, true, "Alla");
                         ui.radio_value(&mut d.all_pages, false, "Sidor:");
                         ui.add_enabled(
                             !d.all_pages,
                             TextEdit::singleline(&mut d.range).hint_text("1-3,5").desired_width(110.0).margin(Margin::symmetric(8, 5)),
                         );
-                    });
+                      });
+                    })
+                    .response
+                    .on_disabled_hover_text(hint);
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut d.duplex, "Dubbelsidigt");
+                    ui.add_enabled(!WINDOWS, egui::Checkbox::new(&mut d.duplex, "Dubbelsidigt")).on_disabled_hover_text(hint);
                     ui.end_row();
                 });
                 if !range_ok && !d.range.is_empty() {
@@ -297,7 +350,7 @@ impl KladdApp {
             Err(e) => return self.notify(ctx, format!("Kunde inte skapa PDF: {e}"), true),
         };
         if matches!(action, Action::OpenPdf) {
-            if let Err(e) = Command::new("xdg-open").arg(&pdf).spawn() {
+            if let Err(e) = platform::open(&pdf) {
                 self.notify(ctx, format!("Kunde inte öppna PDF: {e}"), true);
             }
             return;
@@ -309,13 +362,20 @@ impl KladdApp {
         self.print.result = Some(rx);
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let res = match Command::new("lp").args(&args).output() {
+            let out = if WINDOWS {
+                // Windows: PDF-läsarens utskriftsverb; utan vald skrivare används standardskrivaren.
+                let sel = (!printer.is_empty()).then_some(printer.as_str());
+                platform::quiet(&mut powershell(&ps_print_script(sel, &pdf))).output()
+            } else {
+                platform::quiet(Command::new("lp").args(&args)).output()
+            };
+            let res = match out {
                 Ok(o) if o.status.success() => Ok(printer),
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
                     Err(if err.is_empty() { "Utskriften misslyckades".to_string() } else { err })
                 }
-                Err(e) => Err(format!("Kunde inte köra lp: {e}")),
+                Err(e) => Err(format!("Kunde inte skriva ut: {e}")),
             };
             let _ = tx.send(res);
             repaint.request_repaint();
@@ -333,6 +393,16 @@ mod tests {
         assert!(parse_printers("").is_empty());
         assert_eq!(parse_default("system default destination: HP_1\n").as_deref(), Some("HP_1"));
         assert_eq!(parse_default("no system default destination\n"), None);
+    }
+
+    #[test]
+    fn builds_powershell_print() {
+        let f = Path::new("C:\\t\\a b.pdf");
+        assert_eq!(ps_print_script(None, f), "Start-Process -FilePath 'C:\\t\\a b.pdf' -Verb Print");
+        assert_eq!(
+            ps_print_script(Some("Kontor's"), f),
+            "Start-Process -FilePath 'C:\\t\\a b.pdf' -Verb PrintTo -ArgumentList '\"Kontor''s\"'"
+        );
     }
 
     #[test]
