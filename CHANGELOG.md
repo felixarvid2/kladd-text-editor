@@ -4,6 +4,31 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [1.9.0] – 2026-11-12
+
+### Nytt
+
+- **PDF-visare.** PDF:er öppnas nu i en riktig PDF-visare som visar sidorna som de ser ut. Sidorna renderas med hayro (ren Rust) och är skarpa på HiDPI-skärmar. Renderingen sker i bakgrundstrådar, så gränssnittet aldrig fryser. Grå arbetsyta med vita sidor och skugga, och kontinuerlig rullning.
+- **Zoom.** Automatisk (som pdf.js), Verklig storlek, Hel sida, Sidbredd och 50–400 %. Ctrl+plus/minus, Ctrl+0 (100 %), Ctrl+1/2/3, Ctrl+mushjul och nypning kring pekaren. Zoomen går från 10 till 2500 %.
+- **Uppslag.** Visa en sida eller två sidor, med udda eller jämna sidor till vänster. Rotera med R och Shift+R. Färgval: normala, inverterade eller sepia.
+- **Navigering.** Sidfältet visar "3 / 12" (Ctrl+G). PgUp/PgDn, Mellanslag, N/P, J/K, Home/End. Alt+Vänster och Alt+Höger går bakåt och framåt i historiken efter länkar och hopp. Sidetiketter (till exempel "iv") visas när PDF:en har sådana. Handverktyget (H) och dra med mittenknappen. Sida, zoom och rotation sparas per fil.
+- **Sidopanel** (F4) med miniatyrer och innehållsförteckning (bokmärken) som följer aktuell sida.
+- **Markera text** med musen: dubbelklick markerar ett ord och trippelklick en rad. Ctrl+C kopierar och Ctrl+A markerar allt.
+- **Sök** (Ctrl+F) i hela dokumentet: "3 av 17", och alla träffar markeras. Sökningen skiljer på stora och små bokstäver och på hela ord när det är valt. Diakritiska tecken ignoreras. Enter, Shift+Enter och F3 går mellan träffarna.
+- **Klickbara länkar.** Interna länkar hoppar i dokumentet. Externa länkar öppnas i webbläsaren efter bekräftelse.
+- **Redigera**-knappen gör om PDF:en till ett redigerbart dokument i dokumentläget. Omvandlingen är samma som tidigare: text, rubriker, listor, tabeller och bilder. Layouten kan ändras, och originalet ändras inte förrän du sparar.
+- **Utskrift** skickar originalfilen. Lösenordsskyddade PDF:er skrivs ut som en avkrypterad kopia. *Spara kopia* (Ctrl+S) sparar originalet oförändrat.
+- **Dokumentegenskaper:** titel, författare, ämne, nyckelord, datum, program, PDF-version, sidstorlek med pappersnamn, antal sidor och filstorlek.
+- **Presentationsläge** (F5) visar helskärm med en sida åt gången. Esc avslutar.
+- **Läser om automatiskt** när filen ändras på disk, och positionen behålls. *Läs om* finns också i Visa-menyn.
+- **Kopiera sidan som bild** och **Öppna i systemets PDF-visare.** Statusraden visar sida, PDF-version och zoom.
+- Trasiga sidor visar ett fel på sidan i stället för att krascha. PDF-flikar räknas aldrig som ändrade.
+
+### Ändrat
+
+- En PDF visas inte längre som Markdown-text när den öppnas. Tryck **Redigera** för det. PDF:er som visaren inte kan läsa öppnas som text, som förut.
+- Numrerade listor från PDF där numret ligger i två textbitar ("1" + "1.") blir rätt nummer (11) vid omvandlingen.
+
 ## [1.8.0] – 2026-11-12
 
 ### Nytt

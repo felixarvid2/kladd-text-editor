@@ -52,6 +52,8 @@ pub struct Document {
     pub word_view: bool,
     /// Sant om filen är en PDF vars text visas som Markdown.
     pub pdf: bool,
+    /// Sant om filen är en PDF som visas som sidor i PDF-visaren (inget Markdown, aldrig ändrad).
+    pub pdfv: Option<Box<crate::pdfview::chrome::PdfTab>>,
     /// Meddelande att visa när filen har öppnats (t.ex. vad som inte kommer med).
     pub open_note: Option<String>,
     /// Innehåll i ett öppnat Word-dokument som Kladd inte kan spara tillbaka.
@@ -158,6 +160,7 @@ impl Document {
             docx: false,
             word_view: false,
             pdf: false,
+            pdfv: None,
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
@@ -181,40 +184,54 @@ impl Document {
         let bytes = std::fs::read(path).map_err(|e| LoadError::Message(describe_io_error(&e, path)))?;
         let ext = ext_of(path);
         if ext == "pdf" || bytes.starts_with(b"%PDF-") {
-            let loaded = crate::pdf_read::read(&bytes, password).map_err(|e| match e {
-                crate::pdf_read::ReadError::NeedsPassword => LoadError::NeedsPassword,
-                crate::pdf_read::ReadError::WrongPassword => LoadError::WrongPassword,
-                crate::pdf_read::ReadError::Other(m) => LoadError::Message(m),
-            })?;
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let open_note = if loaded.markdown.trim().is_empty() {
-                Some(format!("{name} innehåller ingen text som kan läsas (skannade sidor?)"))
-            } else if loaded.pages_without_text > 0 {
-                let n = loaded.pages_without_text;
-                Some(format!("{n} av {} sidor i {name} saknar text (skannade sidor?)", loaded.page_count))
-            } else {
-                None
-            };
-            return Ok(Self {
-                id,
-                path: Some(path.to_path_buf()),
-                saved_hash: hash_text(&loaded.markdown),
-                saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
-                text: loaded.markdown,
-                encoding: TextEncoding::Utf8,
-                line_ending: LineEnding::Lf,
-                dirty: false,
-                docx: false,
-                word_view: false,
-                pdf: true,
-                open_note,
-                docx_dropped: loaded.dropped,
-                images: loaded.images,
-                docx_source: None,
-                untitled_index: 0,
-            });
+            return Self::from_pdf_text(id, path, &bytes, password);
         }
         Self::load_bytes(id, path, bytes, &ext).map_err(LoadError::Message)
+    }
+
+    /// Gör om en PDF till redigerbar Markdown-text (dagens väg, används av Redigera i PDF-visaren).
+    pub fn from_pdf_text(id: u64, path: &Path, bytes: &[u8], password: Option<&str>) -> Result<Self, LoadError> {
+        let loaded = crate::pdf_read::read(bytes, password).map_err(|e| match e {
+            crate::pdf_read::ReadError::NeedsPassword => LoadError::NeedsPassword,
+            crate::pdf_read::ReadError::WrongPassword => LoadError::WrongPassword,
+            crate::pdf_read::ReadError::Other(m) => LoadError::Message(m),
+        })?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let open_note = if loaded.markdown.trim().is_empty() {
+            Some(format!("{name} innehåller ingen text som kan läsas (skannade sidor?)"))
+        } else if loaded.pages_without_text > 0 {
+            let n = loaded.pages_without_text;
+            Some(format!("{n} av {} sidor i {name} saknar text (skannade sidor?)", loaded.page_count))
+        } else {
+            None
+        };
+        Ok(Self {
+            id,
+            path: Some(path.to_path_buf()),
+            saved_hash: hash_text(&loaded.markdown),
+            saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
+            text: loaded.markdown,
+            encoding: TextEncoding::Utf8,
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            docx: false,
+            word_view: true,
+            pdf: true,
+            pdfv: None,
+            open_note,
+            docx_dropped: loaded.dropped,
+            images: loaded.images,
+            docx_source: None,
+            untitled_index: 0,
+        })
+    }
+
+    /// En flik i PDF-visaren: ingen text, aldrig ändrad.
+    pub fn pdf_tab(id: u64, path: &Path, tab: crate::pdfview::chrome::PdfTab) -> Self {
+        let mut d = Self::new_untitled(id, 0);
+        d.path = Some(path.to_path_buf());
+        d.pdfv = Some(Box::new(tab));
+        d
     }
 
     fn load_bytes(id: u64, path: &Path, bytes: Vec<u8>, ext: &str) -> Result<Self, String> {
@@ -234,6 +251,7 @@ impl Document {
                 docx: true,
                 word_view: true,
                 pdf: false,
+                pdfv: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     format!("{name} innehåller {} som inte visas i Kladd", join_sv(&loaded.dropped))
@@ -259,6 +277,7 @@ impl Document {
                 docx: true,
                 word_view: true,
                 pdf: false,
+                pdfv: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     format!("{name} innehåller {} som inte visas i Kladd", join_sv(&loaded.dropped))
@@ -294,6 +313,7 @@ impl Document {
             docx: false,
             word_view: false,
             pdf: false,
+            pdfv: None,
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
@@ -452,7 +472,7 @@ impl Document {
         if self.docx {
             return if is_odt_ext(&self.extension()) { "OpenDocument" } else { "Word" }.to_owned();
         }
-        if self.pdf {
+        if self.pdf || self.pdfv.is_some() {
             return "PDF".to_owned();
         }
         let ext = self.extension();
@@ -573,7 +593,7 @@ fn is_word_ext(ext: &str) -> bool {
 
 /// Skriver till en temporär fil bredvid målet och byter sedan namn,
 /// så att en krasch eller full disk aldrig lämnar en halvskriven fil.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -599,7 +619,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
-fn describe_io_error(e: &std::io::Error, path: &Path) -> String {
+pub(crate) fn describe_io_error(e: &std::io::Error, path: &Path) -> String {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

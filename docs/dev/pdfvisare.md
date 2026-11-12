@@ -157,3 +157,59 @@ pub struct DocInfo { pub title: Option<String>, pub author: Option<String>, pub 
 pub struct PdfMeta { pub outline: Vec<OutlineItem>, pub links: Vec<Vec<Link>>, pub labels: Vec<String>, pub info: DocInfo }
 pub fn read_meta(bytes: &[u8], password: Option<&str>) -> PdfMeta;  // aldrig panik; tomt vid fel
 ```
+
+## API-kontrakt för våg B
+
+`src/pdfview/view.rs` (visaren, agent 1) äger `PdfView`. `src/pdfview/chrome.rs` och
+integrationen i app.rs/doc.rs (agent 2) använder bara metoderna nedan.
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum ZoomMode { #[default] Auto, ActualSize, PageFit, PageWidth, Custom }
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Spread { #[default] None, Odd, Even }
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tool { #[default] Select, Hand }
+
+/// Sparas per fil i inställningarna (kom ihåg läget).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ViewMemory { pub page: usize, pub y_frac: f32, pub zoom_mode: ZoomMode, pub zoom: f32, pub rotation: u16, pub spread: Spread }
+
+pub struct PdfView { /* engine, meta, layout, texturer, markering, sök, historik … */ }
+impl PdfView {
+    pub fn new(engine: PdfEngine, meta: PdfMeta, bytes: Arc<Vec<u8>>, memory: Option<ViewMemory>) -> Self;
+    /// Ritar sidorna i hela `ui`-ytan och hanterar mus/tangenter när den har fokus.
+    pub fn show(&mut self, ui: &mut egui::Ui, palette: &crate::theme::Palette, dark: bool);
+    pub fn handle_keys(&mut self, ctx: &egui::Context);      // anropas från app.rs handle_shortcuts i PDF-läge
+    pub fn page_count(&self) -> usize;
+    pub fn current_page(&self) -> usize;                      // 0-baserad, sidan i mitten av vyn
+    pub fn page_label(&self, page: usize) -> String;          // "iv" eller "4"
+    pub fn go_to_page(&mut self, page: usize);
+    pub fn go_to(&mut self, dest: &Dest);                     // lägger till i historiken
+    pub fn back(&mut self); pub fn forward(&mut self); pub fn can_back(&self) -> bool; pub fn can_forward(&self) -> bool;
+    pub fn zoom(&self) -> f32;                                // 1.0 = 100 %
+    pub fn zoom_mode(&self) -> ZoomMode;
+    pub fn set_zoom_mode(&mut self, m: ZoomMode);
+    pub fn set_zoom(&mut self, z: f32);                       // → Custom
+    pub fn zoom_in(&mut self); pub fn zoom_out(&mut self);    // ×1,1
+    pub fn rotate(&mut self, clockwise: bool);
+    pub fn spread(&self) -> Spread; pub fn set_spread(&mut self, s: Spread);
+    pub fn recolor(&self) -> Recolor; pub fn set_recolor(&mut self, r: Recolor);
+    pub fn tool(&self) -> Tool; pub fn set_tool(&mut self, t: Tool);
+    // Sök
+    pub fn find_set(&mut self, query: &str, case_sensitive: bool, whole_word: bool); // startar/uppdaterar
+    pub fn find_next(&mut self, backwards: bool);
+    pub fn find_status(&self) -> FindStatus;                  // { searching: bool, current: Option<usize>, total: usize, done_pages: usize }
+    pub fn find_clear(&mut self);
+    // Text
+    pub fn selected_text(&self) -> Option<String>; pub fn select_all(&mut self); pub fn copy_selection(&self, ctx: &egui::Context);
+    // Presentationsläge (helskärm, en sida åt gången)
+    pub fn presenting(&self) -> bool; pub fn set_presenting(&mut self, on: bool);
+    pub fn memory(&self) -> ViewMemory;
+    pub fn meta(&self) -> &PdfMeta; pub fn engine(&self) -> &PdfEngine; pub fn bytes(&self) -> &Arc<Vec<u8>>;
+    /// Bild av en sida för miniatyrer (begär rendering i liten skala; None tills den finns).
+    pub fn thumbnail(&mut self, ctx: &egui::Context, page: usize, width_px: f32) -> Option<egui::TextureHandle>;
+    /// Ersätter dokumentet efter att filen ändrats på disk; behåller sida och zoom.
+    pub fn reload(&mut self, engine: PdfEngine, meta: PdfMeta, bytes: Arc<Vec<u8>>);
+}
+```
