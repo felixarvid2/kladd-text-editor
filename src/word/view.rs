@@ -317,6 +317,33 @@ impl KladdApp {
         self.settings.word_zoom = ((z * 100.0).round() / 100.0).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 
+    /// Ctrl+V: har urklippet HTML (Word, LibreOffice, Google Dokument, webben) görs den om till
+    /// Kladds format och sätts in; annars (och vid Ctrl+Skift+V) klistrar egui in vanlig text.
+    fn word_paste_html(&mut self, ctx: &egui::Context) {
+        // Ctrl+V ger en `Paste`-händelse bara om urklippet också har vanlig text; knapptrycket
+        // fångar även ett urklipp med enbart HTML.
+        let is_paste = |e: &egui::Event| {
+            matches!(e, egui::Event::Paste(_))
+                || matches!(e, egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command)
+        };
+        let (paste, shift) = ctx.input(|i| (i.events.iter().any(is_paste), i.modifiers.shift));
+        if !paste || shift {
+            return;
+        }
+        let Some(html) = crate::paste::clipboard_html() else { return };
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        let defaults = markup::analyze(&doc.text).defaults;
+        let mut pasted = crate::paste::html_to_markdown(&html, Some(&defaults));
+        if pasted.markdown.trim().is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| i.events.retain(|e| !is_paste(e)));
+        crate::paste::make_names_unique(&mut pasted, &doc.images);
+        doc.images.append(&mut pasted.images);
+        let md = pasted.markdown;
+        self.word_edit(ctx, |t, s| crate::paste::insert(t, s, &md));
+    }
+
     /// Kortkommandon som bara gäller i dokumentläget (konsumeras före TextEdit).
     pub(crate) fn word_shortcuts(&mut self, ctx: &egui::Context) {
         if let Some(doc) = self.docs.get(self.active) {
@@ -325,6 +352,7 @@ impl KladdApp {
                 return;
             }
         }
+        self.word_paste_html(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
         let shift = ctx.input(|i| i.modifiers.shift);

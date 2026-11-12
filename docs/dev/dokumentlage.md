@@ -230,3 +230,20 @@ Gemensamma format (alla moduler ska använda dessa):
   som Kladd inte skriver om (sidhuvuden, sidfötter, fotnoter, kommentarer, inställningar, tema,
   typsnittstabell …), `w:sectPr` behålls, och varje stycke vars Markdown inte har ändrats skrivs
   tillbaka med sin ursprungliga XML.
+
+## Inklistring av formaterad text (`src/paste.rs`)
+
+Ctrl+V i dokumentläget läser HTML från systemets urklipp (`arboard`) och gör om den till
+Kladds Markdown med `paste::html_to_markdown(html, Some(&defaults))`: rubriker (även Words
+`MsoTitle`/`MsoHeading*`/`mso-outline-level`), fet/kursiv/understruken/struken (taggar och CSS),
+`<span style>` för typsnitt, storlek, färg och bakgrund (utom svart text, vit bakgrund och
+dokumentets grundformat), `<div align>`, listor (även Words `mso-list`-låtsaslistor och Google
+Dokuments platta `aria-level`-listor), tabeller (cellerna slås ihop till en rad), länkar och
+`data:`-bilder som `bild:inklistrad-N.ext` (med `width` om den är känd). Övriga bilder blir sin
+alternativtext. HTML läses av en egen förlåtande tolk, utan extra crate.
+
+`word_paste_html` (view.rs) tar bort `Event::Paste` innan TextEdit ser den och sätter in
+resultatet med `paste::insert` (block får tomma rader runt sig, ett inline-stycke sätts in
+direkt). Ctrl+Skift+V och urklipp utan HTML går som förut. egui skickar `Paste` bara när
+urklippet också har vanlig text, vilket Word, LibreOffice, Google Dokument och webbläsare alltid
+lägger dit.

@@ -9,6 +9,7 @@ mod preview;
 mod print;
 mod highlight;
 mod icons;
+mod paste;
 mod single;
 mod spell;
 mod style;
