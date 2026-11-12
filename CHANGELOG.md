@@ -15,7 +15,6 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - **Bilder.** Klicka på en bild för att markera den, dra i hörnen för att ändra storlek och justera läget med verktygsraden vid bilden.
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
 - **Utskrift med `Ctrl+P`** till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF.
-- **Ett fönster.** Filer som öppnas från filhanteraren eller terminalen läggs som nya flikar i det fönster som redan är öppet. `kladd --new-window` ger ett separat fönster.
 
 ### Ändrat
 
