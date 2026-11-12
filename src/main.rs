@@ -3,6 +3,7 @@
 mod app;
 mod doc;
 mod docx;
+mod export;
 mod odt;
 mod pdf_read;
 mod pdf_write;

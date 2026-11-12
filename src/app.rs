@@ -427,7 +427,9 @@ impl KladdApp {
                 .add_filter("Markdown", &["md"])
                 .add_filter("Word-dokument", &["docx"])
                 .add_filter("OpenDocument-text (.odt)", &["odt"])
-                .add_filter("PDF", &["pdf"]);
+                .add_filter("PDF", &["pdf"])
+                .add_filter("Webbsida (.html)", &["html"])
+                .add_filter("E-bok (.epub)", &["epub"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -521,7 +523,19 @@ impl KladdApp {
     ) {
         let doc = &mut self.docs[idx];
         let was_md = doc.is_markdown();
+        let export = doc.is_export_target(path);
         match doc.save_to(path) {
+            Ok(warnings) if export => {
+                // Export: fliken är kvar som den var (och ändrad), så den stängs inte här.
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if warnings.is_empty() {
+                    self.notify(ctx, format!("Exporterade {name}"), false);
+                } else {
+                    let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
+                    let what = if list.len() == 1 { "bilden" } else { "bilderna" };
+                    self.notify(ctx, format!("Exporterade {name}, men hittade inte {what} {}", join_sv(&list)), true);
+                }
+            }
             Ok(warnings) => {
                 let title = doc.title();
                 if was_md != doc.is_markdown() || doc.extension().is_empty() {

@@ -2961,7 +2961,7 @@ fn numbering_xml(ordered_starts: &[u64]) -> String {
     )
 }
 
-fn now_w3cdtf() -> String {
+pub(crate) fn now_w3cdtf() -> String {
     // Utan extra beroenden: räkna ut UTC-datum från Unix-tid.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
