@@ -405,17 +405,17 @@ impl KladdApp {
             .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
             .show(ui, |ui| {
                 let full = ui.max_rect();
-                let right_w = 200.0;
+                let right_w = 186.0;
                 let left_w = (full.width() - right_w - 8.0).max(200.0);
                 let right = Rect::from_min_size(pos2(full.right() - right_w, full.top()), vec2(right_w, 28.0));
                 ui.set_min_height(28.0);
 
                 // Vänster del: bryts till en andra rad när fönstret är smalt.
                 ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
-                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
                     // Stil
                     egui::ComboBox::from_id_salt("kladd-word-style")
-                        .width(130.0)
+                        .width(106.0)
                         .selected_text(block_label(act.block))
                         .show_ui(ui, |ui| {
                             for b in [
@@ -432,7 +432,7 @@ impl KladdApp {
                         });
                     // Typsnitt och storlek
                     egui::ComboBox::from_id_salt("kladd-word-font")
-                        .width(150.0)
+                        .width(126.0)
                         .selected_text(cur_font.clone())
                         .show_ui(ui, |ui| {
                             let pick = |f: &str| {
@@ -456,7 +456,7 @@ impl KladdApp {
                             }
                         });
                     egui::ComboBox::from_id_salt("kladd-word-size")
-                        .width(56.0)
+                        .width(50.0)
                         .selected_text(fmt_size(cur_size))
                         .show_ui(ui, |ui| {
                             for sz in SIZES {

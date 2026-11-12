@@ -245,7 +245,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                             *n += 1;
                             m
                         }
-                        _ => ["•", "◦", "▪"][depth % 3].to_owned(),
+                        _ => ["•", "–", "·"][depth % 3].to_owned(),
                     });
                 }
                 Tag::Table(_) => {
