@@ -46,6 +46,10 @@ pub enum Icon {
     TextColor,
     /// Markeringspenna; färgstapeln under ritas av `color_button`.
     Highlight,
+    /// Radbrytning av bild: bilden på en egen rad / texten flyter höger om / vänster om den.
+    WrapInline,
+    WrapLeft,
+    WrapRight,
     /// Rubrikträd (navigeringsfönstret).
     Outline,
     /// Innehållsförteckning: rader med sidnummer till höger.
@@ -144,6 +148,33 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             }
             painter.line_segment([c + vec2(-3.5, -1.0), c + vec2(-5.5, 3.5)], s);
             painter.line_segment([c + vec2(-5.5, 3.5), c + vec2(0.5, 3.0)], s);
+        }
+        Icon::WrapInline | Icon::WrapLeft | Icon::WrapRight => {
+            let boxr = |x0: f32, x1: f32, y0: f32, y1: f32| {
+                painter.rect_stroke(Rect::from_min_max(c + vec2(x0, y0), c + vec2(x1, y1)), 1.0, s, egui::StrokeKind::Middle)
+            };
+            let line = |x0: f32, x1: f32, dy: f32| painter.line_segment([c + vec2(x0, dy), c + vec2(x1, dy)], s);
+            match icon {
+                Icon::WrapInline => {
+                    line(-6.5, 6.5, -6.0);
+                    boxr(-3.5, 3.5, -3.0, 2.5);
+                    line(-6.5, 6.5, 5.5);
+                }
+                Icon::WrapLeft => {
+                    boxr(-6.5, -1.5, -6.0, -0.5);
+                    line(1.5, 6.5, -5.0);
+                    line(1.5, 6.5, -1.5);
+                    line(-6.5, 6.5, 2.5);
+                    line(-6.5, 6.5, 6.0);
+                }
+                _ => {
+                    boxr(1.5, 6.5, -6.0, -0.5);
+                    line(-6.5, -1.5, -5.0);
+                    line(-6.5, -1.5, -1.5);
+                    line(-6.5, 6.5, 2.5);
+                    line(-6.5, 6.5, 6.0);
+                }
+            }
         }
         Icon::Outline => {
             // Indragna rader: rubrik, underrubrik, underrubrik, rubrik.

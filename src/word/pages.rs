@@ -78,7 +78,11 @@ impl Geom {
 /// Flyttar ner rader som inte ryms på sin sida så att de börjar överst på nästa sida. Rader
 /// delas aldrig; en rad som är högre än en sida står ensam på sin. Galleriets y = 0 är textytans
 /// överkant på första sidan.
-pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32) {
+///
+/// `floats` = (radnummer, höjd) för raden som en flytande bild förankras på: bilden räknas som en
+/// rad av sin höjd, så att en bild som inte ryms flyttas till nästa sida tillsammans med texten
+/// efter den.
+pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)]) {
     if g.rows.is_empty() {
         return;
     }
@@ -89,11 +93,13 @@ pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32) {
     let mut page = 0usize;
     let mut shift = 0.0f32;
     let mut prev_bottom = f32::NEG_INFINITY;
-    for pr in g.rows.iter_mut() {
+    let mut float_bottom = f32::NEG_INFINITY;
+    for (ri, pr) in g.rows.iter_mut().enumerate() {
         let h = pr.row.size.y;
+        let fh = floats.iter().find(|f| f.0 == ri).map_or(0.0, |f| f.1);
         let top = pr.pos.y + shift;
         let page_top = page as f32 * stride;
-        if top + h > page_top + text_h + eps && top > page_top + eps {
+        if top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
             // Nästa sida, men inte över en rad som sträcker sig förbi arket.
             page += 1;
             while (page as f32 * stride) < prev_bottom - eps {
@@ -103,8 +109,11 @@ pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32) {
         }
         pr.pos.y += shift;
         prev_bottom = pr.pos.y + h;
+        if fh > 0.0 {
+            float_bottom = float_bottom.max(pr.pos.y + fh);
+        }
     }
-    g.rect.max.y = g.rect.max.y.max(prev_bottom);
+    g.rect.max.y = g.rect.max.y.max(prev_bottom).max(float_bottom);
     g.mesh_bounds = Rect::NOTHING;
     for pr in &g.rows {
         g.mesh_bounds |= pr.row.visuals.mesh_bounds.translate(pr.pos.to_vec2());
@@ -459,7 +468,7 @@ mod tests {
                 }
                 job.wrap.max_width = 200.0;
                 let mut g = ui.ctx().fonts_mut(|f| f.layout_job(job));
-                paginate(Arc::make_mut(&mut g), &geom(), 1.0);
+                paginate(Arc::make_mut(&mut g), &geom(), 1.0, &[]);
                 out = Some(g);
             });
             std::mem::forget(r);

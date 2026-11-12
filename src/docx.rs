@@ -18,6 +18,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::style::{self, Align, DocDefaults, SpanStyle};
+use crate::word::markup::Float;
 
 /// Högsta antal poster i ett paket (WordCraft: zip_guard).
 const MAX_ENTRIES: u64 = 20_000;
@@ -899,7 +900,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let repl = match name {
             Some(name) => {
                 let img = images.iter().find(|(n, _)| *n == name).map(|(_, i)| i);
-                image_md(&name, &f.alt, f.extent, img)
+                let float = f.anchor.as_ref().and_then(|a| anchor_float(a, f.extent, &page));
+                image_md(&name, &f.alt, f.extent, img, float)
             }
             // Bilden går inte att visa: originalkörningen bevaras som markör.
             None => f.fallback.map(token_text).unwrap_or_default(),
@@ -1044,14 +1046,16 @@ fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Th
 
 /// Hur en bild skrivs i texten: `![alt](bild:namn)`, eller `<img … width>` när storleken avviker
 /// från bildens egen (96 dpi) eller från den som redan lagrats för bilden.
-fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Image>) -> String {
+fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Image>, float: Option<Float>) -> String {
     let differs = |a: f64, b: f64| b > 0.0 && (a - b).abs() / b > 0.02;
     let want = extent.map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
     let natural = img.and_then(|i| imagesize::blob_size(&i.bytes).ok()).map(|s| s.width as f64);
     let stored = img.and_then(|i| i.extent).map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
     let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
+    // En flytande bild skrivs alltid som `<img … width align>`.
+    let want = if float.is_some() { want.or(natural) } else { want };
     match want {
-        Some(w) if natural.is_some_and(|n| differs(w, n)) || stored.is_some_and(|st| differs(w, st)) => {
+        Some(w) if float.is_some() || natural.is_some_and(|n| differs(w, n)) || stored.is_some_and(|st| differs(w, st)) => {
             let mut a = String::new();
             for c in alt.chars() {
                 match c {
@@ -1063,7 +1067,12 @@ fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Imag
                     c => a.push(c),
                 }
             }
-            format!("<img src=\"{src}\" alt=\"{a}\" width=\"{}\">", w.round().max(1.0) as i64)
+            let al = match float {
+                Some(Float::Left) => " align=\"left\"",
+                Some(Float::Right) => " align=\"right\"",
+                None => "",
+            };
+            format!("<img src=\"{src}\" alt=\"{a}\" width=\"{}\"{al}>", w.round().max(1.0) as i64)
         }
         _ => format!("![{}]({src})", escape_alt(alt)),
     }
@@ -1274,8 +1283,51 @@ struct FoundImage {
     target: String,
     alt: String,
     extent: Option<(i64, i64)>,
+    /// Förankrad bild med omflöde (`wp:anchor` + `wrapSquare/Tight/Through`): läget i sidled.
+    anchor: Option<AnchorPos>,
     /// Markör för hela körningen, om bilden inte går att visa.
     fallback: Option<usize>,
+}
+
+/// `wp:positionH` för en förankrad bild med textomflöde.
+#[derive(Default, Clone)]
+struct AnchorPos {
+    /// `relativeFrom` ("column", "margin", "page" …).
+    rel: String,
+    /// `wp:align`: left, right, center, inside, outside.
+    align: Option<String>,
+    /// `wp:posOffset` i EMU.
+    off: Option<i64>,
+}
+
+/// Sidan en förankrad bild flyter på: `align` left/right, eller en förskjutning nära vänster
+/// respektive höger marginal. Mitt på raden, "inside/outside" och okända lägen ger `None`
+/// (bilden blir en egen rad).
+fn anchor_float(a: &AnchorPos, extent: Option<(i64, i64)>, page: &DocDefaults) -> Option<Float> {
+    match a.align.as_deref() {
+        Some("left") => return Some(Float::Left),
+        Some("right") => return Some(Float::Right),
+        Some(_) => return None,
+        None => {}
+    }
+    let off = a.off? as f64;
+    let (pw, _) = page.page();
+    let [_, r, _, l] = page.margins();
+    let (l, text_w) = (l as f64 * 12700.0, (pw - l - r) as f64 * 12700.0);
+    let w = extent.map_or(0.0, |e| e.0 as f64);
+    // Bildens vänsterkant räknad från textspaltens vänsterkant.
+    let left = match a.rel.as_str() {
+        "page" => off - l,
+        "column" | "margin" | "leftMargin" | "character" | "" => off,
+        _ => return None,
+    };
+    if left <= 0.25 * text_w {
+        Some(Float::Left)
+    } else if left + w >= 0.75 * text_w {
+        Some(Float::Right)
+    } else {
+        None
+    }
 }
 
 /// Lägger originalets XML i listan över okända objekt och ger dess nummer.
@@ -1306,6 +1358,14 @@ struct Drawing {
     alt: String,
     title: String,
     extent: Option<(i64, i64)>,
+    /// `wp:anchor` (inte `wp:inline`).
+    anchored: bool,
+    /// `wrapSquare`, `wrapTight` eller `wrapThrough`: texten flyter runt bilden.
+    wraps: bool,
+    pos: AnchorPos,
+    in_pos_h: bool,
+    /// Vad nästa text är: 1 = `wp:align`, 2 = `wp:posOffset`.
+    text_of: u8,
 }
 
 fn escape_alt(s: &str) -> String {
@@ -1596,6 +1656,14 @@ fn parse_body(
                                 skip = 1;
                             }
                         }
+                        b"anchor" => d.anchored = true,
+                        b"wrapSquare" | b"wrapTight" | b"wrapThrough" => d.wraps = true,
+                        b"positionH" => {
+                            d.pos.rel = attr(e, b"relativeFrom").unwrap_or_default();
+                            d.in_pos_h = !empty;
+                        }
+                        b"align" if d.in_pos_h && !empty => d.text_of = 1,
+                        b"posOffset" if d.in_pos_h && !empty => d.text_of = 2,
                         _ => {}
                     }
                     continue;
@@ -1826,6 +1894,11 @@ fn parse_body(
                 }
                 if let Some(d) = drawing.as_mut() {
                     d.depth -= 1;
+                    match local(e.name().as_ref()) {
+                        b"positionH" => d.in_pos_h = false,
+                        b"align" | b"posOffset" => d.text_of = 0,
+                        _ => {}
+                    }
                     if d.depth > 0 {
                         continue;
                     }
@@ -1841,6 +1914,7 @@ fn parse_body(
                                 target: resolve_target(dir, &target),
                                 alt: alt.trim().to_owned(),
                                 extent: d.extent,
+                                anchor: (d.anchored && d.wraps).then_some(d.pos),
                                 fallback: None,
                             });
                         }
@@ -1968,7 +2042,13 @@ fn parse_body(
                 }
             }
             Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => {
-                if skip == 0 && in_t && !hidden(&field_depth) {
+                if let Some(d) = drawing.as_mut().filter(|d| d.text_of != 0) {
+                    let t = text_of(&ev);
+                    match d.text_of {
+                        1 => d.pos.align = Some(t.trim().to_ascii_lowercase()),
+                        _ => d.pos.off = t.trim().parse().ok(),
+                    }
+                } else if skip == 0 && in_t && !hidden(&field_depth) {
                     let t = text_of(&ev).replace(['\n', '\r'], " ");
                     if !t.is_empty() {
                         push_text(&mut para, &t, &fmt, &link.last().cloned().flatten());
@@ -2514,7 +2594,7 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str) {
+    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str, float: Option<Float>) {
         let Some(ext) = image_ext(&bytes) else { return };
         // Samma bild flera gånger bäddas bara in en gång; en bild som redan finns i
         // originalpaketet återanvänds.
@@ -2546,9 +2626,30 @@ impl<'a> Writer<'a> {
         let mut alt_x = String::new();
         xml_escape(alt, &mut alt_x);
         self.open_para();
-        self.body.push_str(&format!(
-            r#"<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:r="{R_NS}" distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
-        ));
+        const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+        // Gemensam del efter placeringen: storlek, beskrivning och själva bilden.
+        let tail = format!(
+            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
+        );
+        let drawing = match float {
+            // Flytande bild: förankrad vid stycket, vid vänster/höger textkant, text runt (12 px luft).
+            Some(side) => {
+                let (al, dist_l, dist_r) = match side {
+                    Float::Left => ("left", 0, 114300),
+                    Float::Right => ("right", 114300, 0),
+                };
+                format!(
+                    r#"<wp:anchor xmlns:wp="{WP}" xmlns:r="{R_NS}" distT="0" distB="0" distL="{dist_l}" distR="{dist_r}" simplePos="0" relativeHeight="{}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>{al}</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>{}</wp:anchor>"#,
+                    251_658_240 + doc_pr,
+                    tail.replace("{WRAP}", r#"<wp:wrapSquare wrapText="bothSides"/>"#)
+                )
+            }
+            None => format!(
+                r#"<wp:inline xmlns:wp="{WP}" xmlns:r="{R_NS}" distT="0" distB="0" distL="0" distR="0">{}</wp:inline>"#,
+                tail.replace("{WRAP}", "")
+            ),
+        };
+        self.body.push_str(&format!("<w:r><w:drawing>{drawing}</w:drawing></w:r>"));
     }
 
     fn para_props(&self) -> String {
@@ -2704,7 +2805,7 @@ impl<'a> Writer<'a> {
     }
 
     /// Bäddar in en bild från en `![](…)` eller `<img>`; saknas bilden stannar texten.
-    fn image_ref(&mut self, src: &str, alt: &str, size: (Option<f64>, Option<f64>), resolve: &dyn Fn(&str) -> Option<Image>) {
+    fn image_ref(&mut self, src: &str, alt: &str, size: (Option<f64>, Option<f64>), float: Option<Float>, resolve: &dyn Fn(&str) -> Option<Image>) {
         if self.in_footnote {
             self.run(alt, false);
             return;
@@ -2712,7 +2813,7 @@ impl<'a> Writer<'a> {
         match resolve(src) {
             Some(img) if is_supported_image(&img.bytes) => {
                 let extent = sized_extent(&img, size);
-                self.picture(img.bytes, extent, alt);
+                self.picture(img.bytes, extent, alt, float);
             }
             _ => {
                 self.missing.push(src.to_owned());
@@ -2783,6 +2884,7 @@ struct ImgTag {
     alt: String,
     width: Option<f64>,
     height: Option<f64>,
+    align: Option<Float>,
 }
 
 fn parse_img(s: &str) -> Option<ImgTag> {
@@ -2795,7 +2897,7 @@ fn parse_img(s: &str) -> Option<ImgTag> {
         return None;
     }
     let decode = |v: &str| v.replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
-    let (mut src, mut alt, mut width, mut height) = (None, String::new(), None, None);
+    let (mut src, mut alt, mut width, mut height, mut align) = (None, String::new(), None, None, None);
     let mut chars = inner.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
         if c.is_whitespace() {
@@ -2849,10 +2951,17 @@ fn parse_img(s: &str) -> Option<ImgTag> {
             "alt" => alt = value.clone(),
             "width" => width = num(),
             "height" => height = num(),
+            "align" => {
+                align = match value.trim().to_ascii_lowercase().as_str() {
+                    "left" => Some(Float::Left),
+                    "right" => Some(Float::Right),
+                    _ => None,
+                }
+            }
             _ => {}
         }
     }
-    Some(ImgTag { src: src.filter(|s| !s.is_empty())?, alt, width, height })
+    Some(ImgTag { src: src.filter(|s| !s.is_empty())?, alt, width, height, align })
 }
 
 /// Bildens storlek i EMU när taggen anger bredd och/eller höjd i CSS-pixlar (bevarar proportionerna).
@@ -3099,7 +3208,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 TagEnd::Link => w.fmt.link = None,
                 TagEnd::Image => {
                     if let Some((src, alt)) = w.image.take() {
-                        w.image_ref(&src, &alt, (None, None), resolve);
+                        w.image_ref(&src, &alt, (None, None), None, resolve);
                     }
                 }
                 _ => {}
@@ -3133,7 +3242,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         w.token(n);
                     }
                 } else if let Some(img) = parse_img(&s) {
-                    w.image_ref(&img.src, &img.alt, (img.width, img.height), resolve);
+                    w.image_ref(&img.src, &img.alt, (img.width, img.height), img.align, resolve);
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.toc(md);
@@ -5249,6 +5358,127 @@ Marginal
         let doc2 = part_text(&again.bytes, "word/document.xml");
         assert_eq!(doc2.matches("<wp:extent ").count(), 3);
         assert_eq!(read(&again.bytes).unwrap().markdown, back.markdown);
+    }
+
+    const TEST_PNG: [u8; 67] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1,
+        8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0,
+        5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn floating_image_roundtrip() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let md = "<img src=\"bild:a.png\" alt=\"Sol\" width=\"200\" align=\"left\">Text bredvid.\n\n<img src=\"bild:a.png\" alt=\"\" width=\"100\" align=\"right\">\n\nSlut\n";
+        let out = write(md, "x", &resolve, None).unwrap();
+        assert!(out.missing_images.is_empty());
+        let doc = part_text(&out.bytes, "word/document.xml");
+        assert_eq!(doc.matches("<wp:anchor ").count(), 2, "{doc}");
+        assert_eq!(doc.matches("<wp:inline ").count(), 0);
+        assert!(doc.contains(r#"distT="0" distB="0" distL="0" distR="114300" simplePos="0""#), "{doc}");
+        assert!(doc.contains(r#"distL="114300" distR="0" simplePos="0""#));
+        assert!(doc.contains(r#"<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>left</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx="1905000" cy="1905000"/>"#));
+        assert!(doc.contains("<wp:align>right</wp:align>"));
+        assert_eq!(doc.matches(r#"<wp:wrapSquare wrapText="bothSides"/>"#).count(), 2);
+        // Schemaordning: wrap före docPr.
+        assert!(doc.find("<wp:wrapSquare").unwrap() < doc.find("<wp:docPr").unwrap());
+        // relativeHeight är unika.
+        let rh: Vec<&str> = doc.split("relativeHeight=\"").skip(1).map(|x| x.split('"').next().unwrap()).collect();
+        assert_eq!(rh.len(), 2);
+        assert_ne!(rh[0], rh[1]);
+
+        let back = read(&out.bytes).unwrap();
+        let name = &back.images[0].0;
+        let want = format!(
+            "<img src=\"bild:{name}\" alt=\"Sol\" width=\"200\" align=\"left\">Text bredvid.\n\n<img src=\"bild:{name}\" alt=\"\" width=\"100\" align=\"right\">\n\nSlut\n"
+        );
+        assert_eq!(back.markdown, want);
+        // Och tillbaka igen med Source: oförändrat.
+        let imgs = back.images.clone();
+        let again = write(&back.markdown, "x", &move |s| imgs.iter().find(|(n, _)| Some(n.as_str()) == s.strip_prefix(IMAGE_SCHEME)).map(|(_, i)| i.clone()), back.source.as_ref()).unwrap();
+        assert_eq!(read(&again.bytes).unwrap().markdown, back.markdown);
+    }
+
+    #[test]
+    fn anchor_variants_are_read() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let md = "<img src=\"bild:a.png\" alt=\"\" width=\"200\" align=\"left\">\n";
+        let w = write(md, "x", &resolve, None).unwrap().bytes;
+        // Byter `from` mot `to` i document.xml och ger sidan bilden får vid inläsning.
+        let read_with = |from: &str, to: &str| {
+            let b = patch_document(&w, |x| x.replace(from, to));
+            let m = read(&b).unwrap().markdown;
+            if m.contains("align=\"left\"") {
+                "left"
+            } else if m.contains("align=\"right\"") {
+                "right"
+            } else {
+                "none"
+            }
+        };
+        let al = |a: &str| read_with("<wp:align>left</wp:align>", &format!("<wp:align>{a}</wp:align>"));
+        assert_eq!(al("left"), "left");
+        assert_eq!(al("right"), "right");
+        assert_eq!(al("center"), "none");
+        // wrapTight och wrapThrough flyter också; wrapTopAndBottom och wrapNone gör det inte.
+        let sq = r#"<wp:wrapSquare wrapText="bothSides"/>"#;
+        let poly = r#"<wp:wrapPolygon edited="0"><wp:start x="0" y="0"/></wp:wrapPolygon>"#;
+        assert_eq!(read_with(sq, &format!(r#"<wp:wrapTight wrapText="bothSides">{poly}</wp:wrapTight>"#)), "left");
+        assert_eq!(read_with(sq, &format!(r#"<wp:wrapThrough wrapText="bothSides">{poly}</wp:wrapThrough>"#)), "left");
+        assert_eq!(read_with(sq, "<wp:wrapTopAndBottom/>"), "none");
+        assert_eq!(read_with(sq, "<wp:wrapNone/>"), "none");
+        // Förskjutning nära vänster/höger marginal i stället för align (A4: textbredd 5731510 EMU).
+        let h = r#"<wp:positionH relativeFrom="column"><wp:align>left</wp:align></wp:positionH>"#;
+        let off = |rel: &str, o: i64| read_with(h, &format!(r#"<wp:positionH relativeFrom="{rel}"><wp:posOffset>{o}</wp:posOffset></wp:positionH>"#));
+        assert_eq!(off("column", 0), "left");
+        assert_eq!(off("column", 3_800_000), "right");
+        assert_eq!(off("column", 2_000_000), "none");
+        assert_eq!(off("page", 720_000), "left");
+        // Inline-bilder blir aldrig flytande.
+        let inl = w_inline();
+        assert!(!read(&inl).unwrap().markdown.contains("align="));
+    }
+
+    fn w_inline() -> Vec<u8> {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        write("<img src=\"bild:a.png\" width=\"50\">\n", "x", &resolve, None).unwrap().bytes
+    }
+
+    /// Skriver ett dokument med en flytande bild och låter LibreOffice göra PDF: texten bredvid
+    /// bilden ska börja till höger om den. Kräver `soffice` och `pdftotext`.
+    #[test]
+    #[ignore]
+    fn floating_image_libreoffice() {
+        let dir = std::env::temp_dir().join("kladd-float-lo");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Rutig bild så att den syns i PDF:en.
+        let mut img = image::RgbImage::new(240, 160);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb(if (x / 20 + y / 20) % 2 == 0 { [60, 120, 200] } else { [255, 200, 40] });
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
+        let md = format!("<img src=\"b.png\" alt=\"\" width=\"240\" align=\"left\">{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n");
+        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None }), None).unwrap();
+        let docx = dir.join("f.docx");
+        std::fs::write(&docx, w.bytes).unwrap();
+        let st = std::process::Command::new("soffice")
+            .arg(format!("-env:UserInstallation=file://{}/profile", dir.display()))
+            .args(["--headless", "--convert-to", "pdf", "--outdir"]).arg(&dir).arg(&docx).output().unwrap();
+        assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+        let out = std::process::Command::new("pdftotext").args(["-bbox"]).arg(dir.join("f.pdf")).arg("-").output().unwrap();
+        let html = String::from_utf8_lossy(&out.stdout).into_owned();
+        // x för varje stycke-startord "Lorem".
+        let xs: Vec<f32> = html
+            .lines()
+            .filter(|l| l.contains(">Lorem<"))
+            .filter_map(|l| l.split("xMin=\"").nth(1)?.split('"').next()?.parse().ok())
+            .collect();
+        assert!(xs.len() >= 6, "{xs:?}");
+        // Första stycket (bredvid bilden) börjar efter bildens 180 pt + marginalen 72 pt.
+        assert!(xs[0] > 240.0, "första stycket vid x = {}", xs[0]);
+        assert!(xs.iter().any(|&x| x < 100.0), "inget stycke under bilden: {xs:?}");
     }
 
     #[test]

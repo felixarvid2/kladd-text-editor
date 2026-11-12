@@ -24,6 +24,7 @@ use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEn
 use crate::docx::Image as DocImage;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::theme;
+use crate::word::markup::Float;
 
 // --- mått i punkter (1/72 tum); sidstorlek och marginaler kommer från dokumentet ---
 const BODY_SIZE: f32 = 10.5;
@@ -129,7 +130,7 @@ enum Block {
     Code { text: String, indent: f32 },
     Table { rows: Vec<Vec<Vec<Span>>> },
     Rule,
-    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align },
+    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float> },
     /// Innehållsförteckning (`<!-- kladd: toc -->`).
     Toc,
 }
@@ -179,14 +180,19 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 }
 
 /// `<img src="…" alt="…" width="W" [height="H"]>` med storlek i CSS-px (1/96 tum) omräknad till pt.
-fn parse_img(tag: &str) -> Option<(String, String, ImgSize)> {
+fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>)> {
     if !tag.get(..4)?.eq_ignore_ascii_case("<img") || !tag.ends_with('>') {
         return None;
     }
     let src = attr(tag, "src")?;
     let alt = attr(tag, "alt").unwrap_or_default();
     let px = |n: &str| attr(tag, n).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v > 0.0).map(|v| v * 0.75);
-    Some((src, alt, ImgSize { w: px("width"), h: px("height") }))
+    let float = match attr(tag, "align").map(|a| a.trim().to_ascii_lowercase()).as_deref() {
+        Some("left") => Some(Float::Left),
+        Some("right") => Some(Float::Right),
+        _ => None,
+    };
+    Some((src, alt, ImgSize { w: px("width"), h: px("height") }, float))
 }
 
 fn heading_num(level: HeadingLevel) -> u8 {
@@ -396,7 +402,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     if let Some((src, alt)) = image.take() {
                         // En bild i en tabellcell eller mitt i text ritas som eget block efter stycket.
                         flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left, float: None });
                     }
                 }
                 _ => {}
@@ -443,10 +449,10 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     } else if style::is_div_close(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         aligns.pop();
-                    } else if let Some((src, alt, size)) = parse_img(tag) {
+                    } else if let Some((src, alt, size, float)) = parse_img(tag) {
                         // `<img>` med storlek blir ett eget bildblock, justerat av omgivande `<div align>`.
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align, float });
                     } else if tag == crate::word::nav::TOC_LINE {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::Toc);
@@ -468,8 +474,14 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
             MdEvent::TaskListMarker(done) => push_text(&mut spans, if done { "☑ " } else { "☐ " }, &style),
             MdEvent::FootnoteReference(t) if note_cur.is_some() => push_text(&mut spans, &format!("[{t}]"), &style),
             MdEvent::FootnoteReference(t) => {
-                note_labels.push(t.to_string());
-                let n = note_labels.len();
+                // Samma etikett flera gånger är samma fotnot (som i Markdown).
+                let n = match note_labels.iter().position(|l| l.as_str() == &*t) {
+                    Some(i) => i + 1,
+                    None => {
+                        note_labels.push(t.to_string());
+                        note_labels.len()
+                    }
+                };
                 let st = Style { fnref: Some(n), ..style.clone() };
                 spans.push(Span { text: n.to_string(), style: st });
             }
@@ -539,11 +551,26 @@ struct Layout<'a> {
     reserved: f32,
     /// Sant medan fotnoterna ritas (deras nummer är inga nya referenser).
     in_notes: bool,
+    /// Flytande bilder som texten flyter runt just nu.
+    floats: Vec<FloatBox>,
     /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
     /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
     toc_entries: Vec<(u8, String)>,
     toc_pos: Vec<(usize, f32)>,
 }
+
+/// En flytande bild: sida, upptagen bredd (bild + luft), sidan (0-baserad) och understa kanten (pt).
+struct FloatBox {
+    side: Float,
+    w: f32,
+    page: usize,
+    bottom: f32,
+}
+
+/// Luft mellan en flytande bild och texten (12 px).
+const FLOAT_GAP: f32 = 9.0;
+/// Minsta textbredd bredvid en flytande bild; smalare och bilden blir ett vanligt block.
+const FLOAT_MIN_ROOM: f32 = 72.0;
 
 /// En färdigbruten rad. `hard` = raden slutar med radbrytning (ska inte marginaljusteras).
 struct Line {
@@ -669,6 +696,7 @@ impl<'a> Layout<'a> {
             page_notes: Vec::new(),
             reserved: 0.0,
             in_notes: false,
+            floats: Vec::new(),
             toc_entries: Vec::new(),
             toc_pos: Vec::new(),
         }
@@ -760,6 +788,28 @@ impl<'a> Layout<'a> {
             out.push(Op::Text { x, y, face: self.base, size, text, color: MUTED, italic: false });
         }
         out
+    }
+
+    /// Flyttar ner till under alla flytande bilder (block som inte flyter runt dem) och glömmer dem.
+    fn clear_floats(&mut self) {
+        self.prune_floats();
+        if let Some(b) = self.floats.iter().map(|f| f.bottom).reduce(f32::max) {
+            self.y = self.y.max(b);
+        }
+        self.floats.clear();
+    }
+
+    /// Tar bort flytande bilder som är passerade (annan sida, eller texten har kommit under dem).
+    fn prune_floats(&mut self) {
+        let (page, y) = (self.pages.len().wrapping_sub(1), self.y);
+        self.floats.retain(|f| f.page == page && y < f.bottom - 0.5);
+    }
+
+    /// Utrymmet vid aktuell rad: (förskjutning från vänster, bredd som tas av flytande bilder).
+    fn float_room(&mut self) -> (f32, f32) {
+        self.prune_floats();
+        let sum = |side: Float| self.floats.iter().filter(|f| f.side == side).map(|f| f.w).sum::<f32>();
+        (sum(Float::Left), sum(Float::Left) + sum(Float::Right))
     }
 
     fn page(&mut self) -> &mut PageOps {
@@ -918,6 +968,34 @@ impl<'a> Layout<'a> {
         lines
     }
 
+    /// Nästa rad ur `pieces` från `from`, bruten i `width`: raden och index för första ordet efter den.
+    /// Samma girighet som `break_lines`, men en rad i taget så att bredden kan variera med flytande bilder.
+    fn take_line(pieces: &[Piece], from: usize, width: f32) -> (Line, usize) {
+        let mut line = Line { pieces: Vec::new(), hard: false };
+        let (mut w, mut i) = (0.0, from);
+        while i < pieces.len() {
+            let p = &pieces[i];
+            if p.newline {
+                line.hard = true;
+                i += 1;
+                break;
+            }
+            if !p.space && w + p.width > width && !line.pieces.is_empty() {
+                break;
+            }
+            i += 1;
+            if p.space && line.pieces.is_empty() {
+                continue; // inget mellanslag först på en rad
+            }
+            w += p.width;
+            line.pieces.push(Piece { text: p.text.clone(), width: p.width, ..p_clone(p) });
+        }
+        while line.pieces.last().is_some_and(|p| p.space) {
+            line.pieces.pop();
+        }
+        (line, i)
+    }
+
     /// Lägger ut text i en ruta. Returnerar höjden som användes.
     #[allow(clippy::too_many_arguments)]
     fn text_block(
@@ -931,25 +1009,41 @@ impl<'a> Layout<'a> {
         italic_all: bool,
         first_line_extra: Option<(String, Face)>,
     ) {
-        let lines = self.break_lines(spans, base, size, width);
-        let n = lines.len();
-        for (i, mut line) in lines.into_iter().enumerate() {
+        let pieces = self.pieces(spans, base, size);
+        let pieces: Vec<Piece> = pieces.into_iter().flat_map(|p| self.split_long(p, width)).collect();
+        let (mut next, mut i) = (0usize, 0usize);
+        loop {
+            // Flytande bilder gör raden smalare (och förskjuter den vid vänsterbilder).
+            let (mut fx, mut fw) = self.float_room();
+            let (mut line, mut after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0)).max(1.0));
+            let page_before = self.pages.len();
             // Fotnoterna på raden ska ha plats längst ned på samma sida som raden.
-            let refs: Vec<usize> = if self.in_notes {
-                Vec::new()
-            } else {
-                line.pieces.iter().filter_map(|p| p.style.fnref).filter(|n| !self.page_notes.contains(n)).collect()
+            let refs_of = |this: &Self, line: &Line| -> Vec<usize> {
+                if this.in_notes {
+                    Vec::new()
+                } else {
+                    line.pieces.iter().filter_map(|p| p.style.fnref).filter(|n| !this.page_notes.contains(n)).collect()
+                }
             };
-            let msz = line_size(&line, size);
-            let line_h = msz * LINE;
-            let mut need = self.note_cost(&refs);
-            if need > 0.0 && self.y + line_h + self.reserved + need > self.ph - self.mb && self.y > self.mt + 0.5 {
+            let mut refs = refs_of(self, &line);
+            let line_h0 = line_size(&line, size) * LINE;
+            let need0 = self.note_cost(&refs);
+            if need0 > 0.0 && self.y + line_h0 + self.reserved + need0 > self.ph - self.mb && self.y > self.mt + 0.5 {
                 self.new_page();
-                need = self.note_cost(&refs);
             }
-            self.ensure(line_h);
+            self.ensure(line_h0);
+            if self.pages.len() != page_before {
+                (fx, fw) = self.float_room();
+                (line, after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0)).max(1.0));
+                refs = refs_of(self, &line);
+            }
+            let need = self.note_cost(&refs);
             self.reserved += need;
             self.page_notes.extend(refs);
+            let (x, width) = (x + fx, width - fw.min(width - 24.0));
+            let last = after >= pieces.len() && !line.hard;
+            let msz = line_size(&line, size);
+            let line_h = msz * LINE;
             let baseline = self.y + msz * 1.08;
             if i == 0 {
                 if let Some((marker, mface)) = &first_line_extra {
@@ -971,7 +1065,7 @@ impl<'a> Layout<'a> {
             match self.align {
                 Align::Center => dx = ((width - lw) / 2.0).max(0.0),
                 Align::Right => dx = (width - lw).max(0.0),
-                Align::Justify if i + 1 < n && !line.hard => {
+                Align::Justify if !last && !line.hard => {
                     justify(&mut line.pieces, width);
                     stretched = true;
                 }
@@ -1031,10 +1125,20 @@ impl<'a> Layout<'a> {
                 }
             }
             self.y += line_h;
+            next = after;
+            i += 1;
+            if last {
+                break;
+            }
         }
     }
 
-    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align) {
+    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align, float: Option<Float>) {
+        // Bilder som inte flyter, och texten om bilden saknas, kommer under flytande bilder.
+        let float = float.filter(|_| indent == 0.0);
+        if float.is_none() {
+            self.clear_floats();
+        }
         let Some(img) = (self.resolve)(src) else {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
@@ -1071,9 +1175,22 @@ impl<'a> Layout<'a> {
             w *= max_h / h;
             h = max_h;
         }
+        // Flytande bild: vid vänster/höger textkant, text runt; ryms den inte flyttas den till nästa sida.
+        let mut float = float;
+        if float.is_some() && (w + FLOAT_GAP > max_w - FLOAT_MIN_ROOM || !self.floats.is_empty() && self.floats.iter().any(|f| Some(f.side) == float)) {
+            self.clear_floats();
+            float = None;
+        }
         self.ensure(h);
         let index = self.images.len();
         self.images.push(image);
+        if let Some(side) = float {
+            let (x, y) = (if side == Float::Left { self.ml } else { self.ml + self.cw - w }, self.y);
+            self.page().ops.push(Op::Image { x, y, w, h, index });
+            let page = self.pages.len() - 1;
+            self.floats.push(FloatBox { side, w: w + FLOAT_GAP, page, bottom: y + h });
+            return;
+        }
         let free = (self.cw - indent - w).max(0.0);
         let dx = match align {
             Align::Center => free / 2.0,
@@ -1086,6 +1203,7 @@ impl<'a> Layout<'a> {
     }
 
     fn table(&mut self, rows: &[Vec<Vec<Span>>]) {
+        self.clear_floats();
         let cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
         let size = self.body * 0.95;
         let pad = 5.0;
@@ -1150,6 +1268,7 @@ impl<'a> Layout<'a> {
     }
 
     fn code(&mut self, text: &str, indent: f32) {
+        self.clear_floats();
         let size = self.body * 0.86;
         let line_h = size * 1.45;
         let pad = 8.0;
@@ -1247,13 +1366,14 @@ impl<'a> Layout<'a> {
                 Block::Code { text, indent } => self.code(text, *indent),
                 Block::Table { rows } => self.table(rows),
                 Block::Rule => {
+                    self.clear_floats();
                     self.ensure(16.0);
                     let y = self.y + 6.0;
                     let (ml, cw) = (self.ml, self.cw);
                     self.page().ops.push(Op::Line { x1: ml, y1: y, x2: ml + cw, y2: y, width: 0.8, color: RULE });
                     self.y += 16.0;
                 }
-                Block::Image { src, alt, indent, size, align } => self.image(src, alt, *indent, *size, *align),
+                Block::Image { src, alt, indent, size, align, float } => self.image(src, alt, *indent, *size, *align, *float),
                 Block::Toc => self.toc(),
             }
         }
@@ -1761,6 +1881,66 @@ mod tests {
         assert_eq!(im.len(), 2);
         assert!((im[0].0 - (lay.ml + (lay.cw - 72.0) / 2.0)).abs() < 0.01, "{im:?}");
         assert!((im[1].0 - (lay.ml + lay.cw - 72.0)).abs() < 0.01);
+    }
+
+    const LOREM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
+
+    #[test]
+    fn floats_wrap_text_line_by_line() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        for (side, tag) in [(Float::Left, "left"), (Float::Right, "right")] {
+            let md = format!("<img src=\"a\" width=\"192\" align=\"{tag}\">\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n");
+            let (mut lay, _) = laid_out(&md, &resolve);
+            let im = images_of(&lay);
+            assert_eq!(im.len(), 1);
+            let (ix, iy, iw, ih) = im[0];
+            let want_x = if side == Float::Left { lay.ml } else { lay.ml + lay.cw - iw };
+            assert!((ix - want_x).abs() < 0.01, "{side:?}: bild vid {ix}");
+            let body = lay.body;
+            let (mut beside, mut below) = (0, 0);
+            for (x, y, t) in texts(&lay.pages[0].ops) {
+                let w = lay.m.width(Face::Sans, body, &t);
+                if y < iy + ih {
+                    beside += 1;
+                    let (lo, hi) = if side == Float::Left { (lay.ml + iw + FLOAT_GAP, lay.ml + lay.cw) } else { (lay.ml, lay.ml + lay.cw - iw - FLOAT_GAP) };
+                    assert!(x >= lo - 0.01 && x + w <= hi + 0.5, "{side:?}: rad vid {x}..{} (y {y}) utanför {lo}..{hi}", x + w);
+                } else {
+                    below += 1;
+                    assert!((x - lay.ml).abs() < 0.01, "{side:?}: rad under bilden vid {x}");
+                }
+            }
+            assert!(beside >= 3 && below >= 3, "{side:?}: {beside} bredvid, {below} under");
+            // Bilden tar ingen egen höjd: första textraden ligger överst.
+            let first = texts(&lay.pages[0].ops).first().map(|t| t.1).unwrap();
+            assert!(first < lay.mt + 20.0, "första raden y = {first}");
+        }
+    }
+
+    #[test]
+    fn float_that_does_not_fit_moves_to_the_next_page() {
+        let data = png(100, 100);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        // Fyll sidan nästan helt, sedan en bild på 150 pt som inte ryms.
+        let filler: Vec<String> = (0..12).map(|_| LOREM.to_owned()).collect();
+        let md = format!("{}\n\n<img src=\"a\" width=\"200\" align=\"left\">\n\n{LOREM}\n\n{LOREM}\n", filler.join("\n\n"));
+        let (lay, _) = laid_out(&md, &resolve);
+        assert!(lay.pages.len() >= 2);
+        let on_page = |k: usize| lay.pages[k].ops.iter().filter(|o| matches!(o, Op::Image { .. })).count();
+        assert_eq!((on_page(0), on_page(1)), (0, 1));
+        // Texten efter bilden står bredvid den på sida 2.
+        let t = texts(&lay.pages[1].ops);
+        assert!(t.iter().any(|(x, _, _)| *x > lay.ml + 100.0), "{t:?}");
+    }
+
+    #[test]
+    fn float_without_room_is_a_plain_block() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let md = format!("<img src=\"a\" width=\"700\" align=\"left\">\n\n{LOREM}\n");
+        let (lay, _) = laid_out(&md, &resolve);
+        let (_, iy, _, ih) = images_of(&lay)[0];
+        assert!(texts(&lay.pages[0].ops).iter().all(|(x, y, _)| (*x - lay.ml).abs() < 0.01 && *y > iy + ih - 1.0));
     }
 
     #[test]

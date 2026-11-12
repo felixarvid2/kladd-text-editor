@@ -36,6 +36,13 @@ pub enum Inline {
     Strike,
 }
 
+/// Flytande bild: texten i följande stycken flyter runt bilden (`<img align="left|right">`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Float {
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageRef {
     pub alt: String,
@@ -44,6 +51,8 @@ pub struct ImageRef {
     pub width: Option<f32>,
     /// Höjd i CSS-pixlar; bara satt för `<img height>`.
     pub height: Option<f32>,
+    /// `<img align="left|right">`: bilden flyter vid vänster/höger textkant.
+    pub align: Option<Float>,
 }
 
 /// En bit av texten med enhetlig stil. Bitarna täcker hela texten i ordning, utan glapp.
@@ -331,7 +340,7 @@ fn parse(text: &str) -> Parsed {
                     }
                     Tag::Link { link_type, .. } => link = Some((r.clone(), link_type, r.start + 1)),
                     Tag::Image { dest_url, .. } => {
-                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None });
+                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None, align: None });
                         let idx = (images.len() - 1) as u32;
                         fill(&mut st, r.clone(), |s| {
                             s.image = Some(idx);
@@ -830,6 +839,11 @@ fn parse_img(tag: &str) -> Option<ImageRef> {
         alt: get("alt").unwrap_or_default(),
         width: get("width").and_then(|v| px_value(&v)),
         height: get("height").and_then(|v| px_value(&v)),
+        align: get("align").and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "left" => Some(Float::Left),
+            "right" => Some(Float::Right),
+            _ => None,
+        }),
     })
 }
 
@@ -887,39 +901,235 @@ pub fn image_at(text: &str, a: &Analysis, pos: usize) -> Option<(Range<usize>, I
     piece_at(a, prev).and_then(hit)
 }
 
+/// `<img src alt [width] [height] [align]>` (attributen i den ordningen).
+fn img_tag(img: &ImageRef) -> String {
+    let mut s = format!("<img src=\"{}\" alt=\"{}\"", encode_attr(&img.src), encode_attr(&img.alt));
+    if let Some(w) = img.width {
+        s.push_str(&format!(" width=\"{w}\""));
+    }
+    if let Some(h) = img.height {
+        s.push_str(&format!(" height=\"{h}\""));
+    }
+    match img.align {
+        Some(Float::Left) => s.push_str(" align=\"left\""),
+        Some(Float::Right) => s.push_str(" align=\"right\""),
+        None => {}
+    }
+    s.push('>');
+    s
+}
+
+/// Byter ut bildbiten `range` mot `new` och markerar den nya taggen.
+fn replace_tag(text: &str, range: Range<usize>, new: &str) -> Edit {
+    let mut t = String::with_capacity(text.len() + new.len());
+    t.push_str(&text[..range.start]);
+    t.push_str(new);
+    t.push_str(&text[range.end..]);
+    Edit { text: t, sel: range.start..range.start + new.len() }
+}
+
 /// Ändrar bildens bredd: `Some(w)` skriver `<img src alt width>` (hela pixlar; en uttryckligen
 /// satt höjd skalas med, annars utelämnas den så att proportionerna bevaras), `None` skriver
-/// tillbaka `![alt](src)` (höjden försvinner). `image_range` är bitens område; träffar det
-/// ingen bild, eller blir resultatet detsamma, lämnas texten orörd. Markeringen blir bilden.
+/// tillbaka `![alt](src)` (höjden försvinner; en flytande bild förblir `<img align>`).
+/// `image_range` är bitens område; träffar det ingen bild, eller blir resultatet detsamma,
+/// lämnas texten orörd. Markeringen blir bilden.
 pub fn set_image_size(text: &str, image_range: Range<usize>, width: Option<f32>) -> Edit {
     let keep = || Edit { text: text.to_string(), sel: image_range.clone() };
     let a = analyze(text);
-    let Some(img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
+    let Some(mut img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
         return keep();
     };
     let new = match width {
         Some(w) if w.is_finite() && w >= 1.0 => {
             let w = w.round();
-            let h = img.height.map(|h| match img.width {
+            img.height = img.height.map(|h| match img.width {
                 Some(ow) if ow > 0.0 => (h * w / ow).round().max(1.0),
                 _ => h.round().max(1.0),
             });
-            let mut s = format!("<img src=\"{}\" alt=\"{}\" width=\"{}\"", encode_attr(&img.src), encode_attr(&img.alt), w);
-            if let Some(h) = h {
-                s.push_str(&format!(" height=\"{h}\""));
-            }
-            s.push('>');
-            s
+            img.width = Some(w);
+            img_tag(&img)
         }
         Some(_) => return keep(),
         None if text[image_range.clone()].starts_with("![") => return keep(),
-        None => md_image(&img),
+        None => {
+            img.width = None;
+            img.height = None;
+            if img.align.is_some() { img_tag(&img) } else { md_image(&img) }
+        }
     };
-    let mut t = String::with_capacity(text.len() + new.len());
-    t.push_str(&text[..image_range.start]);
-    t.push_str(&new);
-    t.push_str(&text[image_range.end..]);
-    Edit { text: t, sel: image_range.start..image_range.start + new.len() }
+    replace_tag(text, image_range, &new)
+}
+
+/// Sätter radbrytningen för en bild: `Some(Float::Left|Right)` låter texten flyta runt bilden
+/// (`<img … align>`), `None` gör den till en egen rad igen. Texten orörd om `range` inte är en bild.
+pub fn set_image_float(text: &str, image_range: Range<usize>, float: Option<Float>) -> Edit {
+    let keep = || Edit { text: text.to_string(), sel: image_range.clone() };
+    let a = analyze(text);
+    let Some(mut img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
+        return keep();
+    };
+    if img.align == float {
+        return keep();
+    }
+    img.align = float;
+    let new = if float.is_none() && img.width.is_none() && img.height.is_none() { md_image(&img) } else { img_tag(&img) };
+    replace_tag(text, image_range, &new)
+}
+
+/// Byteintervall (utan radbrytning) för raden som innehåller `pos`.
+fn line_at(text: &str, pos: usize) -> Range<usize> {
+    let pos = floor_boundary(text, pos.min(text.len()));
+    let s = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let e = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+    s..e
+}
+
+fn is_div_open_line(l: &str) -> bool {
+    let t = l.trim();
+    t.starts_with("<div") && t.matches('>').count() == 1 && parse_div_open(t).is_some()
+}
+
+/// Det som flyttas när bilden i `image_range` flyttas: hela raden om den bara innehåller bilden,
+/// och hela `<div align>…</div>`-blocket om raden var det enda i det; annars bara själva taggen.
+pub fn image_block(text: &str, image_range: Range<usize>) -> Range<usize> {
+    let line = line_at(text, image_range.start);
+    if text[line.clone()].trim().len() != image_range.len() {
+        return image_range;
+    }
+    // Rad före/efter (hoppar över tomma rader).
+    let prev = |from: usize| -> Option<Range<usize>> {
+        let mut e = from;
+        while e > 0 {
+            let l = line_at(text, e - 1);
+            if !text[l.clone()].trim().is_empty() {
+                return Some(l);
+            }
+            e = l.start;
+        }
+        None
+    };
+    let next = |from: usize| -> Option<Range<usize>> {
+        let mut s = from;
+        while s < text.len() {
+            let l = line_at(text, s);
+            if !text[l.clone()].trim().is_empty() {
+                return Some(l);
+            }
+            s = l.end + 1;
+        }
+        None
+    };
+    if let (Some(o), Some(c)) = (prev(line.start), next(line.end + 1)) {
+        if is_div_open_line(&text[o.clone()]) && is_div_close(text[c.clone()].trim()) {
+            return o.start..c.end;
+        }
+    }
+    line
+}
+
+/// Raden (hela tabellen om det är en tabell) som en bild släpps före (`after == false`) eller
+/// efter när pekaren står vid `target`. En tom rad går till närmaste stycke åt det håll bilden
+/// ska hamna.
+pub fn drop_line(text: &str, target: usize, after: bool) -> Range<usize> {
+    let mut line = line_at(text, target);
+    if text[line.clone()].trim().is_empty() {
+        let (mut up, mut down) = (line.start, line.end + 1);
+        let mut found = None;
+        loop {
+            if after && up > 0 {
+                let l = line_at(text, up - 1);
+                up = l.start;
+                if !text[l.clone()].trim().is_empty() {
+                    found = Some(l);
+                    break;
+                }
+            } else if !after && down < text.len() {
+                let l = line_at(text, down);
+                down = l.end + 1;
+                if !text[l.clone()].trim().is_empty() {
+                    found = Some(l);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        line = found.unwrap_or(line);
+    }
+    if text[line.clone()].trim_start().starts_with('|') {
+        let (mut s, mut e) = (line.start, line.end);
+        while s > 0 {
+            let l = line_at(text, s - 1);
+            if !text[l.clone()].trim_start().starts_with('|') {
+                break;
+            }
+            s = l.start;
+        }
+        while e < text.len() {
+            let l = line_at(text, e + 1);
+            if l.start <= e || !text[l.clone()].trim_start().starts_with('|') {
+                break;
+            }
+            e = l.end;
+        }
+        line = s..e;
+    }
+    line
+}
+
+/// Flyttar bilden i `image_range` till före (`after == false`) eller efter raden som innehåller
+/// `target` (byteläge). Bilden hamnar på en egen rad med tomma rader omkring; `<div align>`-
+/// blocket som bara innehöll bilden följer med. Tabeller räknas som en rad (bilden hamnar före
+/// eller efter hela tabellen) och tomma rader går till närmaste stycke. `None` om det inte är en
+/// bild eller om bilden redan står där. `sel` i resultatet är bilden på sin nya plats.
+pub fn move_image(text: &str, image_range: Range<usize>, target: usize, after: bool) -> Option<Edit> {
+    let a = analyze(text);
+    a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.as_ref())?;
+    let block = image_block(text, image_range.clone());
+    let (ba, bb) = (block.start, block.end);
+    let line = drop_line(text, target, after);
+    let t = if after { line.end } else { line.start };
+    // Släpp på sig själv (eller direkt intill) ändrar inget.
+    if t >= ba && t <= bb {
+        return None;
+    }
+    let moved = &text[ba..bb];
+    // Ta bort blocket; blankraderna runt det slås ihop till ett avstånd.
+    let left = text[..ba].trim_end_matches('\n');
+    let nl_l = ba - left.len();
+    let right = text[bb..].trim_start_matches('\n');
+    let nl_r = text[bb..].len() - right.len();
+    let inline = block == image_range && text[line_at(text, ba)].trim().len() != bb - ba;
+    let sep = if inline || left.is_empty() {
+        0
+    } else if right.is_empty() {
+        nl_r
+    } else {
+        nl_l.max(nl_r).max(1)
+    };
+    let mut rest = String::with_capacity(text.len());
+    rest.push_str(left);
+    rest.push_str(&"\n".repeat(sep));
+    rest.push_str(right);
+    let t2 = if t < ba { t } else { left.len() + sep + (t - (bb + nl_r)) };
+    let (head, tail) = rest.split_at(t2.min(rest.len()));
+    let mut out = String::with_capacity(rest.len() + moved.len() + 4);
+    out.push_str(head);
+    let at = if after {
+        out.push_str("\n\n");
+        out.len()
+    } else {
+        out.len()
+    };
+    out.push_str(moved);
+    if !after {
+        out.push_str("\n\n");
+    }
+    out.push_str(tail);
+    // Bilden i det flyttade blocket.
+    let off = image_range.start - ba;
+    let new_start = at + off;
+    Some(Edit { text: out, sel: new_start..new_start + image_range.len() })
 }
 
 // ============================================================== aktiv formatering
@@ -3096,7 +3306,7 @@ mod tests {
         let t = "före\n\n![Sol](bild:image1.png)\n\nefter";
         let p = pc(t, "![Sol](bild:image1.png)");
         assert!(p.markup);
-        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None }));
+        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None, align: None }));
         assert_eq!(p.range.len(), "![Sol](bild:image1.png)".len());
         // Två bilder intill varandra blir två bitar.
         let t = "![a](1.png)![b](2.png)";
@@ -4344,7 +4554,7 @@ mod tests {
     // ---- bilder (HTML) och objektmarkörer
 
     fn iref(alt: &str, src: &str, width: Option<f32>, height: Option<f32>) -> ImageRef {
-        ImageRef { alt: alt.into(), src: src.into(), width, height }
+        ImageRef { alt: alt.into(), src: src.into(), width, height, align: None }
     }
 
     fn at(t: &str, needle: &str) -> usize {

@@ -753,6 +753,23 @@ impl KladdApp {
             Act::Original => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, None)),
             Act::Resize { w, h: None } => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, Some(w))),
             Act::Resize { w, h: Some(h) } => self.word_edit(ctx, |t, _| images::set_free_size(t, r, w, h)),
+            Act::Float(f) => self.word_edit(ctx, |t, _| markup::set_image_float(t, r, f)),
+            Act::Move { target, after } => {
+                // Ett ångra-steg; bilden förblir vald på sin nya plats.
+                let mut at = None;
+                self.word_edit(ctx, |t, _| match markup::move_image(t, r.clone(), target, after) {
+                    Some(e) => {
+                        at = Some(e.sel.start);
+                        e
+                    }
+                    None => markup::Edit { text: t.to_string(), sel: r.clone() },
+                });
+                if let (Some(at), Some(doc)) = (at, self.docs.get(self.active)) {
+                    let a = markup::analyze(&doc.text);
+                    let idx = a.pieces.iter().filter(|pc| pc.image.is_some() && pc.range.start < at).count();
+                    self.wv.img.selected = Some(idx);
+                }
+            }
             Act::Delete => {
                 self.word_edit(ctx, |t, _| images::remove_image(t, r));
                 self.wv.img.deselect();
@@ -1095,13 +1112,22 @@ impl KladdApp {
                         if let Some(sz) = sizes.get(&images::size_key(img)) {
                             let ci = conv.at(pc.range.start);
                             let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
+                            // Flytande bild: vid textkanten, på radens höjd (raden själv har ingen höjd).
+                            let side = word.float_side(doc_id, text, pc.range.start);
                             {
                                 let uri = image_uri(&img.src, doc_id);
-                                let rect = Rect::from_min_size(r.min, *sz);
+                                let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
+                                let min = match side {
+                                    Some((markup::Float::Left, _)) => pos2(gpos.x, top),
+                                    Some((markup::Float::Right, _)) => pos2(gpos.x + text_w - sz.x, top),
+                                    None => r.min,
+                                };
+                                let rect = Rect::from_min_size(min, *sz);
                                 if rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
                                     egui::Image::new(uri.clone()).paint_at(ui, rect);
                                     painted.push(images::Painted {
                                         rect,
+                                        align: img.align,
                                         range: pc.range.clone(),
                                         index: img_index - 1,
                                         uri,
@@ -1160,7 +1186,32 @@ impl KladdApp {
 
                 // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
                 let max_w = text_w;
-                img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p);
+                // Var en dragen bild skulle hamna: raden under pekaren, före eller efter beroende på
+                // om pekaren står över eller under radens mitt. Bara över ett ark.
+                let drop_at = |pos: egui::Pos2| -> Option<images::Drop> {
+                    if !(0..total).any(|k| pages::sheet_rect(&geom, page_left, page_top, k).contains(pos)) {
+                        return None;
+                    }
+                    let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
+                    let extent = |l: &Range<usize>| {
+                        let a = galley.pos_from_cursor(CCursor::new(byte_to_char(text, l.start)));
+                        let e = galley.pos_from_cursor(CCursor::new(byte_to_char(text, l.end)));
+                        (a.min.y + gpos.y, e.max.y + gpos.y)
+                    };
+                    let raw = markup::drop_line(text, b, false);
+                    let (top, bottom) = extent(&raw);
+                    let after = pos.y > (top + bottom) / 2.0;
+                    let line = markup::drop_line(text, b, after);
+                    let (top, bottom) = if line == raw { (top, bottom) } else { extent(&line) };
+                    Some(images::Drop {
+                        target: if after { line.end } else { line.start },
+                        after,
+                        y: if after { bottom } else { top },
+                        x0: gpos.x,
+                        x1: gpos.x + text_w,
+                    })
+                };
+                img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
 
                 // Tabellrutnät: 1 px kantlinjer vid de dolda pipornas lägen och radgränserna.
                 if !edited {

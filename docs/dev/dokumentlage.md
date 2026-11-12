@@ -278,6 +278,30 @@ Gemensamma format (alla moduler ska använda dessa):
     bredd (som Pandoc). Lika många streck (eller `---` överallt) = automatisk bredd.
 - **Flytande bilder**: `<img src="…" alt="…" width="200" align="left">` (eller `right`): texten i
   följande stycken flyter runt bilden. Utan `align` är bilden en egen rad som förut.
+  - `markup::ImageRef.align: Option<Float>`; `set_image_float(text, range, Option<Float>)` skriver
+    om attributet, `set_image_size` behåller det, `move_image`/`image_block`/`drop_line` flyttar en
+    bild (hela raden, och `<div align>`-blocket om bilden var det enda i det).
+  - Layout: en bild med `align` på en rad ensam kollapsar raden (~0 höjd, dold). Bilden ritas i en ruta vid
+    vänster/höger textkant som börjar vid styckets överkant (även när bilden står i ett stycke med
+    text, som Word läses in). Stycken (och styckets egna rader) vars överkant ligger ovanför bildens
+    underkant läggs ut med radbredden minskad med bildens bredd + 12 px, vänsterbilder förskjuter
+    raderna åt höger. **Per rad**: stycket läggs ut smalt, delas vid första raden som börjar under
+    bilden (`layout_para_floats`) och resten läggs ut igen med full bredd. Utläggningen går
+    stycke för stycke i ordning (`relayout`) eftersom bredden beror på var bilden slutar; styckecachen
+    nycklas också på de aktiva bildernas relativa underkant.
+  - Fallgropar: en andra bild på samma sida som en aktiv, eller en bild som lämnar mindre än 96 px
+    text, flyter inte (egen rad). Tabeller flyter inte runt bilder.
+  - Sidbrytning: `pages::paginate` räknar bildens höjd som en rad på förankringsraden; ryms den inte
+    flyttas den, och texten efter den, till nästa sida.
+  - Word: `wp:anchor` med `wrapSquare/Tight/Through` och `positionH` (`align` left/right, eller
+    `posOffset` nära vänster/höger marginal) läses som `align`; skrivs som `wp:anchor` med
+    `wrapSquare wrapText="bothSides"`, `positionH relativeFrom="column"`, `positionV
+    relativeFrom="paragraph"` offset 0, `distL`/`distR` 114300 EMU mot texten. ODT: `draw:frame`
+    `text:anchor-type="paragraph"` och grafikformat med `style:wrap="right|left"` (bilden
+    till vänster/höger) och `style:horizontal-pos`. PDF: samma per-rad-flöde (`FloatBox`). HTML/EPUB:
+    CSS `float`.
+  - Flytt med musen: dra i bildens mitt (inte ett handtag); `images::Act::Move` utförs via
+    `word_edit` (ett ångra-steg). Esc och släpp utanför arken avbryter.
 - **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
   sidnummer (klickbara); Word skriver ett TOC-fält, ODT `text:table-of-content`, PDF/HTML/EPUB en
   lista med rubrikerna.

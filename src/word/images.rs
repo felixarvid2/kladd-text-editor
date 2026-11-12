@@ -6,7 +6,8 @@ use std::ops::Range;
 
 use egui::{Color32, CursorIcon, FontId, Id, LayerId, Order, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
-use super::markup::{self, Align, ImageRef};
+use super::markup::{self, Align, Float, ImageRef};
+use crate::icons::{self, Icon};
 use crate::theme::Palette;
 
 /// Minsta bildstorlek vid dragning (px).
@@ -189,7 +190,10 @@ pub fn set_free_size(text: &str, range: Range<usize>, w: f32, h: f32) -> markup:
 
 /// En ritad bild: ruta på skärmen, bitens byteområde och löpnummer bland dokumentets bilder.
 pub struct Painted {
+    /// Raden/storleken bilden ritas i: för en flytande bild rutan vid textkanten.
     pub rect: Rect,
+    /// Bildens `align` i Markdown-texten (för verktygsradens knappar och flyttens markering).
+    pub align: Option<Float>,
     pub range: Range<usize>,
     pub index: usize,
     pub uri: String,
@@ -203,6 +207,30 @@ pub enum Act {
     Delete,
     /// Ny storlek i CSS-px; `h` bara vid fri storleksändring (Skift).
     Resize { w: f32, h: Option<f32> },
+    /// Radbrytning: texten flyter runt bilden (`Some`) eller bilden är en egen rad (`None`).
+    Float(Option<Float>),
+    /// Flytta bilden till före/efter raden som innehåller byteläget `target`.
+    Move { target: usize, after: bool },
+}
+
+/// Var en bild som dras skulle hamna: byteläge i raden, före eller efter den, skärm-y för
+/// markeringslinjen och textspaltens kanter (skärm-x).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Drop {
+    pub target: usize,
+    pub after: bool,
+    pub y: f32,
+    pub x0: f32,
+    pub x1: f32,
+}
+
+/// Pågående flytt av en bild med musen.
+struct Moving {
+    /// Pekarens avstånd från bildens hörn när dragningen började.
+    grab: Vec2,
+    size: Vec2,
+    uri: String,
+    align: Option<Float>,
 }
 
 struct Drag {
@@ -222,6 +250,7 @@ pub struct State {
     /// Vald bilds byteområde i senaste bildrutan (för formateringsradens justering).
     pub range: Option<Range<usize>>,
     drag: Option<Drag>,
+    mv: Option<Moving>,
 }
 
 impl State {
@@ -229,6 +258,12 @@ impl State {
         self.selected = None;
         self.range = None;
         self.drag = None;
+        self.mv = None;
+    }
+
+    /// Pågår en dragning (storlek eller flytt)?
+    pub fn busy(&self) -> bool {
+        self.drag.is_some() || self.mv.is_some()
     }
 }
 
@@ -244,6 +279,7 @@ pub fn ui(
     (z, max_w): (f32, f32),
     editor_id: Id,
     p: &Palette,
+    drop_at: &dyn Fn(egui::Pos2) -> Option<Drop>,
 ) -> Option<Act> {
     if st.doc_id != doc_id || st.selected.is_some_and(|i| i >= n_images) {
         st.deselect();
@@ -271,6 +307,9 @@ pub fn ui(
             let origin = ctx.input(|i| i.pointer.press_origin());
             if let Some(h) = origin.and_then(|o| hit_handle(im.rect, o)) {
                 st.drag = Some(Drag { handle: h, index: im.index, orig: im.rect, origin: origin.unwrap_or_default(), last: im.rect.size() });
+            } else if let Some(o) = origin.filter(|o| im.rect.contains(*o)) {
+                // Bildens mitt: flytta den.
+                st.mv = Some(Moving { grab: o - im.rect.min, size: im.rect.size(), uri: im.uri.clone(), align: im.align });
             }
         }
     }
@@ -311,21 +350,69 @@ pub fn ui(
         act = released;
     }
 
+    // Pågående flytt: spökbild, markeringslinje (och bildens ruta vid kanten för flytande bilder).
+    if let Some(m) = st.mv.take() {
+        let pos = ctx.pointer_latest_pos().unwrap_or_default();
+        let down = ctx.input(|i| i.pointer.primary_down());
+        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if !esc {
+            let target = drop_at(pos);
+            ctx.set_cursor_icon(if target.is_some() { CursorIcon::Grabbing } else { CursorIcon::NotAllowed });
+            let layer = LayerId::new(Order::Tooltip, Id::unique("kladd-img-move"));
+            let pt = ctx.layer_painter(layer);
+            let ghost = Rect::from_min_size(pos - m.grab, m.size);
+            let mut child = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(ghost));
+            egui::Image::new(m.uri.clone()).tint(Color32::from_white_alpha(110)).paint_at(&mut child, ghost);
+            pt.rect_stroke(ghost, 0.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Middle);
+            if let Some(d) = target {
+                pt.rect_filled(Rect::from_min_max(pos2(d.x0, d.y - 1.0), pos2(d.x1, d.y + 1.0)), 1.0, p.accent);
+                for x in [d.x0, d.x1] {
+                    pt.circle_filled(pos2(x, d.y), 3.0, p.accent);
+                }
+                if let Some(side) = m.align {
+                    let x = if side == Float::Left { d.x0 } else { d.x1 - m.size.x };
+                    let r = Rect::from_min_size(pos2(x, d.y), m.size);
+                    pt.rect_filled(r, 0.0, p.accent.gamma_multiply(0.12));
+                    pt.rect_stroke(r, 0.0, Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
+                }
+            }
+            // Rulla när pekaren närmar sig kanten av fönstret.
+            let view = ui.clip_rect();
+            let edge = 36.0;
+            let dy = if pos.y < view.top() + edge {
+                (view.top() + edge - pos.y).min(edge) * 0.5
+            } else if pos.y > view.bottom() - edge {
+                -((pos.y - (view.bottom() - edge)).min(edge) * 0.5)
+            } else {
+                0.0
+            };
+            if dy != 0.0 {
+                ui.scroll_with_delta(vec2(0.0, dy));
+            }
+            if down {
+                st.mv = Some(m);
+            } else if let Some(d) = target {
+                act = Some(Act::Move { target: d.target, after: d.after });
+            }
+        }
+        ctx.request_repaint();
+    }
+
     // Ram, handtag och verktygsrad för den valda bilden.
     let mut bar_rect = None;
     st.range = None;
     if let Some(im) = st.selected.and_then(|sel| painted.iter().find(|i| i.index == sel)) {
         st.range = Some(im.range.clone());
         paint_selection(ui, im.rect, p);
-        if st.drag.is_none() && act.is_none() {
-            let (a, rect) = toolbar(ui, im.rect, p);
+        if !st.busy() && act.is_none() {
+            let (a, rect) = toolbar(ui, im.rect, p, im.align);
             act = a;
             bar_rect = Some(rect);
         }
     }
 
     // Tryck utanför bilder och verktygsraden avmarkerar.
-    if ctx.input(|i| i.pointer.primary_pressed()) && st.drag.is_none() {
+    if ctx.input(|i| i.pointer.primary_pressed()) && !st.busy() {
         let pos = ctx.pointer_interact_pos();
         let on_img = pos.is_some_and(|q| {
             painted.iter().any(|i| i.rect.expand(if st.selected == Some(i.index) { HIT } else { 0.0 }).contains(q))
@@ -366,7 +453,7 @@ fn paint_selection(ui: &Ui, r: Rect, p: &Palette) {
 }
 
 /// Flytande verktygsrad ovanför (annars under) bilden.
-fn toolbar(ui: &mut Ui, r: Rect, p: &Palette) -> (Option<Act>, Rect) {
+fn toolbar(ui: &mut Ui, r: Rect, p: &Palette, float: Option<Float>) -> (Option<Act>, Rect) {
     let mut act = None;
     let screen = ui.ctx().content_rect();
     let pos = if r.top() - 40.0 > screen.top() { pos2(r.left(), r.top() - 38.0) } else { pos2(r.left(), r.bottom() + 10.0) };
@@ -389,6 +476,17 @@ fn toolbar(ui: &mut Ui, r: Rect, p: &Palette) -> (Option<Act>, Rect) {
                             act = Some(a);
                         }
                     }
+                    ui.add_space(4.0);
+                    // Radbrytning: bilden på en egen rad, eller text som flyter runt den.
+                    for (icon, to, tip) in [
+                        (Icon::WrapInline, None, "Radbrytning: I texten"),
+                        (Icon::WrapLeft, Some(Float::Left), "Radbrytning: Vänster (text till höger om bilden)"),
+                        (Icon::WrapRight, Some(Float::Right), "Radbrytning: Höger (text till vänster om bilden)"),
+                    ] {
+                        if icons::toggle_button(ui, p, icon, float == to, tip).clicked() {
+                            act = Some(Act::Float(to));
+                        }
+                    }
                 });
             });
         });
@@ -400,7 +498,7 @@ mod tests {
     use super::*;
 
     fn img(w: Option<f32>, h: Option<f32>) -> ImageRef {
-        ImageRef { alt: "a".into(), src: "x.png".into(), width: w, height: h }
+        ImageRef { alt: "a".into(), src: "x.png".into(), width: w, height: h, align: None }
     }
 
     #[test]

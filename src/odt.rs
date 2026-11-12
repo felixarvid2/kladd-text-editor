@@ -31,6 +31,7 @@ use quick_xml::Reader;
 
 use crate::docx::{escape_inline, escape_line_start, image_ext, is_supported_image, wrap, Image, Loaded, Written, IMAGE_SCHEME};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
+use crate::word::markup::Float;
 
 const MIME: &str = "application/vnd.oasis.opendocument.text";
 const MAX_ENTRIES: usize = 20_000;
@@ -261,6 +262,9 @@ struct StyleDef {
     auto: bool,
     tp: TProps,
     align: Option<Align>,
+    /// `style:wrap` och `style:horizontal-pos` i `style:graphic-properties`.
+    wrap: Option<String>,
+    hpos: Option<String>,
 }
 
 #[derive(Default)]
@@ -351,10 +355,36 @@ impl Styles {
                         d.align = Some(parse_align(a));
                     }
                 }
+                "style:graphic-properties" => {
+                    d.wrap = c.attr("style:wrap").map(str::to_owned);
+                    d.hpos = c.attr("style:horizontal-pos").map(str::to_owned);
+                }
                 _ => {}
             }
         }
         d
+    }
+
+    /// Sidan en ram med grafikformatet `name` flyter på. `style:wrap="right"` betyder att texten
+    /// står till höger om bilden (bilden till vänster), `left` tvärtom; vid `parallel`, `dynamic`
+    /// och `biggest` avgör `style:horizontal-pos` (`left`/`right`). Allt annat (`none`, `run-through`,
+    /// ramar som ligger i texten) är ingen flytande bild.
+    fn float_of(&self, name: &str) -> Option<Float> {
+        let (mut wrap, mut hpos) = (None, None);
+        for d in self.chain("graphic", name) {
+            wrap = d.wrap.as_ref().or(wrap);
+            hpos = d.hpos.as_ref().or(hpos);
+        }
+        match wrap?.as_str() {
+            "right" => Some(Float::Left),
+            "left" => Some(Float::Right),
+            "parallel" | "dynamic" | "biggest" => match hpos.map(String::as_str) {
+                Some("left") => Some(Float::Left),
+                Some("right") => Some(Float::Right),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn list_style(&mut self, s: &Node) {
@@ -786,8 +816,15 @@ impl<'s, 'b> Rd<'s, 'b> {
         let fw = e.attr("svg:width").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let fh = e.attr("svg:height").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
+        // Ramar som ligger i texten (`as-char`) flyter aldrig.
+        let float = e
+            .attr("draw:style-name")
+            .filter(|_| e.attr("text:anchor-type") != Some("as-char"))
+            .and_then(|n| self.st.float_of(n));
         let md = match (natural, fw) {
-            (Some((nw, nh)), Some(w)) if (w - nw).abs() > 1.5 || fh.is_some_and(|h| (h - w * nh / nw).abs() > 1.5) => {
+            (Some((nw, nh)), Some(w))
+                if float.is_some() || (w - nw).abs() > 1.5 || fh.is_some_and(|h| (h - w * nh / nw).abs() > 1.5) =>
+            {
                 let mut tag = format!("<img src=\"{}\"", html_escape_attr(&src));
                 if !alt.is_empty() {
                     tag.push_str(&format!(" alt=\"{}\"", html_escape_attr(&alt)));
@@ -795,6 +832,11 @@ impl<'s, 'b> Rd<'s, 'b> {
                 tag.push_str(&format!(" width=\"{}\"", w.round() as i64));
                 if let Some(h) = fh.filter(|h| (h - w * nh / nw).abs() > 1.5) {
                     tag.push_str(&format!(" height=\"{}\"", h.round() as i64));
+                }
+                match float {
+                    Some(Float::Left) => tag.push_str(" align=\"left\""),
+                    Some(Float::Right) => tag.push_str(" align=\"right\""),
+                    None => {}
                 }
                 tag.push('>');
                 tag
@@ -1808,7 +1850,7 @@ impl<'a> W<'a> {
         self.after_space = true;
     }
 
-    fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>) {
+    fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>, float: Option<Float>) {
         let Some(img) = (self.resolve)(src).filter(|i| is_supported_image(&i.bytes)) else {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
@@ -1854,13 +1896,27 @@ impl<'a> W<'a> {
             self.frame_style = true;
             self.auto.push_str("<style:style style:name=\"fr1\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:vertical-pos=\"top\" style:vertical-rel=\"baseline\" style:wrap=\"none\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\"/></style:style>");
         }
+        // Flytande bild: förankrad vid stycket, vid kanten, text runt med 12 px (0,318 cm) luft.
+        let (style_name, anchor) = match float {
+            Some(side) => {
+                let (name, pos, wrap, ml, mr) = match side {
+                    Float::Left => ("frL", "left", "right", "0cm", "0.318cm"),
+                    Float::Right => ("frR", "right", "left", "0.318cm", "0cm"),
+                };
+                if !self.auto.contains(&format!("style:name=\"{name}\"")) {
+                    self.auto.push_str(&format!("<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\" style:horizontal-pos=\"{pos}\" style:horizontal-rel=\"paragraph\" style:wrap=\"{wrap}\" style:number-wrapped-paragraphs=\"no-limit\" style:run-through=\"foreground\" fo:margin-left=\"{ml}\" fo:margin-right=\"{mr}\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0cm\"/></style:style>"));
+                }
+                (name, "paragraph")
+            }
+            None => ("fr1", "as-char"),
+        };
         self.open_para();
         self.open_link_if_needed();
         self.n_frame += 1;
         let n = self.n_frame;
         let desc = if alt.is_empty() { String::new() } else { format!("<svg:desc>{}</svg:desc>", esc(alt)) };
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"fr1\" draw:name=\"Bild{n}\" text:anchor-type=\"as-char\" svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
+            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\" svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
             cm(w_pt),
             cm(h_pt),
             n - 1
@@ -1920,7 +1976,12 @@ impl<'a> W<'a> {
             let get = |k: &str| attrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
             let num = |k: &str| get(k).and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().ok()).filter(|v| *v > 0.0);
             let (src, alt) = (get("src").unwrap_or("").to_owned(), get("alt").unwrap_or("").to_owned());
-            self.image(&src, &alt, num("width"), num("height"));
+            let float = match get("align").map(|a| a.trim().to_ascii_lowercase()).as_deref() {
+                Some("left") => Some(Float::Left),
+                Some("right") => Some(Float::Right),
+                _ => None,
+            };
+            self.image(&src, &alt, num("width"), num("height"), float);
             // Det som följer på nästa rader i samma HTML-block är vanlig text.
             let rest = t[end + 1..].trim_matches('\n');
             if !rest.trim().is_empty() {
@@ -2120,7 +2181,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 }
                 TagEnd::Image => {
                     if let Some((src, alt)) = w.image.take() {
-                        w.image(&src, &alt, None, None);
+                        w.image(&src, &alt, None, None, None);
                     }
                 }
                 _ => {}
@@ -2516,6 +2577,86 @@ Slut.
         let missing = write("![x](saknas.png)\n", "T", &|_| None).unwrap();
         assert_eq!(missing.missing_images, vec!["saknas.png".to_owned()]);
         assert_eq!(read(&missing.bytes).unwrap().markdown, "\\[bild: x\\]\n");
+    }
+
+    fn content_xml(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut s = String::new();
+        z.by_name("content.xml").unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn floating_image_roundtrip() {
+        let md = "<img src=\"bild:image1.png\" alt=\"Sol\" width=\"200\" align=\"left\">Text bredvid.\n\n<img src=\"bild:image1.png\" width=\"100\" align=\"right\">\n\nSlut\n";
+        let w = write(md, "T", &resolver()).unwrap();
+        assert!(w.missing_images.is_empty());
+        let c = content_xml(&w.bytes);
+        assert!(c.contains("style:horizontal-pos=\"left\"") && c.contains("style:wrap=\"right\""), "{c}");
+        assert!(c.contains("style:horizontal-pos=\"right\"") && c.contains("style:wrap=\"left\""));
+        assert_eq!(c.matches("text:anchor-type=\"paragraph\"").count(), 2);
+        assert!(!c.contains("text:anchor-type=\"as-char\""));
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
+        // En bild som ligger i texten flyter inte.
+        let inline = write("<img src=\"bild:image1.png\" width=\"200\">\n", "T", &resolver()).unwrap();
+        assert!(!read(&inline.bytes).unwrap().markdown.contains("align="));
+    }
+
+    #[test]
+    fn wrap_values_are_mapped() {
+        let base = |wrap: &str, pos: &str| {
+            let c = LO_CONTENT.replace("svg:width=\"0.0265cm\" svg:height=\"0.0265cm\"", "svg:width=\"6.35cm\" svg:height=\"6.35cm\"");
+            let c = c.replace("<draw:frame draw:name=\"Bild1\" text:anchor-type=\"as-char\"", "<draw:frame draw:style-name=\"fr9\" draw:name=\"Bild1\" text:anchor-type=\"paragraph\"");
+            let style = format!("<style:style style:name=\"fr9\" style:family=\"graphic\"><style:graphic-properties style:wrap=\"{wrap}\" style:horizontal-pos=\"{pos}\"/></style:style>");
+            let c = c.replacen("</office:automatic-styles>", &format!("{style}</office:automatic-styles>"), 1);
+            let l = read(&make_odt(&c, LO_STYLES, &[("Pictures/a.png", &png())])).unwrap();
+            // Bara <img>-taggen (stycket kan ha en egen <div align>).
+            let m = l.markdown;
+            let i = m.find("<img").expect("bildtagg");
+            m[i..i + m[i..].find('>').unwrap()].to_owned()
+        };
+        assert!(base("right", "center").contains("align=\"left\""));
+        assert!(base("left", "center").contains("align=\"right\""));
+        assert!(base("parallel", "right").contains("align=\"right\""));
+        assert!(base("dynamic", "left").contains("align=\"left\""));
+        assert!(!base("none", "left").contains("align="));
+        assert!(!base("run-through", "left").contains("align="));
+        assert!(!base("parallel", "center").contains("align="));
+    }
+
+    /// LibreOffice ska rendera den skrivna filen med texten runt bilden. Kräver `soffice` och `pdftotext`.
+    #[test]
+    #[ignore]
+    fn floating_image_libreoffice() {
+        let dir = std::env::temp_dir().join("kladd-float-lo-odt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = image::RgbImage::new(240, 160);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb(if (x / 20 + y / 20) % 2 == 0 { [60, 120, 200] } else { [255, 200, 40] });
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
+        let md = format!("<img src=\"b.png\" alt=\"\" width=\"240\" align=\"left\">{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n");
+        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None })).unwrap();
+        let odt = dir.join("f.odt");
+        std::fs::write(&odt, w.bytes).unwrap();
+        let st = std::process::Command::new("soffice")
+            .arg(format!("-env:UserInstallation=file://{}/profile", dir.display()))
+            .args(["--headless", "--convert-to", "pdf", "--outdir"]).arg(&dir).arg(&odt).output().unwrap();
+        assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+        let out = std::process::Command::new("pdftotext").args(["-bbox"]).arg(dir.join("f.pdf")).arg("-").output().unwrap();
+        let html = String::from_utf8_lossy(&out.stdout).into_owned();
+        let xs: Vec<f32> = html
+            .lines()
+            .filter(|l| l.contains(">Lorem<"))
+            .filter_map(|l| l.split("xMin=\"").nth(1)?.split('"').next()?.parse().ok())
+            .collect();
+        assert!(xs.len() >= 6, "{xs:?}");
+        assert!(xs[0] > 200.0, "första stycket vid x = {}", xs[0]);
+        assert!(xs.iter().any(|&x| x < 100.0), "inget stycke under bilden: {xs:?}");
     }
 
     #[test]

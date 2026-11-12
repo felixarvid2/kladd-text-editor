@@ -1342,6 +1342,18 @@ fn uuid_v4(seed: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Skriver HTML för `KLADD_MD_IN` till `KLADD_HTML_OUT` (bilder från mappen bredvid): för att
+    /// titta på resultatet i en webbläsare.
+    #[test]
+    #[ignore]
+    fn html_manual() {
+        let (Ok(i), Ok(o)) = (std::env::var("KLADD_MD_IN"), std::env::var("KLADD_HTML_OUT")) else { return };
+        let md = std::fs::read_to_string(&i).unwrap();
+        let dir = std::path::Path::new(&i).parent().unwrap().to_path_buf();
+        let w = html(&md, "Prov", &|src| std::fs::read(dir.join(src)).ok().map(|bytes| Image { bytes, extent: None })).unwrap();
+        std::fs::write(o, w.bytes).unwrap();
+    }
+
     use super::*;
     use std::io::Read;
 

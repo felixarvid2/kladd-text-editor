@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use egui::epaint::text::FontsView;
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
-use egui::{Color32, FontFamily, FontId, Galley, Stroke, Vec2};
+use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
-use super::markup::{self, Align, Analysis, Block, DocDefaults, Piece};
+use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
@@ -113,6 +113,8 @@ struct DocState {
     /// Utlagda stycken, nycklade på allt som påverkar dem.
     units: HashMap<u64, Unit>,
     tick: u64,
+    /// Flytande bilder i senaste utläggningen: bildens byteläge och sida.
+    float_starts: Vec<(usize, Float, usize)>,
 }
 
 #[derive(Default)]
@@ -148,6 +150,7 @@ impl Cache {
             frame: None,
             units: HashMap::new(),
             tick: 0,
+            float_starts: Vec::new(),
         });
         if st.text != text {
             st.text.clear();
@@ -179,6 +182,14 @@ impl Cache {
     /// Bilderna i ordning (räknas om bara när texten ändrats).
     pub fn images(&mut self, doc_id: u64, text: &str) -> Arc<Vec<markup::ImageRef>> {
         self.state(doc_id, text).images()
+    }
+
+    /// Sidan (och radnumret i galleriet som bilden är förankrad vid) om bilden som börjar vid
+    /// `byte` flyter i den senaste utläggningen. Bilder som inte får plats bredvid texten är
+    /// vanliga bilder (`None`).
+    pub fn float_side(&mut self, doc_id: u64, text: &str, byte: usize) -> Option<(Float, usize)> {
+        let st = self.state(doc_id, text);
+        st.float_starts.iter().find(|f| f.0 == byte).map(|f| (f.1, f.2))
     }
 
     /// Rubrikerna i ordning (räknas om bara när texten ändrats).
@@ -306,6 +317,8 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         }
         para.image_w.to_bits().hash(&mut h);
         para.collapse.hash(&mut h);
+        para.float.map(|f| (f.side, f.size.x.to_bits(), f.size.y.to_bits(), f.alone)).hash(&mut h);
+        para.reserve.map(f32::to_bits).hash(&mut h);
         para.toc_h.to_bits().hash(&mut h);
     }
     // Markörens rader i förhållande till fönstret.
@@ -347,6 +360,7 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         pc.object.hash(&mut h);
         pc.footnote_ref.is_some().hash(&mut h);
         pc.footnote_def.is_some().hash(&mut h);
+        pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
         if let Some(s) = &pc.span {
             s.font_family.hash(&mut h);
             s.font_size.map(f32::to_bits).hash(&mut h);
@@ -407,44 +421,94 @@ fn relayout(
         i = last;
     }
 
-    let mut slots: Vec<Arc<Vec<Arc<Galley>>>> = Vec::with_capacity(groups.len());
-    // Stycken att lägga ut: (plats, nyckel, jobb för fönstret, styckena relativt fönstret).
-    let mut pending: Vec<(usize, u64, LayoutJob, Vec<Para>)> = Vec::new();
-    for (gi, (pr, w)) in groups.iter().enumerate() {
-        let key = unit_key(env, text, &a, p, w, &paras[pr.clone()]);
-        if let Some(u) = st.units.get_mut(&key) {
-            u.used = tick;
-            slots.push(u.galleys.clone());
-            continue;
-        }
-        let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
-        job.sections = build_sections(text, &a, p, &grid, w.clone());
-        for s in &mut job.sections {
-            s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
-        }
-        let rel: Vec<Para> = paras[pr.clone()]
-            .iter()
-            .map(|q| Para { range: q.range.start - w.start..q.range.end - w.start, ..q.clone() })
-            .collect();
-        pending.push((gi, key, job, rel));
-        slots.push(Arc::new(Vec::new()));
+    // Grupperna läggs ut i ordning: en flytande bild påverkar bredden på stycken efter den, och
+    // hur högt dessa är avgör var bilden slutar.
+    let gap = FLOAT_GAP * p.zoom;
+    struct FloatBox {
+        side: Float,
+        w: f32,
+        bottom: f32,
     }
-    if !pending.is_empty() {
-        let laid: Vec<Vec<Arc<Galley>>> = ctx.fonts_mut(|f| {
-            pending
-                .iter()
-                .map(|(_, _, job, rel)| rel.iter().map(|q| layout_para(f, job, q, wrap_width, ppp)).collect())
-                .collect()
-        });
-        for ((gi, key, _, _), gs) in pending.into_iter().zip(laid) {
-            let gs = Arc::new(gs);
-            slots[gi] = gs.clone();
-            st.units.insert(key, Unit { galleys: gs, used: tick });
+    let mut active: Vec<FloatBox> = Vec::new();
+    let mut y = 0.0f32;
+    let mut row_no = 0usize;
+    let mut anchors: Vec<(usize, f32)> = Vec::new();
+    let mut starts: Vec<(usize, Float, usize)> = Vec::new();
+    let mut all: Vec<Arc<Galley>> = Vec::new();
+    for (pr, w) in groups.iter() {
+        active.retain(|f| f.bottom > y + 0.5);
+        let table = grid.iter().any(|t| t.region.start < w.end && w.start < t.region.end);
+        let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
+        let mut anchor = None;
+        if let (Some(f), false) = (gp[0].float, table) {
+            let used: f32 = active.iter().map(|f| f.w).sum();
+            let same = active.iter().any(|a| a.side == f.side);
+            if same || wrap_width - used - f.size.x - gap < FLOAT_MIN_ROOM * p.zoom {
+                // Ryms inte bredvid texten: en ensam bild får en egen rad, annars ritas den på texten.
+                gp[0].float = None;
+                if f.alone {
+                    gp[0].collapse = false;
+                    gp[0].reserve = Some(f.size.y);
+                }
+            } else {
+                anchor = Some(f);
+            }
+        } else if gp[0].float.is_some() {
+            gp[0].float = None;
         }
+        // Stycket flyter också runt sin egen bild (om det har text).
+        let own = anchor.filter(|f| !f.alone).map(|f| FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+        let rel: Vec<ActiveFloat> = if table {
+            Vec::new()
+        } else {
+            active
+                .iter()
+                .chain(own.iter())
+                .map(|f| (f.side, f.w, ((f.bottom - y) * 2.0).round() / 2.0))
+                .collect()
+        };
+        let key = {
+            let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
+            for f in &rel {
+                (f.0, f.1.to_bits(), f.2.to_bits()).hash(&mut h);
+            }
+            h.finish()
+        };
+        let galleys: Arc<Vec<Arc<Galley>>> = if let Some(u) = st.units.get_mut(&key) {
+            u.used = tick;
+            u.galleys.clone()
+        } else {
+            let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
+            job.sections = build_sections(text, &a, p, &grid, w.clone());
+            for s in &mut job.sections {
+                s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
+            }
+            let laid: Vec<Arc<Galley>> = ctx.fonts_mut(|f| {
+                gp.iter()
+                    .map(|q| {
+                        let q = Para { range: q.range.start - w.start..q.range.end - w.start, ..q.clone() };
+                        layout_para_floats(f, &job, &q, wrap_width, ppp, &rel)
+                    })
+                    .collect()
+            });
+            let gs = Arc::new(laid);
+            st.units.insert(key, Unit { galleys: gs.clone(), used: tick });
+            gs
+        };
+        if let Some(f) = anchor {
+            anchors.push((row_no, f.size.y));
+            if let Some(pc) = pieces_in(&a, &gp[0].range).iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some())) {
+                starts.push((pc.range.start, f.side, row_no));
+            }
+            active.push(FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+        }
+        row_no += galleys.iter().map(|g| g.rows.len()).sum::<usize>();
+        y += galleys.iter().map(|g| g.rect.height()).sum::<f32>();
+        all.extend(galleys.iter().cloned());
     }
     st.units.retain(|_, u| u.used == tick);
+    st.float_starts = starts;
 
-    let all: Vec<Arc<Galley>> = slots.iter().flat_map(|s| s.iter().cloned()).collect();
     let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
     job.wrap.max_width = wrap_width;
     job.sections.push(LayoutSection {
@@ -454,7 +518,7 @@ fn relayout(
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
     if let Some(geom) = pages {
-        super::pages::paginate(&mut g, geom, ppp);
+        super::pages::paginate(&mut g, geom, ppp, &anchors);
     }
     g
 }
@@ -1000,6 +1064,8 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
     bld.marks.sort_by_key(|m| m.0.start);
     bld.cuts.extend(leads.keys().copied());
 
+    // Slutet på raden med den senast placerade flytande bilden: fler på samma rad är vanliga.
+    let mut float_line_end = 0usize;
     for pc in pcs {
         let r = pc.range.clone();
         if r.is_empty() {
@@ -1023,6 +1089,12 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
                     // Dold text, men första tecknet reserverar bildens höjd.
                     let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
                     let fam = (p.font_family)(Some(a.defaults.font()), false, false);
+                    if img.align.is_some() && r.start >= float_line_end {
+                        // Flytande bild: osynlig och utan höjd; layouten reserverar rutan vid kanten.
+                        float_line_end = text[r.end..].find('\n').map_or(text.len(), |i| r.end + i);
+                        bld.push(r, &hidden_format(fam));
+                        continue;
+                    }
                     let mut f1 = hidden_format(fam.clone());
                     f1.line_height = Some(h);
                     bld.push(r.start..r.start + first, &f1);
@@ -1123,8 +1195,34 @@ struct Para {
     image_w: f32,
     /// Dold taggrad (div, standardkommentaren) eller tom rad intill en: ~0 höjd.
     collapse: bool,
+    /// Stycket har en flytande bild (`<img align>`). Layouten reserverar en ruta vid textkanten
+    /// som stycket självt och följande stycken flyter runt.
+    float: Option<FloatSpec>,
+    /// Bildens höjd när en flytande bild som står ensam inte får plats bredvid texten: den får
+    /// en egen rad.
+    reserve: Option<f32>,
     /// Innehållsförteckning (`<!-- kladd: toc -->`, dold): radens höjd i px, annars 0.
     toc_h: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatSpec {
+    side: Float,
+    size: Vec2,
+    /// Raden innehåller bara bilden (då kollapsar den).
+    alone: bool,
+}
+
+/// Luft mellan en flytande bild och texten (px vid 100 %).
+const FLOAT_GAP: f32 = 12.0;
+/// Minsta textbredd (px vid 100 %) bredvid en flytande bild; smalare och bilden får en egen rad.
+const FLOAT_MIN_ROOM: f32 = 96.0;
+
+/// Sant om raden som `pc` står på bara innehåller bilden (en flytande bild står ensam).
+fn is_float_line(text: &str, pc: &Piece) -> bool {
+    let ls = text[..pc.range.start].rfind('\n').map_or(0, |i| i + 1);
+    let le = text[pc.range.end..].find('\n').map_or(text.len(), |i| pc.range.end + i);
+    text[ls..le].trim().len() == pc.range.len()
 }
 
 /// Styckena i texten. En avslutande `\n` ger ett tomt sista stycke.
@@ -1176,8 +1274,20 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             .filter_map(|img| (p.image_size)(&super::images::size_key(img)))
             .map(|sz| sz.x)
             .sum();
-        let collapse = tag.last() != Some(&0);
-        let toc = if collapse && t == super::nav::TOC_LINE {
+        // Första flytande bilden på raden (fler på samma rad är vanliga bilder).
+        let mut float = None;
+        if !intersects(&range, &p.reveal) {
+            let first = ps.iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some()));
+            if let Some((pc, img)) = first.and_then(|pc| pc.image.as_ref().map(|i| (*pc, i))) {
+                float = (p.image_size)(&super::images::size_key(img)).zip(img.align).map(|(size, side)| FloatSpec {
+                    side,
+                    size,
+                    alone: is_float_line(text, pc),
+                });
+            }
+        }
+        let collapse = tag.last() != Some(&0) || float.is_some_and(|f| f.alone);
+        let toc = if tag.last() != Some(&0) && t == super::nav::TOC_LINE {
             Some(*toc_h.get_or_insert_with(|| {
                 let n = super::nav::toc_entries(&super::nav::headings(text, a)).len();
                 super::nav::toc_size_for(p.zoom, &a.defaults, n).1
@@ -1185,7 +1295,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         } else {
             None
         };
-        out.push(Para { range, align, list, image_w, collapse, toc_h: toc.unwrap_or(0.0) });
+        out.push(Para { range, align, list, image_w, collapse, toc_h: toc.unwrap_or(0.0), float, reserve: None });
         if e >= text.len() {
             break;
         }
@@ -1322,9 +1432,84 @@ fn justify_row(
     Some(best)
 }
 
+/// En flytande bild som är aktiv vid ett stycke: sida, upptagen bredd (bild + luft) och
+/// understa kanten i px under styckets överkant.
+pub(crate) type ActiveFloat = (Float, f32, f32);
+
 /// Lägger ut ett stycke och placerar dess rader: hängande indrag, centrering, högerjustering
 /// och marginaljustering.
 fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: f32, ppp: f32) -> Arc<Galley> {
+    layout_piece(fonts, full, para, avail, 0.0, ppp, None, false, true).0
+}
+
+/// Som `layout_para`, men stycket flyter runt flytande bilder: rader vars överkant ligger ovanför
+/// en bilds underkant läggs ut smalare (och förskjuts åt höger vid vänsterbilder); stycket delas
+/// vid första raden som börjar under bilden och resten läggs ut igen med full (eller nästa
+/// bilds) bredd. Alltså per rad, inte per stycke.
+fn layout_para_floats(
+    fonts: &mut FontsView<'_>,
+    full: &LayoutJob,
+    para: &Para,
+    avail: f32,
+    ppp: f32,
+    floats: &[ActiveFloat],
+) -> Arc<Galley> {
+    if floats.is_empty() || para.range.is_empty() || !avail.is_finite() {
+        return layout_para(fonts, full, para, avail, ppp);
+    }
+    let mut pieces: Vec<Arc<Galley>> = Vec::new();
+    let mut cur = para.clone();
+    let mut y = 0.0f32;
+    loop {
+        let act: Vec<&ActiveFloat> = floats.iter().filter(|f| f.2 > y + 0.25).collect();
+        let sum = |side: Float| act.iter().filter(|f| f.0 == side).map(|f| f.1).sum::<f32>();
+        let (lw, rw) = (sum(Float::Left), sum(Float::Right));
+        let cut = act.iter().map(|f| f.2).fold(f32::NEG_INFINITY, f32::max) - y;
+        let eff = (avail - lw - rw).max(24.0);
+        let (g, consumed) =
+            layout_piece(fonts, full, &cur, eff, lw, ppp, act.first().map(|_| cut), !pieces.is_empty(), true);
+        y += g.rect.height();
+        pieces.push(g);
+        let Some(n) = consumed else { break };
+        // Resten av stycket börjar efter de n första tecknen.
+        let text = &full.text[cur.range.clone()];
+        let Some((off, _)) = text.char_indices().nth(n) else { break };
+        cur.range.start += off;
+        cur.list = cur.list.map(|l| ListGeom { marker_chars: 0, ..l });
+        if cur.range.is_empty() {
+            break;
+        }
+    }
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_else(|| unreachable!());
+    }
+    let whole = Arc::new(clip_job(full, para.range.clone()));
+    let mut g = Galley::concat(whole, &pieces, ppp);
+    // Delningen är ingen radbrytning i texten.
+    let mut at = 0;
+    for pc in &pieces[..pieces.len() - 1] {
+        at += pc.rows.len();
+        g.rows[at - 1].ends_with_newline = false;
+    }
+    Arc::new(g)
+}
+
+/// Lägger ut (en del av) ett stycke i bredden `avail` från vänsterkanten `x0`. Med `cut` delas
+/// stycket före första raden vars överkant ligger på eller under `cut`; då är andra delen
+/// antalet tecken som lades ut. `cont` = delen är en fortsättning (ingen första rad med
+/// listmarkör), `last` = delen innehåller styckets sista rad (marginaljustering lämnar den).
+#[allow(clippy::too_many_arguments)]
+fn layout_piece(
+    fonts: &mut FontsView<'_>,
+    full: &LayoutJob,
+    para: &Para,
+    avail: f32,
+    x0: f32,
+    ppp: f32,
+    cut: Option<f32>,
+    cont: bool,
+    last: bool,
+) -> (Arc<Galley>, Option<usize>) {
     let mut pj = clip_job(full, para.range.clone());
     if para.collapse {
         let h = if para.toc_h > 0.0 {
@@ -1337,6 +1522,10 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
         for s in &mut pj.sections {
             s.format.line_height = Some(h);
         }
+    } else if let Some(h) = para.reserve {
+        for s in &mut pj.sections {
+            s.format.line_height = Some(h);
+        }
     }
     let list = para.list;
     let wrap_w = match list {
@@ -1346,10 +1535,27 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
     pj.wrap.max_width = wrap_w;
     let mut g = fonts.layout_job(pj.clone());
 
+    let mut consumed = None;
+    let mut last = last;
+    if let Some(cut) = cut {
+        if let Some(idx) = g.rows.iter().position(|r| r.pos.y >= cut - 0.01).filter(|&i| i > 0) {
+            let gm = Arc::make_mut(&mut g);
+            consumed = Some(gm.rows[..idx].iter().map(|r| r.row.glyphs.len()).sum());
+            gm.rows.truncate(idx);
+            gm.rect = Rect::ZERO;
+            gm.mesh_bounds = Rect::NOTHING;
+            for r in &gm.rows {
+                gm.rect |= r.rect();
+                gm.mesh_bounds |= r.row.visuals.mesh_bounds.translate(r.pos.to_vec2());
+            }
+            last = false;
+        }
+    }
+
     let finite = avail.is_finite();
-    let shifts = finite && (list.is_some() || para.align != Align::Left);
+    let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0);
     if !shifts {
-        return g;
+        return (g, consumed);
     }
     let round = |x: f32| (x * ppp).round() / ppp;
     let gm = Arc::make_mut(&mut g);
@@ -1360,7 +1566,7 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
         let end = content_end(&row);
         // Radens vänsterkant och bredd som raden ska fylla.
         let left = match list {
-            Some(l) if i == 0 => {
+            Some(l) if i == 0 && !cont => {
                 let prefix = row.glyphs.get(l.marker_chars).map_or(row.size.x, |g| g.pos.x);
                 (l.text_x - prefix).max(0.0)
             }
@@ -1372,17 +1578,17 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
         match para.align {
             Align::Center if list.is_none() => x += ((target - end.max(para.image_w)) / 2.0).max(0.0),
             Align::Right if list.is_none() => x += (target - end.max(para.image_w)).max(0.0),
-            Align::Justify if i + 1 < n => {
+            Align::Justify if i + 1 < n || !last => {
                 if let Some(r) = justify_row(fonts, &pj, char_off, &row, target) {
                     gm.rows[i].row = r;
                 }
             }
             _ => {}
         }
-        gm.rows[i].pos.x = round(x);
+        gm.rows[i].pos.x = round(x + x0);
         char_off += row.glyphs.len();
     }
-    g
+    (g, consumed)
 }
 
 /// Lägger ut hela jobbet stycke för stycke och fogar ihop styckena till ett galleri som
@@ -1899,7 +2105,7 @@ mod tests {
             for _ in 0..2 {
                 let out = ctx.run_ui(Default::default(), |ui| {
                     let mut g = ui.ctx().fonts_mut(|fo| layout_galley(fo, job.clone(), &a, &p, geom.text_w(), 1.0));
-                    pages::paginate(&mut g, &geom, 1.0);
+                    pages::paginate(&mut g, &geom, 1.0, &[]);
                     let row_h = |needle: &str| {
                         let c = egui::text::CCursor::new(ci(&t, needle));
                         g.rows[g.layout_from_cursor(c).row].height()
@@ -2206,7 +2412,7 @@ mod tests {
                 inc = Some(shape(&g));
                 let job = layout_job(&text, &a, &p);
                 let mut f = ctx.fonts_mut(|fo| layout_galley(fo, job, &a, &p, wrap, 1.0));
-                pages::paginate(&mut f, &geom, 1.0);
+                pages::paginate(&mut f, &geom, 1.0, &[]);
                 full = Some(shape(&f));
             });
             std::mem::forget(out);
