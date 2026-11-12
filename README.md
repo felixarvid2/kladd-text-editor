@@ -45,6 +45,8 @@ Ladda ner det senaste `.deb`-paketet från [Releases](https://github.com/felixar
 sudo apt install ./kladd_*.deb
 ```
 
+Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
+
 Du kan också bygga Kladd från källkoden:
 
 ```bash
@@ -70,6 +72,8 @@ git push origin v1.4.0
 ```
 
 Det går också att köra workflowen *Release* för hand under Actions och kryssa i *Publicera release*. Då skapas taggen från versionen i `Cargo.toml`.
+
+Release-anteckningarna hämtas från avsnittet för versionen i `CHANGELOG.md`; finns inget avsnitt skapas anteckningarna automatiskt. Skriv anteckningarna i `CHANGELOG.md` innan du taggar. För en redan publicerad release: kör workflowen för hand, fyll i *update_notes* med taggen (till exempel `v1.5.0`) och lämna *Publicera release* ikryssad av. Då byts bara anteckningarna ut.
 
 </details>
 

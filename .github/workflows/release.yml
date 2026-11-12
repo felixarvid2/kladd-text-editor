@@ -7,6 +7,10 @@
 #      "Publicera release" ikryssat. Då skapas taggen v<version> på den valda
 #      grenens senaste commit.
 # Körs workflowen för hand utan kryss byggs paketet bara som en artefakt.
+# Release-anteckningarna hämtas från avsnittet för versionen i CHANGELOG.md
+# (annars genereras de automatiskt). För en redan publicerad release: kör
+# workflowen för hand med "update_notes" ifylld (t.ex. v1.5.0); då byts bara
+# anteckningarna ut, inget byggs och ingen release skapas.
 name: Release
 
 on:
@@ -18,12 +22,44 @@ on:
         description: "Publicera release (skapar taggen v<version> från Cargo.toml)"
         type: boolean
         default: false
+      update_notes:
+        description: "Uppdatera bara anteckningarna för en befintlig release (tagg, t.ex. v1.5.0) från CHANGELOG.md"
+        type: string
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
+  notes:
+    # Byter ut anteckningarna på en befintlig release. Rör inget annat.
+    if: github.event_name == 'workflow_dispatch' && inputs.update_notes != ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uppdatera release-anteckningar
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.update_notes }}
+        run: |
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Ogiltig tagg '$TAG' (förväntat t.ex. v1.5.0)"; exit 1 ;;
+          esac
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            /^## \[/ { if (on) exit; on = (index($0, "## [" v "]") == 1); next }
+            on' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md har inget avsnitt för $VERSION"
+            exit 1
+          fi
+          printf '\nFullständig ändringslogg: https://github.com/%s/blob/main/CHANGELOG.md\n' "$GITHUB_REPOSITORY" >> notes.md
+          gh release edit "$TAG" --notes-file notes.md
+
   deb:
+    if: github.event_name != 'workflow_dispatch' || inputs.update_notes == ''
     # 22.04 ger ett paket som också fungerar på nyare Ubuntu (äldre glibc).
     runs-on: ubuntu-22.04
     steps:
@@ -68,7 +104,18 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          # Anteckningarna är avsnittet för versionen i CHANGELOG.md, utan rubrikraden.
+          awk -v v="$VERSION" '
+            /^## \[/ { if (on) exit; on = (index($0, "## [" v "]") == 1); next }
+            on' CHANGELOG.md > notes.md
+          if grep -q '[^[:space:]]' notes.md; then
+            printf '\nFullständig ändringslogg: https://github.com/%s/blob/main/CHANGELOG.md\n' "$GITHUB_REPOSITORY" >> notes.md
+            notes=(--notes-file notes.md)
+          else
+            echo "::warning::CHANGELOG.md har inget avsnitt för $VERSION, genererar anteckningar automatiskt"
+            notes=(--generate-notes)
+          fi
           gh release create "$TAG" target/debian/*.deb \
             --target "$GITHUB_SHA" \
             --title "Kladd $VERSION" \
-            --generate-notes
+            "${notes[@]}"
