@@ -259,3 +259,24 @@ som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/si
 → `{sida}`, `text:page-count` → `{sidor}`) hamnar i grundformatskommentaren. Vid skrivning ligger
 `mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
 `language()` visar "OpenDocument".
+
+## 1.7: säkerhetskopior, fotnoter, tabeller, flytande bilder, navigering, export, sök, prestanda
+
+Gemensamma format (alla moduler ska använda dessa):
+
+- **Fotnoter**: Markdown-fotnoter. `[^1]` i texten och definitionen `[^1]: Fotnotens text` i slutet
+  av dokumentet (en definition per rad, efter all annan text, separerade från den med en tom rad).
+  Etiketterna är löpnummer 1, 2, 3 … i den ordning referenserna kommer. pulldown-cmark med
+  `Options::ENABLE_FOOTNOTES`. Word: `w:footnoteReference` + footnotes.xml; ODT: `text:note`.
+- **Tabeller**:
+  - Radbrytning i en cell: `<br>`.
+  - Sammanfogade celler (vågrätt): en cell följs av extra pipes, `| Rubrik över två ||`
+    (MultiMarkdown). Antalet extra `|` = antalet celler den spänner över minus ett. Lodrätt
+    sammanfogade celler stöds inte (de skrivs som tomma celler).
+  - Kolumnbredd: antalet bindestreck i avgränsarraden, `| ------ | -- |`, ger kolumnernas relativa
+    bredd (som Pandoc). Lika många streck (eller `---` överallt) = automatisk bredd.
+- **Flytande bilder**: `<img src="…" alt="…" width="200" align="left">` (eller `right`): texten i
+  följande stycken flyter runt bilden. Utan `align` är bilden en egen rad som förut.
+- **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
+  sidnummer (klickbara); Word skriver ett TOC-fält, ODT `text:table-of-content`, PDF/HTML/EPUB en
+  lista med rubrikerna.
