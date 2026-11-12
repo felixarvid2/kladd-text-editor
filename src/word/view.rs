@@ -753,6 +753,20 @@ impl KladdApp {
             let focus = std::mem::take(&mut self.focus_editor);
             let secondary_target = self.wv.target.clone();
 
+            // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
+            // bara slår upp dem (en okänd familj kraschar egui).
+            let mut fam_map: HashMap<(String, bool, bool), FontFamily> = HashMap::new();
+            for (name, bold, italic) in layout::needed_fonts(&analysis) {
+                let fam = self.doc_fonts.family(&ctx, Some(&name), bold, italic);
+                fam_map.insert((name, bold, italic), fam);
+            }
+            let font_family = |name: Option<&str>, bold: bool, italic: bool| -> FontFamily {
+                name.and_then(|n| fam_map.get(&(n.to_owned(), bold, italic)))
+                    .cloned()
+                    .unwrap_or_else(|| crate::theme::doc_font(bold, italic))
+            };
+            let fonts_gen = self.doc_fonts.generation();
+
             let doc = &mut self.docs[self.active];
             let word = &mut self.word;
             let speller = &mut self.speller;
@@ -782,11 +796,11 @@ impl KladdApp {
                     current_match,
                     image_size: &image_size,
                     measure: &measure,
+                    font_family: &font_family,
+                    fonts_gen,
                 };
                 let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
-                    let mut job = word.job(doc_id, buf.as_str(), &params);
-                    job.wrap.max_width = wrap_width;
-                    ui.ctx().fonts_mut(|f| f.layout_job(job))
+                    word.galley(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width)
                 };
                 let min_h = (px(z, PAGE_H_PT) - 2.0 * margin).max(0.0);
                 let out = ui
