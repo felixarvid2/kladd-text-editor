@@ -4,9 +4,10 @@
 //! också skriver PDF med `krilla`: typsnitten bäddas in som delmängder, texten går att
 //! markera och söka i, rubriker blir bokmärken och länkar blir klickbara.
 //!
-//! Kladd har en egen enkel sidlayout: A4, IBM Plex Sans för brödtext och rubriker,
+//! Kladd har en egen enkel sidlayout: sidstorlek och marginaler från grundformatraden,
+//! IBM Plex Sans för brödtext och rubriker,
 //! IBM Plex Mono för kod, radbrytning mellan ord (mätt med rustybuzz, samma formning
-//! som krilla använder när texten ritas) och sidnummer i sidfoten.
+//! som krilla använder när texten ritas), sidhuvud och sidfot med sidnummer.
 
 use std::collections::HashMap;
 
@@ -24,13 +25,7 @@ use crate::docx::Image as DocImage;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::theme;
 
-// --- sidmått i punkter (1/72 tum) -------------------------------------------
-const PAGE_W: f32 = 595.28;
-const PAGE_H: f32 = 841.89;
-const MARGIN_X: f32 = 64.0;
-const MARGIN_TOP: f32 = 68.0;
-const MARGIN_BOTTOM: f32 = 72.0;
-const CONTENT_W: f32 = PAGE_W - 2.0 * MARGIN_X;
+// --- mått i punkter (1/72 tum); sidstorlek och marginaler kommer från dokumentet ---
 const BODY_SIZE: f32 = 10.5;
 const LINE: f32 = 1.5;
 const PARA_GAP: f32 = 7.5;
@@ -132,7 +127,62 @@ enum Block {
     Code { text: String, indent: f32 },
     Table { rows: Vec<Vec<Vec<Span>>> },
     Rule,
-    Image { src: String, alt: String, indent: f32 },
+    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align },
+}
+
+/// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
+fn strip_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("<!--k:") {
+        let after = &rest[i + 6..];
+        match after.find("-->") {
+            Some(j) if after[..j].chars().all(|c| c.is_ascii_digit()) => {
+                out.push_str(&rest[..i]);
+                rest = &after[j + 3..];
+            }
+            _ => {
+                out.push_str(&rest[..i + 6]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Värdet av attributet `name` i en tagg (med citattecken).
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(name) {
+        let at = from + i;
+        let before_ok = at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace();
+        let rest = tag[at + name.len()..].trim_start();
+        if before_ok {
+            if let Some(r) = rest.strip_prefix('=') {
+                let r = r.trim_start();
+                let q = r.chars().next()?;
+                if q == '"' || q == '\'' {
+                    let end = r[1..].find(q)?;
+                    return Some(r[1..1 + end].to_owned());
+                }
+            }
+        }
+        from = at + name.len();
+    }
+    None
+}
+
+/// `<img src="…" alt="…" width="W" [height="H"]>` med storlek i CSS-px (1/96 tum) omräknad till pt.
+fn parse_img(tag: &str) -> Option<(String, String, ImgSize)> {
+    if !tag.get(..4)?.eq_ignore_ascii_case("<img") || !tag.ends_with('>') {
+        return None;
+    }
+    let src = attr(tag, "src")?;
+    let alt = attr(tag, "alt").unwrap_or_default();
+    let px = |n: &str| attr(tag, n).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v > 0.0).map(|v| v * 0.75);
+    Some((src, alt, ImgSize { w: px("width"), h: px("height") }))
 }
 
 fn heading_num(level: HeadingLevel) -> u8 {
@@ -311,7 +361,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                     if let Some((src, alt)) = image.take() {
                         // En bild i en tabellcell eller mitt i text ritas som eget block efter stycket.
                         flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote) });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left });
                     }
                 }
                 _ => {}
@@ -334,6 +384,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 // Ett HTML-block kan ha flera rader; varje rad som är en känd tagg tolkas för sig.
                 let mut first = true;
+                let t = strip_markers(&t);
                 for line in t.split('\n') {
                     let tag = line.trim();
                     if tag.is_empty() {
@@ -357,6 +408,10 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                     } else if style::is_div_close(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         aligns.pop();
+                    } else if let Some((src, alt, size)) = parse_img(tag) {
+                        // `<img>` med storlek blir ett eget bildblock, justerat av omgivande `<div align>`.
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align });
                     } else if tag.starts_with("<!--") && tag.ends_with("-->") {
                         // Kommentarer (också grundformatraden) skrivs inte ut.
                     } else {
@@ -419,6 +474,14 @@ struct Layout<'a> {
     base: Face,
     /// Justering för blocket som läggs ut just nu.
     align: Align,
+    /// Sidans mått och marginaler i pt (från grundformatraden): bredd, höjd, topp, botten, vänster
+    /// och textbredd.
+    pw: f32,
+    ph: f32,
+    mt: f32,
+    mb: f32,
+    ml: f32,
+    cw: f32,
 }
 
 /// En färdigbruten rad. `hard` = raden slutar med radbrytning (ska inte marginaljusteras).
@@ -505,18 +568,87 @@ fn line_size(l: &Line, size: f32) -> f32 {
     if m > 0.0 { m } else { size }
 }
 
-impl Layout<'_> {
+/// Bildens storlek enligt `width`/`height` i `<img>`, i pt.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ImgSize {
+    w: Option<f32>,
+    h: Option<f32>,
+}
+
+impl<'a> Layout<'a> {
+    fn new(resolve: &'a dyn Fn(&str) -> Option<DocImage>, defaults: &DocDefaults) -> Self {
+        let body = defaults.size();
+        let base = match defaults.font_family.as_deref().map(classify_family) {
+            Some(Family::Mono) => Face::Mono,
+            _ => Face::Sans,
+        };
+        let (pw, ph) = defaults.page();
+        let [mt, mr, mb, ml] = defaults.margins();
+        // Orimliga marginaler (större än sidan) ger ändå en användbar textyta.
+        let cw = (pw - ml - mr).max(36.0);
+        Layout {
+            m: Measurer::new(),
+            pages: Vec::new(),
+            y: mt,
+            headings: Vec::new(),
+            images: Vec::new(),
+            resolve,
+            missing: Vec::new(),
+            body,
+            scale: body / BODY_SIZE,
+            base,
+            align: Align::Left,
+            pw,
+            ph,
+            mt,
+            mb,
+            ml,
+            cw,
+        }
+    }
+
+    /// Sidhuvud och sidfot för sida `page` (1-baserad) av `total`, som ritinstruktioner.
+    /// Baslinjen ligger halvvägs mellan sidkanten och marginalen.
+    fn header_footer(&mut self, d: &DocDefaults, page: usize, total: usize) -> Vec<Op> {
+        let size = self.body * 0.9;
+        let mut out = Vec::new();
+        let items = [
+            (d.header.clone(), d.header_align, self.mt / 2.0),
+            (
+                // Utan eget sidfotstecken visas ändå "N av M" till höger när dokumentet har flera sidor.
+                d.footer.clone().or_else(|| (total > 1).then(|| "{sida} av {sidor}".to_owned())),
+                if d.footer.is_some() { d.footer_align } else { Align::Right },
+                self.ph - self.mb / 2.0,
+            ),
+        ];
+        for (tpl, align, y) in items {
+            let Some(tpl) = tpl else { continue };
+            let text = style::fill_fields(&tpl, page, total).replace('\n', " ");
+            if text.trim().is_empty() {
+                continue;
+            }
+            let w = self.m.width(self.base, size, &text);
+            let x = match align {
+                Align::Center => self.ml + ((self.cw - w) / 2.0).max(0.0),
+                Align::Right => self.ml + (self.cw - w).max(0.0),
+                _ => self.ml,
+            };
+            out.push(Op::Text { x, y, face: self.base, size, text, color: MUTED, italic: false });
+        }
+        out
+    }
+
     fn page(&mut self) -> &mut PageOps {
         self.pages.last_mut().expect("minst en sida")
     }
 
     fn new_page(&mut self) {
         self.pages.push(PageOps { ops: Vec::new() });
-        self.y = MARGIN_TOP;
+        self.y = self.mt;
     }
 
     fn ensure(&mut self, h: f32) {
-        if self.y + h > PAGE_H - MARGIN_BOTTOM && self.y > MARGIN_TOP + 0.5 {
+        if self.y + h > self.ph - self.mb && self.y > self.mt + 0.5 {
             self.new_page();
         }
     }
@@ -713,12 +845,12 @@ impl Layout<'_> {
         }
     }
 
-    fn image(&mut self, src: &str, alt: &str, indent: f32) {
+    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align) {
         let Some(img) = (self.resolve)(src) else {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
             let spans = vec![Span { text: label, style: Style::default() }];
-            self.text_block(&spans, MARGIN_X + indent, CONTENT_W - indent, self.base, self.body, MUTED, false, None);
+            self.text_block(&spans, self.ml + indent, self.cw - indent, self.base, self.body, MUTED, false, None);
             return;
         };
         let Some(image) = make_image(&img.bytes) else {
@@ -731,12 +863,21 @@ impl Layout<'_> {
             Some((cx, cy)) => (cx as f32 / 12_700.0, cy as f32 / 12_700.0),
             None => (pw as f32 * 0.75, ph as f32 * 0.75),
         };
-        let max_w = CONTENT_W - indent;
+        // Angiven storlek (`width`/`height` i CSS-px, redan omräknat till pt); proportionerna bevaras
+        // när bara en sida anges.
+        let aspect = if pw > 0 { ph as f32 / pw as f32 } else { 1.0 };
+        match (size.w, size.h) {
+            (Some(sw), Some(sh)) => (w, h) = (sw, sh),
+            (Some(sw), None) => (w, h) = (sw, sw * aspect),
+            (None, Some(sh)) => (w, h) = (sh / aspect.max(0.0001), sh),
+            _ => {}
+        }
+        let max_w = self.cw - indent;
         if w > max_w {
             h *= max_w / w;
             w = max_w;
         }
-        let max_h = PAGE_H - MARGIN_TOP - MARGIN_BOTTOM;
+        let max_h = self.ph - self.mt - self.mb;
         if h > max_h {
             w *= max_h / h;
             h = max_h;
@@ -744,7 +885,13 @@ impl Layout<'_> {
         self.ensure(h);
         let index = self.images.len();
         self.images.push(image);
-        let (x, y) = (MARGIN_X + indent, self.y);
+        let free = (self.cw - indent - w).max(0.0);
+        let dx = match align {
+            Align::Center => free / 2.0,
+            Align::Right => free,
+            _ => 0.0,
+        };
+        let (x, y) = (self.ml + indent + dx, self.y);
         self.page().ops.push(Op::Image { x, y, w, h, index });
         self.y += h + PARA_GAP;
     }
@@ -759,14 +906,14 @@ impl Layout<'_> {
             for (i, cell) in r.iter().enumerate() {
                 let text: String = cell.iter().map(|s| s.text.as_str()).collect();
                 let w = self.m.width(self.base, size, &text) + 2.0 * pad + 2.0;
-                natural[i] = natural[i].max(w.min(CONTENT_W));
+                natural[i] = natural[i].max(w.min(self.cw));
             }
         }
         let total: f32 = natural.iter().sum();
-        let widths: Vec<f32> = if total <= CONTENT_W {
+        let widths: Vec<f32> = if total <= self.cw {
             natural
         } else {
-            natural.iter().map(|w| (w / total * CONTENT_W).max(30.0)).collect()
+            natural.iter().map(|w| (w / total * self.cw).max(30.0)).collect()
         };
         let line_h = size * LINE;
         for (ri, r) in rows.iter().enumerate() {
@@ -780,9 +927,10 @@ impl Layout<'_> {
             self.ensure(row_h);
             let top = self.y;
             if ri == 0 {
-                self.page().ops.push(Op::Rect { x: MARGIN_X, y: top, w: widths.iter().sum(), h: row_h, color: CODE_BG });
+                let ml = self.ml;
+                self.page().ops.push(Op::Rect { x: ml, y: top, w: widths.iter().sum(), h: row_h, color: CODE_BG });
             }
-            let mut x = MARGIN_X;
+            let mut x = self.ml;
             for (ci, w) in widths.iter().enumerate() {
                 if let Some(cell) = r.get(ci) {
                     self.y = top + pad;
@@ -793,10 +941,11 @@ impl Layout<'_> {
             }
             // Rutnät
             let total_w: f32 = widths.iter().sum();
+            let ml = self.ml;
             let page = self.page();
-            page.ops.push(Op::Line { x1: MARGIN_X, y1: top, x2: MARGIN_X + total_w, y2: top, width: 0.6, color: RULE });
-            page.ops.push(Op::Line { x1: MARGIN_X, y1: top + row_h, x2: MARGIN_X + total_w, y2: top + row_h, width: 0.6, color: RULE });
-            let mut x = MARGIN_X;
+            page.ops.push(Op::Line { x1: ml, y1: top, x2: ml + total_w, y2: top, width: 0.6, color: RULE });
+            page.ops.push(Op::Line { x1: ml, y1: top + row_h, x2: ml + total_w, y2: top + row_h, width: 0.6, color: RULE });
+            let mut x = ml;
             for w in widths.iter().chain(std::iter::once(&0.0)) {
                 page.ops.push(Op::Line { x1: x, y1: top, x2: x, y2: top + row_h, width: 0.6, color: RULE });
                 x += w;
@@ -815,8 +964,8 @@ impl Layout<'_> {
         let size = self.body * 0.86;
         let line_h = size * 1.45;
         let pad = 8.0;
-        let x = MARGIN_X + indent;
-        let w = CONTENT_W - indent;
+        let x = self.ml + indent;
+        let w = self.cw - indent;
         let mut lines = Vec::new();
         for raw in text.split('\n') {
             let raw = raw.replace('\t', "    ");
@@ -836,7 +985,7 @@ impl Layout<'_> {
         while i < lines.len() {
             self.ensure(line_h + 2.0 * pad);
             // Så många rader som får plats på sidan.
-            let room = ((PAGE_H - MARGIN_BOTTOM - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
+            let room = ((self.ph - self.mb - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
             let chunk = &lines[i..(i + room).min(lines.len())];
             let h = chunk.len() as f32 * line_h + 2.0 * pad;
             let top = self.y;
@@ -866,7 +1015,7 @@ impl Layout<'_> {
                         _ => (11.5, Face::SansSemi, 8.0),
                     };
                     let size = size * self.scale;
-                    if bi > 0 && self.y > MARGIN_TOP + 0.5 {
+                    if bi > 0 && self.y > self.mt + 0.5 {
                         self.y += before;
                     }
                     // Håll ihop rubriken med minst två rader text efter.
@@ -874,10 +1023,11 @@ impl Layout<'_> {
                     let text: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
                     self.headings.push(Heading { level: *level, text: text.trim().to_owned(), page: self.pages.len() - 1, y: self.y });
                     let spans: Vec<Span> = spans.iter().map(|s| Span { text: s.text.replace('\n', " "), style: s.style.clone() }).collect();
-                    self.text_block(&spans, MARGIN_X, CONTENT_W, face, size, INK, false, None);
+                    self.text_block(&spans, self.ml, self.cw, face, size, INK, false, None);
                     if *level == 1 {
                         let y = self.y + 2.0;
-                        self.page().ops.push(Op::Rect { x: MARGIN_X, y, w: 36.0, h: 2.2, color: ACCENT });
+                        let ml = self.ml;
+                        self.page().ops.push(Op::Rect { x: ml, y, w: 36.0, h: 2.2, color: ACCENT });
                         self.y += 9.0;
                     } else {
                         self.y += 3.0;
@@ -888,10 +1038,10 @@ impl Layout<'_> {
                     let top = self.y;
                     let page_before = self.pages.len();
                     let (color, italic) = if *quote > 0 { (MUTED, true) } else { (INK, false) };
-                    self.text_block(spans, MARGIN_X + indent, CONTENT_W - indent, self.base, self.body, color, italic, None);
+                    self.text_block(spans, self.ml + indent, self.cw - indent, self.base, self.body, color, italic, None);
                     if *quote > 0 {
-                        let x = MARGIN_X + indent - 9.0;
-                        let start = if self.pages.len() == page_before { top } else { MARGIN_TOP };
+                        let x = self.ml + indent - 9.0;
+                        let start = if self.pages.len() == page_before { top } else { self.mt };
                         let end = self.y;
                         self.page().ops.push(Op::Rect { x, y: start + 2.0, w: 2.0, h: (end - start - 2.0).max(1.0), color: RULE });
                     }
@@ -901,7 +1051,7 @@ impl Layout<'_> {
                     self.align = *align;
                     let mface = if marker.ends_with('.') { Face::Sans } else { Face::SansMedium };
                     let color = if *quote > 0 { MUTED } else { INK };
-                    self.text_block(spans, MARGIN_X + indent + 4.0, CONTENT_W - indent - 4.0, self.base, self.body, color, *quote > 0, Some((marker.clone(), mface)));
+                    self.text_block(spans, self.ml + indent + 4.0, self.cw - indent - 4.0, self.base, self.body, color, *quote > 0, Some((marker.clone(), mface)));
                     let next_is_item = matches!(blocks.get(bi + 1), Some(Block::Item { .. }));
                     self.y += if next_is_item { 2.0 } else { PARA_GAP };
                 }
@@ -910,10 +1060,11 @@ impl Layout<'_> {
                 Block::Rule => {
                     self.ensure(16.0);
                     let y = self.y + 6.0;
-                    self.page().ops.push(Op::Line { x1: MARGIN_X, y1: y, x2: MARGIN_X + CONTENT_W, y2: y, width: 0.8, color: RULE });
+                    let (ml, cw) = (self.ml, self.cw);
+                    self.page().ops.push(Op::Line { x1: ml, y1: y, x2: ml + cw, y2: y, width: 0.8, color: RULE });
                     self.y += 16.0;
                 }
-                Block::Image { src, alt, indent } => self.image(src, alt, *indent),
+                Block::Image { src, alt, indent, size, align } => self.image(src, alt, *indent, *size, *align),
             }
         }
     }
@@ -958,24 +1109,7 @@ fn doc_defaults(md: &str) -> DocDefaults {
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
     let blocks = parse_blocks(markdown);
     let defaults = doc_defaults(markdown);
-    let body = defaults.font_size.unwrap_or(BODY_SIZE);
-    let base = match defaults.font_family.as_deref().map(classify_family) {
-        Some(Family::Mono) => Face::Mono,
-        _ => Face::Sans,
-    };
-    let mut lay = Layout {
-        m: Measurer::new(),
-        pages: Vec::new(),
-        y: MARGIN_TOP,
-        headings: Vec::new(),
-        images: Vec::new(),
-        resolve,
-        missing: Vec::new(),
-        body,
-        scale: body / BODY_SIZE,
-        base,
-        align: Align::Left,
-    };
+    let mut lay = Layout::new(resolve, &defaults);
     lay.new_page();
     lay.run(&blocks);
 
@@ -987,12 +1121,14 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let mut doc = Document::new();
     let total = lay.pages.len();
     let images = std::mem::take(&mut lay.images);
+    // Sidhuvud och sidfot ritas sist, när sidantalet är känt.
+    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer(&defaults, pi + 1, total)).collect();
     for (pi, page_ops) in lay.pages.iter().enumerate() {
-        let mut page = doc.start_page_with(PageSettings::from_wh(PAGE_W, PAGE_H).expect("A4"));
+        let mut page = doc.start_page_with(PageSettings::from_wh(lay.pw, lay.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
         {
             let mut s = page.surface();
-            for op in &page_ops.ops {
+            for op in page_ops.ops.iter().chain(extras[pi].iter()) {
                 match op {
                     Op::Rect { x, y, w, h, color } => {
                         if let Some(r) = Rect::from_xywh(*x, *y, *w, *h) {
@@ -1045,21 +1181,6 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                     Op::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
                 }
             }
-            // Sidfot med sidnummer.
-            if total > 1 {
-                let label = format!("{} av {}", pi + 1, total);
-                let mut m = Measurer::new();
-                let lw = m.width(Face::Sans, 8.5, &label);
-                s.set_fill(Some(fill(MUTED)));
-                s.draw_text(
-                    Point::from_xy(PAGE_W - MARGIN_X - lw, PAGE_H - 36.0),
-                    fonts[&Face::Sans].clone(),
-                    8.5,
-                    &label,
-                    false,
-                    TextDirection::Auto,
-                );
-            }
             s.finish();
         }
         for (x, y, w, h, url) in links {
@@ -1075,7 +1196,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let mut outline = krilla::outline::Outline::new();
     let mut stack: Vec<(u8, krilla::outline::OutlineNode)> = Vec::new();
     for h in lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()) {
-        let dest = krilla::destination::XyzDestination::new(h.page, Point::from_xy(MARGIN_X, h.y));
+        let dest = krilla::destination::XyzDestination::new(h.page, Point::from_xy(lay.ml, h.y));
         let node = krilla::outline::OutlineNode::new(h.text.clone(), dest);
         while stack.last().is_some_and(|(l, _)| *l >= h.level) {
             let (_, done) = stack.pop().unwrap();
@@ -1213,19 +1334,7 @@ mod tests {
     }
 
     fn test_layout(resolve: &dyn Fn(&str) -> Option<DocImage>) -> Layout<'_> {
-        Layout {
-            m: Measurer::new(),
-            pages: Vec::new(),
-            y: MARGIN_TOP,
-            headings: Vec::new(),
-            images: Vec::new(),
-            resolve,
-            missing: Vec::new(),
-            body: BODY_SIZE,
-            scale: 1.0,
-            base: Face::Sans,
-            align: Align::Left,
-        }
+        Layout::new(resolve, &DocDefaults { font_size: Some(BODY_SIZE), ..Default::default() })
     }
 
     #[test]
@@ -1275,6 +1384,131 @@ mod tests {
         let w = write(&md, "Lång", &|_| None).unwrap();
         let s = String::from_utf8_lossy(&w.bytes);
         assert!(s.matches("/Type /Page").count() > 3 || s.matches("/Type/Page").count() > 3);
+    }
+
+    // --- sidformat, sidhuvud/sidfot, bildstorlekar ---------------------------------
+
+    fn laid_out<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> (Layout<'a>, DocDefaults) {
+        let d = doc_defaults(md);
+        let mut lay = Layout::new(resolve, &d);
+        lay.new_page();
+        lay.run(&parse_blocks(md));
+        (lay, d)
+    }
+
+    fn texts(ops: &[Op]) -> Vec<(f32, f32, String)> {
+        ops.iter()
+            .filter_map(|o| match o {
+                Op::Text { x, y, text, .. } => Some((*x, *y, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(w, h))
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn images_of(lay: &Layout) -> Vec<(f32, f32, f32, f32)> {
+        lay.pages
+            .iter()
+            .flat_map(|p| p.ops.iter())
+            .filter_map(|o| match o {
+                Op::Image { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn page_size_and_margins_follow_the_comment() {
+        let md = "<!-- kladd: page-size: letter landscape; page-margin: 36pt 50pt 40pt 60pt -->\n\nHej\n";
+        let (lay, _) = laid_out(md, &|_| None);
+        assert!((lay.pw - 792.0).abs() < 0.5 && (lay.ph - 612.0).abs() < 0.5, "{} x {}", lay.pw, lay.ph);
+        assert_eq!((lay.mt, lay.mb, lay.ml), (36.0, 40.0, 60.0));
+        assert!((lay.cw - (792.0 - 110.0)).abs() < 0.5);
+        let t = texts(&lay.pages[0].ops);
+        assert!((t[0].0 - 60.0).abs() < 0.01, "texten börjar i vänstermarginalen");
+        assert!(write(md, "x", &|_| None).unwrap().bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn header_and_footer_on_every_page_with_page_numbers() {
+        let md = "<!-- kladd: header: \"Rapport\"; header-align: right; footer: \"Sida {sida} av {sidor}\"; footer-align: center -->\n\n".to_owned()
+            + &(0..150).map(|i| format!("Stycke {i} med lite text som fyller sidan.\n\n")).collect::<String>();
+        let (mut lay, d) = laid_out(&md, &|_| None);
+        let total = lay.pages.len();
+        assert!(total >= 3, "{total} sidor");
+        for p in 1..=total {
+            let ops = lay.header_footer(&d, p, total);
+            let t = texts(&ops);
+            assert_eq!(t.len(), 2);
+            assert_eq!(t[0].2, "Rapport");
+            assert_eq!(t[1].2, format!("Sida {p} av {total}"));
+            // Baslinjer halvvägs i topp- och bottenmarginalen.
+            assert!((t[0].1 - lay.mt / 2.0).abs() < 0.01);
+            assert!((t[1].1 - (lay.ph - lay.mb / 2.0)).abs() < 0.01);
+            // Sidfoten är centrerad, sidhuvudet högerställt.
+            let fw = lay.m.width(lay.base, lay.body * 0.9, &t[1].2);
+            assert!((t[1].0 + fw / 2.0 - (lay.ml + lay.cw / 2.0)).abs() < 0.01);
+            let hw = lay.m.width(lay.base, lay.body * 0.9, "Rapport");
+            assert!((t[0].0 + hw - (lay.ml + lay.cw)).abs() < 0.01);
+        }
+        assert!(write(&md, "x", &|_| None).unwrap().bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn no_header_means_no_header_text() {
+        let (mut lay, d) = laid_out("Hej\n", &|_| None);
+        assert!(texts(&lay.header_footer(&d, 1, 1)).is_empty());
+    }
+
+    #[test]
+    fn img_width_sets_size_keeping_aspect_and_clamps() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let (lay, _) = laid_out("<img src=\"bild:a.png\" alt=\"A\" width=\"192\">\n", &resolve);
+        let im = images_of(&lay);
+        assert_eq!(im.len(), 1);
+        assert!((im[0].2 - 144.0).abs() < 0.01 && (im[0].3 - 72.0).abs() < 0.01, "{im:?}");
+        // Både bredd och höjd.
+        let (lay, _) = laid_out("<img src=\"a\" width=\"96\" height=\"96\">\n", &resolve);
+        let im = images_of(&lay);
+        assert!((im[0].2 - 72.0).abs() < 0.01 && (im[0].3 - 72.0).abs() < 0.01);
+        // För bred bild krymps till textbredden.
+        let (lay, _) = laid_out("<img src=\"a\" width=\"5000\">\n", &resolve);
+        let im = images_of(&lay);
+        assert!((im[0].2 - lay.cw).abs() < 0.01 && (im[0].3 - lay.cw / 2.0).abs() < 0.01);
+        // Utan storlek: som förut (96 dpi).
+        let (lay, _) = laid_out("![A](a)\n", &resolve);
+        let im = images_of(&lay);
+        assert!((im[0].2 - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn div_align_places_an_image() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let md = "<div align=\"center\">\n\n<img src=\"a\" width=\"96\">\n\n</div>\n\n<div align=\"right\">\n\n<img src=\"a\" width=\"96\">\n\n</div>\n";
+        let (lay, _) = laid_out(md, &resolve);
+        let im = images_of(&lay);
+        assert_eq!(im.len(), 2);
+        assert!((im[0].0 - (lay.ml + (lay.cw - 72.0) / 2.0)).abs() < 0.01, "{im:?}");
+        assert!((im[1].0 - (lay.ml + lay.cw - 72.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn k_markers_are_never_printed() {
+        for md in ["Före <!--k:1--> efter\n", "<!--k:12-->\n\nText\n", "<!--k:3--> rad\n"] {
+            let (lay, _) = laid_out(md, &|_| None);
+            let all: String = texts(&lay.pages[0].ops).iter().map(|t| t.2.clone()).collect::<Vec<_>>().join(" ");
+            assert!(!all.contains("<!--") && !all.contains("k:"), "{md:?} -> {all:?}");
+        }
+        assert_eq!(strip_markers("a<!--k:1-->b<!-- x -->"), "ab<!-- x -->");
     }
 }
 
