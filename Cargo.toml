@@ -29,6 +29,8 @@ egui_commonmark = { version = "0.26", default-features = false, features = ["pul
 rfd = "0.18"
 arboard = { version = "3.6", default-features = false }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
 encoding_rs = "0.8"
 spellbook = "0.4"
 quick-xml = "0.41"

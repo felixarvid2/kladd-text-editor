@@ -8,6 +8,7 @@ mod pdf_read;
 mod pdf_write;
 mod preview;
 mod print;
+mod recovery;
 mod highlight;
 mod icons;
 mod paste;

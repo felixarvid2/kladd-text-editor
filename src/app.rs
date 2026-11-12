@@ -52,6 +52,8 @@ pub struct Settings {
     pub spell: bool,
     /// Vald ordlista (t.ex. "sv_SE"); `None` = automatiskt.
     pub spell_lang: Option<String>,
+    /// Säkerhetskopiera osparade flikar regelbundet så att de kan återställas efter en krasch.
+    pub autosave_recovery: bool,
 }
 
 impl Default for Settings {
@@ -66,6 +68,7 @@ impl Default for Settings {
             word_zoom: 1.0,
             spell: true,
             spell_lang: None,
+            autosave_recovery: true,
         }
     }
 }
@@ -121,6 +124,8 @@ enum Seek {
 }
 
 pub struct KladdApp {
+    recovery: crate::recovery::Recovery,
+    recovery_prompt: Option<crate::recovery::Prompt>,
     pub(crate) docs: Vec<Document>,
     pub(crate) active: usize,
     next_id: u64,
@@ -221,7 +226,11 @@ impl KladdApp {
             .unwrap_or_default();
         theme::set_dark(ctx, settings.dark);
 
+        let recovery = crate::recovery::Recovery::new();
+        let orphans = crate::recovery::find_orphans(recovery.dir(), &crate::recovery::pid_alive);
         let mut app = Self {
+            recovery,
+            recovery_prompt: crate::recovery::Prompt::new(orphans),
             docs: Vec::new(),
             active: 0,
             next_id: 1,
@@ -552,6 +561,7 @@ impl KladdApp {
             return;
         }
         let doc = self.docs.remove(idx);
+        self.recovery.forget(doc.id);
         self.hl.forget(doc.id);
         self.word.forget(doc.id);
         if self.docs.is_empty() {
@@ -1112,6 +1122,10 @@ impl KladdApp {
         }
         if menu_item(ui, p, "Normal textstorlek", "Ctrl+0", None, true) {
             self.settings.font_size = DEFAULT_FONT_SIZE;
+        }
+        menu_divider(ui, p);
+        if menu_item(ui, p, "Säkerhetskopiera osparade ändringar", "", Some(self.settings.autosave_recovery), true) {
+            self.settings.autosave_recovery = !self.settings.autosave_recovery;
         }
         menu_divider(ui, p);
         if menu_item(ui, p, "Avsluta", "Ctrl+Q", None, true) {
@@ -1816,6 +1830,39 @@ impl KladdApp {
         }
     }
 
+    /// Frågar vid start om osparade ändringar från en tidigare krasch ska återställas.
+    fn recovery_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.recovery_prompt.as_mut() else { return };
+        let Some(choice) = crate::recovery::dialog(ctx, p, prompt) else { return };
+        let prompt = self.recovery_prompt.take().expect("dialogen är öppen");
+        match choice {
+            crate::recovery::Choice::Later => {}
+            crate::recovery::Choice::Discard => prompt.items.iter().for_each(|(f, _)| f.discard()),
+            crate::recovery::Choice::Restore => {
+                let mut restored = 0;
+                for (found, checked) in &prompt.items {
+                    if !*checked {
+                        continue;
+                    }
+                    self.untitled_counter += 1;
+                    let doc = found.into_document(self.next_id, self.untitled_counter);
+                    self.next_id += 1;
+                    if doc.path.is_some() {
+                        self.untitled_counter -= 1;
+                    }
+                    self.docs.push(doc);
+                    self.active = self.docs.len() - 1;
+                    found.discard();
+                    restored += 1;
+                }
+                self.focus_editor = true;
+                // Den återställda texten ska hamna i en ny säkerhetskopia utan att vänta.
+                self.recovery.write_soon();
+                self.notify(ctx, if restored == 1 { "Återställde 1 osparad flik".to_owned() } else { format!("Återställde {restored} osparade flikar") }, false);
+            }
+        }
+    }
+
     /// Utan systemets fönsterram sköter Kladd själv storleksändring från kanterna.
     fn window_edges(&self, ctx: &egui::Context, p: &Palette) {
         let (maximized, fullscreen) =
@@ -1988,6 +2035,7 @@ impl eframe::App for KladdApp {
         // Körs även när fönstret är minimerat, så att osparade ändringar aldrig tappas.
         self.handle_exit(ctx);
         self.handle_incoming(ctx);
+        self.recovery.tick(ctx, &self.docs, self.settings.autosave_recovery);
         if self.docs.get(self.active).map(|d| d.id) != self.last_active_id {
             self.last_active_id = self.docs.get(self.active).map(|d| d.id);
             self.find.current = None;
@@ -2009,6 +2057,7 @@ impl eframe::App for KladdApp {
         self.editor(ui, &p);
         self.find_bar(&ctx, &p);
         self.close_dialog(&ctx, &p);
+        self.recovery_dialog(&ctx, &p);
         self.docx_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
@@ -2019,6 +2068,7 @@ impl eframe::App for KladdApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.recovery.shutdown(&self.docs);
         if self.owns_socket {
             single::cleanup();
         }

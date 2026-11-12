@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TextEncoding {
     Utf8,
     Utf8Bom,
@@ -24,7 +24,7 @@ impl TextEncoding {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LineEnding {
     Lf,
     CrLf,
@@ -379,6 +379,14 @@ impl Document {
     /// Mappen som relativa bildsökvägar utgår från.
     pub fn base_dir(&self) -> Option<PathBuf> {
         self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf)
+    }
+
+    /// Lägger in text från en säkerhetskopia: dokumentet blir osparat även om texten råkar vara lika.
+    pub fn set_recovered(&mut self, text: String, encoding: TextEncoding, line_ending: LineEnding) {
+        self.text = text;
+        self.encoding = encoding;
+        self.line_ending = line_ending;
+        self.dirty = true;
     }
 
     /// Ska anropas när texten har ändrats i editorn.

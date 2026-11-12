@@ -23,6 +23,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 ## Funktioner
 
 - **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
+- **Säkerhetskopia och återställning** – osparade flikar sparas undan var 30:e sekund; efter en krasch erbjuder Kladd att återställa dem vid nästa start. Kan stängas av i huvudmenyn.
 - **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), PDF och många kodformat.
 - **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
