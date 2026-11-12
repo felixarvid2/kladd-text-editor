@@ -325,7 +325,12 @@ impl KladdApp {
                 return;
             }
         }
-        let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
+        // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let hit = |m: Modifiers, k: Key| {
+            (m.shift || !shift) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
+        };
         let ctrl = Modifiers::CTRL;
         let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
         if hit(ctrl, Key::B) {
