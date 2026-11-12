@@ -14,7 +14,6 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Kladds konfigurationsmapp: `$XDG_CONFIG_HOME/kladd`, `~/Library/Application Support/Kladd` eller `%APPDATA%\Kladd`.
-#[allow(dead_code)] // används av stavningskontrollen när den byter till platform
 pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config")).join(APP_DIR)
 }

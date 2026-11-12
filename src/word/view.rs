@@ -1481,19 +1481,31 @@ impl KladdApp {
             ui.spacing_mut().item_spacing.x = 18.0;
             label(ui, format!("{zoom_pct} %"));
             if let Some(sp) = self.speller.as_mut() {
-                if sp.languages().is_empty() {
-                    ui.label(egui::RichText::new("Ingen ordlista").font(font.clone()).color(p.muted))
-                        .on_hover_text("Installera paketet hunspell-sv för svensk stavningskontroll");
+                let finished = sp.poll_download();
+                let busy = sp.downloading().map(str::to_owned);
+                if busy.is_some() {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                let langs: Vec<(String, String)> =
+                    sp.languages().iter().map(|l| (l.code.clone(), l.name.clone())).collect();
+                let name = match (&busy, sp.lang()) {
+                    (Some(n), _) => format!("Hämtar {n}…"),
+                    (None, Some(l)) => l.name.clone(),
+                    (None, None) => "Ingen ordlista".to_owned(),
+                };
+                let hint = if langs.is_empty() {
+                    "Ingen ordlista för stavningskontroll är installerad – klicka för att hämta en"
                 } else {
-                    let name = sp.lang().map_or_else(|| "Ingen ordlista".to_owned(), |l| l.name.clone());
-                    let btn = status_button(ui, p, &name, "Språk för stavningskontroll");
-                    let langs: Vec<(String, String)> =
-                        sp.languages().iter().map(|l| (l.code.clone(), l.name.clone())).collect();
-                    let current = sp.lang().map(|l| l.code.clone());
-                    let mut pick: Option<String> = None;
-                    let mut spell = self.settings.spell;
-                    Popup::menu(&btn).align(RectAlign::TOP_END).gap(6.0).width(220.0).show(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
+                    "Språk för stavningskontroll"
+                };
+                let btn = status_button(ui, p, &name, hint);
+                let current = sp.lang().map(|l| l.code.clone());
+                let mut pick: Option<String> = None;
+                let mut fetch: Option<String> = None;
+                let mut spell = self.settings.spell;
+                Popup::menu(&btn).align(RectAlign::TOP_END).gap(6.0).width(260.0).show(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if !langs.is_empty() {
                         if menu_item(ui, p, "Stavningskontroll", "", Some(spell), true) {
                             spell = !spell;
                         }
@@ -1503,11 +1515,49 @@ impl KladdApp {
                                 pick = Some(code.clone());
                             }
                         }
-                    });
-                    self.settings.spell = spell;
-                    if let Some(code) = pick {
-                        sp.set_lang(&code);
-                        self.settings.spell_lang = Some(code);
+                        menu_divider(ui, p);
+                    }
+                    let missing: Vec<&crate::spell::Download> =
+                        crate::spell::DOWNLOADS.iter().filter(|d| !langs.iter().any(|(c, _)| c == d.code)).collect();
+                    if let Some(n) = &busy {
+                        ui.label(egui::RichText::new(format!("Hämtar {n}…")).font(font.clone()).color(p.muted));
+                    } else if !missing.is_empty() {
+                        if !langs.is_empty() {
+                            ui.label(egui::RichText::new("Hämta fler språk…").font(font.clone()).color(p.muted));
+                        }
+                        for d in missing {
+                            let label =
+                                if d.code == "sv_SE" { "Hämta svensk ordlista".to_owned() } else { format!("Hämta {}", d.name) };
+                            if menu_item(ui, p, &label, "", None, true) {
+                                fetch = Some(d.code.to_owned());
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(crate::spell::LICENSE_NOTE).font(font.clone()).color(p.muted))
+                            .wrap(),
+                    );
+                });
+                self.settings.spell = spell;
+                if let Some(code) = pick {
+                    sp.set_lang(&code);
+                    self.settings.spell_lang = Some(code);
+                }
+                if let Some(code) = fetch {
+                    sp.start_download(&code);
+                }
+                if let Some(res) = finished {
+                    let ctx = ui.ctx().clone();
+                    match res {
+                        Ok(n) => {
+                            if let Some(c) = self.speller.as_ref().and_then(|s| s.lang()).map(|l| l.code.clone()) {
+                                self.settings.spell_lang = Some(c);
+                            }
+                            self.settings.spell = true;
+                            self.notify(&ctx, format!("Ordlistan {n} är hämtad"), false);
+                        }
+                        Err(e) => self.notify(&ctx, format!("Kunde inte hämta ordlistan: {e}"), true),
                     }
                 }
             }
