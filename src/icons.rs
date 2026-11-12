@@ -24,6 +24,8 @@ pub enum Icon {
     Quote,
     Image,
     Table,
+    /// Fotnot: ett stort A med en upphöjd etta.
+    Footnote,
     TableRowAbove,
     TableRowBelow,
     TableColLeft,
@@ -201,6 +203,10 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             for w in m.windows(2) {
                 painter.line_segment([w[0], w[1]], s);
             }
+        }
+        Icon::Footnote => {
+            painter.text(c + vec2(-2.5, 1.5), egui::Align2::CENTER_CENTER, "A", egui::FontId::new(12.5, crate::theme::medium()), color);
+            painter.text(c + vec2(5.0, -4.5), egui::Align2::CENTER_CENTER, "1", egui::FontId::new(8.5, crate::theme::medium()), color);
         }
         Icon::Table => {
             let r = Rect::from_center_size(c, vec2(13.0, 12.0));

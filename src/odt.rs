@@ -10,8 +10,9 @@
 //! dokumentets grundformat (standardstycket + Standard) skrivs som `<span style>`.
 //!
 //! Beslut om saker Kladd inte kan visa:
-//! - Fotnoter och slutnoter (`text:note`) och kommentarer (`office:annotation`) tas bort ur texten
-//!   och rapporteras som borttagna ("fotnoter", "kommentarer"), på samma sätt som för .docx.
+//! - Fotnoter och slutnoter (`text:note`) blir `[^N]` och en definition `[^N]: text` sist i dokumentet
+//!   (slutnoter blir fotnoter). Kommentarer (`office:annotation`) tas bort ur texten och rapporteras
+//!   som borttagna ("kommentarer"), på samma sätt som för .docx.
 //! - Diagram, former och inbäddade objekt (`draw:*` utom bilder) rapporteras som borttagna.
 //! - Länkade bilder (utanför paketet) och bildformat som Kladd inte kan visa (svg, wmf …) likaså.
 //! - Sidnummer och antal sidor i sidhuvud/sidfot blir `{sida}` och `{sidor}`; bara standardsidans
@@ -505,7 +506,6 @@ struct Dropped {
     shapes: bool,
     linked: bool,
     textboxes: bool,
-    notes: bool,
     comments: bool,
 }
 
@@ -520,9 +520,6 @@ impl Dropped {
         }
         if self.textboxes {
             v.push("textrutor");
-        }
-        if self.notes {
-            v.push("fotnoter");
         }
         if self.comments {
             v.push("kommentarer");
@@ -557,6 +554,10 @@ struct Rd<'s, 'b> {
     by_target: HashMap<String, String>,
     blocks: Vec<Block>,
     list_id: usize,
+    /// Fotnotstexterna (Markdown på en rad) i dokumentordning; fotnot N är `[^N]`.
+    notes: Vec<String>,
+    /// Sant medan en fotnots stycken läses.
+    in_note: bool,
 }
 
 fn kind_of(st: &Styles, style: Option<&str>) -> Kind {
@@ -689,7 +690,7 @@ impl<'s, 'b> Rd<'s, 'b> {
                 pc.prev_space = true;
             }
             "draw:frame" => self.frame(e, st, pc, runs),
-            "text:note" => self.dropped.notes = true,
+            "text:note" => self.note(e, runs),
             "office:annotation" => self.dropped.comments = true,
             "text:soft-page-break" | "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:reference-mark"
             | "text:reference-mark-start" | "text:reference-mark-end" | "office:annotation-end" | "text:index-mark"
@@ -697,6 +698,39 @@ impl<'s, 'b> Rd<'s, 'b> {
             | "text:change-end" | "text:toc-mark" | "text:toc-mark-start" | "text:toc-mark-end" => {}
             n if n.starts_with("draw:") => self.dropped.shapes = true,
             _ => self.inline(e, st, pc, runs),
+        }
+    }
+
+    /// En fotnot eller slutnot: `[^N]` i texten, och texten sparas för definitionen sist i dokumentet.
+    fn note(&mut self, e: &Node, runs: &mut Vec<Run>) {
+        if self.in_note {
+            return;
+        }
+        self.in_note = true;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(body) = e.child("text:note-body") {
+            self.note_paras(body, &mut parts);
+        }
+        self.in_note = false;
+        self.notes.push(escape_line_start(&parts.join("<br>")));
+        let label = format!("[^{}]", self.notes.len());
+        push_run(runs, Run { text: label, fmt: Fmt::default(), link: None, raw: true });
+    }
+
+    /// Fotnotens stycken som Markdown, med radbrytningar som `<br>`.
+    fn note_paras(&mut self, n: &Node, out: &mut Vec<String>) {
+        for c in n.els() {
+            match c.name.as_str() {
+                "text:p" | "text:h" => {
+                    let p = self.build_para(c, None);
+                    let s = para_md(&p).replace('\n', "<br>");
+                    if !s.trim().is_empty() {
+                        out.push(s.trim().to_owned());
+                    }
+                }
+                "text:list" | "text:list-item" | "text:section" => self.note_paras(c, out),
+                _ => {}
+            }
         }
     }
 
@@ -780,7 +814,14 @@ impl<'s, 'b> Rd<'s, 'b> {
             kind = Kind::Heading(lvl);
         }
         let named = self.st.named_props("paragraph", style);
-        let span_ref = if kind == Kind::Normal { self.base.clone() } else { named.clone() };
+        // I en fotnot jämförs texten med fotnotsmallen (inte brödtexten), så att den inte fylls med spans.
+        let span_ref = if self.in_note {
+            self.base.over(&named)
+        } else if kind == Kind::Normal {
+            self.base.clone()
+        } else {
+            named.clone()
+        };
         let eff = self.st.tprops("paragraph", style.unwrap_or("Standard"));
         let mut pc = Pc { named, span_ref, prev_space: true };
         let st = St { eff, code: false, link: None };
@@ -1324,11 +1365,19 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         by_target: HashMap::new(),
         blocks: Vec::new(),
         list_id: 0,
+        notes: Vec::new(),
+        in_note: false,
     };
     for c in body.els() {
         rd.walk(c);
     }
     let mut markdown = render(&rd.blocks);
+    if !rd.notes.is_empty() {
+        markdown.push('\n');
+        for (i, n) in rd.notes.iter().enumerate() {
+            markdown.push_str(&format!("[^{}]: {n}\n", i + 1));
+        }
+    }
     let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
     if let Some(s) = &sroot {
         read_page(&st, s, &mut defaults);
@@ -1484,6 +1533,11 @@ struct W<'a> {
     media: Vec<(String, Vec<u8>, &'static str)>,
     missing: Vec<String>,
     text_w: f32,
+    /// Fotnotsdefinitionerna (etikett, stycken som XML) i textens ordning.
+    notes: Vec<(String, String)>,
+    /// Etiketten för varje fotnotsreferens i dokumentordning; platshållaren i texten är dess index.
+    note_order: Vec<String>,
+    in_note: bool,
     /// Rubrikerna H1–H3 (nivå, text, uppskattad sida) till innehållsförteckningen.
     toc: Vec<(u8, String, usize)>,
 }
@@ -1555,12 +1609,17 @@ impl<'a> W<'a> {
             media: Vec::new(),
             missing: Vec::new(),
             text_w,
+            notes: Vec::new(),
+            note_order: Vec::new(),
+            in_note: false,
             toc: Vec::new(),
         }
     }
 
     fn base_para_style(&self) -> String {
-        if let Some(h) = self.heading {
+        if self.in_note {
+            "Footnote".into()
+        } else if let Some(h) = self.heading {
             format!("Heading_20_{h}")
         } else if self.code {
             "Preformatted_20_Text".into()
@@ -1873,6 +1932,40 @@ impl<'a> W<'a> {
         }
     }
 
+    /// Byter platshållarna mot `text:note`; en andra referens till samma etikett får en kopia.
+    fn resolve_notes(&mut self) {
+        if self.note_order.is_empty() {
+            return;
+        }
+        let mut out = String::with_capacity(self.body.len());
+        let mut rest = self.body.as_str();
+        while let Some(i) = rest.find('\u{E004}') {
+            out.push_str(&rest[..i]);
+            let r = &rest[i + '\u{E004}'.len_utf8()..];
+            let Some(e) = r.find('\u{E005}') else {
+                rest = "";
+                break;
+            };
+            if let Some(n) = r[..e].parse::<usize>().ok().filter(|n| *n < self.note_order.len()) {
+                let label = &self.note_order[n];
+                let paras = self
+                    .notes
+                    .iter()
+                    .find(|(l, _)| l == label)
+                    .map(|(_, x)| x.as_str())
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or("<text:p text:style-name=\"Footnote\"/>");
+                let k = n + 1;
+                out.push_str(&format!(
+                    "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{k}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
+                ));
+            }
+            rest = &r[e + '\u{E005}'.len_utf8()..];
+        }
+        out.push_str(rest);
+        self.body = out;
+    }
+
     fn start_list(&mut self, start: Option<u64>) {
         self.close_para();
         self.n_list += 1;
@@ -1896,8 +1989,33 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    // Pågående fotnotsdefinition: (etikett, brödtexten som lagts åt sidan).
+    let mut note_cur: Option<(String, String)> = None;
     for ev in Parser::new_ext(md, opts) {
         match ev {
+            MdEvent::Start(Tag::FootnoteDefinition(label)) => {
+                w.close_para();
+                note_cur = Some((label.to_string(), std::mem::take(&mut w.body)));
+                w.in_note = true;
+            }
+            MdEvent::End(TagEnd::FootnoteDefinition) => {
+                w.close_para();
+                if let Some((label, saved)) = note_cur.take() {
+                    let xml = std::mem::replace(&mut w.body, saved);
+                    w.notes.push((label, xml));
+                }
+                w.in_note = false;
+            }
+            MdEvent::FootnoteReference(t) if w.in_note => w.run(&format!("[{t}]"), false),
+            MdEvent::FootnoteReference(t) => {
+                // Själva noten sätts in när definitionerna lästs (`resolve_notes`).
+                w.open_para();
+                w.note_order.push(t.to_string());
+                let n = w.note_order.len() - 1;
+                w.body.push_str(&format!("\u{E004}{n}\u{E005}"));
+                w.after_space = false;
+            }
             MdEvent::Start(tag) => match tag {
                 Tag::Paragraph => w.close_para(),
                 Tag::Heading { level, .. } => {
@@ -2029,11 +2147,11 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 w.body.push_str("<text:p text:style-name=\"Horizontal_20_Line\"/>");
             }
             MdEvent::TaskListMarker(done) => w.run(if done { "☒ " } else { "☐ " }, false),
-            MdEvent::FootnoteReference(t) => w.run(&format!("[{t}]"), false),
             MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => w.run(&t, false),
         }
     }
     w.close_para();
+    w.resolve_notes();
     w
 }
 
@@ -2173,11 +2291,16 @@ fn styles_xml(d: &DocDefaults) -> String {
     named.push_str("<style:style style:name=\"Horizontal_20_Line\" style:display-name=\"Horizontal Line\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0.2cm\" fo:border-bottom=\"0.5pt solid #000000\" fo:border-top=\"none\" fo:border-left=\"none\" fo:border-right=\"none\" fo:padding=\"0cm\"/><style:text-properties fo:font-size=\"6pt\"/></style:style>");
     named.push_str("<style:style style:name=\"Table_20_Contents\" style:display-name=\"Table Contents\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"/>");
     named.push_str("<style:style style:name=\"Table_20_Heading\" style:display-name=\"Table Heading\" style:family=\"paragraph\" style:parent-style-name=\"Table_20_Contents\" style:class=\"extra\"><style:text-properties fo:font-weight=\"bold\" style:font-weight-asian=\"bold\" style:font-weight-complex=\"bold\"/></style:style>");
+    named.push_str("<style:style style:name=\"Footnote\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"><style:paragraph-properties fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:text-indent=\"0cm\"/><style:text-properties fo:font-size=\"10pt\"/></style:style>");
+    named.push_str("<style:style style:name=\"Footnote_20_Symbol\" style:display-name=\"Footnote Symbol\" style:family=\"text\"/>");
+    named.push_str("<style:style style:name=\"Footnote_20_anchor\" style:display-name=\"Footnote anchor\" style:family=\"text\"><style:text-properties style:text-position=\"super 58%\"/></style:style>");
     named.push_str("<style:style style:name=\"Header\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"/>");
     named.push_str("<style:style style:name=\"Footer\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"/>");
     named.push_str("<style:style style:name=\"Graphics\" style:family=\"graphic\"><style:graphic-properties text:anchor-type=\"paragraph\" svg:x=\"0cm\" svg:y=\"0cm\" style:wrap=\"none\" style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\"/></style:style>");
     named.push_str("<style:style style:name=\"Internet_20_link\" style:display-name=\"Internet link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
     named.push_str("<style:style style:name=\"Visited_20_Internet_20_Link\" style:display-name=\"Visited Internet Link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
+
+    named.push_str("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"1\" text:start-value=\"0\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>");
 
     format!(
         "{XML_DECL}<office:document-styles {NS} office:version=\"1.2\">{}<office:styles>{named}</office:styles><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>",
@@ -2497,7 +2620,7 @@ Slut.
     fn reads_libreoffice_style_document() {
         let bytes = make_odt(LO_CONTENT, LO_STYLES, &[("Pictures/a.png", &png())]);
         let l = read(&bytes).unwrap();
-        assert_eq!(l.dropped, vec!["fotnoter"]);
+        assert!(l.dropped.is_empty(), "{:?}", l.dropped);
         let md = &l.markdown;
         assert!(
             md.starts_with("<!-- kladd: font-family: \"Liberation Serif\"; font-size: 12pt; page-size: Letter; page-margin: 20mm 25mm 20mm 25mm; footer: \"Sida {sida} av {sidor}\"; footer-align: center -->\n\n"),
@@ -2517,7 +2640,9 @@ Slut.
         assert!(md.contains("```\nfn main() {\n    x();\n}\n```"), "{md}");
         assert!(md.contains("| Namn | Antal |\n| --- | --- |\n| Äpple \\| rött | 3 |"), "{md}");
         assert!(md.contains("![Alternativtext](bild:a.png)"), "{md}");
-        assert!(md.ends_with("Sista\n"), "{md}");
+        // Fotnoten blir en referens och en definition sist.
+        assert!(md.contains("[länk](https://example.com)[^1]."), "{md}");
+        assert!(md.ends_with("Sista\n\n[^1]: Fotnot\n"), "{md}");
         assert_eq!(l.images.len(), 1);
     }
 
@@ -2565,3 +2690,7 @@ Slut.
         eprintln!("{}", back.markdown);
     }
 }
+
+#[cfg(test)]
+#[path = "odt_fn_tests.rs"]
+mod fn_tests;

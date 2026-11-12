@@ -222,7 +222,7 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
-- **Okända Word-objekt** (fotnotsreferenser, kommentarsankare, bokmärken, fält, textrutor,
+- **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda
   (noll bredd); i Markdown-förhandsvisningen tas de bort.
@@ -268,6 +268,7 @@ Gemensamma format (alla moduler ska använda dessa):
   av dokumentet (en definition per rad, efter all annan text, separerade från den med en tom rad).
   Etiketterna är löpnummer 1, 2, 3 … i den ordning referenserna kommer. pulldown-cmark med
   `Options::ENABLE_FOOTNOTES`. Word: `w:footnoteReference` + footnotes.xml; ODT: `text:note`.
+  Se [Fotnoter](#fotnoter-17) nedan.
 - **Tabeller**:
   - Radbrytning i en cell: `<br>`.
   - Sammanfogade celler (vågrätt): en cell följs av extra pipes, `| Rubrik över två ||`
@@ -328,3 +329,58 @@ Hur det fungerar:
 Testerna `incremental_layout_equals_full_layout` och `incremental_highlight_equals_full`
 kontrollerar att det inkrementella resultatet är identiskt med full omläggning efter
 slumpmässiga ändringar (deterministiskt frö).
+
+## Fotnoter (1.7)
+
+**Modellen** (`word::markup`): `analyze` markerar `[^` och `]` som dold markup och etiketten som en egen bit
+(`Piece::footnote_ref`); en definition `[^n]: text` är `Block::Footnote` med `[^` och `]:` som markup och
+etiketten som `Piece::footnote_def`. Operationerna arbetar på texten (pulldowns `FootnoteReference` och
+`FootnoteDefinition` ger lägena, kod hoppas över):
+
+```rust
+pub fn insert_footnote(text: &str, caret: usize) -> Edit;        // [^k] vid markören + tom definition, numrerar om
+pub fn renumber_footnotes(text: &str) -> String;                 // 1..n i referensernas ordning, definitioner sist i samma ordning
+pub fn renumber_footnotes_at(text: &str, caret: usize) -> (String, usize);
+pub fn delete_footnote(text: &str, label: &str) -> String;       // referens + definition, numrerar om
+pub fn footnotes_in_order(a: &Analysis) -> bool;                 // snabb kontroll för lat omnumrering
+```
+
+Föräldralösa definitioner (utan referens) behålls sist och får bara ny etikett om den krockar. Ordräkningen
+räknar inte etiketterna.
+
+**Dokumentläget**: etiketterna ritas med 0,65 × storlek, `valign = TOP` och `line_height = None` (med egen
+radhöjd centrerar egui alltid texten, så `valign` gör annars ingenting) i länkfärg; definitionerna med
+0,85 × brödtextens storlek under en skiljelinje (en tredjedels textbredd) före den första definitionen.
+Hovrar man ett nummer visas "Gå till fotnot" (Ctrl+klick); ett klick hoppar när knappen släpps (markören
+flyttas vid nedtryckningen och ändrar layouten, så hoppet kan inte ske vid nedtryckningen). Ett vanligt klick
+hoppar bara om raden inte redan visar sin markup, annars krävs Ctrl. Efter varje ändring numreras fotnoterna
+om om etiketterna inte längre är 1..n i ordning (`word_renumber_footnotes`). Backspace direkt efter (Delete
+direkt före) en referens tar bort hela fotnoten. Verktygsrad: *Infoga fotnot*, `Ctrl+Alt+F`.
+
+**Word** (`docx.rs`): `w:footnoteReference` blir `[^N]` (N i dokumentordning) och texten läses ur
+footnotes.xml (formaterade körningar som Kladds inline-dialekt, flera stycken med `<br>`, skiljelinjer
+överhoppade; jämförs mot fotnotsmallens eget format så att inga `<span>` behövs). Slutnoter och referenser
+med egen märkning (`w:customMarkFollows`) förblir `<!--k:N-->`. `Source` sparar originalets footnotes.xml
+(`FnPart`) och id:n per toppnivåelement (`SrcElem::fn_ids`). Vid skrivning:
+
+- stycken jämförs med fotnotsetiketterna borttagna (`norm` → `[^]`), så ett orört stycke behåller sin
+  ursprungliga XML (med originalets id) även när fotnoterna numrerats om;
+- referenserna i orörda stycken paras ihop med originalets id i ordning; i omskrivna stycken ges varje
+  referens en platshållare som `resolve_footnotes` byter mot ett id: originalfotnoten med samma text om det
+  finns en, annars ett nytt id;
+- footnotes.xml byggs om från definitionerna: skiljelinjer och oförändrade fotnoter ordagrant, ändrade och nya
+  genereras (`FootnoteText`, `FootnoteReference`, `w:footnoteRef`); fotnoter som ingen längre refererar till
+  faller bort, och fotnoter som okända objekt fortfarande refererar till behålls;
+- utan footnotes.xml skapas delen med relation, innehållstyp, skiljelinjer och `w:footnotePr` i settings.xml;
+- länkar och bilder i omskrivna fotnoter skrivs som text (delen har egna relationer).
+
+**ODT** (`odt.rs`): `text:note` (fotnot och slutnot) blir `[^N]` och en definition; skrivs som `text:note`
+med `text:note-citation` och `text:note-body` (stycke `Footnote`, 10 pt, `text:notes-configuration`).
+
+**PDF** (`pdf_write.rs`): noterna ritas längst ned på sidan där de refereras. `text_block` räknar ut
+notens höjd (med avskiljaren) för varje rad med en referens och byter sida om raden och noterna inte ryms;
+`reserved` minskar sidans nedre gräns, och `flush_notes` ritar avskiljaren och noterna (0,85 × storlek)
+när sidan fylls. Referensen är ett litet upphöjt nummer. En enskild not som är längre än en sida delas inte.
+
+**HTML/EPUB** (`export.rs`) hade redan fotnoter via pulldown (`<aside class="footnote">`, EPUB-`noteref`);
+kontrollerat med de befintliga testerna.

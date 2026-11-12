@@ -103,6 +103,8 @@ pub struct State {
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
+    /// Fotnotshopp som väntar på att musknappen släpps (layouten ändras när markören flyttas vid nedtryckning).
+    fn_pending: Option<usize>,
 }
 
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
@@ -112,6 +114,7 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    Footnote,
     Toc,
     TableOp(TableOp),
     PageSetup,
@@ -135,6 +138,7 @@ fn block_label(b: Block) -> String {
         Block::Numbered => "Numrerad lista".into(),
         Block::Code => "Kod".into(),
         Block::Table => "Tabell".into(),
+        Block::Footnote => "Fotnot".into(),
     }
 }
 
@@ -289,6 +293,61 @@ impl KladdApp {
         });
     }
 
+    /// Infogar en fotnot vid markören och flyttar markören till den nya definitionen.
+    pub(crate) fn word_footnote(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| markup::insert_footnote(t, s.end));
+        let b = self.word_selection(ctx).start;
+        if let Some(doc) = self.docs.get(self.active) {
+            self.scroll_to_char = Some(byte_to_char(&doc.text, b));
+        }
+    }
+
+    /// Backspace direkt efter (eller Delete direkt före) en fotnotsreferens tar bort hela fotnoten,
+    /// både referensen och definitionen; annars skulle en trasig `[^1` lämna en föräldralös definition.
+    fn word_footnote_keys(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        if !doc.text.contains("[^") {
+            return;
+        }
+        let (back, del) = ctx.input(|i| {
+            (i.key_pressed(Key::Backspace) && i.modifiers.is_none(), i.key_pressed(Key::Delete) && i.modifiers.is_none())
+        });
+        if !back && !del {
+            return;
+        }
+        let sel = self.word_selection(ctx);
+        if sel.start != sel.end {
+            return;
+        }
+        let hit = markup::footnotes(&doc.text)
+            .refs
+            .into_iter()
+            .find(|r| if back { r.full.end == sel.start } else { r.full.start == sel.start });
+        let Some(r) = hit else { return };
+        ctx.input_mut(|i| i.consume_key(Modifiers::NONE, if back { Key::Backspace } else { Key::Delete }));
+        self.word_edit(ctx, |t, _| {
+            let text = markup::delete_footnote(t, &r.label);
+            markup::Edit { text, sel: r.full.start..r.full.start }
+        });
+    }
+
+    /// Lazy omnumrering: efter en ändring som gör att fotnoternas etiketter inte längre är
+    /// 1..n i ordning (klistrad referens, raderad referens …) numreras de om.
+    fn word_renumber_footnotes(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        if !doc.text.contains("[^") {
+            return;
+        }
+        let a = self.word.analysis(doc.id, &doc.text);
+        if markup::footnotes_in_order(&a) {
+            return;
+        }
+        self.word_edit(ctx, |t, s| {
+            let (text, c) = markup::renumber_footnotes_at(t, s.end);
+            markup::Edit { text, sel: c..c }
+        });
+    }
+
     fn word_block(&mut self, ctx: &egui::Context, b: Block) {
         self.word_edit(ctx, |t, s| markup::set_block(t, s, b));
     }
@@ -334,6 +393,7 @@ impl KladdApp {
             }
         }
         self.word_table_keys(ctx);
+        self.word_footnote_keys(ctx);
         self.word_paste_html(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
@@ -369,6 +429,9 @@ impl KladdApp {
         }
         if hit(ctrl | Modifiers::SHIFT, Key::Comma) || hit(ctrl, Key::OpenBracket) {
             self.word_font_step(ctx, -1);
+        }
+        if hit(ctrl_alt, Key::F) {
+            self.word_footnote(ctx);
         }
         for (k, b) in [
             (Key::Num1, Block::Heading(1)),
@@ -579,6 +642,9 @@ impl KladdApp {
                     if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
                         acts.push(BarAct::Table);
                     }
+                    if icons::button(ui, p, Icon::Footnote, 28.0, false, "Infoga fotnot (Ctrl+Alt+F)", p.chrome).clicked() {
+                        acts.push(BarAct::Footnote);
+                    }
                     if icons::button(ui, p, Icon::Toc, 28.0, false, "Infoga innehållsförteckning", p.chrome).clicked() {
                         acts.push(BarAct::Toc);
                     }
@@ -628,6 +694,7 @@ impl KladdApp {
                 BarAct::Toc => self.insert_toc(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
+                BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
@@ -830,6 +897,8 @@ impl KladdApp {
             let mut table_act: Option<TableOp> = None;
             let mut page_pos = (1usize, 1usize);
             let mut open_page_dlg = false;
+            let mut fn_jump: Option<usize> = None;
+            let mut fn_pending = self.wv.fn_pending.take();
 
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id)).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -886,6 +955,42 @@ impl KladdApp {
                 let text = doc.text.as_str();
                 // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
                 tables::fix_caret(ui.ctx(), id, text);
+
+                // Fotnoter: skiljelinje över definitionerna; numret är en länk mellan referens och definition.
+                if text.contains("[^") {
+                    if let Some(start) = markup::footnote_area_start(text, &analysis) {
+                        let r = galley.pos_from_cursor(CCursor::new(byte_to_char(text, start))).translate(gpos.to_vec2());
+                        let y = (r.top() - px(z, 5.0)).round() + 0.5;
+                        painter_line(ui, p, gpos.x, y, text_w / 3.0, z);
+                    }
+                    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|q| te_rect.contains(*q));
+                    if let Some(q) = hover {
+                        let ci = galley.cursor_from_pos(q - gpos).index.0;
+                        if let Some((label, is_def, lr)) = markup::footnote_label_at(&analysis, char_to_byte(text, ci)) {
+                            let ra = galley.pos_from_cursor(CCursor::new(byte_to_char(text, lr.start))).translate(gpos.to_vec2());
+                            let rb = galley.pos_from_cursor(CCursor::new(byte_to_char(text, lr.end))).translate(gpos.to_vec2());
+                            let hit = Rect::from_min_max(ra.min, rb.max).expand2(vec2(3.0, 0.0));
+                            if hit.contains(q) {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                let tip = if is_def { "Tillbaka till texten" } else { "Gå till fotnot (Ctrl+klick)" };
+                                egui::Tooltip::always_open(ui.ctx().clone(), out.response.layer_id, out.response.id.with("fotnot"), egui::PopupAnchor::Pointer)
+                                    .show(|ui| ui.label(tip));
+                                let (ctrl, pressed) = ui.input(|i| (i.modifiers.command, i.pointer.primary_pressed()));
+                                // Ctrl+klick hoppar alltid; ett vanligt klick hoppar bara om raden inte redan visar sin markup
+                                // (annars går det inte att redigera runt numret). Hoppet görs när knappen släpps.
+                                if pressed && (ctrl || !overlaps(&lr, &reveal)) {
+                                    fn_pending = markup::footnote_target(text, &analysis, &label, is_def);
+                                }
+                            }
+                        }
+                    }
+                }
+                let (released, down) = ui.input(|i| (i.pointer.primary_released(), i.pointer.primary_down()));
+                if released {
+                    fn_jump = fn_pending.take();
+                } else if !down {
+                    fn_pending = None;
+                }
 
                 // Ett ark per sida, med luft emellan.
                 let total = pages::page_count(&galley, &geom);
@@ -1190,6 +1295,7 @@ impl KladdApp {
             });
 
             self.wv.pages = page_pos;
+            self.wv.fn_pending = fn_pending;
             if let Some(b) = toc_click {
                 self.goto_byte(&ctx, b);
             }
@@ -1206,6 +1312,10 @@ impl KladdApp {
             }
             if edited {
                 self.find.current = None;
+                self.word_renumber_footnotes(&ctx);
+            }
+            if let Some(b) = fn_jump {
+                self.goto_byte(&ctx, b);
             }
             if let Some(op) = table_act {
                 self.word_table_op(&ctx, op);
@@ -1308,6 +1418,11 @@ impl<'a> ByteToChar<'a> {
         self.b = b;
         self.c
     }
+}
+
+/// Fotnotsskiljelinjen: en tunn linje, en tredjedels textbredd lång.
+fn painter_line(ui: &Ui, p: &Palette, x: f32, y: f32, len: f32, z: f32) {
+    ui.painter().hline(x..=x + len, y, Stroke::new(z.max(1.0), p.page_text.gamma_multiply(0.7)));
 }
 
 fn image_uri(src: &str, doc_id: u64) -> String {

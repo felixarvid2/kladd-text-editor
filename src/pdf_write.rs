@@ -112,6 +112,8 @@ struct Style {
     link: Option<String>,
     /// Färg, bakgrund, storlek och typsnittsklass från omgivande `<span style="…">`.
     span: SpanStyle,
+    /// Fotnotsnummer (1-baserat): texten ritas som litet upphöjt nummer.
+    fnref: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -198,11 +200,22 @@ fn heading_num(level: HeadingLevel) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn parse_blocks(md: &str) -> Vec<Block> {
+    parse_blocks_notes(md).0
+}
+
+/// Blocken och fotnoterna (text per fotnot, i den ordning referenserna kommer).
+fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
+    let mut note_labels: Vec<String> = Vec::new();
+    let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
+    let mut note_cur: Option<(String, Vec<Block>)> = None;
 
     let mut blocks = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -266,6 +279,26 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         style.strike = strike > 0;
         style.underline = underline > 0;
         match ev {
+            MdEvent::Start(Tag::FootnoteDefinition(label)) => {
+                flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                note_cur = Some((label.to_string(), std::mem::take(&mut blocks)));
+            }
+            MdEvent::End(TagEnd::FootnoteDefinition) => {
+                flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                if let Some((label, saved)) = note_cur.take() {
+                    // Styckena i definitionen läggs efter varandra med ett mellanslag emellan.
+                    let mut text: Vec<Span> = Vec::new();
+                    for b in std::mem::replace(&mut blocks, saved) {
+                        if let Block::Para { spans, .. } | Block::Item { spans, .. } = b {
+                            if !text.is_empty() {
+                                text.push(Span { text: " ".into(), style: Style::default() });
+                            }
+                            text.extend(spans);
+                        }
+                    }
+                    note_defs.push((label, text));
+                }
+            }
             MdEvent::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
@@ -433,12 +466,22 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                 blocks.push(Block::Rule);
             }
             MdEvent::TaskListMarker(done) => push_text(&mut spans, if done { "☑ " } else { "☐ " }, &style),
-            MdEvent::FootnoteReference(t) => push_text(&mut spans, &format!("[{t}]"), &style),
+            MdEvent::FootnoteReference(t) if note_cur.is_some() => push_text(&mut spans, &format!("[{t}]"), &style),
+            MdEvent::FootnoteReference(t) => {
+                note_labels.push(t.to_string());
+                let n = note_labels.len();
+                let st = Style { fnref: Some(n), ..style.clone() };
+                spans.push(Span { text: n.to_string(), style: st });
+            }
             MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => push_text(&mut spans, &t, &style),
         }
     }
     flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, aligns.last().copied().unwrap_or_default());
-    blocks
+    let notes = note_labels
+        .iter()
+        .map(|l| note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default())
+        .collect();
+    (blocks, notes)
 }
 
 // ============================================================== sidlayout
@@ -489,6 +532,13 @@ struct Layout<'a> {
     mb: f32,
     ml: f32,
     cw: f32,
+    /// Fotnoternas text (nummer − 1), och de som hör till sidan som läggs ut just nu.
+    notes: Vec<Vec<Span>>,
+    page_notes: Vec<usize>,
+    /// Höjd längst ned på sidan som är reserverad för fotnoter (avskiljare och text).
+    reserved: f32,
+    /// Sant medan fotnoterna ritas (deras nummer är inga nya referenser).
+    in_notes: bool,
     /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
     /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
     toc_entries: Vec<(u8, String)>,
@@ -615,6 +665,10 @@ impl<'a> Layout<'a> {
             mb,
             ml,
             cw,
+            notes: Vec::new(),
+            page_notes: Vec::new(),
+            reserved: 0.0,
+            in_notes: false,
             toc_entries: Vec::new(),
             toc_pos: Vec::new(),
         }
@@ -713,14 +767,63 @@ impl<'a> Layout<'a> {
     }
 
     fn new_page(&mut self) {
+        self.flush_notes();
         self.pages.push(PageOps { ops: Vec::new() });
         self.y = self.mt;
     }
 
     fn ensure(&mut self, h: f32) {
-        if self.y + h > self.ph - self.mb && self.y > self.mt + 0.5 {
+        if self.y + h + self.reserved > self.ph - self.mb && self.y > self.mt + 0.5 {
             self.new_page();
         }
+    }
+
+    /// Fotnotens rader: litet nummer, mellanslag och texten.
+    fn note_spans(&self, n: usize) -> Vec<Span> {
+        let mut v = vec![
+            Span { text: n.to_string(), style: Style { fnref: Some(n), ..Style::default() } },
+            Span { text: " ".into(), style: Style::default() },
+        ];
+        v.extend(self.notes.get(n - 1).cloned().unwrap_or_default());
+        v
+    }
+
+    /// Hur mycket plats fotnoterna `refs` tar längst ned på sidan (med avskiljaren om det är de första).
+    fn note_cost(&mut self, refs: &[usize]) -> f32 {
+        let size = self.body * 0.85;
+        let mut h = if self.page_notes.is_empty() && !refs.is_empty() { 9.0 } else { 0.0 };
+        for &n in refs {
+            let spans = self.note_spans(n);
+            let width = self.cw;
+            let lines = self.break_lines(&spans, self.base, size, width);
+            h += lines.iter().map(|l| line_size(l, size) * LINE).sum::<f32>() + 2.0;
+        }
+        h
+    }
+
+    /// Ritar sidans fotnoter längst ned: en kort linje och sedan noterna i liten stil.
+    fn flush_notes(&mut self) {
+        if self.page_notes.is_empty() || self.pages.is_empty() {
+            return;
+        }
+        let notes = std::mem::take(&mut self.page_notes);
+        let top = self.ph - self.mb - self.reserved;
+        self.reserved = 0.0;
+        let (ml, cw) = (self.ml, self.cw);
+        let (saved_y, saved_align) = (self.y, self.align);
+        self.page().ops.push(Op::Line { x1: ml, y1: top + 3.0, x2: ml + cw / 3.0, y2: top + 3.0, width: 0.6, color: MUTED });
+        self.y = top + 9.0;
+        self.align = Align::Left;
+        self.in_notes = true;
+        let size = self.body * 0.85;
+        for n in notes {
+            let spans = self.note_spans(n);
+            self.text_block(&spans, ml, cw, self.base, size, INK, false, None);
+            self.y += 2.0;
+        }
+        self.in_notes = false;
+        self.y = saved_y;
+        self.align = saved_align;
     }
 
     /// Delar upp textstyckena i ord som kan radbrytas.
@@ -730,6 +833,7 @@ impl<'a> Layout<'a> {
             let face = face_for(&s.style, base);
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
+            let sz = if s.style.fnref.is_some() { sz * 0.65 } else { sz };
             for (li, line) in s.text.split('\n').enumerate() {
                 if li > 0 {
                     out.push(Piece { text: String::new(), face, size: sz, width: 0.0, style: s.style.clone(), space: false, newline: true });
@@ -830,9 +934,22 @@ impl<'a> Layout<'a> {
         let lines = self.break_lines(spans, base, size, width);
         let n = lines.len();
         for (i, mut line) in lines.into_iter().enumerate() {
+            // Fotnoterna på raden ska ha plats längst ned på samma sida som raden.
+            let refs: Vec<usize> = if self.in_notes {
+                Vec::new()
+            } else {
+                line.pieces.iter().filter_map(|p| p.style.fnref).filter(|n| !self.page_notes.contains(n)).collect()
+            };
             let msz = line_size(&line, size);
             let line_h = msz * LINE;
+            let mut need = self.note_cost(&refs);
+            if need > 0.0 && self.y + line_h + self.reserved + need > self.ph - self.mb && self.y > self.mt + 0.5 {
+                self.new_page();
+                need = self.note_cost(&refs);
+            }
             self.ensure(line_h);
+            self.reserved += need;
+            self.page_notes.extend(refs);
             let baseline = self.y + msz * 1.08;
             if i == 0 {
                 if let Some((marker, mface)) = &first_line_extra {
@@ -894,7 +1011,9 @@ impl<'a> Layout<'a> {
                     (false, Some(sc)) => (sc[0], sc[1], sc[2]),
                     (false, None) => color,
                 };
-                self.page().ops.push(Op::Text { x: rx, y: baseline, face, size: sz, text, color: c, italic: st.italic || italic_all });
+                // Fotnotsnummer ritas upphöjda.
+                let ty = if st.fnref.is_some() { baseline - size * 0.38 } else { baseline };
+                self.page().ops.push(Op::Text { x: rx, y: ty, face, size: sz, text, color: c, italic: st.italic || italic_all });
                 if st.link.is_some() {
                     self.page().ops.push(Op::Line { x1: rx, y1: baseline + 1.6, x2: rx + w, y2: baseline + 1.6, width: 0.6, color: LINK });
                 }
@@ -1055,7 +1174,7 @@ impl<'a> Layout<'a> {
         while i < lines.len() {
             self.ensure(line_h + 2.0 * pad);
             // Så många rader som får plats på sidan.
-            let room = ((self.ph - self.mb - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
+            let room = ((self.ph - self.mb - self.reserved - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
             let chunk = &lines[i..(i + room).min(lines.len())];
             let h = chunk.len() as f32 * line_h + 2.0 * pad;
             let top = self.y;
@@ -1178,7 +1297,7 @@ fn doc_defaults(md: &str) -> DocDefaults {
 
 /// Lägger ut alla block. Med en innehållsförteckning görs två passager: förteckningens höjd beror
 /// bara på antalet rubriker, så sidnumren från första passet stämmer i det andra.
-fn lay_out<'a>(blocks: &[Block], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
+fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
     // Rubrikerna H1–H3 till en eventuell innehållsförteckning (samma urval som bokmärkena).
     let toc_entries: Vec<(u8, String)> = blocks
         .iter()
@@ -1192,16 +1311,20 @@ fn lay_out<'a>(blocks: &[Block], defaults: &DocDefaults, resolve: &'a dyn Fn(&st
         .collect();
     let mut lay = Layout::new(resolve, defaults);
     lay.toc_entries = toc_entries.clone();
+    lay.notes = notes.to_vec();
     lay.new_page();
     lay.run(blocks);
+    lay.flush_notes();
     if blocks.iter().any(|b| matches!(b, Block::Toc)) {
         let pos: Vec<(usize, f32)> =
             lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
         let mut second = Layout::new(resolve, defaults);
         second.toc_entries = toc_entries;
         second.toc_pos = pos;
+        second.notes = notes.to_vec();
         second.new_page();
         second.run(blocks);
+        second.flush_notes();
         lay = second;
     }
     lay
@@ -1209,9 +1332,9 @@ fn lay_out<'a>(blocks: &[Block], defaults: &DocDefaults, resolve: &'a dyn Fn(&st
 
 /// Bygger en PDF av Markdown-text.
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
-    let blocks = parse_blocks(markdown);
+    let (blocks, notes) = parse_blocks_notes(markdown);
     let defaults = doc_defaults(markdown);
-    let mut lay = lay_out(&blocks, &defaults, resolve);
+    let mut lay = lay_out(&blocks, &notes, &defaults, resolve);
 
     let fonts: HashMap<Face, Font> = [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium]
         .into_iter()
@@ -1363,7 +1486,7 @@ mod tests {
         // Rubrikernas riktiga sidor, ur layouten.
         let blocks = parse_blocks(&md);
         assert!(blocks.iter().any(|b| matches!(b, Block::Toc)));
-        let lay = lay_out(&blocks, &doc_defaults(&md), &|_| None);
+        let lay = lay_out(&blocks, &[], &doc_defaults(&md), &|_| None);
         let pages: Vec<usize> = lay.headings.iter().map(|h| h.page + 1).collect();
         assert_eq!(pages.len(), 8);
         assert!(pages.last().unwrap() > &2, "{pages:?}");
@@ -1668,3 +1791,7 @@ mod manual {
         std::fs::write(o, w.bytes).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "pdf_fn_tests.rs"]
+mod fn_tests;

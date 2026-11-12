@@ -9,3 +9,5 @@ pub mod pages;
 pub mod view;
 #[cfg(test)]
 pub mod bench;
+#[cfg(test)]
+mod fn_tests;

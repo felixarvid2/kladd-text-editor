@@ -24,6 +24,8 @@ pub enum Block {
     Numbered,
     Code,
     Table,
+    /// Fotnotsdefinition `[^1]: text` (visas under en skiljelinje i slutet av dokumentet).
+    Footnote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,10 @@ pub struct Piece {
     pub image: Option<ImageRef>,
     /// `Some(N)` för objektmarkören `<!--k:N-->` (en osynlig bit med `markup: true`).
     pub object: Option<u32>,
+    /// `Some(etikett)` för etiketten i en fotnotsreferens `[^etikett]` (`[^` och `]` är markup).
+    pub footnote_ref: Option<String>,
+    /// `Some(etikett)` för etiketten i början av en fotnotsdefinition `[^etikett]: `.
+    pub footnote_def: Option<String>,
     /// Sammanslaget stilvärde för alla omslutande `<span style="…">` (den inre vinner); `None` om ingen.
     pub span: Option<Arc<SpanStyle>>,
     /// Justering från omslutande `<div align>`; `Left` annars.
@@ -131,6 +137,8 @@ struct St {
     list_marker: bool,
     image: Option<u32>,
     object: Option<u32>,
+    fnref: Option<u32>,
+    fndef: Option<u32>,
     span: Option<u32>,
     align: Align,
 }
@@ -149,6 +157,8 @@ impl Default for St {
             list_marker: false,
             image: None,
             object: None,
+            fnref: None,
+            fndef: None,
             span: None,
             align: Align::Left,
         }
@@ -234,8 +244,9 @@ fn parse(text: &str) -> Parsed {
     let mut image_depth = 0usize;
     let mut in_code_block = false;
     let mut last_text_end = 0usize;
+    let mut labels: Vec<String> = Vec::new();
 
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let opts = FOOTNOTE_OPTS;
     for (ev, r) in Parser::new_ext(text, opts).into_offset_iter() {
         let r = r.start.min(n)..r.end.min(n);
         if image_depth > 0 {
@@ -286,6 +297,16 @@ fn parse(text: &str) -> Parsed {
                         match kind {
                             CodeBlockKind::Fenced(_) => mark_fenced(text, &mut st, &r),
                             CodeBlockKind::Indented => fill(&mut st, r.clone(), |s| s.code = true),
+                        }
+                    }
+                    Tag::FootnoteDefinition(_) => {
+                        fill(&mut st, r.clone(), |s| s.block = Block::Footnote);
+                        if let Some((lab, colon_end)) = def_label(text, r.start) {
+                            labels.push(text[lab.clone()].to_owned());
+                            let idx = (labels.len() - 1) as u32;
+                            fill(&mut st, r.start..lab.start, |s| s.markup = true);
+                            fill(&mut st, lab.clone(), |s| s.fndef = Some(idx));
+                            fill(&mut st, lab.end..colon_end, |s| s.markup = true);
                         }
                     }
                     Tag::List(start) => lists.push(start.is_some()),
@@ -340,6 +361,15 @@ fn parse(text: &str) -> Parsed {
                         }
                     }
                     _ => {}
+                }
+            }
+            Event::FootnoteReference(_) => {
+                if r.len() >= 4 && text[r.clone()].starts_with("[^") && tb[r.end - 1] == b']' {
+                    labels.push(text[r.start + 2..r.end - 1].to_owned());
+                    let idx = (labels.len() - 1) as u32;
+                    fill(&mut st, r.start..r.start + 2, |s| s.markup = true);
+                    fill(&mut st, r.start + 2..r.end - 1, |s| s.fnref = Some(idx));
+                    fill(&mut st, r.end - 1..r.end, |s| s.markup = true);
                 }
             }
             Event::Code(_) => {
@@ -484,19 +514,19 @@ fn parse(text: &str) -> Parsed {
         match cur {
             Some((_, s)) if s == st[i] => {}
             Some((start, s)) => {
-                pieces.push(make_piece(start..i, &s, &images, &styles));
+                pieces.push(make_piece(start..i, &s, &images, &styles, &labels));
                 cur = Some((i, st[i]));
             }
             None => cur = Some((i, st[i])),
         }
     }
     if let Some((start, s)) = cur {
-        pieces.push(make_piece(start..n, &s, &images, &styles));
+        pieces.push(make_piece(start..n, &s, &images, &styles, &labels));
     }
     Parsed { pieces, spans, hspans, defaults }
 }
 
-fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>]) -> Piece {
+fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>], labels: &[String]) -> Piece {
     Piece {
         range,
         block: s.block,
@@ -510,6 +540,8 @@ fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<Sp
         list_marker: s.list_marker,
         image: s.image.and_then(|i| images.get(i as usize).cloned()),
         object: s.object,
+        footnote_ref: s.fnref.and_then(|i| labels.get(i as usize).cloned()),
+        footnote_def: s.fndef.and_then(|i| labels.get(i as usize).cloned()),
         span: s.span.and_then(|i| styles.get(i as usize).cloned()),
         align: s.align,
     }
@@ -1374,7 +1406,7 @@ fn add_fmt(text: &str, parsed: &Parsed, a: &Analysis, m: Inline, s: usize, e: us
 
 pub fn set_block(text: &str, sel: Range<usize>, b: Block) -> Edit {
     let (s, e) = norm_sel(text, &sel);
-    if matches!(b, Block::Code | Block::Table) {
+    if matches!(b, Block::Code | Block::Table | Block::Footnote) {
         return Edit { text: text.to_string(), sel: s..e };
     }
     let a = analyze(text);
@@ -2366,13 +2398,394 @@ pub fn set_align(text: &str, sel: Range<usize>, align: Align) -> Edit {
     Edit { text: t, sel: ns..ne }
 }
 
+// ============================================================== fotnoter
+
+/// Markdown-alternativen med fotnoter (samma som `parse` använder).
+pub const FOOTNOTE_OPTS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_FOOTNOTES);
+
+/// Etikettens intervall och slutet på `]:` för definitionen som börjar på `start` (`[^etikett]:`).
+fn def_label(text: &str, start: usize) -> Option<(Range<usize>, usize)> {
+    let rest = text.get(start..)?;
+    let body = rest.strip_prefix("[^")?;
+    let close = body.find(']')?;
+    if body[..close].contains('\n') || !body[close..].starts_with("]:") {
+        return None;
+    }
+    Some((start + 2..start + 2 + close, start + 2 + close + 2))
+}
+
+/// En fotnotsreferens eller -definition i texten.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub label: String,
+    pub label_range: Range<usize>,
+    /// Referensen `[^1]` eller hela definitionen (utan avslutande radbrytningar).
+    pub full: Range<usize>,
+}
+
+/// Referenserna och definitionerna i texten, i textordning.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Notes {
+    pub refs: Vec<Note>,
+    pub defs: Vec<Note>,
+}
+
+pub fn footnotes(text: &str) -> Notes {
+    let mut n = Notes::default();
+    if !text.contains("[^") {
+        return n;
+    }
+    for (ev, r) in Parser::new_ext(text, FOOTNOTE_OPTS).into_offset_iter() {
+        match ev {
+            Event::FootnoteReference(_) => {
+                if r.len() >= 4 && text[r.clone()].starts_with("[^") && text.as_bytes()[r.end - 1] == b']' {
+                    let lr = r.start + 2..r.end - 1;
+                    n.refs.push(Note { label: text[lr.clone()].to_owned(), label_range: lr, full: r });
+                }
+            }
+            Event::Start(Tag::FootnoteDefinition(_)) => {
+                if let Some((lr, colon_end)) = def_label(text, r.start) {
+                    let end = r.start + text[r.start..r.end].trim_end().len();
+                    n.defs.push(Note { label: text[lr.clone()].to_owned(), label_range: lr, full: r.start..end.max(colon_end) });
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Referensernas etiketter, i den ordning de först förekommer.
+fn labels_in_order(notes: &Notes) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for r in &notes.refs {
+        if !order.contains(&r.label) {
+            order.push(r.label.clone());
+        }
+    }
+    order
+}
+
+/// Är fotnoterna i ordning (etiketterna 1..n i referensernas ordning, definitionerna i samma
+/// ordning sist)? Snabb kontroll på analysen, för att bara numrera om när det behövs.
+pub fn footnotes_in_order(a: &Analysis) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut defs: Vec<&str> = Vec::new();
+    for pc in &a.pieces {
+        if let Some(l) = pc.footnote_ref.as_deref() {
+            if !seen.contains(&l) {
+                if l != (seen.len() + 1).to_string() {
+                    return false;
+                }
+                seen.push(l);
+            }
+        } else if let Some(l) = pc.footnote_def.as_deref() {
+            defs.push(l);
+        } else if !defs.is_empty() && pc.block != Block::Footnote && !pc.range.is_empty() {
+            // Brödtext efter en definition: definitionerna ligger inte sist.
+            return false;
+        }
+    }
+    // Definitionerna: de refererade först i nummerordning, föräldralösa sist.
+    let mut next = 1usize;
+    for d in &defs {
+        if seen.contains(d) {
+            if *d != next.to_string() {
+                return false;
+            }
+            next += 1;
+        } else if next <= seen.len() {
+            return false;
+        }
+    }
+    next == seen.len() + 1
+}
+
+/// Numrerar om fotnoterna: etiketterna blir 1..n i den ordning referenserna kommer, och
+/// definitionerna läggs sist i samma ordning. Definitioner utan referens behålls sist.
+pub fn renumber_footnotes(text: &str) -> String {
+    renumber_core(text, None, 0).0
+}
+
+/// Som `renumber_footnotes`, men flyttar också markören `caret` med texten.
+pub fn renumber_footnotes_at(text: &str, caret: usize) -> (String, usize) {
+    let (t, _, c) = renumber_core(text, None, caret);
+    (t, c)
+}
+
+/// Kärnan: ny text, det nya numret för etiketten `track` och den flyttade markören.
+fn renumber_core(text: &str, track: Option<&str>, caret: usize) -> (String, Option<usize>, usize) {
+    let notes = footnotes(text);
+    if notes.refs.is_empty() && notes.defs.is_empty() {
+        return (text.to_owned(), None, caret);
+    }
+    let order = labels_in_order(&notes);
+    let n = order.len();
+    let number_of = |l: &str| order.iter().position(|x| x == l).map(|i| i + 1);
+    let tracked = track.and_then(number_of);
+
+    // Etikett per definition: refererade får sitt nummer, föräldralösa (och dubbletter) behåller
+    // sin etikett om den är ledig, annars nästa lediga nummer.
+    let mut used: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+    let mut taken: Vec<bool> = vec![false; n + 1];
+    let mut def_new: Vec<(String, Option<usize>)> = Vec::new(); // (ny etikett, nummer om refererad)
+    for d in &notes.defs {
+        match number_of(&d.label) {
+            Some(k) if !taken[k] => {
+                taken[k] = true;
+                def_new.push((k.to_string(), Some(k)));
+            }
+            _ => def_new.push((String::new(), None)),
+        }
+    }
+    let mut fresh = n + 1;
+    for (i, d) in notes.defs.iter().enumerate() {
+        if def_new[i].1.is_none() {
+            let l = if !used.contains(&d.label) && !d.label.is_empty() {
+                d.label.clone()
+            } else {
+                loop {
+                    let c = fresh.to_string();
+                    fresh += 1;
+                    if !used.contains(&c) {
+                        break c;
+                    }
+                }
+            };
+            used.push(l.clone());
+            def_new[i].0 = l;
+        }
+    }
+
+    // Etikettbyten.
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for r in &notes.refs {
+        let new = number_of(&r.label).map(|k| k.to_string()).unwrap_or_else(|| r.label.clone());
+        if new != r.label {
+            edits.push((r.label_range.clone(), new));
+        }
+    }
+    for (d, (new, _)) in notes.defs.iter().zip(&def_new) {
+        if *new != d.label {
+            edits.push((d.label_range.clone(), new.clone()));
+        }
+    }
+    edits.sort_by_key(|e| e.0.start);
+
+    // Definitionernas ordning: refererade efter nummer, sedan föräldralösa som förut.
+    let mut idx: Vec<usize> = (0..notes.defs.len()).collect();
+    idx.sort_by_key(|&i| match def_new[i].1 {
+        Some(k) => (0, k, i),
+        None => (1, 0, i),
+    });
+    let in_order = idx.iter().enumerate().all(|(a, &b)| a == b);
+    let mut tail = true;
+    if let Some(first) = notes.defs.first() {
+        let mut at = first.full.start;
+        for d in &notes.defs {
+            tail &= text[at..d.full.start].trim().is_empty();
+            at = d.full.end;
+        }
+        tail &= text[at..].trim().is_empty();
+    }
+    if edits.is_empty() && in_order && tail {
+        return (text.to_owned(), tracked, caret);
+    }
+
+    let map = |p: usize| -> usize {
+        let mut q = p as isize;
+        for (r, s) in &edits {
+            if r.end <= p {
+                q += s.len() as isize - r.len() as isize;
+            } else if r.start < p {
+                q = q - (p - r.start) as isize + s.len() as isize;
+                break;
+            }
+        }
+        q as usize
+    };
+    let new_text = splice(text, &edits);
+    let defs_new: Vec<Range<usize>> = notes.defs.iter().map(|d| map(d.full.start)..map(d.full.end)).collect();
+
+    // Brödtexten utan definitionerna.
+    let mut body = String::new();
+    let mut at = 0;
+    // Raderna efter en definition följer med (annars blir det extra tomrader).
+    let mut removed: Vec<Range<usize>> = defs_new
+        .iter()
+        .map(|r| r.start..r.end + new_text[r.end..].len() - new_text[r.end..].trim_start().len())
+        .collect();
+    removed.sort_by_key(|r| r.start);
+    for r in &removed {
+        body.push_str(&new_text[at..r.start]);
+        at = r.end;
+    }
+    body.push_str(&new_text[at..]);
+    let body_len = body.trim_end().len();
+    body.truncate(body_len);
+    let mut out = body;
+    let body_end = out.len();
+    let mut starts: Vec<usize> = vec![0; notes.defs.len()];
+    for (k, &i) in idx.iter().enumerate() {
+        out.push_str(if k == 0 && !out.is_empty() {
+            "\n\n"
+        } else if k == 0 {
+            ""
+        } else {
+            "\n"
+        });
+        starts[i] = out.len();
+        let mut line = new_text[defs_new[i].clone()].to_owned();
+        if line.ends_with("]:") {
+            line.push(' ');
+        }
+        out.push_str(&line);
+    }
+    if !notes.defs.is_empty() {
+        out.push('\n');
+    }
+
+    // Markören: i en definition följer den med dit definitionen hamnar.
+    let c = match notes.defs.iter().position(|d| d.full.start <= caret && caret <= d.full.end) {
+        Some(i) => starts[i] + (map(caret) - defs_new[i].start).min(defs_new[i].len() + 1),
+        None => {
+            let q = map(caret);
+            let shift: usize = removed.iter().filter(|r| r.end <= q).map(|r| r.len()).sum();
+            (q - shift).min(body_end)
+        }
+    };
+    let c = c.min(out.len());
+    (out, tracked, c)
+}
+
+/// Sätter in en fotnotsreferens `[^k]` vid `caret` (k = dess löpnummer), numrerar om de senare
+/// referenserna och definitionerna och lägger till en tom definition i ordning. Markören hamnar i
+/// den nya definitionen.
+pub fn insert_footnote(text: &str, caret: usize) -> Edit {
+    let mut caret = floor_boundary(text, caret.min(text.len()));
+    let notes = footnotes(text);
+    // Inte i en fotnotsdefinition (fotnot i fotnot saknas) och inte mitt i en referens.
+    if notes.defs.iter().any(|d| d.full.start <= caret && caret <= d.full.end) {
+        return unchanged(text, caret);
+    }
+    if let Some(r) = notes.refs.iter().find(|r| r.full.start < caret && caret < r.full.end) {
+        caret = r.full.end;
+    }
+    const TMP: &str = "kladdny";
+    let mut t = String::with_capacity(text.len() + 32);
+    t.push_str(&text[..caret]);
+    t.push_str("[^");
+    t.push_str(TMP);
+    t.push(']');
+    t.push_str(&text[caret..]);
+    let trimmed = t.trim_end().len();
+    t.truncate(trimmed);
+    // Efter befintliga definitioner räcker en radbrytning, annars en tom rad.
+    let after_defs = notes.defs.last().is_some_and(|d| text[d.full.end..].trim().is_empty());
+    t.push_str(if after_defs { "\n" } else { "\n\n" });
+    t.push_str("[^");
+    t.push_str(TMP);
+    t.push_str("]: ");
+    let (out, k, _) = renumber_core(&t, Some(TMP), 0);
+    let Some(k) = k else { return unchanged(text, caret) };
+    let at = footnotes(&out)
+        .defs
+        .into_iter()
+        .find(|d| d.label == k.to_string())
+        .map_or(out.len(), |d| (d.label_range.end + 3).min(line_end(&out, d.label_range.end)));
+    Edit { sel: at..at, text: out }
+}
+
+/// Tar bort fotnoten `label`: alla referenser och definitionen. De övriga numreras om.
+pub fn delete_footnote(text: &str, label: &str) -> String {
+    let notes = footnotes(text);
+    let mut cuts: Vec<Range<usize>> = notes.refs.iter().filter(|r| r.label == label).map(|r| r.full.clone()).collect();
+    for d in notes.defs.iter().filter(|d| d.label == label) {
+        let end = if text[d.full.end..].starts_with('\n') { d.full.end + 1 } else { d.full.end };
+        cuts.push(d.full.start..end);
+    }
+    if cuts.is_empty() {
+        return text.to_owned();
+    }
+    cuts.sort_by_key(|r| r.start);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for r in &cuts {
+        out.push_str(&text[at..r.start.max(at)]);
+        at = r.end.max(at);
+    }
+    out.push_str(&text[at..]);
+    let out = if footnotes(&out).defs.is_empty() {
+        let t = out.trim_end();
+        if text.ends_with('\n') {
+            format!("{t}\n")
+        } else {
+            t.to_owned()
+        }
+    } else {
+        out
+    };
+    renumber_footnotes(&out)
+}
+
+/// Etiketten, om det är en definition (annars en referens) och etikettbitens intervall för
+/// fotnoten som `pos` ligger i.
+pub fn footnote_label_at(a: &Analysis, pos: usize) -> Option<(String, bool, Range<usize>)> {
+    let i = a.pieces.partition_point(|pc| pc.range.end <= pos);
+    for pc in a.pieces.get(i.saturating_sub(1)..(i + 1).min(a.pieces.len()))? {
+        if pc.range.start <= pos && pos <= pc.range.end {
+            if let Some(l) = &pc.footnote_ref {
+                return Some((l.clone(), false, pc.range.clone()));
+            }
+            if let Some(l) = &pc.footnote_def {
+                return Some((l.clone(), true, pc.range.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Dit ett klick på fotnotsnumret `label` hoppar: från en referens till definitionens text,
+/// från en definition till den första referensen (efter `]`).
+pub fn footnote_target(text: &str, a: &Analysis, label: &str, from_def: bool) -> Option<usize> {
+    if from_def {
+        let pc = a.pieces.iter().find(|pc| pc.footnote_ref.as_deref() == Some(label))?;
+        return Some((pc.range.end + 1).min(text.len()));
+    }
+    let pc = a.pieces.iter().find(|pc| pc.footnote_def.as_deref() == Some(label))?;
+    Some((pc.range.end + 3).min(line_end(text, pc.range.end)))
+}
+
+/// Där fotnotsdefinitionerna börjar (för skiljelinjen), om de ligger sist i dokumentet.
+pub fn footnote_area_start(text: &str, a: &Analysis) -> Option<usize> {
+    let mut start = None;
+    let mut seen_def = false;
+    for pc in a.pieces.iter().rev() {
+        if pc.block == Block::Footnote {
+            start = Some(pc.range.start);
+            seen_def = true;
+        } else if seen_def || text[pc.range.clone()].trim().is_empty() {
+            if seen_def {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 // ============================================================== räkning
 
 pub fn count(_text: &str, a: &Analysis) -> (usize, usize) {
     let mut vis = String::new();
     let mut chars = 0;
     for p in &a.pieces {
-        if p.image.is_some() {
+        // Fotnotsetiketterna är numrering, inte ord.
+        if p.image.is_some() || p.footnote_ref.is_some() || p.footnote_def.is_some() {
             continue;
         }
         if p.markup {

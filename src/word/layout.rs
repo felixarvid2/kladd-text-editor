@@ -341,9 +341,12 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
             Block::Numbered => 3,
             Block::Code => 4,
             Block::Table => 5,
+            Block::Footnote => 6,
         }
         .hash(&mut h);
         pc.object.hash(&mut h);
+        pc.footnote_ref.is_some().hash(&mut h);
+        pc.footnote_def.is_some().hash(&mut h);
         if let Some(s) = &pc.span {
             s.font_family.hash(&mut h);
             s.font_size.map(f32::to_bits).hash(&mut h);
@@ -467,6 +470,7 @@ fn block_size_pt(b: Block, mono: bool, body: f32) -> f32 {
         Block::Heading(3) => 13.0,
         Block::Heading(4) => 12.0,
         Block::Heading(_) => 11.0,
+        Block::Footnote => body * 0.85,
         _ => body,
     }
 }
@@ -560,6 +564,14 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         color,
         ..Default::default()
     };
+    // Fotnotsnummer (referens och definition): litet, upphöjt och i länkfärg. Med egen radhöjd
+    // centreras texten alltid, så upphöjningen kräver `line_height: None` och `valign: TOP`.
+    if pc.footnote_ref.is_some() || pc.footnote_def.is_some() {
+        f.font_id.size *= 0.65;
+        f.line_height = None;
+        f.valign = egui::Align::TOP;
+        f.color = pal.page_link;
+    }
     if pc.code && pc.block != Block::Table {
         f.background = pal.page_code_bg;
     }
