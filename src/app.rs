@@ -145,6 +145,8 @@ pub struct KladdApp {
     preview_images: std::collections::HashSet<String>,
     owns_socket: bool,
     pub(crate) word: crate::word::layout::Cache,
+    /// Typsnitt som Word-dokumenten använder, hämtade från systemet.
+    pub(crate) doc_fonts: crate::word::fonts::DocFonts,
     pub(crate) speller: Option<crate::spell::Speller>,
     pub(crate) wv: crate::word::view::State,
 }
@@ -243,6 +245,7 @@ impl KladdApp {
             preview_images: std::collections::HashSet::new(),
             owns_socket: false,
             word: Default::default(),
+            doc_fonts: crate::word::fonts::DocFonts::new(),
             speller: None,
             wv: Default::default(),
         };
