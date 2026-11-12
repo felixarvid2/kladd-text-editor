@@ -671,7 +671,7 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
 
         if let Some(img) = &pc.image {
             if hide {
-                if let Some(h) = (p.image_size)(&img.src).map(|s| s.y) {
+                if let Some(h) = (p.image_size)(&super::images::size_key(img)).map(|s| s.y) {
                     // Dold text, men första tecknet reserverar bildens höjd.
                     let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
                     let fam = (p.font_family)(Some(a.defaults.font()), false, false);
@@ -820,7 +820,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             .iter()
             .filter(|pc| !intersects(&pc.range, &p.reveal))
             .filter_map(|pc| pc.image.as_ref())
-            .filter_map(|img| (p.image_size)(&img.src))
+            .filter_map(|img| (p.image_size)(&super::images::size_key(img)))
             .map(|sz| sz.x)
             .sum();
         out.push(Para { range, align, list, image_w, collapse: tag.last() != Some(&0) });

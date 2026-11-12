@@ -16,6 +16,7 @@ use egui::{
     UiBuilder, Vec2, pos2, vec2,
 };
 
+use super::images;
 use super::layout::{self, px};
 use super::pages;
 use super::markup::{self, Block, Inline, SpanProp};
@@ -87,6 +88,8 @@ enum SpellAct {
 pub struct State {
     images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
+    /// Vald bild, pågående storleksändring.
+    img: images::State,
     target: Option<SpellTarget>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
@@ -625,7 +628,11 @@ impl KladdApp {
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
                 BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
-                BarAct::Align(al) => self.word_edit(&ctx, |t, s| markup::set_align(t, s, al)),
+                BarAct::Align(al) => {
+                    // En vald bild justeras som sitt stycke, oavsett var markören står.
+                    let img = self.wv.img.range.clone();
+                    self.word_edit(&ctx, |t, s| markup::set_align(t, img.unwrap_or(s), al))
+                }
                 BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
                 BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
                 BarAct::Zoom(d) => self.word_zoom_step(d),
@@ -667,6 +674,21 @@ impl KladdApp {
         }
     }
 
+    /// Utför en åtgärd på den valda bilden (`r` är bildbitens område i texten).
+    fn word_image_act(&mut self, ctx: &egui::Context, act: images::Act, r: Range<usize>) {
+        use images::Act;
+        match act {
+            Act::Align(al) => self.word_edit(ctx, |t, _| markup::set_align(t, r, al)),
+            Act::Original => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, None)),
+            Act::Resize { w, h: None } => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, Some(w))),
+            Act::Resize { w, h: Some(h) } => self.word_edit(ctx, |t, _| images::set_free_size(t, r, w, h)),
+            Act::Delete => {
+                self.word_edit(ctx, |t, _| images::remove_image(t, r));
+                self.wv.img.deselect();
+            }
+        }
+    }
+
     /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
         CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
@@ -699,18 +721,14 @@ impl KladdApp {
             let area_w = avail_w.max(page_w + 2.0 * GAP);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
-            let srcs: Vec<String> = analysis
-                .pieces
-                .iter()
-                .filter_map(|pc| pc.image.as_ref().map(|i| i.src.clone()))
-                .collect();
+            let refs: Vec<markup::ImageRef> = analysis.pieces.iter().filter_map(|pc| pc.image.clone()).collect();
+            let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
-            for src in srcs {
-                self.word_image(&ctx, &src);
-                if let Some(Some(info)) = self.wv.images.get(&(doc_id, src.clone())) {
+            for img in refs {
+                self.word_image(&ctx, &img.src);
+                if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
                     let max_w = geom1.text_w();
-                    let k = (max_w / info.size.x).min(1.0);
-                    sizes.insert(src, info.size * k * z);
+                    sizes.insert(images::size_key(&img), images::display_size(info.size, &img, max_w, z));
                 }
             }
             let image_size = |src: &str| sizes.get(src).copied();
@@ -773,7 +791,12 @@ impl KladdApp {
             };
             let current_match = self.find.current;
             let scroll_to = self.scroll_to_char.take();
-            let focus = std::mem::take(&mut self.focus_editor);
+            // En vald bild tar fokus från texten (annars skulle Delete/Backspace gå dit).
+            let focus = std::mem::take(&mut self.focus_editor) && self.wv.img.selected.is_none();
+            let mut imgs = std::mem::take(&mut self.wv.img);
+            let mut img_act: Option<images::Act> = None;
+            let mut painted: Vec<images::Painted> = Vec::new();
+            let mut img_index = 0usize;
             let secondary_target = self.wv.target.clone();
 
             // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
@@ -944,21 +967,34 @@ impl KladdApp {
                             }
                         };
                     }
+                    if pc.image.is_some() {
+                        img_index += 1;
+                    }
                     if let (Some(img), false) = (&pc.image, shown) {
-                        if let Some(sz) = sizes.get(&img.src) {
+                        if let Some(sz) = sizes.get(&images::size_key(img)) {
                             let ci = conv.at(pc.range.start);
                             let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
                             {
                                 let uri = image_uri(&img.src, doc_id);
                                 let rect = Rect::from_min_size(r.min, *sz);
                                 if rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
-                                    egui::Image::new(uri).paint_at(ui, rect);
+                                    egui::Image::new(uri.clone()).paint_at(ui, rect);
+                                    painted.push(images::Painted {
+                                        rect,
+                                        range: pc.range.clone(),
+                                        index: img_index - 1,
+                                        uri,
+                                    });
                                 }
                             }
                         }
                     }
                 }
                 flush_bar(&mut bar);
+
+                // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
+                let max_w = text_w;
+                img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p);
 
                 // Tabellrutnät: 1 px kantlinjer vid de dolda pipornas lägen och radgränserna.
                 if !edited {
@@ -1091,6 +1127,11 @@ impl KladdApp {
             });
 
             self.wv.pages = page_pos;
+            let img_range = imgs.range.clone();
+            self.wv.img = imgs;
+            if let (Some(act), Some(r)) = (img_act, img_range) {
+                self.word_image_act(&ctx, act, r);
+            }
             if open_page_dlg {
                 self.open_page_dialog();
             }

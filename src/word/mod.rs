@@ -1,4 +1,5 @@
 pub mod fonts;
+pub mod images;
 pub mod layout;
 pub mod markup;
 pub mod tables;
