@@ -24,6 +24,8 @@ pub enum Block {
     Numbered,
     Code,
     Table,
+    /// Fotnotsdefinition `[^1]: text` (visas under en skiljelinje i slutet av dokumentet).
+    Footnote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,13 @@ pub enum Inline {
     Strike,
 }
 
+/// Flytande bild: texten i följande stycken flyter runt bilden (`<img align="left|right">`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Float {
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageRef {
     pub alt: String,
@@ -42,6 +51,8 @@ pub struct ImageRef {
     pub width: Option<f32>,
     /// Höjd i CSS-pixlar; bara satt för `<img height>`.
     pub height: Option<f32>,
+    /// `<img align="left|right">`: bilden flyter vid vänster/höger textkant.
+    pub align: Option<Float>,
 }
 
 /// En bit av texten med enhetlig stil. Bitarna täcker hela texten i ordning, utan glapp.
@@ -62,6 +73,10 @@ pub struct Piece {
     pub image: Option<ImageRef>,
     /// `Some(N)` för objektmarkören `<!--k:N-->` (en osynlig bit med `markup: true`).
     pub object: Option<u32>,
+    /// `Some(etikett)` för etiketten i en fotnotsreferens `[^etikett]` (`[^` och `]` är markup).
+    pub footnote_ref: Option<String>,
+    /// `Some(etikett)` för etiketten i början av en fotnotsdefinition `[^etikett]: `.
+    pub footnote_def: Option<String>,
     /// Sammanslaget stilvärde för alla omslutande `<span style="…">` (den inre vinner); `None` om ingen.
     pub span: Option<Arc<SpanStyle>>,
     /// Justering från omslutande `<div align>`; `Left` annars.
@@ -131,6 +146,8 @@ struct St {
     list_marker: bool,
     image: Option<u32>,
     object: Option<u32>,
+    fnref: Option<u32>,
+    fndef: Option<u32>,
     span: Option<u32>,
     align: Align,
 }
@@ -149,6 +166,8 @@ impl Default for St {
             list_marker: false,
             image: None,
             object: None,
+            fnref: None,
+            fndef: None,
             span: None,
             align: Align::Left,
         }
@@ -234,8 +253,9 @@ fn parse(text: &str) -> Parsed {
     let mut image_depth = 0usize;
     let mut in_code_block = false;
     let mut last_text_end = 0usize;
+    let mut labels: Vec<String> = Vec::new();
 
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let opts = FOOTNOTE_OPTS;
     for (ev, r) in Parser::new_ext(text, opts).into_offset_iter() {
         let r = r.start.min(n)..r.end.min(n);
         if image_depth > 0 {
@@ -288,6 +308,16 @@ fn parse(text: &str) -> Parsed {
                             CodeBlockKind::Indented => fill(&mut st, r.clone(), |s| s.code = true),
                         }
                     }
+                    Tag::FootnoteDefinition(_) => {
+                        fill(&mut st, r.clone(), |s| s.block = Block::Footnote);
+                        if let Some((lab, colon_end)) = def_label(text, r.start) {
+                            labels.push(text[lab.clone()].to_owned());
+                            let idx = (labels.len() - 1) as u32;
+                            fill(&mut st, r.start..lab.start, |s| s.markup = true);
+                            fill(&mut st, lab.clone(), |s| s.fndef = Some(idx));
+                            fill(&mut st, lab.end..colon_end, |s| s.markup = true);
+                        }
+                    }
                     Tag::List(start) => lists.push(start.is_some()),
                     Tag::Item => {
                         let numbered = lists.last().copied().unwrap_or(false);
@@ -310,7 +340,7 @@ fn parse(text: &str) -> Parsed {
                     }
                     Tag::Link { link_type, .. } => link = Some((r.clone(), link_type, r.start + 1)),
                     Tag::Image { dest_url, .. } => {
-                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None });
+                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None, align: None });
                         let idx = (images.len() - 1) as u32;
                         fill(&mut st, r.clone(), |s| {
                             s.image = Some(idx);
@@ -342,6 +372,15 @@ fn parse(text: &str) -> Parsed {
                     _ => {}
                 }
             }
+            Event::FootnoteReference(_) => {
+                if r.len() >= 4 && text[r.clone()].starts_with("[^") && tb[r.end - 1] == b']' {
+                    labels.push(text[r.start + 2..r.end - 1].to_owned());
+                    let idx = (labels.len() - 1) as u32;
+                    fill(&mut st, r.start..r.start + 2, |s| s.markup = true);
+                    fill(&mut st, r.start + 2..r.end - 1, |s| s.fnref = Some(idx));
+                    fill(&mut st, r.end - 1..r.end, |s| s.markup = true);
+                }
+            }
             Event::Code(_) => {
                 let d = tb[r.clone()].iter().take_while(|c| **c == b'`').count();
                 if r.len() >= 2 * d {
@@ -364,6 +403,9 @@ fn parse(text: &str) -> Parsed {
                         s.object = Some(n);
                         s.markup = true;
                     });
+                } else if is_br_tag(t) && st.get(r.start).is_some_and(|x| x.block == Block::Table) {
+                    // Radbrytning i en tabellcell: dold markup, själva brytningen görs av layouten.
+                    fill(&mut st, r.clone(), |s| s.markup = true);
                 } else if t.eq_ignore_ascii_case("<u>") {
                     html_u.push(r.clone());
                 } else if t.eq_ignore_ascii_case("</u>") {
@@ -422,6 +464,9 @@ fn parse(text: &str) -> Parsed {
                                 }),
                             }
                         }
+                    } else if t == super::nav::TOC_LINE {
+                        // Innehållsförteckningen: en dold rad som dokumentläget ersätter med rubrikerna.
+                        fill(&mut st, tr, |s| s.markup = true);
                     } else if ls == 0 {
                         if let Some(d) = DocDefaults::from_comment(t) {
                             defaults = d;
@@ -481,19 +526,19 @@ fn parse(text: &str) -> Parsed {
         match cur {
             Some((_, s)) if s == st[i] => {}
             Some((start, s)) => {
-                pieces.push(make_piece(start..i, &s, &images, &styles));
+                pieces.push(make_piece(start..i, &s, &images, &styles, &labels));
                 cur = Some((i, st[i]));
             }
             None => cur = Some((i, st[i])),
         }
     }
     if let Some((start, s)) = cur {
-        pieces.push(make_piece(start..n, &s, &images, &styles));
+        pieces.push(make_piece(start..n, &s, &images, &styles, &labels));
     }
     Parsed { pieces, spans, hspans, defaults }
 }
 
-fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>]) -> Piece {
+fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>], labels: &[String]) -> Piece {
     Piece {
         range,
         block: s.block,
@@ -507,6 +552,8 @@ fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<Sp
         list_marker: s.list_marker,
         image: s.image.and_then(|i| images.get(i as usize).cloned()),
         object: s.object,
+        footnote_ref: s.fnref.and_then(|i| labels.get(i as usize).cloned()),
+        footnote_def: s.fndef.and_then(|i| labels.get(i as usize).cloned()),
         span: s.span.and_then(|i| styles.get(i as usize).cloned()),
         align: s.align,
     }
@@ -795,6 +842,11 @@ fn parse_img(tag: &str) -> Option<ImageRef> {
         alt: get("alt").unwrap_or_default(),
         width: get("width").and_then(|v| px_value(&v)),
         height: get("height").and_then(|v| px_value(&v)),
+        align: get("align").and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "left" => Some(Float::Left),
+            "right" => Some(Float::Right),
+            _ => None,
+        }),
     })
 }
 
@@ -852,39 +904,235 @@ pub fn image_at(text: &str, a: &Analysis, pos: usize) -> Option<(Range<usize>, I
     piece_at(a, prev).and_then(hit)
 }
 
+/// `<img src alt [width] [height] [align]>` (attributen i den ordningen).
+fn img_tag(img: &ImageRef) -> String {
+    let mut s = format!("<img src=\"{}\" alt=\"{}\"", encode_attr(&img.src), encode_attr(&img.alt));
+    if let Some(w) = img.width {
+        s.push_str(&format!(" width=\"{w}\""));
+    }
+    if let Some(h) = img.height {
+        s.push_str(&format!(" height=\"{h}\""));
+    }
+    match img.align {
+        Some(Float::Left) => s.push_str(" align=\"left\""),
+        Some(Float::Right) => s.push_str(" align=\"right\""),
+        None => {}
+    }
+    s.push('>');
+    s
+}
+
+/// Byter ut bildbiten `range` mot `new` och markerar den nya taggen.
+fn replace_tag(text: &str, range: Range<usize>, new: &str) -> Edit {
+    let mut t = String::with_capacity(text.len() + new.len());
+    t.push_str(&text[..range.start]);
+    t.push_str(new);
+    t.push_str(&text[range.end..]);
+    Edit { text: t, sel: range.start..range.start + new.len() }
+}
+
 /// Ändrar bildens bredd: `Some(w)` skriver `<img src alt width>` (hela pixlar; en uttryckligen
 /// satt höjd skalas med, annars utelämnas den så att proportionerna bevaras), `None` skriver
-/// tillbaka `![alt](src)` (höjden försvinner). `image_range` är bitens område; träffar det
-/// ingen bild, eller blir resultatet detsamma, lämnas texten orörd. Markeringen blir bilden.
+/// tillbaka `![alt](src)` (höjden försvinner; en flytande bild förblir `<img align>`).
+/// `image_range` är bitens område; träffar det ingen bild, eller blir resultatet detsamma,
+/// lämnas texten orörd. Markeringen blir bilden.
 pub fn set_image_size(text: &str, image_range: Range<usize>, width: Option<f32>) -> Edit {
     let keep = || Edit { text: text.to_string(), sel: image_range.clone() };
     let a = analyze(text);
-    let Some(img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
+    let Some(mut img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
         return keep();
     };
     let new = match width {
         Some(w) if w.is_finite() && w >= 1.0 => {
             let w = w.round();
-            let h = img.height.map(|h| match img.width {
+            img.height = img.height.map(|h| match img.width {
                 Some(ow) if ow > 0.0 => (h * w / ow).round().max(1.0),
                 _ => h.round().max(1.0),
             });
-            let mut s = format!("<img src=\"{}\" alt=\"{}\" width=\"{}\"", encode_attr(&img.src), encode_attr(&img.alt), w);
-            if let Some(h) = h {
-                s.push_str(&format!(" height=\"{h}\""));
-            }
-            s.push('>');
-            s
+            img.width = Some(w);
+            img_tag(&img)
         }
         Some(_) => return keep(),
         None if text[image_range.clone()].starts_with("![") => return keep(),
-        None => md_image(&img),
+        None => {
+            img.width = None;
+            img.height = None;
+            if img.align.is_some() { img_tag(&img) } else { md_image(&img) }
+        }
     };
-    let mut t = String::with_capacity(text.len() + new.len());
-    t.push_str(&text[..image_range.start]);
-    t.push_str(&new);
-    t.push_str(&text[image_range.end..]);
-    Edit { text: t, sel: image_range.start..image_range.start + new.len() }
+    replace_tag(text, image_range, &new)
+}
+
+/// Sätter radbrytningen för en bild: `Some(Float::Left|Right)` låter texten flyta runt bilden
+/// (`<img … align>`), `None` gör den till en egen rad igen. Texten orörd om `range` inte är en bild.
+pub fn set_image_float(text: &str, image_range: Range<usize>, float: Option<Float>) -> Edit {
+    let keep = || Edit { text: text.to_string(), sel: image_range.clone() };
+    let a = analyze(text);
+    let Some(mut img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
+        return keep();
+    };
+    if img.align == float {
+        return keep();
+    }
+    img.align = float;
+    let new = if float.is_none() && img.width.is_none() && img.height.is_none() { md_image(&img) } else { img_tag(&img) };
+    replace_tag(text, image_range, &new)
+}
+
+/// Byteintervall (utan radbrytning) för raden som innehåller `pos`.
+fn line_at(text: &str, pos: usize) -> Range<usize> {
+    let pos = floor_boundary(text, pos.min(text.len()));
+    let s = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let e = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+    s..e
+}
+
+fn is_div_open_line(l: &str) -> bool {
+    let t = l.trim();
+    t.starts_with("<div") && t.matches('>').count() == 1 && parse_div_open(t).is_some()
+}
+
+/// Det som flyttas när bilden i `image_range` flyttas: hela raden om den bara innehåller bilden,
+/// och hela `<div align>…</div>`-blocket om raden var det enda i det; annars bara själva taggen.
+pub fn image_block(text: &str, image_range: Range<usize>) -> Range<usize> {
+    let line = line_at(text, image_range.start);
+    if text[line.clone()].trim().len() != image_range.len() {
+        return image_range;
+    }
+    // Rad före/efter (hoppar över tomma rader).
+    let prev = |from: usize| -> Option<Range<usize>> {
+        let mut e = from;
+        while e > 0 {
+            let l = line_at(text, e - 1);
+            if !text[l.clone()].trim().is_empty() {
+                return Some(l);
+            }
+            e = l.start;
+        }
+        None
+    };
+    let next = |from: usize| -> Option<Range<usize>> {
+        let mut s = from;
+        while s < text.len() {
+            let l = line_at(text, s);
+            if !text[l.clone()].trim().is_empty() {
+                return Some(l);
+            }
+            s = l.end + 1;
+        }
+        None
+    };
+    if let (Some(o), Some(c)) = (prev(line.start), next(line.end + 1)) {
+        if is_div_open_line(&text[o.clone()]) && is_div_close(text[c.clone()].trim()) {
+            return o.start..c.end;
+        }
+    }
+    line
+}
+
+/// Raden (hela tabellen om det är en tabell) som en bild släpps före (`after == false`) eller
+/// efter när pekaren står vid `target`. En tom rad går till närmaste stycke åt det håll bilden
+/// ska hamna.
+pub fn drop_line(text: &str, target: usize, after: bool) -> Range<usize> {
+    let mut line = line_at(text, target);
+    if text[line.clone()].trim().is_empty() {
+        let (mut up, mut down) = (line.start, line.end + 1);
+        let mut found = None;
+        loop {
+            if after && up > 0 {
+                let l = line_at(text, up - 1);
+                up = l.start;
+                if !text[l.clone()].trim().is_empty() {
+                    found = Some(l);
+                    break;
+                }
+            } else if !after && down < text.len() {
+                let l = line_at(text, down);
+                down = l.end + 1;
+                if !text[l.clone()].trim().is_empty() {
+                    found = Some(l);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        line = found.unwrap_or(line);
+    }
+    if text[line.clone()].trim_start().starts_with('|') {
+        let (mut s, mut e) = (line.start, line.end);
+        while s > 0 {
+            let l = line_at(text, s - 1);
+            if !text[l.clone()].trim_start().starts_with('|') {
+                break;
+            }
+            s = l.start;
+        }
+        while e < text.len() {
+            let l = line_at(text, e + 1);
+            if l.start <= e || !text[l.clone()].trim_start().starts_with('|') {
+                break;
+            }
+            e = l.end;
+        }
+        line = s..e;
+    }
+    line
+}
+
+/// Flyttar bilden i `image_range` till före (`after == false`) eller efter raden som innehåller
+/// `target` (byteläge). Bilden hamnar på en egen rad med tomma rader omkring; `<div align>`-
+/// blocket som bara innehöll bilden följer med. Tabeller räknas som en rad (bilden hamnar före
+/// eller efter hela tabellen) och tomma rader går till närmaste stycke. `None` om det inte är en
+/// bild eller om bilden redan står där. `sel` i resultatet är bilden på sin nya plats.
+pub fn move_image(text: &str, image_range: Range<usize>, target: usize, after: bool) -> Option<Edit> {
+    let a = analyze(text);
+    a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.as_ref())?;
+    let block = image_block(text, image_range.clone());
+    let (ba, bb) = (block.start, block.end);
+    let line = drop_line(text, target, after);
+    let t = if after { line.end } else { line.start };
+    // Släpp på sig själv (eller direkt intill) ändrar inget.
+    if t >= ba && t <= bb {
+        return None;
+    }
+    let moved = &text[ba..bb];
+    // Ta bort blocket; blankraderna runt det slås ihop till ett avstånd.
+    let left = text[..ba].trim_end_matches('\n');
+    let nl_l = ba - left.len();
+    let right = text[bb..].trim_start_matches('\n');
+    let nl_r = text[bb..].len() - right.len();
+    let inline = block == image_range && text[line_at(text, ba)].trim().len() != bb - ba;
+    let sep = if inline || left.is_empty() {
+        0
+    } else if right.is_empty() {
+        nl_r
+    } else {
+        nl_l.max(nl_r).max(1)
+    };
+    let mut rest = String::with_capacity(text.len());
+    rest.push_str(left);
+    rest.push_str(&"\n".repeat(sep));
+    rest.push_str(right);
+    let t2 = if t < ba { t } else { left.len() + sep + (t - (bb + nl_r)) };
+    let (head, tail) = rest.split_at(t2.min(rest.len()));
+    let mut out = String::with_capacity(rest.len() + moved.len() + 4);
+    out.push_str(head);
+    let at = if after {
+        out.push_str("\n\n");
+        out.len()
+    } else {
+        out.len()
+    };
+    out.push_str(moved);
+    if !after {
+        out.push_str("\n\n");
+    }
+    out.push_str(tail);
+    // Bilden i det flyttade blocket.
+    let off = image_range.start - ba;
+    let new_start = at + off;
+    Some(Edit { text: out, sel: new_start..new_start + image_range.len() })
 }
 
 // ============================================================== aktiv formatering
@@ -1371,7 +1619,7 @@ fn add_fmt(text: &str, parsed: &Parsed, a: &Analysis, m: Inline, s: usize, e: us
 
 pub fn set_block(text: &str, sel: Range<usize>, b: Block) -> Edit {
     let (s, e) = norm_sel(text, &sel);
-    if matches!(b, Block::Code | Block::Table) {
+    if matches!(b, Block::Code | Block::Table | Block::Footnote) {
         return Edit { text: text.to_string(), sel: s..e };
     }
     let a = analyze(text);
@@ -1489,6 +1737,93 @@ pub struct TableInfo {
     pub row_lines: Vec<Range<usize>>,
     /// Hela cellen (mellan två `|`, med blanksteg) för varje cell i `rows`.
     pub cell_spans: Vec<Vec<Range<usize>>>,
+    /// Hur många kolumner varje cell i `rows` spänner över: 1 för en vanlig cell, n för en
+    /// sammanfogad (`| a ||` = 2) och 0 för en täckt cell (de extra, tomma cellerna efter den).
+    pub spans: Vec<Vec<usize>>,
+}
+
+impl TableInfo {
+    /// Kolumnen som äger cellen i kolumn `c` på raden `r` (en täckt cell hör till cellen före).
+    pub fn owner(&self, r: usize, c: usize) -> usize {
+        let Some(sp) = self.spans.get(r) else { return c };
+        let mut c = c.min(sp.len().saturating_sub(1));
+        while c > 0 && sp[c] == 0 {
+            c -= 1;
+        }
+        c
+    }
+
+    /// Antal kolumner cellen (rad, kolumn) spänner över (minst 1).
+    pub fn span(&self, r: usize, c: usize) -> usize {
+        self.spans.get(r).and_then(|s| s.get(c)).copied().unwrap_or(1).max(1)
+    }
+}
+
+/// Är `t` en `<br>`-tagg (`<br>`, `<br/>`, `<br />`, versaler tillåtna)?
+pub fn is_br_tag(t: &str) -> bool {
+    let t = t.trim();
+    t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />")
+}
+
+/// Början av en `<br>`-tagg som slutar på `pos`.
+pub fn br_ending_at(text: &str, pos: usize) -> Option<usize> {
+    let before = text.get(..pos)?;
+    let i = before.rfind('<')?;
+    (pos - i <= 6 && is_br_tag(&before[i..])).then_some(i)
+}
+
+/// Slutet av en `<br>`-tagg som börjar på `pos`.
+pub fn br_starting_at(text: &str, pos: usize) -> Option<usize> {
+    let rest = text.get(pos..)?;
+    if !rest.starts_with('<') {
+        return None;
+    }
+    let e = rest.find('>')?;
+    (e <= 5 && is_br_tag(&rest[..=e])).then_some(pos + e + 1)
+}
+
+/// Byteintervallen för `<br>`-taggarna i `s` (cellens text).
+pub fn br_tags(s: &str) -> Vec<Range<usize>> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 < b.len() {
+        if b[i] == b'<' && (b[i + 1] | 0x20) == b'b' && (b[i + 2] | 0x20) == b'r' {
+            if let Some(e) = s[i..].find('>') {
+                if is_br_tag(&s[i..i + e + 1]) {
+                    out.push(i..i + e + 1);
+                    i += e + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Cellerna (området mellan två `|`) på en tabellrad `start..end` i `text`, och om raden
+/// börjar/slutar med `|`.
+pub fn table_line_cells(text: &str, start: usize, end: usize) -> (Vec<Range<usize>>, bool, bool) {
+    let l = parse_tline(text, start, end);
+    (l.segs, l.lead, l.trail)
+}
+
+/// Spann per cell: 1, n för en sammanfogad cell och 0 för täckta celler. En tom cell utan
+/// ett enda blanksteg (`||`) täcks av cellen före.
+pub fn cell_spans(segs: &[Range<usize>]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::with_capacity(segs.len());
+    let mut owner = 0;
+    for (i, s) in segs.iter().enumerate() {
+        if i > 0 && s.start == s.end {
+            out.push(0);
+            out[owner] += 1;
+        } else {
+            out.push(1);
+            owner = i;
+        }
+    }
+    out
 }
 
 /// En rad i en tabell, delad i celler.
@@ -1589,6 +1924,7 @@ fn table_parse(text: &str, pos: usize) -> Option<(TableInfo, Vec<TLine>)> {
             cols: lines[0].segs.len(),
             row_lines: model.iter().map(|l| l.start..l.end).collect(),
             cell_spans: model.iter().map(|l| l.segs.clone()).collect(),
+            spans: model.iter().map(|l| cell_spans(&l.segs)).collect(),
         };
         return Some((info, lines));
     }
@@ -1612,7 +1948,7 @@ fn col_of(segs: &[Range<usize>], pos: usize) -> Option<usize> {
 /// avgränsningsraden). Före första `|` räknas till första cellen, efter sista till sista.
 pub fn table_cell_at(t: &TableInfo, pos: usize) -> Option<(usize, usize)> {
     let r = t.row_lines.iter().position(|l| l.start <= pos && pos <= l.end)?;
-    Some((r, col_of(&t.cell_spans[r], pos)?))
+    Some((r, t.owner(r, col_of(&t.cell_spans[r], pos)?)))
 }
 
 /// Cellens redigerbara område vid `pos`: cellen minus ett blanksteg utfyllnad på varje sida
@@ -1639,8 +1975,8 @@ fn tctx(text: &str, pos: usize) -> Option<TCtx> {
     let pos = floor_boundary(text, pos);
     let (t, lines) = table_parse(text, pos)?;
     let li = lines.iter().position(|l| l.start <= pos && pos <= l.end)?;
-    let col = col_of(&lines[li].segs, pos).unwrap_or(0);
     let row = if li <= 1 { 0 } else { li - 1 };
+    let col = t.owner(row, col_of(&lines[li].segs, pos).unwrap_or(0));
     Some(TCtx { t, lines, li, row, col })
 }
 
@@ -1686,16 +2022,18 @@ pub fn table_next_cell(text: &str, pos: usize, back: bool) -> Option<Edit> {
     let c = tctx(text, pos)?;
     let cols = c.t.cols.max(1);
     let nrows = c.t.rows.len();
+    // Sista cellen som äger en kolumn på raden `r` (täckta celler räknas inte).
+    let last_owner = |r: usize| c.t.owner(r, cols - 1);
     let (tr, tc) = if back {
         if c.col > 0 {
-            (c.row, c.col - 1)
+            (c.row, c.t.owner(c.row, c.col - 1))
         } else if c.row > 0 {
-            (c.row - 1, cols - 1)
+            (c.row - 1, last_owner(c.row - 1))
         } else {
             (0, 0)
         }
-    } else if c.col + 1 < cols {
-        (c.row, c.col + 1)
+    } else if c.col + c.t.span(c.row, c.col) < cols {
+        (c.row, c.col + c.t.span(c.row, c.col))
     } else if c.row + 1 < nrows {
         (c.row + 1, 0)
     } else {
@@ -1738,18 +2076,27 @@ pub fn table_insert_row(text: &str, pos: usize, below: bool) -> Edit {
 /// Markören hamnar i den nya cellen på markörens rad. Utanför en tabell orört.
 pub fn table_insert_col(text: &str, pos: usize, right: bool) -> Edit {
     let Some(c) = tctx(text, pos) else { return unchanged(text, pos) };
-    let idx = if right { c.col + 1 } else { c.col };
+    let idx = if right { c.col + c.t.span(c.row, c.col) } else { c.col };
+    // Bredden på den nya kolumnen: medelvärdet av de andra om kolumnerna har olika bredd.
+    let dash = table_weights(text, &c.t).map_or(3, |w| (w.iter().sum::<usize>() / w.len().max(1)).max(3));
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     for (li, l) in c.lines.iter().enumerate() {
-        let cell = match li {
-            0 => format!("Kolumn {}", c.t.cols + 1),
-            1 => "---".to_string(),
-            _ => String::new(),
-        };
         let m = l.segs.len();
         if m == 0 || idx > m {
             continue;
         }
+        // Står den nya kolumnen inne i en sammanfogad cell blir cellen bredare i stället.
+        let row = if li <= 1 { 0 } else { li - 1 };
+        if li != 1 && idx < m && c.t.spans.get(row).and_then(|s| s.get(idx)) == Some(&0) {
+            let a = l.segs[idx].start;
+            edits.push((a..a, "|".to_string()));
+            continue;
+        }
+        let cell = match li {
+            0 => format!("Kolumn {}", c.t.cols + 1),
+            1 => "-".repeat(dash),
+            _ => String::new(),
+        };
         let e = if idx < m {
             let a = l.segs[idx].start;
             if idx == 0 && !l.lead {
@@ -1798,16 +2145,19 @@ pub fn table_delete_col(text: &str, pos: usize) -> Edit {
         return table_delete(text, pos);
     }
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-    for l in &c.lines {
+    for (li, l) in c.lines.iter().enumerate() {
         let m = l.segs.len();
         if c.col >= m {
             continue;
         }
-        let seg = &l.segs[c.col];
+        // En sammanfogad cell krymper: cellen behålls och en täckt cell tas bort.
+        let row = if li <= 1 { 0 } else { li - 1 };
+        let k = if li != 1 && c.t.span(row, c.col) > 1 && c.col + 1 < m { c.col + 1 } else { c.col };
+        let seg = &l.segs[k];
         edits.push(if m == 1 {
             // Radens enda cell: raden måste finnas kvar.
             (l.c0..l.c1, "|  |".to_string())
-        } else if c.col + 1 < m || l.trail {
+        } else if k + 1 < m || l.trail {
             (seg.start..seg.end + 1, String::new())
         } else {
             (seg.start - 1..l.c1, String::new())
@@ -1829,6 +2179,200 @@ pub fn table_delete(text: &str, pos: usize) -> Edit {
         after = &after[1..];
     }
     Edit { text: format!("{before}{after}"), sel: before.len()..before.len() }
+}
+
+// ---- sammanfogade celler
+
+/// Radens index bland tabellens rader (`lines`) för byteläget, och modellens radindex.
+fn line_of(lines: &[TLine], pos: usize) -> Option<(usize, usize)> {
+    let li = lines.iter().position(|l| l.start <= pos && pos <= l.end)?;
+    Some((li, if li <= 1 { 0 } else { li - 1 }))
+}
+
+/// Sammanfogar de markerade cellerna på en rad till en cell (innehållen skarvas med ett
+/// blanksteg, `|` skrivs för varje extra kolumn). Ligger markeringen i en enda cell (eller är
+/// tom) sammanfogas cellen med nästa. Markeringen måste ligga på en rad; annars orört.
+pub fn table_merge_cells(text: &str, sel: Range<usize>) -> Edit {
+    let (s0, e0) = (floor_boundary(text, sel.start.min(sel.end)), floor_boundary(text, sel.start.max(sel.end)));
+    let nothing = || unchanged(text, s0);
+    let Some((t, lines)) = table_parse(text, s0) else { return nothing() };
+    let (Some((li, row)), Some((lj, _))) = (line_of(&lines, s0), line_of(&lines, e0)) else { return nothing() };
+    if li != lj || li == 1 {
+        return nothing();
+    }
+    let segs = &lines[li].segs;
+    let (Some(a), Some(b)) = (col_of(segs, s0), col_of(segs, e0)) else { return nothing() };
+    let c0 = t.owner(row, a);
+    let mut c1 = t.owner(row, b);
+    if c1 == c0 {
+        c1 = c0 + t.span(row, c0);
+        if c1 >= segs.len() {
+            return nothing();
+        }
+    }
+    let last = (c1 + t.span(row, c1) - 1).min(segs.len() - 1);
+    let parts: Vec<&str> = (c0..=last)
+        .filter(|&k| t.spans[row].get(k).is_some_and(|&n| n > 0))
+        .map(|k| text[seg_content(text, &segs[k])].trim())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let n = last - c0 + 1;
+    // Utan avslutande `|` på raden behövs en pipa till för att sista cellen ska täckas.
+    let pipes = if last + 1 == segs.len() && !lines[li].trail { n } else { n - 1 };
+    let cell = if parts.is_empty() { "  ".to_string() } else { format!(" {} ", parts.join(" ")) };
+    let new = splice(text, &[(segs[c0].start..segs[last].end, format!("{cell}{}", "|".repeat(pipes)))]);
+    with_cell_sel(new, t.range.start, row, c0, s0)
+}
+
+/// Delar en sammanfogad cell vid `pos` i tomma celler (innehållet stannar i den första).
+/// Orört om cellen inte är sammanfogad.
+pub fn table_split_cell(text: &str, pos: usize) -> Edit {
+    let Some(c) = tctx(text, pos) else { return unchanged(text, pos) };
+    let span = c.t.span(c.row, c.col);
+    if c.li == 1 || span <= 1 {
+        return unchanged(text, pos);
+    }
+    let segs = &c.lines[c.li].segs;
+    let edits: Vec<(Range<usize>, String)> = (c.col + 1..(c.col + span).min(segs.len()))
+        .map(|k| (segs[k].start..segs[k].start, "  ".to_string()))
+        .collect();
+    let new = splice(text, &edits);
+    with_cell_sel(new, c.t.range.start, c.row, c.col, pos)
+}
+
+// ---- kolumnbredd
+
+/// Antal `-` per cell i avgränsarraden `line`. `None` om bredderna är lika (automatisk bredd),
+/// någon cell saknar bindestreck eller raden inte är en avgränsarrad.
+pub fn parse_weights(line: &str) -> Option<Vec<usize>> {
+    if !is_table_delim_row(line) {
+        return None;
+    }
+    let l = parse_tline(line, 0, line.len());
+    let w: Vec<usize> = l.segs.iter().map(|s| line[s.clone()].bytes().filter(|&c| c == b'-').count()).collect();
+    (w.len() > 1 && w.iter().all(|&n| n > 0) && w.iter().any(|&n| n != w[0])).then_some(w)
+}
+
+/// Kolumnernas relativa bredd (antal bindestreck i avgränsarraden); `None` = automatisk bredd.
+pub fn table_weights(text: &str, t: &TableInfo) -> Option<Vec<usize>> {
+    parse_weights(&text[t.delim_row.clone()])
+}
+
+/// Bindestreck per kolumn för bredderna `widths` (godtycklig enhet): summan blir ungefär 40
+/// (minst 8 per kolumn totalt) och varje kolumn får minst 3.
+pub fn dashes_from_widths(widths: &[f64]) -> Vec<usize> {
+    let total: f64 = widths.iter().sum::<f64>().max(1e-9);
+    let target = (widths.len() * 8).max(40) as f64;
+    widths.iter().map(|w| ((w / total * target).round() as usize).max(3)).collect()
+}
+
+/// Skriver om avgränsarraden så att kolumnerna får `dashes` bindestreck (kolonerna för
+/// justering behålls) i tabellen vid `at`. Markeringen `sel` följer med texten. Orört utanför en
+/// tabell eller om antalet kolumner inte stämmer.
+pub fn table_set_widths(text: &str, at: usize, sel: Range<usize>, dashes: &[usize]) -> Edit {
+    let keep = Edit { text: text.to_string(), sel: sel.clone() };
+    let Some((_, lines)) = table_parse(text, floor_boundary(text, at)) else { return keep };
+    let d = &lines[1];
+    if d.segs.len() != dashes.len() {
+        return keep;
+    }
+    let edits: Vec<(Range<usize>, String)> = d
+        .segs
+        .iter()
+        .zip(dashes)
+        .map(|(seg, &n)| {
+            let cell = text[seg.clone()].trim();
+            let left = if cell.starts_with(':') { ":" } else { "" };
+            let right = if cell.ends_with(':') && cell.len() > 1 { ":" } else { "" };
+            (seg.clone(), format!(" {left}{}{right} ", "-".repeat(n.max(1))))
+        })
+        .collect();
+    let new = splice(text, &edits);
+    let map = |p: usize| -> usize {
+        let mut shift: isize = 0;
+        for (r, rep) in &edits {
+            if p >= r.end {
+                shift += rep.len() as isize - r.len() as isize;
+            } else if p > r.start {
+                return (r.start as isize + shift) as usize;
+            }
+        }
+        (p as isize + shift) as usize
+    };
+    Edit { text: new, sel: map(sel.start)..map(sel.end) }
+}
+
+/// Markdown för en tabell som läses ur ett annat format. `rows` har en sträng per rutnätscell
+/// (celler som täcks av en sammanfogad cell är tomma platshållare), `spans` samma form med 0 för
+/// täckta celler, och `widths` kolumnbredderna (godtycklig enhet; tomt eller lika breda =
+/// automatisk bredd, `---`).
+pub fn table_markdown(rows: &[Vec<String>], spans: &[Vec<usize>], widths: &[f64]) -> String {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let row_md = |ri: usize, r: &Vec<String>| {
+        let mut s = String::from("|");
+        for k in 0..cols {
+            if spans.get(ri).and_then(|sp| sp.get(k)) == Some(&0) {
+                s.push('|');
+            } else {
+                let c = r.get(k).filter(|c| !c.is_empty()).map_or(" ", String::as_str);
+                s.push_str(&format!(" {c} |"));
+            }
+        }
+        s
+    };
+    let dashes: Vec<usize> = if widths.len() == cols && widths.iter().all(|&w| w > 0.0) {
+        let d = dashes_from_widths(widths);
+        if d.iter().all(|&n| n == d[0]) { vec![3; cols] } else { d }
+    } else {
+        vec![3; cols]
+    };
+    let mut out = String::new();
+    for (ri, r) in rows.iter().enumerate() {
+        if ri > 0 {
+            out.push('\n');
+        }
+        out.push_str(&row_md(ri, r));
+        if ri == 0 {
+            out.push_str("\n|");
+            for n in &dashes {
+                out.push_str(&format!(" {} |", "-".repeat(*n)));
+            }
+        }
+    }
+    out
+}
+
+// ---- tabellkälla (för exportörerna)
+
+/// Det exportörerna behöver veta om en tabells Markdown-källa utöver det pulldown-cmark ger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableSrc {
+    /// Antal rutnätskolumner (avgränsarradens celler).
+    pub cols: usize,
+    /// Per rad (rubrik först, avgränsarraden hoppas över) och cell: 1, n för en sammanfogad
+    /// cell och 0 för en täckt cell.
+    pub spans: Vec<Vec<usize>>,
+    /// Bindestreck per kolumn när de skiljer sig åt.
+    pub weights: Option<Vec<usize>>,
+}
+
+/// Läser spann och kolumnbredder ur tabellens källtext (rubrikrad, avgränsare, brödrader).
+pub fn table_src(src: &str) -> TableSrc {
+    let mut spans = Vec::new();
+    let mut cols = 0;
+    let mut weights = None;
+    let mut off = 0;
+    for (i, line) in src.split('\n').enumerate() {
+        let l = parse_tline(src, off, off + line.len());
+        off += line.len() + 1;
+        if i == 1 {
+            cols = l.segs.len();
+            weights = parse_weights(line.trim());
+        } else if !line.trim().is_empty() {
+            spans.push(cell_spans(&l.segs));
+        }
+    }
+    TableSrc { cols, spans, weights }
 }
 
 // ============================================================== spans (typsnitt, storlek, färg)
@@ -2363,13 +2907,394 @@ pub fn set_align(text: &str, sel: Range<usize>, align: Align) -> Edit {
     Edit { text: t, sel: ns..ne }
 }
 
+// ============================================================== fotnoter
+
+/// Markdown-alternativen med fotnoter (samma som `parse` använder).
+pub const FOOTNOTE_OPTS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_FOOTNOTES);
+
+/// Etikettens intervall och slutet på `]:` för definitionen som börjar på `start` (`[^etikett]:`).
+fn def_label(text: &str, start: usize) -> Option<(Range<usize>, usize)> {
+    let rest = text.get(start..)?;
+    let body = rest.strip_prefix("[^")?;
+    let close = body.find(']')?;
+    if body[..close].contains('\n') || !body[close..].starts_with("]:") {
+        return None;
+    }
+    Some((start + 2..start + 2 + close, start + 2 + close + 2))
+}
+
+/// En fotnotsreferens eller -definition i texten.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub label: String,
+    pub label_range: Range<usize>,
+    /// Referensen `[^1]` eller hela definitionen (utan avslutande radbrytningar).
+    pub full: Range<usize>,
+}
+
+/// Referenserna och definitionerna i texten, i textordning.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Notes {
+    pub refs: Vec<Note>,
+    pub defs: Vec<Note>,
+}
+
+pub fn footnotes(text: &str) -> Notes {
+    let mut n = Notes::default();
+    if !text.contains("[^") {
+        return n;
+    }
+    for (ev, r) in Parser::new_ext(text, FOOTNOTE_OPTS).into_offset_iter() {
+        match ev {
+            Event::FootnoteReference(_) => {
+                if r.len() >= 4 && text[r.clone()].starts_with("[^") && text.as_bytes()[r.end - 1] == b']' {
+                    let lr = r.start + 2..r.end - 1;
+                    n.refs.push(Note { label: text[lr.clone()].to_owned(), label_range: lr, full: r });
+                }
+            }
+            Event::Start(Tag::FootnoteDefinition(_)) => {
+                if let Some((lr, colon_end)) = def_label(text, r.start) {
+                    let end = r.start + text[r.start..r.end].trim_end().len();
+                    n.defs.push(Note { label: text[lr.clone()].to_owned(), label_range: lr, full: r.start..end.max(colon_end) });
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Referensernas etiketter, i den ordning de först förekommer.
+fn labels_in_order(notes: &Notes) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for r in &notes.refs {
+        if !order.contains(&r.label) {
+            order.push(r.label.clone());
+        }
+    }
+    order
+}
+
+/// Är fotnoterna i ordning (etiketterna 1..n i referensernas ordning, definitionerna i samma
+/// ordning sist)? Snabb kontroll på analysen, för att bara numrera om när det behövs.
+pub fn footnotes_in_order(a: &Analysis) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut defs: Vec<&str> = Vec::new();
+    for pc in &a.pieces {
+        if let Some(l) = pc.footnote_ref.as_deref() {
+            if !seen.contains(&l) {
+                if l != (seen.len() + 1).to_string() {
+                    return false;
+                }
+                seen.push(l);
+            }
+        } else if let Some(l) = pc.footnote_def.as_deref() {
+            defs.push(l);
+        } else if !defs.is_empty() && pc.block != Block::Footnote && !pc.range.is_empty() {
+            // Brödtext efter en definition: definitionerna ligger inte sist.
+            return false;
+        }
+    }
+    // Definitionerna: de refererade först i nummerordning, föräldralösa sist.
+    let mut next = 1usize;
+    for d in &defs {
+        if seen.contains(d) {
+            if *d != next.to_string() {
+                return false;
+            }
+            next += 1;
+        } else if next <= seen.len() {
+            return false;
+        }
+    }
+    next == seen.len() + 1
+}
+
+/// Numrerar om fotnoterna: etiketterna blir 1..n i den ordning referenserna kommer, och
+/// definitionerna läggs sist i samma ordning. Definitioner utan referens behålls sist.
+pub fn renumber_footnotes(text: &str) -> String {
+    renumber_core(text, None, 0).0
+}
+
+/// Som `renumber_footnotes`, men flyttar också markören `caret` med texten.
+pub fn renumber_footnotes_at(text: &str, caret: usize) -> (String, usize) {
+    let (t, _, c) = renumber_core(text, None, caret);
+    (t, c)
+}
+
+/// Kärnan: ny text, det nya numret för etiketten `track` och den flyttade markören.
+fn renumber_core(text: &str, track: Option<&str>, caret: usize) -> (String, Option<usize>, usize) {
+    let notes = footnotes(text);
+    if notes.refs.is_empty() && notes.defs.is_empty() {
+        return (text.to_owned(), None, caret);
+    }
+    let order = labels_in_order(&notes);
+    let n = order.len();
+    let number_of = |l: &str| order.iter().position(|x| x == l).map(|i| i + 1);
+    let tracked = track.and_then(number_of);
+
+    // Etikett per definition: refererade får sitt nummer, föräldralösa (och dubbletter) behåller
+    // sin etikett om den är ledig, annars nästa lediga nummer.
+    let mut used: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+    let mut taken: Vec<bool> = vec![false; n + 1];
+    let mut def_new: Vec<(String, Option<usize>)> = Vec::new(); // (ny etikett, nummer om refererad)
+    for d in &notes.defs {
+        match number_of(&d.label) {
+            Some(k) if !taken[k] => {
+                taken[k] = true;
+                def_new.push((k.to_string(), Some(k)));
+            }
+            _ => def_new.push((String::new(), None)),
+        }
+    }
+    let mut fresh = n + 1;
+    for (i, d) in notes.defs.iter().enumerate() {
+        if def_new[i].1.is_none() {
+            let l = if !used.contains(&d.label) && !d.label.is_empty() {
+                d.label.clone()
+            } else {
+                loop {
+                    let c = fresh.to_string();
+                    fresh += 1;
+                    if !used.contains(&c) {
+                        break c;
+                    }
+                }
+            };
+            used.push(l.clone());
+            def_new[i].0 = l;
+        }
+    }
+
+    // Etikettbyten.
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for r in &notes.refs {
+        let new = number_of(&r.label).map(|k| k.to_string()).unwrap_or_else(|| r.label.clone());
+        if new != r.label {
+            edits.push((r.label_range.clone(), new));
+        }
+    }
+    for (d, (new, _)) in notes.defs.iter().zip(&def_new) {
+        if *new != d.label {
+            edits.push((d.label_range.clone(), new.clone()));
+        }
+    }
+    edits.sort_by_key(|e| e.0.start);
+
+    // Definitionernas ordning: refererade efter nummer, sedan föräldralösa som förut.
+    let mut idx: Vec<usize> = (0..notes.defs.len()).collect();
+    idx.sort_by_key(|&i| match def_new[i].1 {
+        Some(k) => (0, k, i),
+        None => (1, 0, i),
+    });
+    let in_order = idx.iter().enumerate().all(|(a, &b)| a == b);
+    let mut tail = true;
+    if let Some(first) = notes.defs.first() {
+        let mut at = first.full.start;
+        for d in &notes.defs {
+            tail &= text[at..d.full.start].trim().is_empty();
+            at = d.full.end;
+        }
+        tail &= text[at..].trim().is_empty();
+    }
+    if edits.is_empty() && in_order && tail {
+        return (text.to_owned(), tracked, caret);
+    }
+
+    let map = |p: usize| -> usize {
+        let mut q = p as isize;
+        for (r, s) in &edits {
+            if r.end <= p {
+                q += s.len() as isize - r.len() as isize;
+            } else if r.start < p {
+                q = q - (p - r.start) as isize + s.len() as isize;
+                break;
+            }
+        }
+        q as usize
+    };
+    let new_text = splice(text, &edits);
+    let defs_new: Vec<Range<usize>> = notes.defs.iter().map(|d| map(d.full.start)..map(d.full.end)).collect();
+
+    // Brödtexten utan definitionerna.
+    let mut body = String::new();
+    let mut at = 0;
+    // Raderna efter en definition följer med (annars blir det extra tomrader).
+    let mut removed: Vec<Range<usize>> = defs_new
+        .iter()
+        .map(|r| r.start..r.end + new_text[r.end..].len() - new_text[r.end..].trim_start().len())
+        .collect();
+    removed.sort_by_key(|r| r.start);
+    for r in &removed {
+        body.push_str(&new_text[at..r.start]);
+        at = r.end;
+    }
+    body.push_str(&new_text[at..]);
+    let body_len = body.trim_end().len();
+    body.truncate(body_len);
+    let mut out = body;
+    let body_end = out.len();
+    let mut starts: Vec<usize> = vec![0; notes.defs.len()];
+    for (k, &i) in idx.iter().enumerate() {
+        out.push_str(if k == 0 && !out.is_empty() {
+            "\n\n"
+        } else if k == 0 {
+            ""
+        } else {
+            "\n"
+        });
+        starts[i] = out.len();
+        let mut line = new_text[defs_new[i].clone()].to_owned();
+        if line.ends_with("]:") {
+            line.push(' ');
+        }
+        out.push_str(&line);
+    }
+    if !notes.defs.is_empty() {
+        out.push('\n');
+    }
+
+    // Markören: i en definition följer den med dit definitionen hamnar.
+    let c = match notes.defs.iter().position(|d| d.full.start <= caret && caret <= d.full.end) {
+        Some(i) => starts[i] + (map(caret) - defs_new[i].start).min(defs_new[i].len() + 1),
+        None => {
+            let q = map(caret);
+            let shift: usize = removed.iter().filter(|r| r.end <= q).map(|r| r.len()).sum();
+            (q - shift).min(body_end)
+        }
+    };
+    let c = c.min(out.len());
+    (out, tracked, c)
+}
+
+/// Sätter in en fotnotsreferens `[^k]` vid `caret` (k = dess löpnummer), numrerar om de senare
+/// referenserna och definitionerna och lägger till en tom definition i ordning. Markören hamnar i
+/// den nya definitionen.
+pub fn insert_footnote(text: &str, caret: usize) -> Edit {
+    let mut caret = floor_boundary(text, caret.min(text.len()));
+    let notes = footnotes(text);
+    // Inte i en fotnotsdefinition (fotnot i fotnot saknas) och inte mitt i en referens.
+    if notes.defs.iter().any(|d| d.full.start <= caret && caret <= d.full.end) {
+        return unchanged(text, caret);
+    }
+    if let Some(r) = notes.refs.iter().find(|r| r.full.start < caret && caret < r.full.end) {
+        caret = r.full.end;
+    }
+    const TMP: &str = "kladdny";
+    let mut t = String::with_capacity(text.len() + 32);
+    t.push_str(&text[..caret]);
+    t.push_str("[^");
+    t.push_str(TMP);
+    t.push(']');
+    t.push_str(&text[caret..]);
+    let trimmed = t.trim_end().len();
+    t.truncate(trimmed);
+    // Efter befintliga definitioner räcker en radbrytning, annars en tom rad.
+    let after_defs = notes.defs.last().is_some_and(|d| text[d.full.end..].trim().is_empty());
+    t.push_str(if after_defs { "\n" } else { "\n\n" });
+    t.push_str("[^");
+    t.push_str(TMP);
+    t.push_str("]: ");
+    let (out, k, _) = renumber_core(&t, Some(TMP), 0);
+    let Some(k) = k else { return unchanged(text, caret) };
+    let at = footnotes(&out)
+        .defs
+        .into_iter()
+        .find(|d| d.label == k.to_string())
+        .map_or(out.len(), |d| (d.label_range.end + 3).min(line_end(&out, d.label_range.end)));
+    Edit { sel: at..at, text: out }
+}
+
+/// Tar bort fotnoten `label`: alla referenser och definitionen. De övriga numreras om.
+pub fn delete_footnote(text: &str, label: &str) -> String {
+    let notes = footnotes(text);
+    let mut cuts: Vec<Range<usize>> = notes.refs.iter().filter(|r| r.label == label).map(|r| r.full.clone()).collect();
+    for d in notes.defs.iter().filter(|d| d.label == label) {
+        let end = if text[d.full.end..].starts_with('\n') { d.full.end + 1 } else { d.full.end };
+        cuts.push(d.full.start..end);
+    }
+    if cuts.is_empty() {
+        return text.to_owned();
+    }
+    cuts.sort_by_key(|r| r.start);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for r in &cuts {
+        out.push_str(&text[at..r.start.max(at)]);
+        at = r.end.max(at);
+    }
+    out.push_str(&text[at..]);
+    let out = if footnotes(&out).defs.is_empty() {
+        let t = out.trim_end();
+        if text.ends_with('\n') {
+            format!("{t}\n")
+        } else {
+            t.to_owned()
+        }
+    } else {
+        out
+    };
+    renumber_footnotes(&out)
+}
+
+/// Etiketten, om det är en definition (annars en referens) och etikettbitens intervall för
+/// fotnoten som `pos` ligger i.
+pub fn footnote_label_at(a: &Analysis, pos: usize) -> Option<(String, bool, Range<usize>)> {
+    let i = a.pieces.partition_point(|pc| pc.range.end <= pos);
+    for pc in a.pieces.get(i.saturating_sub(1)..(i + 1).min(a.pieces.len()))? {
+        if pc.range.start <= pos && pos <= pc.range.end {
+            if let Some(l) = &pc.footnote_ref {
+                return Some((l.clone(), false, pc.range.clone()));
+            }
+            if let Some(l) = &pc.footnote_def {
+                return Some((l.clone(), true, pc.range.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Dit ett klick på fotnotsnumret `label` hoppar: från en referens till definitionens text,
+/// från en definition till den första referensen (efter `]`).
+pub fn footnote_target(text: &str, a: &Analysis, label: &str, from_def: bool) -> Option<usize> {
+    if from_def {
+        let pc = a.pieces.iter().find(|pc| pc.footnote_ref.as_deref() == Some(label))?;
+        return Some((pc.range.end + 1).min(text.len()));
+    }
+    let pc = a.pieces.iter().find(|pc| pc.footnote_def.as_deref() == Some(label))?;
+    Some((pc.range.end + 3).min(line_end(text, pc.range.end)))
+}
+
+/// Där fotnotsdefinitionerna börjar (för skiljelinjen), om de ligger sist i dokumentet.
+pub fn footnote_area_start(text: &str, a: &Analysis) -> Option<usize> {
+    let mut start = None;
+    let mut seen_def = false;
+    for pc in a.pieces.iter().rev() {
+        if pc.block == Block::Footnote {
+            start = Some(pc.range.start);
+            seen_def = true;
+        } else if seen_def || text[pc.range.clone()].trim().is_empty() {
+            if seen_def {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 // ============================================================== räkning
 
 pub fn count(_text: &str, a: &Analysis) -> (usize, usize) {
     let mut vis = String::new();
     let mut chars = 0;
     for p in &a.pieces {
-        if p.image.is_some() {
+        // Fotnotsetiketterna är numrering, inte ord.
+        if p.image.is_some() || p.footnote_ref.is_some() || p.footnote_def.is_some() {
             continue;
         }
         if p.markup {
@@ -2680,7 +3605,7 @@ mod tests {
         let t = "före\n\n![Sol](bild:image1.png)\n\nefter";
         let p = pc(t, "![Sol](bild:image1.png)");
         assert!(p.markup);
-        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None }));
+        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None, align: None }));
         assert_eq!(p.range.len(), "![Sol](bild:image1.png)".len());
         // Två bilder intill varandra blir två bitar.
         let t = "![a](1.png)![b](2.png)";
@@ -3928,7 +4853,7 @@ mod tests {
     // ---- bilder (HTML) och objektmarkörer
 
     fn iref(alt: &str, src: &str, width: Option<f32>, height: Option<f32>) -> ImageRef {
-        ImageRef { alt: alt.into(), src: src.into(), width, height }
+        ImageRef { alt: alt.into(), src: src.into(), width, height, align: None }
     }
 
     fn at(t: &str, needle: &str) -> usize {
@@ -4506,5 +5431,208 @@ mod tests {
         ] {
             covers(d);
         }
+    }
+
+    // ---- sammanfogade celler, bredd och radbrytning
+
+    #[test]
+    fn tabell_sammanfogad_cell_tolkas() {
+        let t = "| Rubrik över två || x |\n| --- | --- | --- |\n| a | b | c |\n| d |||";
+        let ti = table_at(t, 0).unwrap();
+        assert_eq!(ti.cols, 3);
+        assert_eq!(ti.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]]);
+        assert_eq!(table_cell_at(&ti, at(t, "| x") + 2), Some((0, 2)));
+        // Markören mellan de två pipporna hör till cellen som äger dem.
+        let mid = at(t, "||") + 1;
+        assert_eq!(table_cell_at(&ti, mid), Some((0, 0)));
+        assert_eq!(&t[table_cell_bounds(t, mid).unwrap()], "Rubrik över två");
+        assert_eq!(ti.owner(2, 2), 0);
+        assert_eq!(cell_text(t, &ti)[0], vec!["Rubrik över två", "", "x"]);
+    }
+
+    #[test]
+    fn tabell_sammanfogad_rubrik_är_fortfarande_tabell() {
+        let t = "| Två ||\n| --- | --- |\n| a | b |";
+        let ti = table_at(t, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![2, 0]);
+        let a = analyze(t);
+        assert_eq!(piece_at(&a, 3).map(|p| p.block), Some(Block::Table));
+    }
+
+    #[test]
+    fn tabell_nästa_cell_hoppar_över_täckta() {
+        let t = "| Två || x |\n| --- | --- | --- |\n| a | b | c |";
+        let next = |pos: usize, back: bool| table_next_cell(t, pos, back).unwrap();
+        let e = next(at(t, "Två"), false);
+        assert_eq!(&e.text[e.sel], "x");
+        let e = next(at(t, "x"), true);
+        assert_eq!(&e.text[e.sel], "Två");
+        let e = next(at(t, "a"), true);
+        assert_eq!(&e.text[e.sel], "x");
+        let e = next(at(t, "x"), false);
+        assert_eq!(&e.text[e.sel], "a");
+    }
+
+    #[test]
+    fn tabell_infoga_kolumn_med_sammanfogning() {
+        let t = "| Två || x |\n| --- | --- | --- |\n| a | b | c |";
+        // Till höger om den sammanfogade cellen: efter hela spannet.
+        let e = table_insert_col(t, at(t, "Två"), true);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.cols, 4);
+        assert_eq!(ti.spans[0], vec![2, 0, 1, 1]);
+        assert_eq!(cell_text(&e.text, &ti)[0][2], "Kolumn 4");
+        // Till vänster om x: den nya cellen hamnar mellan.
+        let e = table_insert_col(t, at(t, "x"), false);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![2, 0, 1, 1]);
+        // Inne i spannet på en annan rad: cellen blir bredare i stället.
+        let t2 = "| a | b | c |\n| --- | --- | --- |\n| Två || x |";
+        let e = table_insert_col(t2, at(t2, "b"), false);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.cols, 4);
+        assert_eq!(ti.spans[1], vec![3, 0, 0, 1], "{}", e.text);
+    }
+
+    #[test]
+    fn tabell_ta_bort_kolumn_med_sammanfogning() {
+        let t = "| Två || x |\n| --- | --- | --- |\n| a | b | c |";
+        // Kolumnen som äger den sammanfogade cellen: den krymper men behåller innehållet.
+        let e = table_delete_col(t, at(t, "Två"));
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.cols, 2);
+        assert_eq!(ti.spans[0], vec![1, 1]);
+        assert_eq!(cell_text(&e.text, &ti)[0], vec!["Två", "x"]);
+        assert_eq!(cell_text(&e.text, &ti)[1], vec!["b", "c"]);
+        // Kolumnen efter: täckt cell tas bort.
+        let e = table_delete_col(t, at(t, "b"));
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(cell_text(&e.text, &ti)[0], vec!["Två", "x"]);
+        assert_eq!(cell_text(&e.text, &ti)[1], vec!["a", "c"]);
+    }
+
+    #[test]
+    fn tabell_sammanfoga_celler() {
+        let t = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        // Markering över två celler.
+        let e = table_merge_cells(t, at(t, "A")..at(t, "B") + 1);
+        assert_eq!(e.text, "| A B || C |\n| --- | --- | --- |\n| 1 | 2 | 3 |");
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![2, 0, 1]);
+        assert_eq!(&e.text[e.sel], "A B");
+        // Hela raden.
+        let e = table_merge_cells(t, at(t, "1")..at(t, "3") + 1);
+        assert_eq!(table_at(&e.text, 0).unwrap().spans[1], vec![3, 0, 0], "{}", e.text);
+        assert_eq!(&e.text[e.sel], "1 2 3");
+        // Utan markering: med nästa cell. Tomma celler ger inga extra blanksteg.
+        let t2 = "| A |  | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e = table_merge_cells(t2, at(t2, "A") + 1..at(t2, "A") + 1);
+        assert_eq!(table_at(&e.text, 0).unwrap().spans[0], vec![2, 0, 1]);
+        assert!(e.text.starts_with("| A || C |"), "{}", e.text);
+        // Sista cellen utan någon efter den, två rader och avgränsarraden: orört.
+        assert_eq!(table_merge_cells(t, at(t, "C")..at(t, "C")).text, t);
+        assert_eq!(table_merge_cells(t, at(t, "A")..at(t, "1")).text, t);
+        assert_eq!(table_merge_cells(t, at(t, "---")..at(t, "---") + 1).text, t);
+        assert_eq!(table_merge_cells("text", 1..2).text, "text");
+        // Redan sammanfogade celler slås ihop med hela sitt spann.
+        let t3 = "| A || C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e = table_merge_cells(t3, at(t3, "A")..at(t3, "C") + 1);
+        assert_eq!(table_at(&e.text, 0).unwrap().spans[0], vec![3, 0, 0], "{}", e.text);
+        assert_eq!(&e.text[e.sel], "A C");
+    }
+
+    #[test]
+    fn tabell_sammanfoga_utan_ytterrör() {
+        let t = "A | B\n--|--\n1 | 2";
+        let e = table_merge_cells(t, at(t, "1")..at(t, "2") + 1);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[1], vec![2, 0], "{}", e.text);
+        assert_eq!(&e.text[e.sel], "1 2");
+    }
+
+    #[test]
+    fn tabell_dela_cell() {
+        let t = "| A B || C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e = table_split_cell(t, at(t, "A B"));
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![1, 1, 1]);
+        assert_eq!(cell_text(&e.text, &ti)[0], vec!["A B", "", "C"]);
+        assert_eq!(&e.text[e.sel], "A B");
+        // Samma sak med markören i den täckta delen.
+        let e2 = table_split_cell(t, at(t, "||") + 1);
+        assert_eq!(e2.text, e.text);
+        // Vanlig cell och utanför tabell: orört.
+        assert_eq!(table_split_cell(t, at(t, "C")).text, t);
+        assert_eq!(table_split_cell("text", 1).text, "text");
+        // Tre kolumner.
+        let t3 = "| Hej |||\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e3 = table_split_cell(t3, at(t3, "Hej"));
+        assert_eq!(table_at(&e3.text, 0).unwrap().spans[0], vec![1, 1, 1]);
+        // Sammanfoga och dela är varandras motsats.
+        let m = table_merge_cells(&e3.text, at(&e3.text, "Hej")..at(&e3.text, "Hej") + 1);
+        assert_eq!(table_at(&m.text, 0).unwrap().spans[0], vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn tabell_kolumnbredd_från_streck() {
+        assert_eq!(parse_weights("| ------ | -- | ---- |"), Some(vec![6, 2, 4]));
+        assert_eq!(parse_weights("|:-----:|--:|"), Some(vec![5, 2]));
+        assert_eq!(parse_weights("| --- | --- |"), None);
+        assert_eq!(parse_weights("| --- |"), None);
+        assert_eq!(parse_weights("| a | b |"), None);
+        let t = "| A | B |\n| ------ | -- |\n| 1 | 2 |";
+        let ti = table_at(t, 0).unwrap();
+        assert_eq!(table_weights(t, &ti), Some(vec![6, 2]));
+        assert_eq!(table_weights(TB, &table_at(TB, 0).unwrap()), None);
+    }
+
+    #[test]
+    fn tabell_skriv_kolumnbredd_behåller_justering() {
+        let t = "| A | B | C |\n|:--|:-:|--:|\n| 1 | 2 | 3 |";
+        let caret = at(t, "2");
+        let e = table_set_widths(t, caret, caret..caret, &[10, 5, 3]);
+        let lines: Vec<&str> = e.text.lines().collect();
+        assert_eq!(lines[1], "| :---------- | :-----: | ---: |");
+        assert!(e.text[e.sel.start..].starts_with("2 |"), "{}", e.text);
+        assert_eq!(e.sel.start, e.sel.end);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(table_weights(&e.text, &ti), Some(vec![10, 5, 3]));
+        // Fel antal kolumner och utanför tabell: orört.
+        assert_eq!(table_set_widths(t, 0, 0..0, &[1, 2]).text, t);
+        assert_eq!(table_set_widths("text", 0, 0..0, &[1]).text, "text");
+    }
+
+    #[test]
+    fn tabell_streck_från_bredder() {
+        let d = dashes_from_widths(&[100.0, 300.0, 100.0]);
+        assert_eq!(d, vec![8, 24, 8]);
+        // Minst tre streck.
+        let d = dashes_from_widths(&[1.0, 1000.0]);
+        assert_eq!(d[0], 3);
+        assert!(d.iter().sum::<usize>() >= 40);
+    }
+
+    #[test]
+    fn tabell_källa_för_exportörer() {
+        let s = "| Rubrik över två || x |\n| ------ | -- | ---- |\n| a | b<br>rad | c |\n| d |||";
+        let ts = table_src(s);
+        assert_eq!(ts.cols, 3);
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]]);
+        assert_eq!(ts.weights, Some(vec![6, 2, 4]));
+        assert_eq!(table_src("| a | b |\n| - | - |\n| 1 | 2 |").weights, None);
+    }
+
+    #[test]
+    fn tabell_br_är_dold_markup_och_hittas() {
+        let t = "| a<br>b | c<BR/>d |\n| --- | --- |\n| 1 | 2 |";
+        let a = analyze(t);
+        let br = piece_at(&a, t.find("<br>").unwrap()).unwrap();
+        assert!(br.markup && br.block == Block::Table);
+        assert!(piece_at(&a, t.find("<BR/>").unwrap()).unwrap().markup);
+        assert_eq!(br_tags("x<br>y<br />z<bro>"), vec![1..5, 6..12]);
+        assert!(is_br_tag(" <br/> "));
+        assert!(!is_br_tag("<b>"));
+        // Orden på var sida om en radbrytning räknas var för sig.
+        assert_eq!(count(t, &a).0, 6);
     }
 }

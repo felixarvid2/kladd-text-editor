@@ -24,6 +24,7 @@ use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEn
 use crate::docx::Image as DocImage;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::theme;
+use crate::word::markup::Float;
 
 // --- mått i punkter (1/72 tum); sidstorlek och marginaler kommer från dokumentet ---
 const BODY_SIZE: f32 = 10.5;
@@ -112,6 +113,8 @@ struct Style {
     link: Option<String>,
     /// Färg, bakgrund, storlek och typsnittsklass från omgivande `<span style="…">`.
     span: SpanStyle,
+    /// Fotnotsnummer (1-baserat): texten ritas som litet upphöjt nummer.
+    fnref: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -125,9 +128,12 @@ enum Block {
     Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align },
     Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
     Code { text: String, indent: f32 },
-    Table { rows: Vec<Vec<Vec<Span>>> },
+    /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
+    Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>> },
     Rule,
-    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align },
+    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float> },
+    /// Innehållsförteckning (`<!-- kladd: toc -->`).
+    Toc,
 }
 
 /// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
@@ -175,14 +181,19 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 }
 
 /// `<img src="…" alt="…" width="W" [height="H"]>` med storlek i CSS-px (1/96 tum) omräknad till pt.
-fn parse_img(tag: &str) -> Option<(String, String, ImgSize)> {
+fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>)> {
     if !tag.get(..4)?.eq_ignore_ascii_case("<img") || !tag.ends_with('>') {
         return None;
     }
     let src = attr(tag, "src")?;
     let alt = attr(tag, "alt").unwrap_or_default();
     let px = |n: &str| attr(tag, n).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v > 0.0).map(|v| v * 0.75);
-    Some((src, alt, ImgSize { w: px("width"), h: px("height") }))
+    let float = match attr(tag, "align").map(|a| a.trim().to_ascii_lowercase()).as_deref() {
+        Some("left") => Some(Float::Left),
+        Some("right") => Some(Float::Right),
+        _ => None,
+    };
+    Some((src, alt, ImgSize { w: px("width"), h: px("height") }, float))
 }
 
 fn heading_num(level: HeadingLevel) -> u8 {
@@ -196,11 +207,22 @@ fn heading_num(level: HeadingLevel) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn parse_blocks(md: &str) -> Vec<Block> {
+    parse_blocks_notes(md).0
+}
+
+/// Blocken och fotnoterna (text per fotnot, i den ordning referenserna kommer).
+fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
+    let mut note_labels: Vec<String> = Vec::new();
+    let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
+    let mut note_cur: Option<(String, Vec<Block>)> = None;
 
     let mut blocks = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -256,7 +278,8 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         spans.push(Span { text: text.to_owned(), style: style.clone() });
     };
 
-    for ev in Parser::new_ext(md, opts) {
+    let mut table_src: Option<crate::word::markup::TableSrc> = None;
+    for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
         let align = aligns.last().copied().unwrap_or_default();
         style.span = span_stack.iter().fold(SpanStyle::default(), |acc, s| acc.merged(s));
         style.bold = bold > 0;
@@ -264,6 +287,26 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         style.strike = strike > 0;
         style.underline = underline > 0;
         match ev {
+            MdEvent::Start(Tag::FootnoteDefinition(label)) => {
+                flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                note_cur = Some((label.to_string(), std::mem::take(&mut blocks)));
+            }
+            MdEvent::End(TagEnd::FootnoteDefinition) => {
+                flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                if let Some((label, saved)) = note_cur.take() {
+                    // Styckena i definitionen läggs efter varandra med ett mellanslag emellan.
+                    let mut text: Vec<Span> = Vec::new();
+                    for b in std::mem::replace(&mut blocks, saved) {
+                        if let Block::Para { spans, .. } | Block::Item { spans, .. } = b {
+                            if !text.is_empty() {
+                                text.push(Span { text: " ".into(), style: Style::default() });
+                            }
+                            text.extend(spans);
+                        }
+                    }
+                    note_defs.push((label, text));
+                }
+            }
             MdEvent::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
@@ -300,6 +343,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                 }
                 Tag::Table(_) => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                    table_src = Some(crate::word::markup::table_src(md.get(range.clone()).unwrap_or("")));
                     table = Some(Vec::new());
                 }
                 Tag::TableHead | Tag::TableRow => row = Vec::new(),
@@ -349,7 +393,8 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                 TagEnd::Table => {
                     if let Some(rows) = table.take() {
                         if !rows.is_empty() {
-                            blocks.push(Block::Table { rows });
+                            let src = table_src.take().unwrap_or(crate::word::markup::TableSrc { cols: 0, spans: Vec::new(), weights: None });
+                            blocks.push(Block::Table { rows, spans: src.spans, weights: src.weights });
                         }
                     }
                 }
@@ -361,7 +406,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                     if let Some((src, alt)) = image.take() {
                         // En bild i en tabellcell eller mitt i text ritas som eget block efter stycket.
                         flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left, float: None });
                     }
                 }
                 _ => {}
@@ -408,10 +453,13 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                     } else if style::is_div_close(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         aligns.pop();
-                    } else if let Some((src, alt, size)) = parse_img(tag) {
+                    } else if let Some((src, alt, size, float)) = parse_img(tag) {
                         // `<img>` med storlek blir ett eget bildblock, justerat av omgivande `<div align>`.
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align, float });
+                    } else if tag == crate::word::nav::TOC_LINE {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::Toc);
                     } else if tag.starts_with("<!--") && tag.ends_with("-->") {
                         // Kommentarer (också grundformatraden) skrivs inte ut.
                     } else {
@@ -428,12 +476,28 @@ fn parse_blocks(md: &str) -> Vec<Block> {
                 blocks.push(Block::Rule);
             }
             MdEvent::TaskListMarker(done) => push_text(&mut spans, if done { "☑ " } else { "☐ " }, &style),
-            MdEvent::FootnoteReference(t) => push_text(&mut spans, &format!("[{t}]"), &style),
+            MdEvent::FootnoteReference(t) if note_cur.is_some() => push_text(&mut spans, &format!("[{t}]"), &style),
+            MdEvent::FootnoteReference(t) => {
+                // Samma etikett flera gånger är samma fotnot (som i Markdown).
+                let n = match note_labels.iter().position(|l| l.as_str() == &*t) {
+                    Some(i) => i + 1,
+                    None => {
+                        note_labels.push(t.to_string());
+                        note_labels.len()
+                    }
+                };
+                let st = Style { fnref: Some(n), ..style.clone() };
+                spans.push(Span { text: n.to_string(), style: st });
+            }
             MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => push_text(&mut spans, &t, &style),
         }
     }
     flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, aligns.last().copied().unwrap_or_default());
-    blocks
+    let notes = note_labels
+        .iter()
+        .map(|l| note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default())
+        .collect();
+    (blocks, notes)
 }
 
 // ============================================================== sidlayout
@@ -445,6 +509,8 @@ enum Op {
     Line { x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: (u8, u8, u8) },
     Image { x: f32, y: f32, w: f32, h: f32, index: usize },
     Link { x: f32, y: f32, w: f32, h: f32, url: String },
+    /// Intern länk till en plats i dokumentet (sida från 0, y).
+    Goto { x: f32, y: f32, w: f32, h: f32, page: usize, to_y: f32 },
 }
 
 struct PageOps {
@@ -482,7 +548,33 @@ struct Layout<'a> {
     mb: f32,
     ml: f32,
     cw: f32,
+    /// Fotnoternas text (nummer − 1), och de som hör till sidan som läggs ut just nu.
+    notes: Vec<Vec<Span>>,
+    page_notes: Vec<usize>,
+    /// Höjd längst ned på sidan som är reserverad för fotnoter (avskiljare och text).
+    reserved: f32,
+    /// Sant medan fotnoterna ritas (deras nummer är inga nya referenser).
+    in_notes: bool,
+    /// Flytande bilder som texten flyter runt just nu.
+    floats: Vec<FloatBox>,
+    /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
+    /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
+    toc_entries: Vec<(u8, String)>,
+    toc_pos: Vec<(usize, f32)>,
 }
+
+/// En flytande bild: sida, upptagen bredd (bild + luft), sidan (0-baserad) och understa kanten (pt).
+struct FloatBox {
+    side: Float,
+    w: f32,
+    page: usize,
+    bottom: f32,
+}
+
+/// Luft mellan en flytande bild och texten (12 px).
+const FLOAT_GAP: f32 = 9.0;
+/// Minsta textbredd bredvid en flytande bild; smalare och bilden blir ett vanligt block.
+const FLOAT_MIN_ROOM: f32 = 72.0;
 
 /// En färdigbruten rad. `hard` = raden slutar med radbrytning (ska inte marginaljusteras).
 struct Line {
@@ -604,7 +696,71 @@ impl<'a> Layout<'a> {
             mb,
             ml,
             cw,
+            notes: Vec::new(),
+            page_notes: Vec::new(),
+            reserved: 0.0,
+            in_notes: false,
+            floats: Vec::new(),
+            toc_entries: Vec::new(),
+            toc_pos: Vec::new(),
         }
+    }
+
+    /// Ritar innehållsförteckningen: rubriken "Innehåll" och en rad per rubrik med prickad
+    /// ledlinje, sidnummer till höger och en intern länk till rubriken.
+    fn toc(&mut self) {
+        let size = 20.0 * self.scale;
+        self.ensure(size * LINE + self.body * LINE * 3.0);
+        let (ml, cw, body) = (self.ml, self.cw, self.body);
+        let title = vec![Span { text: "Innehåll".to_owned(), style: Style::default() }];
+        self.text_block(&title, ml, cw, Face::SansSemi, size, INK, false, None);
+        self.y += 6.0;
+        let face = self.base;
+        let line_h = body * LINE;
+        let entries = self.toc_entries.clone();
+        if entries.is_empty() {
+            let spans = vec![Span { text: "Inga rubriker i dokumentet".to_owned(), style: Style::default() }];
+            self.text_block(&spans, ml, cw, face, body, MUTED, true, None);
+            self.y += PARA_GAP;
+            return;
+        }
+        for (i, (level, text)) in entries.iter().enumerate() {
+            self.ensure(line_h);
+            let indent = f32::from(level.saturating_sub(1)) * 14.0;
+            let baseline = self.y + body * 1.08;
+            let num = self.toc_pos.get(i).map(|(p, _)| (p + 1).to_string()).unwrap_or_default();
+            let num_w = self.m.width(face, body, &num);
+            let x = ml + indent;
+            // Titeln kortas med "…" om den inte ryms bredvid sidnumret.
+            let avail = (cw - indent - num_w - 16.0).max(20.0);
+            let mut title = text.clone();
+            if self.m.width(face, body, &title) > avail {
+                while !title.is_empty() && self.m.width(face, body, &format!("{title}…")) > avail {
+                    title.pop();
+                }
+                title.push('…');
+            }
+            let title_w = self.m.width(face, body, &title);
+            let dot = self.m.width(face, body, ". ").max(1.0);
+            let gap = cw - indent - title_w - num_w - 12.0;
+            let dots = if gap > dot { ". ".repeat((gap / dot) as usize) } else { String::new() };
+            let dots_w = self.m.width(face, body, &dots);
+            let page = self.pages.len() - 1;
+            let ops = &mut self.page().ops;
+            ops.push(Op::Text { x, y: baseline, face, size: body, text: title, color: INK, italic: false });
+            if !dots.is_empty() {
+                ops.push(Op::Text { x: ml + cw - num_w - 6.0 - dots_w, y: baseline, face, size: body, text: dots, color: MUTED, italic: false });
+            }
+            if !num.is_empty() {
+                ops.push(Op::Text { x: ml + cw - num_w, y: baseline, face, size: body, text: num, color: INK, italic: false });
+            }
+            if let Some((p, y)) = self.toc_pos.get(i).copied() {
+                let top = self.y;
+                self.pages[page].ops.push(Op::Goto { x, y: top, w: cw - indent, h: line_h, page: p, to_y: y });
+            }
+            self.y += line_h + 2.0;
+        }
+        self.y += PARA_GAP;
     }
 
     /// Sidhuvud och sidfot för sida `page` (1-baserad) av `total`, som ritinstruktioner.
@@ -638,19 +794,90 @@ impl<'a> Layout<'a> {
         out
     }
 
+    /// Flyttar ner till under alla flytande bilder (block som inte flyter runt dem) och glömmer dem.
+    fn clear_floats(&mut self) {
+        self.prune_floats();
+        if let Some(b) = self.floats.iter().map(|f| f.bottom).reduce(f32::max) {
+            self.y = self.y.max(b);
+        }
+        self.floats.clear();
+    }
+
+    /// Tar bort flytande bilder som är passerade (annan sida, eller texten har kommit under dem).
+    fn prune_floats(&mut self) {
+        let (page, y) = (self.pages.len().wrapping_sub(1), self.y);
+        self.floats.retain(|f| f.page == page && y < f.bottom - 0.5);
+    }
+
+    /// Utrymmet vid aktuell rad: (förskjutning från vänster, bredd som tas av flytande bilder).
+    fn float_room(&mut self) -> (f32, f32) {
+        self.prune_floats();
+        let sum = |side: Float| self.floats.iter().filter(|f| f.side == side).map(|f| f.w).sum::<f32>();
+        (sum(Float::Left), sum(Float::Left) + sum(Float::Right))
+    }
+
     fn page(&mut self) -> &mut PageOps {
         self.pages.last_mut().expect("minst en sida")
     }
 
     fn new_page(&mut self) {
+        self.flush_notes();
         self.pages.push(PageOps { ops: Vec::new() });
         self.y = self.mt;
     }
 
     fn ensure(&mut self, h: f32) {
-        if self.y + h > self.ph - self.mb && self.y > self.mt + 0.5 {
+        if self.y + h + self.reserved > self.ph - self.mb && self.y > self.mt + 0.5 {
             self.new_page();
         }
+    }
+
+    /// Fotnotens rader: litet nummer, mellanslag och texten.
+    fn note_spans(&self, n: usize) -> Vec<Span> {
+        let mut v = vec![
+            Span { text: n.to_string(), style: Style { fnref: Some(n), ..Style::default() } },
+            Span { text: " ".into(), style: Style::default() },
+        ];
+        v.extend(self.notes.get(n - 1).cloned().unwrap_or_default());
+        v
+    }
+
+    /// Hur mycket plats fotnoterna `refs` tar längst ned på sidan (med avskiljaren om det är de första).
+    fn note_cost(&mut self, refs: &[usize]) -> f32 {
+        let size = self.body * 0.85;
+        let mut h = if self.page_notes.is_empty() && !refs.is_empty() { 9.0 } else { 0.0 };
+        for &n in refs {
+            let spans = self.note_spans(n);
+            let width = self.cw;
+            let lines = self.break_lines(&spans, self.base, size, width);
+            h += lines.iter().map(|l| line_size(l, size) * LINE).sum::<f32>() + 2.0;
+        }
+        h
+    }
+
+    /// Ritar sidans fotnoter längst ned: en kort linje och sedan noterna i liten stil.
+    fn flush_notes(&mut self) {
+        if self.page_notes.is_empty() || self.pages.is_empty() {
+            return;
+        }
+        let notes = std::mem::take(&mut self.page_notes);
+        let top = self.ph - self.mb - self.reserved;
+        self.reserved = 0.0;
+        let (ml, cw) = (self.ml, self.cw);
+        let (saved_y, saved_align) = (self.y, self.align);
+        self.page().ops.push(Op::Line { x1: ml, y1: top + 3.0, x2: ml + cw / 3.0, y2: top + 3.0, width: 0.6, color: MUTED });
+        self.y = top + 9.0;
+        self.align = Align::Left;
+        self.in_notes = true;
+        let size = self.body * 0.85;
+        for n in notes {
+            let spans = self.note_spans(n);
+            self.text_block(&spans, ml, cw, self.base, size, INK, false, None);
+            self.y += 2.0;
+        }
+        self.in_notes = false;
+        self.y = saved_y;
+        self.align = saved_align;
     }
 
     /// Delar upp textstyckena i ord som kan radbrytas.
@@ -660,6 +887,7 @@ impl<'a> Layout<'a> {
             let face = face_for(&s.style, base);
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
+            let sz = if s.style.fnref.is_some() { sz * 0.65 } else { sz };
             for (li, line) in s.text.split('\n').enumerate() {
                 if li > 0 {
                     out.push(Piece { text: String::new(), face, size: sz, width: 0.0, style: s.style.clone(), space: false, newline: true });
@@ -744,6 +972,34 @@ impl<'a> Layout<'a> {
         lines
     }
 
+    /// Nästa rad ur `pieces` från `from`, bruten i `width`: raden och index för första ordet efter den.
+    /// Samma girighet som `break_lines`, men en rad i taget så att bredden kan variera med flytande bilder.
+    fn take_line(pieces: &[Piece], from: usize, width: f32) -> (Line, usize) {
+        let mut line = Line { pieces: Vec::new(), hard: false };
+        let (mut w, mut i) = (0.0, from);
+        while i < pieces.len() {
+            let p = &pieces[i];
+            if p.newline {
+                line.hard = true;
+                i += 1;
+                break;
+            }
+            if !p.space && w + p.width > width && !line.pieces.is_empty() {
+                break;
+            }
+            i += 1;
+            if p.space && line.pieces.is_empty() {
+                continue; // inget mellanslag först på en rad
+            }
+            w += p.width;
+            line.pieces.push(Piece { text: p.text.clone(), width: p.width, ..p_clone(p) });
+        }
+        while line.pieces.last().is_some_and(|p| p.space) {
+            line.pieces.pop();
+        }
+        (line, i)
+    }
+
     /// Lägger ut text i en ruta. Returnerar höjden som användes.
     #[allow(clippy::too_many_arguments)]
     fn text_block(
@@ -757,12 +1013,41 @@ impl<'a> Layout<'a> {
         italic_all: bool,
         first_line_extra: Option<(String, Face)>,
     ) {
-        let lines = self.break_lines(spans, base, size, width);
-        let n = lines.len();
-        for (i, mut line) in lines.into_iter().enumerate() {
+        let pieces = self.pieces(spans, base, size);
+        let pieces: Vec<Piece> = pieces.into_iter().flat_map(|p| self.split_long(p, width)).collect();
+        let (mut next, mut i) = (0usize, 0usize);
+        loop {
+            // Flytande bilder gör raden smalare (och förskjuter den vid vänsterbilder).
+            let (mut fx, mut fw) = self.float_room();
+            let (mut line, mut after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0)).max(1.0));
+            let page_before = self.pages.len();
+            // Fotnoterna på raden ska ha plats längst ned på samma sida som raden.
+            let refs_of = |this: &Self, line: &Line| -> Vec<usize> {
+                if this.in_notes {
+                    Vec::new()
+                } else {
+                    line.pieces.iter().filter_map(|p| p.style.fnref).filter(|n| !this.page_notes.contains(n)).collect()
+                }
+            };
+            let mut refs = refs_of(self, &line);
+            let line_h0 = line_size(&line, size) * LINE;
+            let need0 = self.note_cost(&refs);
+            if need0 > 0.0 && self.y + line_h0 + self.reserved + need0 > self.ph - self.mb && self.y > self.mt + 0.5 {
+                self.new_page();
+            }
+            self.ensure(line_h0);
+            if self.pages.len() != page_before {
+                (fx, fw) = self.float_room();
+                (line, after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0)).max(1.0));
+                refs = refs_of(self, &line);
+            }
+            let need = self.note_cost(&refs);
+            self.reserved += need;
+            self.page_notes.extend(refs);
+            let (x, width) = (x + fx, width - fw.min(width - 24.0));
+            let last = after >= pieces.len() && !line.hard;
             let msz = line_size(&line, size);
             let line_h = msz * LINE;
-            self.ensure(line_h);
             let baseline = self.y + msz * 1.08;
             if i == 0 {
                 if let Some((marker, mface)) = &first_line_extra {
@@ -784,7 +1069,7 @@ impl<'a> Layout<'a> {
             match self.align {
                 Align::Center => dx = ((width - lw) / 2.0).max(0.0),
                 Align::Right => dx = (width - lw).max(0.0),
-                Align::Justify if i + 1 < n && !line.hard => {
+                Align::Justify if !last && !line.hard => {
                     justify(&mut line.pieces, width);
                     stretched = true;
                 }
@@ -824,7 +1109,9 @@ impl<'a> Layout<'a> {
                     (false, Some(sc)) => (sc[0], sc[1], sc[2]),
                     (false, None) => color,
                 };
-                self.page().ops.push(Op::Text { x: rx, y: baseline, face, size: sz, text, color: c, italic: st.italic || italic_all });
+                // Fotnotsnummer ritas upphöjda.
+                let ty = if st.fnref.is_some() { baseline - size * 0.38 } else { baseline };
+                self.page().ops.push(Op::Text { x: rx, y: ty, face, size: sz, text, color: c, italic: st.italic || italic_all });
                 if st.link.is_some() {
                     self.page().ops.push(Op::Line { x1: rx, y1: baseline + 1.6, x2: rx + w, y2: baseline + 1.6, width: 0.6, color: LINK });
                 }
@@ -842,10 +1129,20 @@ impl<'a> Layout<'a> {
                 }
             }
             self.y += line_h;
+            next = after;
+            i += 1;
+            if last {
+                break;
+            }
         }
     }
 
-    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align) {
+    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align, float: Option<Float>) {
+        // Bilder som inte flyter, och texten om bilden saknas, kommer under flytande bilder.
+        let float = float.filter(|_| indent == 0.0);
+        if float.is_none() {
+            self.clear_floats();
+        }
         let Some(img) = (self.resolve)(src) else {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
@@ -882,9 +1179,22 @@ impl<'a> Layout<'a> {
             w *= max_h / h;
             h = max_h;
         }
+        // Flytande bild: vid vänster/höger textkant, text runt; ryms den inte flyttas den till nästa sida.
+        let mut float = float;
+        if float.is_some() && (w + FLOAT_GAP > max_w - FLOAT_MIN_ROOM || !self.floats.is_empty() && self.floats.iter().any(|f| Some(f.side) == float)) {
+            self.clear_floats();
+            float = None;
+        }
         self.ensure(h);
         let index = self.images.len();
         self.images.push(image);
+        if let Some(side) = float {
+            let (x, y) = (if side == Float::Left { self.ml } else { self.ml + self.cw - w }, self.y);
+            self.page().ops.push(Op::Image { x, y, w, h, index });
+            let page = self.pages.len() - 1;
+            self.floats.push(FloatBox { side, w: w + FLOAT_GAP, page, bottom: y + h });
+            return;
+        }
         let free = (self.cw - indent - w).max(0.0);
         let dx = match align {
             Align::Center => free / 2.0,
@@ -896,60 +1206,107 @@ impl<'a> Layout<'a> {
         self.y += h + PARA_GAP;
     }
 
-    fn table(&mut self, rows: &[Vec<Vec<Span>>]) {
+    fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>) {
+        self.clear_floats();
         let cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
         let size = self.body * 0.95;
         let pad = 5.0;
-        // Kolumnbredd efter innehållets naturliga bredd, inom sidbredden.
-        let mut natural = vec![24.0f32; cols];
-        for r in rows {
-            for (i, cell) in r.iter().enumerate() {
-                let text: String = cell.iter().map(|s| s.text.as_str()).collect();
-                let w = self.m.width(self.base, size, &text) + 2.0 * pad + 2.0;
-                natural[i] = natural[i].max(w.min(self.cw));
+        let span_of = |ri: usize, ci: usize| spans.get(ri).and_then(|r| r.get(ci)).copied().unwrap_or(1);
+        // Cellens text rad för rad (`<br>` är ett radslut).
+        let widest = |this: &mut Self, cell: &[Span]| -> f32 {
+            let text: String = cell.iter().map(|s| s.text.as_str()).collect();
+            text.split('\n').map(|l| this.m.width(this.base, size, l)).fold(0.0, f32::max)
+        };
+        // Kolumnbredd: antalet streck i avgränsarraden, annars innehållets naturliga bredd inom sidbredden.
+        let widths: Vec<f32> = match weights.filter(|w| w.len() == cols) {
+            Some(w) => {
+                let sum: usize = w.iter().sum();
+                w.iter().map(|&n| self.cw * n as f32 / sum as f32).collect()
             }
-        }
-        let total: f32 = natural.iter().sum();
-        let widths: Vec<f32> = if total <= self.cw {
-            natural
-        } else {
-            natural.iter().map(|w| (w / total * self.cw).max(30.0)).collect()
+            None => {
+                let mut natural = vec![24.0f32; cols];
+                let mut wide: Vec<(usize, usize, f32)> = Vec::new();
+                for (ri, r) in rows.iter().enumerate() {
+                    for (i, cell) in r.iter().enumerate() {
+                        let w = widest(self, cell) + 2.0 * pad + 2.0;
+                        match span_of(ri, i) {
+                            0 => {}
+                            1 => natural[i] = natural[i].max(w.min(self.cw)),
+                            n => wide.push((i, n, w)),
+                        }
+                    }
+                }
+                for (i, n, w) in wide {
+                    let have: f32 = natural.iter().skip(i).take(n).sum();
+                    if have < w {
+                        let add = (w.min(self.cw) - have) / n as f32;
+                        for c in natural.iter_mut().skip(i).take(n) {
+                            *c += add.max(0.0);
+                        }
+                    }
+                }
+                let total: f32 = natural.iter().sum();
+                if total <= self.cw {
+                    natural
+                } else {
+                    // Proportionellt, men ingen kolumn smalare än 30 pt; resten delar på det som blir över.
+                    let mut w: Vec<f32> = natural.iter().map(|w| w / total * self.cw).collect();
+                    let small: f32 = w.iter().filter(|x| **x < 30.0).count() as f32 * 30.0;
+                    let big: f32 = w.iter().filter(|x| **x >= 30.0).sum();
+                    let scale = if big > 0.0 { ((self.cw - small) / big).min(1.0) } else { 1.0 };
+                    for x in &mut w {
+                        *x = if *x < 30.0 { 30.0 } else { *x * scale };
+                    }
+                    w
+                }
+            }
         };
         let line_h = size * LINE;
+        let total_w: f32 = widths.iter().sum();
+        // Cellernas x och bredd (täckta celler utelämnas, ägaren får hela bredden).
+        let cells_of = |ri: usize, len: usize| -> Vec<(usize, f32, f32)> {
+            let mut out = Vec::new();
+            let mut x = 0.0;
+            for ci in 0..len.min(cols) {
+                let n = span_of(ri, ci);
+                let w: f32 = widths.iter().skip(ci).take(n.max(1)).sum();
+                if n > 0 {
+                    out.push((ci, x, w));
+                }
+                x += widths[ci];
+            }
+            out
+        };
         for (ri, r) in rows.iter().enumerate() {
+            let face = if ri == 0 { Face::SansSemi } else { self.base };
+            let layout = cells_of(ri, r.len());
             // Mät radens höjd genom att lägga ut cellerna på en provsida.
             let mut heights = Vec::new();
-            for (ci, cell) in r.iter().enumerate() {
-                let base = if ri == 0 { Face::SansSemi } else { self.base };
-                heights.push(self.cell_height(cell, widths[ci] - 2.0 * pad, size, base));
+            for &(ci, _, w) in &layout {
+                heights.push(self.cell_height(&r[ci], w - 2.0 * pad, size, face));
             }
             let row_h = heights.iter().copied().fold(line_h, f32::max) + 2.0 * pad;
             self.ensure(row_h);
             let top = self.y;
             if ri == 0 {
                 let ml = self.ml;
-                self.page().ops.push(Op::Rect { x: ml, y: top, w: widths.iter().sum(), h: row_h, color: CODE_BG });
+                self.page().ops.push(Op::Rect { x: ml, y: top, w: total_w, h: row_h, color: CODE_BG });
             }
-            let mut x = self.ml;
-            for (ci, w) in widths.iter().enumerate() {
-                if let Some(cell) = r.get(ci) {
-                    self.y = top + pad;
-                    let face = if ri == 0 { Face::SansSemi } else { self.base };
-                    self.text_block(cell, x + pad, w - 2.0 * pad, face, size, INK, false, None);
-                }
-                x += w;
+            for &(ci, x, w) in &layout {
+                self.y = top + pad;
+                let ml = self.ml;
+                self.text_block(&r[ci], ml + x + pad, w - 2.0 * pad, face, size, INK, false, None);
             }
-            // Rutnät
-            let total_w: f32 = widths.iter().sum();
+            // Rutnät: kanter runt varje cell (en sammanfogad cell har inga streck inuti).
             let ml = self.ml;
+            let right = layout.last().map_or(total_w, |&(_, x, w)| x + w);
             let page = self.page();
-            page.ops.push(Op::Line { x1: ml, y1: top, x2: ml + total_w, y2: top, width: 0.6, color: RULE });
-            page.ops.push(Op::Line { x1: ml, y1: top + row_h, x2: ml + total_w, y2: top + row_h, width: 0.6, color: RULE });
-            let mut x = ml;
-            for w in widths.iter().chain(std::iter::once(&0.0)) {
-                page.ops.push(Op::Line { x1: x, y1: top, x2: x, y2: top + row_h, width: 0.6, color: RULE });
-                x += w;
+            page.ops.push(Op::Line { x1: ml, y1: top, x2: ml + right, y2: top, width: 0.6, color: RULE });
+            page.ops.push(Op::Line { x1: ml, y1: top + row_h, x2: ml + right, y2: top + row_h, width: 0.6, color: RULE });
+            for &(_, x, _) in &layout {
+                page.ops.push(Op::Line { x1: ml + x, y1: top, x2: ml + x, y2: top + row_h, width: 0.6, color: RULE });
             }
+            page.ops.push(Op::Line { x1: ml + right, y1: top, x2: ml + right, y2: top + row_h, width: 0.6, color: RULE });
             self.y = top + row_h;
         }
         self.y += PARA_GAP;
@@ -961,6 +1318,7 @@ impl<'a> Layout<'a> {
     }
 
     fn code(&mut self, text: &str, indent: f32) {
+        self.clear_floats();
         let size = self.body * 0.86;
         let line_h = size * 1.45;
         let pad = 8.0;
@@ -985,7 +1343,7 @@ impl<'a> Layout<'a> {
         while i < lines.len() {
             self.ensure(line_h + 2.0 * pad);
             // Så många rader som får plats på sidan.
-            let room = ((self.ph - self.mb - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
+            let room = ((self.ph - self.mb - self.reserved - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
             let chunk = &lines[i..(i + room).min(lines.len())];
             let h = chunk.len() as f32 * line_h + 2.0 * pad;
             let top = self.y;
@@ -1056,15 +1414,17 @@ impl<'a> Layout<'a> {
                     self.y += if next_is_item { 2.0 } else { PARA_GAP };
                 }
                 Block::Code { text, indent } => self.code(text, *indent),
-                Block::Table { rows } => self.table(rows),
+                Block::Table { rows, spans, weights } => self.table(rows, spans, weights.as_deref()),
                 Block::Rule => {
+                    self.clear_floats();
                     self.ensure(16.0);
                     let y = self.y + 6.0;
                     let (ml, cw) = (self.ml, self.cw);
                     self.page().ops.push(Op::Line { x1: ml, y1: y, x2: ml + cw, y2: y, width: 0.8, color: RULE });
                     self.y += 16.0;
                 }
-                Block::Image { src, alt, indent, size, align } => self.image(src, alt, *indent, *size, *align),
+                Block::Image { src, alt, indent, size, align, float } => self.image(src, alt, *indent, *size, *align, *float),
+                Block::Toc => self.toc(),
             }
         }
     }
@@ -1105,13 +1465,46 @@ fn doc_defaults(md: &str) -> DocDefaults {
     DocDefaults::from_comment(first).unwrap_or_default()
 }
 
+/// Lägger ut alla block. Med en innehållsförteckning görs två passager: förteckningens höjd beror
+/// bara på antalet rubriker, så sidnumren från första passet stämmer i det andra.
+fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
+    // Rubrikerna H1–H3 till en eventuell innehållsförteckning (samma urval som bokmärkena).
+    let toc_entries: Vec<(u8, String)> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Heading(l, spans, _) if *l <= 3 => {
+                let t: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
+                (!t.trim().is_empty()).then(|| (*l, t.trim().to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut lay = Layout::new(resolve, defaults);
+    lay.toc_entries = toc_entries.clone();
+    lay.notes = notes.to_vec();
+    lay.new_page();
+    lay.run(blocks);
+    lay.flush_notes();
+    if blocks.iter().any(|b| matches!(b, Block::Toc)) {
+        let pos: Vec<(usize, f32)> =
+            lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
+        let mut second = Layout::new(resolve, defaults);
+        second.toc_entries = toc_entries;
+        second.toc_pos = pos;
+        second.notes = notes.to_vec();
+        second.new_page();
+        second.run(blocks);
+        second.flush_notes();
+        lay = second;
+    }
+    lay
+}
+
 /// Bygger en PDF av Markdown-text.
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
-    let blocks = parse_blocks(markdown);
+    let (blocks, notes) = parse_blocks_notes(markdown);
     let defaults = doc_defaults(markdown);
-    let mut lay = Layout::new(resolve, &defaults);
-    lay.new_page();
-    lay.run(&blocks);
+    let mut lay = lay_out(&blocks, &notes, &defaults, resolve);
 
     let fonts: HashMap<Face, Font> = [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium]
         .into_iter()
@@ -1126,6 +1519,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     for (pi, page_ops) in lay.pages.iter().enumerate() {
         let mut page = doc.start_page_with(PageSettings::from_wh(lay.pw, lay.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
+        let mut gotos = Vec::new();
         {
             let mut s = page.surface();
             for op in page_ops.ops.iter().chain(extras[pi].iter()) {
@@ -1179,6 +1573,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                         }
                     }
                     Op::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
+                    Op::Goto { x, y, w, h, page, to_y } => gotos.push((*x, *y, *w, *h, *page, *to_y)),
                 }
             }
             s.finish();
@@ -1186,6 +1581,13 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
         for (x, y, w, h, url) in links {
             if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
                 let target = krilla::annotation::Target::Action(krilla::action::Action::Link(krilla::action::LinkAction::new(url)));
+                page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
+            }
+        }
+        for (x, y, w, h, to_page, to_y) in gotos {
+            if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
+                let dest = krilla::destination::XyzDestination::new(to_page, Point::from_xy(lay.ml, to_y));
+                let target = krilla::annotation::Target::Destination(krilla::destination::Destination::Xyz(dest));
                 page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
             }
         }
@@ -1232,12 +1634,116 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
 mod tests {
     use super::*;
 
+    /// Lägger ut Markdown och ger sidans ritinstruktioner (för kontroll av tabellernas geometri).
+    fn first_page_ops(md: &str) -> (Vec<(f32, f32, f32, f32)>, Vec<(f32, f32, String)>, f32, f32) {
+        let blocks = parse_blocks(md);
+        let defaults = doc_defaults(md);
+        let resolve = |_: &str| None;
+        let mut lay = Layout::new(&resolve, &defaults);
+        lay.new_page();
+        lay.run(&blocks);
+        let mut vlines = Vec::new();
+        let mut texts = Vec::new();
+        for op in &lay.pages[0].ops {
+            match op {
+                Op::Line { x1, y1, x2, y2, .. } if (x1 - x2).abs() < 0.01 => vlines.push((*x1, *y1, *x2, *y2)),
+                Op::Text { x, y, text, .. } => texts.push((*x, *y, text.clone())),
+                _ => {}
+            }
+        }
+        (vlines, texts, lay.ml, lay.cw)
+    }
+
+    #[test]
+    fn table_columns_follow_dash_counts() {
+        let (v, _, ml, cw) = first_page_ops("| A | B | C |\n| ---- | -- | -- |\n| 1 | 2 | 3 |\n");
+        let mut xs: Vec<f32> = v.iter().map(|l| l.0).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert_eq!(xs.len(), 4, "{xs:?}");
+        assert!((xs[0] - ml).abs() < 0.01 && (xs[3] - (ml + cw)).abs() < 0.01, "{xs:?} {ml} {cw}");
+        let w: Vec<f32> = xs.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!((w[0] / w[1] - 2.0).abs() < 0.01 && (w[1] - w[2]).abs() < 0.01, "{w:?}");
+    }
+
+    #[test]
+    fn table_merged_cells_have_no_inner_border() {
+        let (v, texts, ml, _) = first_page_ops("| Två || x |\n| --- | --- | --- |\n| a | b | c |\n");
+        // Rubrikradens lodräta streck: vänster, mellan sammanfogad cell och x, höger. Brödraden har fyra.
+        let tops: Vec<f32> = {
+            let mut t: Vec<f32> = v.iter().map(|l| l.1).collect();
+            t.sort_by(|a, b| a.total_cmp(b));
+            t.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+            t
+        };
+        assert_eq!(tops.len(), 2, "{tops:?}");
+        let head = v.iter().filter(|l| (l.1 - tops[0]).abs() < 0.01).count();
+        let body = v.iter().filter(|l| (l.1 - tops[1]).abs() < 0.01).count();
+        assert_eq!((head, body), (3, 4), "{v:?}");
+        // Texten i den sammanfogade cellen börjar i första kolumnen och "x" efter den.
+        let tva = texts.iter().find(|t| t.2 == "Två").unwrap();
+        let x = texts.iter().find(|t| t.2 == "x").unwrap();
+        assert!(tva.0 < ml + 10.0 && x.0 > tva.0 + 30.0, "{tva:?} {x:?}");
+    }
+
+    #[test]
+    fn table_cells_wrap_and_break_lines() {
+        let one = first_page_ops("| A | B |\n| --- | --- |\n| kort | kort |\n").0;
+        let height = |v: &[(f32, f32, f32, f32)], row: usize| {
+            let mut t: Vec<&(f32, f32, f32, f32)> = v.iter().collect();
+            t.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let l = t[row * 3];
+            l.3 - l.1
+        };
+        let h1 = height(&one, 1);
+        // `<br>` ger tre rader i cellen.
+        let (v, texts, _, _) = first_page_ops("| A | B |\n| --- | --- |\n| a<br>b<br>c | kort |\n");
+        assert!(height(&v, 1) > 2.0 * h1, "{} vs {h1}", height(&v, 1));
+        let ys: Vec<f32> = ["a", "b", "c"].iter().map(|n| texts.iter().find(|t| t.2 == *n).unwrap().1).collect();
+        assert!(ys[0] < ys[1] && ys[1] < ys[2], "{ys:?}");
+        // Lång text bryts inom sin kolumn i stället för att göra tabellen bredare.
+        let long = "ord ".repeat(60);
+        let (v, _, ml, cw) = first_page_ops(&format!("| A | B |\n| --- | --- |\n| {long} | kort |\n"));
+        assert!(height(&v, 1) > 2.0 * h1, "{}", height(&v, 1));
+        assert!(v.iter().all(|l| l.0 <= ml + cw + 0.01), "tabellen är bredare än texten: {v:?} {ml} {cw}");
+    }
+
     #[test]
     fn writes_a_pdf() {
         let md = "# Rubrik\n\nEn **fet** och *kursiv* rad med [länk](https://example.com) och `kod`.\n\n- ett\n- två\n    1. nästlad\n\n> citat\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```\nkod\n```\n\n---\n\n![saknas](finns-inte.png)\n";
         let w = write(md, "Test", &|_| None).unwrap();
         assert!(w.bytes.starts_with(b"%PDF-"));
         assert_eq!(w.missing_images, vec!["finns-inte.png".to_owned()]);
+    }
+
+    #[test]
+    fn toc_has_title_entries_and_real_page_numbers() {
+        let mut md = String::from("<!-- kladd: toc -->\n\n");
+        for i in 1..=4 {
+            md.push_str(&format!("# Kapitel {i}\n\n"));
+            for _ in 0..22 {
+                md.push_str("Brödtext som fyller ut sidan så att kapitlen hamnar på olika sidor i dokumentet. Och lite till så att raden bryts.\n\n");
+            }
+            md.push_str(&format!("## Avsnitt {i}\n\nKort.\n\n"));
+        }
+        let w = write(&md, "T", &|_| None).unwrap();
+        // Rubrikernas riktiga sidor, ur layouten.
+        let blocks = parse_blocks(&md);
+        assert!(blocks.iter().any(|b| matches!(b, Block::Toc)));
+        let lay = lay_out(&blocks, &[], &doc_defaults(&md), &|_| None);
+        let pages: Vec<usize> = lay.headings.iter().map(|h| h.page + 1).collect();
+        assert_eq!(pages.len(), 8);
+        assert!(pages.last().unwrap() > &2, "{pages:?}");
+        // PDF:en innehåller förteckningen med de sidnummer rubrikerna faktiskt fick.
+        let back = crate::pdf_read::read(&w.bytes, None).ok().expect("läsbar PDF");
+        assert!(back.markdown.contains("Innehåll"), "{}", back.markdown);
+        for (name, page) in ["Kapitel 1", "Avsnitt 1", "Kapitel 2", "Avsnitt 2", "Kapitel 3", "Avsnitt 3", "Kapitel 4", "Avsnitt 4"].iter().zip(&pages) {
+            let at = back.markdown.find(&format!("{name} .")).unwrap_or_else(|| panic!("{name} saknas i förteckningen:\n{}", back.markdown));
+            let rest = back.markdown[at + name.len()..].trim_start_matches([' ', '.']);
+            let num: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            assert_eq!(num, page.to_string(), "{name}:\n{}", back.markdown);
+        }
+        assert!(back.page_count >= 3);
     }
 
     #[test]
@@ -1501,6 +2007,66 @@ mod tests {
         assert!((im[1].0 - (lay.ml + lay.cw - 72.0)).abs() < 0.01);
     }
 
+    const LOREM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
+
+    #[test]
+    fn floats_wrap_text_line_by_line() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        for (side, tag) in [(Float::Left, "left"), (Float::Right, "right")] {
+            let md = format!("<img src=\"a\" width=\"192\" align=\"{tag}\">\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n");
+            let (mut lay, _) = laid_out(&md, &resolve);
+            let im = images_of(&lay);
+            assert_eq!(im.len(), 1);
+            let (ix, iy, iw, ih) = im[0];
+            let want_x = if side == Float::Left { lay.ml } else { lay.ml + lay.cw - iw };
+            assert!((ix - want_x).abs() < 0.01, "{side:?}: bild vid {ix}");
+            let body = lay.body;
+            let (mut beside, mut below) = (0, 0);
+            for (x, y, t) in texts(&lay.pages[0].ops) {
+                let w = lay.m.width(Face::Sans, body, &t);
+                if y < iy + ih {
+                    beside += 1;
+                    let (lo, hi) = if side == Float::Left { (lay.ml + iw + FLOAT_GAP, lay.ml + lay.cw) } else { (lay.ml, lay.ml + lay.cw - iw - FLOAT_GAP) };
+                    assert!(x >= lo - 0.01 && x + w <= hi + 0.5, "{side:?}: rad vid {x}..{} (y {y}) utanför {lo}..{hi}", x + w);
+                } else {
+                    below += 1;
+                    assert!((x - lay.ml).abs() < 0.01, "{side:?}: rad under bilden vid {x}");
+                }
+            }
+            assert!(beside >= 3 && below >= 3, "{side:?}: {beside} bredvid, {below} under");
+            // Bilden tar ingen egen höjd: första textraden ligger överst.
+            let first = texts(&lay.pages[0].ops).first().map(|t| t.1).unwrap();
+            assert!(first < lay.mt + 20.0, "första raden y = {first}");
+        }
+    }
+
+    #[test]
+    fn float_that_does_not_fit_moves_to_the_next_page() {
+        let data = png(100, 100);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        // Fyll sidan nästan helt, sedan en bild på 150 pt som inte ryms.
+        let filler: Vec<String> = (0..12).map(|_| LOREM.to_owned()).collect();
+        let md = format!("{}\n\n<img src=\"a\" width=\"200\" align=\"left\">\n\n{LOREM}\n\n{LOREM}\n", filler.join("\n\n"));
+        let (lay, _) = laid_out(&md, &resolve);
+        assert!(lay.pages.len() >= 2);
+        let on_page = |k: usize| lay.pages[k].ops.iter().filter(|o| matches!(o, Op::Image { .. })).count();
+        assert_eq!((on_page(0), on_page(1)), (0, 1));
+        // Texten efter bilden står bredvid den på sida 2.
+        let t = texts(&lay.pages[1].ops);
+        assert!(t.iter().any(|(x, _, _)| *x > lay.ml + 100.0), "{t:?}");
+    }
+
+    #[test]
+    fn float_without_room_is_a_plain_block() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let md = format!("<img src=\"a\" width=\"700\" align=\"left\">\n\n{LOREM}\n");
+        let (lay, _) = laid_out(&md, &resolve);
+        let (_, iy, _, ih) = images_of(&lay)[0];
+        assert!(texts(&lay.pages[0].ops).iter().all(|(x, y, _)| (*x - lay.ml).abs() < 0.01 && *y > iy + ih - 1.0));
+    }
+
     #[test]
     fn k_markers_are_never_printed() {
         for md in ["Före <!--k:1--> efter\n", "<!--k:12-->\n\nText\n", "<!--k:3--> rad\n"] {
@@ -1529,3 +2095,7 @@ mod manual {
         std::fs::write(o, w.bytes).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "pdf_fn_tests.rs"]
+mod fn_tests;

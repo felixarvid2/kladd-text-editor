@@ -10,8 +10,9 @@
 //! dokumentets grundformat (standardstycket + Standard) skrivs som `<span style>`.
 //!
 //! Beslut om saker Kladd inte kan visa:
-//! - Fotnoter och slutnoter (`text:note`) och kommentarer (`office:annotation`) tas bort ur texten
-//!   och rapporteras som borttagna ("fotnoter", "kommentarer"), på samma sätt som för .docx.
+//! - Fotnoter och slutnoter (`text:note`) blir `[^N]` och en definition `[^N]: text` sist i dokumentet
+//!   (slutnoter blir fotnoter). Kommentarer (`office:annotation`) tas bort ur texten och rapporteras
+//!   som borttagna ("kommentarer"), på samma sätt som för .docx.
 //! - Diagram, former och inbäddade objekt (`draw:*` utom bilder) rapporteras som borttagna.
 //! - Länkade bilder (utanför paketet) och bildformat som Kladd inte kan visa (svg, wmf …) likaså.
 //! - Sidnummer och antal sidor i sidhuvud/sidfot blir `{sida}` och `{sidor}`; bara standardsidans
@@ -30,6 +31,7 @@ use quick_xml::Reader;
 
 use crate::docx::{escape_inline, escape_line_start, image_ext, is_supported_image, wrap, Image, Loaded, Written, IMAGE_SCHEME};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
+use crate::word::markup::{self, Float};
 
 const MIME: &str = "application/vnd.oasis.opendocument.text";
 const MAX_ENTRIES: usize = 20_000;
@@ -260,6 +262,9 @@ struct StyleDef {
     auto: bool,
     tp: TProps,
     align: Option<Align>,
+    /// `style:wrap` och `style:horizontal-pos` i `style:graphic-properties`.
+    wrap: Option<String>,
+    hpos: Option<String>,
 }
 
 #[derive(Default)]
@@ -271,6 +276,8 @@ struct Styles {
     fonts: HashMap<String, String>,
     /// Listformat → (ordnad, startvärde) per nivå.
     lists: HashMap<String, Vec<(bool, u64)>>,
+    /// Kolumnformat (`style:family="table-column"`) → bredd i pt (eller relativ bredd).
+    col_widths: HashMap<String, f64>,
 }
 
 fn unquote_font(f: &str) -> String {
@@ -350,10 +357,36 @@ impl Styles {
                         d.align = Some(parse_align(a));
                     }
                 }
+                "style:graphic-properties" => {
+                    d.wrap = c.attr("style:wrap").map(str::to_owned);
+                    d.hpos = c.attr("style:horizontal-pos").map(str::to_owned);
+                }
                 _ => {}
             }
         }
         d
+    }
+
+    /// Sidan en ram med grafikformatet `name` flyter på. `style:wrap="right"` betyder att texten
+    /// står till höger om bilden (bilden till vänster), `left` tvärtom; vid `parallel`, `dynamic`
+    /// och `biggest` avgör `style:horizontal-pos` (`left`/`right`). Allt annat (`none`, `run-through`,
+    /// ramar som ligger i texten) är ingen flytande bild.
+    fn float_of(&self, name: &str) -> Option<Float> {
+        let (mut wrap, mut hpos) = (None, None);
+        for d in self.chain("graphic", name) {
+            wrap = d.wrap.as_ref().or(wrap);
+            hpos = d.hpos.as_ref().or(hpos);
+        }
+        match wrap?.as_str() {
+            "right" => Some(Float::Left),
+            "left" => Some(Float::Right),
+            "parallel" | "dynamic" | "biggest" => match hpos.map(String::as_str) {
+                Some("left") => Some(Float::Left),
+                Some("right") => Some(Float::Right),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn list_style(&mut self, s: &Node) {
@@ -383,6 +416,18 @@ impl Styles {
                     "style:style" => {
                         let d = self.read_style(s, auto);
                         let fam = s.attr("style:family").unwrap_or("").to_owned();
+                        if fam == "table-column" {
+                            if let Some(p) = s.child("style:table-column-properties") {
+                                let w = p
+                                    .attr("style:column-width")
+                                    .and_then(style::parse_length)
+                                    .map(f64::from)
+                                    .or_else(|| p.attr("style:rel-column-width").and_then(|v| v.trim_end_matches('*').parse().ok()));
+                                if let Some(w) = w {
+                                    self.col_widths.insert(d.name.clone(), w);
+                                }
+                            }
+                        }
                         self.defs.insert((fam, d.name.clone()), d);
                     }
                     "style:default-style" => {
@@ -494,9 +539,17 @@ struct Para {
     list: Option<ListInfo>,
 }
 
+/// En tabell som läses: celler per rutnätsrad, spann (0 = täckt av cellen före) och kolumnbredder.
+#[derive(Clone, Default)]
+struct Tbl {
+    rows: Vec<Vec<String>>,
+    spans: Vec<Vec<usize>>,
+    widths: Vec<f64>,
+}
+
 enum Block {
     Para(Para),
-    Table(Vec<Vec<String>>),
+    Table(Tbl),
     Rule,
 }
 
@@ -505,7 +558,6 @@ struct Dropped {
     shapes: bool,
     linked: bool,
     textboxes: bool,
-    notes: bool,
     comments: bool,
 }
 
@@ -520,9 +572,6 @@ impl Dropped {
         }
         if self.textboxes {
             v.push("textrutor");
-        }
-        if self.notes {
-            v.push("fotnoter");
         }
         if self.comments {
             v.push("kommentarer");
@@ -557,6 +606,10 @@ struct Rd<'s, 'b> {
     by_target: HashMap<String, String>,
     blocks: Vec<Block>,
     list_id: usize,
+    /// Fotnotstexterna (Markdown på en rad) i dokumentordning; fotnot N är `[^N]`.
+    notes: Vec<String>,
+    /// Sant medan en fotnots stycken läses.
+    in_note: bool,
 }
 
 fn kind_of(st: &Styles, style: Option<&str>) -> Kind {
@@ -689,7 +742,7 @@ impl<'s, 'b> Rd<'s, 'b> {
                 pc.prev_space = true;
             }
             "draw:frame" => self.frame(e, st, pc, runs),
-            "text:note" => self.dropped.notes = true,
+            "text:note" => self.note(e, runs),
             "office:annotation" => self.dropped.comments = true,
             "text:soft-page-break" | "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:reference-mark"
             | "text:reference-mark-start" | "text:reference-mark-end" | "office:annotation-end" | "text:index-mark"
@@ -697,6 +750,39 @@ impl<'s, 'b> Rd<'s, 'b> {
             | "text:change-end" | "text:toc-mark" | "text:toc-mark-start" | "text:toc-mark-end" => {}
             n if n.starts_with("draw:") => self.dropped.shapes = true,
             _ => self.inline(e, st, pc, runs),
+        }
+    }
+
+    /// En fotnot eller slutnot: `[^N]` i texten, och texten sparas för definitionen sist i dokumentet.
+    fn note(&mut self, e: &Node, runs: &mut Vec<Run>) {
+        if self.in_note {
+            return;
+        }
+        self.in_note = true;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(body) = e.child("text:note-body") {
+            self.note_paras(body, &mut parts);
+        }
+        self.in_note = false;
+        self.notes.push(escape_line_start(&parts.join("<br>")));
+        let label = format!("[^{}]", self.notes.len());
+        push_run(runs, Run { text: label, fmt: Fmt::default(), link: None, raw: true });
+    }
+
+    /// Fotnotens stycken som Markdown, med radbrytningar som `<br>`.
+    fn note_paras(&mut self, n: &Node, out: &mut Vec<String>) {
+        for c in n.els() {
+            match c.name.as_str() {
+                "text:p" | "text:h" => {
+                    let p = self.build_para(c, None);
+                    let s = para_md(&p).replace('\n', "<br>");
+                    if !s.trim().is_empty() {
+                        out.push(s.trim().to_owned());
+                    }
+                }
+                "text:list" | "text:list-item" | "text:section" => self.note_paras(c, out),
+                _ => {}
+            }
         }
     }
 
@@ -752,8 +838,15 @@ impl<'s, 'b> Rd<'s, 'b> {
         let fw = e.attr("svg:width").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let fh = e.attr("svg:height").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
+        // Ramar som ligger i texten (`as-char`) flyter aldrig.
+        let float = e
+            .attr("draw:style-name")
+            .filter(|_| e.attr("text:anchor-type") != Some("as-char"))
+            .and_then(|n| self.st.float_of(n));
         let md = match (natural, fw) {
-            (Some((nw, nh)), Some(w)) if (w - nw).abs() > 1.5 || fh.is_some_and(|h| (h - w * nh / nw).abs() > 1.5) => {
+            (Some((nw, nh)), Some(w))
+                if float.is_some() || (w - nw).abs() > 1.5 || fh.is_some_and(|h| (h - w * nh / nw).abs() > 1.5) =>
+            {
                 let mut tag = format!("<img src=\"{}\"", html_escape_attr(&src));
                 if !alt.is_empty() {
                     tag.push_str(&format!(" alt=\"{}\"", html_escape_attr(&alt)));
@@ -761,6 +854,11 @@ impl<'s, 'b> Rd<'s, 'b> {
                 tag.push_str(&format!(" width=\"{}\"", w.round() as i64));
                 if let Some(h) = fh.filter(|h| (h - w * nh / nw).abs() > 1.5) {
                     tag.push_str(&format!(" height=\"{}\"", h.round() as i64));
+                }
+                match float {
+                    Some(Float::Left) => tag.push_str(" align=\"left\""),
+                    Some(Float::Right) => tag.push_str(" align=\"right\""),
+                    None => {}
                 }
                 tag.push('>');
                 tag
@@ -780,7 +878,14 @@ impl<'s, 'b> Rd<'s, 'b> {
             kind = Kind::Heading(lvl);
         }
         let named = self.st.named_props("paragraph", style);
-        let span_ref = if kind == Kind::Normal { self.base.clone() } else { named.clone() };
+        // I en fotnot jämförs texten med fotnotsmallen (inte brödtexten), så att den inte fylls med spans.
+        let span_ref = if self.in_note {
+            self.base.over(&named)
+        } else if kind == Kind::Normal {
+            self.base.clone()
+        } else {
+            named.clone()
+        };
         let eff = self.st.tprops("paragraph", style.unwrap_or("Standard"));
         let mut pc = Pc { named, span_ref, prev_space: true };
         let st = St { eff, code: false, link: None };
@@ -824,13 +929,18 @@ impl<'s, 'b> Rd<'s, 'b> {
                 let p = self.build_para(n, None);
                 self.emit(p);
             }
+            // Innehållsförteckningen blir raden `<!-- kladd: toc -->`; innehållet byggs om av Kladd.
+            "text:table-of-content" => {
+                let run = Run { text: crate::word::nav::TOC_LINE.to_owned(), fmt: Fmt::default(), link: None, raw: true };
+                self.blocks.push(Block::Para(Para { kind: Kind::Normal, runs: vec![run], align: Align::Left, list: None }));
+            }
             "text:list" => {
                 self.list_id += 1;
                 let id = self.list_id;
                 self.list(n, 0, None, id);
             }
             "table:table" => self.table(n),
-            "text:section" | "text:table-of-content" | "text:alphabetical-index" | "text:illustration-index"
+            "text:section" | "text:alphabetical-index" | "text:illustration-index"
             | "text:table-index" | "text:object-index" | "text:user-index" | "text:bibliography" | "text:index-body"
             | "text:index-title" => {
                 for c in n.els() {
@@ -902,12 +1012,29 @@ impl<'s, 'b> Rd<'s, 'b> {
         parts.join("<br>").replace('|', "\\|")
     }
 
+    /// Kolumnernas bredder ur `table:table-column` (också i grupper).
+    fn column_widths(&self, n: &Node, out: &mut Vec<f64>) {
+        for c in n.els() {
+            match c.name.as_str() {
+                "table:table-columns" | "table:table-header-columns" | "table:table-column-group" => self.column_widths(c, out),
+                "table:table-column" => {
+                    let rep = c.attr("table:number-columns-repeated").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+                    let w = c.attr("table:style-name").and_then(|s| self.st.col_widths.get(s)).copied().unwrap_or(0.0);
+                    for _ in 0..rep.clamp(1, 256) {
+                        out.push(w);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn cell_paras(&mut self, n: &Node, out: &mut Vec<String>) {
         for c in n.els() {
             match c.name.as_str() {
                 "text:p" | "text:h" => {
                     let p = self.build_para(c, None);
-                    let s = para_md(&p).replace('\n', " ");
+                    let s = para_md(&p).replace('\n', "<br>");
                     if !s.trim().is_empty() {
                         out.push(s.trim().to_owned());
                     }
@@ -920,20 +1047,24 @@ impl<'s, 'b> Rd<'s, 'b> {
     }
 
     fn table(&mut self, t: &Node) {
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        self.table_rows(t, &mut rows);
-        if rows.is_empty() {
+        let mut tbl = Tbl::default();
+        self.table_rows(t, &mut tbl);
+        if tbl.rows.is_empty() {
             return;
         }
-        self.blocks.push(Block::Table(rows));
+        self.column_widths(t, &mut tbl.widths);
+        self.blocks.push(Block::Table(tbl));
     }
 
-    fn table_rows(&mut self, n: &Node, rows: &mut Vec<Vec<String>>) {
+    fn table_rows(&mut self, n: &Node, tbl: &mut Tbl) {
         for c in n.els() {
             match c.name.as_str() {
-                "table:table-header-rows" | "table:table-row-group" | "table:table-rows" => self.table_rows(c, rows),
+                "table:table-header-rows" | "table:table-row-group" | "table:table-rows" => self.table_rows(c, tbl),
                 "table:table-row" => {
                     let mut cells = Vec::new();
+                    let mut spans = Vec::new();
+                    // Kolumner kvar i den vågräta sammanfogningen från cellen före.
+                    let mut pending = 0usize;
                     for cell in c.els() {
                         let rep = cell.attr("table:number-columns-repeated").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
                         match cell.name.as_str() {
@@ -942,9 +1073,26 @@ impl<'s, 'b> Rd<'s, 'b> {
                                 let rep = if text.is_empty() { rep.min(1) } else { rep.min(64) };
                                 for _ in 0..rep.max(1) {
                                     cells.push(text.clone());
+                                    spans.push(1);
+                                }
+                                pending = cell
+                                    .attr("table:number-columns-spanned")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .map_or(0, |n| n.clamp(1, 64) - 1);
+                            }
+                            // Täckt av en vågrät sammanfogning, eller (lodrätt) av en cell ovanför:
+                            // då en tom vanlig cell.
+                            "table:covered-table-cell" => {
+                                for _ in 0..rep.clamp(1, 64) {
+                                    cells.push(String::new());
+                                    if pending > 0 {
+                                        pending -= 1;
+                                        spans.push(0);
+                                    } else {
+                                        spans.push(1);
+                                    }
                                 }
                             }
-                            "table:covered-table-cell" => cells.push(String::new()),
                             _ => {}
                         }
                         if cells.len() > 256 {
@@ -956,7 +1104,8 @@ impl<'s, 'b> Rd<'s, 'b> {
                         continue;
                     }
                     for _ in 0..rep.clamp(1, 64) {
-                        rows.push(cells.clone());
+                        tbl.rows.push(cells.clone());
+                        tbl.spans.push(spans.clone());
                     }
                 }
                 _ => {}
@@ -1072,7 +1221,8 @@ fn set_align(out: &mut String, cur: &mut Align, new: Align) {
     *cur = new;
 }
 
-fn render(blocks: &[Block]) -> String {
+/// `text_w` är textytans bredd i pt: tabeller som är klart smalare får automatisk bredd.
+fn render(blocks: &[Block], text_w: Option<f64>) -> String {
     let mut out = String::new();
     let mut prev_list: Option<usize> = None;
     let mut cur_align = Align::Left;
@@ -1142,9 +1292,9 @@ fn render(blocks: &[Block]) -> String {
                 }
                 out.push_str("---");
             }
-            Block::Table(rows) => {
+            Block::Table(tbl) => {
                 prev_list = None;
-                let mut rows = rows.clone();
+                let mut rows = tbl.rows.clone();
                 if rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
                     for c in rows[0].iter_mut() {
                         if c.len() > 4 {
@@ -1152,24 +1302,14 @@ fn render(blocks: &[Block]) -> String {
                         }
                     }
                 }
-                let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
                 if cur_align != Align::Left {
                     set_align(&mut out, &mut cur_align, Align::Left);
                 } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
-                let row_md = |r: &Vec<String>| {
-                    let mut cells: Vec<String> = r.iter().map(|c| if c.is_empty() { " ".into() } else { c.clone() }).collect();
-                    cells.resize(cols, " ".into());
-                    format!("| {} |", cells.join(" | "))
-                };
-                out.push_str(&row_md(&rows[0]));
-                out.push('\n');
-                out.push_str(&format!("|{}", " --- |".repeat(cols)));
-                for r in &rows[1..] {
-                    out.push('\n');
-                    out.push_str(&row_md(r));
-                }
+                let narrow = text_w.is_some_and(|tw| tw > 0.0 && tbl.widths.iter().sum::<f64>() < tw * 0.9);
+                let widths: &[f64] = if narrow { &[] } else { &tbl.widths };
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, widths));
             }
         }
     }
@@ -1319,14 +1459,27 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         by_target: HashMap::new(),
         blocks: Vec::new(),
         list_id: 0,
+        notes: Vec::new(),
+        in_note: false,
     };
     for c in body.els() {
         rd.walk(c);
     }
-    let mut markdown = render(&rd.blocks);
     let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
     if let Some(s) = &sroot {
         read_page(&st, s, &mut defaults);
+    }
+    let text_w = {
+        let (w, _) = defaults.page();
+        let m = defaults.margins();
+        f64::from(w - m[1] - m[3])
+    };
+    let mut markdown = render(&rd.blocks, Some(text_w));
+    if !rd.notes.is_empty() {
+        markdown.push('\n');
+        for (i, n) in rd.notes.iter().enumerate() {
+            markdown.push_str(&format!("[^{}]: {n}\n", i + 1));
+        }
     }
     let comment = defaults.to_comment();
     if !comment.is_empty() {
@@ -1443,6 +1596,12 @@ fn parse_attrs(s: &str) -> Vec<(String, String)> {
 
 struct WTable {
     in_head: bool,
+    /// Spann per rad och cell ur tabellens källa (0 = täckt cell).
+    spans: Vec<Vec<usize>>,
+    /// Antal påbörjade rader och cellen i raden som skrivs.
+    rows: usize,
+    cell: usize,
+    covered: bool,
 }
 
 struct W<'a> {
@@ -1479,6 +1638,13 @@ struct W<'a> {
     media: Vec<(String, Vec<u8>, &'static str)>,
     missing: Vec<String>,
     text_w: f32,
+    /// Fotnotsdefinitionerna (etikett, stycken som XML) i textens ordning.
+    notes: Vec<(String, String)>,
+    /// Etiketten för varje fotnotsreferens i dokumentordning; platshållaren i texten är dess index.
+    note_order: Vec<String>,
+    in_note: bool,
+    /// Rubrikerna H1–H3 (nivå, text, uppskattad sida) till innehållsförteckningen.
+    toc: Vec<(u8, String, usize)>,
 }
 
 fn heading_num(level: HeadingLevel) -> u8 {
@@ -1548,11 +1714,17 @@ impl<'a> W<'a> {
             media: Vec::new(),
             missing: Vec::new(),
             text_w,
+            notes: Vec::new(),
+            note_order: Vec::new(),
+            in_note: false,
+            toc: Vec::new(),
         }
     }
 
     fn base_para_style(&self) -> String {
-        if let Some(h) = self.heading {
+        if self.in_note {
+            "Footnote".into()
+        } else if let Some(h) = self.heading {
             format!("Heading_20_{h}")
         } else if self.code {
             "Preformatted_20_Text".into()
@@ -1741,7 +1913,7 @@ impl<'a> W<'a> {
         self.after_space = true;
     }
 
-    fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>) {
+    fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>, float: Option<Float>) {
         let Some(img) = (self.resolve)(src).filter(|i| is_supported_image(&i.bytes)) else {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
@@ -1787,13 +1959,27 @@ impl<'a> W<'a> {
             self.frame_style = true;
             self.auto.push_str("<style:style style:name=\"fr1\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:vertical-pos=\"top\" style:vertical-rel=\"baseline\" style:wrap=\"none\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\"/></style:style>");
         }
+        // Flytande bild: förankrad vid stycket, vid kanten, text runt med 12 px (0,318 cm) luft.
+        let (style_name, anchor) = match float {
+            Some(side) => {
+                let (name, pos, wrap, ml, mr) = match side {
+                    Float::Left => ("frL", "left", "right", "0cm", "0.318cm"),
+                    Float::Right => ("frR", "right", "left", "0.318cm", "0cm"),
+                };
+                if !self.auto.contains(&format!("style:name=\"{name}\"")) {
+                    self.auto.push_str(&format!("<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\" style:horizontal-pos=\"{pos}\" style:horizontal-rel=\"paragraph\" style:wrap=\"{wrap}\" style:number-wrapped-paragraphs=\"no-limit\" style:run-through=\"foreground\" fo:margin-left=\"{ml}\" fo:margin-right=\"{mr}\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0cm\"/></style:style>"));
+                }
+                (name, "paragraph")
+            }
+            None => ("fr1", "as-char"),
+        };
         self.open_para();
         self.open_link_if_needed();
         self.n_frame += 1;
         let n = self.n_frame;
         let desc = if alt.is_empty() { String::new() } else { format!("<svg:desc>{}</svg:desc>", esc(alt)) };
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"fr1\" draw:name=\"Bild{n}\" text:anchor-type=\"as-char\" svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
+            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\" svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
             cm(w_pt),
             cm(h_pt),
             n - 1
@@ -1801,10 +1987,33 @@ impl<'a> W<'a> {
         self.after_space = false;
     }
 
+    /// Skriver innehållsförteckningen: `text:table-of-content` med rubriknivåer 1–3 och en
+    /// färdig förteckning (LibreOffice uppdaterar den via Verktyg > Uppdatera).
+    fn toc(&mut self) {
+        let mut x = String::from("<text:table-of-content text:protected=\"true\" text:name=\"Innehåll1\"><text:table-of-content-source text:outline-level=\"3\"><text:index-title-template text:style-name=\"Contents_20_Heading\">Innehåll</text:index-title-template>");
+        for n in 1..=3 {
+            x.push_str(&format!(
+                "<text:table-of-content-entry-template text:outline-level=\"{n}\" text:style-name=\"Contents_20_{n}\"><text:index-entry-link-start text:style-name=\"Internet_20_link\"/><text:index-entry-chapter/><text:index-entry-text/><text:index-entry-tab-stop style:type=\"right\" style:leader-char=\".\"/><text:index-entry-page-number/><text:index-entry-link-end/></text:table-of-content-entry-template>"
+            ));
+        }
+        x.push_str("</text:table-of-content-source><text:index-body><text:index-title text:name=\"Innehåll1_Head\"><text:p text:style-name=\"Contents_20_Heading\">Innehåll</text:p></text:index-title>");
+        for (level, text, page) in &self.toc {
+            x.push_str(&format!(
+                "<text:p text:style-name=\"Contents_20_{level}\">{}<text:tab/>{page}</text:p>",
+                esc(text)
+            ));
+        }
+        x.push_str("</text:index-body></text:table-of-content>");
+        self.body.push_str(&x);
+    }
+
     fn html(&mut self, s: &str) {
         let t = s.trim();
         let single_line = t.lines().count() == 1;
-        if t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />") {
+        if t == crate::word::nav::TOC_LINE {
+            self.close_para();
+            self.toc();
+        } else if t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />") {
             self.line_break();
         } else if let Some(style) = style::parse_span_open(s) {
             let merged = self.spans.last().map_or(style.clone(), |outer| outer.merged(&style));
@@ -1830,7 +2039,12 @@ impl<'a> W<'a> {
             let get = |k: &str| attrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
             let num = |k: &str| get(k).and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().ok()).filter(|v| *v > 0.0);
             let (src, alt) = (get("src").unwrap_or("").to_owned(), get("alt").unwrap_or("").to_owned());
-            self.image(&src, &alt, num("width"), num("height"));
+            let float = match get("align").map(|a| a.trim().to_ascii_lowercase()).as_deref() {
+                Some("left") => Some(Float::Left),
+                Some("right") => Some(Float::Right),
+                _ => None,
+            };
+            self.image(&src, &alt, num("width"), num("height"), float);
             // Det som följer på nästa rader i samma HTML-block är vanlig text.
             let rest = t[end + 1..].trim_matches('\n');
             if !rest.trim().is_empty() {
@@ -1840,6 +2054,40 @@ impl<'a> W<'a> {
         } else {
             self.run(s.trim_end_matches('\n'), false);
         }
+    }
+
+    /// Byter platshållarna mot `text:note`; en andra referens till samma etikett får en kopia.
+    fn resolve_notes(&mut self) {
+        if self.note_order.is_empty() {
+            return;
+        }
+        let mut out = String::with_capacity(self.body.len());
+        let mut rest = self.body.as_str();
+        while let Some(i) = rest.find('\u{E004}') {
+            out.push_str(&rest[..i]);
+            let r = &rest[i + '\u{E004}'.len_utf8()..];
+            let Some(e) = r.find('\u{E005}') else {
+                rest = "";
+                break;
+            };
+            if let Some(n) = r[..e].parse::<usize>().ok().filter(|n| *n < self.note_order.len()) {
+                let label = &self.note_order[n];
+                let paras = self
+                    .notes
+                    .iter()
+                    .find(|(l, _)| l == label)
+                    .map(|(_, x)| x.as_str())
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or("<text:p text:style-name=\"Footnote\"/>");
+                let k = n + 1;
+                out.push_str(&format!(
+                    "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{k}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
+                ));
+            }
+            rest = &r[e + '\u{E005}'.len_utf8()..];
+        }
+        out.push_str(rest);
+        self.body = out;
     }
 
     fn start_list(&mut self, start: Option<u64>) {
@@ -1853,12 +2101,45 @@ impl<'a> W<'a> {
 
 fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: f32) -> W<'a> {
     let mut w = W::new(resolve, text_w);
+    if md.contains(crate::word::nav::TOC_LINE) {
+        let heads = crate::word::nav::headings_scan(md);
+        w.toc = crate::word::nav::toc_entries(&heads)
+            .into_iter()
+            // Grov uppskattning: ca 3 000 tecken per sida (LibreOffice räknar om vid uppdatering).
+            .map(|h| (h.level, h.text.clone(), 1 + md[..h.start].chars().count() / 3000))
+            .collect();
+    }
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
-    for ev in Parser::new_ext(md, opts) {
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    // Pågående fotnotsdefinition: (etikett, brödtexten som lagts åt sidan).
+    let mut note_cur: Option<(String, String)> = None;
+    for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
         match ev {
+            MdEvent::Start(Tag::FootnoteDefinition(label)) => {
+                w.close_para();
+                note_cur = Some((label.to_string(), std::mem::take(&mut w.body)));
+                w.in_note = true;
+            }
+            MdEvent::End(TagEnd::FootnoteDefinition) => {
+                w.close_para();
+                if let Some((label, saved)) = note_cur.take() {
+                    let xml = std::mem::replace(&mut w.body, saved);
+                    w.notes.push((label, xml));
+                }
+                w.in_note = false;
+            }
+            MdEvent::FootnoteReference(t) if w.in_note => w.run(&format!("[{t}]"), false),
+            MdEvent::FootnoteReference(t) => {
+                // Själva noten sätts in när definitionerna lästs (`resolve_notes`).
+                w.open_para();
+                w.note_order.push(t.to_string());
+                let n = w.note_order.len() - 1;
+                w.body.push_str(&format!("\u{E004}{n}\u{E005}"));
+                w.after_space = false;
+            }
             MdEvent::Start(tag) => match tag {
                 Tag::Paragraph => w.close_para(),
                 Tag::Heading { level, .. } => {
@@ -1887,25 +2168,65 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                         w.cell_style = true;
                         w.auto.push_str("<style:style style:name=\"TabellCell\" style:family=\"table-cell\"><style:table-cell-properties fo:padding=\"0.097cm\" fo:border=\"0.5pt solid #000000\"/></style:style>");
                     }
+                    let src = markup::table_src(md.get(range.clone()).unwrap_or(""));
                     w.auto.push_str(&format!(
-                        "<style:style style:name=\"Tabell{n}\" style:family=\"table\"><style:table-properties style:width=\"{tw}\" table:align=\"margins\"/></style:style><style:style style:name=\"Tabell{n}.A\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{cw}\"/></style:style>",
-                        tw = cm(w.text_w),
-                        cw = cm(w.text_w / cols as f32)
+                        "<style:style style:name=\"Tabell{n}\" style:family=\"table\"><style:table-properties style:width=\"{tw}\" table:align=\"margins\"/></style:style>",
+                        tw = cm(w.text_w)
                     ));
-                    w.body.push_str(&format!(
-                        "<table:table table:name=\"Tabell{n}\" table:style-name=\"Tabell{n}\"><table:table-column table:style-name=\"Tabell{n}.A\" table:number-columns-repeated=\"{cols}\"/>"
-                    ));
-                    w.table = Some(WTable { in_head: false });
+                    w.body.push_str(&format!("<table:table table:name=\"Tabell{n}\" table:style-name=\"Tabell{n}\">"));
+                    match src.weights.as_ref().filter(|ws| ws.len() == cols) {
+                        // Olika många streck: en kolumnformat per kolumn med proportionell bredd.
+                        Some(ws) => {
+                            let sum: usize = ws.iter().sum();
+                            for (j, &d) in ws.iter().enumerate() {
+                                w.auto.push_str(&format!(
+                                    "<style:style style:name=\"Tabell{n}.C{j}\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{}\"/></style:style>",
+                                    cm(w.text_w * d as f32 / sum as f32)
+                                ));
+                                w.body.push_str(&format!("<table:table-column table:style-name=\"Tabell{n}.C{j}\"/>"));
+                            }
+                        }
+                        None => {
+                            w.auto.push_str(&format!(
+                                "<style:style style:name=\"Tabell{n}.A\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{cw}\"/></style:style>",
+                                cw = cm(w.text_w / cols as f32)
+                            ));
+                            w.body.push_str(&format!(
+                                "<table:table-column table:style-name=\"Tabell{n}.A\" table:number-columns-repeated=\"{cols}\"/>"
+                            ));
+                        }
+                    }
+                    w.table = Some(WTable { in_head: false, spans: src.spans, rows: 0, cell: 0, covered: false });
                 }
                 Tag::TableHead => {
                     if let Some(t) = w.table.as_mut() {
                         t.in_head = true;
+                        t.rows += 1;
+                        t.cell = 0;
                     }
                     w.body.push_str("<table:table-header-rows><table:table-row>");
                 }
-                Tag::TableRow => w.body.push_str("<table:table-row>"),
+                Tag::TableRow => {
+                    if let Some(t) = w.table.as_mut() {
+                        t.rows += 1;
+                        t.cell = 0;
+                    }
+                    w.body.push_str("<table:table-row>");
+                }
                 Tag::TableCell => {
-                    w.body.push_str("<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\">");
+                    let span = w.table.as_mut().map_or(1, |t| {
+                        let span = t.spans.get(t.rows.saturating_sub(1)).and_then(|r| r.get(t.cell)).copied().unwrap_or(1);
+                        t.covered = span == 0;
+                        span
+                    });
+                    match span {
+                        // Täckt av cellen före: ingen text, bara platshållaren.
+                        0 => w.body.push_str("<table:covered-table-cell/>"),
+                        1 => w.body.push_str("<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\">"),
+                        n => w.body.push_str(&format!(
+                            "<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\" table:number-columns-spanned=\"{n}\">"
+                        )),
+                    }
                 }
                 Tag::Emphasis => w.italic += 1,
                 Tag::Strong => w.bold += 1,
@@ -1950,9 +2271,15 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 }
                 TagEnd::TableRow => w.body.push_str("</table:table-row>"),
                 TagEnd::TableCell => {
-                    w.open_para(); // en cell ska innehålla minst ett stycke
-                    w.close_para();
-                    w.body.push_str("</table:table-cell>");
+                    let covered = w.table.as_mut().is_some_and(|t| {
+                        t.cell += 1;
+                        std::mem::take(&mut t.covered)
+                    });
+                    if !covered {
+                        w.open_para(); // en cell ska innehålla minst ett stycke
+                        w.close_para();
+                        w.body.push_str("</table:table-cell>");
+                    }
                 }
                 TagEnd::Emphasis => w.italic = w.italic.saturating_sub(1),
                 TagEnd::Strong => w.bold = w.bold.saturating_sub(1),
@@ -1963,7 +2290,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 }
                 TagEnd::Image => {
                     if let Some((src, alt)) = w.image.take() {
-                        w.image(&src, &alt, None, None);
+                        w.image(&src, &alt, None, None, None);
                     }
                 }
                 _ => {}
@@ -1990,11 +2317,11 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 w.body.push_str("<text:p text:style-name=\"Horizontal_20_Line\"/>");
             }
             MdEvent::TaskListMarker(done) => w.run(if done { "☒ " } else { "☐ " }, false),
-            MdEvent::FootnoteReference(t) => w.run(&format!("[{t}]"), false),
             MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => w.run(&t, false),
         }
     }
     w.close_para();
+    w.resolve_notes();
     w
 }
 
@@ -2118,17 +2445,32 @@ fn styles_xml(d: &DocDefaults) -> String {
             "<style:style style:name=\"Heading_20_{n}\" style:display-name=\"Heading {n}\" style:family=\"paragraph\" style:parent-style-name=\"Heading\" style:next-style-name=\"Text_20_body\" style:default-outline-level=\"{n}\" style:class=\"text\"><style:text-properties fo:font-size=\"{size}pt\" fo:color=\"#{color}\"/></style:style>"
         ));
     }
+    // Innehållsförteckningen: rubrik och tre nivåer med högerställd flik med prickar.
+    let text_w_pt = (pw - m[1] - m[3]).max(36.0);
+    named.push_str("<style:style style:name=\"Contents_20_Heading\" style:display-name=\"Contents Heading\" style:family=\"paragraph\" style:parent-style-name=\"Heading\" style:class=\"index\"><style:paragraph-properties fo:margin-top=\"0.423cm\" fo:margin-bottom=\"0.212cm\"/><style:text-properties fo:font-size=\"18pt\" fo:color=\"#1F3864\"/></style:style>");
+    for (n, indent_pt) in [(1, 0.0f32), (2, 14.17), (3, 28.35)] {
+        let (indent, tab) = (cm(indent_pt), cm((text_w_pt - indent_pt).max(36.0)));
+        named.push_str(&format!(
+            "<style:style style:name=\"Contents_20_{n}\" style:display-name=\"Contents {n}\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\"><style:paragraph-properties fo:margin-left=\"{indent}\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.1cm\"><style:tab-stops><style:tab-stop style:position=\"{tw}\" style:type=\"right\" style:leader-style=\"dotted\" style:leader-text=\".\"/></style:tab-stops></style:paragraph-properties></style:style>",
+            tw = tab
+        ));
+    }
     named.push_str("<style:style style:name=\"Quotations\" style:display-name=\"Quotations\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-left=\"1cm\" fo:margin-right=\"0cm\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.247cm\" fo:padding-left=\"0.3cm\" fo:border-left=\"1.5pt solid #A6A6A6\" fo:border-top=\"none\" fo:border-bottom=\"none\" fo:border-right=\"none\"/><style:text-properties fo:color=\"#404040\"/></style:style>");
     named.push_str("<style:style style:name=\"Preformatted_20_Text\" style:display-name=\"Preformatted Text\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0cm\"/><style:text-properties style:font-name=\"Liberation Mono\" fo:font-size=\"10pt\"/></style:style>");
     named.push_str("<style:style style:name=\"Source_20_Text\" style:display-name=\"Source Text\" style:family=\"text\"><style:text-properties style:font-name=\"Liberation Mono\"/></style:style>");
     named.push_str("<style:style style:name=\"Horizontal_20_Line\" style:display-name=\"Horizontal Line\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0.2cm\" fo:border-bottom=\"0.5pt solid #000000\" fo:border-top=\"none\" fo:border-left=\"none\" fo:border-right=\"none\" fo:padding=\"0cm\"/><style:text-properties fo:font-size=\"6pt\"/></style:style>");
     named.push_str("<style:style style:name=\"Table_20_Contents\" style:display-name=\"Table Contents\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"/>");
     named.push_str("<style:style style:name=\"Table_20_Heading\" style:display-name=\"Table Heading\" style:family=\"paragraph\" style:parent-style-name=\"Table_20_Contents\" style:class=\"extra\"><style:text-properties fo:font-weight=\"bold\" style:font-weight-asian=\"bold\" style:font-weight-complex=\"bold\"/></style:style>");
+    named.push_str("<style:style style:name=\"Footnote\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"><style:paragraph-properties fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:text-indent=\"0cm\"/><style:text-properties fo:font-size=\"10pt\"/></style:style>");
+    named.push_str("<style:style style:name=\"Footnote_20_Symbol\" style:display-name=\"Footnote Symbol\" style:family=\"text\"/>");
+    named.push_str("<style:style style:name=\"Footnote_20_anchor\" style:display-name=\"Footnote anchor\" style:family=\"text\"><style:text-properties style:text-position=\"super 58%\"/></style:style>");
     named.push_str("<style:style style:name=\"Header\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"/>");
     named.push_str("<style:style style:name=\"Footer\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\"/>");
     named.push_str("<style:style style:name=\"Graphics\" style:family=\"graphic\"><style:graphic-properties text:anchor-type=\"paragraph\" svg:x=\"0cm\" svg:y=\"0cm\" style:wrap=\"none\" style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\"/></style:style>");
     named.push_str("<style:style style:name=\"Internet_20_link\" style:display-name=\"Internet link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
     named.push_str("<style:style style:name=\"Visited_20_Internet_20_Link\" style:display-name=\"Visited Internet Link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
+
+    named.push_str("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"1\" text:start-value=\"0\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>");
 
     format!(
         "{XML_DECL}<office:document-styles {NS} office:version=\"1.2\">{}<office:styles>{named}</office:styles><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>",
@@ -2346,6 +2688,102 @@ Slut.
         assert_eq!(read(&missing.bytes).unwrap().markdown, "\\[bild: x\\]\n");
     }
 
+    fn content_xml(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut s = String::new();
+        z.by_name("content.xml").unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn floating_image_roundtrip() {
+        let md = "<img src=\"bild:image1.png\" alt=\"Sol\" width=\"200\" align=\"left\">Text bredvid.\n\n<img src=\"bild:image1.png\" width=\"100\" align=\"right\">\n\nSlut\n";
+        let w = write(md, "T", &resolver()).unwrap();
+        assert!(w.missing_images.is_empty());
+        let c = content_xml(&w.bytes);
+        assert!(c.contains("style:horizontal-pos=\"left\"") && c.contains("style:wrap=\"right\""), "{c}");
+        assert!(c.contains("style:horizontal-pos=\"right\"") && c.contains("style:wrap=\"left\""));
+        assert_eq!(c.matches("text:anchor-type=\"paragraph\"").count(), 2);
+        assert!(!c.contains("text:anchor-type=\"as-char\""));
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
+        // En bild som ligger i texten flyter inte.
+        let inline = write("<img src=\"bild:image1.png\" width=\"200\">\n", "T", &resolver()).unwrap();
+        assert!(!read(&inline.bytes).unwrap().markdown.contains("align="));
+    }
+
+    #[test]
+    fn wrap_values_are_mapped() {
+        let base = |wrap: &str, pos: &str| {
+            let c = LO_CONTENT.replace("svg:width=\"0.0265cm\" svg:height=\"0.0265cm\"", "svg:width=\"6.35cm\" svg:height=\"6.35cm\"");
+            let c = c.replace("<draw:frame draw:name=\"Bild1\" text:anchor-type=\"as-char\"", "<draw:frame draw:style-name=\"fr9\" draw:name=\"Bild1\" text:anchor-type=\"paragraph\"");
+            let style = format!("<style:style style:name=\"fr9\" style:family=\"graphic\"><style:graphic-properties style:wrap=\"{wrap}\" style:horizontal-pos=\"{pos}\"/></style:style>");
+            let c = c.replacen("</office:automatic-styles>", &format!("{style}</office:automatic-styles>"), 1);
+            let l = read(&make_odt(&c, LO_STYLES, &[("Pictures/a.png", &png())])).unwrap();
+            // Bara <img>-taggen (stycket kan ha en egen <div align>).
+            let m = l.markdown;
+            let i = m.find("<img").expect("bildtagg");
+            m[i..i + m[i..].find('>').unwrap()].to_owned()
+        };
+        assert!(base("right", "center").contains("align=\"left\""));
+        assert!(base("left", "center").contains("align=\"right\""));
+        assert!(base("parallel", "right").contains("align=\"right\""));
+        assert!(base("dynamic", "left").contains("align=\"left\""));
+        assert!(!base("none", "left").contains("align="));
+        assert!(!base("run-through", "left").contains("align="));
+        assert!(!base("parallel", "center").contains("align="));
+    }
+
+    /// LibreOffice ska rendera den skrivna filen med texten runt bilden. Kräver `soffice` och `pdftotext`.
+    #[test]
+    #[ignore]
+    fn floating_image_libreoffice() {
+        let dir = std::env::temp_dir().join("kladd-float-lo-odt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = image::RgbImage::new(240, 160);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb(if (x / 20 + y / 20) % 2 == 0 { [60, 120, 200] } else { [255, 200, 40] });
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
+        let md = format!("<img src=\"b.png\" alt=\"\" width=\"240\" align=\"left\">{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n");
+        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None })).unwrap();
+        let odt = dir.join("f.odt");
+        std::fs::write(&odt, w.bytes).unwrap();
+        let st = std::process::Command::new("soffice")
+            .arg(format!("-env:UserInstallation=file://{}/profile", dir.display()))
+            .args(["--headless", "--convert-to", "pdf", "--outdir"]).arg(&dir).arg(&odt).output().unwrap();
+        assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+        let out = std::process::Command::new("pdftotext").args(["-bbox"]).arg(dir.join("f.pdf")).arg("-").output().unwrap();
+        let html = String::from_utf8_lossy(&out.stdout).into_owned();
+        let xs: Vec<f32> = html
+            .lines()
+            .filter(|l| l.contains(">Lorem<"))
+            .filter_map(|l| l.split("xMin=\"").nth(1)?.split('"').next()?.parse().ok())
+            .collect();
+        assert!(xs.len() >= 6, "{xs:?}");
+        assert!(xs[0] > 200.0, "första stycket vid x = {}", xs[0]);
+        assert!(xs.iter().any(|&x| x < 100.0), "inget stycke under bilden: {xs:?}");
+    }
+
+    #[test]
+    fn toc_line_roundtrips_as_table_of_content() {
+        let md = "# Ett\n\n<!-- kladd: toc -->\n\n## Två\n\n#### Fyra\n\nSlut.\n";
+        let w = write(md, "T", &|_| None).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&w.bytes)).unwrap();
+        let mut content = String::new();
+        z.by_name("content.xml").unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("<text:table-of-content "), "{content}");
+        assert!(content.contains("text:outline-level=\"3\""));
+        assert!(content.contains(">Två<text:tab/>1</text:p>"), "{content}");
+        assert!(!content.contains("Fyra</text:p><text:tab"), "H4 ska inte vara med");
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
+    }
+
     #[test]
     fn numbered_list_start_and_spaces() {
         let md = "5. fem\n6. sex\n\nTre    mellanslag och\ttab.\n";
@@ -2432,7 +2870,7 @@ Slut.
     fn reads_libreoffice_style_document() {
         let bytes = make_odt(LO_CONTENT, LO_STYLES, &[("Pictures/a.png", &png())]);
         let l = read(&bytes).unwrap();
-        assert_eq!(l.dropped, vec!["fotnoter"]);
+        assert!(l.dropped.is_empty(), "{:?}", l.dropped);
         let md = &l.markdown;
         assert!(
             md.starts_with("<!-- kladd: font-family: \"Liberation Serif\"; font-size: 12pt; page-size: Letter; page-margin: 20mm 25mm 20mm 25mm; footer: \"Sida {sida} av {sidor}\"; footer-align: center -->\n\n"),
@@ -2452,7 +2890,9 @@ Slut.
         assert!(md.contains("```\nfn main() {\n    x();\n}\n```"), "{md}");
         assert!(md.contains("| Namn | Antal |\n| --- | --- |\n| Äpple \\| rött | 3 |"), "{md}");
         assert!(md.contains("![Alternativtext](bild:a.png)"), "{md}");
-        assert!(md.ends_with("Sista\n"), "{md}");
+        // Fotnoten blir en referens och en definition sist.
+        assert!(md.contains("[länk](https://example.com)[^1]."), "{md}");
+        assert!(md.ends_with("Sista\n\n[^1]: Fotnot\n"), "{md}");
         assert_eq!(l.images.len(), 1);
     }
 
@@ -2475,6 +2915,71 @@ Slut.
             z.finish().unwrap();
         }
         assert!(read(&buf.into_inner()).err().unwrap().contains("inte ett OpenDocument"));
+    }
+
+    fn content_part(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = String::new();
+        Read::read_to_string(&mut z.by_name("content.xml").unwrap(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn table_merge_widths_and_breaks_roundtrip() {
+        let md = "| Rubrik över två || x |\n| ------ | -- | ---- |\n| a | b<br>rad | c |\n| d |||\n";
+        let w = write(md, "T", &resolver()).unwrap();
+        let xml = content_part(&w.bytes);
+        assert!(xml.contains("table:number-columns-spanned=\"2\""), "{xml}");
+        assert!(xml.contains("table:number-columns-spanned=\"3\""));
+        assert_eq!(xml.matches("<table:covered-table-cell/>").count(), 3, "{xml}");
+        assert!(xml.contains("b<text:line-break/>rad"), "{xml}");
+        // En kolumnformat per kolumn, i förhållande 6:2:4.
+        let width = |name: &str| -> f32 {
+            let i = xml.find(&format!("style:name=\"{name}\"")).unwrap();
+            let rest = &xml[i..];
+            let j = rest.find("style:column-width=\"").unwrap() + 20;
+            rest[j..].split("cm").next().unwrap().parse().unwrap()
+        };
+        let (a, b, c) = (width("Tabell1.C0"), width("Tabell1.C1"), width("Tabell1.C2"));
+        assert!((a / b - 3.0).abs() < 0.05 && (c / b - 2.0).abs() < 0.05, "{a} {b} {c}");
+        let back = read(&w.bytes).unwrap();
+        let ts = markup::table_src(&back.markdown);
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]], "{}", back.markdown);
+        assert_eq!(ts.weights, Some(vec![20, 7, 13]), "{}", back.markdown);
+        assert!(back.markdown.contains("| a | b<br>rad | c |"), "{}", back.markdown);
+    }
+
+    #[test]
+    fn table_equal_widths_use_one_repeated_column() {
+        let md = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let w = write(md, "T", &resolver()).unwrap();
+        let xml = content_part(&w.bytes);
+        assert!(xml.contains("table:number-columns-repeated=\"2\""), "{xml}");
+        assert!(!xml.contains("covered-table-cell") && !xml.contains("columns-spanned"));
+        assert!(read(&w.bytes).unwrap().markdown.contains("| A | B |\n| --- | --- |\n| 1 | 2 |"));
+    }
+
+    #[test]
+    fn reads_spans_covered_cells_and_widths_from_libreoffice() {
+        let table = r#"<table:table table:name="T"><table:table-column table:style-name="co1"/><table:table-column table:style-name="co2" table:number-columns-repeated="2"/>
+<table:table-row><table:table-cell table:number-columns-spanned="2" office:value-type="string"><text:p>Bred</text:p></table:table-cell><table:covered-table-cell/><table:table-cell office:value-type="string"><text:p>Id</text:p></table:table-cell></table:table-row>
+<table:table-row><table:table-cell table:number-rows-spanned="2" office:value-type="string"><text:p>Lodrät</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>rad<text:line-break/>två</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>c</text:p></table:table-cell></table:table-row>
+<table:table-row><table:covered-table-cell/><table:table-cell office:value-type="string"><text:p>e</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>f</text:p></table:table-cell></table:table-row></table:table>"#;
+        let styles = r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="8cm"/></style:style><style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="4cm"/></style:style>"#;
+        let a = LO_CONTENT.find("<table:table ").unwrap();
+        let b = LO_CONTENT.find("</table:table>").unwrap() + "</table:table>".len();
+        let c = format!("{}{}{}", &LO_CONTENT[..a], table, &LO_CONTENT[b..]).replacen("<office:automatic-styles>", &format!("<office:automatic-styles>{styles}"), 1);
+        let l = read(&make_odt(&c, LO_STYLES, &[("Pictures/a.png", &png())])).unwrap();
+        let md = &l.markdown;
+        let start = md.find("| Bred").unwrap();
+        let tbl = &md[start..md[start..].find("\n\n").map_or(md.len(), |i| start + i)];
+        let ts = markup::table_src(tbl);
+        // Bred över två kolumner; den lodräta täckningen blir en tom cell, inte en sammanfogning.
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![1, 1, 1]], "{tbl}");
+        // 8 cm : 4 cm : 4 cm av 40 streck = 20:10:10.
+        assert_eq!(ts.weights, Some(vec![20, 10, 10]), "{tbl}");
+        assert!(tbl.contains("| Lodrät | rad<br>två | c |"), "{tbl}");
+        assert!(tbl.contains("|   | e | f |"), "{tbl}");
     }
 
     /// Konverterar Kladds .odt med LibreOffice; kör med `cargo test -- --ignored`.
@@ -2500,3 +3005,7 @@ Slut.
         eprintln!("{}", back.markdown);
     }
 }
+
+#[cfg(test)]
+#[path = "odt_fn_tests.rs"]
+mod fn_tests;

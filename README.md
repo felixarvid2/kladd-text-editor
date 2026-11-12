@@ -23,13 +23,15 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 ## Funktioner
 
 - **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
+- **Säkerhetskopia och återställning** – osparade flikar sparas undan var 30:e sekund; efter en krasch erbjuder Kladd att återställa dem vid nästa start. Kan stängas av i huvudmenyn.
 - **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), PDF och många kodformat.
 - **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
 - **Förlustfri Word-sparning** – Word-filer sparas med alla sina delar kvar, se [Word-dokument](#word-dokument).
 - **Syntaxfärgning** och radnummer.
-- **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`.
+- **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`, med alternativ för versaler, hela ord och reguljära uttryck (`$1` och `${namn}` fungerar i ersättningen). I dokumentläget söker Kladd i den synliga texten, så "fet text" hittar `**fet** text`. Du kan också söka på formatering (fetstil, kursiv, färg, markering, rubrik) och låta *Ersätt* lägga på eller ta bort formatering på träffarna.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
+- **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
 - **Två teman** – *Gryning* och *Skymning*.
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
 - **Dra och släpp** filer direkt i fönstret.
@@ -44,6 +46,8 @@ Ladda ner det senaste `.deb`-paketet från [Releases](https://github.com/felixar
 ```bash
 sudo apt install ./kladd_*.deb
 ```
+
+Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
 
 Du kan också bygga Kladd från källkoden:
 
@@ -71,6 +75,8 @@ git push origin v1.4.0
 
 Det går också att köra workflowen *Release* för hand under Actions och kryssa i *Publicera release*. Då skapas taggen från versionen i `Cargo.toml`.
 
+Release-anteckningarna hämtas från avsnittet för versionen i `CHANGELOG.md`; finns inget avsnitt skapas anteckningarna automatiskt. Skriv anteckningarna i `CHANGELOG.md` innan du taggar. För en redan publicerad release: kör workflowen för hand, fyll i *update_notes* med taggen (till exempel `v1.5.0`) och lämna *Publicera release* ikryssad av. Då byts bara anteckningarna ut.
+
 </details>
 
 ## Word-dokument
@@ -81,13 +87,19 @@ Kladd öppnar `.docx` och `.odt` (LibreOffice) i dokumentläge, som liknar ett W
 
 ![Ett Word-dokument i Kladds dokumentläge](docs/dokumentlage-ljust.png)
 
-Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och marginaler från dokumentet och typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Listor dras in med hängande indrag, tabeller ritas som rutnät och bilder visas i texten. Markdown-koden är dold; den visas nedtonad bara på raden där markören står.
+Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och marginaler från dokumentet och typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Listor dras in med hängande indrag, tabeller ritas som rutnät med celler som bryter långa rader, `Enter` för radbrytning i cellen, sammanfogade celler och kolumnbredder som du ändrar genom att dra i kanten, och bilder visas i texten. Markdown-koden är dold; den visas nedtonad bara på raden där markören står. Fotnoter visas som små upphöjda siffror med texten under en skiljelinje sist i dokumentet: *Infoga fotnot* i verktygsraden (`Ctrl+Alt+F`) lägger till en och numrerar om, Ctrl+klick på ett nummer hoppar mellan referensen och fotnoten, och fotnoterna följer med som riktiga fotnoter när du sparar som `.docx` eller `.odt` och hamnar längst ned på sidan i PDF.
 
-Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, infoga bild och tabell, ångra och gör om samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
+Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, menyn *Infoga* (bild, tabell, fotnot och innehållsförteckning), ångra och gör om, sidinställningar samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
 
 ### Förlustfri sparning
 
 Kladd behåller alla delar av originalfilen, som sidhuvud, sidfot, fotnoter, kommentarer, teman och inställningar. Vid sparning skrivs bara de stycken om som du har ändrat; oförändrade stycken sparas exakt som de var. Objekt som Kladd inte kan visa, till exempel fotnotsreferenser, kommentarer, fält och textrutor, blir osynliga markörer `<!--k:N-->` i Markdown-texten och skrivs tillbaka när du sparar. Det enda som kan försvinna är spårade ändringar i stycken som du ändrar.
+
+### Navigering och innehållsförteckning
+
+Navigeringsfönstret (`Ctrl+Shift+O`, knappen längst upp till höger eller *Navigeringsfönster* i menyn) visar rubrikerna i Word-, ODT-, PDF- och Markdown-flikar, i både dokumentläge och textläge. Klicka på en rubrik för att flytta markören dit; pilen fäller ihop underrubriker och fältet *Sök i rubriker* filtrerar listan.
+
+*Infoga → Innehållsförteckning* (i formateringsfältet eller huvudmenyn) sätter in raden `<!-- kladd: toc -->` vid markören. I dokumentläget visas rubrikerna H1–H3 med sidnummer; klicka på en post för att hoppa dit. Står markören på raden visas själva kommentaren. Sparas dokumentet som `.docx` blir det ett innehållsförteckningsfält som Word uppdaterar när filen öppnas (Word frågar då om fälten ska uppdateras), som `.odt` en `text:table-of-content` och som PDF en förteckning med riktiga sidnummer och länkar. Förteckningar som redan finns i ett öppnat Word- eller OpenDocument-dokument visas som samma rad.
 
 ### Sidor och utskrift
 
@@ -101,7 +113,7 @@ Knappen *Sidinställningar* (eller dubbelklick på sidhuvud eller sidfot) öppna
 
 Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.
 
-Klicka på en bild för att markera den. Dra i hörnen för att ändra storlek (håll Skift för fri proportion). En liten verktygsrad vid bilden justerar läget (vänster, centrerat eller höger), återställer originalstorleken eller tar bort bilden. Delete tar bort en markerad bild.
+Klicka på en bild för att markera den. Dra i hörnen för att ändra storlek (håll Skift för fri proportion) eller dra i själva bilden för att flytta den: en linje visar var den hamnar, och Esc avbryter. En liten verktygsrad vid bilden justerar läget (vänster, centrerat eller höger), väljer radbrytning (*I texten*, eller *Vänster*/*Höger* så att texten flyter runt bilden), återställer originalstorleken eller tar bort bilden. Delete tar bort en markerad bild. Flytande bilder sparas som förankrade bilder med textomflöde i Word och LibreOffice.
 
 Ctrl+V klistrar in formaterad text med rubriker, fetstil, kursiv, understrykning, färger, typsnitt, storlekar, justering, listor, tabeller, länkar och inbäddade bilder. Ctrl+Shift+V klistrar in oformaterad text.
 
@@ -173,6 +185,7 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+Shift+>` / `Ctrl+Shift+<` (eller `Ctrl+]` / `Ctrl+[`) | Större / mindre text, ett steg (endast dokumentläge) |
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Markdownförhandsvisning |
+| `Ctrl+Shift+O` | Navigeringsfönster (rubrikträd) på/av |
 | `Ctrl+Shift+L` | Byt tema |
 | `Ctrl+Q` | Avsluta |
 

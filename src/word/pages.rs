@@ -77,8 +77,13 @@ impl Geom {
 
 /// Flyttar ner rader som inte ryms på sin sida så att de börjar överst på nästa sida. Rader
 /// delas aldrig; en rad som är högre än en sida står ensam på sin. Galleriets y = 0 är textytans
-/// överkant på första sidan.
-pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32) {
+/// överkant på första sidan. `groups` är radintervall (stigande, utan överlapp) som hör ihop och
+/// flyttas tillsammans, till exempel cellernas rader i en tabellrad.
+///
+/// `floats` = (radnummer, höjd) för raden som en flytande bild förankras på: bilden räknas som en
+/// rad av sin höjd, så att en bild som inte ryms flyttas till nästa sida tillsammans med texten
+/// efter den.
+pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], groups: &[std::ops::Range<usize>]) {
     if g.rows.is_empty() {
         return;
     }
@@ -89,22 +94,44 @@ pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32) {
     let mut page = 0usize;
     let mut shift = 0.0f32;
     let mut prev_bottom = f32::NEG_INFINITY;
-    for pr in g.rows.iter_mut() {
-        let h = pr.row.size.y;
-        let top = pr.pos.y + shift;
+    let mut float_bottom = f32::NEG_INFINITY;
+    let mut next_group = 0;
+    let mut i = 0;
+    while i < g.rows.len() {
+        while next_group < groups.len() && groups[next_group].start < i {
+            next_group += 1;
+        }
+        let end = match groups.get(next_group) {
+            Some(r) if r.start == i && r.end > i => r.end.min(g.rows.len()),
+            _ => i + 1,
+        };
+        let (mut y0, mut y1) = (f32::INFINITY, f32::NEG_INFINITY);
+        for pr in &g.rows[i..end] {
+            y0 = y0.min(pr.pos.y);
+            y1 = y1.max(pr.pos.y + pr.row.size.y);
+        }
+        let h = y1 - y0;
+        let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
+        let top = y0 + shift;
         let page_top = page as f32 * stride;
-        if top + h > page_top + text_h + eps && top > page_top + eps {
+        if top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
             // Nästa sida, men inte över en rad som sträcker sig förbi arket.
             page += 1;
             while (page as f32 * stride) < prev_bottom - eps {
                 page += 1;
             }
-            shift = round(page as f32 * stride - pr.pos.y);
+            shift = round(page as f32 * stride - y0);
         }
-        pr.pos.y += shift;
-        prev_bottom = pr.pos.y + h;
+        for pr in &mut g.rows[i..end] {
+            pr.pos.y += shift;
+        }
+        prev_bottom = y0 + shift + h;
+        if fh > 0.0 {
+            float_bottom = float_bottom.max(y0 + shift + fh);
+        }
+        i = end;
     }
-    g.rect.max.y = g.rect.max.y.max(prev_bottom);
+    g.rect.max.y = g.rect.max.y.max(prev_bottom).max(float_bottom);
     g.mesh_bounds = Rect::NOTHING;
     for pr in &g.rows {
         g.mesh_bounds |= pr.row.visuals.mesh_bounds.translate(pr.pos.to_vec2());
@@ -459,7 +486,7 @@ mod tests {
                 }
                 job.wrap.max_width = 200.0;
                 let mut g = ui.ctx().fonts_mut(|f| f.layout_job(job));
-                paginate(Arc::make_mut(&mut g), &geom(), 1.0);
+                paginate(Arc::make_mut(&mut g), &geom(), 1.0, &[], &[]);
                 out = Some(g);
             });
             std::mem::forget(r);

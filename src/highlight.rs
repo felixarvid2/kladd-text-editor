@@ -3,15 +3,16 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
-use egui::{Color32, FontFamily, FontId};
-use syntect::easy::HighlightLines;
+use egui::{Color32, FontFamily, FontId, Galley};
+use syntect::highlighting::Highlighter as SynHighlighter;
 use syntect::highlighting::{
-    Color, FontStyle, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
+    Color, FontStyle, HighlightIterator, HighlightState, ScopeSelectors, StyleModifier, Theme, ThemeItem,
+    ThemeSettings,
 };
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::LinesWithEndings;
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::theme::{self, Palette};
 
@@ -22,7 +23,40 @@ pub struct Highlighter {
     syntaxes: SyntaxSet,
     dark: Theme,
     light: Theme,
-    cache: HashMap<u64, (u64, LayoutJob)>,
+    docs: HashMap<u64, DocHl>,
+}
+
+/// En färgad bit av en rad (relativt radens början).
+#[derive(Clone)]
+struct Sp {
+    start: u32,
+    end: u32,
+    fg: [u8; 3],
+    bold: bool,
+    italic: bool,
+}
+
+/// Färgning av en rad och parsningstillstånden *före* raden: en ändring behöver bara göra
+/// om raderna från den ändrade tills tillståndet efter en rad är detsamma som förut.
+struct LineInfo {
+    start: usize,
+    parse: ParseState,
+    hl: HighlightState,
+    spans: Vec<Sp>,
+}
+
+/// Allt som cachas för ett dokument i textläget.
+struct DocHl {
+    /// Senast sedda texten (ändringsdetektor: jämförelse, inte hash).
+    text: String,
+    rev: u64,
+    /// Syntax, tema och storlek som färgningen gjordes med.
+    style_key: u64,
+    /// Rader (och en avslutande tom rad som bär sluttillståndet); `None` = ingen färgning.
+    lines: Option<Vec<LineInfo>>,
+    sections: Vec<LayoutSection>,
+    newlines: usize,
+    galley: Option<(u64, Arc<Galley>)>,
 }
 
 pub struct Params<'a> {
@@ -30,9 +64,8 @@ pub struct Params<'a> {
     pub syntax_hint: &'a str,
     pub palette: &'a Palette,
     pub font_size: f32,
-    pub query: &'a str,
-    pub case_sensitive: bool,
-    pub current_match: Option<usize>,
+    /// Sökträffar som `(start, slut, är_aktuell)` (se `search::highlights`).
+    pub matches: &'a [(usize, usize, bool)],
 }
 
 fn to_color(c: Color32) -> Color {
@@ -127,12 +160,12 @@ impl Highlighter {
             syntaxes: SyntaxSet::load_defaults_newlines(),
             dark: build_theme(&theme::skymning()),
             light: build_theme(&theme::gryning()),
-            cache: HashMap::new(),
+            docs: HashMap::new(),
         }
     }
 
     pub fn forget(&mut self, doc_id: u64) {
-        self.cache.remove(&doc_id);
+        self.docs.remove(&doc_id);
     }
 
     fn syntax_for(&self, hint: &str, text: &str) -> Option<&SyntaxReference> {
@@ -152,105 +185,239 @@ impl Highlighter {
         None
     }
 
-    pub fn layout(&mut self, text: &str, p: &Params<'_>) -> LayoutJob {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut h);
+    /// Håller dokumentets färgning i takt med texten. Oförändrad text kostar en jämförelse.
+    fn sync(&mut self, text: &str, p: &Params<'_>) {
+        let mut h = Fx::default();
         p.syntax_hint.hash(&mut h);
         p.palette.dark.hash(&mut h);
         p.font_size.to_bits().hash(&mut h);
-        p.query.hash(&mut h);
-        p.case_sensitive.hash(&mut h);
-        p.current_match.hash(&mut h);
-        let key = h.finish();
-
-        if let Some((k, job)) = self.cache.get(&p.doc_id) {
-            if *k == key {
-                return job.clone();
+        // Första raden kan välja syntax (`#!`): ändras den färgas allt om.
+        text.lines().next().filter(|l| l.starts_with("#!")).hash(&mut h);
+        let style_key = h.finish();
+        if let Some(d) = self.docs.get(&p.doc_id) {
+            if d.style_key == style_key && d.text == text {
+                return;
             }
         }
-        let job = self.build(text, p);
-        self.cache.insert(p.doc_id, (key, job.clone()));
-        job
+        let mut d = self.docs.remove(&p.doc_id).unwrap_or_else(|| DocHl {
+            text: String::new(),
+            rev: 0,
+            style_key: 0,
+            lines: None,
+            sections: Vec::new(),
+            newlines: 0,
+            galley: None,
+        });
+        let old = if d.style_key == style_key { d.lines.take() } else { None };
+        let lines = if text.len() <= MAX_HIGHLIGHT_BYTES {
+            self.syntax_for(p.syntax_hint, text).and_then(|syn| self.highlight(syn, text, p, &d.text, old))
+        } else {
+            None
+        };
+        d.sections = self.sections(text, lines.as_deref(), p);
+        d.lines = lines;
+        d.newlines = text.bytes().filter(|&b| b == b'\n').count();
+        d.text.clear();
+        d.text.push_str(text);
+        d.style_key = style_key;
+        d.rev += 1;
+        self.docs.insert(p.doc_id, d);
     }
 
-    fn build(&self, text: &str, p: &Params<'_>) -> LayoutJob {
+    /// Färgar `text`; med `old` (förra färgningen av `old_text`) görs bara raderna om från den
+    /// första ändrade tills tillståndet stämmer med det förra igen. `None` vid parsningsfel.
+    fn highlight(
+        &self,
+        syn: &SyntaxReference,
+        text: &str,
+        p: &Params<'_>,
+        old_text: &str,
+        old: Option<Vec<LineInfo>>,
+    ) -> Option<Vec<LineInfo>> {
+        let theme = if p.palette.dark { &self.dark } else { &self.light };
+        let hl = SynHighlighter::new(theme);
+        let (ob, nb) = (old_text.as_bytes(), text.as_bytes());
+        let mut out: Vec<LineInfo> = Vec::new();
+        let mut tail: Vec<LineInfo> = Vec::new();
+        let mut delta = 0isize;
+        let mut suf = 0usize;
+        if let Some(mut old) = old.filter(|o| !o.is_empty()) {
+            let pre = ob.iter().zip(nb).take_while(|(a, b)| a == b).count();
+            let n = old.len() - 1; // utan avslutande raden
+            let mut k = old[1..].partition_point(|l| l.start <= pre);
+            // Sista raden utan radbrytning är inte klar: den kan ha fått mer text.
+            if n > 0 && !old_text.ends_with('\n') {
+                k = k.min(n - 1);
+            }
+            tail = old.split_off(k);
+            out = old;
+            suf = ob[pre..].iter().rev().zip(nb[pre..].iter().rev()).take_while(|(a, b)| a == b).count();
+            delta = nb.len() as isize - ob.len() as isize;
+        }
+        let (mut ps, mut hs, mut pos) = match tail.first() {
+            Some(l) => (l.parse.clone(), l.hl.clone(), l.start),
+            None => (ParseState::new(syn), HighlightState::new(&hl, ScopeStack::new()), 0),
+        };
+        loop {
+            // Samma slut som förut och samma tillstånd: resten av färgningen gäller fortfarande.
+            if !tail.is_empty() && (pos == nb.len() || pos + suf > nb.len()) {
+                let os = pos as isize - delta;
+                if os >= 0 {
+                    if let Ok(j) = tail.binary_search_by(|l| l.start.cmp(&(os as usize))) {
+                        if tail[j].parse == ps && tail[j].hl == hs {
+                            let mut rest = tail.split_off(j);
+                            for l in &mut rest {
+                                l.start = (l.start as isize + delta) as usize;
+                            }
+                            out.extend(rest);
+                            return Some(out);
+                        }
+                    }
+                }
+            }
+            let mut info = LineInfo { start: pos, parse: ps.clone(), hl: hs.clone(), spans: Vec::new() };
+            if pos >= nb.len() {
+                out.push(info);
+                return Some(out);
+            }
+            let end = text[pos..].find('\n').map_or(text.len(), |i| pos + i + 1);
+            let line = &text[pos..end];
+            let ops = ps.parse_line(line, &self.syntaxes).ok()?;
+            let base = line.as_ptr() as usize;
+            for (style, piece) in HighlightIterator::new(&mut hs, &ops, line, &hl) {
+                if piece.is_empty() {
+                    continue;
+                }
+                let a = piece.as_ptr() as usize - base;
+                let fg = style.foreground;
+                info.spans.push(Sp {
+                    start: a as u32,
+                    end: (a + piece.len()) as u32,
+                    fg: [fg.r, fg.g, fg.b],
+                    bold: style.font_style.contains(FontStyle::BOLD),
+                    italic: style.font_style.contains(FontStyle::ITALIC),
+                });
+            }
+            out.push(info);
+            pos = end;
+        }
+    }
+
+    /// Sektionerna för hela texten (utan sökmarkering).
+    fn sections(&self, text: &str, lines: Option<&[LineInfo]>, p: &Params<'_>) -> Vec<LayoutSection> {
         let base = TextFormat {
             font_id: FontId::new(p.font_size, FontFamily::Monospace),
             color: p.palette.text,
             line_height: Some((p.font_size * 1.6).round()),
             ..Default::default()
         };
-
-        let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
-
-        let syntax = (text.len() <= MAX_HIGHLIGHT_BYTES)
-            .then(|| self.syntax_for(p.syntax_hint, text))
-            .flatten();
-
-        let mut colored = false;
-        if let Some(syntax) = syntax {
-            let theme = if p.palette.dark { &self.dark } else { &self.light };
-            let mut hl = HighlightLines::new(syntax, theme);
-            let start_ptr = text.as_ptr() as usize;
-            let mut sections = Vec::new();
-            let mut ok = true;
-            'lines: for line in LinesWithEndings::from(text) {
-                match hl.highlight_line(line, &self.syntaxes) {
-                    Ok(ranges) => {
-                        for (style, piece) in ranges {
-                            if piece.is_empty() {
-                                continue;
-                            }
-                            let a = piece.as_ptr() as usize - start_ptr;
-                            let fg = style.foreground;
-                            let mut fmt = base.clone();
-                            fmt.color = Color32::from_rgb(fg.r, fg.g, fg.b);
-                            if style.font_style.contains(FontStyle::BOLD) {
-                                fmt.font_id.family = theme::mono_medium();
-                            }
-                            fmt.italics = style.font_style.contains(FontStyle::ITALIC);
-                            sections.push(LayoutSection {
-                                leading_space: 0.0,
-                                byte_range: ByteIndex(a)..ByteIndex(a + piece.len()),
-                                format: fmt,
-                            });
+        let plain = || {
+            vec![LayoutSection { leading_space: 0.0, byte_range: ByteIndex(0)..ByteIndex(text.len()), format: base.clone() }]
+        };
+        let Some(lines) = lines else { return plain() };
+        let mut secs: Vec<LayoutSection> = Vec::new();
+        let mut last: Option<([u8; 3], bool, bool)> = None;
+        for l in lines {
+            for sp in &l.spans {
+                let (a, b) = (l.start + sp.start as usize, l.start + sp.end as usize);
+                let style = (sp.fg, sp.bold, sp.italic);
+                if last == Some(style) {
+                    if let Some(s) = secs.last_mut() {
+                        if s.byte_range.end.0 == a {
+                            s.byte_range.end = ByteIndex(b);
+                            continue;
                         }
                     }
-                    Err(_) => {
-                        ok = false;
-                        break 'lines;
-                    }
                 }
-            }
-            if ok && !sections.is_empty() {
-                job.sections = sections;
-                colored = true;
+                let mut fmt = base.clone();
+                fmt.color = Color32::from_rgb(sp.fg[0], sp.fg[1], sp.fg[2]);
+                if sp.bold {
+                    fmt.font_id.family = theme::mono_medium();
+                }
+                fmt.italics = sp.italic;
+                secs.push(LayoutSection { leading_space: 0.0, byte_range: ByteIndex(a)..ByteIndex(b), format: fmt });
+                last = Some(style);
             }
         }
-        if !colored {
-            job.sections.push(LayoutSection {
-                leading_space: 0.0,
-                byte_range: ByteIndex(0)..ByteIndex(text.len()),
-                format: base,
-            });
+        if secs.is_empty() {
+            return plain();
         }
+        secs
+    }
 
-        if !p.query.is_empty() {
-            let matches = find_all(text, p.query, p.case_sensitive);
-            if !matches.is_empty() {
-                apply_backgrounds(&mut job, &matches, p.palette, p.current_match);
-            }
+    /// Antal radbrytningar i `text` (cachat: räknas om bara när texten ändrats).
+    pub fn newlines(&mut self, text: &str, p: &Params<'_>) -> usize {
+        self.sync(text, p);
+        self.docs[&p.doc_id].newlines
+    }
+
+    #[cfg(test)]
+    pub fn layout(&mut self, text: &str, p: &Params<'_>) -> LayoutJob {
+        self.sync(text, p);
+        let d = &self.docs[&p.doc_id];
+        let mut job = LayoutJob { text: text.to_owned(), sections: d.sections.clone(), ..Default::default() };
+        if !p.matches.is_empty() {
+            apply_backgrounds(&mut job, p.matches, p.palette);
         }
         job
     }
+
+    /// Färdigt galleri för editorn. Oförändrat läge ger samma galleri utan att något byggs eller
+    /// hashas; efter en ändring färgas bara de ändrade raderna om.
+    pub fn galley(&mut self, ctx: &egui::Context, text: &str, p: &Params<'_>, max_width: f32) -> Arc<Galley> {
+        self.sync(text, p);
+        let ppp = ctx.pixels_per_point();
+        let families = ctx.fonts(|f| f.families().len());
+        let d = &self.docs[&p.doc_id];
+        let mut h = Fx::default();
+        d.rev.hash(&mut h);
+        p.matches.hash(&mut h);
+        max_width.to_bits().hash(&mut h);
+        ppp.to_bits().hash(&mut h);
+        families.hash(&mut h);
+        let key = h.finish();
+        if let Some((k, g)) = &d.galley {
+            if *k == key {
+                return g.clone();
+            }
+        }
+        let mut job = LayoutJob { text: text.to_owned(), sections: d.sections.clone(), ..Default::default() };
+        if !p.matches.is_empty() {
+            apply_backgrounds(&mut job, p.matches, p.palette);
+        }
+        job.wrap.max_width = max_width;
+        let g = ctx.fonts_mut(|f| f.layout_job(job));
+        if let Some(d) = self.docs.get_mut(&p.doc_id) {
+            d.galley = Some((key, g.clone()));
+        }
+        g
+    }
 }
+
+/// Snabb hashfunktion (FxHash) för cachenycklar.
+#[derive(Default)]
+struct Fx(u64);
+
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 
 /// Delar upp sektionerna så att sökträffar får bakgrundsfärg.
 pub(crate) fn apply_backgrounds(
     job: &mut LayoutJob,
-    matches: &[(usize, usize)],
+    matches: &[(usize, usize, bool)],
     palette: &Palette,
-    current_match: Option<usize>,
 ) {
     let mut out = Vec::with_capacity(job.sections.len() + matches.len() * 2);
     let mut mi = 0;
@@ -263,15 +430,15 @@ pub(crate) fn apply_backgrounds(
         let mut k = mi;
         while pos < e {
             let (next, bg) = match matches.get(k) {
-                Some(&(ma, mb)) if ma <= pos => {
-                    let bg = if current_match == Some(ma) {
+                Some(&(ma, mb, cur)) if ma <= pos => {
+                    let bg = if cur {
                         palette.match_current_bg
                     } else {
                         palette.match_bg
                     };
                     (mb.min(e), Some(bg))
                 }
-                Some(&(ma, _)) => (ma.min(e), None),
+                Some(&(ma, _, _)) => (ma.min(e), None),
                 None => (e, None),
             };
             let mut fmt = sec.format.clone();
@@ -284,7 +451,7 @@ pub(crate) fn apply_backgrounds(
                 format: fmt,
             });
             pos = next;
-            if let Some(&(_, mb)) = matches.get(k) {
+            if let Some(&(_, mb, _)) = matches.get(k) {
                 if mb <= pos {
                     k += 1;
                 }
@@ -308,5 +475,50 @@ mod tests {
         }
         assert_eq!(find_all(t, "Åsa", true).len(), 1);
         assert!(find_all(t, "", false).is_empty());
+    }
+
+    /// Inkrementell färgning (bara ändrade rader) ska ge exakt samma sektioner som full färgning.
+    #[test]
+    fn incremental_highlight_equals_full() {
+        use crate::word::bench::{big_markdown, Rng};
+        let pal = theme::palette(true);
+        let mut inc = Highlighter::new();
+        let mut full = Highlighter::new();
+        let mut rng = Rng(99);
+        for (hint, base) in [
+            ("md", format!("```rust\nfn a() {{}}\n```\n\n{}", big_markdown(10_000, 5))),
+            ("rs", "fn main() {\n    let s = \"hej\";\n    /* kommentar\n       mer */\n    println!(\"{}\", s);\n}\n".repeat(30)),
+        ] {
+            let mut text = base;
+            for step in 0..30 {
+                let mut at = rng.below(text.len() + 1);
+                while !text.is_char_boundary(at) {
+                    at += 1;
+                }
+                match rng.below(6) {
+                    0 => text.insert(at, 'x'),
+                    1 => text.insert_str(at, "\n"),
+                    2 => text.insert_str(at, "```\n"),
+                    3 => text.insert_str(at, "/*"),
+                    4 => text.insert_str(at, "\""),
+                    _ => {
+                        if let Some(c) = text[at..].chars().next() {
+                            text.replace_range(at..at + c.len_utf8(), "");
+                        }
+                    }
+                }
+                if step == 15 {
+                    text.push_str("slut utan radbrytning");
+                }
+                let params = |id| Params { doc_id: id, syntax_hint: hint, palette: &pal, font_size: 14.0, matches: &[] };
+                let a = inc.layout(&text, &params(1));
+                full.forget(2);
+                let b = full.layout(&text, &params(2));
+                assert_eq!(a.sections.len(), b.sections.len(), "{hint} steg {step}");
+                for (x, y) in a.sections.iter().zip(&b.sections) {
+                    assert_eq!((&x.byte_range, x.format.color, x.format.italics), (&y.byte_range, y.format.color, y.format.italics), "{hint} steg {step}");
+                }
+            }
+        }
     }
 }

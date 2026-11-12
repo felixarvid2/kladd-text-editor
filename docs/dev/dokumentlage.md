@@ -222,7 +222,7 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
-- **Okända Word-objekt** (fotnotsreferenser, kommentarsankare, bokmärken, fält, textrutor,
+- **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda
   (noll bredd); i Markdown-förhandsvisningen tas de bort.
@@ -259,3 +259,161 @@ som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/si
 → `{sida}`, `text:page-count` → `{sidor}`) hamnar i grundformatskommentaren. Vid skrivning ligger
 `mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
 `language()` visar "OpenDocument".
+
+## 1.7: säkerhetskopior, fotnoter, tabeller, flytande bilder, navigering, export, sök, prestanda
+
+Gemensamma format (alla moduler ska använda dessa):
+
+- **Fotnoter**: Markdown-fotnoter. `[^1]` i texten och definitionen `[^1]: Fotnotens text` i slutet
+  av dokumentet (en definition per rad, efter all annan text, separerade från den med en tom rad).
+  Etiketterna är löpnummer 1, 2, 3 … i den ordning referenserna kommer. pulldown-cmark med
+  `Options::ENABLE_FOOTNOTES`. Word: `w:footnoteReference` + footnotes.xml; ODT: `text:note`.
+  Se [Fotnoter](#fotnoter-17) nedan.
+- **Tabeller**:
+  - Radbrytning i en cell: `<br>`.
+  - Sammanfogade celler (vågrätt): en cell följs av extra pipes, `| Rubrik över två ||`
+    (MultiMarkdown). Antalet extra `|` = antalet celler den spänner över minus ett. Lodrätt
+    sammanfogade celler stöds inte (de skrivs som tomma celler).
+  - Kolumnbredd: antalet bindestreck i avgränsarraden, `| ------ | -- |`, ger kolumnernas relativa
+    bredd (som Pandoc). Lika många streck (eller `---` överallt) = automatisk bredd.
+- **Flytande bilder**: `<img src="…" alt="…" width="200" align="left">` (eller `right`): texten i
+  följande stycken flyter runt bilden. Utan `align` är bilden en egen rad som förut.
+  - `markup::ImageRef.align: Option<Float>`; `set_image_float(text, range, Option<Float>)` skriver
+    om attributet, `set_image_size` behåller det, `move_image`/`image_block`/`drop_line` flyttar en
+    bild (hela raden, och `<div align>`-blocket om bilden var det enda i det).
+  - Layout: en bild med `align` på en rad ensam kollapsar raden (~0 höjd, dold). Bilden ritas i en ruta vid
+    vänster/höger textkant som börjar vid styckets överkant (även när bilden står i ett stycke med
+    text, som Word läses in). Stycken (och styckets egna rader) vars överkant ligger ovanför bildens
+    underkant läggs ut med radbredden minskad med bildens bredd + 12 px, vänsterbilder förskjuter
+    raderna åt höger. **Per rad**: stycket läggs ut smalt, delas vid första raden som börjar under
+    bilden (`layout_para_floats`) och resten läggs ut igen med full bredd. Utläggningen går
+    stycke för stycke i ordning (`relayout`) eftersom bredden beror på var bilden slutar; styckecachen
+    nycklas också på de aktiva bildernas relativa underkant.
+  - Fallgropar: en andra bild på samma sida som en aktiv, eller en bild som lämnar mindre än 96 px
+    text, flyter inte (egen rad). Tabeller flyter inte runt bilder.
+  - Sidbrytning: `pages::paginate` räknar bildens höjd som en rad på förankringsraden; ryms den inte
+    flyttas den, och texten efter den, till nästa sida.
+  - Word: `wp:anchor` med `wrapSquare/Tight/Through` och `positionH` (`align` left/right, eller
+    `posOffset` nära vänster/höger marginal) läses som `align`; skrivs som `wp:anchor` med
+    `wrapSquare wrapText="bothSides"`, `positionH relativeFrom="column"`, `positionV
+    relativeFrom="paragraph"` offset 0, `distL`/`distR` 114300 EMU mot texten. ODT: `draw:frame`
+    `text:anchor-type="paragraph"` och grafikformat med `style:wrap="right|left"` (bilden
+    till vänster/höger) och `style:horizontal-pos`. PDF: samma per-rad-flöde (`FloatBox`). HTML/EPUB:
+    CSS `float`.
+  - Flytt med musen: dra i bildens mitt (inte ett handtag); `images::Act::Move` utförs via
+    `word_edit` (ett ångra-steg). Esc och släpp utanför arken avbryter.
+- **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
+  sidnummer (klickbara); Word skriver ett TOC-fält, ODT `text:table-of-content`, PDF/HTML/EPUB en
+  lista med rubrikerna.
+  Dokumentläget reserverar raden (`Para::toc_h`, höjd efter antalet H1–H3-rubriker, högst en sida)
+  och ritar posterna ovanpå (`navui::paint_toc`); sidnumret är rubrikens sida i det redan
+  sidbrutna galleriet, så en passage räcker. PDF gör två passager (`pdf_write::lay_out`).
+- **Navigeringsfönster** (`word::nav`, `word::navui`): rubriker ur den cachade analysen
+  (`layout::Cache::headings`, dokumentläget) eller en radskanning (`nav::headings_scan`, textläget)
+  som görs om bara när texten ändrats.
+
+Tabelllayout (`src/word/grid.rs`): varje tabellrad läggs ut som ett galleri per cell (radbredd =
+kolumnbredd − cellmarginal, `<br>` ger ett galleri per del) och cellernas rader placeras bredvid
+varandra med `PlacedRow::pos`; raderna ligger i källordning så teckenräkningen är exakt.
+Sidbrytningen flyttar en tabellrads alla rader tillsammans (`paginate` med `groups`). Eftersom
+raderna överlappar i y duger inte `Galley::cursor_from_pos` och `cursor_up_one_row`: musklick
+(`tables::pointer_fix`) och Upp/Ned (`grid::vertical`) räknas ur tabellens geometri (`TableGeom`).
+Kolumnkanter dras med egna träffytor ovanpå TextEdit; släpp skriver om avgränsarraden
+(`markup::table_set_widths`).
+
+## Prestanda
+
+Mätt med `cargo test [--release] -- --ignored bench --nocapture --test-threads=1`
+(`src/word/bench.rs`): ett genererat dokument på 600 KB / 249 sidor (rubriker, fetstil,
+listor, tabeller) i dokumentläget och 300 KB Markdown i textläget.
+
+| Mätning | Release före | Release efter | Debug före | Debug efter |
+|---|---|---|---|---|
+| (a) kall full layout (analys + galleri + sidbrytning) | 342 ms | 340–380 ms | 8 770 ms | 8 980 ms |
+| (b) ett tecken i mitten | 81 ms | 35–44 ms | 357 ms | 137 ms |
+| (b2) markören byter rad | 42 ms | 7–10 ms | 262 ms | 41 ms |
+| (c) oförändrad bildruta | 2,0 ms | 0,1 ms | 10,8 ms | 0,1 ms |
+| (d) stavning efter ett tecken | 12 ms | 4–8 ms | 90 ms | 27 ms |
+| (e) textläge, kall färgning + layout | 622 ms | 540–590 ms | 10 173 ms | 8 950 ms |
+| (e) textläge, ett tecken | 350 ms | 12 ms | 3 646 ms | 105 ms |
+| (e) textläge, oförändrad bildruta | 3,7 ms | 0,0 ms | 34,8 ms | 0,0 ms |
+
+Hur det fungerar:
+
+- **Ändringsdetektor.** `layout::Cache` håller en kopia av texten per dokument och jämför
+  (memcmp) i stället för att hasha 600 KB varje bildruta. Ändrad text ger ny revision, ny
+  analys och nya listor över tabeller, bilder och typsnitt; annars görs ingenting.
+- **Styckecache.** `galley_paged` lägger ut dokumentet stycke för stycke (en tabell är ett
+  stycke). Nyckeln är styckets text, dess bitar (relativt styckets början), geometri
+  (justering, listindrag), markörens träff och sökträffar, plus parametrar som zoom, tema,
+  bredd och typsnittsgeneration. Efter en ändring läggs bara berörda stycken om; markören som
+  byter rad berör två. Sedan fogas styckena ihop (`Galley::concat`) och sidbryts. Cachen
+  rensas på stycken som inte användes i senaste bildrutan.
+- **Ritning.** Punkter, citatstreck, bilder, tabellkanter och våglinjer itereras bara för det
+  som är synligt (bitarna slås upp med binärsökning från galleriets synliga tecken).
+- **Stavning.** Resultatet cachas per revision och per stycke.
+- **Textläge.** `highlight::Highlighter` sparar syntects tillstånd före varje rad. En ändring
+  färgar om raderna från den ändrade tills tillståndet efter en rad är lika med det förra
+  (då gäller resten av färgningen), och färdigt galleri cachas per revision och bredd.
+- **Analysen** (`markup::analyze`, ca 28 ms release / 85 ms debug för 600 KB) görs fortfarande
+  om för hela texten efter varje ändring; den är nu det som dominerar. Inkrementell analys per
+  block bedömdes osäker (spann och dividrar går över styckegränser) och är inte gjord.
+
+Testerna `incremental_layout_equals_full_layout` och `incremental_highlight_equals_full`
+kontrollerar att det inkrementella resultatet är identiskt med full omläggning efter
+slumpmässiga ändringar (deterministiskt frö).
+
+## Fotnoter (1.7)
+
+**Modellen** (`word::markup`): `analyze` markerar `[^` och `]` som dold markup och etiketten som en egen bit
+(`Piece::footnote_ref`); en definition `[^n]: text` är `Block::Footnote` med `[^` och `]:` som markup och
+etiketten som `Piece::footnote_def`. Operationerna arbetar på texten (pulldowns `FootnoteReference` och
+`FootnoteDefinition` ger lägena, kod hoppas över):
+
+```rust
+pub fn insert_footnote(text: &str, caret: usize) -> Edit;        // [^k] vid markören + tom definition, numrerar om
+pub fn renumber_footnotes(text: &str) -> String;                 // 1..n i referensernas ordning, definitioner sist i samma ordning
+pub fn renumber_footnotes_at(text: &str, caret: usize) -> (String, usize);
+pub fn delete_footnote(text: &str, label: &str) -> String;       // referens + definition, numrerar om
+pub fn footnotes_in_order(a: &Analysis) -> bool;                 // snabb kontroll för lat omnumrering
+```
+
+Föräldralösa definitioner (utan referens) behålls sist och får bara ny etikett om den krockar. Ordräkningen
+räknar inte etiketterna.
+
+**Dokumentläget**: etiketterna ritas med 0,65 × storlek, `valign = TOP` och `line_height = None` (med egen
+radhöjd centrerar egui alltid texten, så `valign` gör annars ingenting) i länkfärg; definitionerna med
+0,85 × brödtextens storlek under en skiljelinje (en tredjedels textbredd) före den första definitionen.
+Hovrar man ett nummer visas "Gå till fotnot" (Ctrl+klick); ett klick hoppar när knappen släpps (markören
+flyttas vid nedtryckningen och ändrar layouten, så hoppet kan inte ske vid nedtryckningen). Ett vanligt klick
+hoppar bara om raden inte redan visar sin markup, annars krävs Ctrl. Efter varje ändring numreras fotnoterna
+om om etiketterna inte längre är 1..n i ordning (`word_renumber_footnotes`). Backspace direkt efter (Delete
+direkt före) en referens tar bort hela fotnoten. Verktygsrad: *Infoga fotnot*, `Ctrl+Alt+F`.
+
+**Word** (`docx.rs`): `w:footnoteReference` blir `[^N]` (N i dokumentordning) och texten läses ur
+footnotes.xml (formaterade körningar som Kladds inline-dialekt, flera stycken med `<br>`, skiljelinjer
+överhoppade; jämförs mot fotnotsmallens eget format så att inga `<span>` behövs). Slutnoter och referenser
+med egen märkning (`w:customMarkFollows`) förblir `<!--k:N-->`. `Source` sparar originalets footnotes.xml
+(`FnPart`) och id:n per toppnivåelement (`SrcElem::fn_ids`). Vid skrivning:
+
+- stycken jämförs med fotnotsetiketterna borttagna (`norm` → `[^]`), så ett orört stycke behåller sin
+  ursprungliga XML (med originalets id) även när fotnoterna numrerats om;
+- referenserna i orörda stycken paras ihop med originalets id i ordning; i omskrivna stycken ges varje
+  referens en platshållare som `resolve_footnotes` byter mot ett id: originalfotnoten med samma text om det
+  finns en, annars ett nytt id;
+- footnotes.xml byggs om från definitionerna: skiljelinjer och oförändrade fotnoter ordagrant, ändrade och nya
+  genereras (`FootnoteText`, `FootnoteReference`, `w:footnoteRef`); fotnoter som ingen längre refererar till
+  faller bort, och fotnoter som okända objekt fortfarande refererar till behålls;
+- utan footnotes.xml skapas delen med relation, innehållstyp, skiljelinjer och `w:footnotePr` i settings.xml;
+- länkar och bilder i omskrivna fotnoter skrivs som text (delen har egna relationer).
+
+**ODT** (`odt.rs`): `text:note` (fotnot och slutnot) blir `[^N]` och en definition; skrivs som `text:note`
+med `text:note-citation` och `text:note-body` (stycke `Footnote`, 10 pt, `text:notes-configuration`).
+
+**PDF** (`pdf_write.rs`): noterna ritas längst ned på sidan där de refereras. `text_block` räknar ut
+notens höjd (med avskiljaren) för varje rad med en referens och byter sida om raden och noterna inte ryms;
+`reserved` minskar sidans nedre gräns, och `flush_notes` ritar avskiljaren och noterna (0,85 × storlek)
+när sidan fylls. Referensen är ett litet upphöjt nummer. En enskild not som är längre än en sida delas inte.
+
+**HTML/EPUB** (`export.rs`) hade redan fotnoter via pulldown (`<aside class="footnote">`, EPUB-`noteref`);
+kontrollerat med de befintliga testerna.

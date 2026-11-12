@@ -4,22 +4,24 @@
 //! `docs/dev/dokumentlage.md`): `TextEdit` med samma id, så markör och ångra överlever växlingen.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::ops::Range;
 
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
-    Color32,
+    Color32, CursorIcon, Id,
     Align, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
     Modifiers, Key, Panel, Popup, Rect, RectAlign, ScrollArea, Sense, Shape, Stroke, TextBuffer, TextEdit, Ui,
     UiBuilder, Vec2, pos2, vec2,
 };
 
+use super::grid;
 use super::images;
 use super::layout::{self, px};
 use super::pages;
 use super::markup::{self, Block, Inline, SpanProp};
+use super::nav;
 use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
@@ -28,14 +30,14 @@ use crate::theme::Palette;
 /// Storlekarna (pt) i storleksväljaren, som i Word.
 const SIZES: [f32; 17] = [8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0];
 /// Words standardfärger för text (första raden) och en rad grå/temafärger.
-const TEXT_COLORS: [[u32; 10]; 2] = [
+pub(crate) const TEXT_COLORS: [[u32; 10]; 2] = [
     [0xC00000, 0xFF0000, 0xFFC000, 0xFFFF00, 0x92D050, 0x00B050, 0x00B0F0, 0x0070C0, 0x002060, 0x7030A0],
     [0x000000, 0x404040, 0x7F7F7F, 0xBFBFBF, 0xFFFFFF, 0x44546A, 0x4472C4, 0xED7D31, 0xA5A5A5, 0x70AD47],
 ];
 const DEFAULT_TEXT_COLOR: [u8; 3] = [0xC0, 0x00, 0x00];
 const DEFAULT_HIGHLIGHT: [u8; 3] = [0xFF, 0xFF, 0x00];
 /// Markeringsfärgerna (Words `w:highlight`) med svenska namn.
-const HIGHLIGHTS: [(&str, &str); 15] = [
+pub(crate) const HIGHLIGHTS: [(&str, &str); 15] = [
     ("yellow", "Gul"),
     ("green", "Grön"),
     ("cyan", "Turkos"),
@@ -65,9 +67,13 @@ struct ImgInfo {
 
 struct SpellCache {
     doc_id: u64,
-    text_hash: u64,
+    /// Dokumentrevisionen resultatet gäller.
+    rev: u64,
     generation: u64,
-    ranges: Vec<Range<usize>>,
+    ranges: Arc<Vec<Range<usize>>>,
+    /// Felstavade ord per textstycke (hash av stycket -> lägen relativt styckets början), så att
+    /// en ändring bara kontrollerar de stycken som ändrats.
+    per_range: HashMap<u64, Vec<Range<usize>>>,
 }
 
 /// Ordet som högerklickades, med förslag (beräknade en gång när menyn öppnas).
@@ -98,6 +104,8 @@ pub struct State {
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
+    /// Fotnotshopp som väntar på att musknappen släpps (layouten ändras när markören flyttas vid nedtryckning).
+    fn_pending: Option<usize>,
 }
 
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
@@ -107,6 +115,8 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    Footnote,
+    Toc,
     TableOp(TableOp),
     PageSetup,
     Undo,
@@ -120,12 +130,6 @@ enum BarAct {
     Highlight(Option<[u8; 3]>),
 }
 
-fn hash_text(text: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
-}
-
 fn block_label(b: Block) -> String {
     match b {
         Block::Normal => "Brödtext".into(),
@@ -135,6 +139,7 @@ fn block_label(b: Block) -> String {
         Block::Numbered => "Numrerad lista".into(),
         Block::Code => "Kod".into(),
         Block::Table => "Tabell".into(),
+        Block::Footnote => "Fotnot".into(),
     }
 }
 
@@ -157,7 +162,7 @@ fn rgb_color(c: [u8; 3]) -> Color32 {
 
 /// Färgväljare i en meny: "ingen färg"-rad och rader med 16 px stora rutor. `Some(val)` när
 /// något valts (`val` = `None` för den första raden).
-fn color_popup(
+pub(crate) fn color_popup(
     ui: &mut Ui,
     p: &Palette,
     none_label: &str,
@@ -243,7 +248,11 @@ impl KladdApp {
         }
         let s = byte_to_char(&doc.text, edit.sel.start);
         let e = byte_to_char(&doc.text, edit.sel.end);
-        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(s), CCursor::new(e))));
+        let _ = (s, e);
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            tables::cursor_at(&doc.text, edit.sel.start),
+            tables::cursor_at(&doc.text, edit.sel.end),
+        )));
         state.store(ctx, id);
         self.focus_editor = true;
         self.find.current = None;
@@ -286,6 +295,61 @@ impl KladdApp {
             let next = step_size(cur, dir);
             let prop = if (next - a.defaults.size()).abs() < 0.01 { None } else { Some(next) };
             markup::set_span_prop(t, s, SpanProp::FontSize(prop))
+        });
+    }
+
+    /// Infogar en fotnot vid markören och flyttar markören till den nya definitionen.
+    pub(crate) fn word_footnote(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| markup::insert_footnote(t, s.end));
+        let b = self.word_selection(ctx).start;
+        if let Some(doc) = self.docs.get(self.active) {
+            self.scroll_to_char = Some(byte_to_char(&doc.text, b));
+        }
+    }
+
+    /// Backspace direkt efter (eller Delete direkt före) en fotnotsreferens tar bort hela fotnoten,
+    /// både referensen och definitionen; annars skulle en trasig `[^1` lämna en föräldralös definition.
+    fn word_footnote_keys(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        if !doc.text.contains("[^") {
+            return;
+        }
+        let (back, del) = ctx.input(|i| {
+            (i.key_pressed(Key::Backspace) && i.modifiers.is_none(), i.key_pressed(Key::Delete) && i.modifiers.is_none())
+        });
+        if !back && !del {
+            return;
+        }
+        let sel = self.word_selection(ctx);
+        if sel.start != sel.end {
+            return;
+        }
+        let hit = markup::footnotes(&doc.text)
+            .refs
+            .into_iter()
+            .find(|r| if back { r.full.end == sel.start } else { r.full.start == sel.start });
+        let Some(r) = hit else { return };
+        ctx.input_mut(|i| i.consume_key(Modifiers::NONE, if back { Key::Backspace } else { Key::Delete }));
+        self.word_edit(ctx, |t, _| {
+            let text = markup::delete_footnote(t, &r.label);
+            markup::Edit { text, sel: r.full.start..r.full.start }
+        });
+    }
+
+    /// Lazy omnumrering: efter en ändring som gör att fotnoternas etiketter inte längre är
+    /// 1..n i ordning (klistrad referens, raderad referens …) numreras de om.
+    fn word_renumber_footnotes(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        if !doc.text.contains("[^") {
+            return;
+        }
+        let a = self.word.analysis(doc.id, &doc.text);
+        if markup::footnotes_in_order(&a) {
+            return;
+        }
+        self.word_edit(ctx, |t, s| {
+            let (text, c) = markup::renumber_footnotes_at(t, s.end);
+            markup::Edit { text, sel: c..c }
         });
     }
 
@@ -334,6 +398,7 @@ impl KladdApp {
             }
         }
         self.word_table_keys(ctx);
+        self.word_footnote_keys(ctx);
         self.word_paste_html(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
@@ -369,6 +434,9 @@ impl KladdApp {
         }
         if hit(ctrl | Modifiers::SHIFT, Key::Comma) || hit(ctrl, Key::OpenBracket) {
             self.word_font_step(ctx, -1);
+        }
+        if hit(ctrl_alt, Key::F) {
+            self.word_footnote(ctx);
         }
         for (k, b) in [
             (Key::Num1, Block::Heading(1)),
@@ -573,12 +641,23 @@ impl KladdApp {
                         }
                     }
                     divider(ui, p);
-                    if icons::button(ui, p, Icon::Image, 28.0, false, "Infoga bild", p.chrome).clicked() {
-                        acts.push(BarAct::Image);
-                    }
-                    if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
-                        acts.push(BarAct::Table);
-                    }
+                    // Infoga: bild, tabell, fotnot och innehållsförteckning i en meny, som i Word.
+                    let insert = crate::app::status_button(ui, p, "Infoga \u{25BE}", "Infoga bild, tabell, fotnot eller innehållsförteckning");
+                    Popup::menu(&insert).gap(4.0).width(230.0).show(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        if crate::app::menu_item(ui, p, "Bild…", "Ctrl+Shift+I", None, true) {
+                            acts.push(BarAct::Image);
+                        }
+                        if crate::app::menu_item(ui, p, "Tabell", "", None, true) {
+                            acts.push(BarAct::Table);
+                        }
+                        if crate::app::menu_item(ui, p, "Fotnot", "Ctrl+Alt+F", None, true) {
+                            acts.push(BarAct::Footnote);
+                        }
+                        if crate::app::menu_item(ui, p, "Innehållsförteckning", "", None, true) {
+                            acts.push(BarAct::Toc);
+                        }
+                    });
                     if in_table {
                         divider(ui, p);
                         if let Some(op) = tables::bar_group(ui, p) {
@@ -622,8 +701,10 @@ impl KladdApp {
                 BarAct::Inline(m) => self.word_toggle(&ctx, m),
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
+                BarAct::Toc => self.insert_toc(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
+                BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
@@ -682,6 +763,23 @@ impl KladdApp {
             Act::Original => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, None)),
             Act::Resize { w, h: None } => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, Some(w))),
             Act::Resize { w, h: Some(h) } => self.word_edit(ctx, |t, _| images::set_free_size(t, r, w, h)),
+            Act::Float(f) => self.word_edit(ctx, |t, _| markup::set_image_float(t, r, f)),
+            Act::Move { target, after } => {
+                // Ett ångra-steg; bilden förblir vald på sin nya plats.
+                let mut at = None;
+                self.word_edit(ctx, |t, _| match markup::move_image(t, r.clone(), target, after) {
+                    Some(e) => {
+                        at = Some(e.sel.start);
+                        e
+                    }
+                    None => markup::Edit { text: t.to_string(), sel: r.clone() },
+                });
+                if let (Some(at), Some(doc)) = (at, self.docs.get(self.active)) {
+                    let a = markup::analyze(&doc.text);
+                    let idx = a.pieces.iter().filter(|pc| pc.image.is_some() && pc.range.start < at).count();
+                    self.wv.img.selected = Some(idx);
+                }
+            }
             Act::Delete => {
                 self.word_edit(ctx, |t, _| images::remove_image(t, r));
                 self.wv.img.deselect();
@@ -721,10 +819,10 @@ impl KladdApp {
             let area_w = avail_w.max(page_w + 2.0 * GAP);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
-            let refs: Vec<markup::ImageRef> = analysis.pieces.iter().filter_map(|pc| pc.image.clone()).collect();
+            let refs = self.word.images(doc_id, &self.docs[self.active].text);
             let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
-            for img in refs {
+            for img in refs.iter().cloned() {
                 self.word_image(&ctx, &img.src);
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
                     let max_w = geom1.text_w();
@@ -738,10 +836,10 @@ impl KladdApp {
                 ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x)
             };
 
-            // Stavningskontroll.
-            let text_hash = hash_text(&self.docs[self.active].text);
+            // Stavningskontroll: en gång per ändring, och bara för stycken som ändrats.
+            let rev = self.word.rev(doc_id, &self.docs[self.active].text);
             let spell_on = self.settings.spell;
-            let mut misspelled: Vec<Range<usize>> = Vec::new();
+            let mut misspelled: Arc<Vec<Range<usize>>> = Arc::default();
             if spell_on {
                 if let Some(sp) = self.speller.as_mut() {
                     if sp.ready() {
@@ -750,10 +848,10 @@ impl KladdApp {
                             .wv
                             .spell
                             .as_ref()
-                            .is_some_and(|c| c.doc_id == doc_id && c.text_hash == text_hash && c.generation == gen_);
+                            .is_some_and(|c| c.doc_id == doc_id && c.rev == rev && c.generation == gen_);
                         if !fresh {
                             let text = &self.docs[self.active].text;
-                            let mut ranges: Vec<Range<usize>> = Vec::new();
+                            let mut spans: Vec<Range<usize>> = Vec::new();
                             for pc in &analysis.pieces {
                                 if pc.markup
                                     || pc.code
@@ -763,13 +861,18 @@ impl KladdApp {
                                 {
                                     continue;
                                 }
-                                match ranges.last_mut() {
+                                match spans.last_mut() {
                                     Some(last) if last.end == pc.range.start => last.end = pc.range.end,
-                                    _ => ranges.push(pc.range.clone()),
+                                    _ => spans.push(pc.range.clone()),
                                 }
                             }
-                            let found = sp.misspelled(text, &ranges);
-                            self.wv.spell = Some(SpellCache { doc_id, text_hash, generation: gen_, ranges: found });
+                            let mut per_range = match self.wv.spell.take() {
+                                Some(c) if c.doc_id == doc_id && c.generation == gen_ => c.per_range,
+                                _ => HashMap::new(),
+                            };
+                            let found = sp.misspelled_cached(text, &spans, &mut per_range);
+                            self.wv.spell =
+                                Some(SpellCache { doc_id, rev, generation: gen_, ranges: Arc::new(found), per_range });
                         }
                         misspelled = self.wv.spell.as_ref().map(|c| c.ranges.clone()).unwrap_or_default();
                     } else {
@@ -782,14 +885,10 @@ impl KladdApp {
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
             let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
-            let tabs = layout::tables(&self.docs[self.active].text, &analysis);
+            let heads = self.word.headings(doc_id, &self.docs[self.active].text);
+            let mut toc_click: Option<usize> = None;
 
-            let (query, case_sensitive) = if self.find.open {
-                (self.find.query.clone(), self.find.case_sensitive)
-            } else {
-                (String::new(), false)
-            };
-            let current_match = self.find.current;
+            let matches = self.search_highlights();
             let scroll_to = self.scroll_to_char.take();
             // En vald bild tar fokus från texten (annars skulle Delete/Backspace gå dit).
             let focus = std::mem::take(&mut self.focus_editor) && self.wv.img.selected.is_none();
@@ -802,7 +901,8 @@ impl KladdApp {
             // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
             // bara slår upp dem (en okänd familj kraschar egui).
             let mut fam_map: HashMap<(String, bool, bool), FontFamily> = HashMap::new();
-            for (name, bold, italic) in layout::needed_fonts(&analysis) {
+            let needed = self.word.fonts(doc_id, &self.docs[self.active].text);
+            for (name, bold, italic) in needed.iter().cloned() {
                 let fam = self.doc_fonts.family(&ctx, Some(&name), bold, italic);
                 fam_map.insert((name, bold, italic), fam);
             }
@@ -821,8 +921,11 @@ impl KladdApp {
             let mut new_target: Option<Option<SpellTarget>> = None;
             let mut table_menu: Option<bool> = None;
             let mut table_act: Option<TableOp> = None;
+            let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
             let mut open_page_dlg = false;
+            let mut fn_jump: Option<usize> = None;
+            let mut fn_pending = self.wv.fn_pending.take();
 
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id)).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -840,9 +943,7 @@ impl KladdApp {
                     palette: p,
                     zoom: z,
                     reveal: reveal.clone(),
-                    query: &query,
-                    case_sensitive,
-                    current_match,
+                    matches: &matches,
                     image_size: &image_size,
                     measure: &measure,
                     font_family: &font_family,
@@ -879,8 +980,104 @@ impl KladdApp {
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
+                // Tabeller: kolumnkanter att dra i, pekarens träffyta och markören i cellens innehåll.
+                let tview = if edited { None } else { word.table_view(doc_id, text) };
+                let mut vtabs: Vec<VisTable> = Vec::new();
+                let mut drag_preview: Option<(f32, f32, f32)> = None;
+                let mut on_edge = false;
+                if let Some((_, geoms)) = &tview {
+                    let idx = grid::GalleyIndex::new(text, &galley);
+                    let clip = ui.clip_rect();
+                    let pad = grid::cell_pad(z);
+                    for (ti, t) in geoms.iter().enumerate() {
+                        if t.rows.is_empty() {
+                            continue;
+                        }
+                        let first = grid::row_extent(&galley, &idx, t, 0);
+                        let last = grid::row_extent(&galley, &idx, t, t.rows.len() - 1);
+                        if gpos.y + last.1 < clip.top() - 4.0 || gpos.y + first.0 > clip.bottom() + 4.0 {
+                            continue;
+                        }
+                        let exts: Vec<(f32, f32)> = (0..t.rows.len()).map(|r| grid::row_extent(&galley, &idx, t, r)).collect();
+                        let (top, bottom) = (gpos.y + first.0, gpos.y + last.1);
+                        for j in 1..t.cols() {
+                            let x = gpos.x + t.col_x[j];
+                            let strip = Rect::from_min_max(pos2(x - 3.0, top), pos2(x + 3.0, bottom));
+                            let r = ui.interact(strip, Id::unique(("kladd-tblcol", doc_id, ti, j)), Sense::click_and_drag());
+                            if r.hovered() || r.dragged() {
+                                ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
+                                on_edge = true;
+                            }
+                            let drag_key = Id::unique("kladd-tblcol-drag");
+                            if r.drag_started() {
+                                let widths: Vec<f32> = (0..t.cols()).map(|k| t.col_x[k + 1] - t.col_x[k]).collect();
+                                // Där knappen trycktes ned (draget kan ha hunnit flytta pekaren före första bildrutan).
+                                let x0 = ui.ctx().input(|i| i.pointer.press_origin()).or(r.interact_pointer_pos()).map_or(x, |p| p.x);
+                                ui.ctx().data_mut(|d| d.insert_temp(drag_key, (t.region.start, j, widths, x0)));
+                            }
+                            if r.dragged() || r.drag_stopped() {
+                                let st = ui.ctx().data(|d| d.get_temp::<(usize, usize, Vec<f32>, f32)>(drag_key));
+                                if let (Some((region, col, widths, x0)), Some(ptr)) = (st, r.interact_pointer_pos()) {
+                                    let min_w = 2.0 * pad + 12.0;
+                                    let dx = (ptr.x - x0).clamp(min_w - widths[col - 1], widths[col] - min_w);
+                                    if r.dragged() {
+                                        drag_preview = Some((x + dx, top, bottom));
+                                    }
+                                    if r.drag_stopped() {
+                                        let mut w = widths.clone();
+                                        w[col - 1] += dx;
+                                        w[col] -= dx;
+                                        let w: Vec<f64> = w.iter().map(|&v| f64::from(v)).collect();
+                                        col_resize = Some((region, markup::dashes_from_widths(&w)));
+                                    }
+                                }
+                                if r.drag_stopped() {
+                                    ui.ctx().data_mut(|d| d.remove::<(usize, usize, Vec<f32>, f32)>(drag_key));
+                                }
+                            }
+                        }
+                        vtabs.push(VisTable { ti, exts });
+                    }
+                    tables::pointer_fix(ui.ctx(), id, text, &galley, gpos, geoms, &out.response, on_edge);
+                }
                 // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
                 tables::fix_caret(ui.ctx(), id, text);
+
+                // Fotnoter: skiljelinje över definitionerna; numret är en länk mellan referens och definition.
+                if text.contains("[^") {
+                    if let Some(start) = markup::footnote_area_start(text, &analysis) {
+                        let r = galley.pos_from_cursor(CCursor::new(byte_to_char(text, start))).translate(gpos.to_vec2());
+                        let y = (r.top() - px(z, 5.0)).round() + 0.5;
+                        painter_line(ui, p, gpos.x, y, text_w / 3.0, z);
+                    }
+                    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|q| te_rect.contains(*q));
+                    if let Some(q) = hover {
+                        let ci = galley.cursor_from_pos(q - gpos).index.0;
+                        if let Some((label, is_def, lr)) = markup::footnote_label_at(&analysis, char_to_byte(text, ci)) {
+                            let ra = galley.pos_from_cursor(CCursor::new(byte_to_char(text, lr.start))).translate(gpos.to_vec2());
+                            let rb = galley.pos_from_cursor(CCursor::new(byte_to_char(text, lr.end))).translate(gpos.to_vec2());
+                            let hit = Rect::from_min_max(ra.min, rb.max).expand2(vec2(3.0, 0.0));
+                            if hit.contains(q) {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                let tip = if is_def { "Tillbaka till texten" } else { "Gå till fotnot (Ctrl+klick)" };
+                                egui::Tooltip::always_open(ui.ctx().clone(), out.response.layer_id, out.response.id.with("fotnot"), egui::PopupAnchor::Pointer)
+                                    .show(|ui| ui.label(tip));
+                                let (ctrl, pressed) = ui.input(|i| (i.modifiers.command, i.pointer.primary_pressed()));
+                                // Ctrl+klick hoppar alltid; ett vanligt klick hoppar bara om raden inte redan visar sin markup
+                                // (annars går det inte att redigera runt numret). Hoppet görs när knappen släpps.
+                                if pressed && (ctrl || !overlaps(&lr, &reveal)) {
+                                    fn_pending = markup::footnote_target(text, &analysis, &label, is_def);
+                                }
+                            }
+                        }
+                    }
+                }
+                let (released, down) = ui.input(|i| (i.pointer.primary_released(), i.pointer.primary_down()));
+                if released {
+                    fn_jump = fn_pending.take();
+                } else if !down {
+                    fn_pending = None;
+                }
 
                 // Ett ark per sida, med luft emellan.
                 let total = pages::page_count(&galley, &geom);
@@ -925,7 +1122,18 @@ impl KladdApp {
                         );
                     }
                 };
-                for pc in &analysis.pieces {
+                // Bara det som syns (med marginal) behöver ritas om: sökväg via galleriets rader.
+                let vis = {
+                    let lo = galley.cursor_from_pos(vec2(0.0, clip.top() - gpos.y - 300.0)).index.0;
+                    let hi = galley.cursor_from_pos(vec2(0.0, clip.bottom() - gpos.y + 300.0)).index.0;
+                    char_to_byte(text, lo)..char_to_byte(text, hi)
+                };
+                let i0 = analysis.pieces.partition_point(|pc| pc.range.end <= vis.start);
+                let i1 = i0 + analysis.pieces[i0..].partition_point(|pc| pc.range.start < vis.end);
+                if !refs.is_empty() {
+                    img_index = analysis.pieces[..i0].iter().filter(|pc| pc.image.is_some()).count();
+                }
+                for pc in &analysis.pieces[i0..i1] {
                     let shown = overlaps(&pc.range, &reveal);
                     if pc.list_marker && pc.markup && !shown && !edited {
                         // Punkten ritas 12 pt före textens början (markören efter dold markör).
@@ -974,13 +1182,22 @@ impl KladdApp {
                         if let Some(sz) = sizes.get(&images::size_key(img)) {
                             let ci = conv.at(pc.range.start);
                             let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
+                            // Flytande bild: vid textkanten, på radens höjd (raden själv har ingen höjd).
+                            let side = word.float_side(doc_id, text, pc.range.start);
                             {
                                 let uri = image_uri(&img.src, doc_id);
-                                let rect = Rect::from_min_size(r.min, *sz);
+                                let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
+                                let min = match side {
+                                    Some((markup::Float::Left, _)) => pos2(gpos.x, top),
+                                    Some((markup::Float::Right, _)) => pos2(gpos.x + text_w - sz.x, top),
+                                    None => r.min,
+                                };
+                                let rect = Rect::from_min_size(min, *sz);
                                 if rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
                                     egui::Image::new(uri.clone()).paint_at(ui, rect);
                                     painted.push(images::Painted {
                                         rect,
+                                        align: img.align,
                                         range: pc.range.clone(),
                                         index: img_index - 1,
                                         uri,
@@ -992,40 +1209,106 @@ impl KladdApp {
                 }
                 flush_bar(&mut bar);
 
+                // Innehållsförteckningar: raden är dold och har reserverat höjden; posterna
+                // ritas här med sidnumren från galleriet (sidbrytningen är redan gjord, så en
+                // enda passage räcker: förteckningens höjd beror bara på antalet rubriker).
+                if text.contains("kladd: toc") {
+                    let from = text[..vis.start].rfind('\n').map_or(0, |i| i + 1);
+                    let to = text[vis.end..].find('\n').map_or(text.len(), |i| vis.end + i);
+                    let entries = nav::toc_entries(&heads);
+                    let (shown, toc_h) = nav::toc_size_for(z, &analysis.defaults, entries.len());
+                    for (k, line) in nav::toc_lines(&text[from..to]).into_iter().enumerate() {
+                        let line = line.start + from..line.end + from;
+                        if overlaps(&line, &reveal) {
+                            continue;
+                        }
+                        let top = galley
+                            .pos_from_cursor(CCursor::new(text[..line.start].chars().count()))
+                            .translate(gpos.to_vec2())
+                            .min;
+                        let rect = Rect::from_min_size(pos2(gpos.x, top.y), vec2(text_w, toc_h));
+                        if rect.bottom() < clip.top() || rect.top() > clip.bottom() {
+                            continue;
+                        }
+                        let mut c2 = ByteToChar::new(text);
+                        let page_nums: Vec<usize> = entries
+                            .iter()
+                            .take(shown)
+                            .map(|h| geom.page_of(galley.pos_from_cursor(CCursor::new(c2.at(h.start))).min.y) + 1)
+                            .collect();
+                        let fam = |bold: bool| font_family(Some(analysis.defaults.font()), bold, false);
+                        if let Some(b) = super::navui::paint_toc(
+                            ui,
+                            p,
+                            z,
+                            &analysis.defaults,
+                            &fam,
+                            rect,
+                            egui::Id::unique(("kladd-toc", doc_id, k)),
+                            &entries,
+                            &page_nums,
+                            shown,
+                        ) {
+                            toc_click = Some(b);
+                        }
+                    }
+                }
+
                 // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
                 let max_w = text_w;
-                img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p);
+                // Var en dragen bild skulle hamna: raden under pekaren, före eller efter beroende på
+                // om pekaren står över eller under radens mitt. Bara över ett ark.
+                let drop_at = |pos: egui::Pos2| -> Option<images::Drop> {
+                    if !(0..total).any(|k| pages::sheet_rect(&geom, page_left, page_top, k).contains(pos)) {
+                        return None;
+                    }
+                    let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
+                    let extent = |l: &Range<usize>| {
+                        let a = galley.pos_from_cursor(CCursor::new(byte_to_char(text, l.start)));
+                        let e = galley.pos_from_cursor(CCursor::new(byte_to_char(text, l.end)));
+                        (a.min.y + gpos.y, e.max.y + gpos.y)
+                    };
+                    let raw = markup::drop_line(text, b, false);
+                    let (top, bottom) = extent(&raw);
+                    let after = pos.y > (top + bottom) / 2.0;
+                    let line = markup::drop_line(text, b, after);
+                    let (top, bottom) = if line == raw { (top, bottom) } else { extent(&line) };
+                    Some(images::Drop {
+                        target: if after { line.end } else { line.start },
+                        after,
+                        y: if after { bottom } else { top },
+                        x0: gpos.x,
+                        x1: gpos.x + text_w,
+                    })
+                };
+                img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
 
-                // Tabellrutnät: 1 px kantlinjer vid de dolda pipornas lägen och radgränserna.
-                if !edited {
+                // Tabellrutnät: 1 px kantlinjer runt varje cell, och en förhandsvisning av kolumnkanten som dras.
+                if let Some((_, geoms)) = &tview {
                     let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
-                    let mut conv = ByteToChar::new(text);
-                    for t in tabs.iter() {
+                    for vt in &vtabs {
+                        let t = &geoms[vt.ti];
                         for (ri, row) in t.rows.iter().enumerate() {
-                            let (Some(&first), Some(&last)) = (row.pipes.first(), row.pipes.last()) else { continue };
-                            if row.delimiter || first == last {
-                                continue;
-                            }
-                            let at = |conv: &mut ByteToChar, b: usize| {
-                                galley.pos_from_cursor(CCursor::new(conv.at(b))).translate(gpos.to_vec2())
-                            };
-                            let rs = at(&mut conv, row.line.start);
-                            let re = at(&mut conv, row.line.end);
-                            let (y0, y1) = (rs.top(), re.bottom());
+                            let (Some(first), Some(last)) = (row.cells.first(), row.cells.last()) else { continue };
+                            let (y0, y1) = (gpos.y + vt.exts[ri].0, gpos.y + vt.exts[ri].1);
                             if y1 < clip.top() || y0 > clip.bottom() {
                                 continue;
                             }
-                            let xs: Vec<f32> = row.pipes.iter().map(|&b| snap(at(&mut conv, b).left())).collect();
-                            for &x in &xs {
+                            for c in &row.cells {
+                                let x = snap(gpos.x + t.cell_x(c).0);
                                 painter.line_segment([pos2(x, snap(y0)), pos2(x, snap(y1))], stroke);
                             }
-                            let (x0, x1) = (xs[0], xs[xs.len() - 1]);
+                            let (x0, x1) = (snap(gpos.x + t.cell_x(first).0), snap(gpos.x + t.cell_x(last).1));
+                            painter.line_segment([pos2(x1, snap(y0)), pos2(x1, snap(y1))], stroke);
                             if ri == 0 {
                                 painter.line_segment([pos2(x0, snap(y0)), pos2(x1, snap(y0))], stroke);
                             }
                             painter.line_segment([pos2(x0, snap(y1)), pos2(x1, snap(y1))], stroke);
                         }
+                    }
+                    if let Some((x, y0, y1)) = drag_preview {
+                        painter.line_segment([pos2(snap(x), y0), pos2(snap(x), y1)], Stroke::new(2.0, p.accent));
                     }
                 }
 
@@ -1039,7 +1322,8 @@ impl KladdApp {
                     let mut conv = ByteToChar::new(text);
                     let amp = 1.2 * z.max(0.8);
                     let half = 2.0 * z.max(0.8);
-                    for r in &misspelled {
+                    let m0 = misspelled.partition_point(|r| r.end < vis.start);
+                    for r in misspelled[m0..].iter().take_while(|r| r.start <= vis.end) {
                         if focused && r.start <= caret_b && caret_b <= r.end {
                             continue;
                         }
@@ -1082,7 +1366,8 @@ impl KladdApp {
                         }
                     }
                     new_target = Some(found);
-                    table_menu = Some(tables::on_secondary_click(ui.ctx(), id, text, ui.ctx().pointer_interact_pos().map(|pos| char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0))));
+                    let geoms = tview.as_ref().map(|v| v.1.clone()).unwrap_or_default();
+                    table_menu = Some(tables::on_secondary_click(ui.ctx(), id, text, ui.ctx().pointer_interact_pos().map(|pos| tables::byte_at(text, &galley, &geoms, pos - gpos))));
                 }
                 let target = match &new_target {
                     Some(t) => t.clone(),
@@ -1127,6 +1412,10 @@ impl KladdApp {
             });
 
             self.wv.pages = page_pos;
+            self.wv.fn_pending = fn_pending;
+            if let Some(b) = toc_click {
+                self.goto_byte(&ctx, b);
+            }
             let img_range = imgs.range.clone();
             self.wv.img = imgs;
             if let (Some(act), Some(r)) = (img_act, img_range) {
@@ -1140,9 +1429,16 @@ impl KladdApp {
             }
             if edited {
                 self.find.current = None;
+                self.word_renumber_footnotes(&ctx);
+            }
+            if let Some(b) = fn_jump {
+                self.goto_byte(&ctx, b);
             }
             if let Some(op) = table_act {
                 self.word_table_op(&ctx, op);
+            }
+            if let Some((at, dashes)) = col_resize {
+                self.word_edit(&ctx, |t, s| markup::table_set_widths(t, at, s, &dashes));
             }
             match spell_act {
                 Some(SpellAct::Replace(r, s)) => {
@@ -1221,6 +1517,12 @@ impl KladdApp {
 }
 
 /// Byteoffset till teckenindex, effektivt för stigande offset.
+/// En tabell som syns: index i `table_view` och överkant/nederkant för varje rad.
+struct VisTable {
+    ti: usize,
+    exts: Vec<(f32, f32)>,
+}
+
 struct ByteToChar<'a> {
     text: &'a str,
     b: usize,
@@ -1242,6 +1544,11 @@ impl<'a> ByteToChar<'a> {
         self.b = b;
         self.c
     }
+}
+
+/// Fotnotsskiljelinjen: en tunn linje, en tredjedels textbredd lång.
+fn painter_line(ui: &Ui, p: &Palette, x: f32, y: f32, len: f32, z: f32) {
+    ui.painter().hline(x..=x + len, y, Stroke::new(z.max(1.0), p.page_text.gamma_multiply(0.7)));
 }
 
 fn image_uri(src: &str, doc_id: u64) -> String {

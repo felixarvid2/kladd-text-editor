@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TextEncoding {
     Utf8,
     Utf8Bom,
@@ -24,7 +24,7 @@ impl TextEncoding {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LineEnding {
     Lf,
     CrLf,
@@ -304,6 +304,21 @@ impl Document {
 
     /// Sparar dokumentet. Returnerar varningar (t.ex. bilder som inte hittades).
     pub fn save_to(&mut self, path: &Path) -> Result<Vec<String>, String> {
+        if self.is_export_target(path) {
+            // Export (webbsida, e-bok): filen skrivs men fliken behåller sin sökväg, sitt format
+            // och sitt ändrat-läge, till skillnad från PDF som blir flikens nya format.
+            let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let images = &self.images;
+            let resolve = |src: &str| resolve_image(src, &base, images);
+            let written = if ext_of(path) == "epub" {
+                crate::export::epub(&self.text, &title, &resolve)?
+            } else {
+                crate::export::html(&self.text, &title, &resolve)?
+            };
+            write_atomic(path, &written.bytes).map_err(|e| describe_io_error(&e, path))?;
+            return Ok(written.missing_images);
+        }
         let to_word = ext_of(path) == "docx";
         let to_odt = ext_of(path) == "odt";
         let to_pdf = ext_of(path) == "pdf";
@@ -355,6 +370,16 @@ impl Document {
         Ok(warnings)
     }
 
+    /// Sant om att spara till `path` är en export (.epub, eller .html/.htm från ett Markdown-baserat
+    /// dokument) som lämnar flikens eget format och sökväg orörda.
+    pub fn is_export_target(&self, path: &Path) -> bool {
+        match ext_of(path).as_str() {
+            "epub" => true,
+            "html" | "htm" => self.is_markdown(),
+            _ => false,
+        }
+    }
+
     /// Skriver bilderna till `<namn>-bilder/` och byter `bild:x` mot sökvägar i texten.
     fn export_images(&mut self, target: &Path) -> Result<(), String> {
         let stem = target.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "dokument".into());
@@ -379,6 +404,14 @@ impl Document {
     /// Mappen som relativa bildsökvägar utgår från.
     pub fn base_dir(&self) -> Option<PathBuf> {
         self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf)
+    }
+
+    /// Lägger in text från en säkerhetskopia: dokumentet blir osparat även om texten råkar vara lika.
+    pub fn set_recovered(&mut self, text: String, encoding: TextEncoding, line_ending: LineEnding) {
+        self.text = text;
+        self.encoding = encoding;
+        self.line_ending = line_ending;
+        self.dirty = true;
     }
 
     /// Ska anropas när texten har ändrats i editorn.

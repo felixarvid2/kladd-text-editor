@@ -22,8 +22,14 @@ pub enum Icon {
     BulletList,
     NumberedList,
     Quote,
+    // Bild, tabell, fotnot och innehållsförteckning ligger i menyn Infoga, ikonerna sparas.
+    #[allow(dead_code)]
     Image,
+    #[allow(dead_code)]
     Table,
+    /// Fotnot: ett stort A med en upphöjd etta.
+    #[allow(dead_code)]
+    Footnote,
     TableRowAbove,
     TableRowBelow,
     TableColLeft,
@@ -31,6 +37,8 @@ pub enum Icon {
     TableDelRow,
     TableDelCol,
     TableDelete,
+    TableMerge,
+    TableSplit,
     /// Ett pappersark med vikt hörn.
     Page,
     Undo,
@@ -44,6 +52,15 @@ pub enum Icon {
     TextColor,
     /// Markeringspenna; färgstapeln under ritas av `color_button`.
     Highlight,
+    /// Radbrytning av bild: bilden på en egen rad / texten flyter höger om / vänster om den.
+    WrapInline,
+    WrapLeft,
+    WrapRight,
+    /// Rubrikträd (navigeringsfönstret).
+    Outline,
+    /// Innehållsförteckning: rader med sidnummer till höger.
+    #[allow(dead_code)]
+    Toc,
 }
 
 pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32) {
@@ -139,6 +156,48 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             painter.line_segment([c + vec2(-3.5, -1.0), c + vec2(-5.5, 3.5)], s);
             painter.line_segment([c + vec2(-5.5, 3.5), c + vec2(0.5, 3.0)], s);
         }
+        Icon::WrapInline | Icon::WrapLeft | Icon::WrapRight => {
+            let boxr = |x0: f32, x1: f32, y0: f32, y1: f32| {
+                painter.rect_stroke(Rect::from_min_max(c + vec2(x0, y0), c + vec2(x1, y1)), 1.0, s, egui::StrokeKind::Middle)
+            };
+            let line = |x0: f32, x1: f32, dy: f32| painter.line_segment([c + vec2(x0, dy), c + vec2(x1, dy)], s);
+            match icon {
+                Icon::WrapInline => {
+                    line(-6.5, 6.5, -6.0);
+                    boxr(-3.5, 3.5, -3.0, 2.5);
+                    line(-6.5, 6.5, 5.5);
+                }
+                Icon::WrapLeft => {
+                    boxr(-6.5, -1.5, -6.0, -0.5);
+                    line(1.5, 6.5, -5.0);
+                    line(1.5, 6.5, -1.5);
+                    line(-6.5, 6.5, 2.5);
+                    line(-6.5, 6.5, 6.0);
+                }
+                _ => {
+                    boxr(1.5, 6.5, -6.0, -0.5);
+                    line(-6.5, -1.5, -5.0);
+                    line(-6.5, -1.5, -1.5);
+                    line(-6.5, 6.5, 2.5);
+                    line(-6.5, 6.5, 6.0);
+                }
+            }
+        }
+        Icon::Outline => {
+            // Indragna rader: rubrik, underrubrik, underrubrik, rubrik.
+            for (dx, w, dy) in [(0.0, 11.0, -5.0), (3.5, 7.5, -1.7), (3.5, 7.5, 1.7), (0.0, 11.0, 5.0)] {
+                let x0 = -6.0 + dx;
+                painter.line_segment([c + vec2(x0, dy), c + vec2(x0 + w, dy)], s);
+            }
+        }
+        Icon::Toc => {
+            // Rader med punktlinjer och korta sidnummer längst till höger.
+            for dy in [-4.5, 0.0, 4.5] {
+                painter.line_segment([c + vec2(-6.5, dy), c + vec2(0.5, dy)], s);
+                painter.circle_filled(c + vec2(2.5, dy + 0.6), 0.6, color);
+                painter.line_segment([c + vec2(4.5, dy), c + vec2(6.5, dy)], s);
+            }
+        }
         Icon::BulletList => {
             for dy in [-4.5, 0.0, 4.5] {
                 painter.circle_filled(c + vec2(-5.5, dy), 1.25, color);
@@ -183,6 +242,10 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
                 painter.line_segment([w[0], w[1]], s);
             }
         }
+        Icon::Footnote => {
+            painter.text(c + vec2(-2.5, 1.5), egui::Align2::CENTER_CENTER, "A", egui::FontId::new(12.5, crate::theme::medium()), color);
+            painter.text(c + vec2(5.0, -4.5), egui::Align2::CENTER_CENTER, "1", egui::FontId::new(8.5, crate::theme::medium()), color);
+        }
         Icon::Table => {
             let r = Rect::from_center_size(c, vec2(13.0, 12.0));
             painter.rect_stroke(r, 1.5, s, egui::StrokeKind::Middle);
@@ -205,6 +268,24 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             let pc = c + vec2(px_, py_);
             painter.line_segment([pc + vec2(-2.5, 0.0), pc + vec2(2.5, 0.0)], s);
             painter.line_segment([pc + vec2(0.0, -2.5), pc + vec2(0.0, 2.5)], s);
+        }
+        Icon::TableMerge | Icon::TableSplit => {
+            // Två celler med pilar mot varandra (sammanfoga) eller ifrån varandra (dela).
+            let r = Rect::from_center_size(c, vec2(16.0, 11.0));
+            let s1 = Stroke::new(1.2, color);
+            painter.rect_stroke(r, 1.0, s1, egui::StrokeKind::Middle);
+            let split = matches!(icon, Icon::TableSplit);
+            if split {
+                painter.line_segment([pos2(c.x, r.top()), pos2(c.x, r.bottom())], s1);
+            }
+            for dir in [-1.0f32, 1.0] {
+                // Pilen på varje sida om mitten; spetsen vid mitten (sammanfoga) eller kanten (dela).
+                let (from, to) = if split { (3.0, 6.0) } else { (6.0, 3.0) };
+                let (a, b) = (c + vec2(dir * from, 0.0), c + vec2(dir * to, 0.0));
+                painter.line_segment([a, b], s);
+                painter.line_segment([b, b + vec2(-dir * (to - from).signum() * 2.0, -2.0)], s);
+                painter.line_segment([b, b + vec2(-dir * (to - from).signum() * 2.0, 2.0)], s);
+            }
         }
         Icon::TableDelRow | Icon::TableDelCol | Icon::TableDelete => {
             // Rutnät; den borttagna raden/kolumnen fylld, hela tabellen överstruken.

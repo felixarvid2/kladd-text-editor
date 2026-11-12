@@ -5,16 +5,17 @@
 //! hög utom där markören står (`Params::reveal`), där den visas dämpad.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
 use egui::epaint::text::FontsView;
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
-use egui::{Color32, FontFamily, FontId, Galley, Stroke, Vec2};
+use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
-use super::markup::{self, Align, Analysis, Block, DocDefaults, Piece};
+use super::grid::{self, TableGeom};
+use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
@@ -28,9 +29,8 @@ pub struct Params<'a> {
     pub zoom: f32,
     /// Byteintervall där markup visas (markörens rader); tomt = dölj all markup.
     pub reveal: Range<usize>,
-    pub query: &'a str,
-    pub case_sensitive: bool,
-    pub current_match: Option<usize>,
+    /// Sökträffar som `(start, slut, är_aktuell)` i källtexten (se `search::highlights`).
+    pub matches: &'a [(usize, usize, bool)],
     /// Bildkälla -> visningsstorlek i px (redan zoomad).
     pub image_size: &'a dyn Fn(&str) -> Option<Vec2>,
     /// Textbredd i px för en sträng i ett typsnitt (för tabellkolumner och listindrag).
@@ -42,54 +42,210 @@ pub struct Params<'a> {
     pub fonts_gen: u64,
 }
 
+/// Snabb, enkel hashfunktion (FxHash) för cachenycklar: SipHash är för långsam för att hasha
+/// hela texten och alla bitar varje gång något ändras.
 #[derive(Default)]
-pub struct Cache {
-    analyses: HashMap<u64, (u64, Arc<Analysis>)>,
-    jobs: HashMap<u64, (u64, LayoutJob)>,
-    galleys: HashMap<u64, (u64, Arc<Galley>)>,
+struct Fx(u64);
+
+impl Fx {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
 }
 
-fn hash_of<T: Hash + ?Sized>(v: &T) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.hash(&mut h);
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(buf) ^ ((rest.len() as u64) << 56));
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Snabb hash av en sträng (för cachenycklar).
+pub fn fast_hash(s: &str) -> u64 {
+    let mut h = Fx::default();
+    s.hash(&mut h);
     h.finish()
 }
 
-impl Cache {
-    pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
-        let th = hash_of(text);
-        if let Some((k, a)) = self.analyses.get(&doc_id) {
-            if *k == th {
-                return a.clone();
-            }
-        }
-        let a = Arc::new(markup::analyze(text));
-        self.analyses.insert(doc_id, (th, a.clone()));
-        a
+/// Ett stycke eller en hel tabell som läggs ut och cachas för sig.
+struct Unit {
+    galleys: Arc<Vec<Arc<Galley>>>,
+    /// Tabellens geometri (relativ till fönstret) om enheten är en tabell.
+    geom: Option<Arc<TableGeom>>,
+    /// Bildruta då enheten senast användes (oanvända enheter rensas).
+    used: u64,
+}
+
+/// Allt som cachas för ett dokument.
+struct DocState {
+    /// Senast sedda texten: ändringsdetektorn är en jämförelse (memcmp), inte en hash.
+    text: String,
+    /// Räknas upp varje gång texten ändrats.
+    rev: u64,
+    analysis: Arc<Analysis>,
+    tables: Option<Arc<Vec<Table>>>,
+    images: Option<Arc<Vec<markup::ImageRef>>>,
+    headings: Option<Arc<Vec<super::nav::Heading>>>,
+    fonts: Option<Arc<BTreeSet<(String, bool, bool)>>>,
+    /// Hela galleriet för förra bildrutan, med nyckeln det byggdes med.
+    frame: Option<(u64, Arc<Galley>)>,
+    /// Utlagda stycken, nycklade på allt som påverkar dem.
+    units: HashMap<u64, Unit>,
+    /// Tabellernas geometri i senaste omläggningen (absoluta byteintervall).
+    geoms: Arc<Vec<TableGeom>>,
+    tick: u64,
+    /// Flytande bilder i senaste utläggningen: bildens byteläge och sida.
+    float_starts: Vec<(usize, Float, usize)>,
+}
+
+#[derive(Default)]
+pub struct Cache {
+    docs: HashMap<u64, DocState>,
+    jobs: HashMap<u64, (u64, LayoutJob)>,
+}
+
+impl DocState {
+    fn tables(&mut self) -> Arc<Vec<Table>> {
+        let (text, a) = (&self.text, &self.analysis);
+        self.tables.get_or_insert_with(|| Arc::new(tables(text, a))).clone()
     }
 
-    /// Nyckeln: texthash, reveal, zoom, dark, query, case_sensitive, current_match, typsnittsgeneration.
-    fn job_key(text: &str, p: &Params) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut h);
+    fn images(&mut self) -> Arc<Vec<markup::ImageRef>> {
+        let a = &self.analysis;
+        self.images.get_or_insert_with(|| Arc::new(a.pieces.iter().filter_map(|pc| pc.image.clone()).collect())).clone()
+    }
+}
+
+impl Cache {
+    /// Håller dokumentets tillstånd i takt med texten. En ändring kostar en jämförelse av
+    /// texten och en ny analys; är texten oförändrad görs ingenting.
+    fn state(&mut self, doc_id: u64, text: &str) -> &mut DocState {
+        let st = self.docs.entry(doc_id).or_insert_with(|| DocState {
+            text: text.to_owned(),
+            rev: 0,
+            analysis: Arc::new(markup::analyze(text)),
+            tables: None,
+            images: None,
+            headings: None,
+            fonts: None,
+            frame: None,
+            units: HashMap::new(),
+            geoms: Arc::default(),
+            tick: 0,
+            float_starts: Vec::new(),
+        });
+        if st.text != text {
+            st.text.clear();
+            st.text.push_str(text);
+            st.rev += 1;
+            st.analysis = Arc::new(markup::analyze(text));
+            st.tables = None;
+            st.images = None;
+            st.headings = None;
+            st.fonts = None;
+        }
+        st
+    }
+
+    /// Revisionsnummer: ändras exakt när texten ändrats sedan förra anropet.
+    pub fn rev(&mut self, doc_id: u64, text: &str) -> u64 {
+        self.state(doc_id, text).rev
+    }
+
+    pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
+        self.state(doc_id, text).analysis.clone()
+    }
+
+    /// Dokumentets tabeller (räknas om bara när texten ändrats).
+    pub fn tables(&mut self, doc_id: u64, text: &str) -> Arc<Vec<Table>> {
+        self.state(doc_id, text).tables()
+    }
+
+    /// Tabellernas rutnät från senaste utläggningen av `text` och galleriet som visas, om
+    /// utläggningen gjordes för just den här texten (annars `None`).
+    pub fn table_view(&mut self, doc_id: u64, text: &str) -> Option<(Arc<Galley>, Arc<Vec<TableGeom>>)> {
+        let st = self.docs.get(&doc_id)?;
+        if st.text != text {
+            return None;
+        }
+        let (_, g) = st.frame.as_ref()?;
+        Some((g.clone(), st.geoms.clone()))
+    }
+
+    /// Bilderna i ordning (räknas om bara när texten ändrats).
+    pub fn images(&mut self, doc_id: u64, text: &str) -> Arc<Vec<markup::ImageRef>> {
+        self.state(doc_id, text).images()
+    }
+
+    /// Sidan (och radnumret i galleriet som bilden är förankrad vid) om bilden som börjar vid
+    /// `byte` flyter i den senaste utläggningen. Bilder som inte får plats bredvid texten är
+    /// vanliga bilder (`None`).
+    pub fn float_side(&mut self, doc_id: u64, text: &str, byte: usize) -> Option<(Float, usize)> {
+        let st = self.state(doc_id, text);
+        st.float_starts.iter().find(|f| f.0 == byte).map(|f| (f.1, f.2))
+    }
+
+    /// Rubrikerna i ordning (räknas om bara när texten ändrats).
+    pub fn headings(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::nav::Heading>> {
+        let st = self.state(doc_id, text);
+        let (t, a) = (&st.text, &st.analysis);
+        st.headings.get_or_insert_with(|| Arc::new(super::nav::headings(t, a))).clone()
+    }
+
+    /// Typsnitten dokumentet använder (räknas om bara när texten ändrats).
+    pub fn fonts(&mut self, doc_id: u64, text: &str) -> Arc<BTreeSet<(String, bool, bool)>> {
+        let st = self.state(doc_id, text);
+        let a = &st.analysis;
+        st.fonts.get_or_insert_with(|| Arc::new(needed_fonts(a))).clone()
+    }
+
+    /// Nyckeln: revision, reveal, zoom, dark, sökträffar, typsnittsgeneration.
+    fn job_key(rev: u64, p: &Params) -> u64 {
+        let mut h = Fx::default();
+        rev.hash(&mut h);
         p.reveal.start.hash(&mut h);
         p.reveal.end.hash(&mut h);
         p.zoom.to_bits().hash(&mut h);
         p.palette.dark.hash(&mut h);
-        p.query.hash(&mut h);
-        p.case_sensitive.hash(&mut h);
-        p.current_match.hash(&mut h);
+        p.matches.hash(&mut h);
         p.fonts_gen.hash(&mut h);
         h.finish()
     }
 
-    /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag). Jobbet
-    /// byggs först (`p.measure` tar fonts-låset, så det måste ske utanför `fonts_mut`).
+    /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag).
     pub fn galley(&mut self, ctx: &egui::Context, doc_id: u64, text: &str, p: &Params, wrap_width: f32) -> Arc<Galley> {
         self.galley_paged(ctx, doc_id, text, p, wrap_width, None)
     }
 
     /// Som `galley`, men med raderna uppdelade på sidor enligt `pages` (se `pages::paginate`).
+    ///
+    /// Oförändrad bildruta: en jämförelse av texten och en hash av parametrarna. Efter en
+    /// ändring läggs bara de stycken ut som ändrats (eller vars parametrar ändrats); övriga
+    /// hämtas ur styckecachen. Sedan fogas styckena ihop och sidbryts.
     pub fn galley_paged(
         &mut self,
         ctx: &egui::Context,
@@ -99,52 +255,343 @@ impl Cache {
         wrap_width: f32,
         pages: Option<&super::pages::Geom>,
     ) -> Arc<Galley> {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        Self::job_key(text, p).hash(&mut h);
+        let ppp = ctx.pixels_per_point();
+        // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
+        let families = ctx.fonts(|f| f.families().len());
+        let st = self.state(doc_id, text);
+
+        // Parametrar som gäller alla stycken.
+        let mut e = Fx::default();
+        p.zoom.to_bits().hash(&mut e);
+        format!("{:?}", p.palette).hash(&mut e);
+        p.fonts_gen.hash(&mut e);
+        wrap_width.to_bits().hash(&mut e);
+        ppp.to_bits().hash(&mut e);
+        families.hash(&mut e);
+        let env = e.finish();
+
+        let mut h = Fx::default();
+        env.hash(&mut h);
+        st.rev.hash(&mut h);
+        p.reveal.start.hash(&mut h);
+        p.reveal.end.hash(&mut h);
+        p.matches.hash(&mut h);
         if let Some(g) = pages {
             g.hash_into(&mut h);
         }
-        wrap_width.to_bits().hash(&mut h);
-        ctx.pixels_per_point().to_bits().hash(&mut h);
-        // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
-        ctx.fonts(|f| f.families().len()).hash(&mut h);
+        // Bildstorlekar kan bli kända först efter att bilden lästs in.
+        for img in st.images().iter() {
+            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        }
         let key = h.finish();
-        if let Some((k, g)) = self.galleys.get(&doc_id) {
+        if let Some((k, g)) = &st.frame {
             if *k == key {
                 return g.clone();
             }
         }
-        let job = self.job(doc_id, text, p);
-        let a = self.analysis(doc_id, text);
-        let ppp = ctx.pixels_per_point();
-        let mut g = ctx.fonts_mut(|f| layout_galley(f, job, &a, p, wrap_width, ppp));
-        if let Some(geom) = pages {
-            super::pages::paginate(&mut g, geom, ppp);
-        }
-        let g = Arc::new(g);
-        self.galleys.insert(doc_id, (key, g.clone()));
+
+        let g = Arc::new(relayout(st, ctx, text, p, wrap_width, ppp, env, pages));
+        st.frame = Some((key, g.clone()));
         g
     }
 
     pub fn job(&mut self, doc_id: u64, text: &str, p: &Params) -> LayoutJob {
-        let key = Self::job_key(text, p);
-
+        let st = self.state(doc_id, text);
+        let key = Self::job_key(st.rev, p);
+        let a = st.analysis.clone();
         if let Some((k, job)) = self.jobs.get(&doc_id) {
             if *k == key {
                 return job.clone();
             }
         }
-        let a = self.analysis(doc_id, text);
         let job = layout_job(text, &a, p);
         self.jobs.insert(doc_id, (key, job.clone()));
         job
     }
 
     pub fn forget(&mut self, doc_id: u64) {
-        self.analyses.remove(&doc_id);
+        self.docs.remove(&doc_id);
         self.jobs.remove(&doc_id);
-        self.galleys.remove(&doc_id);
     }
+}
+
+/// Hashar det som påverkar hur ett fönster av texten ser ut efter layout: texten, styckenas
+/// geometri, bitarna (relativt fönstret) och hur markören/sökträffarna träffar dem.
+fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, paras: &[Para]) -> u64 {
+    let mut h = Fx(env);
+    text[w.clone()].hash(&mut h);
+    for para in paras {
+        (para.range.start - w.start.min(para.range.start)).hash(&mut h);
+        para.range.len().hash(&mut h);
+        (para.align as u8).hash(&mut h);
+        match para.list {
+            Some(l) => {
+                1u8.hash(&mut h);
+                l.text_x.to_bits().hash(&mut h);
+                l.marker_chars.hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        para.image_w.to_bits().hash(&mut h);
+        para.collapse.hash(&mut h);
+        para.float.map(|f| (f.side, f.size.x.to_bits(), f.size.y.to_bits(), f.alone)).hash(&mut h);
+        para.reserve.map(f32::to_bits).hash(&mut h);
+        para.toc_h.to_bits().hash(&mut h);
+    }
+    // Markörens rader i förhållande till fönstret.
+    if intersects(&p.reveal, w) {
+        (p.reveal.start.max(w.start) - w.start).hash(&mut h);
+        (p.reveal.end.min(w.end) - w.start).hash(&mut h);
+    }
+    for m in matches_in(p.matches, w) {
+        (m.0.max(w.start) - w.start, m.1.min(w.end) - w.start, m.2).hash(&mut h);
+    }
+    for pc in pieces_in(a, w) {
+        (pc.range.start.max(w.start) - w.start).hash(&mut h);
+        (pc.range.end.min(w.end) - w.start).hash(&mut h);
+        let flags = u16::from(pc.bold)
+            | u16::from(pc.italic) << 1
+            | u16::from(pc.underline) << 2
+            | u16::from(pc.strike) << 3
+            | u16::from(pc.code) << 4
+            | u16::from(pc.link) << 5
+            | u16::from(pc.markup) << 6
+            | u16::from(pc.list_marker) << 7
+            | u16::from(pc.range.start < w.start) << 8
+            | u16::from(pc.range.end > w.end) << 9
+            | u16::from(intersects(&pc.range, &p.reveal)) << 10
+            | u16::from(pc.image.is_some()) << 11
+            | (pc.align as u16) << 12;
+        flags.hash(&mut h);
+        match pc.block {
+            Block::Normal => 0u8,
+            Block::Heading(n) => 10 + n,
+            Block::Quote => 1,
+            Block::Bullet => 2,
+            Block::Numbered => 3,
+            Block::Code => 4,
+            Block::Table => 5,
+            Block::Footnote => 6,
+        }
+        .hash(&mut h);
+        pc.object.hash(&mut h);
+        pc.footnote_ref.is_some().hash(&mut h);
+        pc.footnote_def.is_some().hash(&mut h);
+        pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
+        if let Some(s) = &pc.span {
+            s.font_family.hash(&mut h);
+            s.font_size.map(f32::to_bits).hash(&mut h);
+            s.color.hash(&mut h);
+            s.background.hash(&mut h);
+        }
+        if let Some(img) = &pc.image {
+            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Lägger ut dokumentet från styckecachen och fogar ihop det. `env` = hash av parametrarna
+/// som gäller alla stycken.
+#[allow(clippy::too_many_arguments)]
+fn relayout(
+    st: &mut DocState,
+    ctx: &egui::Context,
+    text: &str,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    env: u64,
+    pages: Option<&super::pages::Geom>,
+) -> Galley {
+    st.tick += 1;
+    let tick = st.tick;
+    let a = st.analysis.clone();
+    let grid = st.tables();
+    let env = {
+        let mut h = Fx(env);
+        format!("{:?}", a.defaults).hash(&mut h);
+        h.finish()
+    };
+    let paras = paragraphs(text, &a, p);
+    let groups = group_paras(text, &paras, &grid);
+    let min_h = px(p.zoom, a.defaults.size()) * 1.4;
+
+    // Grupperna läggs ut i ordning: en flytande bild påverkar bredden på stycken efter den, och
+    // hur högt dessa är avgör var bilden slutar.
+    let gap = FLOAT_GAP * p.zoom;
+    struct FloatBox {
+        side: Float,
+        w: f32,
+        bottom: f32,
+    }
+    let mut active: Vec<FloatBox> = Vec::new();
+    let mut y = 0.0f32;
+    let mut row_no = 0usize;
+    let mut anchors: Vec<(usize, f32)> = Vec::new();
+    let mut starts: Vec<(usize, Float, usize)> = Vec::new();
+    let mut all: Vec<Arc<Galley>> = Vec::new();
+    let mut geoms: Vec<TableGeom> = Vec::new();
+    let mut row_groups: Vec<Range<usize>> = Vec::new();
+    for (pr, w, tbl) in groups.iter() {
+        active.retain(|f| f.bottom > y + 0.5);
+        let table = tbl.is_some();
+        let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
+        let mut anchor = None;
+        if let (Some(f), false) = (gp[0].float, table) {
+            let used: f32 = active.iter().map(|f| f.w).sum();
+            let same = active.iter().any(|a| a.side == f.side);
+            if same || wrap_width - used - f.size.x - gap < FLOAT_MIN_ROOM * p.zoom {
+                // Ryms inte bredvid texten: en ensam bild får en egen rad, annars ritas den på texten.
+                gp[0].float = None;
+                if f.alone {
+                    gp[0].collapse = false;
+                    gp[0].reserve = Some(f.size.y);
+                }
+            } else {
+                anchor = Some(f);
+            }
+        } else if gp[0].float.is_some() {
+            gp[0].float = None;
+        }
+        // Stycket flyter också runt sin egen bild (om det har text).
+        let own = anchor.filter(|f| !f.alone).map(|f| FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+        let rel: Vec<ActiveFloat> = if table {
+            Vec::new()
+        } else {
+            active
+                .iter()
+                .chain(own.iter())
+                .map(|f| (f.side, f.w, ((f.bottom - y) * 2.0).round() / 2.0))
+                .collect()
+        };
+        let key = {
+            let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
+            for f in &rel {
+                (f.0, f.1.to_bits(), f.2.to_bits()).hash(&mut h);
+            }
+            h.finish()
+        };
+        let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
+            u.used = tick;
+            (u.galleys.clone(), u.geom.clone())
+        } else {
+            let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
+            job.sections = build_sections(text, &a, p, &grid, w.clone());
+            for s in &mut job.sections {
+                s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
+            }
+            let relp: Vec<Para> =
+                gp.iter().map(|q| Para { range: q.range.start - w.start..q.range.end - w.start, ..q.clone() }).collect();
+            // Kolumnbredder mäts före `fonts_mut` (måttet tar själv fontlåset).
+            let geom = tbl.map(|_| {
+                let lines: Vec<Range<usize>> = paras[pr.clone()].iter().map(|q| q.range.clone()).collect();
+                Arc::new(grid::plan(text, &a, &lines, p, wrap_width).rel(w.start))
+            });
+            let laid: Vec<Arc<Galley>> = ctx.fonts_mut(|f| match &geom {
+                Some(g) => layout_table_lines(f, &job, &relp, g, p, wrap_width, ppp, min_h),
+                None => relp.iter().map(|q| layout_para_floats(f, &job, q, wrap_width, ppp, &rel)).collect(),
+            });
+            let gs = Arc::new(laid);
+            st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
+            (gs, geom)
+        };
+        if let Some(g) = &tgeom {
+            geoms.push(g.abs(w.start));
+            for lg in galleys.iter().filter(|lg| lg.rows.len() > 1) {
+                let _ = lg;
+            }
+            let mut r = row_no;
+            for lg in galleys.iter() {
+                if lg.rows.len() > 1 {
+                    row_groups.push(r..r + lg.rows.len());
+                }
+                r += lg.rows.len();
+            }
+        }
+        if let Some(f) = anchor {
+            anchors.push((row_no, f.size.y));
+            if let Some(pc) = pieces_in(&a, &gp[0].range).iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some())) {
+                starts.push((pc.range.start, f.side, row_no));
+            }
+            active.push(FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+        }
+        row_no += galleys.iter().map(|g| g.rows.len()).sum::<usize>();
+        y += galleys.iter().map(|g| g.rect.height()).sum::<f32>();
+        all.extend(galleys.iter().cloned());
+    }
+    st.units.retain(|_, u| u.used == tick);
+    st.float_starts = starts;
+
+    st.geoms = Arc::new(geoms);
+    let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
+    job.wrap.max_width = wrap_width;
+    job.sections.push(LayoutSection {
+        leading_space: 0.0,
+        byte_range: ByteIndex(0)..ByteIndex(text.len()),
+        format: TextFormat::default(),
+    });
+    let mut g = Galley::concat(Arc::new(job), &all, ppp);
+    if let Some(geom) = pages {
+        super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+    }
+    g
+}
+
+/// Stycken som läggs ut tillsammans: ett vanligt stycke, eller alla rader i en tabell.
+/// Ger (styckesindex, textfönster, tabellindex).
+fn group_paras(text: &str, paras: &[Para], grid: &[Table]) -> Vec<(Range<usize>, Range<usize>, Option<usize>)> {
+    let mut groups = Vec::new();
+    let mut ti = 0;
+    let mut i = 0;
+    while i < paras.len() {
+        let r = &paras[i].range;
+        while ti < grid.len() && grid[ti].region.end <= r.start {
+            ti += 1;
+        }
+        let mut last = i + 1;
+        let mut table = None;
+        if let Some(t) = grid.get(ti).filter(|t| t.region.start < r.end && r.start < t.region.end) {
+            while last < paras.len() && paras[last].range.start < t.region.end {
+                last += 1;
+            }
+            table = Some(ti);
+        }
+        let start = paras[i].range.start;
+        let end = (paras[last - 1].range.end + 1).min(text.len());
+        // En avslutande tom rad hämtar formatet från radbrytningen före.
+        let start = if start == text.len() && start > 0 { start - 1 } else { start };
+        groups.push((i..last, start..end.max(start), table));
+        i = last;
+    }
+    groups
+}
+
+/// Lägger ut en tabells rader: avgränsarraden (rad 1) som ett vanligt stycke, övriga som rutnät.
+#[allow(clippy::too_many_arguments)]
+fn layout_table_lines(
+    fonts: &mut FontsView<'_>,
+    job: &LayoutJob,
+    paras: &[Para],
+    geom: &TableGeom,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    min_h: f32,
+) -> Vec<Arc<Galley>> {
+    let mut row = 0;
+    paras
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            if i == 1 || row >= geom.rows.len() {
+                layout_para(fonts, job, q, wrap_width, ppp)
+            } else {
+                row += 1;
+                grid::layout_line(fonts, job, 0, geom, row - 1, q.range.clone(), ppp, p, min_h)
+            }
+        })
+        .collect()
 }
 
 /// Storlek (pt) för blockets text; `body` = dokumentets brödtextstorlek.
@@ -158,6 +605,7 @@ fn block_size_pt(b: Block, mono: bool, body: f32) -> f32 {
         Block::Heading(3) => 13.0,
         Block::Heading(4) => 12.0,
         Block::Heading(_) => 11.0,
+        Block::Footnote => body * 0.85,
         _ => body,
     }
 }
@@ -171,9 +619,9 @@ fn intersects(a: &Range<usize>, b: &Range<usize>) -> bool {
 pub const HIDDEN_PX: f32 = 0.01;
 
 /// Cellmarginal i tabeller (pt).
-const CELL_PAD_PT: f32 = 5.4;
+pub(super) const CELL_PAD_PT: f32 = 5.4;
 /// Minsta bredd (em) på en kolumn där alla celler är tomma.
-const EMPTY_COL_EM: f32 = 3.0;
+pub(super) const EMPTY_COL_EM: f32 = 3.0;
 
 fn hidden_format(family: FontFamily) -> TextFormat {
     TextFormat {
@@ -251,6 +699,14 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         color,
         ..Default::default()
     };
+    // Fotnotsnummer (referens och definition): litet, upphöjt och i länkfärg. Med egen radhöjd
+    // centreras texten alltid, så upphöjningen kräver `line_height: None` och `valign: TOP`.
+    if pc.footnote_ref.is_some() || pc.footnote_def.is_some() {
+        f.font_id.size *= 0.65;
+        f.line_height = None;
+        f.valign = egui::Align::TOP;
+        f.color = pal.page_link;
+    }
     if pc.code && pc.block != Block::Table {
         f.background = pal.page_code_bg;
     }
@@ -416,11 +872,10 @@ pub fn list_text_x(zoom: f32, level: usize) -> f32 {
 
 // ------------------------------------------------------------------ tabeller
 
-/// En tabellrad: radens byteintervall (utan radbrytning) och byteläget för varje `|`.
+/// En tabellrad: radens byteintervall (utan radbrytning).
 #[derive(Debug, Clone)]
 pub struct TableRow {
     pub line: Range<usize>,
-    pub pipes: Vec<usize>,
     /// Avgränsarraden (`| --- | --- |`), som döljs helt.
     pub delimiter: bool,
 }
@@ -430,24 +885,6 @@ pub struct Table {
     /// Från första till sista tabellbiten.
     pub region: Range<usize>,
     pub rows: Vec<TableRow>,
-}
-
-fn table_pipes(text: &str, line: &Range<usize>) -> Vec<usize> {
-    let b = text.as_bytes();
-    let mut p = line.start;
-    while p < line.end && matches!(b[p], b' ' | b'\t' | b'>') {
-        p += 1;
-    }
-    let mut in_code = false;
-    let mut pipes = Vec::new();
-    for i in p..line.end {
-        match b[i] {
-            b'`' => in_code = !in_code,
-            b'|' if !in_code && (i == 0 || b[i - 1] != b'\\') => pipes.push(i),
-            _ => {}
-        }
-    }
-    pipes
 }
 
 /// Alla tabeller i texten (sammanhängande tabellbitar), rad för rad.
@@ -477,8 +914,7 @@ pub fn tables(text: &str, a: &Analysis) -> Vec<Table> {
             let le = text[pos..region.end].find('\n').map_or(region.end, |i| pos + i);
             if le > pos {
                 let line = pos..le;
-                let pipes = table_pipes(text, &line);
-                rows.push(TableRow { line, pipes, delimiter: idx == 1 });
+                rows.push(TableRow { line, delimiter: idx == 1 });
             }
             idx += 1;
             pos = le + 1;
@@ -493,10 +929,16 @@ struct Builder {
     secs: Vec<(Range<usize>, TextFormat)>,
     cuts: BTreeSet<usize>,
     marks: Vec<(Range<usize>, TextFormat)>,
+    /// Bara sektioner inom fönstret byggs (hela texten för `layout_job`, ett stycke för cachen).
+    win: Range<usize>,
 }
 
 impl Builder {
     fn push(&mut self, r: Range<usize>, f: &TextFormat) {
+        let r = r.start.max(self.win.start)..r.end.min(self.win.end);
+        if r.start >= r.end {
+            return;
+        }
         let mut start = r.start;
         let cuts: Vec<usize> = self.cuts.range(r.start + 1..r.end).copied().collect();
         for end in cuts.into_iter().chain([r.end]) {
@@ -525,75 +967,22 @@ impl Builder {
     }
 }
 
-/// Cellens synliga text (utan markup), för breddmätning.
-fn visible_text(text: &str, a: &Analysis, r: &Range<usize>) -> String {
-    let i = a.pieces.partition_point(|p| p.range.end <= r.start);
-    let mut s = String::new();
-    for pc in &a.pieces[i..] {
-        if pc.range.start >= r.end {
-            break;
-        }
-        if !pc.markup {
-            s.push_str(&text[pc.range.start.max(r.start)..pc.range.end.min(r.end)]);
-        }
-    }
-    s.trim().to_owned()
-}
-
-struct Cell {
-    start: usize,
-    end: usize,
-    w: f32,
-}
-
-/// Rutnätslayout för en tabell som inte visas rått: kolumnbredder mäts med `p.measure`, och
-/// pipor och celltext får `leading_space` så att kolumnerna linjerar. Pipor, blanksteg i
-/// cellerna och avgränsarraden döljs (avgränsarraden kollapsar till 1 px höjd).
-fn grid_table(
-    text: &str,
-    a: &Analysis,
-    t: &Table,
-    p: &Params,
-    bld: &mut Builder,
-    leads: &mut BTreeMap<usize, f32>,
-) {
+/// Format för en tabell som visas som rutnät: blanksteg runt cellernas innehåll döljs, en tom
+/// cell behåller radhöjden och avgränsarraden döljs och kollapsar till 1 px höjd. Kolumnernas
+/// bredd och cellernas placering görs av `grid` när raderna läggs ut.
+fn grid_table(text: &str, a: &Analysis, t: &Table, p: &Params, bld: &mut Builder) {
     let z = p.zoom;
-    let pad = px(z, CELL_PAD_PT);
     let size = px(z, a.defaults.size());
-    let mut rows: Vec<(&TableRow, Vec<Cell>)> = Vec::new();
-    let mut ncols = 0;
-    for (ri, row) in t.rows.iter().enumerate() {
-        if row.delimiter {
-            continue;
-        }
-        let font = FontId::new(size, (p.font_family)(Some(a.defaults.font()), ri == 0, false));
-        let mut cells = Vec::new();
-        for (j, &pp) in row.pipes.iter().enumerate() {
-            let start = pp + 1;
-            let end = row.pipes.get(j + 1).copied().unwrap_or(row.line.end);
-            if j + 1 == row.pipes.len() && text[start..end].trim().is_empty() {
-                break; // avslutande pipan
-            }
-            let vis = visible_text(text, a, &(start..end));
-            let w = if vis.is_empty() { 0.0 } else { (p.measure)(&vis, font.clone()) };
-            cells.push(Cell { start, end, w });
-        }
-        ncols = ncols.max(cells.len());
-        rows.push((row, cells));
-    }
-    let mut col_x = vec![0.0f32; ncols + 1];
-    for j in 0..ncols {
-        let mut w = rows.iter().filter_map(|(_, c)| c.get(j)).map(|c| c.w).fold(0.0, f32::max);
-        // En helt tom kolumn får minst 3 em så att cellerna går att klicka i.
-        if w == 0.0 {
-            w = EMPTY_COL_EM * size;
-        }
-        col_x[j + 1] = col_x[j] + w + 2.0 * pad;
-    }
     let hid = hidden_format(theme::doc_font(false, false));
-    for (row, cells) in &rows {
-        for (j, c) in cells.iter().enumerate() {
-            let s = &text[c.start..c.end];
+    let b = text.as_bytes();
+    for row in t.rows.iter().filter(|r| !r.delimiter) {
+        let mut start = row.line.start;
+        while start < row.line.end && matches!(b[start], b' ' | b'\t' | b'>') {
+            start += 1;
+        }
+        let (segs, _, _) = markup::table_line_cells(text, start, row.line.end);
+        for seg in segs {
+            let s = &text[seg.clone()];
             let lead_ws = s.len() - s.trim_start().len();
             let trail_ws = s.len() - s.trim_end().len();
             if lead_ws == s.len() {
@@ -601,20 +990,15 @@ fn grid_table(
                     // Tom cell: behåll radhöjden så att en helt tom rad inte kollapsar.
                     let mut f = hid.clone();
                     f.line_height = Some(size * 1.4);
-                    bld.marks.push((c.start..c.end, f));
+                    bld.marks.push((seg.clone(), f));
                 }
             } else {
                 if lead_ws > 0 {
-                    bld.marks.push((c.start..c.start + lead_ws, hid.clone()));
+                    bld.marks.push((seg.start..seg.start + lead_ws, hid.clone()));
                 }
                 if trail_ws > 0 {
-                    bld.marks.push((c.end - trail_ws..c.end, hid.clone()));
+                    bld.marks.push((seg.end - trail_ws..seg.end, hid.clone()));
                 }
-            }
-            *leads.entry(c.start).or_insert(0.0) += pad;
-            // Nästa pipa hamnar på kolumnens högra kant.
-            if row.pipes.get(j + 1).is_some() {
-                *leads.entry(c.end).or_insert(0.0) += (col_x[j + 1] - (col_x[j] + pad + c.w)).max(0.0);
             }
         }
     }
@@ -627,20 +1011,40 @@ fn grid_table(
 }
 
 pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
-    let bytes = text.as_bytes();
-    let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new() };
-    let mut leads: BTreeMap<usize, f32> = BTreeMap::new();
+    let grid = tables(text, a);
+    let secs = build_sections(text, a, p, &grid, 0..text.len());
+    LayoutJob { text: text.to_owned(), sections: secs, ..Default::default() }
+}
 
+/// Sökträffarna (sorterade på start) som överlappar `w`.
+fn matches_in<'a>(m: &'a [(usize, usize, bool)], w: &Range<usize>) -> &'a [(usize, usize, bool)] {
+    let i = m.partition_point(|x| x.1 <= w.start);
+    let n = m[i..].partition_point(|x| x.0 < w.end);
+    &m[i..i + n]
+}
+
+/// Bitarna som överlappar `w`.
+fn pieces_in<'a>(a: &'a Analysis, w: &Range<usize>) -> &'a [Piece] {
+    let i = a.pieces.partition_point(|pc| pc.range.end <= w.start);
+    let n = a.pieces[i..].partition_point(|pc| pc.range.start < w.end);
+    &a.pieces[i..i + n]
+}
+
+/// Sektionerna (med byteoffset i hela texten) för fönstret `win`, som måste börja och sluta
+/// på radgränser (eller täcka hela tabeller). Samma kod bygger hela dokumentet och ett enskilt
+/// stycke; bitar som sticker ut ur fönstret beskärs men bedöms med sitt hela intervall.
+fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Range<usize>) -> Vec<LayoutSection> {
+    let bytes = text.as_bytes();
+    let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new(), win: win.clone() };
+    let pcs = pieces_in(a, &win);
     // Tabeller är alltid rutnät, också med markören i dem: bara inline-markup i markörens cell
     // visas (via `reveal`), aldrig pipor eller avgränsarrad.
-    let grid = tables(text, a);
-    for t in &grid {
-        grid_table(text, a, t, p, &mut bld, &mut leads);
+    for t in grid.iter().filter(|t| intersects(&t.region, &win)) {
+        grid_table(text, a, t, p, &mut bld);
     }
-
     // Listor: indraget före markören döljs. Själva hängande indraget (texten börjar 0,5" in,
     // +0,25" per nivå) görs i `layout_galley` när stycket läggs ut.
-    for pc in &a.pieces {
+    for pc in pcs {
         if !pc.list_marker || pc.range.is_empty() || intersects(&pc.range, &p.reveal) {
             continue;
         }
@@ -650,9 +1054,10 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
         }
     }
     bld.marks.sort_by_key(|m| m.0.start);
-    bld.cuts.extend(leads.keys().copied());
 
-    for pc in &a.pieces {
+    // Slutet på raden med den senast placerade flytande bilden: fler på samma rad är vanliga.
+    let mut float_line_end = 0usize;
+    for pc in pcs {
         let r = pc.range.clone();
         if r.is_empty() {
             continue;
@@ -660,7 +1065,7 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
         let revealed = intersects(&r, &p.reveal);
         let hide = !revealed;
         // Tabellpipor förblir dolda också när markören står i cellen bredvid.
-        let hide = hide || (pc.block == Block::Table && pc.markup && &text[r.clone()] == "|");
+        let hide = hide || (pc.block == Block::Table && pc.markup && (&text[r.clone()] == "|" || markup::is_br_tag(&text[r.clone()])));
         let grid_hdr = if pc.block == Block::Table {
             grid.iter()
                 .find(|t| t.region.start <= r.start && r.start < t.region.end)
@@ -675,6 +1080,12 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
                     // Dold text, men första tecknet reserverar bildens höjd.
                     let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
                     let fam = (p.font_family)(Some(a.defaults.font()), false, false);
+                    if img.align.is_some() && r.start >= float_line_end {
+                        // Flytande bild: osynlig och utan höjd; layouten reserverar rutan vid kanten.
+                        float_line_end = text[r.end..].find('\n').map_or(text.len(), |i| r.end + i);
+                        bld.push(r, &hidden_format(fam));
+                        continue;
+                    }
                     let mut f1 = hidden_format(fam.clone());
                     f1.line_height = Some(h);
                     bld.push(r.start..r.start + first, &f1);
@@ -703,9 +1114,10 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
 
         let fmt = piece_format(pc, hide, grid_hdr, p, &a.defaults);
         // Tomradsbrytningar blir egna sektioner med 8 pt radhöjd.
-        let mut start = r.start;
-        for (off, c) in text[r.clone()].char_indices() {
-            let i = r.start + off;
+        let rc = r.start.max(win.start)..r.end.min(win.end);
+        let mut start = rc.start;
+        for (off, c) in text[rc.clone()].char_indices() {
+            let i = rc.start + off;
             if c == '\n' && (i == 0 || bytes[i - 1] == b'\n') {
                 if start < i {
                     bld.push(start..i, &fmt);
@@ -714,41 +1126,34 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
                 start = i + 1;
             }
         }
-        if start < r.end {
-            bld.push(start..r.end, &fmt);
+        if start < rc.end {
+            bld.push(start..rc.end, &fmt);
         }
     }
 
     // Slå ihop angränsande sektioner med samma format (inte där en sektion har leading_space).
-    let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
+    let mut job = LayoutJob { text: String::new(), ..Default::default() };
     for (range, format) in bld.secs {
-        let lead = leads.get(&range.start).copied().unwrap_or(0.0);
-        if lead == 0.0 {
-            if let Some(last) = job.sections.last_mut() {
-                if last.format == format && last.byte_range.end.0 == range.start {
-                    last.byte_range.end = ByteIndex(range.end);
-                    continue;
-                }
+        if let Some(last) = job.sections.last_mut() {
+            if last.format == format && last.byte_range.end.0 == range.start {
+                last.byte_range.end = ByteIndex(range.end);
+                continue;
             }
         }
         job.sections.push(LayoutSection {
-            leading_space: lead,
+            leading_space: 0.0,
             byte_range: ByteIndex(range.start)..ByteIndex(range.end),
             format,
         });
     }
 
-    if !p.query.is_empty() {
-        let matches = highlight::find_all(text, p.query, p.case_sensitive);
+    {
+        let matches = matches_in(p.matches, &win);
         if !matches.is_empty() {
-            highlight::apply_backgrounds(&mut job, &matches, p.palette, p.current_match);
-            // apply_backgrounds nollar leading_space: sätt tillbaka den.
-            for s in &mut job.sections {
-                s.leading_space = leads.get(&s.byte_range.start.0).copied().unwrap_or(0.0);
-            }
+            highlight::apply_backgrounds(&mut job, matches, p.palette);
         }
     }
-    job
+    job.sections
 }
 
 
@@ -774,6 +1179,34 @@ struct Para {
     image_w: f32,
     /// Dold taggrad (div, standardkommentaren) eller tom rad intill en: ~0 höjd.
     collapse: bool,
+    /// Stycket har en flytande bild (`<img align>`). Layouten reserverar en ruta vid textkanten
+    /// som stycket självt och följande stycken flyter runt.
+    float: Option<FloatSpec>,
+    /// Bildens höjd när en flytande bild som står ensam inte får plats bredvid texten: den får
+    /// en egen rad.
+    reserve: Option<f32>,
+    /// Innehållsförteckning (`<!-- kladd: toc -->`, dold): radens höjd i px, annars 0.
+    toc_h: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatSpec {
+    side: Float,
+    size: Vec2,
+    /// Raden innehåller bara bilden (då kollapsar den).
+    alone: bool,
+}
+
+/// Luft mellan en flytande bild och texten (px vid 100 %).
+const FLOAT_GAP: f32 = 12.0;
+/// Minsta textbredd (px vid 100 %) bredvid en flytande bild; smalare och bilden får en egen rad.
+const FLOAT_MIN_ROOM: f32 = 96.0;
+
+/// Sant om raden som `pc` står på bara innehåller bilden (en flytande bild står ensam).
+fn is_float_line(text: &str, pc: &Piece) -> bool {
+    let ls = text[..pc.range.start].rfind('\n').map_or(0, |i| i + 1);
+    let le = text[pc.range.end..].find('\n').map_or(text.len(), |i| pc.range.end + i);
+    text[ls..le].trim().len() == pc.range.len()
 }
 
 /// Styckena i texten. En avslutande `\n` ger ett tomt sista stycke.
@@ -781,6 +1214,8 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
     // 0 = vanligt stycke, 1 = dold öppningstagg/kommentar, 2 = dold stängningstagg.
     let mut tag: Vec<u8> = Vec::new();
     let mut out: Vec<Para> = Vec::new();
+    // Innehållsförteckningens höjd räknas först när en sådan rad hittas (beror på rubrikerna).
+    let mut toc_h: Option<f32> = None;
     let mut s = 0;
     loop {
         let e = text[s..].find('\n').map_or(text.len(), |i| s + i);
@@ -823,7 +1258,28 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             .filter_map(|img| (p.image_size)(&super::images::size_key(img)))
             .map(|sz| sz.x)
             .sum();
-        out.push(Para { range, align, list, image_w, collapse: tag.last() != Some(&0) });
+        // Första flytande bilden på raden (fler på samma rad är vanliga bilder).
+        let mut float = None;
+        if !intersects(&range, &p.reveal) {
+            let first = ps.iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some()));
+            if let Some((pc, img)) = first.and_then(|pc| pc.image.as_ref().map(|i| (*pc, i))) {
+                float = (p.image_size)(&super::images::size_key(img)).zip(img.align).map(|(size, side)| FloatSpec {
+                    side,
+                    size,
+                    alone: is_float_line(text, pc),
+                });
+            }
+        }
+        let collapse = tag.last() != Some(&0) || float.is_some_and(|f| f.alone);
+        let toc = if tag.last() != Some(&0) && t == super::nav::TOC_LINE {
+            Some(*toc_h.get_or_insert_with(|| {
+                let n = super::nav::toc_entries(&super::nav::headings(text, a)).len();
+                super::nav::toc_size_for(p.zoom, &a.defaults, n).1
+            }))
+        } else {
+            None
+        };
+        out.push(Para { range, align, list, image_w, collapse, toc_h: toc.unwrap_or(0.0), float, reserve: None });
         if e >= text.len() {
             break;
         }
@@ -844,7 +1300,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
 
 /// Utsnitt av `full` för byteintervallet `r`, med sektionerna omräknade till 0. Ett tomt
 /// intervall får en tom sektion med formatet där stycket börjar (det ger radhöjden).
-fn clip_job(full: &LayoutJob, r: Range<usize>) -> LayoutJob {
+pub(super) fn clip_job(full: &LayoutJob, r: Range<usize>) -> LayoutJob {
     let mut j = LayoutJob {
         text: full.text[r.clone()].to_owned(),
         wrap: full.wrap.clone(),
@@ -884,7 +1340,7 @@ fn content_end(row: &egui::epaint::text::Row) -> f32 {
     row.glyphs.iter().rposition(|g| !g.chr.is_whitespace()).map_or(0.0, |i| row.glyphs[i].max_x())
 }
 
-fn is_hidden_format(f: &TextFormat) -> bool {
+pub(super) fn is_hidden_format(f: &TextFormat) -> bool {
     f.font_id.size <= HIDDEN_PX * 2.0
 }
 
@@ -960,12 +1416,97 @@ fn justify_row(
     Some(best)
 }
 
+/// En flytande bild som är aktiv vid ett stycke: sida, upptagen bredd (bild + luft) och
+/// understa kanten i px under styckets överkant.
+pub(crate) type ActiveFloat = (Float, f32, f32);
+
 /// Lägger ut ett stycke och placerar dess rader: hängande indrag, centrering, högerjustering
 /// och marginaljustering.
 fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: f32, ppp: f32) -> Arc<Galley> {
+    layout_piece(fonts, full, para, avail, 0.0, ppp, None, false, true).0
+}
+
+/// Som `layout_para`, men stycket flyter runt flytande bilder: rader vars överkant ligger ovanför
+/// en bilds underkant läggs ut smalare (och förskjuts åt höger vid vänsterbilder); stycket delas
+/// vid första raden som börjar under bilden och resten läggs ut igen med full (eller nästa
+/// bilds) bredd. Alltså per rad, inte per stycke.
+fn layout_para_floats(
+    fonts: &mut FontsView<'_>,
+    full: &LayoutJob,
+    para: &Para,
+    avail: f32,
+    ppp: f32,
+    floats: &[ActiveFloat],
+) -> Arc<Galley> {
+    if floats.is_empty() || para.range.is_empty() || !avail.is_finite() {
+        return layout_para(fonts, full, para, avail, ppp);
+    }
+    let mut pieces: Vec<Arc<Galley>> = Vec::new();
+    let mut cur = para.clone();
+    let mut y = 0.0f32;
+    loop {
+        let act: Vec<&ActiveFloat> = floats.iter().filter(|f| f.2 > y + 0.25).collect();
+        let sum = |side: Float| act.iter().filter(|f| f.0 == side).map(|f| f.1).sum::<f32>();
+        let (lw, rw) = (sum(Float::Left), sum(Float::Right));
+        let cut = act.iter().map(|f| f.2).fold(f32::NEG_INFINITY, f32::max) - y;
+        let eff = (avail - lw - rw).max(24.0);
+        let (g, consumed) =
+            layout_piece(fonts, full, &cur, eff, lw, ppp, act.first().map(|_| cut), !pieces.is_empty(), true);
+        y += g.rect.height();
+        pieces.push(g);
+        let Some(n) = consumed else { break };
+        // Resten av stycket börjar efter de n första tecknen.
+        let text = &full.text[cur.range.clone()];
+        let Some((off, _)) = text.char_indices().nth(n) else { break };
+        cur.range.start += off;
+        cur.list = cur.list.map(|l| ListGeom { marker_chars: 0, ..l });
+        if cur.range.is_empty() {
+            break;
+        }
+    }
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_else(|| unreachable!());
+    }
+    let whole = Arc::new(clip_job(full, para.range.clone()));
+    let mut g = Galley::concat(whole, &pieces, ppp);
+    // Delningen är ingen radbrytning i texten.
+    let mut at = 0;
+    for pc in &pieces[..pieces.len() - 1] {
+        at += pc.rows.len();
+        g.rows[at - 1].ends_with_newline = false;
+    }
+    Arc::new(g)
+}
+
+/// Lägger ut (en del av) ett stycke i bredden `avail` från vänsterkanten `x0`. Med `cut` delas
+/// stycket före första raden vars överkant ligger på eller under `cut`; då är andra delen
+/// antalet tecken som lades ut. `cont` = delen är en fortsättning (ingen första rad med
+/// listmarkör), `last` = delen innehåller styckets sista rad (marginaljustering lämnar den).
+#[allow(clippy::too_many_arguments)]
+fn layout_piece(
+    fonts: &mut FontsView<'_>,
+    full: &LayoutJob,
+    para: &Para,
+    avail: f32,
+    x0: f32,
+    ppp: f32,
+    cut: Option<f32>,
+    cont: bool,
+    last: bool,
+) -> (Arc<Galley>, Option<usize>) {
     let mut pj = clip_job(full, para.range.clone());
     if para.collapse {
-        let h = if para.range.is_empty() { 1.0 } else { HIDDEN_PX };
+        let h = if para.toc_h > 0.0 {
+            para.toc_h
+        } else if para.range.is_empty() {
+            1.0
+        } else {
+            HIDDEN_PX
+        };
+        for s in &mut pj.sections {
+            s.format.line_height = Some(h);
+        }
+    } else if let Some(h) = para.reserve {
         for s in &mut pj.sections {
             s.format.line_height = Some(h);
         }
@@ -978,10 +1519,27 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
     pj.wrap.max_width = wrap_w;
     let mut g = fonts.layout_job(pj.clone());
 
+    let mut consumed = None;
+    let mut last = last;
+    if let Some(cut) = cut {
+        if let Some(idx) = g.rows.iter().position(|r| r.pos.y >= cut - 0.01).filter(|&i| i > 0) {
+            let gm = Arc::make_mut(&mut g);
+            consumed = Some(gm.rows[..idx].iter().map(|r| r.row.glyphs.len()).sum());
+            gm.rows.truncate(idx);
+            gm.rect = Rect::ZERO;
+            gm.mesh_bounds = Rect::NOTHING;
+            for r in &gm.rows {
+                gm.rect |= r.rect();
+                gm.mesh_bounds |= r.row.visuals.mesh_bounds.translate(r.pos.to_vec2());
+            }
+            last = false;
+        }
+    }
+
     let finite = avail.is_finite();
-    let shifts = finite && (list.is_some() || para.align != Align::Left);
+    let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0);
     if !shifts {
-        return g;
+        return (g, consumed);
     }
     let round = |x: f32| (x * ppp).round() / ppp;
     let gm = Arc::make_mut(&mut g);
@@ -992,7 +1550,7 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
         let end = content_end(&row);
         // Radens vänsterkant och bredd som raden ska fylla.
         let left = match list {
-            Some(l) if i == 0 => {
+            Some(l) if i == 0 && !cont => {
                 let prefix = row.glyphs.get(l.marker_chars).map_or(row.size.x, |g| g.pos.x);
                 (l.text_x - prefix).max(0.0)
             }
@@ -1004,27 +1562,88 @@ fn layout_para(fonts: &mut FontsView<'_>, full: &LayoutJob, para: &Para, avail: 
         match para.align {
             Align::Center if list.is_none() => x += ((target - end.max(para.image_w)) / 2.0).max(0.0),
             Align::Right if list.is_none() => x += (target - end.max(para.image_w)).max(0.0),
-            Align::Justify if i + 1 < n => {
+            Align::Justify if i + 1 < n || !last => {
                 if let Some(r) = justify_row(fonts, &pj, char_off, &row, target) {
                     gm.rows[i].row = r;
                 }
             }
             _ => {}
         }
-        gm.rows[i].pos.x = round(x);
+        gm.rows[i].pos.x = round(x + x0);
         char_off += row.glyphs.len();
     }
-    g
+    (g, consumed)
 }
 
 /// Lägger ut hela jobbet stycke för stycke och fogar ihop styckena till ett galleri som
 /// TextEdit kan använda som vilket annat: tecken och markörlägen stämmer med texten.
-pub fn layout_galley(fonts: &mut FontsView<'_>, mut job: LayoutJob, a: &Analysis, p: &Params, wrap_width: f32, ppp: f32) -> Galley {
+pub fn layout_galley(fonts: &mut FontsView<'_>, job: LayoutJob, a: &Analysis, p: &Params, wrap_width: f32, ppp: f32) -> Galley {
+    layout_galley_full(fonts, job, a, p, wrap_width, ppp, None, None).0
+}
+
+/// Tabellernas rutnät för hela texten (i tur och ordning). Mäter med `p.measure`, så anropas
+/// utanför `fonts_mut`; resultatet kan ges till `layout_galley_full`.
+pub fn plan_tables(text: &str, a: &Analysis, p: &Params, wrap_width: f32) -> Vec<TableGeom> {
+    let paras = paragraphs(text, a, p);
+    let grid = tables(text, a);
+    group_paras(text, &paras, &grid)
+        .into_iter()
+        .filter(|g| g.2.is_some())
+        .map(|(pr, _, _)| {
+            let lines: Vec<Range<usize>> = paras[pr].iter().map(|q| q.range.clone()).collect();
+            grid::plan(text, a, &lines, p, wrap_width)
+        })
+        .collect()
+}
+
+/// Som `layout_galley`, men sidbruten enligt `pages` och med tabellernas geometri.
+pub fn layout_galley_full(
+    fonts: &mut FontsView<'_>,
+    mut job: LayoutJob,
+    a: &Analysis,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    pages: Option<&super::pages::Geom>,
+    plans: Option<&[TableGeom]>,
+) -> (Galley, Vec<TableGeom>) {
     job.wrap.max_width = wrap_width;
     let full = Arc::new(job);
     let paras = paragraphs(&full.text, a, p);
-    let galleys: Vec<Arc<Galley>> = paras.iter().map(|para| layout_para(fonts, &full, para, wrap_width, ppp)).collect();
-    Galley::concat(full, &galleys, ppp)
+    let grid = tables(&full.text, a);
+    let min_h = px(p.zoom, a.defaults.size()) * 1.4;
+    let mut galleys: Vec<Arc<Galley>> = Vec::new();
+    let mut geoms = Vec::new();
+    let mut row_groups: Vec<Range<usize>> = Vec::new();
+    let mut row = 0;
+    for (pr, _, tbl) in group_paras(&full.text, &paras, &grid) {
+        let gs: Vec<Arc<Galley>> = if tbl.is_some() {
+            let lines: Vec<Range<usize>> = paras[pr.clone()].iter().map(|q| q.range.clone()).collect();
+            let geom = match plans.and_then(|v| v.get(geoms.len())) {
+                Some(g) => g.clone(),
+                None => grid::plan(&full.text, a, &lines, p, wrap_width),
+            };
+            let gs = layout_table_lines(fonts, &full, &paras[pr.clone()], &geom, p, wrap_width, ppp, min_h);
+            for lg in &gs {
+                if lg.rows.len() > 1 {
+                    row_groups.push(row..row + lg.rows.len());
+                }
+                row += lg.rows.len();
+            }
+            geoms.push(geom);
+            gs
+        } else {
+            let gs: Vec<Arc<Galley>> = paras[pr].iter().map(|para| layout_para(fonts, &full, para, wrap_width, ppp)).collect();
+            row += gs.iter().map(|g| g.rows.len()).sum::<usize>();
+            gs
+        };
+        galleys.extend(gs);
+    }
+    let mut g = Galley::concat(full, &galleys, ppp);
+    if let Some(geom) = pages {
+        super::pages::paginate(&mut g, geom, ppp, &[], &row_groups);
+    }
+    (g, geoms)
 }
 
 #[cfg(test)]
@@ -1047,13 +1666,13 @@ mod tests {
     fn build(text: &str, reveal: Range<usize>, query: &str) -> LayoutJob {
         let pal = theme::palette(false);
         let img = |_: &str| Some(Vec2::new(100.0, 50.0));
+        let matches: Vec<(usize, usize, bool)> =
+            highlight::find_all(text, query, false).into_iter().map(|(a, b)| (a, b, false)).collect();
         let p = Params {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            query,
-            case_sensitive: false,
-            current_match: None,
+            matches: &matches,
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -1139,9 +1758,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &no_img,
             measure: &measure,
             font_family: &fam,
@@ -1166,24 +1783,27 @@ mod tests {
         assert_eq!(sec_at(&job, b - 2).format.color, pal.page_markup);
         assert_eq!(sec_at(&job, t.find("|---").unwrap()).format.color, Color32::TRANSPARENT);
         assert_ne!(sec_at(&job, t.find('1').unwrap()).format.font_id.family, FontFamily::Monospace);
-        // Rutnätet finns kvar (cellmarginalen före texten).
-        assert!(job.sections.iter().any(|s| s.leading_space > 0.0));
         // Även en markering över hela tabellen avslöjar inga pipor.
         let job = build(t, 0..t.len(), "");
         assert_eq!(sec_at(&job, 0).format.color, Color32::TRANSPARENT);
-        assert!(job.sections.iter().any(|s| s.leading_space > 0.0));
+        // `<br>` förblir dold också på markörens rad.
+        let t = "| a<br>b | c |\n|---|---|\n| 1 | 2 |\n";
+        let job = build(t, 0..t.len(), "");
+        assert_eq!(sec_at(&job, t.find("<br>").unwrap()).format.color, Color32::TRANSPARENT);
     }
 
     #[test]
     fn empty_columns_keep_a_minimum_width() {
         let t = "| a |  |\n| --- | --- |\n| 1 |  |\n";
         let job = build(t, 0..0, "");
-        // Pipan efter den tomma cellen skjuts ut minst 3 em.
-        let last = t.find("|\n|").unwrap();
-        assert!(sec_at(&job, last).leading_space >= 3.0 * px(1.0, 11.0), "{}", sec_at(&job, last).leading_space);
         // Den tomma cellen behåller radhöjden så att en helt tom rad syns.
         let blank = t.rfind("|  |").unwrap() + 1;
         assert!(sec_at(&job, blank).format.line_height.unwrap_or(0.0) >= px(1.0, 11.0));
+        // Den tomma kolumnen är minst 3 em bred.
+        with_grid(t, 1000.0, |_, gs, _| {
+            let w = gs[0].col_x[2] - gs[0].col_x[1];
+            assert!(w >= 3.0 * px(1.0, 11.0), "{w}");
+        });
     }
 
     #[test]
@@ -1262,9 +1882,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &no_img,
             measure: &measure,
             font_family: &fam,
@@ -1317,9 +1935,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family,
@@ -1500,6 +2116,70 @@ mod tests {
     }
 
     #[test]
+    fn toc_line_reserves_height_and_headings_map_to_pages() {
+        use crate::word::{nav, pages};
+        let filler = "Brödtext som fyller sidan. ".repeat(12);
+        let mut t = format!("# Början\n\n{}\n\n", nav::TOC_LINE);
+        for i in 0..4 {
+            t.push_str(&format!("## Avsnitt {i}\n\n"));
+            for _ in 0..14 {
+                t.push_str(&format!("{filler}\n\n"));
+            }
+        }
+        t.push_str("### Slut\n\nsista\n");
+        let a = markup::analyze(&t);
+        let heads = nav::headings(&t, &a);
+        let n = nav::toc_entries(&heads).len();
+        assert_eq!(n, 6);
+        let want = nav::toc_size_for(1.0, &a.defaults, n).1;
+        let geom = pages::Geom::new(1.0, &a.defaults);
+        let pg = theme::palette(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let img = |_: &str| None;
+        let run = |reveal: Range<usize>| {
+            let p = Params {
+                palette: &pg,
+                zoom: 1.0,
+                reveal,
+                matches: &[],
+                image_size: &img,
+                measure: &measure,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let job = layout_job(&t, &a, &p);
+            let mut res = None;
+            for _ in 0..2 {
+                let out = ctx.run_ui(Default::default(), |ui| {
+                    let mut g = ui.ctx().fonts_mut(|fo| layout_galley(fo, job.clone(), &a, &p, geom.text_w(), 1.0));
+                    pages::paginate(&mut g, &geom, 1.0, &[], &[]);
+                    let row_h = |needle: &str| {
+                        let c = egui::text::CCursor::new(ci(&t, needle));
+                        g.rows[g.layout_from_cursor(c).row].height()
+                    };
+                    let page_of = |h: &nav::Heading| {
+                        let c = egui::text::CCursor::new(t[..h.start].chars().count());
+                        geom.page_of(g.pos_from_cursor(c).min.y)
+                    };
+                    res = Some((row_h("<!-- kladd"), heads.iter().map(page_of).collect::<Vec<_>>()));
+                });
+                std::mem::forget(out);
+            }
+            res.unwrap()
+        };
+        let (h, pages_of) = run(0..0);
+        assert!((h - want).abs() < 0.5, "{h} != {want}");
+        assert_eq!(pages_of[0], 0);
+        assert!(pages_of.windows(2).all(|w| w[0] <= w[1]), "{pages_of:?}");
+        assert!(*pages_of.last().unwrap() >= 3, "{pages_of:?}");
+        // Markören på raden visar kommentaren i stället (vanlig radhöjd).
+        let at = t.find("<!-- kladd").unwrap();
+        let (h2, _) = run(at..at + 5);
+        assert!(h2 < 40.0, "{h2}");
+    }
+
+    #[test]
     fn span_font_size_color_and_background() {
         let t = "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt -->\n\nStandard <span style=\"font-family: Arial; font-size: 16pt; color: #FF0000; background-color: #FFFF00\">röd</span> slut\n\n# Rubrik <span style=\"color: #0000FF\">blå</span>\n";
         let times = FontFamily::Name("times".into());
@@ -1515,9 +2195,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &ff,
@@ -1541,7 +2219,9 @@ mod tests {
         assert_eq!(b.format.color, Color32::from_rgb(0, 0, 255));
         assert_eq!(b.format.font_id.size, px(1.0, 18.0));
         // Sökträffar går före markeringsfärgen.
-        let mut q = Params { query: "röd", ..p };
+        let found: Vec<(usize, usize, bool)> =
+            highlight::find_all(t, "röd", false).into_iter().map(|(a, b)| (a, b, false)).collect();
+        let mut q = Params { matches: &found, ..p };
         q.palette = &pal;
         let job = Cache::default().job(1, t, &q);
         assert_eq!(sec_at(&job, t.find("röd").unwrap()).format.background, pal.match_bg);
@@ -1590,9 +2270,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -1615,7 +2293,7 @@ mod tests {
         }
         assert_eq!(res, vec![true, false]);
         c.forget(1);
-        assert!(c.galleys.is_empty());
+        assert!(c.docs.is_empty());
     }
 
     #[test]
@@ -1634,47 +2312,334 @@ mod tests {
         // Avgränsarraden kollapsar, även radbrytningen.
         let d = t.find("| ---").unwrap();
         assert_eq!(sec_at(&job, d).format.line_height, Some(px(1.0, 1.0)));
-        // Cellmarginal före texten; pipan efter den smalare cellen skjuts ut.
+        // Kolumnerna är innehållets bredd plus cellmarginal; texten efter tabellen är orörd.
         let pad = px(1.0, CELL_PAD_PT);
-        assert_eq!(sec_at(&job, namn - 1).leading_space, pad);
-        let pipe2 = t.find("| Id").unwrap();
-        let w_alex = measure("Alexandra", FontId::default());
-        let w_namn = measure("Namn", FontId::default());
-        assert!((sec_at(&job, pipe2).leading_space - (w_alex - w_namn + pad)).abs() < 0.01);
-        // Texten efter tabellen är orörd.
-        assert_eq!(sec_at(&job, t.find("efter").unwrap()).leading_space, 0.0);
+        with_grid(t, 1000.0, |_, gs, _| {
+            let g = &gs[0];
+            assert_eq!(g.cols(), 2);
+            assert!(g.col_x[1] > 2.0 * pad + 40.0 && g.col_x[1] < 200.0, "{:?}", g.col_x);
+            assert!(g.col_x[2] - g.col_x[1] > 2.0 * pad, "{:?}", g.col_x);
+            assert_eq!(g.rows.len(), 2);
+            assert_eq!(g.delim, Some(t.find("| ---").unwrap()..t.find("| ---").unwrap() + 13));
+        });
     }
 
-    #[test]
-    fn table_columns_align_in_galley() {
+    /// Lägger ut `text` som i dokumentläget (sidbruten om `pages`) och ger galleriet, tabellernas
+    /// geometri och texten till `f`. Mäter kolumner med verkligt typsnitt.
+    fn with_grid<R>(text: &str, wrap: f32, f: impl FnOnce(&Galley, &[grid::TableGeom], &LayoutJob) -> R) -> R {
+        with_grid_paged(text, wrap, None, f)
+    }
+
+    fn with_grid_paged<R>(
+        text: &str,
+        wrap: f32,
+        pages: Option<&super::super::pages::Geom>,
+        f: impl FnOnce(&Galley, &[grid::TableGeom], &LayoutJob) -> R,
+    ) -> R {
         let pal = theme::palette(false);
-        let t = "| A | Bee |\n| --- | --- |\n| Mycket långt | d |\n";
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
-        let meas = |s: &str, f: FontId| -> f32 {
-            let out = ctx.run_ui(Default::default(), |_| {});
-            std::mem::forget(out);
-            ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x)
-        };
+        let meas = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
         let p = Params {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &no_img,
             measure: &meas,
             font_family: &fam,
             fonts_gen: 0,
         };
-        let job = layout_job(t, &markup::analyze(t), &p);
-        let ci = |needle: &str| t[..t.find(needle).unwrap()].chars().count();
-        let (xb, xd) = with_galley(job, |g| {
-            let x = |needle: &str| g.pos_from_cursor(egui::text::CCursor::new(ci(needle))).left();
-            (x("Bee"), x("d |"))
+        let a = markup::analyze(text);
+        let job = layout_job(text, &a, &p);
+        let mut f = Some(f);
+        let mut res = None;
+        for frame in 0..2 {
+            let out = ctx.run_ui(Default::default(), |ui| {
+                let plans = plan_tables(text, &a, &p, wrap);
+                let (g, geoms) =
+                    ui.ctx().fonts_mut(|fo| layout_galley_full(fo, job.clone(), &a, &p, wrap, 1.0, pages, Some(&plans)));
+                if frame == 1 {
+                    res = Some((f.take().unwrap())(&g, &geoms, &job));
+                }
+            });
+            std::mem::forget(out);
+        }
+        res.unwrap()
+    }
+
+    /// Cellens rektangel i galleriet: x från kolumngränserna, y från radens rader.
+    fn cell_rect(text: &str, g: &Galley, t: &grid::TableGeom, row: usize, cell: usize) -> egui::Rect {
+        let idx = grid::GalleyIndex::new(text, g);
+        let (y0, y1) = grid::row_extent(g, &idx, t, row);
+        let (x0, x1) = t.cell_x(&t.rows[row].cells[cell]);
+        egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    }
+
+    const WRAPPING: &str = "| Namn | Beskrivning | Id |\n| --- | --- | --- |\n| Alex | Det här är en riktigt lång cell som måste brytas flera gånger inuti sin kolumn, och därför skriver vi fler ord så att den blir ännu längre än den var förut, och längre än så också | 7 |\n| Bo<br>Cee<br>Dee | kort | 8 |\n\nefter";
+
+    #[test]
+    fn table_cells_wrap_inside_their_column() {
+        with_grid(WRAPPING, 400.0, |g, gs, _| {
+            let t = &gs[0];
+            // Tabellen blir inte bredare än textbredden.
+            assert!(*t.col_x.last().unwrap() <= 400.0 + 0.01, "{:?}", t.col_x);
+            // Den långa cellen bryts: raden är högre än en enkel rad.
+            let idx = grid::GalleyIndex::new(WRAPPING, g);
+            let (h0, h0b) = grid::row_extent(g, &idx, t, 0);
+            let (h1, h1b) = grid::row_extent(g, &idx, t, 1);
+            assert!(h1b - h1 > 2.5 * (h0b - h0), "{} vs {}", h1b - h1, h0b - h0);
+            // Alla cellens rader ligger inom kolumnen.
+            let cell = &t.rows[1].cells[1];
+            let (x0, x1) = t.cell_x(cell);
+            let cr = grid::cell_rows(&idx, cell);
+            assert!(cr.len() >= 3, "{cr:?}");
+            for i in cr {
+                let r = &g.rows[i];
+                assert!(r.pos.x >= x0 - 0.01 && r.pos.x + r.row.size.x <= x1 + 0.5, "rad {i}: {} {}", r.pos.x, r.row.size.x);
+            }
+            // Raden är lika hög som den högsta cellen: nästa rad börjar där den slutar.
+            assert!((h1b - h1) > 0.0 && (grid::row_extent(g, &idx, t, 2).0 - h1b).abs() < 1.0);
         });
-        assert!((xb - xd).abs() < 1.5, "kolumn 2 linjerar inte: {xb} vs {xd}");
+    }
+
+    #[test]
+    fn table_br_breaks_lines_in_a_cell() {
+        with_grid(WRAPPING, 400.0, |g, gs, _| {
+            let t = &gs[0];
+            let idx = grid::GalleyIndex::new(WRAPPING, g);
+            let cell = &t.rows[2].cells[0];
+            let cr = grid::cell_rows(&idx, cell);
+            let cr_start = cr.start;
+            assert_eq!(cr.len(), 3);
+            let ys: Vec<f32> = cr.clone().map(|i| g.rows[i].pos.y).collect();
+            assert!(ys[0] < ys[1] && ys[1] < ys[2], "{ys:?}");
+            let xs: Vec<f32> = cr.map(|i| g.rows[i].pos.x).collect();
+            assert!((xs[0] - xs[1]).abs() < 0.01 && (xs[1] - xs[2]).abs() < 0.01);
+            // Raden är tre rader hög.
+            let (a, b) = grid::row_extent(g, &idx, t, 2);
+            let one = g.rows[cr_start].row.size.y;
+            assert!((b - a - 3.0 * one).abs() < 1.0, "{} {}", b - a, one);
+        });
+    }
+
+    #[test]
+    fn table_char_counts_stay_exact() {
+        for t in [
+            WRAPPING,
+            "| a || b |\n| --- | --- | --- |\n| 1 | 2<br>x | 3 |\n",
+            "A | B\n--|--\n1 | 2\n\nefter",
+            "| ö |\n| - |\n| <br> |\n| x<br><br>y |",
+        ] {
+            with_grid(t, 300.0, |g, _, job| {
+                let total: usize = g.rows.iter().map(|r| r.char_count_including_newline().0).sum();
+                assert_eq!(total, job.text.chars().count(), "{t:?}");
+                assert_eq!(g.text(), t);
+                // Bara radslut efter hela rader i texten: antalet rader med radslut = antal \n.
+                let nl = g.rows.iter().filter(|r| r.ends_with_newline).count();
+                assert_eq!(nl, t.matches('\n').count(), "{t:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn table_cursor_positions_land_in_their_cell() {
+        with_grid(WRAPPING, 400.0, |g, gs, job| {
+            let t = &gs[0];
+            let text = &job.text;
+            let ci = |b: usize| text[..b].chars().count();
+            let mut checked = 0;
+            for (ri, row) in t.rows.iter().enumerate() {
+                for (k, c) in row.cells.iter().enumerate() {
+                    let rect = cell_rect(text, g, t, ri, k);
+                    // Varje tecken i cellens innehåll (utom dolda taggar).
+                    let br = markup::br_tags(&text[c.seg.clone()]);
+                    for (off, _) in text[c.seg.clone()].char_indices() {
+                        let b = c.seg.start + off;
+                        if br.iter().any(|t| t.contains(&off)) || text[c.seg.clone()].trim().is_empty() {
+                            continue;
+                        }
+                        let r = g.pos_from_cursor(egui::text::CCursor::new(ci(b)));
+                        assert!(
+                            rect.x_range().contains(r.min.x + 0.5) && rect.y_range().contains(r.center().y),
+                            "tecken {b} ({:?}) i ({ri},{k}): {r:?} utanför {rect:?}",
+                            &text[b..b + 1]
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 60, "{checked}");
+        });
+    }
+
+    #[test]
+    fn table_hit_round_trips_every_character() {
+        with_grid(WRAPPING, 400.0, |g, gs, job| {
+            let text = &job.text;
+            let t = &gs[0];
+            let idx = grid::GalleyIndex::new(text, g);
+            let ci = |b: usize| text[..b].chars().count();
+            let mut checked = 0;
+            for row in &t.rows {
+                for c in &row.cells {
+                    let br = markup::br_tags(&text[c.seg.clone()]);
+                    for (off, ch) in text[c.seg.clone()].char_indices() {
+                        let b = c.seg.start + off;
+                        if ch == ' ' || br.iter().any(|t| t.contains(&off)) {
+                            continue;
+                        }
+                        // Mitt i tecknets ruta.
+                        let cc = |i: usize| {
+                            let mut c = egui::text::CCursor::new(i);
+                            c.prefer_next_row = true;
+                            c
+                        };
+                        let r = g.pos_from_cursor(cc(ci(b)));
+                        let next = g.pos_from_cursor(cc(ci(b) + 1));
+                        // Ligaturer (Carlitos "ti") ger andra tecknet bredd noll: det går inte att peka på.
+                        if (next.min.y - r.min.y).abs() < 1.0 && (next.min.x - r.min.x).abs() < 0.01 {
+                            continue;
+                        }
+                        let x = if (next.min.y - r.min.y).abs() < 1.0 { r.min.x + (next.min.x - r.min.x) * 0.25 } else { r.min.x + 0.5 };
+                        let got = grid::hit(g, &idx, t, Vec2::new(x, r.center().y));
+                        assert_eq!(got, Some(b), "tecken {b} {:?}: r {r:?} next {next:?} x {x}", ch);
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 60, "{checked}");
+            // Utanför tabellen träffar den inte.
+            assert_eq!(grid::hit(g, &idx, t, Vec2::new(10.0, -20.0)), None);
+            assert_eq!(grid::hit(g, &idx, t, Vec2::new(10.0, 5000.0)), None);
+            // Mellan kolumnerna och till höger om tabellen hamnar den i närmaste cell.
+            let h = grid::hit(g, &idx, t, Vec2::new(399.0, 5.0)).unwrap();
+            assert!(t.rows[0].cells.last().unwrap().seg.contains(&h) || h == t.rows[0].cells.last().unwrap().seg.end);
+        });
+    }
+
+    #[test]
+    fn table_up_down_moves_between_cells_and_out() {
+        let text = format!("före\n\n{WRAPPING}");
+        with_grid(&text, 400.0, |g, gs, job| {
+            let text = &job.text;
+            let t = &gs[0];
+            let at = |needle: &str| text.find(needle).unwrap();
+            // Ned från "Alex" (rad 1, kolumn 0) hamnar i "Bo" (rad 2, kolumn 0).
+            let b = grid::vertical(text, g, gs, at("Alex") + 1, false).unwrap();
+            assert!(t.rows[2].cells[0].seg.contains(&b), "{b} {:?}", t.rows[2].cells[0]);
+            // Upp därifrån tillbaka.
+            let b2 = grid::vertical(text, g, gs, b, true).unwrap();
+            assert!(t.rows[1].cells[0].seg.contains(&b2) || b2 == t.rows[1].cells[0].seg.end);
+            // I den långa cellen går Ned rad för rad inuti cellen innan den lämnar den.
+            let long = &t.rows[1].cells[1];
+            let first = at("Det här") + 2;
+            let mut pos = first;
+            let mut steps = 0;
+            loop {
+                let n = grid::vertical(text, g, gs, pos, false).unwrap();
+                if !long.seg.contains(&n) && n != long.seg.end {
+                    assert!(t.rows[2].cells[1].seg.contains(&n) || n == t.rows[2].cells[1].seg.end, "{n}");
+                    break;
+                }
+                assert!(n > pos, "fastnade vid {pos}");
+                pos = n;
+                steps += 1;
+                assert!(steps < 20);
+            }
+            assert!(steps >= 2, "{steps}");
+            // I "Bo<br>Cee<br>Dee": Ned flyttar mellan delarna, aldrig in i taggen.
+            let bo = at("Bo");
+            let n1 = grid::vertical(text, g, gs, bo, false).unwrap();
+            assert_eq!(&text[n1..n1 + 3], "Cee");
+            let n2 = grid::vertical(text, g, gs, n1, false).unwrap();
+            assert_eq!(&text[n2..n2 + 3], "Dee");
+            // Från sista raden ned: ut ur tabellen till raden efter.
+            let out = grid::vertical(text, g, gs, at("Dee"), false).unwrap();
+            assert!(out > t.region.end, "{out} {}", t.region.end);
+            // Från första raden upp: ut till raden före.
+            let up = grid::vertical(text, g, gs, at("Namn") + 1, true).unwrap();
+            assert!(up < t.region.start, "{up}");
+            // Utanför en tabell: ingen träff.
+            assert_eq!(grid::vertical(text, g, gs, 1, false), None);
+        });
+    }
+
+    #[test]
+    fn table_up_down_at_document_edges_stays() {
+        let t = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        with_grid(t, 400.0, |g, gs, job| {
+            let text = &job.text;
+            assert_eq!(grid::vertical(text, g, gs, 2, true), Some(2));
+            let last = text.rfind('2').unwrap();
+            assert_eq!(grid::vertical(text, g, gs, last, false), Some(last));
+        });
+    }
+
+    #[test]
+    fn table_dash_counts_set_proportional_widths() {
+        let t = "| A | B | C |\n| ---- | -- | -- |\n| x | y | z |\n";
+        with_grid(t, 400.0, |_, gs, _| {
+            let w: Vec<f32> = gs[0].col_x.windows(2).map(|p| p[1] - p[0]).collect();
+            assert!((w.iter().sum::<f32>() - 400.0).abs() < 0.01, "{w:?}");
+            assert!((w[0] / w[1] - 2.0).abs() < 0.01 && (w[1] - w[2]).abs() < 0.01, "{w:?}");
+        });
+        // Lika många streck: automatisk bredd (innehållets), alltså smalare än texten.
+        let t = "| A | B | C |\n| --- | --- | --- |\n| x | y | z |\n";
+        with_grid(t, 400.0, |_, gs, _| assert!(*gs[0].col_x.last().unwrap() < 200.0, "{:?}", gs[0].col_x));
+    }
+
+    #[test]
+    fn table_merged_cell_spans_columns() {
+        let t = "| Rubrik över två || x |\n| --- | --- | --- |\n| a | b | c |\n";
+        with_grid(t, 600.0, |g, gs, job| {
+            let tg = &gs[0];
+            assert_eq!(tg.cols(), 3);
+            let head = &tg.rows[0].cells;
+            assert_eq!(head.len(), 2);
+            assert_eq!((head[0].col, head[0].span), (0, 2));
+            assert_eq!((head[1].col, head[1].span), (2, 1));
+            // Den sammanfogade cellens rektangel täcker kolumn 0 och 1.
+            let r = cell_rect(&job.text, g, tg, 0, 0);
+            assert!((r.right() - tg.col_x[2]).abs() < 0.01 && r.left() == 0.0);
+            // Rubriktexten ryms utan att bryta (kolumnerna växer tillsammans).
+            let idx = grid::GalleyIndex::new(&job.text, g);
+            assert_eq!(grid::cell_rows(&idx, &head[0]).len(), 1);
+            // Brödraden har tre celler och kolumn 3 ligger på samma x som "x".
+            assert_eq!(tg.rows[1].cells.len(), 3);
+        });
+    }
+
+    #[test]
+    fn table_columns_align_in_galley() {
+        let t = "| A | Bee |\n| --- | --- |\n| Mycket långt | d |\n";
+        with_grid(t, 600.0, |g, gs, _| {
+            let ci = |needle: &str| t[..t.find(needle).unwrap()].chars().count();
+            let x = |needle: &str| g.pos_from_cursor(egui::text::CCursor::new(ci(needle))).left();
+            let (xb, xd) = (x("Bee"), x("d |"));
+            assert!((xb - xd).abs() < 1.5, "kolumn 2 linjerar inte: {xb} vs {xd}");
+            assert!((xb - (gs[0].col_x[1] + px(1.0, CELL_PAD_PT))).abs() < 1.5);
+        });
+    }
+
+    #[test]
+    fn table_rows_page_break_as_a_unit() {
+        use super::super::pages;
+        // Många höga rader (långa celler) över flera sidor: en tabellrads celler hamnar på samma sida.
+        let mut t = String::from("| A | B |\n| --- | --- |\n");
+        for i in 0..40 {
+            t.push_str(&format!("| rad {i} | {} |\n", "ord ".repeat(30)));
+        }
+        let geom = pages::Geom::new(1.0, &markup::analyze(&t).defaults);
+        with_grid_paged(&t, geom.text_w(), Some(&geom), |g, gs, job| {
+            assert!(pages::page_count(g, &geom) >= 2, "{}", pages::page_count(g, &geom));
+            let idx = grid::GalleyIndex::new(&job.text, g);
+            for r in 0..gs[0].rows.len() {
+                let rows = idx.rows(idx.chr(gs[0].rows[r].line.start), idx.chr(gs[0].rows[r].line.end));
+                let pages_of: std::collections::BTreeSet<usize> = rows.map(|i| geom.page_of(g.rows[i].pos.y)).collect();
+                assert_eq!(pages_of.len(), 1, "rad {r} delades: {pages_of:?}");
+            }
+        });
     }
 
     #[test]
@@ -1685,9 +2650,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -1704,5 +2667,131 @@ mod tests {
         assert_ne!(a.sections[1].format.color, d.sections[1].format.color);
         c.forget(1);
         assert!(c.jobs.is_empty());
+    }
+
+    /// Rad för rad: (position, antal tecken, ends_with_newline).
+    fn shape(g: &Galley) -> Vec<(i32, i32, usize, bool)> {
+        g.rows
+            .iter()
+            .map(|r| {
+                (
+                    (r.pos.x * 100.0).round() as i32,
+                    (r.pos.y * 100.0).round() as i32,
+                    r.char_count_including_newline().0,
+                    r.ends_with_newline,
+                )
+            })
+            .collect()
+    }
+
+    const EXTRA: &str = "> Ett citat\n> andra raden\n\n```\nkod ** inte fet\n\nkod två\n```\n\n<div align=\"center\">\n\nMitten **fet**\n\n</div>\n\n<div align=\"justify\">\n\nLorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua\n\n</div>\n\n1. ett\n2. två\n    - nästlat\n\n";
+
+    /// Det inkrementella galleriet (styckecache, med markörrader och sökträffar) ska vara
+    /// identiskt med en full omläggning efter slumpmässiga ändringar.
+    #[test]
+    fn incremental_layout_equals_full_layout() {
+        use super::super::{bench, pages};
+        let pal = theme::palette(false);
+        let img = |_: &str| None;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut rng = bench::Rng(12345);
+        let mut text = format!("{EXTRA}{}", bench::big_markdown(40_000, 3));
+        let mut cache = Cache::default();
+        let geom = pages::Geom::new(1.0, &markup::analyze(&text).defaults);
+        let mut checked = 0;
+        for step in 0..40 {
+            if step > 0 {
+                // Slumpad ändring: infoga, ta bort eller klistra in en strukturtecken-rad.
+                let mut at = rng.below(text.len());
+                while !text.is_char_boundary(at) {
+                    at += 1;
+                }
+                match rng.below(5) {
+                    0 => text.insert(at, 'x'),
+                    1 => text.insert_str(at, "**"),
+                    2 => text.insert_str(at, "\n\n"),
+                    3 => text.insert_str(at, "\n| a | b |\n| - | - |\n| c | d |\n"),
+                    _ => {
+                        if let Some(c) = text[at..].chars().next() {
+                            text.replace_range(at..at + c.len_utf8(), "");
+                        }
+                    }
+                }
+            }
+            let mut rv = rng.below(text.len());
+            while !text.is_char_boundary(rv) {
+                rv += 1;
+            }
+            let reveal = if step % 3 == 0 { 0..0 } else { super::super::tables::reveal_range(&text, rv..rv) };
+            let mut ms = highlight::find_all(&text, "dokument", false);
+            ms.truncate(50);
+            let matches: Vec<(usize, usize, bool)> = ms.iter().enumerate().map(|(i, m)| (m.0, m.1, i == 3)).collect();
+            let measure_fn = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal,
+                matches: &matches,
+                image_size: &img,
+                measure: &measure_fn,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let a = markup::analyze(&text);
+            let wrap = geom.text_w();
+            let mut inc = None;
+            let mut full = None;
+            let out = ctx.run_ui(Default::default(), |_| {
+                let plans = plan_tables(&text, &a, &p, wrap);
+                let g = cache.galley_paged(&ctx, 1, &text, &p, wrap, Some(&geom));
+                // Andra anropet i samma läge ska träffa bildrutecachen.
+                assert!(Arc::ptr_eq(&g, &cache.galley_paged(&ctx, 1, &text, &p, wrap, Some(&geom))));
+                inc = Some(shape(&g));
+                let job = layout_job(&text, &a, &p);
+                let (f, _) = ctx.fonts_mut(|fo| layout_galley_full(fo, job, &a, &p, wrap, 1.0, Some(&geom), Some(&plans)));
+                full = Some(shape(&f));
+            });
+            std::mem::forget(out);
+            assert_eq!(inc, full, "steg {step}");
+            checked += 1;
+        }
+        assert_eq!(checked, 40);
+    }
+
+    /// Markören som byter rad ska bara lägga om de berörda styckena.
+    #[test]
+    fn caret_move_relayouts_only_two_paragraphs() {
+        let pal = theme::palette(false);
+        let img = |_: &str| None;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let text = (0..200).map(|i| format!("Stycke {i} med **fetstil** och text\n\n")).collect::<String>();
+        let mut cache = Cache::default();
+        let measure_fn = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
+        let mut counts = Vec::new();
+        for reveal in [0..0, 40..41, 80..81] {
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal,
+                matches: &[],
+                image_size: &img,
+                measure: &measure_fn,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let before: Vec<u64> = cache.docs.get(&1).map(|d| d.units.keys().copied().collect()).unwrap_or_default();
+            let out = ctx.run_ui(Default::default(), |_| {
+                cache.galley_paged(&ctx, 1, &text, &p, 500.0, None);
+            });
+            std::mem::forget(out);
+            let after: Vec<u64> = cache.docs[&1].units.keys().copied().collect();
+            counts.push(after.iter().filter(|k| !before.contains(k)).count());
+        }
+        // Första gången läggs allt ut; sedan en ny enhet per berört stycke (det nya, markörens).
+        assert!(counts[0] > 150);
+        assert!(counts[1] <= 3, "{counts:?}");
+        assert!(counts[2] <= 3, "{counts:?}");
     }
 }

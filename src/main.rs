@@ -3,11 +3,14 @@
 mod app;
 mod doc;
 mod docx;
+mod export;
 mod odt;
 mod pdf_read;
 mod pdf_write;
+mod search;
 mod preview;
 mod print;
+mod recovery;
 mod highlight;
 mod icons;
 mod paste;
