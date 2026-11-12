@@ -30,9 +30,8 @@ pub struct Params<'a> {
     pub syntax_hint: &'a str,
     pub palette: &'a Palette,
     pub font_size: f32,
-    pub query: &'a str,
-    pub case_sensitive: bool,
-    pub current_match: Option<usize>,
+    /// Sökträffar som `(start, slut, är_aktuell)` (se `search::highlights`).
+    pub matches: &'a [(usize, usize, bool)],
 }
 
 fn to_color(c: Color32) -> Color {
@@ -158,9 +157,7 @@ impl Highlighter {
         p.syntax_hint.hash(&mut h);
         p.palette.dark.hash(&mut h);
         p.font_size.to_bits().hash(&mut h);
-        p.query.hash(&mut h);
-        p.case_sensitive.hash(&mut h);
-        p.current_match.hash(&mut h);
+        p.matches.hash(&mut h);
         let key = h.finish();
 
         if let Some((k, job)) = self.cache.get(&p.doc_id) {
@@ -235,11 +232,8 @@ impl Highlighter {
             });
         }
 
-        if !p.query.is_empty() {
-            let matches = find_all(text, p.query, p.case_sensitive);
-            if !matches.is_empty() {
-                apply_backgrounds(&mut job, &matches, p.palette, p.current_match);
-            }
+        if !p.matches.is_empty() {
+            apply_backgrounds(&mut job, p.matches, p.palette);
         }
         job
     }
@@ -248,9 +242,8 @@ impl Highlighter {
 /// Delar upp sektionerna så att sökträffar får bakgrundsfärg.
 pub(crate) fn apply_backgrounds(
     job: &mut LayoutJob,
-    matches: &[(usize, usize)],
+    matches: &[(usize, usize, bool)],
     palette: &Palette,
-    current_match: Option<usize>,
 ) {
     let mut out = Vec::with_capacity(job.sections.len() + matches.len() * 2);
     let mut mi = 0;
@@ -263,15 +256,15 @@ pub(crate) fn apply_backgrounds(
         let mut k = mi;
         while pos < e {
             let (next, bg) = match matches.get(k) {
-                Some(&(ma, mb)) if ma <= pos => {
-                    let bg = if current_match == Some(ma) {
+                Some(&(ma, mb, cur)) if ma <= pos => {
+                    let bg = if cur {
                         palette.match_current_bg
                     } else {
                         palette.match_bg
                     };
                     (mb.min(e), Some(bg))
                 }
-                Some(&(ma, _)) => (ma.min(e), None),
+                Some(&(ma, _, _)) => (ma.min(e), None),
                 None => (e, None),
             };
             let mut fmt = sec.format.clone();
@@ -284,7 +277,7 @@ pub(crate) fn apply_backgrounds(
                 format: fmt,
             });
             pos = next;
-            if let Some(&(_, mb)) = matches.get(k) {
+            if let Some(&(_, mb, _)) = matches.get(k) {
                 if mb <= pos {
                     k += 1;
                 }

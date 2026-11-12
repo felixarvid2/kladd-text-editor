@@ -1,6 +1,7 @@
 //! Kladds fönster: flikar, editor, sök, förhandsvisning och dialoger.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use egui::text::{CCursor, CCursorRange};
@@ -23,7 +24,9 @@ fn is_image_path(p: &Path) -> bool {
         .map(|e| e.to_string_lossy().to_lowercase())
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()) || e == "webp")
 }
-use crate::highlight::{Highlighter, Params, find_all};
+use crate::highlight::{Highlighter, Params};
+use crate::search::{self, Apply, DocReplace, FormatFilter, Match, Results};
+use crate::word::markup;
 use crate::icons::{self, Icon};
 use crate::single::{self, Incoming};
 use crate::theme::{self, Palette};
@@ -106,9 +109,31 @@ pub(crate) struct Find {
     pub(crate) query: String,
     pub(crate) replacement: String,
     pub(crate) case_sensitive: bool,
+    pub(crate) whole_word: bool,
+    pub(crate) regex: bool,
+    /// Formatfilter (bara dokumentläget).
+    pub(crate) fmt: FormatFilter,
+    /// Formatering som "Ersätt" lägger på träffen (bara dokumentläget).
+    pub(crate) apply: Option<Apply>,
+    /// Bara formatera träffarna och lämna texten orörd.
+    pub(crate) keep_text: bool,
     /// Byte-start för den aktuella träffen.
     pub(crate) current: Option<usize>,
     pub(crate) focus_query: bool,
+    /// Senaste sökresultatet med nyckel (flik, text, inställningar).
+    cache: Option<(u64, Arc<Results>)>,
+}
+
+impl Find {
+    fn spec(&self, word: bool) -> search::Spec {
+        search::Spec {
+            query: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            regex: self.regex,
+            fmt: if word { self.fmt.clone() } else { FormatFilter::default() },
+        }
+    }
 }
 
 struct Toast {
@@ -629,15 +654,69 @@ impl KladdApp {
         self.focus_editor = true;
     }
 
-    fn seek(&mut self, ctx: &egui::Context, how: Seek) {
+    /// Träffarna för den aktiva fliken (dokumentläget söker i den synliga texten). Cachas tills
+    /// texten eller sökinställningarna ändras.
+    pub(crate) fn search_results(&mut self) -> Arc<Results> {
+        use std::hash::{Hash, Hasher};
+        if !self.find.open {
+            return Arc::default();
+        }
+        let Some(doc) = self.docs.get(self.active) else { return Arc::default() };
+        let word = doc.word_view;
+        let spec = self.find.spec(word);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (doc.id, word).hash(&mut h);
+        doc.text.hash(&mut h);
+        spec.hash(&mut h);
+        let key = h.finish();
+        if let Some((k, r)) = &self.find.cache {
+            if *k == key {
+                return r.clone();
+            }
+        }
+        let r = Arc::new(if word {
+            let a = self.word.analysis(doc.id, &doc.text);
+            search::search_doc(&doc.text, &a, &spec)
+        } else {
+            search::search_text(&doc.text, &spec)
+        });
+        self.find.cache = Some((key, r.clone()));
+        r
+    }
+
+    /// Bakgrundsintervall för editorns layout (tomma när sökningen är stängd).
+    pub(crate) fn search_highlights(&mut self) -> Vec<(usize, usize, bool)> {
+        if !self.find.open {
+            return Vec::new();
+        }
+        let r = self.search_results();
+        search::highlights(&r, self.find.current)
+    }
+
+    /// Markerar träffen i editorn och rullar dit.
+    fn select_match(&mut self, ctx: &egui::Context, m: &Match) {
         let Some(doc) = self.docs.get(self.active) else { return };
-        let matches = find_all(&doc.text, &self.find.query, self.find.case_sensitive);
+        let id = editor_id(doc.id);
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        let (ca, cb) = (byte_to_char(&doc.text, m.start), byte_to_char(&doc.text, m.end));
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(CCursor::new(ca), CCursor::new(cb))));
+        state.store(ctx, id);
+        self.find.current = Some(m.start);
+        self.scroll_to_char = Some(ca);
+    }
+
+    fn seek(&mut self, ctx: &egui::Context, how: Seek) {
+        let results = self.search_results();
+        let matches = &results.matches;
+        let Some(doc) = self.docs.get(self.active) else { return };
         if matches.is_empty() {
             self.find.current = None;
             return;
         }
         let id = editor_id(doc.id);
-        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        let state = TextEditState::load(ctx, id).unwrap_or_default();
         let (sa, sb) = state
             .cursor
             .char_range()
@@ -648,62 +727,104 @@ impl KladdApp {
             .unwrap_or((0, 0));
         let (ba, bb) = (char_to_byte(&doc.text, sa), char_to_byte(&doc.text, sb));
         let pick = match how {
-            Seek::FromSelectionStart => matches.iter().find(|m| m.0 >= ba).or(matches.first()),
+            Seek::FromSelectionStart => matches.iter().find(|m| m.start >= ba).or(matches.first()),
             Seek::Next => {
                 let from = if self.find.current == Some(ba) { bb.max(ba + 1) } else { ba };
-                matches.iter().find(|m| m.0 >= from).or(matches.first())
+                matches.iter().find(|m| m.start >= from).or(matches.first())
             }
-            Seek::Prev => matches.iter().rev().find(|m| m.0 < ba).or(matches.last()),
+            Seek::Prev => matches.iter().rev().find(|m| m.start < ba).or(matches.last()),
         };
-        let &(ma, mb) = pick.expect("minst en träff");
-        let (ca, cb) = (byte_to_char(&doc.text, ma), byte_to_char(&doc.text, mb));
-        state
-            .cursor
-            .set_char_range(Some(CCursorRange::two(CCursor::new(ca), CCursor::new(cb))));
-        state.store(ctx, id);
-        self.find.current = Some(ma);
-        self.scroll_to_char = Some(ca);
+        let m = pick.expect("minst en träff").clone();
+        self.select_match(ctx, &m);
+    }
+
+    /// Hur "Ersätt" ska formatera: bara formatering när "Behåll text" är ikryssad.
+    fn doc_replace_opts<'a>(&self, only: Option<usize>, repl: &'a str) -> DocReplace<'a> {
+        DocReplace { repl, keep_text: self.find.apply.is_some() && self.find.keep_text, apply: self.find.apply, only }
     }
 
     fn replace_one(&mut self, ctx: &egui::Context) {
-        let Some(doc) = self.docs.get_mut(self.active) else { return };
-        let matches = find_all(&doc.text, &self.find.query, self.find.case_sensitive);
-        let current = self
-            .find
-            .current
-            .and_then(|c| matches.iter().copied().find(|m| m.0 == c));
-        if let Some((a, b)) = current {
-            doc.text.replace_range(a..b, &self.find.replacement);
-            doc.on_edited();
-            let after = byte_to_char(&doc.text, a + self.find.replacement.len());
-            let id = editor_id(doc.id);
-            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
-            state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(after))));
-            state.store(ctx, id);
+        let results = self.search_results();
+        let Some(cur) = self.find.current else {
+            self.seek(ctx, Seek::FromSelectionStart);
+            return;
+        };
+        let Some(idx) = results.matches.iter().position(|m| m.start == cur) else {
+            self.seek(ctx, Seek::FromSelectionStart);
+            return;
+        };
+        let repl = self.find.replacement.clone();
+        if self.word_mode() {
+            let o = self.doc_replace_opts(Some(cur), &repl);
+            let keep = o.keep_text;
+            let spec = self.find.spec(true);
+            self.word_edit(ctx, |t, _| {
+                search::replace_doc(t, &spec, &o).map(|r| r.0).unwrap_or(markup::Edit { text: t.to_owned(), sel: 0..0 })
+            });
+            // word_edit tar fokus till editorn; sökfältet ska behålla den.
+            self.focus_editor = false;
+            if keep {
+                // Texten är kvar och matchar fortfarande: gå vidare till nästa träff.
+                let after = self.search_results();
+                let next = after.matches.get(idx + 1).or(after.matches.first()).cloned();
+                if let Some(m) = next {
+                    self.select_match(ctx, &m);
+                }
+                return;
+            }
+        } else {
+            let spec = self.find.spec(false);
+            let Some(doc) = self.docs.get_mut(self.active) else { return };
+            if let Some(r) = search::replace_text(&doc.text, &spec, &repl, Some(cur)) {
+                doc.text = r.text;
+                doc.on_edited();
+                let id = editor_id(doc.id);
+                let after = byte_to_char(&doc.text, r.caret);
+                let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+                state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(after))));
+                state.store(ctx, id);
+            }
             self.find.current = None;
         }
         self.seek(ctx, Seek::FromSelectionStart);
     }
 
     fn replace_all(&mut self, ctx: &egui::Context) {
-        let Some(doc) = self.docs.get_mut(self.active) else { return };
-        let matches = find_all(&doc.text, &self.find.query, self.find.case_sensitive);
-        if matches.is_empty() {
+        if self.search_results().matches.is_empty() {
             return;
         }
-        let mut out = String::with_capacity(doc.text.len());
-        let mut last = 0;
-        for &(a, b) in &matches {
-            out.push_str(&doc.text[last..a]);
-            out.push_str(&self.find.replacement);
-            last = b;
+        let repl = self.find.replacement.clone();
+        let n;
+        let keep = self.find.apply.is_some() && self.find.keep_text && self.word_mode();
+        if self.word_mode() {
+            let o = self.doc_replace_opts(None, &repl);
+            let spec = self.find.spec(true);
+            let mut count = 0;
+            // Ett enda ångra-steg för alla träffar.
+            self.word_edit(ctx, |t, _| match search::replace_doc(t, &spec, &o) {
+                Some((e, c)) => {
+                    count = c;
+                    e
+                }
+                None => markup::Edit { text: t.to_owned(), sel: 0..0 },
+            });
+            self.focus_editor = false;
+            n = count;
+        } else {
+            let spec = self.find.spec(false);
+            let Some(doc) = self.docs.get_mut(self.active) else { return };
+            let Some(r) = search::replace_text(&doc.text, &spec, &repl, None) else { return };
+            doc.text = r.text;
+            doc.on_edited();
+            n = r.count;
         }
-        out.push_str(&doc.text[last..]);
-        doc.text = out;
-        doc.on_edited();
         self.find.current = None;
-        let n = matches.len();
-        let msg = if n == 1 { "Ersatte 1 träff".to_owned() } else { format!("Ersatte {n} träffar") };
+        let msg = match (keep, n) {
+            (true, 1) => "Formaterade 1 träff".to_owned(),
+            (true, n) => format!("Formaterade {n} träffar"),
+            (false, 1) => "Ersatte 1 träff".to_owned(),
+            (false, n) => format!("Ersatte {n} träffar"),
+        };
         self.notify(ctx, msg, false);
     }
 
@@ -1313,12 +1434,7 @@ impl KladdApp {
                 let font_size = self.settings.font_size;
                 let wrap = self.settings.wrap;
                 let line_numbers = self.settings.line_numbers;
-                let (query, case_sensitive) = if self.find.open {
-                    (self.find.query.clone(), self.find.case_sensitive)
-                } else {
-                    (String::new(), false)
-                };
-                let current_match = self.find.current;
+                let matches = self.search_highlights();
                 let scroll_to = self.scroll_to_char.take();
                 let focus = std::mem::take(&mut self.focus_editor);
 
@@ -1352,9 +1468,7 @@ impl KladdApp {
                                 syntax_hint: &hint,
                                 palette: p,
                                 font_size,
-                                query: &query,
-                                case_sensitive,
-                                current_match,
+                                matches: &matches,
                             };
                             let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
                                 let mut job = hl.layout(buf.as_str(), &params);
@@ -1512,13 +1626,13 @@ impl KladdApp {
         if !self.find.open || self.docs.is_empty() {
             return;
         }
-        let width = 430.0f32.min(self.editor_rect.width() - 24.0);
+        let word = self.word_mode();
+        let width = 520.0f32.min(self.editor_rect.width() - 24.0);
         let pos = pos2(self.editor_rect.right() - width - 22.0, self.editor_rect.top() + 12.0);
-        let matches = {
-            let doc = &self.docs[self.active];
-            find_all(&doc.text, &self.find.query, self.find.case_sensitive)
-        };
-        let current_idx = self.find.current.and_then(|c| matches.iter().position(|m| m.0 == c));
+        let results = self.search_results();
+        let matches = &results.matches;
+        let has_search = !self.find.query.is_empty() || (word && !self.find.fmt.is_empty());
+        let current_idx = self.find.current.and_then(|c| matches.iter().position(|m| m.start == c));
 
         egui::Area::new(Id::unique("kladd-find"))
             .order(Order::Foreground)
@@ -1539,7 +1653,7 @@ impl KladdApp {
                             if icons::button(ui, p, chevron, 26.0, false, "Visa ersätt", p.surface).clicked() {
                                 self.find.replace = !self.find.replace;
                             }
-                            let field_w = ui.available_width() - 26.0 * 4.0 - 84.0 - 4.0 * 6.0;
+                            let field_w = ui.available_width() - 26.0 * 6.0 - 84.0 - 4.0 * 8.0;
                             let q = ui.add(
                                 TextEdit::singleline(&mut self.find.query)
                                     .id(Id::unique("kladd-find-query"))
@@ -1547,6 +1661,10 @@ impl KladdApp {
                                     .desired_width(field_w)
                                     .margin(Margin::symmetric(8, 5)),
                             );
+                            if let Some(err) = &results.error {
+                                ui.painter().rect_stroke(q.rect, 4.0, Stroke::new(1.5, p.error), egui::StrokeKind::Inside);
+                                q.clone().on_hover_text(format!("Ogiltigt reguljärt uttryck: {err}"));
+                            }
                             if self.find.focus_query {
                                 q.request_focus();
                                 self.find.focus_query = false;
@@ -1560,7 +1678,9 @@ impl KladdApp {
                                 seek = Some(if back { Seek::Prev } else { Seek::Next });
                                 self.find.focus_query = true;
                             }
-                            let count = if self.find.query.is_empty() {
+                            let count = if results.error.is_some() {
+                                "Ogiltigt".to_owned()
+                            } else if !has_search {
                                 String::new()
                             } else if matches.is_empty() {
                                 "Inga träffar".to_owned()
@@ -1570,11 +1690,24 @@ impl KladdApp {
                                 format!("{} träffar", matches.len())
                             };
                             let (cr, _) = ui.allocate_exact_size(vec2(84.0, 26.0), Sense::hover());
-                            let color = if matches.is_empty() && !self.find.query.is_empty() { p.error } else { p.muted };
+                            let bad = results.error.is_some() || (matches.is_empty() && has_search);
+                            let color = if bad { p.error } else { p.muted };
                             ui.painter().text(cr.center(), Align2::CENTER_CENTER, count, FontId::new(12.0, FontFamily::Proportional), color);
 
+                            let mut toggled = false;
                             if icons::button(ui, p, Icon::CaseSensitive, 26.0, self.find.case_sensitive, "Skilj på stora och små bokstäver", p.surface).clicked() {
                                 self.find.case_sensitive = !self.find.case_sensitive;
+                                toggled = true;
+                            }
+                            if text_toggle(ui, p, "ab", self.find.whole_word, "Hela ord").clicked() {
+                                self.find.whole_word = !self.find.whole_word;
+                                toggled = true;
+                            }
+                            if text_toggle(ui, p, ".*", self.find.regex, "Reguljära uttryck (ersättning kan använda $1 och ${namn})").clicked() {
+                                self.find.regex = !self.find.regex;
+                                toggled = true;
+                            }
+                            if toggled {
                                 self.find.current = None;
                                 seek = Some(Seek::FromSelectionStart);
                             }
@@ -1588,13 +1721,34 @@ impl KladdApp {
                                 self.close_find();
                             }
                         });
+                        if word {
+                            ui.horizontal(|ui| {
+                                ui.add_space(30.0);
+                                let mut fmt = self.find.fmt.clone();
+                                let btn = ui.add(quiet_button(&fmt.label(), p).min_size(vec2(110.0, 26.0)));
+                                let btn = btn.on_hover_text("Sök bara text med vald formatering. Tom sökning hittar all text med formateringen");
+                                Popup::menu(&btn).gap(4.0).width(200.0).show(|ui| format_filter_menu(ui, p, &mut fmt));
+                                if fmt != self.find.fmt {
+                                    self.find.fmt = fmt;
+                                    self.find.current = None;
+                                    seek = Some(Seek::FromSelectionStart);
+                                }
+                                if !self.find.fmt.is_empty() && icons::button(ui, p, Icon::Close, 22.0, false, "Ta bort formatfiltret", p.surface).clicked() {
+                                    self.find.fmt = FormatFilter::default();
+                                    self.find.current = None;
+                                    seek = Some(Seek::FromSelectionStart);
+                                }
+                            });
+                        }
                         let mut do_replace = false;
                         let mut do_replace_all = false;
                         if self.find.replace {
+                            let keep = word && self.find.apply.is_some() && self.find.keep_text;
                             ui.horizontal(|ui| {
                                 ui.add_space(30.0);
                                 let field_w = (ui.available_width() - 74.0 - 104.0 - 16.0).max(80.0);
-                                let r = ui.add(
+                                let r = ui.add_enabled(
+                                    !keep,
                                     TextEdit::singleline(&mut self.find.replacement)
                                         .id(Id::unique("kladd-find-replace"))
                                         .hint_text("Ersätt med")
@@ -1614,6 +1768,24 @@ impl KladdApp {
                                     do_replace_all = true;
                                 }
                             });
+                            if word {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(30.0);
+                                    let label = match self.find.apply {
+                                        None => "Formatera".to_owned(),
+                                        Some(a) => format!("Formatera: {}", apply_label(a)),
+                                    };
+                                    let btn = ui.add(quiet_button(&label, p).min_size(vec2(150.0, 26.0)));
+                                    let btn = btn.on_hover_text("Lägg på formatering på träffen när du ersätter");
+                                    let mut ap = self.find.apply;
+                                    Popup::menu(&btn).gap(4.0).width(200.0).show(|ui| apply_menu(ui, p, &mut ap));
+                                    self.find.apply = ap;
+                                    if self.find.apply.is_some() {
+                                        ui.checkbox(&mut self.find.keep_text, "Behåll text")
+                                            .on_hover_text("Formatera träffarna utan att ändra texten");
+                                    }
+                                });
+                            }
                         }
                         if let Some(s) = seek {
                             self.seek(ctx, s);
@@ -1955,6 +2127,114 @@ pub(crate) fn quiet_button(text: &str, p: &Palette) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(p.text))
         .fill(p.surface_hover)
         .stroke(Stroke::NONE)
+}
+
+/// Liten textknapp som kan vara intryckt (t.ex. ".*" i sökfältet).
+fn text_toggle(ui: &mut Ui, p: &Palette, label: &str, on: bool, tooltip: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let response = response.on_hover_text(tooltip);
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        if hovered {
+            ui.painter().rect_filled(rect, 7.0, p.surface_hover);
+        }
+        let color = if on {
+            p.accent
+        } else if hovered {
+            p.text
+        } else {
+            p.muted
+        };
+        if on {
+            ui.painter().rect_stroke(rect.shrink(1.5), 6.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Inside);
+        }
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::new(13.0, FontFamily::Monospace), color);
+    }
+    response
+}
+
+fn text_color_rows() -> Vec<Vec<(String, [u8; 3])>> {
+    crate::word::view::TEXT_COLORS
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|c| {
+                    let rgb = [(c >> 16) as u8, (c >> 8) as u8, *c as u8];
+                    (crate::style::hex(rgb), rgb)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn highlight_rows() -> Vec<Vec<(String, [u8; 3])>> {
+    let all: Vec<(String, [u8; 3])> = crate::word::view::HIGHLIGHTS
+        .iter()
+        .filter_map(|(id, name)| {
+            let rgb = crate::style::highlight_rgb(id)?;
+            Some((format!("{name} ({})", crate::style::hex(rgb)), rgb))
+        })
+        .collect();
+    vec![all[..8].to_vec(), all[8..].to_vec()]
+}
+
+/// Innehållet i "Format"-menyn i sökfältet: vilken formatering en träff måste ha.
+fn format_filter_menu(ui: &mut Ui, p: &Palette, f: &mut FormatFilter) {
+    ui.checkbox(&mut f.bold, "Fetstil");
+    ui.checkbox(&mut f.italic, "Kursiv");
+    ui.checkbox(&mut f.underline, "Understruken");
+    ui.checkbox(&mut f.strike, "Genomstruken");
+    ui.checkbox(&mut f.highlight, "Markerad");
+    ui.menu_button(if f.color.is_some() { "Textfärg (vald)" } else { "Textfärg" }, |ui| {
+        if let Some(c) = crate::word::view::color_popup(ui, p, "Alla färger", &text_color_rows(), f.color) {
+            f.color = c;
+        }
+    });
+    for n in 1..=3u8 {
+        let mut on = f.heading == Some(n);
+        if ui.checkbox(&mut on, format!("Rubrik {n}")).changed() {
+            f.heading = on.then_some(n);
+        }
+    }
+}
+
+fn apply_label(a: Apply) -> &'static str {
+    match a {
+        Apply::Bold => "Fetstil",
+        Apply::Italic => "Kursiv",
+        Apply::Underline => "Understruken",
+        Apply::Color(_) => "Textfärg",
+        Apply::Highlight(_) => "Markering",
+        Apply::Clear => "Ta bort formatering",
+    }
+}
+
+/// Innehållet i "Formatera"-menyn i ersättningsraden.
+fn apply_menu(ui: &mut Ui, p: &Palette, ap: &mut Option<Apply>) {
+    if ui.selectable_label(ap.is_none(), "Ingen formatering").clicked() {
+        *ap = None;
+        ui.close();
+    }
+    for a in [Apply::Bold, Apply::Italic, Apply::Underline] {
+        if ui.selectable_label(*ap == Some(a), apply_label(a)).clicked() {
+            *ap = Some(a);
+            ui.close();
+        }
+    }
+    ui.menu_button("Textfärg", |ui| {
+        if let Some(Some(c)) = crate::word::view::color_popup(ui, p, "Automatisk", &text_color_rows(), None) {
+            *ap = Some(Apply::Color(c));
+        }
+    });
+    ui.menu_button("Markering", |ui| {
+        if let Some(Some(c)) = crate::word::view::color_popup(ui, p, "Ingen färg", &highlight_rows(), None) {
+            *ap = Some(Apply::Highlight(c));
+        }
+    });
+    if ui.selectable_label(*ap == Some(Apply::Clear), apply_label(Apply::Clear)).clicked() {
+        *ap = Some(Apply::Clear);
+        ui.close();
+    }
 }
 
 pub(crate) fn menu_divider(ui: &mut Ui, p: &Palette) {

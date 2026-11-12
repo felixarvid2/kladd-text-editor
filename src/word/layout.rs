@@ -28,9 +28,8 @@ pub struct Params<'a> {
     pub zoom: f32,
     /// Byteintervall där markup visas (markörens rader); tomt = dölj all markup.
     pub reveal: Range<usize>,
-    pub query: &'a str,
-    pub case_sensitive: bool,
-    pub current_match: Option<usize>,
+    /// Sökträffar som `(start, slut, är_aktuell)` i källtexten (se `search::highlights`).
+    pub matches: &'a [(usize, usize, bool)],
     /// Bildkälla -> visningsstorlek i px (redan zoomad).
     pub image_size: &'a dyn Fn(&str) -> Option<Vec2>,
     /// Textbredd i px för en sträng i ett typsnitt (för tabellkolumner och listindrag).
@@ -68,7 +67,7 @@ impl Cache {
         a
     }
 
-    /// Nyckeln: texthash, reveal, zoom, dark, query, case_sensitive, current_match, typsnittsgeneration.
+    /// Nyckeln: texthash, reveal, zoom, dark, sökträffar, typsnittsgeneration.
     fn job_key(text: &str, p: &Params) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
@@ -76,9 +75,7 @@ impl Cache {
         p.reveal.end.hash(&mut h);
         p.zoom.to_bits().hash(&mut h);
         p.palette.dark.hash(&mut h);
-        p.query.hash(&mut h);
-        p.case_sensitive.hash(&mut h);
-        p.current_match.hash(&mut h);
+        p.matches.hash(&mut h);
         p.fonts_gen.hash(&mut h);
         h.finish()
     }
@@ -738,10 +735,10 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
         });
     }
 
-    if !p.query.is_empty() {
-        let matches = highlight::find_all(text, p.query, p.case_sensitive);
+    {
+        let matches = p.matches;
         if !matches.is_empty() {
-            highlight::apply_backgrounds(&mut job, &matches, p.palette, p.current_match);
+            highlight::apply_backgrounds(&mut job, matches, p.palette);
             // apply_backgrounds nollar leading_space: sätt tillbaka den.
             for s in &mut job.sections {
                 s.leading_space = leads.get(&s.byte_range.start.0).copied().unwrap_or(0.0);
@@ -1047,13 +1044,13 @@ mod tests {
     fn build(text: &str, reveal: Range<usize>, query: &str) -> LayoutJob {
         let pal = theme::palette(false);
         let img = |_: &str| Some(Vec2::new(100.0, 50.0));
+        let matches: Vec<(usize, usize, bool)> =
+            highlight::find_all(text, query, false).into_iter().map(|(a, b)| (a, b, false)).collect();
         let p = Params {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            query,
-            case_sensitive: false,
-            current_match: None,
+            matches: &matches,
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -1139,9 +1136,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &no_img,
             measure: &measure,
             font_family: &fam,
@@ -1262,9 +1257,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &no_img,
             measure: &measure,
             font_family: &fam,
@@ -1317,9 +1310,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family,
@@ -1515,9 +1506,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &ff,
@@ -1541,7 +1530,9 @@ mod tests {
         assert_eq!(b.format.color, Color32::from_rgb(0, 0, 255));
         assert_eq!(b.format.font_id.size, px(1.0, 18.0));
         // Sökträffar går före markeringsfärgen.
-        let mut q = Params { query: "röd", ..p };
+        let found: Vec<(usize, usize, bool)> =
+            highlight::find_all(t, "röd", false).into_iter().map(|(a, b)| (a, b, false)).collect();
+        let mut q = Params { matches: &found, ..p };
         q.palette = &pal;
         let job = Cache::default().job(1, t, &q);
         assert_eq!(sec_at(&job, t.find("röd").unwrap()).format.background, pal.match_bg);
@@ -1590,9 +1581,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -1660,9 +1649,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &no_img,
             measure: &meas,
             font_family: &fam,
@@ -1685,9 +1672,7 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            query: "",
-            case_sensitive: false,
-            current_match: None,
+            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,

@@ -28,14 +28,14 @@ use crate::theme::Palette;
 /// Storlekarna (pt) i storleksväljaren, som i Word.
 const SIZES: [f32; 17] = [8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0];
 /// Words standardfärger för text (första raden) och en rad grå/temafärger.
-const TEXT_COLORS: [[u32; 10]; 2] = [
+pub(crate) const TEXT_COLORS: [[u32; 10]; 2] = [
     [0xC00000, 0xFF0000, 0xFFC000, 0xFFFF00, 0x92D050, 0x00B050, 0x00B0F0, 0x0070C0, 0x002060, 0x7030A0],
     [0x000000, 0x404040, 0x7F7F7F, 0xBFBFBF, 0xFFFFFF, 0x44546A, 0x4472C4, 0xED7D31, 0xA5A5A5, 0x70AD47],
 ];
 const DEFAULT_TEXT_COLOR: [u8; 3] = [0xC0, 0x00, 0x00];
 const DEFAULT_HIGHLIGHT: [u8; 3] = [0xFF, 0xFF, 0x00];
 /// Markeringsfärgerna (Words `w:highlight`) med svenska namn.
-const HIGHLIGHTS: [(&str, &str); 15] = [
+pub(crate) const HIGHLIGHTS: [(&str, &str); 15] = [
     ("yellow", "Gul"),
     ("green", "Grön"),
     ("cyan", "Turkos"),
@@ -157,7 +157,7 @@ fn rgb_color(c: [u8; 3]) -> Color32 {
 
 /// Färgväljare i en meny: "ingen färg"-rad och rader med 16 px stora rutor. `Some(val)` när
 /// något valts (`val` = `None` för den första raden).
-fn color_popup(
+pub(crate) fn color_popup(
     ui: &mut Ui,
     p: &Palette,
     none_label: &str,
@@ -784,12 +784,7 @@ impl KladdApp {
             let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
             let tabs = layout::tables(&self.docs[self.active].text, &analysis);
 
-            let (query, case_sensitive) = if self.find.open {
-                (self.find.query.clone(), self.find.case_sensitive)
-            } else {
-                (String::new(), false)
-            };
-            let current_match = self.find.current;
+            let matches = self.search_highlights();
             let scroll_to = self.scroll_to_char.take();
             // En vald bild tar fokus från texten (annars skulle Delete/Backspace gå dit).
             let focus = std::mem::take(&mut self.focus_editor) && self.wv.img.selected.is_none();
@@ -840,9 +835,7 @@ impl KladdApp {
                     palette: p,
                     zoom: z,
                     reveal: reveal.clone(),
-                    query: &query,
-                    case_sensitive,
-                    current_match,
+                    matches: &matches,
                     image_size: &image_size,
                     measure: &measure,
                     font_family: &font_family,
