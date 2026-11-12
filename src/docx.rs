@@ -2983,6 +2983,23 @@ fn now_w3cdtf() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// Uppdaterar `dcterms:modified` och `cp:lastModifiedBy` i en befintlig core.xml.
+/// `None` om ingen av dem finns (då lämnas delen som den är).
+fn touch_core(xml: &str, now: &str) -> Option<String> {
+    fn set(xml: &str, open_prefix: &str, close: &str, value: &str) -> Option<String> {
+        let start = xml.find(open_prefix)?;
+        let gt = start + xml[start..].find('>')?;
+        if xml[..gt].ends_with('/') {
+            return None;
+        }
+        let end = gt + xml[gt..].find(close)?;
+        Some(format!("{}{value}{}", &xml[..=gt], &xml[end..]))
+    }
+    let a = set(xml, "<dcterms:modified", "</dcterms:modified>", now);
+    let b = set(a.as_deref().unwrap_or(xml), "<cp:lastModifiedBy", "</cp:lastModifiedBy>", "Kladd");
+    b.or(a)
+}
+
 fn core_xml(title: &str, created: &str) -> String {
     let now = now_w3cdtf();
     let mut t = String::new();
@@ -3789,6 +3806,10 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
 
     // ---- formatmallar och numrering: originalen kompletteras bara
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
+    // Senast ändrad: datum och program uppdateras, resten av core.xml lämnas orört.
+    if let Some(core) = src.part("docProps/core.xml").map(decode_xml).and_then(|x| touch_core(&x, &now_w3cdtf())) {
+        replaced.insert("docprops/core.xml".into(), fix_decl(&core).into_bytes());
+    }
     let mut doc_rel_add = writer_rels(&w);
     doc_rel_add.push_str(&extras.rels);
     let mut type_add = std::mem::take(&mut extras.types);
@@ -4626,4 +4647,14 @@ mod manual {
             std::fs::write(o, w.bytes).unwrap();
         }
     }
+    #[test]
+    fn touch_core_updates_modified() {
+        let xml = r#"<cp:coreProperties><dc:title>T</dc:title><cp:lastModifiedBy>Anna</cp:lastModifiedBy><dcterms:modified xsi:type="dcterms:W3CDTF">2020-01-01T00:00:00Z</dcterms:modified></cp:coreProperties>"#;
+        let out = crate::docx::touch_core(xml, "2026-11-12T10:00:00Z").unwrap();
+        assert!(out.contains(r#"<dcterms:modified xsi:type="dcterms:W3CDTF">2026-11-12T10:00:00Z</dcterms:modified>"#));
+        assert!(out.contains("<cp:lastModifiedBy>Kladd</cp:lastModifiedBy>"));
+        assert!(out.contains("<dc:title>T</dc:title>"));
+        assert_eq!(crate::docx::touch_core("<cp:coreProperties/>", "x"), None);
+    }
+
 }
