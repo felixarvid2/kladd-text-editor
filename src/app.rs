@@ -1227,7 +1227,8 @@ impl KladdApp {
                         st.visuals.override_text_color = Some(p.text);
                         ui.set_max_width(680.0f32.min(ui.available_width()));
                         // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
-                        let mut text = std::borrow::Cow::Borrowed(doc.text.as_str());
+                        // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
+                        let mut text: std::borrow::Cow<str> = std::borrow::Cow::Owned(crate::preview::clean(&doc.text));
                         for (name, img) in &doc.images {
                             let enc = name.replace(' ', "%20");
                             let uri = format!("bytes://kladd/{}/{enc}", doc.id);
