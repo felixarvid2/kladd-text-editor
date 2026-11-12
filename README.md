@@ -57,7 +57,7 @@ sudo apt install ./kladd_*.deb
 xattr -dr com.apple.quarantine /Applications/Kladd.app
 ```
 
-På macOS skickar Finder inte filen till programmet när du väljer *Öppna med → Kladd* på en fil. Öppna filerna i stället med *Arkiv → Öppna* eller genom att dra dem till Kladd-fönstret eller ikonen i Dock.
+På macOS går det ännu inte att öppna filer från Finder med *Öppna med* eller genom att dra dem till ikonen i Dock. Öppna dem i stället med *Öppna…* i menyn (`⌘O`) eller genom att dra dem till Kladd-fönstret.
 
 Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
 
