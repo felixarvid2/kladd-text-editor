@@ -160,6 +160,8 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 
 ## Kortkommandon
 
+På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
+
 | Kommando | Funktion |
 |---|---|
 | `Ctrl+T` / `Ctrl+N` | Ny flik |

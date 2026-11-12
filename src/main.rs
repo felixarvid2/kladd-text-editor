@@ -13,6 +13,7 @@ mod print;
 mod recovery;
 mod highlight;
 mod icons;
+mod keys;
 mod paste;
 mod single;
 mod spell;

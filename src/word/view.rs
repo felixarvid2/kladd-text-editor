@@ -406,8 +406,9 @@ impl KladdApp {
         let hit = |m: Modifiers, k: Key| {
             (m.shift || !shift) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
         };
-        let ctrl = Modifiers::CTRL;
-        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
+        // COMMAND = ⌘ på Mac, Ctrl annars (⌘⌥1 för rubriker som i Word för Mac).
+        let ctrl = Modifiers::COMMAND;
+        let ctrl_alt = Modifiers::COMMAND | Modifiers::ALT;
         if hit(ctrl, Key::B) {
             self.word_toggle(ctx, Inline::Bold);
         }

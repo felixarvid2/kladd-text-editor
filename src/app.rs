@@ -912,8 +912,12 @@ impl KladdApp {
         if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() {
             return;
         }
-        let ctrl = Modifiers::CTRL;
-        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        // COMMAND = ⌘ på Mac, Ctrl annars.
+        let ctrl = Modifiers::COMMAND;
+        let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        // Flikbyte med Ctrl+Tab är Ctrl även på Mac.
+        let tab_ctrl = Modifiers::CTRL;
+        let tab_ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
         let hit = |m: Modifiers, k: Key| {
             ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
         };
@@ -940,12 +944,12 @@ impl KladdApp {
         if hit(ctrl, Key::W) && !self.docs.is_empty() {
             self.request_close_tab(self.active);
         }
-        if hit(ctrl_shift, Key::Tab) || hit(ctrl, Key::PageUp) {
+        if hit(tab_ctrl_shift, Key::Tab) || hit(tab_ctrl, Key::PageUp) {
             if !self.docs.is_empty() {
                 self.active = (self.active + self.docs.len() - 1) % self.docs.len();
                 self.focus_editor = true;
             }
-        } else if (hit(ctrl, Key::Tab) || hit(ctrl, Key::PageDown)) && !self.docs.is_empty() {
+        } else if (hit(tab_ctrl, Key::Tab) || hit(tab_ctrl, Key::PageDown)) && !self.docs.is_empty() {
             self.active = (self.active + 1) % self.docs.len();
             self.focus_editor = true;
         }
@@ -2158,7 +2162,7 @@ pub(crate) fn quiet_button(text: &str, p: &Palette) -> egui::Button<'static> {
 /// Liten textknapp som kan vara intryckt (t.ex. ".*" i sökfältet).
 fn text_toggle(ui: &mut Ui, p: &Palette, label: &str, on: bool, tooltip: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-    let response = response.on_hover_text(tooltip);
+    let response = response.on_hover_text(crate::keys::shortcut(tooltip));
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         if hovered {
@@ -2291,7 +2295,7 @@ pub(crate) fn menu_item(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, c
         painter.text(
             pos2(rect.right() - 10.0, rect.center().y),
             Align2::RIGHT_CENTER,
-            shortcut,
+            crate::keys::shortcut(shortcut),
             FontId::new(12.0, FontFamily::Proportional),
             if enabled { p.muted } else { p.faint },
         );
@@ -2308,7 +2312,7 @@ pub(crate) fn status_button(ui: &mut Ui, p: &Palette, text: &str, tooltip: &str)
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, p.muted);
     let size = vec2(galley.size().x + 14.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let resp = resp.on_hover_text(tooltip);
+    let resp = resp.on_hover_text(crate::keys::shortcut(tooltip));
     let color = if resp.hovered() { p.text } else { p.muted };
     if resp.hovered() {
         ui.painter().rect_filled(rect, 5.0, p.surface_hover);
@@ -2336,13 +2340,13 @@ fn welcome_row(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, detail: Op
     let galley = painter.layout_no_wrap(truncate(label, 34), FontId::new(14.5, theme::medium()), label_color);
     let label_w = galley.size().x;
     painter.galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, label_color);
-    let right = if shortcut.is_empty() { detail.unwrap_or("") } else { shortcut };
+    let right = if shortcut.is_empty() { std::borrow::Cow::Borrowed(detail.unwrap_or("")) } else { crate::keys::shortcut(shortcut) };
     if !right.is_empty() {
         let max_chars = ((rect.width() - label_w - 24.0) / 7.0).max(6.0) as usize;
         painter.text(
             pos2(rect.right(), rect.center().y),
             Align2::RIGHT_CENTER,
-            truncate(right, max_chars),
+            truncate(&right, max_chars),
             FontId::new(12.5, FontFamily::Proportional),
             p.muted,
         );
