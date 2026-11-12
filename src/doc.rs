@@ -58,6 +58,8 @@ pub struct Document {
     pub docx_dropped: Vec<&'static str>,
     /// Bilder från ett öppnat Word-dokument, refererade som `bild:namn` i texten.
     pub images: Vec<(String, crate::docx::Image)>,
+    /// Originalpaketet för ett öppnat Word-dokument, så att sparning bara skriver om det som ändrats.
+    pub docx_source: Option<std::sync::Arc<crate::docx::Source>>,
     saved_hash: u64,
     saved_meta: (TextEncoding, LineEnding),
     untitled_index: usize,
@@ -159,6 +161,7 @@ impl Document {
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
+            docx_source: None,
             saved_hash: hash_text(""),
             saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
             untitled_index,
@@ -207,6 +210,7 @@ impl Document {
                 open_note,
                 docx_dropped: loaded.dropped,
                 images: loaded.images,
+                docx_source: None,
                 untitled_index: 0,
             });
         }
@@ -236,6 +240,7 @@ impl Document {
                 }),
                 docx_dropped: loaded.dropped,
                 images: loaded.images,
+                docx_source: loaded.source.map(std::sync::Arc::new),
                 untitled_index: 0,
             });
         }
@@ -260,6 +265,7 @@ impl Document {
                 }),
                 docx_dropped: loaded.dropped,
                 images: loaded.images,
+                docx_source: None,
                 untitled_index: 0,
             });
         }
@@ -291,6 +297,7 @@ impl Document {
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
+            docx_source: None,
             untitled_index: 0,
         })
     }
@@ -317,7 +324,8 @@ impl Document {
         } else if to_word {
             let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let images = &self.images;
-            let written = crate::docx::write(&self.text, &title, &|src| resolve_image(src, &base, images))?;
+            let source = self.docx_source.as_deref();
+            let written = crate::docx::write(&self.text, &title, &|src| resolve_image(src, &base, images), source)?;
             warnings.extend(written.missing_images);
             written.bytes
         } else {

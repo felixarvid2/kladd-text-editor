@@ -1332,7 +1332,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if !comment.is_empty() {
         markdown = format!("{comment}\n\n{markdown}");
     }
-    Ok(Loaded { markdown, images: rd.images, dropped: rd.dropped.list() })
+    Ok(Loaded { source: None, markdown, images: rd.images, dropped: rd.dropped.list() })
 }
 
 // ============================================================== skrivning
