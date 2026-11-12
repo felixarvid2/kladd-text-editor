@@ -128,7 +128,8 @@ enum Block {
     Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align },
     Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
     Code { text: String, indent: f32 },
-    Table { rows: Vec<Vec<Vec<Span>>> },
+    /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
+    Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>> },
     Rule,
     Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float> },
     /// Innehållsförteckning (`<!-- kladd: toc -->`).
@@ -277,7 +278,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         spans.push(Span { text: text.to_owned(), style: style.clone() });
     };
 
-    for ev in Parser::new_ext(md, opts) {
+    let mut table_src: Option<crate::word::markup::TableSrc> = None;
+    for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
         let align = aligns.last().copied().unwrap_or_default();
         style.span = span_stack.iter().fold(SpanStyle::default(), |acc, s| acc.merged(s));
         style.bold = bold > 0;
@@ -341,6 +343,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 }
                 Tag::Table(_) => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                    table_src = Some(crate::word::markup::table_src(md.get(range.clone()).unwrap_or("")));
                     table = Some(Vec::new());
                 }
                 Tag::TableHead | Tag::TableRow => row = Vec::new(),
@@ -390,7 +393,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 TagEnd::Table => {
                     if let Some(rows) = table.take() {
                         if !rows.is_empty() {
-                            blocks.push(Block::Table { rows });
+                            let src = table_src.take().unwrap_or(crate::word::markup::TableSrc { cols: 0, spans: Vec::new(), weights: None });
+                            blocks.push(Block::Table { rows, spans: src.spans, weights: src.weights });
                         }
                     }
                 }
@@ -1202,61 +1206,107 @@ impl<'a> Layout<'a> {
         self.y += h + PARA_GAP;
     }
 
-    fn table(&mut self, rows: &[Vec<Vec<Span>>]) {
+    fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>) {
         self.clear_floats();
         let cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
         let size = self.body * 0.95;
         let pad = 5.0;
-        // Kolumnbredd efter innehållets naturliga bredd, inom sidbredden.
-        let mut natural = vec![24.0f32; cols];
-        for r in rows {
-            for (i, cell) in r.iter().enumerate() {
-                let text: String = cell.iter().map(|s| s.text.as_str()).collect();
-                let w = self.m.width(self.base, size, &text) + 2.0 * pad + 2.0;
-                natural[i] = natural[i].max(w.min(self.cw));
+        let span_of = |ri: usize, ci: usize| spans.get(ri).and_then(|r| r.get(ci)).copied().unwrap_or(1);
+        // Cellens text rad för rad (`<br>` är ett radslut).
+        let widest = |this: &mut Self, cell: &[Span]| -> f32 {
+            let text: String = cell.iter().map(|s| s.text.as_str()).collect();
+            text.split('\n').map(|l| this.m.width(this.base, size, l)).fold(0.0, f32::max)
+        };
+        // Kolumnbredd: antalet streck i avgränsarraden, annars innehållets naturliga bredd inom sidbredden.
+        let widths: Vec<f32> = match weights.filter(|w| w.len() == cols) {
+            Some(w) => {
+                let sum: usize = w.iter().sum();
+                w.iter().map(|&n| self.cw * n as f32 / sum as f32).collect()
             }
-        }
-        let total: f32 = natural.iter().sum();
-        let widths: Vec<f32> = if total <= self.cw {
-            natural
-        } else {
-            natural.iter().map(|w| (w / total * self.cw).max(30.0)).collect()
+            None => {
+                let mut natural = vec![24.0f32; cols];
+                let mut wide: Vec<(usize, usize, f32)> = Vec::new();
+                for (ri, r) in rows.iter().enumerate() {
+                    for (i, cell) in r.iter().enumerate() {
+                        let w = widest(self, cell) + 2.0 * pad + 2.0;
+                        match span_of(ri, i) {
+                            0 => {}
+                            1 => natural[i] = natural[i].max(w.min(self.cw)),
+                            n => wide.push((i, n, w)),
+                        }
+                    }
+                }
+                for (i, n, w) in wide {
+                    let have: f32 = natural.iter().skip(i).take(n).sum();
+                    if have < w {
+                        let add = (w.min(self.cw) - have) / n as f32;
+                        for c in natural.iter_mut().skip(i).take(n) {
+                            *c += add.max(0.0);
+                        }
+                    }
+                }
+                let total: f32 = natural.iter().sum();
+                if total <= self.cw {
+                    natural
+                } else {
+                    // Proportionellt, men ingen kolumn smalare än 30 pt; resten delar på det som blir över.
+                    let mut w: Vec<f32> = natural.iter().map(|w| w / total * self.cw).collect();
+                    let small: f32 = w.iter().filter(|x| **x < 30.0).count() as f32 * 30.0;
+                    let big: f32 = w.iter().filter(|x| **x >= 30.0).sum();
+                    let scale = if big > 0.0 { ((self.cw - small) / big).min(1.0) } else { 1.0 };
+                    for x in &mut w {
+                        *x = if *x < 30.0 { 30.0 } else { *x * scale };
+                    }
+                    w
+                }
+            }
         };
         let line_h = size * LINE;
+        let total_w: f32 = widths.iter().sum();
+        // Cellernas x och bredd (täckta celler utelämnas, ägaren får hela bredden).
+        let cells_of = |ri: usize, len: usize| -> Vec<(usize, f32, f32)> {
+            let mut out = Vec::new();
+            let mut x = 0.0;
+            for ci in 0..len.min(cols) {
+                let n = span_of(ri, ci);
+                let w: f32 = widths.iter().skip(ci).take(n.max(1)).sum();
+                if n > 0 {
+                    out.push((ci, x, w));
+                }
+                x += widths[ci];
+            }
+            out
+        };
         for (ri, r) in rows.iter().enumerate() {
+            let face = if ri == 0 { Face::SansSemi } else { self.base };
+            let layout = cells_of(ri, r.len());
             // Mät radens höjd genom att lägga ut cellerna på en provsida.
             let mut heights = Vec::new();
-            for (ci, cell) in r.iter().enumerate() {
-                let base = if ri == 0 { Face::SansSemi } else { self.base };
-                heights.push(self.cell_height(cell, widths[ci] - 2.0 * pad, size, base));
+            for &(ci, _, w) in &layout {
+                heights.push(self.cell_height(&r[ci], w - 2.0 * pad, size, face));
             }
             let row_h = heights.iter().copied().fold(line_h, f32::max) + 2.0 * pad;
             self.ensure(row_h);
             let top = self.y;
             if ri == 0 {
                 let ml = self.ml;
-                self.page().ops.push(Op::Rect { x: ml, y: top, w: widths.iter().sum(), h: row_h, color: CODE_BG });
+                self.page().ops.push(Op::Rect { x: ml, y: top, w: total_w, h: row_h, color: CODE_BG });
             }
-            let mut x = self.ml;
-            for (ci, w) in widths.iter().enumerate() {
-                if let Some(cell) = r.get(ci) {
-                    self.y = top + pad;
-                    let face = if ri == 0 { Face::SansSemi } else { self.base };
-                    self.text_block(cell, x + pad, w - 2.0 * pad, face, size, INK, false, None);
-                }
-                x += w;
+            for &(ci, x, w) in &layout {
+                self.y = top + pad;
+                let ml = self.ml;
+                self.text_block(&r[ci], ml + x + pad, w - 2.0 * pad, face, size, INK, false, None);
             }
-            // Rutnät
-            let total_w: f32 = widths.iter().sum();
+            // Rutnät: kanter runt varje cell (en sammanfogad cell har inga streck inuti).
             let ml = self.ml;
+            let right = layout.last().map_or(total_w, |&(_, x, w)| x + w);
             let page = self.page();
-            page.ops.push(Op::Line { x1: ml, y1: top, x2: ml + total_w, y2: top, width: 0.6, color: RULE });
-            page.ops.push(Op::Line { x1: ml, y1: top + row_h, x2: ml + total_w, y2: top + row_h, width: 0.6, color: RULE });
-            let mut x = ml;
-            for w in widths.iter().chain(std::iter::once(&0.0)) {
-                page.ops.push(Op::Line { x1: x, y1: top, x2: x, y2: top + row_h, width: 0.6, color: RULE });
-                x += w;
+            page.ops.push(Op::Line { x1: ml, y1: top, x2: ml + right, y2: top, width: 0.6, color: RULE });
+            page.ops.push(Op::Line { x1: ml, y1: top + row_h, x2: ml + right, y2: top + row_h, width: 0.6, color: RULE });
+            for &(_, x, _) in &layout {
+                page.ops.push(Op::Line { x1: ml + x, y1: top, x2: ml + x, y2: top + row_h, width: 0.6, color: RULE });
             }
+            page.ops.push(Op::Line { x1: ml + right, y1: top, x2: ml + right, y2: top + row_h, width: 0.6, color: RULE });
             self.y = top + row_h;
         }
         self.y += PARA_GAP;
@@ -1364,7 +1414,7 @@ impl<'a> Layout<'a> {
                     self.y += if next_is_item { 2.0 } else { PARA_GAP };
                 }
                 Block::Code { text, indent } => self.code(text, *indent),
-                Block::Table { rows } => self.table(rows),
+                Block::Table { rows, spans, weights } => self.table(rows, spans, weights.as_deref()),
                 Block::Rule => {
                     self.clear_floats();
                     self.ensure(16.0);
@@ -1583,6 +1633,80 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lägger ut Markdown och ger sidans ritinstruktioner (för kontroll av tabellernas geometri).
+    fn first_page_ops(md: &str) -> (Vec<(f32, f32, f32, f32)>, Vec<(f32, f32, String)>, f32, f32) {
+        let blocks = parse_blocks(md);
+        let defaults = doc_defaults(md);
+        let resolve = |_: &str| None;
+        let mut lay = Layout::new(&resolve, &defaults);
+        lay.new_page();
+        lay.run(&blocks);
+        let mut vlines = Vec::new();
+        let mut texts = Vec::new();
+        for op in &lay.pages[0].ops {
+            match op {
+                Op::Line { x1, y1, x2, y2, .. } if (x1 - x2).abs() < 0.01 => vlines.push((*x1, *y1, *x2, *y2)),
+                Op::Text { x, y, text, .. } => texts.push((*x, *y, text.clone())),
+                _ => {}
+            }
+        }
+        (vlines, texts, lay.ml, lay.cw)
+    }
+
+    #[test]
+    fn table_columns_follow_dash_counts() {
+        let (v, _, ml, cw) = first_page_ops("| A | B | C |\n| ---- | -- | -- |\n| 1 | 2 | 3 |\n");
+        let mut xs: Vec<f32> = v.iter().map(|l| l.0).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert_eq!(xs.len(), 4, "{xs:?}");
+        assert!((xs[0] - ml).abs() < 0.01 && (xs[3] - (ml + cw)).abs() < 0.01, "{xs:?} {ml} {cw}");
+        let w: Vec<f32> = xs.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!((w[0] / w[1] - 2.0).abs() < 0.01 && (w[1] - w[2]).abs() < 0.01, "{w:?}");
+    }
+
+    #[test]
+    fn table_merged_cells_have_no_inner_border() {
+        let (v, texts, ml, _) = first_page_ops("| Två || x |\n| --- | --- | --- |\n| a | b | c |\n");
+        // Rubrikradens lodräta streck: vänster, mellan sammanfogad cell och x, höger. Brödraden har fyra.
+        let tops: Vec<f32> = {
+            let mut t: Vec<f32> = v.iter().map(|l| l.1).collect();
+            t.sort_by(|a, b| a.total_cmp(b));
+            t.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+            t
+        };
+        assert_eq!(tops.len(), 2, "{tops:?}");
+        let head = v.iter().filter(|l| (l.1 - tops[0]).abs() < 0.01).count();
+        let body = v.iter().filter(|l| (l.1 - tops[1]).abs() < 0.01).count();
+        assert_eq!((head, body), (3, 4), "{v:?}");
+        // Texten i den sammanfogade cellen börjar i första kolumnen och "x" efter den.
+        let tva = texts.iter().find(|t| t.2 == "Två").unwrap();
+        let x = texts.iter().find(|t| t.2 == "x").unwrap();
+        assert!(tva.0 < ml + 10.0 && x.0 > tva.0 + 30.0, "{tva:?} {x:?}");
+    }
+
+    #[test]
+    fn table_cells_wrap_and_break_lines() {
+        let one = first_page_ops("| A | B |\n| --- | --- |\n| kort | kort |\n").0;
+        let height = |v: &[(f32, f32, f32, f32)], row: usize| {
+            let mut t: Vec<&(f32, f32, f32, f32)> = v.iter().collect();
+            t.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let l = t[row * 3];
+            l.3 - l.1
+        };
+        let h1 = height(&one, 1);
+        // `<br>` ger tre rader i cellen.
+        let (v, texts, _, _) = first_page_ops("| A | B |\n| --- | --- |\n| a<br>b<br>c | kort |\n");
+        assert!(height(&v, 1) > 2.0 * h1, "{} vs {h1}", height(&v, 1));
+        let ys: Vec<f32> = ["a", "b", "c"].iter().map(|n| texts.iter().find(|t| t.2 == *n).unwrap().1).collect();
+        assert!(ys[0] < ys[1] && ys[1] < ys[2], "{ys:?}");
+        // Lång text bryts inom sin kolumn i stället för att göra tabellen bredare.
+        let long = "ord ".repeat(60);
+        let (v, _, ml, cw) = first_page_ops(&format!("| A | B |\n| --- | --- |\n| {long} | kort |\n"));
+        assert!(height(&v, 1) > 2.0 * h1, "{}", height(&v, 1));
+        assert!(v.iter().all(|l| l.0 <= ml + cw + 0.01), "tabellen är bredare än texten: {v:?} {ml} {cw}");
+    }
 
     #[test]
     fn writes_a_pdf() {

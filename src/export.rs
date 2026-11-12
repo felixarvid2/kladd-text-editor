@@ -23,9 +23,8 @@ use pulldown_cmark::{html::push_html, Alignment, CowStr, Event, HeadingLevel, Op
 
 use crate::docx::{Image, Written};
 use crate::style::DocDefaults;
+use crate::word::markup;
 
-/// Cell som bara innehåller detta tecken är en sammanfogad cell (`||` i källan).
-const SPAN: &str = "\u{E000}";
 /// Platshållare för innehållsförteckningen medan texten byggs.
 const TOC_MARK: &str = "<!--kladd-toc-->";
 
@@ -200,94 +199,11 @@ pub fn epub(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>
 // Förberedelse
 // ---------------------------------------------------------------------------------------------
 
-/// Grundformat från första raden, och texten med `||` i tabeller utbytta mot markörceller.
+/// Grundformat från första raden, och texten med enhetliga radslut.
 fn prepare(md: &str) -> (String, DocDefaults) {
     let md = md.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let defaults = md.lines().next().and_then(DocDefaults::from_comment).unwrap_or_default();
-    (mark_colspans(&md), defaults)
-}
-
-/// Byter tomma celler utan blanktecken (`||`) i tabellrader mot en cell med bara `SPAN`.
-fn mark_colspans(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut fence: Option<char> = None;
-    for line in text.split_inclusive('\n') {
-        let t = line.trim_start();
-        let marker = if t.starts_with("```") {
-            Some('`')
-        } else if t.starts_with("~~~") {
-            Some('~')
-        } else {
-            None
-        };
-        if let Some(m) = marker {
-            match fence {
-                None => fence = Some(m),
-                Some(f) if f == m => fence = None,
-                _ => {}
-            }
-            out.push_str(line);
-            continue;
-        }
-        let is_delimiter = t.trim().chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'));
-        if fence.is_none() && t.starts_with('|') && t.contains("||") && !is_delimiter {
-            out.push_str(&span_line(line));
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
-}
-
-fn span_line(line: &str) -> String {
-    let (body, nl) = match line.strip_suffix('\n') {
-        Some(b) => (b, "\n"),
-        None => (line, ""),
-    };
-    let indent = body.len() - body.trim_start().len();
-    let trimmed = body.trim_end();
-    let segs = split_row(&trimmed[indent..]);
-    let n = segs.len();
-    let mut s = body[..indent].to_owned();
-    for (i, seg) in segs.iter().enumerate() {
-        if i > 0 {
-            s.push('|');
-        }
-        if i > 0 && i != n - 1 && seg.is_empty() {
-            s.push(' ');
-            s.push_str(SPAN);
-            s.push(' ');
-        } else {
-            s.push_str(seg);
-        }
-    }
-    s.push_str(nl);
-    s
-}
-
-/// Delar en tabellrad vid `|` utanför kodspann och utan `\|`.
-fn split_row(row: &str) -> Vec<String> {
-    let mut segs = vec![String::new()];
-    let mut in_code = false;
-    let mut chars = row.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                let cur = segs.last_mut().unwrap();
-                cur.push(c);
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                }
-            }
-            '`' => {
-                in_code = !in_code;
-                segs.last_mut().unwrap().push(c);
-            }
-            '|' if !in_code => segs.push(String::new()),
-            _ => segs.last_mut().unwrap().push(c),
-        }
-    }
-    segs
+    (md, defaults)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -628,23 +544,30 @@ fn render_table<'a>(
     table_src: &str,
     src: &'a str,
 ) -> String {
+    // Spann och kolumnbredder ur källan (samma tolkning som dokumentläget och övriga format):
+    // en cell utan något blanksteg mellan två `|` täcks av cellen före.
+    let ts = markup::table_src(table_src);
     // Rader: (är rubrikrad, celler).
     let mut rows: Vec<(bool, Vec<Cell>)> = Vec::new();
-    let mut in_head = false;
+    let mut seen = 0usize;
     let mut i = 0;
     while i < evs.len() {
         match &evs[i].0 {
             Event::Start(Tag::TableHead) => {
-                in_head = true;
                 rows.push((true, Vec::new()));
+                seen = 0;
             }
-            Event::End(TagEnd::TableHead) => in_head = false,
-            Event::Start(Tag::TableRow) => rows.push((false, Vec::new())),
+            Event::Start(Tag::TableRow) => {
+                rows.push((false, Vec::new()));
+                seen = 0;
+            }
             Event::Start(Tag::TableCell) => {
                 let end = (i + 1..evs.len()).find(|&j| matches!(evs[j].0, Event::End(TagEnd::TableCell))).unwrap_or(evs.len() - 1);
                 let mapped = map_events(cx, &evs[i + 1..end], src, false);
-                let is_span = matches!(mapped.as_slice(), [Event::Text(t)] if t.as_ref() == SPAN);
+                let covered = ts.spans.get(rows.len().saturating_sub(1)).and_then(|r| r.get(seen)) == Some(&0);
+                seen += 1;
                 if let Some((_, cells)) = rows.last_mut() {
+                    let is_span = covered;
                     if is_span {
                         match cells.last_mut() {
                             Some(last) => last.span += 1,
@@ -662,7 +585,6 @@ fn render_table<'a>(
         }
         i += 1;
     }
-    let _ = in_head;
 
     let widths = col_widths(table_src, aligns.len());
     let mut s = String::new();
@@ -712,23 +634,9 @@ fn render_table<'a>(
 
 /// Kolumnbredder i procent från bindestrecken i avgränsarraden. `None` = automatisk bredd.
 fn col_widths(table_src: &str, cols: usize) -> Option<Vec<String>> {
-    let line = table_src.lines().nth(1)?;
-    let mut parts = split_row(line.trim());
-    if parts.first().is_some_and(|p| p.trim().is_empty()) {
-        parts.remove(0);
-    }
-    if parts.last().is_some_and(|p| p.trim().is_empty()) {
-        parts.pop();
-    }
-    if parts.len() != cols || cols == 0 {
-        return None;
-    }
-    let dashes: Vec<usize> = parts.iter().map(|p| p.chars().filter(|&c| c == '-').count()).collect();
-    if dashes.iter().any(|&d| d == 0) || dashes.iter().all(|&d| d == dashes[0]) {
-        return None;
-    }
-    let total: usize = dashes.iter().sum();
-    Some(dashes.iter().map(|&d| format!("{:.1}", d as f64 * 100.0 / total as f64)).collect())
+    let w = markup::table_src(table_src).weights.filter(|w| w.len() == cols)?;
+    let total: usize = w.iter().sum();
+    Some(w.iter().map(|&d| format!("{:.1}", d as f64 * 100.0 / total as f64)).collect())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1449,6 +1357,35 @@ Slut & tecken < 5. Se [länk](https://exempel.se?a=1&b=2).\n\n\
         let w = html("# Hej\n\n## Hej\n\n### 1. Siffra\n", "x", &resolve).unwrap();
         let s = String::from_utf8(w.bytes).unwrap();
         assert!(s.contains("id=\"hej\"") && s.contains("id=\"hej-2\"") && s.contains("id=\"h-1-siffra\""), "{s}");
+    }
+
+    /// HTML-tabellen ska stämma med Markdown-källans tolkning i `markup::table_src` (samma spann
+    /// och kolumnbredder som dokumentläget, Word, ODT och PDF använder).
+    #[test]
+    fn html_table_matches_shared_table_parsing() {
+        for md in [
+            "| Två || x |\n| ---- | -- | -- |\n| a | b | c |\n| d |||",
+            "| Hela raden |||\n| --- | --- | --- |\n| a | b<br>rad | c |",
+            "| Slutar med två ||\n| -- | -- |\n| a | b |",
+            "A || B\n-|-|-\n1 | 2 | 3",
+        ] {
+            let ts = markup::table_src(md);
+            let s = String::from_utf8(html(md, "x", &resolve).unwrap().bytes).unwrap();
+            let body = &s[s.find("<table").unwrap()..s.find("</table>").unwrap()];
+            let rows: Vec<&str> = body.split("<tr>").skip(1).collect();
+            assert_eq!(rows.len(), ts.spans.len(), "{md}\n{s}");
+            for (r, row) in rows.iter().enumerate() {
+                let spans: Vec<usize> = row
+                    .split("</t")
+                    .filter(|c| c.contains("<td") || c.contains("<th"))
+                    .map(|c| c.split("colspan=\"").nth(1).and_then(|x| x.split('"').next()).and_then(|x| x.parse().ok()).unwrap_or(1))
+                    .collect();
+                let owners: Vec<usize> = ts.spans[r].iter().copied().filter(|&n| n > 0).collect();
+                assert_eq!(spans, owners, "rad {r} i {md}\n{s}");
+            }
+            let cols = body.matches("<col ").count();
+            assert_eq!(cols, if ts.weights.is_some() { ts.cols } else { 0 }, "{md}\n{s}");
+        }
     }
 
     #[test]

@@ -10,12 +10,13 @@ use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
-    Color32,
+    Color32, CursorIcon, Id,
     Align, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
     Modifiers, Key, Panel, Popup, Rect, RectAlign, ScrollArea, Sense, Shape, Stroke, TextBuffer, TextEdit, Ui,
     UiBuilder, Vec2, pos2, vec2,
 };
 
+use super::grid;
 use super::images;
 use super::layout::{self, px};
 use super::pages;
@@ -247,7 +248,11 @@ impl KladdApp {
         }
         let s = byte_to_char(&doc.text, edit.sel.start);
         let e = byte_to_char(&doc.text, edit.sel.end);
-        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(s), CCursor::new(e))));
+        let _ = (s, e);
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            tables::cursor_at(&doc.text, edit.sel.start),
+            tables::cursor_at(&doc.text, edit.sel.end),
+        )));
         state.store(ctx, id);
         self.focus_editor = true;
         self.find.current = None;
@@ -875,7 +880,6 @@ impl KladdApp {
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
             let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
-            let tabs = self.word.tables(doc_id, &self.docs[self.active].text);
             let heads = self.word.headings(doc_id, &self.docs[self.active].text);
             let mut toc_click: Option<usize> = None;
 
@@ -912,6 +916,7 @@ impl KladdApp {
             let mut new_target: Option<Option<SpellTarget>> = None;
             let mut table_menu: Option<bool> = None;
             let mut table_act: Option<TableOp> = None;
+            let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
             let mut open_page_dlg = false;
             let mut fn_jump: Option<usize> = None;
@@ -970,6 +975,66 @@ impl KladdApp {
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
+                // Tabeller: kolumnkanter att dra i, pekarens träffyta och markören i cellens innehåll.
+                let tview = if edited { None } else { word.table_view(doc_id, text) };
+                let mut vtabs: Vec<VisTable> = Vec::new();
+                let mut drag_preview: Option<(f32, f32, f32)> = None;
+                let mut on_edge = false;
+                if let Some((_, geoms)) = &tview {
+                    let idx = grid::GalleyIndex::new(text, &galley);
+                    let clip = ui.clip_rect();
+                    let pad = grid::cell_pad(z);
+                    for (ti, t) in geoms.iter().enumerate() {
+                        if t.rows.is_empty() {
+                            continue;
+                        }
+                        let first = grid::row_extent(&galley, &idx, t, 0);
+                        let last = grid::row_extent(&galley, &idx, t, t.rows.len() - 1);
+                        if gpos.y + last.1 < clip.top() - 4.0 || gpos.y + first.0 > clip.bottom() + 4.0 {
+                            continue;
+                        }
+                        let exts: Vec<(f32, f32)> = (0..t.rows.len()).map(|r| grid::row_extent(&galley, &idx, t, r)).collect();
+                        let (top, bottom) = (gpos.y + first.0, gpos.y + last.1);
+                        for j in 1..t.cols() {
+                            let x = gpos.x + t.col_x[j];
+                            let strip = Rect::from_min_max(pos2(x - 3.0, top), pos2(x + 3.0, bottom));
+                            let r = ui.interact(strip, Id::unique(("kladd-tblcol", doc_id, ti, j)), Sense::click_and_drag());
+                            if r.hovered() || r.dragged() {
+                                ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
+                                on_edge = true;
+                            }
+                            let drag_key = Id::unique("kladd-tblcol-drag");
+                            if r.drag_started() {
+                                let widths: Vec<f32> = (0..t.cols()).map(|k| t.col_x[k + 1] - t.col_x[k]).collect();
+                                // Där knappen trycktes ned (draget kan ha hunnit flytta pekaren före första bildrutan).
+                                let x0 = ui.ctx().input(|i| i.pointer.press_origin()).or(r.interact_pointer_pos()).map_or(x, |p| p.x);
+                                ui.ctx().data_mut(|d| d.insert_temp(drag_key, (t.region.start, j, widths, x0)));
+                            }
+                            if r.dragged() || r.drag_stopped() {
+                                let st = ui.ctx().data(|d| d.get_temp::<(usize, usize, Vec<f32>, f32)>(drag_key));
+                                if let (Some((region, col, widths, x0)), Some(ptr)) = (st, r.interact_pointer_pos()) {
+                                    let min_w = 2.0 * pad + 12.0;
+                                    let dx = (ptr.x - x0).clamp(min_w - widths[col - 1], widths[col] - min_w);
+                                    if r.dragged() {
+                                        drag_preview = Some((x + dx, top, bottom));
+                                    }
+                                    if r.drag_stopped() {
+                                        let mut w = widths.clone();
+                                        w[col - 1] += dx;
+                                        w[col] -= dx;
+                                        let w: Vec<f64> = w.iter().map(|&v| f64::from(v)).collect();
+                                        col_resize = Some((region, markup::dashes_from_widths(&w)));
+                                    }
+                                }
+                                if r.drag_stopped() {
+                                    ui.ctx().data_mut(|d| d.remove::<(usize, usize, Vec<f32>, f32)>(drag_key));
+                                }
+                            }
+                        }
+                        vtabs.push(VisTable { ti, exts });
+                    }
+                    tables::pointer_fix(ui.ctx(), id, text, &galley, gpos, geoms, &out.response, on_edge);
+                }
                 // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
                 tables::fix_caret(ui.ctx(), id, text);
 
@@ -1213,37 +1278,32 @@ impl KladdApp {
                 };
                 img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
 
-                // Tabellrutnät: 1 px kantlinjer vid de dolda pipornas lägen och radgränserna.
-                if !edited {
+                // Tabellrutnät: 1 px kantlinjer runt varje cell, och en förhandsvisning av kolumnkanten som dras.
+                if let Some((_, geoms)) = &tview {
                     let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
-                    let mut conv = ByteToChar::new(text);
-                    let t0 = tabs.partition_point(|t| t.region.end <= vis.start);
-                    for t in tabs[t0..].iter().take_while(|t| t.region.start < vis.end) {
+                    for vt in &vtabs {
+                        let t = &geoms[vt.ti];
                         for (ri, row) in t.rows.iter().enumerate() {
-                            let (Some(&first), Some(&last)) = (row.pipes.first(), row.pipes.last()) else { continue };
-                            if row.delimiter || first == last {
-                                continue;
-                            }
-                            let at = |conv: &mut ByteToChar, b: usize| {
-                                galley.pos_from_cursor(CCursor::new(conv.at(b))).translate(gpos.to_vec2())
-                            };
-                            let rs = at(&mut conv, row.line.start);
-                            let re = at(&mut conv, row.line.end);
-                            let (y0, y1) = (rs.top(), re.bottom());
+                            let (Some(first), Some(last)) = (row.cells.first(), row.cells.last()) else { continue };
+                            let (y0, y1) = (gpos.y + vt.exts[ri].0, gpos.y + vt.exts[ri].1);
                             if y1 < clip.top() || y0 > clip.bottom() {
                                 continue;
                             }
-                            let xs: Vec<f32> = row.pipes.iter().map(|&b| snap(at(&mut conv, b).left())).collect();
-                            for &x in &xs {
+                            for c in &row.cells {
+                                let x = snap(gpos.x + t.cell_x(c).0);
                                 painter.line_segment([pos2(x, snap(y0)), pos2(x, snap(y1))], stroke);
                             }
-                            let (x0, x1) = (xs[0], xs[xs.len() - 1]);
+                            let (x0, x1) = (snap(gpos.x + t.cell_x(first).0), snap(gpos.x + t.cell_x(last).1));
+                            painter.line_segment([pos2(x1, snap(y0)), pos2(x1, snap(y1))], stroke);
                             if ri == 0 {
                                 painter.line_segment([pos2(x0, snap(y0)), pos2(x1, snap(y0))], stroke);
                             }
                             painter.line_segment([pos2(x0, snap(y1)), pos2(x1, snap(y1))], stroke);
                         }
+                    }
+                    if let Some((x, y0, y1)) = drag_preview {
+                        painter.line_segment([pos2(snap(x), y0), pos2(snap(x), y1)], Stroke::new(2.0, p.accent));
                     }
                 }
 
@@ -1301,7 +1361,8 @@ impl KladdApp {
                         }
                     }
                     new_target = Some(found);
-                    table_menu = Some(tables::on_secondary_click(ui.ctx(), id, text, ui.ctx().pointer_interact_pos().map(|pos| char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0))));
+                    let geoms = tview.as_ref().map(|v| v.1.clone()).unwrap_or_default();
+                    table_menu = Some(tables::on_secondary_click(ui.ctx(), id, text, ui.ctx().pointer_interact_pos().map(|pos| tables::byte_at(text, &galley, &geoms, pos - gpos))));
                 }
                 let target = match &new_target {
                     Some(t) => t.clone(),
@@ -1370,6 +1431,9 @@ impl KladdApp {
             }
             if let Some(op) = table_act {
                 self.word_table_op(&ctx, op);
+            }
+            if let Some((at, dashes)) = col_resize {
+                self.word_edit(&ctx, |t, s| markup::table_set_widths(t, at, s, &dashes));
             }
             match spell_act {
                 Some(SpellAct::Replace(r, s)) => {
@@ -1448,6 +1512,12 @@ impl KladdApp {
 }
 
 /// Byteoffset till teckenindex, effektivt för stigande offset.
+/// En tabell som syns: index i `table_view` och överkant/nederkant för varje rad.
+struct VisTable {
+    ti: usize,
+    exts: Vec<(f32, f32)>,
+}
+
 struct ByteToChar<'a> {
     text: &'a str,
     b: usize,

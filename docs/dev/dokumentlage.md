@@ -312,6 +312,15 @@ Gemensamma format (alla moduler ska använda dessa):
   (`layout::Cache::headings`, dokumentläget) eller en radskanning (`nav::headings_scan`, textläget)
   som görs om bara när texten ändrats.
 
+Tabelllayout (`src/word/grid.rs`): varje tabellrad läggs ut som ett galleri per cell (radbredd =
+kolumnbredd − cellmarginal, `<br>` ger ett galleri per del) och cellernas rader placeras bredvid
+varandra med `PlacedRow::pos`; raderna ligger i källordning så teckenräkningen är exakt.
+Sidbrytningen flyttar en tabellrads alla rader tillsammans (`paginate` med `groups`). Eftersom
+raderna överlappar i y duger inte `Galley::cursor_from_pos` och `cursor_up_one_row`: musklick
+(`tables::pointer_fix`) och Upp/Ned (`grid::vertical`) räknas ur tabellens geometri (`TableGeom`).
+Kolumnkanter dras med egna träffytor ovanpå TextEdit; släpp skriver om avgränsarraden
+(`markup::table_set_widths`).
+
 ## Prestanda
 
 Mätt med `cargo test [--release] -- --ignored bench --nocapture --test-threads=1`

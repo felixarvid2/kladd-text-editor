@@ -403,6 +403,9 @@ fn parse(text: &str) -> Parsed {
                         s.object = Some(n);
                         s.markup = true;
                     });
+                } else if is_br_tag(t) && st.get(r.start).is_some_and(|x| x.block == Block::Table) {
+                    // Radbrytning i en tabellcell: dold markup, själva brytningen görs av layouten.
+                    fill(&mut st, r.clone(), |s| s.markup = true);
                 } else if t.eq_ignore_ascii_case("<u>") {
                     html_u.push(r.clone());
                 } else if t.eq_ignore_ascii_case("</u>") {
@@ -1734,6 +1737,93 @@ pub struct TableInfo {
     pub row_lines: Vec<Range<usize>>,
     /// Hela cellen (mellan två `|`, med blanksteg) för varje cell i `rows`.
     pub cell_spans: Vec<Vec<Range<usize>>>,
+    /// Hur många kolumner varje cell i `rows` spänner över: 1 för en vanlig cell, n för en
+    /// sammanfogad (`| a ||` = 2) och 0 för en täckt cell (de extra, tomma cellerna efter den).
+    pub spans: Vec<Vec<usize>>,
+}
+
+impl TableInfo {
+    /// Kolumnen som äger cellen i kolumn `c` på raden `r` (en täckt cell hör till cellen före).
+    pub fn owner(&self, r: usize, c: usize) -> usize {
+        let Some(sp) = self.spans.get(r) else { return c };
+        let mut c = c.min(sp.len().saturating_sub(1));
+        while c > 0 && sp[c] == 0 {
+            c -= 1;
+        }
+        c
+    }
+
+    /// Antal kolumner cellen (rad, kolumn) spänner över (minst 1).
+    pub fn span(&self, r: usize, c: usize) -> usize {
+        self.spans.get(r).and_then(|s| s.get(c)).copied().unwrap_or(1).max(1)
+    }
+}
+
+/// Är `t` en `<br>`-tagg (`<br>`, `<br/>`, `<br />`, versaler tillåtna)?
+pub fn is_br_tag(t: &str) -> bool {
+    let t = t.trim();
+    t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />")
+}
+
+/// Början av en `<br>`-tagg som slutar på `pos`.
+pub fn br_ending_at(text: &str, pos: usize) -> Option<usize> {
+    let before = text.get(..pos)?;
+    let i = before.rfind('<')?;
+    (pos - i <= 6 && is_br_tag(&before[i..])).then_some(i)
+}
+
+/// Slutet av en `<br>`-tagg som börjar på `pos`.
+pub fn br_starting_at(text: &str, pos: usize) -> Option<usize> {
+    let rest = text.get(pos..)?;
+    if !rest.starts_with('<') {
+        return None;
+    }
+    let e = rest.find('>')?;
+    (e <= 5 && is_br_tag(&rest[..=e])).then_some(pos + e + 1)
+}
+
+/// Byteintervallen för `<br>`-taggarna i `s` (cellens text).
+pub fn br_tags(s: &str) -> Vec<Range<usize>> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 < b.len() {
+        if b[i] == b'<' && (b[i + 1] | 0x20) == b'b' && (b[i + 2] | 0x20) == b'r' {
+            if let Some(e) = s[i..].find('>') {
+                if is_br_tag(&s[i..i + e + 1]) {
+                    out.push(i..i + e + 1);
+                    i += e + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Cellerna (området mellan två `|`) på en tabellrad `start..end` i `text`, och om raden
+/// börjar/slutar med `|`.
+pub fn table_line_cells(text: &str, start: usize, end: usize) -> (Vec<Range<usize>>, bool, bool) {
+    let l = parse_tline(text, start, end);
+    (l.segs, l.lead, l.trail)
+}
+
+/// Spann per cell: 1, n för en sammanfogad cell och 0 för täckta celler. En tom cell utan
+/// ett enda blanksteg (`||`) täcks av cellen före.
+pub fn cell_spans(segs: &[Range<usize>]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::with_capacity(segs.len());
+    let mut owner = 0;
+    for (i, s) in segs.iter().enumerate() {
+        if i > 0 && s.start == s.end {
+            out.push(0);
+            out[owner] += 1;
+        } else {
+            out.push(1);
+            owner = i;
+        }
+    }
+    out
 }
 
 /// En rad i en tabell, delad i celler.
@@ -1834,6 +1924,7 @@ fn table_parse(text: &str, pos: usize) -> Option<(TableInfo, Vec<TLine>)> {
             cols: lines[0].segs.len(),
             row_lines: model.iter().map(|l| l.start..l.end).collect(),
             cell_spans: model.iter().map(|l| l.segs.clone()).collect(),
+            spans: model.iter().map(|l| cell_spans(&l.segs)).collect(),
         };
         return Some((info, lines));
     }
@@ -1857,7 +1948,7 @@ fn col_of(segs: &[Range<usize>], pos: usize) -> Option<usize> {
 /// avgränsningsraden). Före första `|` räknas till första cellen, efter sista till sista.
 pub fn table_cell_at(t: &TableInfo, pos: usize) -> Option<(usize, usize)> {
     let r = t.row_lines.iter().position(|l| l.start <= pos && pos <= l.end)?;
-    Some((r, col_of(&t.cell_spans[r], pos)?))
+    Some((r, t.owner(r, col_of(&t.cell_spans[r], pos)?)))
 }
 
 /// Cellens redigerbara område vid `pos`: cellen minus ett blanksteg utfyllnad på varje sida
@@ -1884,8 +1975,8 @@ fn tctx(text: &str, pos: usize) -> Option<TCtx> {
     let pos = floor_boundary(text, pos);
     let (t, lines) = table_parse(text, pos)?;
     let li = lines.iter().position(|l| l.start <= pos && pos <= l.end)?;
-    let col = col_of(&lines[li].segs, pos).unwrap_or(0);
     let row = if li <= 1 { 0 } else { li - 1 };
+    let col = t.owner(row, col_of(&lines[li].segs, pos).unwrap_or(0));
     Some(TCtx { t, lines, li, row, col })
 }
 
@@ -1931,16 +2022,18 @@ pub fn table_next_cell(text: &str, pos: usize, back: bool) -> Option<Edit> {
     let c = tctx(text, pos)?;
     let cols = c.t.cols.max(1);
     let nrows = c.t.rows.len();
+    // Sista cellen som äger en kolumn på raden `r` (täckta celler räknas inte).
+    let last_owner = |r: usize| c.t.owner(r, cols - 1);
     let (tr, tc) = if back {
         if c.col > 0 {
-            (c.row, c.col - 1)
+            (c.row, c.t.owner(c.row, c.col - 1))
         } else if c.row > 0 {
-            (c.row - 1, cols - 1)
+            (c.row - 1, last_owner(c.row - 1))
         } else {
             (0, 0)
         }
-    } else if c.col + 1 < cols {
-        (c.row, c.col + 1)
+    } else if c.col + c.t.span(c.row, c.col) < cols {
+        (c.row, c.col + c.t.span(c.row, c.col))
     } else if c.row + 1 < nrows {
         (c.row + 1, 0)
     } else {
@@ -1983,18 +2076,27 @@ pub fn table_insert_row(text: &str, pos: usize, below: bool) -> Edit {
 /// Markören hamnar i den nya cellen på markörens rad. Utanför en tabell orört.
 pub fn table_insert_col(text: &str, pos: usize, right: bool) -> Edit {
     let Some(c) = tctx(text, pos) else { return unchanged(text, pos) };
-    let idx = if right { c.col + 1 } else { c.col };
+    let idx = if right { c.col + c.t.span(c.row, c.col) } else { c.col };
+    // Bredden på den nya kolumnen: medelvärdet av de andra om kolumnerna har olika bredd.
+    let dash = table_weights(text, &c.t).map_or(3, |w| (w.iter().sum::<usize>() / w.len().max(1)).max(3));
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     for (li, l) in c.lines.iter().enumerate() {
-        let cell = match li {
-            0 => format!("Kolumn {}", c.t.cols + 1),
-            1 => "---".to_string(),
-            _ => String::new(),
-        };
         let m = l.segs.len();
         if m == 0 || idx > m {
             continue;
         }
+        // Står den nya kolumnen inne i en sammanfogad cell blir cellen bredare i stället.
+        let row = if li <= 1 { 0 } else { li - 1 };
+        if li != 1 && idx < m && c.t.spans.get(row).and_then(|s| s.get(idx)) == Some(&0) {
+            let a = l.segs[idx].start;
+            edits.push((a..a, "|".to_string()));
+            continue;
+        }
+        let cell = match li {
+            0 => format!("Kolumn {}", c.t.cols + 1),
+            1 => "-".repeat(dash),
+            _ => String::new(),
+        };
         let e = if idx < m {
             let a = l.segs[idx].start;
             if idx == 0 && !l.lead {
@@ -2043,16 +2145,19 @@ pub fn table_delete_col(text: &str, pos: usize) -> Edit {
         return table_delete(text, pos);
     }
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-    for l in &c.lines {
+    for (li, l) in c.lines.iter().enumerate() {
         let m = l.segs.len();
         if c.col >= m {
             continue;
         }
-        let seg = &l.segs[c.col];
+        // En sammanfogad cell krymper: cellen behålls och en täckt cell tas bort.
+        let row = if li <= 1 { 0 } else { li - 1 };
+        let k = if li != 1 && c.t.span(row, c.col) > 1 && c.col + 1 < m { c.col + 1 } else { c.col };
+        let seg = &l.segs[k];
         edits.push(if m == 1 {
             // Radens enda cell: raden måste finnas kvar.
             (l.c0..l.c1, "|  |".to_string())
-        } else if c.col + 1 < m || l.trail {
+        } else if k + 1 < m || l.trail {
             (seg.start..seg.end + 1, String::new())
         } else {
             (seg.start - 1..l.c1, String::new())
@@ -2074,6 +2179,200 @@ pub fn table_delete(text: &str, pos: usize) -> Edit {
         after = &after[1..];
     }
     Edit { text: format!("{before}{after}"), sel: before.len()..before.len() }
+}
+
+// ---- sammanfogade celler
+
+/// Radens index bland tabellens rader (`lines`) för byteläget, och modellens radindex.
+fn line_of(lines: &[TLine], pos: usize) -> Option<(usize, usize)> {
+    let li = lines.iter().position(|l| l.start <= pos && pos <= l.end)?;
+    Some((li, if li <= 1 { 0 } else { li - 1 }))
+}
+
+/// Sammanfogar de markerade cellerna på en rad till en cell (innehållen skarvas med ett
+/// blanksteg, `|` skrivs för varje extra kolumn). Ligger markeringen i en enda cell (eller är
+/// tom) sammanfogas cellen med nästa. Markeringen måste ligga på en rad; annars orört.
+pub fn table_merge_cells(text: &str, sel: Range<usize>) -> Edit {
+    let (s0, e0) = (floor_boundary(text, sel.start.min(sel.end)), floor_boundary(text, sel.start.max(sel.end)));
+    let nothing = || unchanged(text, s0);
+    let Some((t, lines)) = table_parse(text, s0) else { return nothing() };
+    let (Some((li, row)), Some((lj, _))) = (line_of(&lines, s0), line_of(&lines, e0)) else { return nothing() };
+    if li != lj || li == 1 {
+        return nothing();
+    }
+    let segs = &lines[li].segs;
+    let (Some(a), Some(b)) = (col_of(segs, s0), col_of(segs, e0)) else { return nothing() };
+    let c0 = t.owner(row, a);
+    let mut c1 = t.owner(row, b);
+    if c1 == c0 {
+        c1 = c0 + t.span(row, c0);
+        if c1 >= segs.len() {
+            return nothing();
+        }
+    }
+    let last = (c1 + t.span(row, c1) - 1).min(segs.len() - 1);
+    let parts: Vec<&str> = (c0..=last)
+        .filter(|&k| t.spans[row].get(k).is_some_and(|&n| n > 0))
+        .map(|k| text[seg_content(text, &segs[k])].trim())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let n = last - c0 + 1;
+    // Utan avslutande `|` på raden behövs en pipa till för att sista cellen ska täckas.
+    let pipes = if last + 1 == segs.len() && !lines[li].trail { n } else { n - 1 };
+    let cell = if parts.is_empty() { "  ".to_string() } else { format!(" {} ", parts.join(" ")) };
+    let new = splice(text, &[(segs[c0].start..segs[last].end, format!("{cell}{}", "|".repeat(pipes)))]);
+    with_cell_sel(new, t.range.start, row, c0, s0)
+}
+
+/// Delar en sammanfogad cell vid `pos` i tomma celler (innehållet stannar i den första).
+/// Orört om cellen inte är sammanfogad.
+pub fn table_split_cell(text: &str, pos: usize) -> Edit {
+    let Some(c) = tctx(text, pos) else { return unchanged(text, pos) };
+    let span = c.t.span(c.row, c.col);
+    if c.li == 1 || span <= 1 {
+        return unchanged(text, pos);
+    }
+    let segs = &c.lines[c.li].segs;
+    let edits: Vec<(Range<usize>, String)> = (c.col + 1..(c.col + span).min(segs.len()))
+        .map(|k| (segs[k].start..segs[k].start, "  ".to_string()))
+        .collect();
+    let new = splice(text, &edits);
+    with_cell_sel(new, c.t.range.start, c.row, c.col, pos)
+}
+
+// ---- kolumnbredd
+
+/// Antal `-` per cell i avgränsarraden `line`. `None` om bredderna är lika (automatisk bredd),
+/// någon cell saknar bindestreck eller raden inte är en avgränsarrad.
+pub fn parse_weights(line: &str) -> Option<Vec<usize>> {
+    if !is_table_delim_row(line) {
+        return None;
+    }
+    let l = parse_tline(line, 0, line.len());
+    let w: Vec<usize> = l.segs.iter().map(|s| line[s.clone()].bytes().filter(|&c| c == b'-').count()).collect();
+    (w.len() > 1 && w.iter().all(|&n| n > 0) && w.iter().any(|&n| n != w[0])).then_some(w)
+}
+
+/// Kolumnernas relativa bredd (antal bindestreck i avgränsarraden); `None` = automatisk bredd.
+pub fn table_weights(text: &str, t: &TableInfo) -> Option<Vec<usize>> {
+    parse_weights(&text[t.delim_row.clone()])
+}
+
+/// Bindestreck per kolumn för bredderna `widths` (godtycklig enhet): summan blir ungefär 40
+/// (minst 8 per kolumn totalt) och varje kolumn får minst 3.
+pub fn dashes_from_widths(widths: &[f64]) -> Vec<usize> {
+    let total: f64 = widths.iter().sum::<f64>().max(1e-9);
+    let target = (widths.len() * 8).max(40) as f64;
+    widths.iter().map(|w| ((w / total * target).round() as usize).max(3)).collect()
+}
+
+/// Skriver om avgränsarraden så att kolumnerna får `dashes` bindestreck (kolonerna för
+/// justering behålls) i tabellen vid `at`. Markeringen `sel` följer med texten. Orört utanför en
+/// tabell eller om antalet kolumner inte stämmer.
+pub fn table_set_widths(text: &str, at: usize, sel: Range<usize>, dashes: &[usize]) -> Edit {
+    let keep = Edit { text: text.to_string(), sel: sel.clone() };
+    let Some((_, lines)) = table_parse(text, floor_boundary(text, at)) else { return keep };
+    let d = &lines[1];
+    if d.segs.len() != dashes.len() {
+        return keep;
+    }
+    let edits: Vec<(Range<usize>, String)> = d
+        .segs
+        .iter()
+        .zip(dashes)
+        .map(|(seg, &n)| {
+            let cell = text[seg.clone()].trim();
+            let left = if cell.starts_with(':') { ":" } else { "" };
+            let right = if cell.ends_with(':') && cell.len() > 1 { ":" } else { "" };
+            (seg.clone(), format!(" {left}{}{right} ", "-".repeat(n.max(1))))
+        })
+        .collect();
+    let new = splice(text, &edits);
+    let map = |p: usize| -> usize {
+        let mut shift: isize = 0;
+        for (r, rep) in &edits {
+            if p >= r.end {
+                shift += rep.len() as isize - r.len() as isize;
+            } else if p > r.start {
+                return (r.start as isize + shift) as usize;
+            }
+        }
+        (p as isize + shift) as usize
+    };
+    Edit { text: new, sel: map(sel.start)..map(sel.end) }
+}
+
+/// Markdown för en tabell som läses ur ett annat format. `rows` har en sträng per rutnätscell
+/// (celler som täcks av en sammanfogad cell är tomma platshållare), `spans` samma form med 0 för
+/// täckta celler, och `widths` kolumnbredderna (godtycklig enhet; tomt eller lika breda =
+/// automatisk bredd, `---`).
+pub fn table_markdown(rows: &[Vec<String>], spans: &[Vec<usize>], widths: &[f64]) -> String {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let row_md = |ri: usize, r: &Vec<String>| {
+        let mut s = String::from("|");
+        for k in 0..cols {
+            if spans.get(ri).and_then(|sp| sp.get(k)) == Some(&0) {
+                s.push('|');
+            } else {
+                let c = r.get(k).filter(|c| !c.is_empty()).map_or(" ", String::as_str);
+                s.push_str(&format!(" {c} |"));
+            }
+        }
+        s
+    };
+    let dashes: Vec<usize> = if widths.len() == cols && widths.iter().all(|&w| w > 0.0) {
+        let d = dashes_from_widths(widths);
+        if d.iter().all(|&n| n == d[0]) { vec![3; cols] } else { d }
+    } else {
+        vec![3; cols]
+    };
+    let mut out = String::new();
+    for (ri, r) in rows.iter().enumerate() {
+        if ri > 0 {
+            out.push('\n');
+        }
+        out.push_str(&row_md(ri, r));
+        if ri == 0 {
+            out.push_str("\n|");
+            for n in &dashes {
+                out.push_str(&format!(" {} |", "-".repeat(*n)));
+            }
+        }
+    }
+    out
+}
+
+// ---- tabellkälla (för exportörerna)
+
+/// Det exportörerna behöver veta om en tabells Markdown-källa utöver det pulldown-cmark ger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableSrc {
+    /// Antal rutnätskolumner (avgränsarradens celler).
+    pub cols: usize,
+    /// Per rad (rubrik först, avgränsarraden hoppas över) och cell: 1, n för en sammanfogad
+    /// cell och 0 för en täckt cell.
+    pub spans: Vec<Vec<usize>>,
+    /// Bindestreck per kolumn när de skiljer sig åt.
+    pub weights: Option<Vec<usize>>,
+}
+
+/// Läser spann och kolumnbredder ur tabellens källtext (rubrikrad, avgränsare, brödrader).
+pub fn table_src(src: &str) -> TableSrc {
+    let mut spans = Vec::new();
+    let mut cols = 0;
+    let mut weights = None;
+    let mut off = 0;
+    for (i, line) in src.split('\n').enumerate() {
+        let l = parse_tline(src, off, off + line.len());
+        off += line.len() + 1;
+        if i == 1 {
+            cols = l.segs.len();
+            weights = parse_weights(line.trim());
+        } else if !line.trim().is_empty() {
+            spans.push(cell_spans(&l.segs));
+        }
+    }
+    TableSrc { cols, spans, weights }
 }
 
 // ============================================================== spans (typsnitt, storlek, färg)
@@ -5132,5 +5431,208 @@ mod tests {
         ] {
             covers(d);
         }
+    }
+
+    // ---- sammanfogade celler, bredd och radbrytning
+
+    #[test]
+    fn tabell_sammanfogad_cell_tolkas() {
+        let t = "| Rubrik över två || x |\n| --- | --- | --- |\n| a | b | c |\n| d |||";
+        let ti = table_at(t, 0).unwrap();
+        assert_eq!(ti.cols, 3);
+        assert_eq!(ti.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]]);
+        assert_eq!(table_cell_at(&ti, at(t, "| x") + 2), Some((0, 2)));
+        // Markören mellan de två pipporna hör till cellen som äger dem.
+        let mid = at(t, "||") + 1;
+        assert_eq!(table_cell_at(&ti, mid), Some((0, 0)));
+        assert_eq!(&t[table_cell_bounds(t, mid).unwrap()], "Rubrik över två");
+        assert_eq!(ti.owner(2, 2), 0);
+        assert_eq!(cell_text(t, &ti)[0], vec!["Rubrik över två", "", "x"]);
+    }
+
+    #[test]
+    fn tabell_sammanfogad_rubrik_är_fortfarande_tabell() {
+        let t = "| Två ||\n| --- | --- |\n| a | b |";
+        let ti = table_at(t, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![2, 0]);
+        let a = analyze(t);
+        assert_eq!(piece_at(&a, 3).map(|p| p.block), Some(Block::Table));
+    }
+
+    #[test]
+    fn tabell_nästa_cell_hoppar_över_täckta() {
+        let t = "| Två || x |\n| --- | --- | --- |\n| a | b | c |";
+        let next = |pos: usize, back: bool| table_next_cell(t, pos, back).unwrap();
+        let e = next(at(t, "Två"), false);
+        assert_eq!(&e.text[e.sel], "x");
+        let e = next(at(t, "x"), true);
+        assert_eq!(&e.text[e.sel], "Två");
+        let e = next(at(t, "a"), true);
+        assert_eq!(&e.text[e.sel], "x");
+        let e = next(at(t, "x"), false);
+        assert_eq!(&e.text[e.sel], "a");
+    }
+
+    #[test]
+    fn tabell_infoga_kolumn_med_sammanfogning() {
+        let t = "| Två || x |\n| --- | --- | --- |\n| a | b | c |";
+        // Till höger om den sammanfogade cellen: efter hela spannet.
+        let e = table_insert_col(t, at(t, "Två"), true);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.cols, 4);
+        assert_eq!(ti.spans[0], vec![2, 0, 1, 1]);
+        assert_eq!(cell_text(&e.text, &ti)[0][2], "Kolumn 4");
+        // Till vänster om x: den nya cellen hamnar mellan.
+        let e = table_insert_col(t, at(t, "x"), false);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![2, 0, 1, 1]);
+        // Inne i spannet på en annan rad: cellen blir bredare i stället.
+        let t2 = "| a | b | c |\n| --- | --- | --- |\n| Två || x |";
+        let e = table_insert_col(t2, at(t2, "b"), false);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.cols, 4);
+        assert_eq!(ti.spans[1], vec![3, 0, 0, 1], "{}", e.text);
+    }
+
+    #[test]
+    fn tabell_ta_bort_kolumn_med_sammanfogning() {
+        let t = "| Två || x |\n| --- | --- | --- |\n| a | b | c |";
+        // Kolumnen som äger den sammanfogade cellen: den krymper men behåller innehållet.
+        let e = table_delete_col(t, at(t, "Två"));
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.cols, 2);
+        assert_eq!(ti.spans[0], vec![1, 1]);
+        assert_eq!(cell_text(&e.text, &ti)[0], vec!["Två", "x"]);
+        assert_eq!(cell_text(&e.text, &ti)[1], vec!["b", "c"]);
+        // Kolumnen efter: täckt cell tas bort.
+        let e = table_delete_col(t, at(t, "b"));
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(cell_text(&e.text, &ti)[0], vec!["Två", "x"]);
+        assert_eq!(cell_text(&e.text, &ti)[1], vec!["a", "c"]);
+    }
+
+    #[test]
+    fn tabell_sammanfoga_celler() {
+        let t = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        // Markering över två celler.
+        let e = table_merge_cells(t, at(t, "A")..at(t, "B") + 1);
+        assert_eq!(e.text, "| A B || C |\n| --- | --- | --- |\n| 1 | 2 | 3 |");
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![2, 0, 1]);
+        assert_eq!(&e.text[e.sel], "A B");
+        // Hela raden.
+        let e = table_merge_cells(t, at(t, "1")..at(t, "3") + 1);
+        assert_eq!(table_at(&e.text, 0).unwrap().spans[1], vec![3, 0, 0], "{}", e.text);
+        assert_eq!(&e.text[e.sel], "1 2 3");
+        // Utan markering: med nästa cell. Tomma celler ger inga extra blanksteg.
+        let t2 = "| A |  | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e = table_merge_cells(t2, at(t2, "A") + 1..at(t2, "A") + 1);
+        assert_eq!(table_at(&e.text, 0).unwrap().spans[0], vec![2, 0, 1]);
+        assert!(e.text.starts_with("| A || C |"), "{}", e.text);
+        // Sista cellen utan någon efter den, två rader och avgränsarraden: orört.
+        assert_eq!(table_merge_cells(t, at(t, "C")..at(t, "C")).text, t);
+        assert_eq!(table_merge_cells(t, at(t, "A")..at(t, "1")).text, t);
+        assert_eq!(table_merge_cells(t, at(t, "---")..at(t, "---") + 1).text, t);
+        assert_eq!(table_merge_cells("text", 1..2).text, "text");
+        // Redan sammanfogade celler slås ihop med hela sitt spann.
+        let t3 = "| A || C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e = table_merge_cells(t3, at(t3, "A")..at(t3, "C") + 1);
+        assert_eq!(table_at(&e.text, 0).unwrap().spans[0], vec![3, 0, 0], "{}", e.text);
+        assert_eq!(&e.text[e.sel], "A C");
+    }
+
+    #[test]
+    fn tabell_sammanfoga_utan_ytterrör() {
+        let t = "A | B\n--|--\n1 | 2";
+        let e = table_merge_cells(t, at(t, "1")..at(t, "2") + 1);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[1], vec![2, 0], "{}", e.text);
+        assert_eq!(&e.text[e.sel], "1 2");
+    }
+
+    #[test]
+    fn tabell_dela_cell() {
+        let t = "| A B || C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e = table_split_cell(t, at(t, "A B"));
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(ti.spans[0], vec![1, 1, 1]);
+        assert_eq!(cell_text(&e.text, &ti)[0], vec!["A B", "", "C"]);
+        assert_eq!(&e.text[e.sel], "A B");
+        // Samma sak med markören i den täckta delen.
+        let e2 = table_split_cell(t, at(t, "||") + 1);
+        assert_eq!(e2.text, e.text);
+        // Vanlig cell och utanför tabell: orört.
+        assert_eq!(table_split_cell(t, at(t, "C")).text, t);
+        assert_eq!(table_split_cell("text", 1).text, "text");
+        // Tre kolumner.
+        let t3 = "| Hej |||\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let e3 = table_split_cell(t3, at(t3, "Hej"));
+        assert_eq!(table_at(&e3.text, 0).unwrap().spans[0], vec![1, 1, 1]);
+        // Sammanfoga och dela är varandras motsats.
+        let m = table_merge_cells(&e3.text, at(&e3.text, "Hej")..at(&e3.text, "Hej") + 1);
+        assert_eq!(table_at(&m.text, 0).unwrap().spans[0], vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn tabell_kolumnbredd_från_streck() {
+        assert_eq!(parse_weights("| ------ | -- | ---- |"), Some(vec![6, 2, 4]));
+        assert_eq!(parse_weights("|:-----:|--:|"), Some(vec![5, 2]));
+        assert_eq!(parse_weights("| --- | --- |"), None);
+        assert_eq!(parse_weights("| --- |"), None);
+        assert_eq!(parse_weights("| a | b |"), None);
+        let t = "| A | B |\n| ------ | -- |\n| 1 | 2 |";
+        let ti = table_at(t, 0).unwrap();
+        assert_eq!(table_weights(t, &ti), Some(vec![6, 2]));
+        assert_eq!(table_weights(TB, &table_at(TB, 0).unwrap()), None);
+    }
+
+    #[test]
+    fn tabell_skriv_kolumnbredd_behåller_justering() {
+        let t = "| A | B | C |\n|:--|:-:|--:|\n| 1 | 2 | 3 |";
+        let caret = at(t, "2");
+        let e = table_set_widths(t, caret, caret..caret, &[10, 5, 3]);
+        let lines: Vec<&str> = e.text.lines().collect();
+        assert_eq!(lines[1], "| :---------- | :-----: | ---: |");
+        assert!(e.text[e.sel.start..].starts_with("2 |"), "{}", e.text);
+        assert_eq!(e.sel.start, e.sel.end);
+        let ti = table_at(&e.text, 0).unwrap();
+        assert_eq!(table_weights(&e.text, &ti), Some(vec![10, 5, 3]));
+        // Fel antal kolumner och utanför tabell: orört.
+        assert_eq!(table_set_widths(t, 0, 0..0, &[1, 2]).text, t);
+        assert_eq!(table_set_widths("text", 0, 0..0, &[1]).text, "text");
+    }
+
+    #[test]
+    fn tabell_streck_från_bredder() {
+        let d = dashes_from_widths(&[100.0, 300.0, 100.0]);
+        assert_eq!(d, vec![8, 24, 8]);
+        // Minst tre streck.
+        let d = dashes_from_widths(&[1.0, 1000.0]);
+        assert_eq!(d[0], 3);
+        assert!(d.iter().sum::<usize>() >= 40);
+    }
+
+    #[test]
+    fn tabell_källa_för_exportörer() {
+        let s = "| Rubrik över två || x |\n| ------ | -- | ---- |\n| a | b<br>rad | c |\n| d |||";
+        let ts = table_src(s);
+        assert_eq!(ts.cols, 3);
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]]);
+        assert_eq!(ts.weights, Some(vec![6, 2, 4]));
+        assert_eq!(table_src("| a | b |\n| - | - |\n| 1 | 2 |").weights, None);
+    }
+
+    #[test]
+    fn tabell_br_är_dold_markup_och_hittas() {
+        let t = "| a<br>b | c<BR/>d |\n| --- | --- |\n| 1 | 2 |";
+        let a = analyze(t);
+        let br = piece_at(&a, t.find("<br>").unwrap()).unwrap();
+        assert!(br.markup && br.block == Block::Table);
+        assert!(piece_at(&a, t.find("<BR/>").unwrap()).unwrap().markup);
+        assert_eq!(br_tags("x<br>y<br />z<bro>"), vec![1..5, 6..12]);
+        assert!(is_br_tag(" <br/> "));
+        assert!(!is_br_tag("<b>"));
+        // Orden på var sida om en radbrytning räknas var för sig.
+        assert_eq!(count(t, &a).0, 6);
     }
 }

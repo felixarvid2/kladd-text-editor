@@ -33,6 +33,8 @@ pub enum Icon {
     TableDelRow,
     TableDelCol,
     TableDelete,
+    TableMerge,
+    TableSplit,
     /// Ett pappersark med vikt hörn.
     Page,
     Undo,
@@ -261,6 +263,24 @@ pub fn paint(painter: &Painter, icon: Icon, c: Pos2, color: Color32, bg: Color32
             let pc = c + vec2(px_, py_);
             painter.line_segment([pc + vec2(-2.5, 0.0), pc + vec2(2.5, 0.0)], s);
             painter.line_segment([pc + vec2(0.0, -2.5), pc + vec2(0.0, 2.5)], s);
+        }
+        Icon::TableMerge | Icon::TableSplit => {
+            // Två celler med pilar mot varandra (sammanfoga) eller ifrån varandra (dela).
+            let r = Rect::from_center_size(c, vec2(16.0, 11.0));
+            let s1 = Stroke::new(1.2, color);
+            painter.rect_stroke(r, 1.0, s1, egui::StrokeKind::Middle);
+            let split = matches!(icon, Icon::TableSplit);
+            if split {
+                painter.line_segment([pos2(c.x, r.top()), pos2(c.x, r.bottom())], s1);
+            }
+            for dir in [-1.0f32, 1.0] {
+                // Pilen på varje sida om mitten; spetsen vid mitten (sammanfoga) eller kanten (dela).
+                let (from, to) = if split { (3.0, 6.0) } else { (6.0, 3.0) };
+                let (a, b) = (c + vec2(dir * from, 0.0), c + vec2(dir * to, 0.0));
+                painter.line_segment([a, b], s);
+                painter.line_segment([b, b + vec2(-dir * (to - from).signum() * 2.0, -2.0)], s);
+                painter.line_segment([b, b + vec2(-dir * (to - from).signum() * 2.0, 2.0)], s);
+            }
         }
         Icon::TableDelRow | Icon::TableDelCol | Icon::TableDelete => {
             // Rutnät; den borttagna raden/kolumnen fylld, hela tabellen överstruken.

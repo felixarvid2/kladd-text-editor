@@ -31,7 +31,7 @@ use quick_xml::Reader;
 
 use crate::docx::{escape_inline, escape_line_start, image_ext, is_supported_image, wrap, Image, Loaded, Written, IMAGE_SCHEME};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
-use crate::word::markup::Float;
+use crate::word::markup::{self, Float};
 
 const MIME: &str = "application/vnd.oasis.opendocument.text";
 const MAX_ENTRIES: usize = 20_000;
@@ -276,6 +276,8 @@ struct Styles {
     fonts: HashMap<String, String>,
     /// Listformat → (ordnad, startvärde) per nivå.
     lists: HashMap<String, Vec<(bool, u64)>>,
+    /// Kolumnformat (`style:family="table-column"`) → bredd i pt (eller relativ bredd).
+    col_widths: HashMap<String, f64>,
 }
 
 fn unquote_font(f: &str) -> String {
@@ -414,6 +416,18 @@ impl Styles {
                     "style:style" => {
                         let d = self.read_style(s, auto);
                         let fam = s.attr("style:family").unwrap_or("").to_owned();
+                        if fam == "table-column" {
+                            if let Some(p) = s.child("style:table-column-properties") {
+                                let w = p
+                                    .attr("style:column-width")
+                                    .and_then(style::parse_length)
+                                    .map(f64::from)
+                                    .or_else(|| p.attr("style:rel-column-width").and_then(|v| v.trim_end_matches('*').parse().ok()));
+                                if let Some(w) = w {
+                                    self.col_widths.insert(d.name.clone(), w);
+                                }
+                            }
+                        }
                         self.defs.insert((fam, d.name.clone()), d);
                     }
                     "style:default-style" => {
@@ -525,9 +539,17 @@ struct Para {
     list: Option<ListInfo>,
 }
 
+/// En tabell som läses: celler per rutnätsrad, spann (0 = täckt av cellen före) och kolumnbredder.
+#[derive(Clone, Default)]
+struct Tbl {
+    rows: Vec<Vec<String>>,
+    spans: Vec<Vec<usize>>,
+    widths: Vec<f64>,
+}
+
 enum Block {
     Para(Para),
-    Table(Vec<Vec<String>>),
+    Table(Tbl),
     Rule,
 }
 
@@ -990,12 +1012,29 @@ impl<'s, 'b> Rd<'s, 'b> {
         parts.join("<br>").replace('|', "\\|")
     }
 
+    /// Kolumnernas bredder ur `table:table-column` (också i grupper).
+    fn column_widths(&self, n: &Node, out: &mut Vec<f64>) {
+        for c in n.els() {
+            match c.name.as_str() {
+                "table:table-columns" | "table:table-header-columns" | "table:table-column-group" => self.column_widths(c, out),
+                "table:table-column" => {
+                    let rep = c.attr("table:number-columns-repeated").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+                    let w = c.attr("table:style-name").and_then(|s| self.st.col_widths.get(s)).copied().unwrap_or(0.0);
+                    for _ in 0..rep.clamp(1, 256) {
+                        out.push(w);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn cell_paras(&mut self, n: &Node, out: &mut Vec<String>) {
         for c in n.els() {
             match c.name.as_str() {
                 "text:p" | "text:h" => {
                     let p = self.build_para(c, None);
-                    let s = para_md(&p).replace('\n', " ");
+                    let s = para_md(&p).replace('\n', "<br>");
                     if !s.trim().is_empty() {
                         out.push(s.trim().to_owned());
                     }
@@ -1008,20 +1047,24 @@ impl<'s, 'b> Rd<'s, 'b> {
     }
 
     fn table(&mut self, t: &Node) {
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        self.table_rows(t, &mut rows);
-        if rows.is_empty() {
+        let mut tbl = Tbl::default();
+        self.table_rows(t, &mut tbl);
+        if tbl.rows.is_empty() {
             return;
         }
-        self.blocks.push(Block::Table(rows));
+        self.column_widths(t, &mut tbl.widths);
+        self.blocks.push(Block::Table(tbl));
     }
 
-    fn table_rows(&mut self, n: &Node, rows: &mut Vec<Vec<String>>) {
+    fn table_rows(&mut self, n: &Node, tbl: &mut Tbl) {
         for c in n.els() {
             match c.name.as_str() {
-                "table:table-header-rows" | "table:table-row-group" | "table:table-rows" => self.table_rows(c, rows),
+                "table:table-header-rows" | "table:table-row-group" | "table:table-rows" => self.table_rows(c, tbl),
                 "table:table-row" => {
                     let mut cells = Vec::new();
+                    let mut spans = Vec::new();
+                    // Kolumner kvar i den vågräta sammanfogningen från cellen före.
+                    let mut pending = 0usize;
                     for cell in c.els() {
                         let rep = cell.attr("table:number-columns-repeated").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
                         match cell.name.as_str() {
@@ -1030,9 +1073,26 @@ impl<'s, 'b> Rd<'s, 'b> {
                                 let rep = if text.is_empty() { rep.min(1) } else { rep.min(64) };
                                 for _ in 0..rep.max(1) {
                                     cells.push(text.clone());
+                                    spans.push(1);
+                                }
+                                pending = cell
+                                    .attr("table:number-columns-spanned")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .map_or(0, |n| n.clamp(1, 64) - 1);
+                            }
+                            // Täckt av en vågrät sammanfogning, eller (lodrätt) av en cell ovanför:
+                            // då en tom vanlig cell.
+                            "table:covered-table-cell" => {
+                                for _ in 0..rep.clamp(1, 64) {
+                                    cells.push(String::new());
+                                    if pending > 0 {
+                                        pending -= 1;
+                                        spans.push(0);
+                                    } else {
+                                        spans.push(1);
+                                    }
                                 }
                             }
-                            "table:covered-table-cell" => cells.push(String::new()),
                             _ => {}
                         }
                         if cells.len() > 256 {
@@ -1044,7 +1104,8 @@ impl<'s, 'b> Rd<'s, 'b> {
                         continue;
                     }
                     for _ in 0..rep.clamp(1, 64) {
-                        rows.push(cells.clone());
+                        tbl.rows.push(cells.clone());
+                        tbl.spans.push(spans.clone());
                     }
                 }
                 _ => {}
@@ -1230,9 +1291,9 @@ fn render(blocks: &[Block]) -> String {
                 }
                 out.push_str("---");
             }
-            Block::Table(rows) => {
+            Block::Table(tbl) => {
                 prev_list = None;
-                let mut rows = rows.clone();
+                let mut rows = tbl.rows.clone();
                 if rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
                     for c in rows[0].iter_mut() {
                         if c.len() > 4 {
@@ -1240,24 +1301,12 @@ fn render(blocks: &[Block]) -> String {
                         }
                     }
                 }
-                let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
                 if cur_align != Align::Left {
                     set_align(&mut out, &mut cur_align, Align::Left);
                 } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
-                let row_md = |r: &Vec<String>| {
-                    let mut cells: Vec<String> = r.iter().map(|c| if c.is_empty() { " ".into() } else { c.clone() }).collect();
-                    cells.resize(cols, " ".into());
-                    format!("| {} |", cells.join(" | "))
-                };
-                out.push_str(&row_md(&rows[0]));
-                out.push('\n');
-                out.push_str(&format!("|{}", " --- |".repeat(cols)));
-                for r in &rows[1..] {
-                    out.push('\n');
-                    out.push_str(&row_md(r));
-                }
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, &tbl.widths));
             }
         }
     }
@@ -1539,6 +1588,12 @@ fn parse_attrs(s: &str) -> Vec<(String, String)> {
 
 struct WTable {
     in_head: bool,
+    /// Spann per rad och cell ur tabellens källa (0 = täckt cell).
+    spans: Vec<Vec<usize>>,
+    /// Antal påbörjade rader och cellen i raden som skrivs.
+    rows: usize,
+    cell: usize,
+    covered: bool,
 }
 
 struct W<'a> {
@@ -2053,7 +2108,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
     opts.insert(Options::ENABLE_FOOTNOTES);
     // Pågående fotnotsdefinition: (etikett, brödtexten som lagts åt sidan).
     let mut note_cur: Option<(String, String)> = None;
-    for ev in Parser::new_ext(md, opts) {
+    for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
         match ev {
             MdEvent::Start(Tag::FootnoteDefinition(label)) => {
                 w.close_para();
@@ -2105,25 +2160,65 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                         w.cell_style = true;
                         w.auto.push_str("<style:style style:name=\"TabellCell\" style:family=\"table-cell\"><style:table-cell-properties fo:padding=\"0.097cm\" fo:border=\"0.5pt solid #000000\"/></style:style>");
                     }
+                    let src = markup::table_src(md.get(range.clone()).unwrap_or(""));
                     w.auto.push_str(&format!(
-                        "<style:style style:name=\"Tabell{n}\" style:family=\"table\"><style:table-properties style:width=\"{tw}\" table:align=\"margins\"/></style:style><style:style style:name=\"Tabell{n}.A\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{cw}\"/></style:style>",
-                        tw = cm(w.text_w),
-                        cw = cm(w.text_w / cols as f32)
+                        "<style:style style:name=\"Tabell{n}\" style:family=\"table\"><style:table-properties style:width=\"{tw}\" table:align=\"margins\"/></style:style>",
+                        tw = cm(w.text_w)
                     ));
-                    w.body.push_str(&format!(
-                        "<table:table table:name=\"Tabell{n}\" table:style-name=\"Tabell{n}\"><table:table-column table:style-name=\"Tabell{n}.A\" table:number-columns-repeated=\"{cols}\"/>"
-                    ));
-                    w.table = Some(WTable { in_head: false });
+                    w.body.push_str(&format!("<table:table table:name=\"Tabell{n}\" table:style-name=\"Tabell{n}\">"));
+                    match src.weights.as_ref().filter(|ws| ws.len() == cols) {
+                        // Olika många streck: en kolumnformat per kolumn med proportionell bredd.
+                        Some(ws) => {
+                            let sum: usize = ws.iter().sum();
+                            for (j, &d) in ws.iter().enumerate() {
+                                w.auto.push_str(&format!(
+                                    "<style:style style:name=\"Tabell{n}.C{j}\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{}\"/></style:style>",
+                                    cm(w.text_w * d as f32 / sum as f32)
+                                ));
+                                w.body.push_str(&format!("<table:table-column table:style-name=\"Tabell{n}.C{j}\"/>"));
+                            }
+                        }
+                        None => {
+                            w.auto.push_str(&format!(
+                                "<style:style style:name=\"Tabell{n}.A\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{cw}\"/></style:style>",
+                                cw = cm(w.text_w / cols as f32)
+                            ));
+                            w.body.push_str(&format!(
+                                "<table:table-column table:style-name=\"Tabell{n}.A\" table:number-columns-repeated=\"{cols}\"/>"
+                            ));
+                        }
+                    }
+                    w.table = Some(WTable { in_head: false, spans: src.spans, rows: 0, cell: 0, covered: false });
                 }
                 Tag::TableHead => {
                     if let Some(t) = w.table.as_mut() {
                         t.in_head = true;
+                        t.rows += 1;
+                        t.cell = 0;
                     }
                     w.body.push_str("<table:table-header-rows><table:table-row>");
                 }
-                Tag::TableRow => w.body.push_str("<table:table-row>"),
+                Tag::TableRow => {
+                    if let Some(t) = w.table.as_mut() {
+                        t.rows += 1;
+                        t.cell = 0;
+                    }
+                    w.body.push_str("<table:table-row>");
+                }
                 Tag::TableCell => {
-                    w.body.push_str("<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\">");
+                    let span = w.table.as_mut().map_or(1, |t| {
+                        let span = t.spans.get(t.rows.saturating_sub(1)).and_then(|r| r.get(t.cell)).copied().unwrap_or(1);
+                        t.covered = span == 0;
+                        span
+                    });
+                    match span {
+                        // Täckt av cellen före: ingen text, bara platshållaren.
+                        0 => w.body.push_str("<table:covered-table-cell/>"),
+                        1 => w.body.push_str("<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\">"),
+                        n => w.body.push_str(&format!(
+                            "<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\" table:number-columns-spanned=\"{n}\">"
+                        )),
+                    }
                 }
                 Tag::Emphasis => w.italic += 1,
                 Tag::Strong => w.bold += 1,
@@ -2168,9 +2263,15 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 }
                 TagEnd::TableRow => w.body.push_str("</table:table-row>"),
                 TagEnd::TableCell => {
-                    w.open_para(); // en cell ska innehålla minst ett stycke
-                    w.close_para();
-                    w.body.push_str("</table:table-cell>");
+                    let covered = w.table.as_mut().is_some_and(|t| {
+                        t.cell += 1;
+                        std::mem::take(&mut t.covered)
+                    });
+                    if !covered {
+                        w.open_para(); // en cell ska innehålla minst ett stycke
+                        w.close_para();
+                        w.body.push_str("</table:table-cell>");
+                    }
                 }
                 TagEnd::Emphasis => w.italic = w.italic.saturating_sub(1),
                 TagEnd::Strong => w.bold = w.bold.saturating_sub(1),
@@ -2806,6 +2907,71 @@ Slut.
             z.finish().unwrap();
         }
         assert!(read(&buf.into_inner()).err().unwrap().contains("inte ett OpenDocument"));
+    }
+
+    fn content_part(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = String::new();
+        Read::read_to_string(&mut z.by_name("content.xml").unwrap(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn table_merge_widths_and_breaks_roundtrip() {
+        let md = "| Rubrik över två || x |\n| ------ | -- | ---- |\n| a | b<br>rad | c |\n| d |||\n";
+        let w = write(md, "T", &resolver()).unwrap();
+        let xml = content_part(&w.bytes);
+        assert!(xml.contains("table:number-columns-spanned=\"2\""), "{xml}");
+        assert!(xml.contains("table:number-columns-spanned=\"3\""));
+        assert_eq!(xml.matches("<table:covered-table-cell/>").count(), 3, "{xml}");
+        assert!(xml.contains("b<text:line-break/>rad"), "{xml}");
+        // En kolumnformat per kolumn, i förhållande 6:2:4.
+        let width = |name: &str| -> f32 {
+            let i = xml.find(&format!("style:name=\"{name}\"")).unwrap();
+            let rest = &xml[i..];
+            let j = rest.find("style:column-width=\"").unwrap() + 20;
+            rest[j..].split("cm").next().unwrap().parse().unwrap()
+        };
+        let (a, b, c) = (width("Tabell1.C0"), width("Tabell1.C1"), width("Tabell1.C2"));
+        assert!((a / b - 3.0).abs() < 0.05 && (c / b - 2.0).abs() < 0.05, "{a} {b} {c}");
+        let back = read(&w.bytes).unwrap();
+        let ts = markup::table_src(&back.markdown);
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]], "{}", back.markdown);
+        assert_eq!(ts.weights, Some(vec![20, 7, 13]), "{}", back.markdown);
+        assert!(back.markdown.contains("| a | b<br>rad | c |"), "{}", back.markdown);
+    }
+
+    #[test]
+    fn table_equal_widths_use_one_repeated_column() {
+        let md = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let w = write(md, "T", &resolver()).unwrap();
+        let xml = content_part(&w.bytes);
+        assert!(xml.contains("table:number-columns-repeated=\"2\""), "{xml}");
+        assert!(!xml.contains("covered-table-cell") && !xml.contains("columns-spanned"));
+        assert!(read(&w.bytes).unwrap().markdown.contains("| A | B |\n| --- | --- |\n| 1 | 2 |"));
+    }
+
+    #[test]
+    fn reads_spans_covered_cells_and_widths_from_libreoffice() {
+        let table = r#"<table:table table:name="T"><table:table-column table:style-name="co1"/><table:table-column table:style-name="co2" table:number-columns-repeated="2"/>
+<table:table-row><table:table-cell table:number-columns-spanned="2" office:value-type="string"><text:p>Bred</text:p></table:table-cell><table:covered-table-cell/><table:table-cell office:value-type="string"><text:p>Id</text:p></table:table-cell></table:table-row>
+<table:table-row><table:table-cell table:number-rows-spanned="2" office:value-type="string"><text:p>Lodrät</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>rad<text:line-break/>två</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>c</text:p></table:table-cell></table:table-row>
+<table:table-row><table:covered-table-cell/><table:table-cell office:value-type="string"><text:p>e</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>f</text:p></table:table-cell></table:table-row></table:table>"#;
+        let styles = r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="8cm"/></style:style><style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="4cm"/></style:style>"#;
+        let a = LO_CONTENT.find("<table:table ").unwrap();
+        let b = LO_CONTENT.find("</table:table>").unwrap() + "</table:table>".len();
+        let c = format!("{}{}{}", &LO_CONTENT[..a], table, &LO_CONTENT[b..]).replacen("<office:automatic-styles>", &format!("<office:automatic-styles>{styles}"), 1);
+        let l = read(&make_odt(&c, LO_STYLES, &[("Pictures/a.png", &png())])).unwrap();
+        let md = &l.markdown;
+        let start = md.find("| Bred").unwrap();
+        let tbl = &md[start..md[start..].find("\n\n").map_or(md.len(), |i| start + i)];
+        let ts = markup::table_src(tbl);
+        // Bred över två kolumner; den lodräta täckningen blir en tom cell, inte en sammanfogning.
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![1, 1, 1]], "{tbl}");
+        // 8 cm : 4 cm : 4 cm av 40 streck = 20:10:10.
+        assert_eq!(ts.weights, Some(vec![20, 10, 10]), "{tbl}");
+        assert!(tbl.contains("| Lodrät | rad<br>två | c |"), "{tbl}");
+        assert!(tbl.contains("|   | e | f |"), "{tbl}");
     }
 
     /// Konverterar Kladds .odt med LibreOffice; kör med `cargo test -- --ignored`.

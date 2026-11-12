@@ -18,7 +18,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::style::{self, Align, DocDefaults, SpanStyle};
-use crate::word::markup::Float;
+use crate::word::markup::{self, Float};
 
 /// Högsta antal poster i ett paket (WordCraft: zip_guard).
 const MAX_ENTRIES: u64 = 20_000;
@@ -746,8 +746,22 @@ impl Para {
 
 enum Block {
     Para(Para),
-    /// Rader och toppnivåelementets index.
-    Table(Vec<Vec<String>>, usize),
+    /// Tabellen och toppnivåelementets index.
+    Table(Tbl, usize),
+}
+
+/// En tabell som läses: celler per rad (en sammanfogad cell följs av tomma platshållare),
+/// deras spann (0 = täckt av cellen före) och kolumnbredderna ur `w:tblGrid` (tjugondels punkter).
+#[derive(Default, Clone)]
+struct Tbl {
+    rows: Vec<Vec<String>>,
+    spans: Vec<Vec<usize>>,
+    widths: Vec<f64>,
+    /// Pågående rad och cell.
+    row: Vec<String>,
+    row_spans: Vec<usize>,
+    cell: Option<String>,
+    span: usize,
 }
 
 /// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade ändringar godtas
@@ -1510,7 +1524,7 @@ fn parse_body(
     // Fältkoder: mellan begin och separate visas inget.
     let mut field_depth: Vec<bool> = Vec::new();
     // Tabeller: stack av (rader, aktuell rad, aktuell cell)
-    let mut tables: Vec<(Vec<Vec<String>>, Vec<String>, Option<String>)> = Vec::new();
+    let mut tables: Vec<Tbl> = Vec::new();
     let mut in_ppr = false;
     let mut alt_depth: Vec<bool> = Vec::new(); // AlternateContent: har Choice använts?
     // Originalets XML: djup i trädet, toppnivåelementets start och körningen som läses.
@@ -1736,7 +1750,7 @@ fn parse_body(
                     }
                     b"ins" | b"moveTo" => dropped.tracked = true,
                     b"sdtPr" | b"sdtEndPr" | b"instrText" | b"delText" | b"pPrChange" | b"rPrChange"
-                    | b"sectPr" | b"tblPr" | b"tblGrid" | b"trPr" | b"tcPr" | b"fldData" => {
+                    | b"sectPr" | b"tblPr" | b"trPr" | b"fldData" => {
                         if !empty {
                             skip = 1;
                         }
@@ -1866,16 +1880,30 @@ fn parse_body(
                         if let Some(p) = para.take() {
                             blocks.push(Block::Para(p));
                         }
-                        tables.push((Vec::new(), Vec::new(), None));
+                        tables.push(Tbl::default());
                     }
                     b"tr" if !empty => {
                         if let Some(t) = tables.last_mut() {
-                            t.1 = Vec::new();
+                            t.row = Vec::new();
+                            t.row_spans = Vec::new();
                         }
                     }
                     b"tc" if !empty => {
                         if let Some(t) = tables.last_mut() {
-                            t.2 = Some(String::new());
+                            t.cell = Some(String::new());
+                            t.span = 1;
+                        }
+                    }
+                    // Kolumnbredd och sammanfogning. En lodrätt sammanfogad fortsättningscell
+                    // (`w:vMerge`) läses som en tom cell: Kladd har bara vågräta sammanfogningar.
+                    b"gridCol" => {
+                        if let Some(t) = tables.last_mut() {
+                            t.widths.push(attr(e, b"w").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0));
+                        }
+                    }
+                    b"gridSpan" => {
+                        if let Some(t) = tables.last_mut() {
+                            t.span = attr(e, b"val").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 63);
                         }
                     }
                     _ => {}
@@ -1994,7 +2022,7 @@ fn parse_body(
                             }
                             if let Some(t) = tables.last_mut() {
                                 // Stycke i en tabellcell: lägg texten i cellen.
-                                if let Some(cell) = t.2.as_mut() {
+                                if let Some(cell) = t.cell.as_mut() {
                                     let txt: String = p.runs.iter().map(|r| inline_md(r)).collect();
                                     let txt = txt.trim();
                                     if !txt.is_empty() {
@@ -2012,29 +2040,37 @@ fn parse_body(
                     }
                     b"tc" => {
                         if let Some(t) = tables.last_mut() {
-                            let cell = t.2.take().unwrap_or_default();
-                            t.1.push(cell);
+                            let cell = t.cell.take().unwrap_or_default();
+                            let span = t.span.max(1);
+                            t.row.push(cell);
+                            t.row_spans.push(span);
+                            for _ in 1..span {
+                                t.row.push(String::new());
+                                t.row_spans.push(0);
+                            }
                         }
                     }
                     b"tr" => {
                         if let Some(t) = tables.last_mut() {
-                            let row = std::mem::take(&mut t.1);
-                            t.0.push(row);
+                            let row = std::mem::take(&mut t.row);
+                            let sp = std::mem::take(&mut t.row_spans);
+                            t.rows.push(row);
+                            t.spans.push(sp);
                         }
                     }
                     b"tbl" => {
-                        if let Some((rows, _, _)) = tables.pop() {
+                        if let Some(t) = tables.pop() {
                             if let Some(outer) = tables.last_mut() {
                                 // Nästlad tabell: platta till i den yttre cellen.
-                                let flat: Vec<String> = rows.iter().map(|r| r.join(" ")).collect();
-                                if let Some(cell) = outer.2.as_mut() {
+                                let flat: Vec<String> = t.rows.iter().map(|r| r.iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" ")).collect();
+                                if let Some(cell) = outer.cell.as_mut() {
                                     if !cell.is_empty() {
                                         cell.push_str("<br>");
                                     }
                                     cell.push_str(&flat.join("<br>"));
                                 }
-                            } else if !rows.is_empty() {
-                                blocks.push(Block::Table(rows, info.elems.len().wrapping_sub(1)));
+                            } else if !t.rows.is_empty() {
+                                blocks.push(Block::Table(t, info.elems.len().wrapping_sub(1)));
                             }
                         }
                     }
@@ -2335,11 +2371,11 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering) -> (String, Vec<Md
                     }
                 }
             }
-            Block::Table(rows, origin) => {
+            Block::Table(tbl, origin) => {
                 prev_list = false;
                 top_num = None;
                 // Rubrikraden skrivs i fetstil av Kladd; visa den utan **.
-                let mut rows = rows.clone();
+                let mut rows = tbl.rows.clone();
                 if rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
                     for c in rows[0].iter_mut() {
                         if c.len() > 4 {
@@ -2347,26 +2383,14 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering) -> (String, Vec<Md
                         }
                     }
                 }
-                let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
                 // Tabeller justeras inte.
                 if cur_align != Align::Left {
                     set_align(&mut out, &mut cur_align, Align::Left);
                 } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
-                let row_md = |r: &Vec<String>| {
-                    let mut cells: Vec<String> = r.iter().map(|c| if c.is_empty() { " ".into() } else { c.clone() }).collect();
-                    cells.resize(cols, " ".into());
-                    format!("| {} |", cells.join(" | "))
-                };
                 let start = out.len();
-                out.push_str(&row_md(&rows[0]));
-                out.push('\n');
-                out.push_str(&format!("|{}", " --- |".repeat(cols)));
-                for r in &rows[1..] {
-                    out.push('\n');
-                    out.push_str(&row_md(r));
-                }
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, &tbl.widths));
                 units.push(MdUnit { origin: *origin, desc: "t|left".to_owned(), key: norm(&out[start..]) });
             }
         }
@@ -2502,8 +2526,16 @@ struct GenNote {
 }
 
 struct TableState {
-    cols: usize,
     in_head: bool,
+    /// Kolumnbredder i tjugondels punkter.
+    widths: Vec<u32>,
+    /// Spann per rad och cell ur tabellens källa (0 = täckt cell).
+    spans: Vec<Vec<usize>>,
+    /// Antal påbörjade rader och cellen i raden som läses.
+    rows: usize,
+    cell: usize,
+    /// Den här cellen är täckt av cellen före och skrivs inte.
+    covered: bool,
 }
 
 /// Platshållare i den skrivna texten för markör nummer N (byts mot originalets XML när
@@ -3106,31 +3138,58 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 }
                 Tag::Table(aligns) => {
                     w.close_para();
+                    let src = markup::table_src(md.get(range.clone()).unwrap_or(""));
                     let cols = aligns.len().max(1);
-                    let col_w = 9026 / cols; // A4-bredd minus marginaler, i tjugondels punkter
+                    // Textytans bredd i tjugondels punkter (A4 med tums marginaler: 9026).
+                    let total = if w.ctx.max_width > 0 { (w.ctx.max_width / 635) as u32 } else { 9026 };
+                    // Kolumnbredd efter antalet streck i avgränsarraden, annars lika breda.
+                    let widths: Vec<u32> = match src.weights.as_ref().filter(|ws| ws.len() == cols) {
+                        Some(ws) => {
+                            let sum: usize = ws.iter().sum();
+                            ws.iter().map(|&n| (f64::from(total) * n as f64 / sum as f64).round() as u32).collect()
+                        }
+                        None => vec![total / cols as u32; cols],
+                    };
                     w.body.push_str(
                         "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
                     );
-                    for _ in 0..cols {
-                        w.body.push_str(&format!("<w:gridCol w:w=\"{col_w}\"/>"));
+                    for cw in &widths {
+                        w.body.push_str(&format!("<w:gridCol w:w=\"{cw}\"/>"));
                     }
                     w.body.push_str("</w:tblGrid>");
-                    w.table = Some(TableState { cols, in_head: false });
+                    w.table = Some(TableState { in_head: false, widths, spans: src.spans, rows: 0, cell: 0, covered: false });
                 }
                 Tag::TableHead => {
                     if let Some(t) = w.table.as_mut() {
                         t.in_head = true;
+                        t.rows += 1;
+                        t.cell = 0;
                     }
                     w.body.push_str("<w:tr><w:trPr><w:tblHeader/></w:trPr>");
                 }
-                Tag::TableRow => w.body.push_str("<w:tr>"),
+                Tag::TableRow => {
+                    if let Some(t) = w.table.as_mut() {
+                        t.rows += 1;
+                        t.cell = 0;
+                    }
+                    w.body.push_str("<w:tr>");
+                }
                 Tag::TableCell => {
-                    let cols = w.table.as_ref().map_or(1, |t| t.cols);
-                    w.body.push_str(&format!(
-                        "<w:tc><w:tcPr><w:tcW w:w=\"{}\" w:type=\"dxa\"/></w:tcPr>",
-                        9026 / cols
-                    ));
-                    w.open_para();
+                    let (span, width) = match w.table.as_mut() {
+                        Some(t) => {
+                            let span = t.spans.get(t.rows.saturating_sub(1)).and_then(|r| r.get(t.cell)).copied().unwrap_or(1);
+                            t.covered = span == 0;
+                            let width: u32 = t.widths.iter().skip(t.cell).take(span.max(1)).sum();
+                            (span, width)
+                        }
+                        None => (1, 9026),
+                    };
+                    // En täckt cell skrivs inte: den före den spänner över den (`w:gridSpan`).
+                    if span > 0 {
+                        let grid = if span > 1 { format!("<w:gridSpan w:val=\"{span}\"/>") } else { String::new() };
+                        w.body.push_str(&format!("<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>{grid}</w:tcPr>"));
+                        w.open_para();
+                    }
                 }
                 Tag::FootnoteDefinition(label) => {
                     w.close_para();
@@ -3190,9 +3249,15 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 }
                 TagEnd::TableRow => w.body.push_str("</w:tr>"),
                 TagEnd::TableCell => {
-                    w.open_para(); // en cell måste innehålla minst ett stycke
-                    w.close_para();
-                    w.body.push_str("</w:tc>");
+                    let covered = w.table.as_mut().is_some_and(|t| {
+                        t.cell += 1;
+                        std::mem::take(&mut t.covered)
+                    });
+                    if !covered {
+                        w.open_para(); // en cell måste innehålla minst ett stycke
+                        w.close_para();
+                        w.body.push_str("</w:tc>");
+                    }
                 }
                 TagEnd::FootnoteDefinition => {
                     w.close_para();
@@ -5537,6 +5602,75 @@ Marginal
             println!("{f}: {same}/{} delar identiska, tappat: {:?}, markörer: {}", names.len(), l.dropped, l.markdown.matches("<!--k:").count());
             std::fs::write(format!("{f}.kladd-ut.docx"), out).unwrap();
         }
+    }
+
+    #[test]
+    fn table_merge_widths_and_breaks_roundtrip() {
+        let md = "| Rubrik över två || x |\n| ------ | -- | ---- |\n| a | b<br>rad | c |\n| d |||\n";
+        let w = write(md, "T", &|_| None, None).unwrap();
+        let xml = part_text(&w.bytes, "word/document.xml");
+        // Sammanfogad cell, kolumnbredder i förhållande 6:2:4 och radbrytning i cellen.
+        assert!(xml.contains("<w:gridSpan w:val=\"2\"/>"), "{xml}");
+        assert!(xml.contains("<w:gridSpan w:val=\"3\"/>"));
+        assert!(xml.contains("<w:gridCol w:w=\"4513\"/><w:gridCol w:w=\"1504\"/><w:gridCol w:w=\"3008\"/>"), "{xml}");
+        assert!(xml.contains("<w:tcW w:w=\"6017\" w:type=\"dxa\"/><w:gridSpan w:val=\"2\"/>"));
+        assert!(xml.contains("<w:r><w:br/></w:r>"));
+        // Täckta celler skrivs inte: 2 + 3 + 1 celler.
+        assert_eq!(xml.matches("<w:tc>").count(), 6, "{xml}");
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        let ts = markup::table_src(&back.markdown);
+        assert_eq!(ts.cols, 3);
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![3, 0, 0]], "{}", back.markdown);
+        assert_eq!(ts.weights, Some(vec![20, 7, 13]), "{}", back.markdown);
+        assert!(back.markdown.contains("| a | b<br>rad | c |"), "{}", back.markdown);
+        // Och en gång till ger samma text.
+        assert_eq!(rt(&back.markdown), back.markdown);
+    }
+
+    #[test]
+    fn table_equal_widths_stay_plain() {
+        let md = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        assert_eq!(rt(md), md);
+        let xml = part_text(&write(md, "T", &|_| None, None).unwrap().bytes, "word/document.xml");
+        assert!(xml.contains("<w:gridCol w:w=\"4512\"/><w:gridCol w:w=\"4512\"/>"), "{xml}");
+        assert!(!xml.contains("gridSpan"));
+    }
+
+    #[test]
+    fn reads_grid_span_widths_and_vertical_merge_from_word() {
+        let w = write("x\n", "x", &|_| None, None).unwrap();
+        let patched = patch_document(&w.bytes, |x| {
+            let cell = |pr: &str, t: &str| {
+                format!("<w:tc><w:tcPr>{pr}</w:tcPr><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>")
+            };
+            let tbl = format!(
+                "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"6000\"/><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+                 <w:tr>{}{}</w:tr>\
+                 <w:tr>{}{}{}</w:tr>\
+                 <w:tr>{}{}{}</w:tr></w:tbl>",
+                cell("<w:tcW w:w=\"8000\" w:type=\"dxa\"/><w:gridSpan w:val=\"2\"/>", "Bred"),
+                cell("<w:tcW w:w=\"2000\" w:type=\"dxa\"/>", "Id"),
+                cell("<w:vMerge w:val=\"restart\"/>", "Lodrät"),
+                cell("", "b"),
+                cell("", "c"),
+                cell("<w:vMerge/>", ""),
+                cell("", "e"),
+                cell("", "f"),
+            );
+            let start = x.find("<w:p>").unwrap();
+            let end = x.rfind("</w:p>").unwrap() + "</w:p>".len();
+            format!("{}{}{}", &x[..start], tbl, &x[end..])
+        });
+        let back = read(&patched).unwrap();
+        let md = back.markdown.trim_end();
+        let ts = markup::table_src(md);
+        assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![1, 1, 1]], "{md}");
+        // 2000:6000:2000 av 40 streck = 8:24:8.
+        assert_eq!(ts.weights, Some(vec![8, 24, 8]), "{md}");
+        // Lodrätt sammanfogad fortsättningscell blir en tom cell.
+        assert!(md.contains("| Lodrät | b | c |"), "{md}");
+        assert!(md.contains("|   | e | f |"), "{md}");
     }
 
 }
