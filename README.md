@@ -36,17 +36,17 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 
 ## Kom igång
 
-Kladd är ett öppet källkodsprojekt och har ännu inget färdigt releasepaket. Bygg det från källkoden:
+Ladda ner det senaste `.deb`-paketet från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest) och installera det med:
+
+```bash
+sudo apt install ./kladd_*.deb
+```
+
+Du kan också bygga Kladd från källkoden:
 
 ```bash
 cargo build --release
 ./target/release/kladd
-```
-
-Har du redan ett färdigt `.deb`-paket installerar du det med:
-
-```bash
-sudo apt install ./kladd_*.deb
 ```
 
 <details>
@@ -58,6 +58,13 @@ cargo deb                          # skapar paketet i target/debian/
 ```
 
 Avinstallera med `sudo apt remove kladd`.
+
+En ny release skapas automatiskt när en versionstagg pushas. Höj först `version` i `Cargo.toml`, och tagga sedan samma version:
+
+```bash
+git tag v1.4.0
+git push origin v1.4.0
+```
 
 </details>
 
