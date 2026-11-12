@@ -210,3 +210,52 @@ GitHub. Allt tolkas och skrivs med `src/style.rs`:
 Dokumentläget lägger ut varje stycke för sig (egen radbredd, justering och hängande indrag)
 och fogar ihop styckena med `Galley::concat`. Marginaljustering fördelar utrymmet på
 mellanrummen i alla rader utom styckets sista.
+
+## 1.6: förlustfri Word, sidor, inklistring, tabeller, bilder, utskrift, ODT
+
+Gemensamma format (alla moduler ska använda dessa):
+
+- **Sida, sidhuvud och sidfot** står i grundformatskommentaren (`style::DocDefaults`):
+  `<!-- kladd: page-size: A4; page-margin: 25mm 20mm; header: "Rapport"; header-align: right;
+  footer: "Sida {sida} av {sidor}"; footer-align: center -->`. Standard är A4 med en tums
+  marginaler och inget sidhuvud eller sidfot. `style::fill_fields` fyller i `{sida}`/`{sidor}`.
+- **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
+  CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
+  skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
+- **Okända Word-objekt** (fotnotsreferenser, kommentarsankare, bokmärken, fält, textrutor,
+  former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
+  `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda
+  (noll bredd); i Markdown-förhandsvisningen tas de bort.
+- **Förlustfri .docx**: originalpaketet sparas i `Document`. Vid sparning kopieras alla delar
+  som Kladd inte skriver om (sidhuvuden, sidfötter, fotnoter, kommentarer, inställningar, tema,
+  typsnittstabell …), `w:sectPr` behålls, och varje stycke vars Markdown inte har ändrats skrivs
+  tillbaka med sin ursprungliga XML.
+
+## Inklistring av formaterad text (`src/paste.rs`)
+
+Ctrl+V i dokumentläget läser HTML från systemets urklipp (`arboard`) och gör om den till
+Kladds Markdown med `paste::html_to_markdown(html, Some(&defaults))`: rubriker (även Words
+`MsoTitle`/`MsoHeading*`/`mso-outline-level`), fet/kursiv/understruken/struken (taggar och CSS),
+`<span style>` för typsnitt, storlek, färg och bakgrund (utom svart text, vit bakgrund och
+dokumentets grundformat), `<div align>`, listor (även Words `mso-list`-låtsaslistor och Google
+Dokuments platta `aria-level`-listor), tabeller (cellerna slås ihop till en rad), länkar och
+`data:`-bilder som `bild:inklistrad-N.ext` (med `width` om den är känd). Övriga bilder blir sin
+alternativtext. HTML läses av en egen förlåtande tolk, utan extra crate.
+
+`word_paste_html` (view.rs) tar bort `Event::Paste` innan TextEdit ser den och sätter in
+resultatet med `paste::insert` (block får tomma rader runt sig, ett inline-stycke sätts in
+direkt). Ctrl+Skift+V och urklipp utan HTML går som förut. egui skickar `Paste` bara när
+urklippet också har vanlig text, vilket Word, LibreOffice, Google Dokument och webbläsare alltid
+lägger dit.
+
+### OpenDocument-text (.odt)
+
+`src/odt.rs` läser och skriver `.odt` (LibreOffice) med samma Markdown-dialekt och dokumentläge som
+`.docx`: `odt::read(bytes) -> docx::Loaded` och `odt::write(markdown, titel, resolve) -> docx::Written`.
+Formatmallar (`office:styles` och `office:automatic-styles` i `styles.xml`/`content.xml`) löses längs
+`style:parent-style-name`; bara det som skiljer sig från grundformatet (standardstycket + Standard)
+blir `<span style>`. Fotnoter, kommentarer, former/diagram och länkade bilder tas bort och rapporteras
+som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/sidfot (`text:page-number`
+→ `{sida}`, `text:page-count` → `{sidor}`) hamnar i grundformatskommentaren. Vid skrivning ligger
+`mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
+`language()` visar "OpenDocument".

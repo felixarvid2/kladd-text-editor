@@ -23,7 +23,10 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 ## Funktioner
 
 - **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
-- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), PDF och många kodformat.
+- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), PDF och många kodformat.
+- **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
+- **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
+- **Förlustfri Word-sparning** – Word-filer sparas med alla sina delar kvar, se [Word-dokument](#word-dokument).
 - **Syntaxfärgning** och radnummer.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
@@ -31,7 +34,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
 - **Dra och släpp** filer direkt i fönstret.
 - **Ett fönster** – filer som öppnas från filhanteraren eller terminalen läggs som nya flikar i det Kladd-fönster som redan är öppet. Använd `kladd --new-window` för ett separat fönster.
-- **Dokumentläge** – Word-dokument visas som ett dokument med A4-sida, formateringsfält och sidnummer. Se [Word-dokument](#word-dokument).
+- **Dokumentläge** – Word- och OpenDocument-dokument visas som ett dokument med riktiga sidor, formateringsfält och sidnummer. Se [Word-dokument](#word-dokument).
 - **Stavningskontroll** i dokumentläget, med svenska och engelska ordlistor från systemet.
 
 ## Kom igång
@@ -72,15 +75,35 @@ Det går också att köra workflowen *Release* för hand under Actions och kryss
 
 ## Word-dokument
 
-Kladd öppnar `.docx` i dokumentläge, som liknar ett Word-dokument. När du sparar som `.docx` blir det ett riktigt Word-dokument som öppnas i Word, LibreOffice och Google Dokument. Med *Spara som* kan vilken flik som helst sparas som `.docx`.
+Kladd öppnar `.docx` och `.odt` (LibreOffice) i dokumentläge, som liknar ett Word-dokument. När du sparar som `.docx` blir det ett riktigt Word-dokument som öppnas i Word, LibreOffice och Google Dokument. `.odt` sparas som OpenDocument-text. Med *Spara som* kan vilken flik som helst sparas som `.docx`.
 
 ### Dokumentläge
 
 ![Ett Word-dokument i Kladds dokumentläge](docs/dokumentlage-ljust.png)
 
-Ett öppnat `.docx` visas på en vit A4-sida mot grå bakgrund, med typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Listor dras in med hängande indrag, tabeller ritas som rutnät, bilder visas i texten och sidbrytningar markeras med "Sida N". Markdown-koden är dold; den visas nedtonad bara på raden där markören står.
+Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och marginaler från dokumentet och typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Listor dras in med hängande indrag, tabeller ritas som rutnät och bilder visas i texten. Markdown-koden är dold; den visas nedtonad bara på raden där markören står.
 
 Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, infoga bild och tabell, ångra och gör om samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
+
+### Förlustfri sparning
+
+Kladd behåller alla delar av originalfilen, som sidhuvud, sidfot, fotnoter, kommentarer, teman och inställningar. Vid sparning skrivs bara de stycken om som du har ändrat; oförändrade stycken sparas exakt som de var. Objekt som Kladd inte kan visa, till exempel fotnotsreferenser, kommentarer, fält och textrutor, blir osynliga markörer `<!--k:N-->` i Markdown-texten och skrivs tillbaka när du sparar. Det enda som kan försvinna är spårade ändringar i stycken som du ändrar.
+
+### Sidor och utskrift
+
+Knappen *Sidinställningar* (eller dubbelklick på sidhuvud eller sidfot) öppnar en dialog för sidstorlek (A4, A5, A3, Letter, Legal), stående eller liggande, marginaler, sidhuvud och sidfot. I sidhuvud och sidfot betyder `{sida}` och `{sidor}` sidnummer och antal sidor. Inställningarna sparas i grundformatskommentaren:
+
+```
+<!-- kladd: page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"; footer-align: center -->
+```
+
+### Tabeller, bilder och inklistring
+
+Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.
+
+Klicka på en bild för att markera den. Dra i hörnen för att ändra storlek (håll Skift för fri proportion). En liten verktygsrad vid bilden justerar läget (vänster, centrerat eller höger), återställer originalstorleken eller tar bort bilden. Delete tar bort en markerad bild.
+
+Ctrl+V klistrar in formaterad text med rubriker, fetstil, kursiv, understrykning, färger, typsnitt, storlekar, justering, listor, tabeller, länkar och inbäddade bilder. Ctrl+Shift+V klistrar in oformaterad text.
 
 Vill du se dokumentet som vanlig Markdown-text klickar du på *Markdown* i formateringsfältet. Klicka på *Visa som dokument* i statusfältet för att gå tillbaka.
 
@@ -97,16 +120,19 @@ Kladd använder de Hunspell-ordlistor som finns i `/usr/share/hunspell`, samma s
 | Typsnitt, storlek, textfärg, markering | `<span style="font-family: Arial; font-size: 14pt; color: #C00000; background-color: #FFFF00">…</span>` |
 | Centrerat, högerjusterat, marginaljusterat | `<div align="center">` … `</div>` |
 | Dokumentets grundtypsnitt | `<!-- kladd: font-family: "Times New Roman"; font-size: 12pt -->` på första raden |
+| Sidstorlek, marginaler, sidhuvud och sidfot | Samma kommentar: `page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"` |
+| Fotnoter, kommentarer, fält, textrutor m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
 | Punktlistor och numrerade listor | `-` och `1.` |
 | Citat | `>` |
 | Tabeller | `\| kolumn \| kolumn \|` |
 | Länkar | `[text](https://…)` |
 | Kod | `` `kod` `` och kodblock |
 | Bilder (PNG, JPEG, GIF, BMP) | `![text](bild:image1.png)` |
+| Bildstorlek | `<img src="…" alt="…" width="240">` |
 
 Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
 
-Diagram, former, textrutor, kommentarer, fotnoter, sidhuvuden och spårade ändringar visas inte. Kladd säger till när ett dokument innehåller sådant och frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
+Diagram, former, textrutor, kommentarer, fotnoter och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
 
 Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
 
@@ -128,6 +154,10 @@ Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/
 | `Ctrl+O` | Öppna fil |
 | `Ctrl+S` | Spara |
 | `Ctrl+Shift+S` | Spara som |
+| `Ctrl+P` | Skriv ut (alla flikar) |
+| `Ctrl+Shift+V` | Klistra in oformaterat (endast dokumentläge) |
+| `Tab` / `Shift+Tab` | Nästa / föregående cell i tabell (endast dokumentläge) |
+| `Delete` | Ta bort markerad bild (endast dokumentläge) |
 | `Ctrl+W` | Stäng flik |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Nästa / föregående flik |
 | `Ctrl+Shift+I` | Infoga bild |

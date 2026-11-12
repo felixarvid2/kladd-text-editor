@@ -149,6 +149,7 @@ pub struct KladdApp {
     pub(crate) doc_fonts: crate::word::fonts::DocFonts,
     pub(crate) speller: Option<crate::spell::Speller>,
     pub(crate) wv: crate::word::view::State,
+    pub(crate) print: crate::print::PrintState,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -248,6 +249,7 @@ impl KladdApp {
             doc_fonts: crate::word::fonts::DocFonts::new(),
             speller: None,
             wv: Default::default(),
+            print: Default::default(),
         };
         if single_instance {
             let (tx, rx) = channel();
@@ -372,6 +374,7 @@ impl KladdApp {
                 .add_filter("Alla filer", &["*"])
                 .add_filter("Text och Word", TEXT_EXTENSIONS)
                 .add_filter("Word-dokument", &["docx", "docm", "dotx"])
+                .add_filter("OpenDocument-text", &["odt", "ott"])
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -394,7 +397,8 @@ impl KladdApp {
         let doc_id = doc.id;
         let name = if doc.needs_save_as() {
             let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-            format!("{}.docx", stem.unwrap_or_else(|| doc.title()))
+            let ext = if doc.extension() == "ott" { "odt" } else { "docx" };
+            format!("{}.{ext}", stem.unwrap_or_else(|| doc.title()))
         } else if doc.path.is_some() {
             doc.title()
         } else {
@@ -413,6 +417,7 @@ impl KladdApp {
                 .add_filter("Text", &["txt"])
                 .add_filter("Markdown", &["md"])
                 .add_filter("Word-dokument", &["docx"])
+                .add_filter("OpenDocument-text (.odt)", &["odt"])
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -754,7 +759,7 @@ impl KladdApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() {
+        if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() {
             return;
         }
         let ctrl = Modifiers::CTRL;
@@ -765,6 +770,9 @@ impl KladdApp {
 
         if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
             self.new_tab();
+        }
+        if hit(ctrl, Key::P) {
+            self.open_print(ctx);
         }
         if hit(ctrl, Key::O) {
             self.request_open(ctx);
@@ -1066,6 +1074,9 @@ impl KladdApp {
         if menu_item(ui, p, "Spara som…", "Ctrl+Shift+S", None, has_doc) {
             self.request_save_as(ctx, self.active, false, false);
         }
+        if menu_item(ui, p, "Skriv ut…", "Ctrl+P", None, has_doc) {
+            self.open_print(ctx);
+        }
         if menu_item(ui, p, "Stäng flik", "Ctrl+W", None, has_doc) {
             self.request_close_tab(self.active);
         }
@@ -1126,7 +1137,7 @@ impl KladdApp {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     if let Some(doc) = self.docs.get(self.active) {
-                        let lang = if doc.word_view { "Word".to_owned() } else { doc.language() };
+                        let lang = doc.language();
                         ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
                     let now = Self::now(&ctx);
@@ -1149,6 +1160,8 @@ impl KladdApp {
                         if doc.docx || doc.pdf {
                             let (label, tip) = if doc.pdf {
                                 ("PDF-dokument", "Texten visas som Markdown och sparas som en ny PDF")
+                            } else if doc.language() == "OpenDocument" {
+                                ("OpenDocument-text", "Visas som Markdown och sparas som .odt")
                             } else {
                                 ("Word-dokument", "Visas som Markdown och sparas som .docx")
                             };
@@ -1227,7 +1240,8 @@ impl KladdApp {
                         st.visuals.override_text_color = Some(p.text);
                         ui.set_max_width(680.0f32.min(ui.available_width()));
                         // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
-                        let mut text = std::borrow::Cow::Borrowed(doc.text.as_str());
+                        // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
+                        let mut text: std::borrow::Cow<str> = std::borrow::Cow::Owned(crate::preview::clean(&doc.text));
                         for (name, img) in &doc.images {
                             let enc = name.replace(' ', "%20");
                             let uri = format!("bytes://kladd/{}/{enc}", doc.id);
@@ -1997,6 +2011,8 @@ impl eframe::App for KladdApp {
         self.close_dialog(&ctx, &p);
         self.docx_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
+        self.print_dialog(&ctx, &p);
+        self.page_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);

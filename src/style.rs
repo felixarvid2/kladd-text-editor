@@ -185,16 +185,41 @@ pub fn div_open(align: Align) -> String {
     format!("<div align=\"{}\">", align.as_attr())
 }
 
-/// Dokumentets grundformat (första raden `<!-- kladd: … -->`).
+/// Dokumentets grundformat (första raden `<!-- kladd: … -->`): typsnitt, storlek, sida,
+/// marginaler, sidhuvud och sidfot.
+///
+/// ```text
+/// <!-- kladd: font-family: "Times New Roman"; font-size: 12pt; page-size: 210mm 297mm;
+///      page-margin: 25mm 20mm 25mm 20mm; header: "Rapport"; header-align: right;
+///      footer: "Sida {sida} av {sidor}"; footer-align: center -->
+/// ```
+///
+/// Allt står på en rad. `page-size` är `A4`, `A5`, `A3`, `Letter`, `Legal` eller bredd och höjd
+/// (`mm`, `cm`, `in`, `pt`); `landscape` efter namnet vänder sidan. `page-margin` följer CSS:
+/// ett värde för alla, eller topp höger botten vänster. I `header`/`footer` står `{sida}` för
+/// sidnumret och `{sidor}` för antalet sidor.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocDefaults {
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
+    /// Sidans bredd och höjd i pt.
+    pub page_size: Option<(f32, f32)>,
+    /// Marginaler i pt: topp, höger, botten, vänster.
+    pub page_margin: Option<[f32; 4]>,
+    pub header: Option<String>,
+    pub header_align: Align,
+    pub footer: Option<String>,
+    pub footer_align: Align,
 }
+
+/// A4 i pt.
+pub const A4: (f32, f32) = (595.28, 841.89);
+/// En tum.
+pub const DEFAULT_MARGIN: f32 = 72.0;
 
 impl DocDefaults {
     pub fn is_empty(&self) -> bool {
-        self.font_family.is_none() && self.font_size.is_none()
+        self.to_comment().is_empty()
     }
 
     pub fn font(&self) -> &str {
@@ -205,6 +230,16 @@ impl DocDefaults {
         self.font_size.unwrap_or(DEFAULT_SIZE)
     }
 
+    /// Sidans storlek i pt (A4 om inget anges).
+    pub fn page(&self) -> (f32, f32) {
+        self.page_size.unwrap_or(A4)
+    }
+
+    /// Marginaler i pt: topp, höger, botten, vänster (en tum om inget anges).
+    pub fn margins(&self) -> [f32; 4] {
+        self.page_margin.unwrap_or([DEFAULT_MARGIN; 4])
+    }
+
     /// Raden som skrivs först i texten, utan radslut. Tom sträng om inget avviker från standard.
     pub fn to_comment(&self) -> String {
         let mut parts = Vec::new();
@@ -213,6 +248,23 @@ impl DocDefaults {
         }
         if let Some(s) = self.font_size.filter(|s| (s - DEFAULT_SIZE).abs() > 0.01) {
             parts.push(format!("font-size: {}pt", fmt_pt(s)));
+        }
+        if let Some((w, h)) = self.page_size.filter(|&p| !same_size(p, A4)) {
+            parts.push(format!("page-size: {}", page_size_css(w, h)));
+        }
+        if let Some(m) = self.page_margin.filter(|m| m.iter().any(|v| (v - DEFAULT_MARGIN).abs() > 0.5)) {
+            parts.push(format!("page-margin: {}", margin_css(m)));
+        }
+        for (name, text, align) in [
+            ("header", &self.header, self.header_align),
+            ("footer", &self.footer, self.footer_align),
+        ] {
+            if let Some(t) = text.as_deref().filter(|t| !t.is_empty()) {
+                parts.push(format!("{name}: {}", quote(t)));
+                if align != Align::Left {
+                    parts.push(format!("{name}-align: {}", align.as_attr()));
+                }
+            }
         }
         if parts.is_empty() {
             return String::new();
@@ -225,9 +277,185 @@ impl DocDefaults {
         let t = line.trim();
         let inner = t.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
         let css = inner.strip_prefix("kladd:")?;
-        let s = SpanStyle::from_css(css);
-        Some(DocDefaults { font_family: s.font_family, font_size: s.font_size })
+        let mut d = DocDefaults::default();
+        for (k, v) in declarations(css) {
+            match k.as_str() {
+                "font-family" => d.font_family = split_font_list(&v).into_iter().next().filter(|f| !f.is_empty()),
+                "font-size" => d.font_size = parse_size(&v),
+                "page-size" => d.page_size = parse_page_size(&v),
+                "page-margin" => d.page_margin = parse_margins(&v),
+                "header" => d.header = Some(unquote(&v)),
+                "footer" => d.footer = Some(unquote(&v)),
+                "header-align" => d.header_align = Align::from_attr(&v),
+                "footer-align" => d.footer_align = Align::from_attr(&v),
+                _ => {}
+            }
+        }
+        Some(d)
     }
+}
+
+/// Text i sidhuvud eller sidfot med fälten ifyllda.
+pub fn fill_fields(template: &str, page: usize, pages: usize) -> String {
+    template.replace("{sida}", &page.to_string()).replace("{sidor}", &pages.to_string())
+}
+
+/// `namn: värde`-par separerade med `;`, där värden inom citattecken får innehålla `;`.
+fn declarations(css: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in css.chars() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            None if c == ';' => out.push(std::mem::take(&mut cur)),
+            None => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out.into_iter()
+        .filter_map(|d| {
+            let (k, v) = d.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        })
+        .collect()
+}
+
+fn quote(t: &str) -> String {
+    let mut s = String::from('"');
+    for c in t.chars() {
+        match c {
+            '"' => s.push_str("\\\""),
+            '\\' => s.push_str("\\\\"),
+            '\n' => s.push(' '),
+            // "--" skulle avsluta kommentaren i HTML.
+            '-' if s.ends_with('-') => s.push_str("\\-"),
+            c => s.push(c),
+        }
+    }
+    s.push('"');
+    s
+}
+
+fn unquote(v: &str) -> String {
+    let v = v.trim();
+    let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return v.to_owned();
+    };
+    let mut out = String::new();
+    let mut esc = false;
+    for c in inner.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// En längd som `25mm`, `2.5cm`, `1in`, `72pt` eller `96px`, i pt.
+pub fn parse_length(v: &str) -> Option<f32> {
+    let v = v.trim().to_ascii_lowercase();
+    let (num, f) = if let Some(n) = v.strip_suffix("mm") {
+        (n, 72.0 / 25.4)
+    } else if let Some(n) = v.strip_suffix("cm") {
+        (n, 72.0 / 2.54)
+    } else if let Some(n) = v.strip_suffix("in") {
+        (n, 72.0)
+    } else if let Some(n) = v.strip_suffix("pt") {
+        (n, 1.0)
+    } else if let Some(n) = v.strip_suffix("px") {
+        (n, 0.75)
+    } else {
+        (v.as_str(), 1.0)
+    };
+    let x: f32 = num.trim().parse().ok()?;
+    (x >= 0.0 && x < 100_000.0).then_some(x * f)
+}
+
+fn parse_page_size(v: &str) -> Option<(f32, f32)> {
+    let words: Vec<String> = v.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+    let landscape = words.iter().any(|w| w == "landscape");
+    let named = words.iter().find_map(|w| {
+        Some(match w.as_str() {
+            "a3" => (841.89, 1190.55),
+            "a4" => A4,
+            "a5" => (419.53, 595.28),
+            "letter" => (612.0, 792.0),
+            "legal" => (612.0, 1008.0),
+            _ => return None,
+        })
+    });
+    let (w, h) = match named {
+        Some(p) => p,
+        None => {
+            let lens: Vec<f32> = words.iter().filter_map(|w| parse_length(w)).collect();
+            if lens.len() != 2 || lens[0] <= 0.0 || lens[1] <= 0.0 {
+                return None;
+            }
+            (lens[0], lens[1])
+        }
+    };
+    Some(if landscape && w < h { (h, w) } else { (w, h) })
+}
+
+fn parse_margins(v: &str) -> Option<[f32; 4]> {
+    let l: Vec<f32> = v.split_whitespace().map(parse_length).collect::<Option<_>>()?;
+    Some(match l.as_slice() {
+        [a] => [*a; 4],
+        [tb, rl] => [*tb, *rl, *tb, *rl],
+        [t, rl, b] => [*t, *rl, *b, *rl],
+        [t, r, b, l] => [*t, *r, *b, *l],
+        _ => return None,
+    })
+}
+
+fn same_size(a: (f32, f32), b: (f32, f32)) -> bool {
+    (a.0 - b.0).abs() < 1.0 && (a.1 - b.1).abs() < 1.0
+}
+
+fn page_size_css(w: f32, h: f32) -> String {
+    for (name, p) in [("A3", (841.89, 1190.55)), ("A4", A4), ("A5", (419.53, 595.28)), ("Letter", (612.0, 792.0)), ("Legal", (612.0, 1008.0))] {
+        if same_size((w, h), p) {
+            return name.to_owned();
+        }
+        if same_size((h, w), p) {
+            return format!("{name} landscape");
+        }
+    }
+    format!("{} {}", mm(w), mm(h))
+}
+
+fn margin_css(m: [f32; 4]) -> String {
+    if m.iter().all(|v| (v - m[0]).abs() < 0.5) {
+        mm(m[0])
+    } else {
+        m.iter().map(|v| mm(*v)).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// pt som mm med högst en decimal.
+fn mm(pt: f32) -> String {
+    let v = (pt * 25.4 / 72.0 * 10.0).round() / 10.0;
+    if v.fract() == 0.0 { format!("{}mm", v as i64) } else { format!("{v}mm") }
 }
 
 /// Words markeringsfärger (`w:highlight`) som RGB.
@@ -416,12 +644,47 @@ mod tests {
 
     #[test]
     fn defaults_comment() {
-        let d = DocDefaults { font_family: Some("Times New Roman".into()), font_size: Some(12.0) };
+        let d = DocDefaults { font_family: Some("Times New Roman".into()), font_size: Some(12.0), ..Default::default() };
         let c = d.to_comment();
         assert_eq!(c, "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt -->");
         assert_eq!(DocDefaults::from_comment(&c), Some(d));
-        assert_eq!(DocDefaults { font_family: Some("Calibri".into()), font_size: Some(11.0) }.to_comment(), "");
+        assert_eq!(DocDefaults { font_family: Some("Calibri".into()), font_size: Some(11.0), ..Default::default() }.to_comment(), "");
         assert_eq!(DocDefaults::from_comment("<!-- något annat -->"), None);
+    }
+
+    #[test]
+    fn page_setup_comment() {
+        let d = DocDefaults {
+            page_size: Some((612.0, 792.0)),
+            page_margin: Some([72.0, 56.69, 72.0, 56.69]),
+            header: Some("Rapport; \"utkast\" -- 2026".into()),
+            header_align: Align::Right,
+            footer: Some("Sida {sida} av {sidor}".into()),
+            footer_align: Align::Center,
+            ..Default::default()
+        };
+        let c = d.to_comment();
+        assert!(c.contains("page-size: Letter"), "{c}");
+        assert!(c.contains("page-margin: 25.4mm 20mm 25.4mm 20mm"), "{c}");
+        assert!(c.contains("footer-align: center"), "{c}");
+        assert!(!c[4..c.len() - 3].contains("--"), "kommentaren får inte innehålla --: {c}");
+        let back = DocDefaults::from_comment(&c).unwrap();
+        assert_eq!(back.header.as_deref(), Some("Rapport; \"utkast\" -- 2026"));
+        assert_eq!(back.footer, d.footer);
+        assert_eq!(back.header_align, Align::Right);
+        assert_eq!(back.page_size, Some((612.0, 792.0)));
+        let m = back.page_margin.unwrap();
+        assert!((m[1] - 56.69).abs() < 0.2 && (m[0] - 72.0).abs() < 0.2);
+        assert_eq!(fill_fields("Sida {sida} av {sidor}", 2, 5), "Sida 2 av 5");
+    }
+
+    #[test]
+    fn page_sizes() {
+        assert_eq!(parse_page_size("A4 landscape"), Some((841.89, 595.28)));
+        assert_eq!(parse_page_size("210mm 297mm").map(|(w, h)| (w.round(), h.round())), Some((595.0, 842.0)));
+        assert_eq!(parse_margins("1in 2cm"), Some([72.0, 72.0 / 2.54 * 2.0, 72.0, 72.0 / 2.54 * 2.0]));
+        assert_eq!(DocDefaults { page_size: Some(A4), page_margin: Some([72.0; 4]), ..Default::default() }.to_comment(), "");
+        assert_eq!(DocDefaults::default().page(), A4);
     }
 
     #[test]

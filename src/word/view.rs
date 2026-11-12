@@ -11,13 +11,16 @@ use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
     Color32,
-    Align, Align2, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
+    Align, CentralPanel, FontFamily, FontId, Frame, KeyboardShortcut, Layout, Margin,
     Modifiers, Key, Panel, Popup, Rect, RectAlign, ScrollArea, Sense, Shape, Stroke, TextBuffer, TextEdit, Ui,
     UiBuilder, Vec2, pos2, vec2,
 };
 
-use super::layout::{self, MARGIN_PT, PAGE_H_PT, PAGE_W_PT, px};
+use super::images;
+use super::layout::{self, px};
+use super::pages;
 use super::markup::{self, Block, Inline, SpanProp};
+use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::icons::{self, GlyphStyle, Icon};
 use crate::theme::Palette;
@@ -85,9 +88,13 @@ enum SpellAct {
 pub struct State {
     images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
+    /// Vald bild, pågående storleksändring.
+    img: images::State,
     target: Option<SpellTarget>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
+    /// Öppen dialog "Sidinställningar".
+    pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
@@ -100,6 +107,8 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    TableOp(TableOp),
+    PageSetup,
     Undo,
     Redo,
     Zoom(f32),
@@ -185,38 +194,10 @@ fn color_popup(
 }
 
 fn divider(ui: &mut Ui, p: &Palette) {
-    ui.add_space(4.0);
+    ui.add_space(3.0);
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line));
-    ui.add_space(4.0);
-}
-
-/// Radgränserna (y i px från galleriets överkant) där en ny sida börjar. `rows` är (topp, botten)
-/// för varje rad. Varje sida rymmer så många hela rader som får plats på `page_h`, minst en, och
-/// brytlinjen läggs mellan sista raden och nästa, så den aldrig skär en rad.
-fn page_breaks(rows: &[(f32, f32)], page_h: f32) -> Vec<f32> {
-    let mut out = Vec::new();
-    if page_h <= 0.0 || rows.is_empty() {
-        return out;
-    }
-    let mut i = 0;
-    while i < rows.len() {
-        let limit = rows[i].0 + page_h + 0.01;
-        let mut j = i;
-        while j + 1 < rows.len() && rows[j + 1].1 <= limit {
-            j += 1;
-        }
-        if j + 1 >= rows.len() {
-            break;
-        }
-        out.push((rows[j].1 + rows[j + 1].0) / 2.0);
-        i = j + 1;
-    }
-    out
-}
-
-fn overlaps_strict(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start < b.end && b.start < a.end
+    ui.add_space(3.0);
 }
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -230,7 +211,7 @@ impl KladdApp {
     }
 
     /// Markeringen i den aktiva flikens editor, som byteintervall.
-    fn word_selection(&self, ctx: &egui::Context) -> Range<usize> {
+    pub(crate) fn word_selection(&self, ctx: &egui::Context) -> Range<usize> {
         let Some(doc) = self.docs.get(self.active) else { return 0..0 };
         let state = TextEditState::load(ctx, editor_id(doc.id)).unwrap_or_default();
         match state.cursor.char_range() {
@@ -317,6 +298,33 @@ impl KladdApp {
         self.settings.word_zoom = ((z * 100.0).round() / 100.0).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 
+    /// Ctrl+V: har urklippet HTML (Word, LibreOffice, Google Dokument, webben) görs den om till
+    /// Kladds format och sätts in; annars (och vid Ctrl+Skift+V) klistrar egui in vanlig text.
+    fn word_paste_html(&mut self, ctx: &egui::Context) {
+        // Ctrl+V ger en `Paste`-händelse bara om urklippet också har vanlig text; knapptrycket
+        // fångar även ett urklipp med enbart HTML.
+        let is_paste = |e: &egui::Event| {
+            matches!(e, egui::Event::Paste(_))
+                || matches!(e, egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command)
+        };
+        let (paste, shift) = ctx.input(|i| (i.events.iter().any(is_paste), i.modifiers.shift));
+        if !paste || shift {
+            return;
+        }
+        let Some(html) = crate::paste::clipboard_html() else { return };
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        let defaults = markup::analyze(&doc.text).defaults;
+        let mut pasted = crate::paste::html_to_markdown(&html, Some(&defaults));
+        if pasted.markdown.trim().is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| i.events.retain(|e| !is_paste(e)));
+        crate::paste::make_names_unique(&mut pasted, &doc.images);
+        doc.images.append(&mut pasted.images);
+        let md = pasted.markdown;
+        self.word_edit(ctx, |t, s| crate::paste::insert(t, s, &md));
+    }
+
     /// Kortkommandon som bara gäller i dokumentläget (konsumeras före TextEdit).
     pub(crate) fn word_shortcuts(&mut self, ctx: &egui::Context) {
         if let Some(doc) = self.docs.get(self.active) {
@@ -325,6 +333,8 @@ impl KladdApp {
                 return;
             }
         }
+        self.word_table_keys(ctx);
+        self.word_paste_html(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
         let shift = ctx.input(|i| i.modifiers.shift);
@@ -383,6 +393,7 @@ impl KladdApp {
         }
         let sel = self.word_selection(&ctx);
         let doc = &self.docs[self.active];
+        let in_table = markup::table_at(&doc.text, sel.start).is_some();
         let analysis = self.word.analysis(doc.id, &doc.text);
         let act = markup::active(&doc.text, &analysis, sel);
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
@@ -410,7 +421,7 @@ impl KladdApp {
             .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
             .show(ui, |ui| {
                 let full = ui.max_rect();
-                let right_w = 186.0;
+                let right_w = 218.0;
                 let left_w = (full.width() - right_w - 8.0).max(200.0);
                 let right = Rect::from_min_size(pos2(full.right() - right_w, full.top()), vec2(right_w, 28.0));
                 ui.set_min_height(28.0);
@@ -420,7 +431,7 @@ impl KladdApp {
                     ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
                     // Stil
                     egui::ComboBox::from_id_salt("kladd-word-style")
-                        .width(106.0)
+                        .width(98.0)
                         .selected_text(block_label(act.block))
                         .show_ui(ui, |ui| {
                             for b in [
@@ -437,7 +448,7 @@ impl KladdApp {
                         });
                     // Typsnitt och storlek
                     egui::ComboBox::from_id_salt("kladd-word-font")
-                        .width(126.0)
+                        .width(112.0)
                         .selected_text(cur_font.clone())
                         .show_ui(ui, |ui| {
                             let pick = |f: &str| {
@@ -568,6 +579,12 @@ impl KladdApp {
                     if icons::button(ui, p, Icon::Table, 28.0, false, "Infoga tabell", p.chrome).clicked() {
                         acts.push(BarAct::Table);
                     }
+                    if in_table {
+                        divider(ui, p);
+                        if let Some(op) = tables::bar_group(ui, p) {
+                            acts.push(BarAct::TableOp(op));
+                        }
+                    }
                     divider(ui, p);
                     if icons::button(ui, p, Icon::Undo, 28.0, false, "Ångra (Ctrl+Z)", p.chrome).clicked() {
                         acts.push(BarAct::Undo);
@@ -581,6 +598,9 @@ impl KladdApp {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     if status_button(ui, p, "Markdown", "Visa dokumentet som Markdown-text").clicked() {
                         acts.push(BarAct::ToMarkdown);
+                    }
+                    if icons::button(ui, p, Icon::Page, 28.0, false, "Sidinställningar", p.chrome).clicked() {
+                        acts.push(BarAct::PageSetup);
                     }
                     divider(ui, p);
                     if icons::button(ui, p, Icon::Plus, 28.0, false, "Zooma in (Ctrl+plus)", p.chrome).clicked() {
@@ -602,11 +622,17 @@ impl KladdApp {
                 BarAct::Inline(m) => self.word_toggle(&ctx, m),
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
+                BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
+                BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
                 BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
-                BarAct::Align(al) => self.word_edit(&ctx, |t, s| markup::set_align(t, s, al)),
+                BarAct::Align(al) => {
+                    // En vald bild justeras som sitt stycke, oavsett var markören står.
+                    let img = self.wv.img.range.clone();
+                    self.word_edit(&ctx, |t, s| markup::set_align(t, img.unwrap_or(s), al))
+                }
                 BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
                 BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
                 BarAct::Zoom(d) => self.word_zoom_step(d),
@@ -648,7 +674,22 @@ impl KladdApp {
         }
     }
 
-    /// Sidvyn: grått skrivbord, en vit A4-sida med text, sidbrytningar och stavningsmarkering.
+    /// Utför en åtgärd på den valda bilden (`r` är bildbitens område i texten).
+    fn word_image_act(&mut self, ctx: &egui::Context, act: images::Act, r: Range<usize>) {
+        use images::Act;
+        match act {
+            Act::Align(al) => self.word_edit(ctx, |t, _| markup::set_align(t, r, al)),
+            Act::Original => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, None)),
+            Act::Resize { w, h: None } => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, Some(w))),
+            Act::Resize { w, h: Some(h) } => self.word_edit(ctx, |t, _| images::set_free_size(t, r, w, h)),
+            Act::Delete => {
+                self.word_edit(ctx, |t, _| images::remove_image(t, r));
+                self.wv.img.deselect();
+            }
+        }
+    }
+
+    /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
         CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
             self.editor_rect = ui.max_rect();
@@ -663,34 +704,31 @@ impl KladdApp {
                 self.settings.word_zoom = (self.settings.word_zoom * zd).clamp(MIN_ZOOM, MAX_ZOOM);
             }
 
-            let avail_w = ui.available_width();
-            let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-            if avail_w < px(z, PAGE_W_PT) + 2.0 * GAP {
-                z = ((avail_w - 2.0 * GAP) / px(1.0, PAGE_W_PT)).max(0.4);
-            }
-            let page_w = px(z, PAGE_W_PT);
-            let margin = px(z, MARGIN_PT);
-            let text_w = page_w - 2.0 * margin;
-            let text_h_page = px(z, PAGE_H_PT - 2.0 * MARGIN_PT);
-            let area_w = avail_w.max(page_w + 2.0 * GAP);
-
             let doc_id = self.docs[self.active].id;
             let id = editor_id(doc_id);
             let analysis = self.word.analysis(doc_id, &self.docs[self.active].text);
 
+            // Sidans mått kommer från dokumentets grundformat; zoomen anpassas så att sidan ryms.
+            let avail_w = ui.available_width();
+            let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+            let geom1 = pages::Geom::new(1.0, &analysis.defaults);
+            if avail_w < geom1.page_w * z + 2.0 * GAP {
+                z = ((avail_w - 2.0 * GAP) / geom1.page_w).max(0.4);
+            }
+            let geom = pages::Geom::new(z, &analysis.defaults);
+            let page_w = geom.page_w;
+            let text_w = geom.text_w();
+            let area_w = avail_w.max(page_w + 2.0 * GAP);
+
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
-            let srcs: Vec<String> = analysis
-                .pieces
-                .iter()
-                .filter_map(|pc| pc.image.as_ref().map(|i| i.src.clone()))
-                .collect();
+            let refs: Vec<markup::ImageRef> = analysis.pieces.iter().filter_map(|pc| pc.image.clone()).collect();
+            let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
-            for src in srcs {
-                self.word_image(&ctx, &src);
-                if let Some(Some(info)) = self.wv.images.get(&(doc_id, src.clone())) {
-                    let max_w = px(1.0, PAGE_W_PT - 2.0 * MARGIN_PT);
-                    let k = (max_w / info.size.x).min(1.0);
-                    sizes.insert(src, info.size * k * z);
+            for img in refs {
+                self.word_image(&ctx, &img.src);
+                if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
+                    let max_w = geom1.text_w();
+                    sizes.insert(images::size_key(&img), images::display_size(info.size, &img, max_w, z));
                 }
             }
             let image_size = |src: &str| sizes.get(src).copied();
@@ -743,10 +781,8 @@ impl KladdApp {
             // Markupen visas bara på markörens rader när editorn har fokus.
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
-            let reveal = if focused { markup::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
-            // Står markören i en tabell visas hela tabellen som rå Markdown.
+            let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
             let tabs = layout::tables(&self.docs[self.active].text, &analysis);
-            let reveal = layout::reveal_whole_tables(&tabs, reveal);
 
             let (query, case_sensitive) = if self.find.open {
                 (self.find.query.clone(), self.find.case_sensitive)
@@ -755,7 +791,12 @@ impl KladdApp {
             };
             let current_match = self.find.current;
             let scroll_to = self.scroll_to_char.take();
-            let focus = std::mem::take(&mut self.focus_editor);
+            // En vald bild tar fokus från texten (annars skulle Delete/Backspace gå dit).
+            let focus = std::mem::take(&mut self.focus_editor) && self.wv.img.selected.is_none();
+            let mut imgs = std::mem::take(&mut self.wv.img);
+            let mut img_act: Option<images::Act> = None;
+            let mut painted: Vec<images::Painted> = Vec::new();
+            let mut img_index = 0usize;
             let secondary_target = self.wv.target.clone();
 
             // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
@@ -778,7 +819,10 @@ impl KladdApp {
             let mut edited = false;
             let mut spell_act: Option<SpellAct> = None;
             let mut new_target: Option<Option<SpellTarget>> = None;
-            let mut pages = (1usize, 1usize);
+            let mut table_menu: Option<bool> = None;
+            let mut table_act: Option<TableOp> = None;
+            let mut page_pos = (1usize, 1usize);
+            let mut open_page_dlg = false;
 
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id)).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -789,7 +833,7 @@ impl KladdApp {
                 let page_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
-                    pos2(page_left + margin, page_top + margin),
+                    pos2(page_left + geom.left, page_top + geom.top),
                     vec2(text_w, f32::INFINITY),
                 );
                 let params = layout::Params {
@@ -805,9 +849,9 @@ impl KladdApp {
                     fonts_gen,
                 };
                 let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
-                    word.galley(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width)
+                    word.galley_paged(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width, Some(&geom))
                 };
-                let min_h = (px(z, PAGE_H_PT) - 2.0 * margin).max(0.0);
+                let min_h = geom.text_h();
                 let out = ui
                     .scope_builder(UiBuilder::new().max_rect(text_rect), |ui| {
                         TextEdit::multiline(&mut doc.text)
@@ -835,21 +879,35 @@ impl KladdApp {
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
+                // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
+                tables::fix_caret(ui.ctx(), id, text);
 
-                // Sidan och skuggan, i höjd med texten.
-                let page_h = px(z, PAGE_H_PT).max(2.0 * margin + te_rect.height());
-                let page_rect = Rect::from_min_size(pos2(page_left, page_top), vec2(page_w, page_h));
-                ui.painter().set(
-                    shadow_slot,
-                    Shape::rect_filled(page_rect.translate(vec2(0.0, 2.0)).expand(1.5), 2.0, p.page_shadow),
-                );
-                ui.painter().set(page_slot, Shape::rect_filled(page_rect, 1.0, p.page));
+                // Ett ark per sida, med luft emellan.
+                let total = pages::page_count(&galley, &geom);
+                let clip = ui.clip_rect();
+                let (shadows, sheets) = pages::sheet_shapes(p, &geom, page_left, page_top, total, clip);
+                ui.painter().set(shadow_slot, shadows);
+                ui.painter().set(page_slot, sheets);
+                let last_bottom = pages::sheet_rect(&geom, page_left, page_top, total - 1).bottom();
                 ui.allocate_rect(
-                    Rect::from_min_max(origin, pos2(origin.x + area_w, page_rect.bottom() + GAP)),
+                    Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),
                     Sense::hover(),
                 );
-
-                let clip = ui.clip_rect();
+                // Sidhuvud och sidfot (skrivskyddade här; dubbelklick öppnar sidinställningarna).
+                let hf_font = pages::header_font(
+                    z,
+                    &analysis.defaults,
+                    font_family(Some(analysis.defaults.font()), false, false),
+                );
+                for k in 0..total {
+                    let sheet = pages::sheet_rect(&geom, page_left, page_top, k);
+                    if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
+                        continue;
+                    }
+                    if pages::header_footer(ui, p, &geom, sheet, k, total, &analysis.defaults, hf_font.clone(), doc_id) {
+                        open_page_dlg = true;
+                    }
+                }
                 let painter = ui.painter().clone();
 
                 // Byte -> teckenindex, framåt i en svep (bitarna ligger i ordning).
@@ -909,15 +967,24 @@ impl KladdApp {
                             }
                         };
                     }
+                    if pc.image.is_some() {
+                        img_index += 1;
+                    }
                     if let (Some(img), false) = (&pc.image, shown) {
-                        if let Some(sz) = sizes.get(&img.src) {
+                        if let Some(sz) = sizes.get(&images::size_key(img)) {
                             let ci = conv.at(pc.range.start);
                             let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
                             {
                                 let uri = image_uri(&img.src, doc_id);
                                 let rect = Rect::from_min_size(r.min, *sz);
                                 if rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
-                                    egui::Image::new(uri).paint_at(ui, rect);
+                                    egui::Image::new(uri.clone()).paint_at(ui, rect);
+                                    painted.push(images::Painted {
+                                        rect,
+                                        range: pc.range.clone(),
+                                        index: img_index - 1,
+                                        uri,
+                                    });
                                 }
                             }
                         }
@@ -925,12 +992,16 @@ impl KladdApp {
                 }
                 flush_bar(&mut bar);
 
+                // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
+                let max_w = text_w;
+                img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p);
+
                 // Tabellrutnät: 1 px kantlinjer vid de dolda pipornas lägen och radgränserna.
                 if !edited {
                     let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
                     let mut conv = ByteToChar::new(text);
-                    for t in tabs.iter().filter(|t| !overlaps_strict(&t.region, &reveal)) {
+                    for t in tabs.iter() {
                         for (ri, row) in t.rows.iter().enumerate() {
                             let (Some(&first), Some(&last)) = (row.pipes.first(), row.pipes.last()) else { continue };
                             if row.delimiter || first == last {
@@ -958,34 +1029,9 @@ impl KladdApp {
                     }
                 }
 
-                // Sidbrytningar (ungefärliga): vid radgränser, aldrig genom en rad.
-                let top_of_text = gpos.y;
-                let rows: Vec<(f32, f32)> = galley.rows.iter().map(|r| (r.min_y(), r.max_y())).collect();
-                let breaks = page_breaks(&rows, text_h_page);
-                let total = breaks.len() + 1;
-                let right_x = page_left + page_w - margin + 8.0;
-                for (k, by) in breaks.iter().enumerate() {
-                    let y = top_of_text + by;
-                    if y >= clip.top() - 20.0 && y <= clip.bottom() + 20.0 {
-                        painter.extend(Shape::dashed_line(
-                            &[pos2(page_left, y), pos2(page_left + page_w, y)],
-                            Stroke::new(1.0, p.page_markup),
-                            5.0,
-                            4.0,
-                        ));
-                        painter.text(
-                            pos2(right_x, y),
-                            Align2::LEFT_CENTER,
-                            format!("Sida {}", k + 2),
-                            FontId::new(10.0, FontFamily::Proportional),
-                            p.page_muted,
-                        );
-                    }
-                }
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
-                let cur = breaks.iter().filter(|b| **b <= caret_y + 0.5).count() + 1;
-                pages = (cur.min(total), total);
+                page_pos = ((geom.page_of(caret_y) + 1).min(total), total);
 
                 // Röd våglinje under felstavade ord.
                 if !misspelled.is_empty() {
@@ -1036,30 +1082,40 @@ impl KladdApp {
                         }
                     }
                     new_target = Some(found);
+                    table_menu = Some(tables::on_secondary_click(ui.ctx(), id, text, ui.ctx().pointer_interact_pos().map(|pos| char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0))));
                 }
                 let target = match &new_target {
                     Some(t) => t.clone(),
                     None => secondary_target.clone(),
                 };
-                if let Some(t) = target {
+                let in_table_menu = table_menu.unwrap_or_else(|| tables::menu_open(ui.ctx()));
+                if target.is_some() || in_table_menu {
                     out.response.context_menu(|ui| {
                         ui.set_min_width(210.0);
                         ui.set_max_width(260.0);
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        if t.suggestions.is_empty() {
-                            ui.add_enabled(false, egui::Label::new("Inga förslag"));
-                        }
-                        for s in t.suggestions.iter().take(6) {
-                            if menu_item(ui, p, s, "", None, true) {
-                                spell_act = Some(SpellAct::Replace(t.range.clone(), s.clone()));
+                        if let Some(t) = &target {
+                            if t.suggestions.is_empty() {
+                                ui.add_enabled(false, egui::Label::new("Inga förslag"));
+                            }
+                            for s in t.suggestions.iter().take(6) {
+                                if menu_item(ui, p, s, "", None, true) {
+                                    spell_act = Some(SpellAct::Replace(t.range.clone(), s.clone()));
+                                }
+                            }
+                            menu_divider(ui, p);
+                            if menu_item(ui, p, "Ignorera alla", "", None, true) {
+                                spell_act = Some(SpellAct::Ignore(t.word.clone()));
+                            }
+                            if menu_item(ui, p, "Lägg till i ordlistan", "", None, true) {
+                                spell_act = Some(SpellAct::Add(t.word.clone()));
+                            }
+                            if in_table_menu {
+                                menu_divider(ui, p);
                             }
                         }
-                        menu_divider(ui, p);
-                        if menu_item(ui, p, "Ignorera alla", "", None, true) {
-                            spell_act = Some(SpellAct::Ignore(t.word.clone()));
-                        }
-                        if menu_item(ui, p, "Lägg till i ordlistan", "", None, true) {
-                            spell_act = Some(SpellAct::Add(t.word.clone()));
+                        if in_table_menu {
+                            table_act = tables::menu_items(ui, p);
                         }
                     });
                 }
@@ -1070,12 +1126,23 @@ impl KladdApp {
                 }
             });
 
-            self.wv.pages = pages;
+            self.wv.pages = page_pos;
+            let img_range = imgs.range.clone();
+            self.wv.img = imgs;
+            if let (Some(act), Some(r)) = (img_act, img_range) {
+                self.word_image_act(&ctx, act, r);
+            }
+            if open_page_dlg {
+                self.open_page_dialog();
+            }
             if let Some(t) = new_target {
                 self.wv.target = t;
             }
             if edited {
                 self.find.current = None;
+            }
+            if let Some(op) = table_act {
+                self.word_table_op(&ctx, op);
             }
             match spell_act {
                 Some(SpellAct::Replace(r, s)) => {
@@ -1183,27 +1250,7 @@ fn image_uri(src: &str, doc_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_breaks, step_size};
-
-    #[test]
-    fn sidbrytning_mellan_rader() {
-        // Rader på 20 px; sidan rymmer 100 px = 5 rader.
-        let rows: Vec<(f32, f32)> = (0..12).map(|i| (i as f32 * 20.0, i as f32 * 20.0 + 20.0)).collect();
-        let b = page_breaks(&rows, 100.0);
-        assert_eq!(b, vec![100.0, 200.0]);
-        // Aldrig genom en rad.
-        for y in &b {
-            assert!(rows.iter().all(|r| !(r.0 < *y && *y < r.1)), "{y}");
-        }
-        // Sidan rymmer inte en hel rad till: brytningen hamnar före den.
-        let b = page_breaks(&rows, 110.0);
-        assert_eq!(b[0], 100.0);
-        // En rad högre än sidan får en egen sida.
-        let tall = [(0.0, 20.0), (20.0, 400.0), (400.0, 420.0)];
-        assert_eq!(page_breaks(&tall, 100.0).len(), 2);
-        assert!(page_breaks(&rows[..5], 100.0).is_empty());
-        assert!(page_breaks(&[], 100.0).is_empty());
-    }
+    use super::step_size;
 
     #[test]
     fn size_steps_follow_the_list() {

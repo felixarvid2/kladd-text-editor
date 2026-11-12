@@ -18,10 +18,6 @@ use super::markup::{self, Align, Analysis, Block, DocDefaults, Piece};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
-pub const PAGE_W_PT: f32 = 595.0; // A4
-pub const PAGE_H_PT: f32 = 842.0;
-pub const MARGIN_PT: f32 = 72.0; // 1 tum
-
 /// Punkter till pixlar vid zoom (96 dpi).
 pub fn px(zoom: f32, pt: f32) -> f32 {
     pt * 96.0 / 72.0 * zoom
@@ -90,8 +86,24 @@ impl Cache {
     /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag). Jobbet
     /// byggs först (`p.measure` tar fonts-låset, så det måste ske utanför `fonts_mut`).
     pub fn galley(&mut self, ctx: &egui::Context, doc_id: u64, text: &str, p: &Params, wrap_width: f32) -> Arc<Galley> {
+        self.galley_paged(ctx, doc_id, text, p, wrap_width, None)
+    }
+
+    /// Som `galley`, men med raderna uppdelade på sidor enligt `pages` (se `pages::paginate`).
+    pub fn galley_paged(
+        &mut self,
+        ctx: &egui::Context,
+        doc_id: u64,
+        text: &str,
+        p: &Params,
+        wrap_width: f32,
+        pages: Option<&super::pages::Geom>,
+    ) -> Arc<Galley> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         Self::job_key(text, p).hash(&mut h);
+        if let Some(g) = pages {
+            g.hash_into(&mut h);
+        }
         wrap_width.to_bits().hash(&mut h);
         ctx.pixels_per_point().to_bits().hash(&mut h);
         // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
@@ -105,7 +117,11 @@ impl Cache {
         let job = self.job(doc_id, text, p);
         let a = self.analysis(doc_id, text);
         let ppp = ctx.pixels_per_point();
-        let g = Arc::new(ctx.fonts_mut(|f| layout_galley(f, job, &a, p, wrap_width, ppp)));
+        let mut g = ctx.fonts_mut(|f| layout_galley(f, job, &a, p, wrap_width, ppp));
+        if let Some(geom) = pages {
+            super::pages::paginate(&mut g, geom, ppp);
+        }
+        let g = Arc::new(g);
         self.galleys.insert(doc_id, (key, g.clone()));
         g
     }
@@ -156,6 +172,8 @@ pub const HIDDEN_PX: f32 = 0.01;
 
 /// Cellmarginal i tabeller (pt).
 const CELL_PAD_PT: f32 = 5.4;
+/// Minsta bredd (em) på en kolumn där alla celler är tomma.
+const EMPTY_COL_EM: f32 = 3.0;
 
 fn hidden_format(family: FontFamily) -> TextFormat {
     TextFormat {
@@ -470,21 +488,6 @@ pub fn tables(text: &str, a: &Analysis) -> Vec<Table> {
     out
 }
 
-/// Utvidgar `reveal` så att en tabell som markören står i visas helt (rå Markdown).
-pub fn reveal_whole_tables(tables: &[Table], reveal: Range<usize>) -> Range<usize> {
-    if reveal.is_empty() {
-        return reveal;
-    }
-    let mut r = reveal;
-    for t in tables {
-        if intersects(&t.region, &r) {
-            r.start = r.start.min(t.region.start);
-            r.end = r.end.max(t.region.end);
-        }
-    }
-    r
-}
-
 /// Sektionsbyggare: delar bitar vid `cuts` och lägger över `marks` (egna format för intervall).
 struct Builder {
     secs: Vec<(Range<usize>, TextFormat)>,
@@ -580,7 +583,11 @@ fn grid_table(
     }
     let mut col_x = vec![0.0f32; ncols + 1];
     for j in 0..ncols {
-        let w = rows.iter().filter_map(|(_, c)| c.get(j)).map(|c| c.w).fold(0.0, f32::max);
+        let mut w = rows.iter().filter_map(|(_, c)| c.get(j)).map(|c| c.w).fold(0.0, f32::max);
+        // En helt tom kolumn får minst 3 em så att cellerna går att klicka i.
+        if w == 0.0 {
+            w = EMPTY_COL_EM * size;
+        }
         col_x[j + 1] = col_x[j] + w + 2.0 * pad;
     }
     let hid = hidden_format(theme::doc_font(false, false));
@@ -591,7 +598,10 @@ fn grid_table(
             let trail_ws = s.len() - s.trim_end().len();
             if lead_ws == s.len() {
                 if !s.is_empty() {
-                    bld.marks.push((c.start..c.end, hid.clone()));
+                    // Tom cell: behåll radhöjden så att en helt tom rad inte kollapsar.
+                    let mut f = hid.clone();
+                    f.line_height = Some(size * 1.4);
+                    bld.marks.push((c.start..c.end, f));
                 }
             } else {
                 if lead_ws > 0 {
@@ -621,9 +631,9 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
     let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new() };
     let mut leads: BTreeMap<usize, f32> = BTreeMap::new();
 
-    // Tabeller som inte visas rått blir rutnät.
-    let tabs = tables(text, a);
-    let grid: Vec<&Table> = tabs.iter().filter(|t| !intersects(&t.region, &p.reveal)).collect();
+    // Tabeller är alltid rutnät, också med markören i dem: bara inline-markup i markörens cell
+    // visas (via `reveal`), aldrig pipor eller avgränsarrad.
+    let grid = tables(text, a);
     for t in &grid {
         grid_table(text, a, t, p, &mut bld, &mut leads);
     }
@@ -649,7 +659,9 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
         }
         let revealed = intersects(&r, &p.reveal);
         let hide = !revealed;
-        let grid_hdr = if pc.block == Block::Table && !revealed {
+        // Tabellpipor förblir dolda också när markören står i cellen bredvid.
+        let hide = hide || (pc.block == Block::Table && pc.markup && &text[r.clone()] == "|");
+        let grid_hdr = if pc.block == Block::Table {
             grid.iter()
                 .find(|t| t.region.start <= r.start && r.start < t.region.end)
                 .map(|t| t.rows.first().is_some_and(|row| r.start <= row.line.end))
@@ -659,7 +671,7 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
 
         if let Some(img) = &pc.image {
             if hide {
-                if let Some(h) = (p.image_size)(&img.src).map(|s| s.y) {
+                if let Some(h) = (p.image_size)(&super::images::size_key(img)).map(|s| s.y) {
                     // Dold text, men första tecknet reserverar bildens höjd.
                     let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
                     let fam = (p.font_family)(Some(a.defaults.font()), false, false);
@@ -808,7 +820,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             .iter()
             .filter(|pc| !intersects(&pc.range, &p.reveal))
             .filter_map(|pc| pc.image.as_ref())
-            .filter_map(|img| (p.image_size)(&img.src))
+            .filter_map(|img| (p.image_size)(&super::images::size_key(img)))
             .map(|sz| sz.x)
             .sum();
         out.push(Para { range, align, list, image_w, collapse: tag.last() != Some(&0) });
@@ -1144,13 +1156,34 @@ mod tests {
     }
 
     #[test]
-    fn table_raw_when_revealed() {
-        let t = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+    fn table_stays_grid_with_caret_inside() {
+        let pal = theme::palette(false);
+        let t = "| a | **b** |\n|---|---|\n| 1 | 2 |\n";
+        // Markören i cellen "b": bara dess `**` visas, pipor och avgränsarrad förblir dolda.
+        let b = t.find('b').unwrap();
+        let job = build(t, b - 2..b + 3, "");
+        assert_eq!(sec_at(&job, 0).format.color, Color32::TRANSPARENT);
+        assert_eq!(sec_at(&job, b - 2).format.color, pal.page_markup);
+        assert_eq!(sec_at(&job, t.find("|---").unwrap()).format.color, Color32::TRANSPARENT);
+        assert_ne!(sec_at(&job, t.find('1').unwrap()).format.font_id.family, FontFamily::Monospace);
+        // Rutnätet finns kvar (cellmarginalen före texten).
+        assert!(job.sections.iter().any(|s| s.leading_space > 0.0));
+        // Även en markering över hela tabellen avslöjar inga pipor.
         let job = build(t, 0..t.len(), "");
-        let s = sec_at(&job, 0);
-        assert_eq!(s.format.font_id.family, FontFamily::Monospace);
-        assert_ne!(s.format.color, Color32::TRANSPARENT);
-        assert!(job.sections.iter().all(|s| s.leading_space == 0.0));
+        assert_eq!(sec_at(&job, 0).format.color, Color32::TRANSPARENT);
+        assert!(job.sections.iter().any(|s| s.leading_space > 0.0));
+    }
+
+    #[test]
+    fn empty_columns_keep_a_minimum_width() {
+        let t = "| a |  |\n| --- | --- |\n| 1 |  |\n";
+        let job = build(t, 0..0, "");
+        // Pipan efter den tomma cellen skjuts ut minst 3 em.
+        let last = t.find("|\n|").unwrap();
+        assert!(sec_at(&job, last).leading_space >= 3.0 * px(1.0, 11.0), "{}", sec_at(&job, last).leading_space);
+        // Den tomma cellen behåller radhöjden så att en helt tom rad syns.
+        let blank = t.rfind("|  |").unwrap() + 1;
+        assert!(sec_at(&job, blank).format.line_height.unwrap_or(0.0) >= px(1.0, 11.0));
     }
 
     #[test]
