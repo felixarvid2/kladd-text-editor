@@ -6,6 +6,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ### Nytt
 
+- **Engelskt gränssnitt (första delen).** Ny inställning *Språk / Language* längst ned i huvudmenyn (Automatiskt, Svenska, English; Automatiskt följer systemets språk) som gäller direkt utan omstart. Översättningssystemet (`src/i18n.rs`, tabeller i `src/i18n/`, beskrivet i `docs/dev/oversattning.md`) är nycklat på svensk källtext, så texter som ännu inte översatts visas på svenska. Hittills översatt: huvudmeny, dialoger, notiser, sökfältet, statusrad, välkomstvy och kommandoradens hjälp. Huvudmenyn rullar nu om fönstret är för lågt.
 - **AppImage för Linux.** Varje release innehåller nu `Kladd-<version>-x86_64.AppImage` som körs på de flesta distributioner utan installation.
 
 ### Ändrat

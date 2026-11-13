@@ -24,6 +24,7 @@ mod review;
 mod highlight;
 mod history;
 mod history_ui;
+mod i18n;
 mod icons;
 mod keys;
 mod macopen;
@@ -52,12 +53,13 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         if s == "--help" || s == "-h" {
-            println!(
+            i18n::set_lang(i18n::LangSetting::Auto.resolve());
+            println!("{}", i18n::t(
                 "Användning: kladd [--new-window] [FIL ...]\n\n\
                  Öppnar filerna i varsin flik. Om Kladd redan är öppet läggs\n\
                  filerna till som nya flikar där.\n\n\
                  -n, --new-window   öppna ett separat fönster"
-            );
+            ));
             return Ok(());
         }
         if s == "--new-window" || s == "-n" {
@@ -74,7 +76,8 @@ fn main() -> eframe::Result {
         if !path.exists() {
             // Skapa filen så att `kladd ny.md` fungerar som i andra editorer.
             if let Err(e) = std::fs::write(&path, "") {
-                eprintln!("kladd: kunde inte skapa {}: {e}", path.display());
+                i18n::set_lang(i18n::LangSetting::Auto.resolve());
+                eprintln!("{}", crate::tf!("kladd: kunde inte skapa {path}: {e}", path = path.display(), e = e));
                 continue;
             }
         }

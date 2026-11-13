@@ -468,8 +468,8 @@ impl Document {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.display().to_string()),
-            None if self.untitled_index <= 1 => "Namnlös".to_owned(),
-            None => format!("Namnlös {}", self.untitled_index),
+            None if self.untitled_index <= 1 => crate::i18n::t("Namnlös").to_owned(),
+            None => crate::tf!("Namnlös {n}", n = self.untitled_index),
         }
     }
 
@@ -597,7 +597,7 @@ pub fn join_sv(items: &[&str]) -> String {
     match items {
         [] => String::new(),
         [a] => (*a).to_owned(),
-        [rest @ .., last] => format!("{} och {last}", rest.join(", ")),
+        [rest @ .., last] => format!("{} {} {last}", rest.join(", "), crate::i18n::t("och")),
     }
 }
 

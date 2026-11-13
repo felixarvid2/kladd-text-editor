@@ -15,7 +15,9 @@ use egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::t;
 use crate::panes::{self, Orient};
+use crate::tf;
 use crate::doc::{Document, LineEnding, LoadError, TEXT_EXTENSIONS, TextEncoding, join_sv};
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
@@ -101,6 +103,8 @@ pub struct Settings {
     pub workspace_panel: bool,
     /// Dolda filer och mappar som .git, target och node_modules visas i trädet.
     pub workspace_hidden: bool,
+    /// Språk för gränssnittet ("Språk / Language").
+    pub lang: crate::i18n::LangSetting,
 }
 
 impl Default for Settings {
@@ -131,6 +135,7 @@ impl Default for Settings {
             workspace: None,
             workspace_panel: false,
             workspace_hidden: false,
+            lang: Default::default(),
         }
     }
 }
@@ -302,6 +307,13 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// "<klart>, men hittade inte bilden X" / "bilderna X och Y".
+fn missing_images(done: &str, warnings: &[String]) -> String {
+    let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
+    let what = if list.len() == 1 { t("bilden") } else { t("bilderna") };
+    tf!("{done}, men hittade inte {what} {list}", done = done, what = what, list = join_sv(&list))
+}
+
 fn home_dir() -> Option<PathBuf> {
     crate::platform::home_dir()
 }
@@ -331,6 +343,7 @@ impl KladdApp {
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
         theme::set_dark(ctx, settings.dark);
+        crate::i18n::set_lang(settings.lang.resolve());
 
         let recovery = crate::recovery::Recovery::new();
         let orphans = crate::recovery::find_orphans(recovery.dir(), &crate::recovery::pid_alive);
@@ -507,11 +520,11 @@ impl KladdApp {
         let dir = self.start_dir();
         std::thread::spawn(move || {
             let mut dlg = rfd::FileDialog::new()
-                .set_title("Öppna fil")
-                .add_filter("Alla filer", &["*"])
-                .add_filter("Text och Word", TEXT_EXTENSIONS)
-                .add_filter("Word-dokument", &["docx", "docm", "dotx"])
-                .add_filter("OpenDocument-text", &["odt", "ott"])
+                .set_title(t("Öppna fil"))
+                .add_filter(t("Alla filer"), &["*"])
+                .add_filter(t("Text och Word"), TEXT_EXTENSIONS)
+                .add_filter(t("Word-dokument"), &["docx", "docm", "dotx"])
+                .add_filter(t("OpenDocument-text"), &["odt", "ott"])
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -524,7 +537,7 @@ impl KladdApp {
 
     fn request_save_as(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
         if self.dialog.is_some() {
-            self.notify(ctx, "Stäng den öppna fildialogen först.", true);
+            self.notify(ctx, t("Stäng den öppna fildialogen först."), true);
             return;
         }
         let Some(doc) = self.docs.get(idx) else { return };
@@ -548,16 +561,16 @@ impl KladdApp {
             .or_else(|| self.start_dir());
         std::thread::spawn(move || {
             let mut dlg = rfd::FileDialog::new()
-                .set_title("Spara som")
+                .set_title(t("Spara som"))
                 .set_file_name(name)
-                .add_filter("Alla filer", &["*"])
+                .add_filter(t("Alla filer"), &["*"])
                 .add_filter("Text", &["txt"])
                 .add_filter("Markdown", &["md"])
-                .add_filter("Word-dokument", &["docx"])
-                .add_filter("OpenDocument-text (.odt)", &["odt"])
+                .add_filter(t("Word-dokument"), &["docx"])
+                .add_filter(t("OpenDocument-text (.odt)"), &["odt"])
                 .add_filter("PDF", &["pdf"])
-                .add_filter("Webbsida (.html)", &["html"])
-                .add_filter("E-bok (.epub)", &["epub"]);
+                .add_filter(t("Webbsida (.html)"), &["html"])
+                .add_filter(t("E-bok (.epub)"), &["epub"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -578,8 +591,8 @@ impl KladdApp {
         let dir = self.start_dir();
         std::thread::spawn(move || {
             let mut dlg = rfd::FileDialog::new()
-                .set_title("Infoga bild")
-                .add_filter("Bilder", IMAGE_EXTENSIONS);
+                .set_title(t("Infoga bild"))
+                .add_filter(t("Bilder"), IMAGE_EXTENSIONS);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -594,7 +607,7 @@ impl KladdApp {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         if std::fs::read(path).ok().and_then(|b| crate::docx::image_ext(&b)).is_none() {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            self.notify(ctx, format!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF eller BMP)."), true);
+            self.notify(ctx, tf!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF eller BMP).", name = name), true);
             return;
         }
         // Relativ sökväg om bilden ligger i dokumentets mapp, annars absolut.
@@ -668,16 +681,15 @@ impl KladdApp {
                         Ok(warnings) => {
                             self.after_save(idx, &path);
                             if warnings.is_empty() {
-                                self.notify(ctx, "Sparat automatiskt", false);
+                                self.notify(ctx, t("Sparat automatiskt"), false);
                             } else {
-                                let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
-                                let what = if list.len() == 1 { "bilden" } else { "bilderna" };
-                                self.notify(ctx, format!("Sparat automatiskt, men hittade inte {what} {}", join_sv(&list)), true);
+                                let msg = missing_images(t("Sparat automatiskt"), &warnings);
+                                self.notify(ctx, msg, true);
                             }
                         }
                         Err(e) => {
                             self.autosave.mark_failed(id, &self.docs[idx].text);
-                            self.notify(ctx, format!("Automatisk sparning misslyckades: {e}"), true);
+                            self.notify(ctx, tf!("Automatisk sparning misslyckades: {e}", e = e), true);
                         }
                     }
                 }
@@ -692,7 +704,7 @@ impl KladdApp {
         let Some(doc) = self.docs.get(self.active) else { return };
         match doc.path.clone() {
             Some(path) => self.history = Some(crate::history_ui::Dialog::new(doc, &path)),
-            None => self.notify(ctx, "Spara filen först, så börjar historiken.", false),
+            None => self.notify(ctx, t("Spara filen först, så börjar historiken."), false),
         }
     }
 
@@ -710,7 +722,7 @@ impl KladdApp {
             Action::OpenNew(ts) => (ts, false),
         };
         let loaded = crate::history::read(&crate::history::root(), &dlg.path, ts)
-            .map_err(|e| format!("Versionen kunde inte läsas: {e}"))
+            .map_err(|e| tf!("Versionen kunde inte läsas: {e}", e = e))
             .and_then(|bytes| Document::from_version(self.next_id, &dlg.path, &bytes));
         let version = match loaded {
             Ok(v) => v,
@@ -729,7 +741,7 @@ impl KladdApp {
             self.word.forget(id);
             self.find.current = None;
             self.focus_editor = true;
-            self.notify(ctx, "Återställde versionen (ångra med Ctrl+Z)", false);
+            self.notify(ctx, t("Återställde versionen (ångra med Ctrl+Z)"), false);
         } else {
             self.next_id += 1;
             self.docs.push(version);
@@ -754,11 +766,10 @@ impl KladdApp {
                 // Export: fliken är kvar som den var (och ändrad), så den stängs inte här.
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 if warnings.is_empty() {
-                    self.notify(ctx, format!("Exporterade {name}"), false);
+                    self.notify(ctx, tf!("Exporterade {name}", name = name), false);
                 } else {
-                    let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
-                    let what = if list.len() == 1 { "bilden" } else { "bilderna" };
-                    self.notify(ctx, format!("Exporterade {name}, men hittade inte {what} {}", join_sv(&list)), true);
+                    let msg = missing_images(&tf!("Exporterade {name}", name = name), &warnings);
+                    self.notify(ctx, msg, true);
                 }
             }
             Ok(warnings) => {
@@ -769,11 +780,10 @@ impl KladdApp {
                 self.remember(path);
                 self.after_save(idx, path);
                 if warnings.is_empty() {
-                    self.notify(ctx, format!("Sparade {title}"), false);
+                    self.notify(ctx, tf!("Sparade {title}", title = title), false);
                 } else {
-                    let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
-                    let what = if list.len() == 1 { "bilden" } else { "bilderna" };
-                    self.notify(ctx, format!("Sparade {title}, men hittade inte {what} {}", join_sv(&list)), true);
+                    let msg = missing_images(&tf!("Sparade {title}", title = title), &warnings);
+                    self.notify(ctx, msg, true);
                 }
                 if then_close {
                     self.close_tab_now(idx);
@@ -1030,10 +1040,10 @@ impl KladdApp {
         }
         self.find.current = None;
         let msg = match (keep, n) {
-            (true, 1) => "Formaterade 1 träff".to_owned(),
-            (true, n) => format!("Formaterade {n} träffar"),
-            (false, 1) => "Ersatte 1 träff".to_owned(),
-            (false, n) => format!("Ersatte {n} träffar"),
+            (true, 1) => t("Formaterade 1 träff").to_owned(),
+            (true, n) => tf!("Formaterade {n} träffar", n = n),
+            (false, 1) => t("Ersatte 1 träff").to_owned(),
+            (false, n) => tf!("Ersatte {n} träffar", n = n),
         };
         self.notify(ctx, msg, false);
     }
@@ -1047,7 +1057,7 @@ impl KladdApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.dialog = None;
-                self.notify(ctx, "Fildialogen kunde inte öppnas. Installera paketet zenity och försök igen.", true);
+                self.notify(ctx, t("Fildialogen kunde inte öppnas. Installera paketet zenity och försök igen."), true);
                 return;
             }
         };
@@ -1092,7 +1102,7 @@ impl KladdApp {
                         .iter()
                         .any(|d| d.id != doc_id && d.path.as_deref() == Some(canon.as_path()));
                     if clash {
-                        self.notify(ctx, "Filen är redan öppen i en annan flik. Stäng den först eller välj ett annat namn.", true);
+                        self.notify(ctx, t("Filen är redan öppen i en annan flik. Stäng den först eller välj ett annat namn."), true);
                     } else {
                         self.write_doc(ctx, idx, &path, then_close, exit);
                     }
@@ -1347,7 +1357,7 @@ impl KladdApp {
                                     ui.spacing_mut().item_spacing.x = 2.0;
                                     self.tabs(ui, p);
                                     ui.add_space(4.0);
-                                    if icons::button(ui, p, Icon::Plus, 28.0, false, "Ny flik (Ctrl+T)", p.chrome).clicked() {
+                                    if icons::button(ui, p, Icon::Plus, 28.0, false, t("Ny flik (Ctrl+T)"), p.chrome).clicked() {
                                         self.new_tab();
                                     }
                                 });
@@ -1359,44 +1369,48 @@ impl KladdApp {
                     UiBuilder::new().max_rect(right).layout(Layout::right_to_left(Align::Center)),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        if icons::window_button(ui, p, Icon::WindowClose, "Stäng", true).clicked() {
+                        if icons::window_button(ui, p, Icon::WindowClose, t("Stäng"), true).clicked() {
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
                         let (icon, tip) = if maximized {
-                            (Icon::Restore, "Återställ")
+                            (Icon::Restore, t("Återställ"))
                         } else {
-                            (Icon::Maximize, "Maximera")
+                            (Icon::Maximize, t("Maximera"))
                         };
                         if icons::window_button(ui, p, icon, tip, false).clicked() {
                             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                         }
-                        if icons::window_button(ui, p, Icon::Minimize, "Minimera", false).clicked() {
+                        if icons::window_button(ui, p, Icon::Minimize, t("Minimera"), false).clicked() {
                             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                         }
                         // diskret avdelare mellan appens knappar och fönsterknapparna
                         let (sep, _) = ui.allocate_exact_size(vec2(14.0, 30.0), Sense::hover());
                         ui.painter().vline(sep.center().x, sep.y_range().shrink(7.0), Stroke::new(1.0, p.line));
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let menu = icons::button(ui, p, Icon::Menu, 30.0, false, "Meny", p.chrome);
+                        let menu = icons::button(ui, p, Icon::Menu, 30.0, false, t("Meny"), p.chrome);
                         Popup::menu(&menu)
                             .width(312.0)
                             .align(RectAlign::BOTTOM_END)
                             .gap(6.0)
-                            .show(|ui| self.menu(ui, &ctx, p));
+                            .show(|ui| {
+                                // Menyn är längre än ett litet fönster: rulla i stället för att klippa.
+                                let max_h = (ctx.content_rect().height() - TOPBAR_H - 24.0).max(200.0);
+                                ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| self.menu(ui, &ctx, p));
+                            });
 
                         let (icon, tip) = if self.settings.dark {
-                            (Icon::Sun, "Byt till ljust tema (Ctrl+Shift+K)")
+                            (Icon::Sun, t("Byt till ljust tema (Ctrl+Shift+K)"))
                         } else {
-                            (Icon::Moon, "Byt till mörkt tema (Ctrl+Shift+K)")
+                            (Icon::Moon, t("Byt till mörkt tema (Ctrl+Shift+K)"))
                         };
                         if icons::button(ui, p, icon, 30.0, false, tip, p.chrome).clicked() {
                             self.toggle_theme(&ctx);
                         }
                         if show_nav_btn {
                             let tip = if self.settings.nav_pane {
-                                "Dölj navigeringsfönstret (Ctrl+Shift+O)"
+                                t("Dölj navigeringsfönstret (Ctrl+Shift+O)")
                             } else {
-                                "Visa navigeringsfönstret (Ctrl+Shift+O)"
+                                t("Visa navigeringsfönstret (Ctrl+Shift+O)")
                             };
                             if icons::button(ui, p, Icon::Outline, 30.0, self.settings.nav_pane, tip, p.chrome).clicked() {
                                 self.settings.nav_pane = !self.settings.nav_pane;
@@ -1404,9 +1418,9 @@ impl KladdApp {
                         }
                         if show_preview_btn {
                             let tip = if self.settings.preview {
-                                "Dölj förhandsvisning (Ctrl+Shift+M)"
+                                t("Dölj förhandsvisning (Ctrl+Shift+M)")
                             } else {
-                                "Visa förhandsvisning (Ctrl+Shift+M)"
+                                t("Visa förhandsvisning (Ctrl+Shift+M)")
                             };
                             if icons::button(ui, p, Icon::Split, 30.0, self.settings.preview, tip, p.chrome)
                                 .clicked()
@@ -1449,7 +1463,7 @@ impl KladdApp {
             let w = (galley.size().x + 14.0 + 34.0).max(96.0);
             let (rect, resp) = ui.allocate_exact_size(vec2(w, height), Sense::click());
             let resp = resp.on_hover_text(
-                doc.path.as_ref().map_or_else(|| "Inte sparad än".to_owned(), |p| p.display().to_string()),
+                doc.path.as_ref().map_or_else(|| t("Inte sparad än").to_owned(), |p| p.display().to_string()),
             );
             let close_rect = Rect::from_center_size(pos2(rect.right() - 17.0, rect.center().y), vec2(20.0, 20.0));
             let close_resp = ui.interact(close_rect, resp.id.with("close"), Sense::click());
@@ -1498,14 +1512,14 @@ impl KladdApp {
         ui.spacing_mut().item_spacing.y = 0.0;
         let has_doc = !self.docs.is_empty();
         let pdf = self.pdf_mode();
-        if menu_item(ui, p, "Ny flik", "Ctrl+T", None, true) {
+        if menu_item(ui, p, t("Ny flik"), "Ctrl+T", None, true) {
             self.new_tab();
         }
-        if menu_item(ui, p, "Öppna…", "Ctrl+O", None, true) {
+        if menu_item(ui, p, t("Öppna…"), "Ctrl+O", None, true) {
             self.request_open(ctx);
         }
         let pdf_changed = self.pdf_unsaved();
-        if menu_item(ui, p, if pdf && !pdf_changed { "Spara kopia…" } else { "Spara" }, "Ctrl+S", None, has_doc) {
+        if menu_item(ui, p, if pdf && !pdf_changed { t("Spara kopia…") } else { t("Spara") }, "Ctrl+S", None, has_doc) {
             if pdf && pdf_changed {
                 self.pdf_save(ctx, self.active, false, false);
             } else if pdf {
@@ -1514,102 +1528,113 @@ impl KladdApp {
                 self.save_doc(ctx, self.active, false, false);
             }
         }
-        if pdf && pdf_changed && menu_item(ui, p, "Spara kopia…", "Ctrl+Shift+S", None, true) {
+        if pdf && pdf_changed && menu_item(ui, p, t("Spara kopia…"), "Ctrl+Shift+S", None, true) {
             self.request_save_copy(ctx, self.active);
         }
-        if menu_item(ui, p, "Spara som…", "Ctrl+Shift+S", None, has_doc && !pdf) {
+        if menu_item(ui, p, t("Spara som…"), "Ctrl+Shift+S", None, has_doc && !pdf) {
             self.request_save_as(ctx, self.active, false, false);
         }
-        if menu_item(ui, p, "Skriv ut…", "Ctrl+P", None, has_doc) {
+        if menu_item(ui, p, t("Skriv ut…"), "Ctrl+P", None, has_doc) {
             self.open_print(ctx);
         }
         let hist = self.docs.get(self.active).is_some_and(|d| d.path.is_some() && d.pdfv.is_none());
-        if menu_item(ui, p, "Versionshistorik…", "", None, hist) {
+        if menu_item(ui, p, t("Versionshistorik…"), "", None, hist) {
             self.open_history(ctx);
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Öppna mapp…", "", None, true) {
+        if menu_item(ui, p, t("Öppna mapp…"), "", None, true) {
             self.request_folder(ctx);
         }
-        if menu_item(ui, p, "Mappträd", "Ctrl+Shift+E", Some(self.settings.workspace_panel), true) {
+        if menu_item(ui, p, t("Mappträd"), "Ctrl+Shift+E", Some(self.settings.workspace_panel), true) {
             self.toggle_workspace_panel(ctx);
         }
-        if menu_item(ui, p, "Stäng mapp", "", None, self.settings.workspace.is_some()) {
+        if menu_item(ui, p, t("Stäng mapp"), "", None, self.settings.workspace.is_some()) {
             self.close_workspace();
         }
-        if menu_item(ui, p, "Snabböppna…", "Ctrl+E", None, true) {
+        if menu_item(ui, p, t("Snabböppna…"), "Ctrl+E", None, true) {
             self.open_quick(ctx);
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Stäng flik", "Ctrl+W", None, has_doc) {
+        if menu_item(ui, p, t("Stäng flik"), "Ctrl+W", None, has_doc) {
             self.request_close_tab(self.active);
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Infoga bild…", "Ctrl+Shift+I", None, has_doc && !pdf) {
+        if menu_item(ui, p, t("Infoga bild…"), "Ctrl+Shift+I", None, has_doc && !pdf) {
             self.request_insert_image(ctx);
         }
-        if menu_item(ui, p, "Infoga innehållsförteckning", "", None, self.docs.get(self.active).is_some_and(Document::is_markdown)) {
+        if menu_item(ui, p, t("Infoga innehållsförteckning"), "", None, self.docs.get(self.active).is_some_and(Document::is_markdown)) {
             self.insert_toc(ctx);
         }
-        if menu_item(ui, p, "Sök", "Ctrl+F", None, has_doc) {
+        if menu_item(ui, p, t("Sök"), "Ctrl+F", None, has_doc) {
             self.open_find(ctx, false);
         }
-        if menu_item(ui, p, "Sök och ersätt", "Ctrl+H", None, has_doc && !pdf) {
+        if menu_item(ui, p, t("Sök och ersätt"), "Ctrl+H", None, has_doc && !pdf) {
             self.open_find(ctx, true);
         }
-        if menu_item(ui, p, "Sök i filer…", "Ctrl+Shift+F", None, true) {
+        if menu_item(ui, p, t("Sök i filer…"), "Ctrl+Shift+F", None, true) {
             self.open_find_files(ctx);
         }
         menu_divider(ui, p);
         let split = self.panes.orient;
-        if menu_item(ui, p, "Dela vyn", "Ctrl+\\", Some(split == Some(Orient::Vertical)), has_doc) {
+        if menu_item(ui, p, t("Dela vyn"), "Ctrl+\\", Some(split == Some(Orient::Vertical)), has_doc) {
             self.toggle_split(Orient::Vertical);
         }
-        if menu_item(ui, p, "Dela vågrätt", "Ctrl+Shift+\\", Some(split == Some(Orient::Horizontal)), has_doc) {
+        if menu_item(ui, p, t("Dela vågrätt"), "Ctrl+Shift+\\", Some(split == Some(Orient::Horizontal)), has_doc) {
             self.toggle_split(Orient::Horizontal);
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Radbrytning", "Alt+Z", Some(self.settings.wrap), true) {
+        if menu_item(ui, p, t("Radbrytning"), "Alt+Z", Some(self.settings.wrap), true) {
             self.settings.wrap = !self.settings.wrap;
         }
-        if menu_item(ui, p, "Radnummer", "", Some(self.settings.line_numbers), true) {
+        if menu_item(ui, p, t("Radnummer"), "", Some(self.settings.line_numbers), true) {
             self.settings.line_numbers = !self.settings.line_numbers;
         }
         let md = self.docs.get(self.active).is_some_and(Document::is_markdown);
-        if menu_item(ui, p, "Navigeringsfönster", "Ctrl+Shift+O", Some(self.settings.nav_pane), md) {
+        if menu_item(ui, p, t("Navigeringsfönster"), "Ctrl+Shift+O", Some(self.settings.nav_pane), md) {
             self.settings.nav_pane = !self.settings.nav_pane;
         }
-        if menu_item(ui, p, "Förhandsvisa Markdown", "Ctrl+Shift+M", Some(self.settings.preview), true) {
+        if menu_item(ui, p, t("Förhandsvisa Markdown"), "Ctrl+Shift+M", Some(self.settings.preview), true) {
             self.settings.preview = !self.settings.preview;
         }
-        if menu_item(ui, p, "Mörkt tema", "Ctrl+Shift+K", Some(self.settings.dark), true) {
+        if menu_item(ui, p, t("Mörkt tema"), "Ctrl+Shift+K", Some(self.settings.dark), true) {
             self.toggle_theme(ctx);
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Större text", "Ctrl++", None, true) {
+        if menu_item(ui, p, t("Större text"), "Ctrl++", None, true) {
             self.zoom(1.0);
         }
-        if menu_item(ui, p, "Mindre text", "Ctrl+−", None, true) {
+        if menu_item(ui, p, t("Mindre text"), "Ctrl+−", None, true) {
             self.zoom(-1.0);
         }
-        if menu_item(ui, p, "Normal textstorlek", "Ctrl+0", None, true) {
+        if menu_item(ui, p, t("Normal textstorlek"), "Ctrl+0", None, true) {
             self.settings.font_size = DEFAULT_FONT_SIZE;
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Säkerhetskopiera osparade ändringar", "", Some(self.settings.autosave_recovery), true) {
+        if menu_item(ui, p, t("Säkerhetskopiera osparade ändringar"), "", Some(self.settings.autosave_recovery), true) {
             self.settings.autosave_recovery = !self.settings.autosave_recovery;
         }
-        if menu_item(ui, p, "Sök efter uppdateringar automatiskt", "", Some(self.settings.auto_update_check), true) {
+        if menu_item(ui, p, t("Sök efter uppdateringar automatiskt"), "", Some(self.settings.auto_update_check), true) {
             self.settings.auto_update_check = !self.settings.auto_update_check;
         }
-        if menu_item(ui, p, "Sök efter uppdateringar", "", None, true) {
+        if menu_item(ui, p, t("Sök efter uppdateringar"), "", None, true) {
             self.update.check_now(ctx);
         }
-        if menu_item(ui, p, "Spara automatiskt", "", Some(self.settings.autosave), true) {
+        if menu_item(ui, p, t("Spara automatiskt"), "", Some(self.settings.autosave), true) {
             self.settings.autosave = !self.settings.autosave;
         }
         menu_divider(ui, p);
-        if menu_item(ui, p, "Avsluta", "Ctrl+Q", None, true) {
+        // Ett klick byter till nästa språkval (Automatiskt, Svenska, English).
+        let cur = self.settings.lang;
+        let label = format!("Språk / Language: {}", cur.label());
+        if menu_item(ui, p, &label, "", None, true) {
+            let all = crate::i18n::LangSetting::ALL;
+            self.settings.lang = all[(all.iter().position(|l| *l == cur).unwrap_or(0) + 1) % all.len()];
+            // Gäller från nästa bild utan omstart.
+            crate::i18n::set_lang(self.settings.lang.resolve());
+            ctx.request_repaint();
+        }
+        menu_divider(ui, p);
+        if menu_item(ui, p, t("Avsluta"), "Ctrl+Q", None, true) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
@@ -1658,21 +1683,21 @@ impl KladdApp {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         if doc.docx || doc.pdf {
                             let (label, tip) = if doc.pdf {
-                                ("PDF-dokument", "Texten visas som Markdown och sparas som en ny PDF")
+                                (t("PDF-dokument"), t("Texten visas som Markdown och sparas som en ny PDF"))
                             } else if doc.language() == "OpenDocument" {
-                                ("OpenDocument-text", "Visas som Markdown och sparas som .odt")
+                                (t("OpenDocument-text"), t("Visas som Markdown och sparas som .odt"))
                             } else {
-                                ("Word-dokument", "Visas som Markdown och sparas som .docx")
+                                (t("Word-dokument"), t("Visas som Markdown och sparas som .docx"))
                             };
                             if doc.docx || doc.pdf {
-                                if status_button(ui, p, "Visa som dokument", "Visa som Word-dokument med sidor och formateringsrad").clicked() {
+                                if status_button(ui, p, t("Visa som dokument"), t("Visa som Word-dokument med sidor och formateringsrad")).clicked() {
                                     doc.word_view = true;
                                 }
                             } else {
                             ui.label(RichText::new(label).font(font.clone()).color(p.muted)).on_hover_text(tip);
                             }
                         } else {
-                        let le = status_button(ui, p, doc.line_ending.label(), "Radslut när filen sparas");
+                        let le = status_button(ui, p, doc.line_ending.label(), t("Radslut när filen sparas"));
                         if le.clicked() {
                             doc.line_ending = match doc.line_ending {
                                 LineEnding::Lf => LineEnding::CrLf,
@@ -1680,7 +1705,7 @@ impl KladdApp {
                             };
                             doc.on_edited();
                         }
-                        let enc = status_button(ui, p, doc.encoding.label(), "Teckenkodning när filen sparas");
+                        let enc = status_button(ui, p, doc.encoding.label(), t("Teckenkodning när filen sparas"));
                         Popup::menu(&enc).align(RectAlign::TOP_END).gap(6.0).width(200.0).show(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for e in [
@@ -1699,14 +1724,14 @@ impl KladdApp {
                         }
                         ui.add_space(10.0);
                         let words = doc.text.split_whitespace().count();
-                        let words = if words == 1 { "1 ord".to_owned() } else { format!("{words} ord") };
+                        let words = if words == 1 { t("1 ord").to_owned() } else { tf!("{words} ord", words = words) };
                         ui.label(RichText::new(words).font(font.clone()).color(p.muted));
                         ui.add_space(10.0);
                         let (line, col, sel) = self.cursor;
                         let pos = if sel > 0 {
-                            format!("Rad {line}, kolumn {col}  ({sel} markerade)")
+                            tf!("Rad {line}, kolumn {col}  ({sel} markerade)", line = line, col = col, sel = sel)
                         } else {
-                            format!("Rad {line}, kolumn {col}")
+                            tf!("Rad {line}, kolumn {col}", line = line, col = col)
                         };
                         ui.label(RichText::new(pos).font(font.clone()).color(p.muted));
                     });
@@ -2049,7 +2074,7 @@ impl KladdApp {
             }
             ui.add_space(8.0);
             let title = titles.iter().find(|t| t.1).map(|t| truncate(&t.0, 32)).unwrap_or_default();
-            let btn = status_button(ui, p, &format!("{title} ▾"), "Välj flik för den här rutan");
+            let btn = status_button(ui, p, &format!("{title} ▾"), t("Välj flik för den här rutan"));
             Popup::menu(&btn).align(RectAlign::BOTTOM_START).gap(4.0).width(240.0).show(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (i, (t, current)) in titles.iter().enumerate() {
@@ -2060,7 +2085,7 @@ impl KladdApp {
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
-                if icons::button(ui, p, Icon::Close, 22.0, false, "Stäng delad vy", p.chrome).clicked() {
+                if icons::button(ui, p, Icon::Close, 22.0, false, t("Stäng delad vy"), p.chrome).clicked() {
                     out.close = true;
                 }
             });
@@ -2070,7 +2095,7 @@ impl KladdApp {
             if same_pdf {
                 CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("PDF:en visas redan i den andra rutan").color(p.muted));
+                        ui.label(RichText::new(t("PDF:en visas redan i den andra rutan")).color(p.muted));
                     });
                 });
             } else {
@@ -2101,8 +2126,8 @@ impl KladdApp {
             let (r, _) = ui.allocate_exact_size(vec2(col_w, galley.size().y + 4.0), Sense::hover());
             let gsize = galley.size();
             ui.painter().galley(r.left_top(), galley, p.text);
-            let t = ctx.input(|i| i.time);
-            let on = (t % 1.1) < 0.65;
+            let time = ctx.input(|i| i.time);
+            let on = (time % 1.1) < 0.65;
             if on {
                 ui.painter().rect_filled(
                     Rect::from_min_size(pos2(r.left() + gsize.x + 6.0, r.top() + 10.0), vec2(5.0, gsize.y - 16.0)),
@@ -2110,28 +2135,28 @@ impl KladdApp {
                     p.accent,
                 );
             }
-            let wait = if on { 0.65 - t % 1.1 } else { 1.1 - t % 1.1 };
+            let wait = if on { 0.65 - time % 1.1 } else { 1.1 - time % 1.1 };
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.01)));
 
             ui.add_space(6.0);
             ui.label(
-                RichText::new("Skriv något nytt eller fortsätt där du var.")
+                RichText::new(t("Skriv något nytt eller fortsätt där du var."))
                     .font(FontId::new(15.0, FontFamily::Proportional))
                     .color(p.muted),
             );
             ui.add_space(30.0);
 
             ui.spacing_mut().item_spacing.y = 2.0;
-            if welcome_row(ui, p, "Ny flik", "Ctrl+T", None) {
+            if welcome_row(ui, p, t("Ny flik"), "Ctrl+T", None) {
                 self.new_tab();
             }
-            if welcome_row(ui, p, "Öppna fil…", "Ctrl+O", None) {
+            if welcome_row(ui, p, t("Öppna fil…"), "Ctrl+O", None) {
                 self.request_open(&ctx);
             }
 
             if !self.settings.recent.is_empty() {
                 ui.add_space(28.0);
-                ui.label(RichText::new("Senast öppnade").font(FontId::new(12.5, theme::medium())).color(p.muted));
+                ui.label(RichText::new(t("Senast öppnade")).font(FontId::new(12.5, theme::medium())).color(p.muted));
                 ui.add_space(6.0);
                 let mut open = None;
                 for path in self.settings.recent.iter().take(6) {
@@ -2175,20 +2200,20 @@ impl KladdApp {
                         let mut seek = None;
                         ui.horizontal(|ui| {
                             let chevron = if self.find.replace { Icon::ChevronUp } else { Icon::ChevronDown };
-                            if icons::button(ui, p, chevron, 26.0, false, "Visa ersätt", p.surface).clicked() {
+                            if icons::button(ui, p, chevron, 26.0, false, t("Visa ersätt"), p.surface).clicked() {
                                 self.find.replace = !self.find.replace;
                             }
                             let field_w = ui.available_width() - 26.0 * 6.0 - 84.0 - 4.0 * 8.0;
                             let q = ui.add(
                                 TextEdit::singleline(&mut self.find.query)
                                     .id(Id::unique("kladd-find-query"))
-                                    .hint_text("Sök")
+                                    .hint_text(t("Sök"))
                                     .desired_width(field_w)
                                     .margin(Margin::symmetric(8, 5)),
                             );
                             if let Some(err) = &results.error {
                                 ui.painter().rect_stroke(q.rect, 4.0, Stroke::new(1.5, p.error), egui::StrokeKind::Inside);
-                                q.clone().on_hover_text(format!("Ogiltigt reguljärt uttryck: {err}"));
+                                q.clone().on_hover_text(tf!("Ogiltigt reguljärt uttryck: {err}", err = err));
                             }
                             if self.find.focus_query {
                                 q.request_focus();
@@ -2204,15 +2229,15 @@ impl KladdApp {
                                 self.find.focus_query = true;
                             }
                             let count = if results.error.is_some() {
-                                "Ogiltigt".to_owned()
+                                t("Ogiltigt").to_owned()
                             } else if !has_search {
                                 String::new()
                             } else if matches.is_empty() {
-                                "Inga träffar".to_owned()
+                                t("Inga träffar").to_owned()
                             } else if let Some(i) = current_idx {
-                                format!("{} av {}", i + 1, matches.len())
+                                tf!("{i} av {n}", i = i + 1, n = matches.len())
                             } else {
-                                format!("{} träffar", matches.len())
+                                tf!("{n} träffar", n = matches.len())
                             };
                             let (cr, _) = ui.allocate_exact_size(vec2(84.0, 26.0), Sense::hover());
                             let bad = results.error.is_some() || (matches.is_empty() && has_search);
@@ -2220,15 +2245,15 @@ impl KladdApp {
                             ui.painter().text(cr.center(), Align2::CENTER_CENTER, count, FontId::new(12.0, FontFamily::Proportional), color);
 
                             let mut toggled = false;
-                            if icons::button(ui, p, Icon::CaseSensitive, 26.0, self.find.case_sensitive, "Skilj på stora och små bokstäver", p.surface).clicked() {
+                            if icons::button(ui, p, Icon::CaseSensitive, 26.0, self.find.case_sensitive, t("Skilj på stora och små bokstäver"), p.surface).clicked() {
                                 self.find.case_sensitive = !self.find.case_sensitive;
                                 toggled = true;
                             }
-                            if text_toggle(ui, p, "ab", self.find.whole_word, "Hela ord").clicked() {
+                            if text_toggle(ui, p, "ab", self.find.whole_word, t("Hela ord")).clicked() {
                                 self.find.whole_word = !self.find.whole_word;
                                 toggled = true;
                             }
-                            if text_toggle(ui, p, ".*", self.find.regex, "Reguljära uttryck (ersättning kan använda $1 och ${namn})").clicked() {
+                            if text_toggle(ui, p, ".*", self.find.regex, t("Reguljära uttryck (ersättning kan använda $1 och ${namn})")).clicked() {
                                 self.find.regex = !self.find.regex;
                                 toggled = true;
                             }
@@ -2236,13 +2261,13 @@ impl KladdApp {
                                 self.find.current = None;
                                 seek = Some(Seek::FromSelectionStart);
                             }
-                            if icons::button(ui, p, Icon::ChevronUp, 26.0, false, "Föregående (Shift+F3)", p.surface).clicked() {
+                            if icons::button(ui, p, Icon::ChevronUp, 26.0, false, t("Föregående (Shift+F3)"), p.surface).clicked() {
                                 seek = Some(Seek::Prev);
                             }
-                            if icons::button(ui, p, Icon::ChevronDown, 26.0, false, "Nästa (Enter eller F3)", p.surface).clicked() {
+                            if icons::button(ui, p, Icon::ChevronDown, 26.0, false, t("Nästa (Enter eller F3)"), p.surface).clicked() {
                                 seek = Some(Seek::Next);
                             }
-                            if icons::button(ui, p, Icon::Close, 26.0, false, "Stäng (Esc)", p.surface).clicked() {
+                            if icons::button(ui, p, Icon::Close, 26.0, false, t("Stäng (Esc)"), p.surface).clicked() {
                                 self.close_find();
                             }
                         });
@@ -2251,14 +2276,14 @@ impl KladdApp {
                                 ui.add_space(30.0);
                                 let mut fmt = self.find.fmt.clone();
                                 let btn = ui.add(quiet_button(&fmt.label(), p).min_size(vec2(110.0, 26.0)));
-                                let btn = btn.on_hover_text("Sök bara text med vald formatering. Tom sökning hittar all text med formateringen");
+                                let btn = btn.on_hover_text(t("Sök bara text med vald formatering. Tom sökning hittar all text med formateringen"));
                                 Popup::menu(&btn).gap(4.0).width(200.0).show(|ui| format_filter_menu(ui, p, &mut fmt));
                                 if fmt != self.find.fmt {
                                     self.find.fmt = fmt;
                                     self.find.current = None;
                                     seek = Some(Seek::FromSelectionStart);
                                 }
-                                if !self.find.fmt.is_empty() && icons::button(ui, p, Icon::Close, 22.0, false, "Ta bort formatfiltret", p.surface).clicked() {
+                                if !self.find.fmt.is_empty() && icons::button(ui, p, Icon::Close, 22.0, false, t("Ta bort formatfiltret"), p.surface).clicked() {
                                     self.find.fmt = FormatFilter::default();
                                     self.find.current = None;
                                     seek = Some(Seek::FromSelectionStart);
@@ -2276,7 +2301,7 @@ impl KladdApp {
                                     !keep,
                                     TextEdit::singleline(&mut self.find.replacement)
                                         .id(Id::unique("kladd-find-replace"))
-                                        .hint_text("Ersätt med")
+                                        .hint_text(t("Ersätt med"))
                                         .desired_width(field_w)
                                         .margin(Margin::symmetric(8, 5)),
                                 );
@@ -2286,10 +2311,10 @@ impl KladdApp {
                                 }
                                 ui.add_space(4.0);
                                 let enabled = !matches.is_empty();
-                                if ui.add_enabled(enabled, quiet_button("Ersätt", p).min_size(vec2(74.0, 28.0))).clicked() {
+                                if ui.add_enabled(enabled, quiet_button(t("Ersätt"), p).min_size(vec2(74.0, 28.0))).clicked() {
                                     do_replace = true;
                                 }
-                                if ui.add_enabled(enabled, quiet_button("Ersätt alla", p).min_size(vec2(104.0, 28.0))).clicked() {
+                                if ui.add_enabled(enabled, quiet_button(t("Ersätt alla"), p).min_size(vec2(104.0, 28.0))).clicked() {
                                     do_replace_all = true;
                                 }
                             });
@@ -2297,17 +2322,17 @@ impl KladdApp {
                                 ui.horizontal(|ui| {
                                     ui.add_space(30.0);
                                     let label = match self.find.apply {
-                                        None => "Formatera".to_owned(),
-                                        Some(a) => format!("Formatera: {}", apply_label(a)),
+                                        None => t("Formatera").to_owned(),
+                                        Some(a) => tf!("Formatera: {fmt}", fmt = apply_label(a)),
                                     };
                                     let btn = ui.add(quiet_button(&label, p).min_size(vec2(150.0, 26.0)));
-                                    let btn = btn.on_hover_text("Lägg på formatering på träffen när du ersätter");
+                                    let btn = btn.on_hover_text(t("Lägg på formatering på träffen när du ersätter"));
                                     let mut ap = self.find.apply;
                                     Popup::menu(&btn).gap(4.0).width(200.0).show(|ui| apply_menu(ui, p, &mut ap));
                                     self.find.apply = ap;
                                     if self.find.apply.is_some() {
-                                        ui.checkbox(&mut self.find.keep_text, "Behåll text")
-                                            .on_hover_text("Formatera träffarna utan att ändra texten");
+                                        ui.checkbox(&mut self.find.keep_text, t("Behåll text"))
+                                            .on_hover_text(t("Formatera träffarna utan att ändra texten"));
                                     }
                                 });
                             }
@@ -2348,16 +2373,16 @@ impl KladdApp {
             .show(ctx, |ui| {
                 ui.set_width(400.0);
                 ui.label(
-                    RichText::new(format!("Spara över {title}?"))
+                    RichText::new(tf!("Spara över {title}?", title = title))
                         .font(FontId::new(17.0, theme::semibold()))
                         .color(p.text),
                 );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(if self.docs[idx].pdf {
-                        format!("Kladd skapar en ny PDF av texten, med rubriker, listor, tabeller, länkar och bilder. {} i originalet ersätts.", capitalize(&lost))
+                        tf!("Kladd skapar en ny PDF av texten, med rubriker, listor, tabeller, länkar och bilder. {lost} i originalet ersätts.", lost = capitalize(&lost))
                     } else {
-                        format!("Kladd sparar text, rubriker, listor, tabeller, länkar, fetstil och kursiv. {} i originalet försvinner.", capitalize(&lost))
+                        tf!("Kladd sparar text, rubriker, listor, tabeller, länkar, fetstil och kursiv. {lost} i originalet försvinner.", lost = capitalize(&lost))
                     })
                     .color(p.muted),
                 );
@@ -2365,7 +2390,7 @@ impl KladdApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let over = egui::Button::new(
-                        RichText::new("Spara över").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                        RichText::new(t("Spara över")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                     )
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
@@ -2373,10 +2398,10 @@ impl KladdApp {
                     if ui.add(over).clicked() {
                         choice = Some(0);
                     }
-                    if ui.add(quiet_button("Spara som ny fil…", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Spara som ny fil…"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(1);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(2);
                     }
                 });
@@ -2418,18 +2443,18 @@ impl KladdApp {
             .show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.label(
-                    RichText::new(format!("{name} är lösenordsskyddad"))
+                    RichText::new(tf!("{name} är lösenordsskyddad", name = name))
                         .font(FontId::new(17.0, theme::semibold()))
                         .color(p.text),
                 );
                 ui.add_space(6.0);
-                let hint = if pending.wrong { "Lösenordet stämde inte. Försök igen." } else { "Skriv lösenordet för att öppna dokumentet." };
+                let hint = if pending.wrong { t("Lösenordet stämde inte. Försök igen.") } else { t("Skriv lösenordet för att öppna dokumentet.") };
                 ui.label(RichText::new(hint).color(if pending.wrong { p.error } else { p.muted }));
                 ui.add_space(14.0);
                 let field = ui.add(
                     TextEdit::singleline(&mut pending.input)
                         .password(true)
-                        .hint_text("Lösenord")
+                        .hint_text(t("Lösenord"))
                         .desired_width(f32::INFINITY)
                         .margin(Margin::symmetric(10, 7)),
                 );
@@ -2444,7 +2469,7 @@ impl KladdApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let open = egui::Button::new(
-                        RichText::new("Öppna").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                        RichText::new(t("Öppna")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                     )
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
@@ -2452,7 +2477,7 @@ impl KladdApp {
                     if ui.add(open).clicked() {
                         choice = Some(0);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(1);
                     }
                 });
@@ -2492,20 +2517,20 @@ impl KladdApp {
             .show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.label(
-                    RichText::new(format!("Spara ändringarna i {title}?"))
+                    RichText::new(tf!("Spara ändringarna i {title}?", title = title))
                         .font(FontId::new(17.0, theme::semibold()))
                         .color(p.text),
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("Om du inte sparar försvinner ändringarna.")
+                    RichText::new(t("Om du inte sparar försvinner ändringarna."))
                         .color(p.muted),
                 );
                 ui.add_space(22.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let save = egui::Button::new(
-                        RichText::new("Spara").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                        RichText::new(t("Spara")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                     )
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
@@ -2513,10 +2538,10 @@ impl KladdApp {
                     if ui.add(save).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         choice = Some(0);
                     }
-                    if ui.add(quiet_button("Släng ändringar", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Släng ändringar"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(1);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(2);
                     }
                 });
@@ -2582,7 +2607,7 @@ impl KladdApp {
                 self.focus_editor = true;
                 // Den återställda texten ska hamna i en ny säkerhetskopia utan att vänta.
                 self.recovery.write_soon();
-                self.notify(ctx, if restored == 1 { "Återställde 1 osparad flik".to_owned() } else { format!("Återställde {restored} osparade flikar") }, false);
+                self.notify(ctx, if restored == 1 { t("Återställde 1 osparad flik").to_owned() } else { tf!("Återställde {n} osparade flikar", n = restored) }, false);
             }
         }
     }
@@ -2646,7 +2671,7 @@ impl KladdApp {
         painter.text(
             r.center(),
             Align2::CENTER_CENTER,
-            "Släpp för att öppna",
+            t("Släpp för att öppna"),
             FontId::new(20.0, theme::medium()),
             p.text,
         );
@@ -2707,7 +2732,7 @@ impl KladdApp {
                 }
                 self.settings.recent.retain(|p| p != path);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.notify(ctx, format!("{name} kunde inte öppnas: {m}"), true);
+                self.notify(ctx, tf!("{name} kunde inte öppnas: {m}", name = name, m = m), true);
                 return;
             }
         };
@@ -2746,10 +2771,10 @@ impl KladdApp {
                 self.word.forget(id);
                 self.find.open = false;
                 self.focus_editor = true;
-                self.notify(ctx, note.unwrap_or_else(|| "PDF:en är nu ett redigerbart dokument".to_owned()), false);
+                self.notify(ctx, note.unwrap_or_else(|| t("PDF:en är nu ett redigerbart dokument").to_owned()), false);
             }
             Err(LoadError::Message(m)) => self.notify(ctx, m, true),
-            Err(_) => self.notify(ctx, "PDF:en kunde inte göras om till text.", true),
+            Err(_) => self.notify(ctx, t("PDF:en kunde inte göras om till text."), true),
         }
     }
 
@@ -2767,7 +2792,7 @@ impl KladdApp {
             let bytes = Arc::new(bytes);
             let engine = PdfEngine::open(bytes.clone(), tab.password.as_deref(), ctx.clone()).map_err(|e| match e {
                 OpenError::Invalid(m) => m,
-                _ => "lösenordet stämmer inte längre".to_owned(),
+                _ => t("lösenordet stämmer inte längre").to_owned(),
             })?;
             let meta = crate::pdfview::meta::read_meta(&bytes, tab.password.as_deref());
             tab.view.reload(engine, meta, bytes);
@@ -2777,10 +2802,10 @@ impl KladdApp {
             Ok(true)
         })();
         match result {
-            Ok(true) => self.notify(ctx, format!("Läste om {name}"), false),
-            Ok(false) if manual => self.notify(ctx, format!("{name} är oförändrad"), false),
+            Ok(true) => self.notify(ctx, tf!("Läste om {name}", name = name), false),
+            Ok(false) if manual => self.notify(ctx, tf!("{name} är oförändrad", name = name), false),
             Ok(false) => {}
-            Err(e) => self.notify(ctx, format!("{name} kunde inte läsas om: {e}"), true),
+            Err(e) => self.notify(ctx, tf!("{name} kunde inte läsas om: {e}", name = name, e = e), true),
         }
     }
 
@@ -2809,7 +2834,7 @@ impl KladdApp {
             match rx.try_recv() {
                 Ok(r) => copied = Some(r),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => copied = Some(Err("Sidan kunde inte renderas".to_owned())),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => copied = Some(Err(t("Sidan kunde inte renderas").to_owned())),
             }
             if copied.is_some() {
                 tab.copy_rx = None;
@@ -2830,13 +2855,13 @@ impl KladdApp {
         match copied {
             Some(Ok(img)) => {
                 ctx.copy_image(img);
-                self.notify(ctx, "Sidan är kopierad som bild", false);
+                self.notify(ctx, t("Sidan är kopierad som bild"), false);
             }
-            Some(Err(e)) => self.notify(ctx, format!("Kunde inte kopiera sidan: {e}"), true),
+            Some(Err(e)) => self.notify(ctx, tf!("Kunde inte kopiera sidan: {e}", e = e), true),
             None => {}
         }
         if let Some(uri) = blocked {
-            self.notify(ctx, format!("Länken öppnas inte: {}", truncate(&uri, 60)), true);
+            self.notify(ctx, tf!("Länken öppnas inte: {uri}", uri = truncate(&uri, 60)), true);
         }
         for (m, err) in polled.notices {
             self.notify(ctx, m, err);
@@ -2859,7 +2884,7 @@ impl KladdApp {
             PdfAction::OpenExternal => {
                 if let Some(path) = self.docs.get(self.active).and_then(|d| d.path.clone()) {
                     if let Err(e) = crate::platform::open(&path) {
-                        self.notify(ctx, format!("Kunde inte öppna PDF-visaren: {e}"), true);
+                        self.notify(ctx, tf!("Kunde inte öppna PDF-visaren: {e}", e = e), true);
                     }
                 }
             }
@@ -2874,12 +2899,12 @@ impl KladdApp {
                         rotation,
                         ctx.clone(),
                     ));
-                    self.notify(ctx, "Kopierar sidan…", false);
+                    self.notify(ctx, t("Kopierar sidan…"), false);
                 }
             }
             PdfAction::OpenUri(uri) => {
                 if let Err(e) = crate::platform::open(Path::new(&uri)) {
-                    self.notify(ctx, format!("Kunde inte öppna länken: {e}"), true);
+                    self.notify(ctx, tf!("Kunde inte öppna länken: {e}", e = e), true);
                 }
             }
             PdfAction::Ocr => self.pdf_ocr(ctx, false),
@@ -2891,7 +2916,7 @@ impl KladdApp {
         let Some(tab) = self.pdf_tab_mut() else { return };
         let pw = tab.password.clone();
         match tab.ocr.start(&tab.view, pw.as_deref(), ctx, edit_after) {
-            Ok(()) => self.notify(ctx, "Känner igen text…", false),
+            Ok(()) => self.notify(ctx, t("Känner igen text…"), false),
             Err(m) => self.notify(ctx, m, true),
         }
     }
@@ -2899,7 +2924,7 @@ impl KladdApp {
     /// "Spara kopia": originalfilens bytes oförändrade till ett nytt namn.
     fn request_save_copy(&mut self, ctx: &egui::Context, idx: usize) {
         if self.dialog.is_some() {
-            self.notify(ctx, "Stäng den öppna fildialogen först.", true);
+            self.notify(ctx, t("Stäng den öppna fildialogen först."), true);
             return;
         }
         let Some(doc) = self.docs.get(idx).filter(|d| d.pdfv.is_some()) else { return };
@@ -2907,12 +2932,12 @@ impl KladdApp {
         self.dialog = Some(rx);
         let ctx = ctx.clone();
         let doc_id = doc.id;
-        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "dokument".into());
+        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| t("dokument").into());
         let dir = doc.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).or_else(|| self.start_dir());
         std::thread::spawn(move || {
             let mut dlg = rfd::FileDialog::new()
-                .set_title("Spara kopia")
-                .set_file_name(format!("{stem} (kopia).pdf"))
+                .set_title(t("Spara kopia"))
+                .set_file_name(tf!("{stem} (kopia).pdf", stem = stem))
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -2939,7 +2964,7 @@ impl KladdApp {
         };
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if self.docs[idx].path.as_deref() == Some(canon.as_path()) {
-            self.notify(ctx, "Välj ett annat namn än originalfilens.", true);
+            self.notify(ctx, t("Välj ett annat namn än originalfilens."), true);
             return;
         }
         // Osparade ändringar (sidor, anteckningar) följer med i kopian; originalfilen och fliken är oförändrade.
@@ -2956,8 +2981,8 @@ impl KladdApp {
         match crate::doc::write_atomic(path, &bytes) {
             Ok(()) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let note = if decrypted { " (utan lösenordsskydd)" } else { "" };
-                self.notify(ctx, format!("Sparade kopian {name}{note}"), false);
+                let msg = if decrypted { tf!("Sparade kopian {name} (utan lösenordsskydd)", name = name) } else { tf!("Sparade kopian {name}", name = name) };
+                self.notify(ctx, msg, false);
             }
             Err(e) => self.notify(ctx, crate::doc::describe_io_error(&e, path), true),
         }
@@ -2994,8 +3019,8 @@ impl KladdApp {
         } else if idx == self.active {
             self.pdf_reload(ctx, true);
         }
-        let note = if decrypted { " PDF:en sparades utan lösenordsskydd." } else { "" };
-        self.notify(ctx, format!("Sparade {name}.{note}"), false);
+        let msg = if decrypted { tf!("Sparade {name}. PDF:en sparades utan lösenordsskydd.", name = name) } else { tf!("Sparade {name}.", name = name) };
+        self.notify(ctx, msg, false);
         if exit {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
@@ -3124,10 +3149,10 @@ impl KladdApp {
             }
         };
         if self.dialog.is_some() {
-            self.notify(ctx, "Stäng den öppna fildialogen först.", true);
+            self.notify(ctx, t("Stäng den öppna fildialogen först."), true);
             return;
         }
-        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "dokument".into());
+        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| t("dokument").into());
         let dir = doc.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).or_else(|| self.start_dir());
         let (tx, rx) = channel();
         self.dialog = Some(rx);
@@ -3138,10 +3163,10 @@ impl KladdApp {
                 dlg = dlg.set_directory(dir);
             }
             let res = if kind == 0 {
-                dlg = dlg.set_title("Extrahera till ny PDF").set_file_name(format!("{stem} (utdrag).pdf"));
+                dlg = dlg.set_title(t("Extrahera till ny PDF")).set_file_name(tf!("{stem} (utdrag).pdf", stem = stem));
                 DialogResult::PdfExtract { doc_id, path: dlg.save_file(), pages }
             } else {
-                dlg = dlg.set_title("Välj PDF att infoga");
+                dlg = dlg.set_title(t("Välj PDF att infoga"));
                 DialogResult::PdfInsert { doc_id, path: dlg.pick_file(), at: pages[0] }
             };
             let _ = tx.send(res);
@@ -3154,13 +3179,13 @@ impl KladdApp {
         let Some(tab) = self.docs[idx].pdfv.as_ref() else { return };
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if self.docs[idx].path.as_deref() == Some(canon.as_path()) {
-            self.notify(ctx, "Välj ett annat namn än originalfilens.", true);
+            self.notify(ctx, t("Välj ett annat namn än originalfilens."), true);
             return;
         }
         match pdfpages::extract_bytes(tab, pages).and_then(|b| crate::doc::write_atomic(path, &b).map_err(|e| crate::doc::describe_io_error(&e, path))) {
             Ok(()) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.notify(ctx, format!("Sparade {name}"), false);
+                self.notify(ctx, tf!("Sparade {name}", name = name), false);
             }
             Err(e) => self.notify(ctx, e, true),
         }
@@ -3244,7 +3269,7 @@ fn highlight_rows() -> Vec<Vec<(String, [u8; 3])>> {
         .iter()
         .filter_map(|(id, name)| {
             let rgb = crate::style::highlight_rgb(id)?;
-            Some((format!("{name} ({})", crate::style::hex(rgb)), rgb))
+            Some((format!("{} ({})", t(*name), crate::style::hex(rgb)), rgb))
         })
         .collect();
     vec![all[..8].to_vec(), all[8..].to_vec()]
@@ -3252,19 +3277,19 @@ fn highlight_rows() -> Vec<Vec<(String, [u8; 3])>> {
 
 /// Innehållet i "Format"-menyn i sökfältet: vilken formatering en träff måste ha.
 fn format_filter_menu(ui: &mut Ui, p: &Palette, f: &mut FormatFilter) {
-    ui.checkbox(&mut f.bold, "Fetstil");
-    ui.checkbox(&mut f.italic, "Kursiv");
-    ui.checkbox(&mut f.underline, "Understruken");
-    ui.checkbox(&mut f.strike, "Genomstruken");
-    ui.checkbox(&mut f.highlight, "Markerad");
-    ui.menu_button(if f.color.is_some() { "Textfärg (vald)" } else { "Textfärg" }, |ui| {
-        if let Some(c) = crate::word::view::color_popup(ui, p, "Alla färger", &text_color_rows(), f.color) {
+    ui.checkbox(&mut f.bold, t("Fetstil"));
+    ui.checkbox(&mut f.italic, t("Kursiv"));
+    ui.checkbox(&mut f.underline, t("Understruken"));
+    ui.checkbox(&mut f.strike, t("Genomstruken"));
+    ui.checkbox(&mut f.highlight, t("Markerad"));
+    ui.menu_button(if f.color.is_some() { t("Textfärg (vald)") } else { t("Textfärg") }, |ui| {
+        if let Some(c) = crate::word::view::color_popup(ui, p, t("Alla färger"), &text_color_rows(), f.color) {
             f.color = c;
         }
     });
     for n in 1..=3u8 {
         let mut on = f.heading == Some(n);
-        if ui.checkbox(&mut on, format!("Rubrik {n}")).changed() {
+        if ui.checkbox(&mut on, tf!("Rubrik {n}", n = n)).changed() {
             f.heading = on.then_some(n);
         }
     }
@@ -3272,18 +3297,18 @@ fn format_filter_menu(ui: &mut Ui, p: &Palette, f: &mut FormatFilter) {
 
 fn apply_label(a: Apply) -> &'static str {
     match a {
-        Apply::Bold => "Fetstil",
-        Apply::Italic => "Kursiv",
-        Apply::Underline => "Understruken",
-        Apply::Color(_) => "Textfärg",
-        Apply::Highlight(_) => "Markering",
-        Apply::Clear => "Ta bort formatering",
+        Apply::Bold => t("Fetstil"),
+        Apply::Italic => t("Kursiv"),
+        Apply::Underline => t("Understruken"),
+        Apply::Color(_) => t("Textfärg"),
+        Apply::Highlight(_) => t("Markering"),
+        Apply::Clear => t("Ta bort formatering"),
     }
 }
 
 /// Innehållet i "Formatera"-menyn i ersättningsraden.
 fn apply_menu(ui: &mut Ui, p: &Palette, ap: &mut Option<Apply>) {
-    if ui.selectable_label(ap.is_none(), "Ingen formatering").clicked() {
+    if ui.selectable_label(ap.is_none(), t("Ingen formatering")).clicked() {
         *ap = None;
         ui.close();
     }
@@ -3293,13 +3318,13 @@ fn apply_menu(ui: &mut Ui, p: &Palette, ap: &mut Option<Apply>) {
             ui.close();
         }
     }
-    ui.menu_button("Textfärg", |ui| {
-        if let Some(Some(c)) = crate::word::view::color_popup(ui, p, "Automatisk", &text_color_rows(), None) {
+    ui.menu_button(t("Textfärg"), |ui| {
+        if let Some(Some(c)) = crate::word::view::color_popup(ui, p, t("Automatisk"), &text_color_rows(), None) {
             *ap = Some(Apply::Color(c));
         }
     });
-    ui.menu_button("Markering", |ui| {
-        if let Some(Some(c)) = crate::word::view::color_popup(ui, p, "Ingen färg", &highlight_rows(), None) {
+    ui.menu_button(t("Markering"), |ui| {
+        if let Some(Some(c)) = crate::word::view::color_popup(ui, p, t("Ingen färg"), &highlight_rows(), None) {
             *ap = Some(Apply::Highlight(c));
         }
     });
