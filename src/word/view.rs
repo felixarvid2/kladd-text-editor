@@ -563,7 +563,7 @@ impl KladdApp {
                     if style_combo.response.secondary_clicked() {
                         acts.push(BarAct::EditStyles);
                     }
-                    if status_button(ui, p, t("Ändra formatmall…"), t("Ändra utseendet på Brödtext, rubriker och citat (högerklicka på stilvalet)")).clicked() {
+                    if status_button(ui, p, t("Mallar…"), t("Ändra formatmall: utseendet på Brödtext, rubriker och citat (högerklicka på stilvalet)")).clicked() {
                         acts.push(BarAct::EditStyles);
                     }
                     // Typsnitt och storlek
