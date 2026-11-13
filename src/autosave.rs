@@ -87,6 +87,8 @@ pub struct Autosave {
     failed: HashMap<u64, u64>,
     last_active: Option<u64>,
     had_focus: bool,
+    /// Stora texter: senast beräknade hash och när (hashas högst två gånger i sekunden).
+    big_hash: HashMap<u64, (f64, u64)>,
 }
 
 /// Något som appen ska göra efter en genomgång.
@@ -98,10 +100,8 @@ pub enum Step {
 }
 
 fn hash(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+    // Samma som förut för vanliga texter; stora texter får en snabb hash (`doc::hash_text`).
+    crate::doc::hash_text(text)
 }
 
 impl Autosave {
@@ -126,6 +126,7 @@ impl Autosave {
     }
 
     pub fn forget(&mut self, doc_id: u64) {
+        self.big_hash.remove(&doc_id);
         self.failed.remove(&doc_id);
         self.stamps.remove(&doc_id);
         self.seen.remove(&doc_id);
@@ -162,7 +163,14 @@ impl Autosave {
         }
         if let Some(doc) = docs.get(active) {
             if eligible(&Facts::of(doc)) {
-                let h = hash(&doc.text);
+                let h = match self.big_hash.get(&doc.id) {
+                    Some(&(at, h)) if doc.text.len() >= crate::bigtext::BIG_BYTES && now - at < 0.5 => h,
+                    _ => {
+                        let h = hash(&doc.text);
+                        self.big_hash.insert(doc.id, (now, h));
+                        h
+                    }
+                };
                 let entry = self.seen.entry(doc.id).or_insert((h, now));
                 if entry.0 != h {
                     *entry = (h, now);

@@ -40,6 +40,12 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Vim-läge i textläget.** Ny inställning *Vim-läge* i huvudmenyn (av som standard; inte i dokumentläget eller PDF) med lägena normal, infoga, markera (tecken, rad, block), ersätt och kommandorad. Normalläget har antal, rörelser (`h j k l w W b B e E ge 0 ^ $ gg G f F t T ; , % { } H M L Ctrl+d Ctrl+u`), operatorer (`d c y > < gu gU ~`) med rörelser och textobjekt (`iw aw iW ip ap i" a" i' i( a( i[ i{ it`), `x X s S r J p P u Ctrl+r . o O a A i I`, register (`"a`–`"z`, `"+`), markeringar, sökning (`/ ? n N * #`) och makron (`q`, `@`). Kommandoraden har `:w :q :wq :x :q! :e`, `:s`/`:%s` (Rusts regex), `:<rad>`, `:set nu/nonu/wrap/nowrap`, `:noh` och `:sp`/`:vs`. Blockmarkör, läge (`-- INFOGA --`) och väntande kommando visas i statusraden. Logiken är en ren tillståndsmaskin (`src/vim.rs`) med många enhetstester.
 
+- **Stora filer.** Textfiler från 5 MB eller 200 000 rader (100 MB-loggar, kodfiler med en miljon rader) öppnas i en virtualiserad vy som bara ritar det som syns: bildrutan går på ~0,03 ms i stället för sekunder, minnet är ungefär filens storlek (förut ~145 gånger) och att skriva i slutet av en 100 MB-fil är omedelbart. Filer över 20 MB läses in i en bakgrundstråd med förloppsruta, utan extra kopior av texten. Radbrytning och färgning är avstängda i den vyn (en notis säger det), sökning görs i bitar utan att gränssnittet fryser och slutar vid 50 000 träffar (*N+ träffar*), *Ersätt* ändrar bara träffens rad och kan ångras, och ordräkning, rubrikträd, autosparning och säkerhetskopiering undviker att läsa om hela texten varje bildruta. Vanliga filer beter sig precis som förut.
+
+
+- **Dokumentläge, stora dokument.** Efter en ändring i ett dokument på hundratals sidor tolkas bara stycket med ändringen om (med kontroll mot resten), och tabeller, bilder och typsnitt återanvänds: skrivning på sida 1500 av 2000 gick från ~740 till ~300 ms per bildruta. Rubrikträdet ritar bara synliga rader när det finns tusentals rubriker.
+- **PDF med tusentals sidor.** Sökningen släpper textlagret för sidor långt från vyn: minnet vid sökning i 1 800 sidor föll från ~360 till ~90 MB. Träffnumret räknas utan att bygga hela träfflistan.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

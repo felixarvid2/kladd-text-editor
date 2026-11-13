@@ -8,6 +8,8 @@ mod autocorrect;
 mod autocorrect_ui;
 mod csv;
 mod autosave;
+mod bigfiles;
+mod bigtext;
 mod doc;
 mod docx;
 mod docx_styles;
@@ -145,3 +147,6 @@ fn percent_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+#[cfg(test)]
+mod bigbench;

@@ -802,6 +802,11 @@ fn mark_table(text: &str, st: &mut [St], r: &Range<usize>) {
     }
 }
 
+/// Bitarna för en text som börjar vid en styckegräns (för den inkrementella analysen, se `incr`).
+pub(super) fn pieces_of(text: &str) -> Vec<Piece> {
+    parse(text).pieces
+}
+
 pub fn analyze(text: &str) -> Analysis {
     let p = parse(text);
     let sections = super::sections::scan(text, &p.defaults);

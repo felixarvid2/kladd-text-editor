@@ -248,6 +248,8 @@ pub struct KladdApp {
     untitled_counter: usize,
     pub(crate) settings: Settings,
     hl: Highlighter,
+    /// Stora textfiler: virtualiserad vy, bakgrundsinläsning, sökning i bitar (`bigfiles`).
+    pub(crate) big: crate::bigfiles::State,
     md_cache: CommonMarkCache,
     pub(crate) find: Find,
     dialog: Option<Receiver<DialogResult>>,
@@ -397,6 +399,7 @@ impl KladdApp {
             untitled_counter: 0,
             settings,
             hl: Highlighter::new(),
+            big: Default::default(),
             md_cache: CommonMarkCache::default(),
             find: Find::default(),
             dialog: None,
@@ -600,6 +603,15 @@ impl KladdApp {
             self.open_pdf_tab(ctx, &canonical, password);
             return;
         }
+        // Stora filer läses in i en bakgrundstråd med förloppsvisning.
+        if crate::bigfiles::wants_background(&canonical) {
+            if !self.big.is_loading(&canonical) {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.big.spawn_load(ctx, id, &canonical, password.map(str::to_owned));
+            }
+            return;
+        }
         let loaded = Document::load_with_password(self.next_id, &canonical, password);
         let loaded = match loaded {
             Err(LoadError::NeedsPassword) => {
@@ -634,6 +646,7 @@ impl KladdApp {
             let old = self.docs[self.active].id;
             self.hl.forget(old);
             self.hl.forget(old | (1 << 62));
+            self.big.forget(old);
             self.word.forget(old);
             self.panes.forget_doc(old, Some(doc.id));
             self.docs[self.active] = doc;
@@ -646,6 +659,31 @@ impl KladdApp {
         self.focus_editor = true;
         if let Some(note) = self.docs[self.active].open_note.take() {
             self.notify(ctx, note, false);
+        }
+    }
+
+    /// Tar emot stora filer som lästs in i bakgrunden.
+    fn poll_big_loads(&mut self, ctx: &egui::Context) {
+        for (path, result) in self.big.poll_loads(ctx) {
+            match result {
+                Ok((doc, view)) => {
+                    // Redan öppnad under tiden (t.ex. dubbelklick två gånger): släng den nya.
+                    if self.docs.iter().any(|d| d.path.as_deref() == Some(&path)) {
+                        continue;
+                    }
+                    self.big.adopt(doc.id, view);
+                    self.install_doc(ctx, doc, &path);
+                    let id = self.docs[self.active].id;
+                    if self.big.has_view(id) {
+                        self.notify(ctx, t("Stor fil: radbrytning och färgning är avstängda för att redigeringen ska gå snabbt."), false);
+                    }
+                }
+                Err(LoadError::NeedsPassword) | Err(LoadError::WrongPassword) => {}
+                Err(LoadError::Message(m)) => {
+                    self.settings.recent.retain(|p| p != &path);
+                    self.notify(ctx, m, true);
+                }
+            }
         }
     }
 
@@ -890,6 +928,7 @@ impl KladdApp {
             crate::history_ui::restore_into(ctx, &mut self.docs[idx], version);
             let id = self.docs[idx].id;
             self.hl.forget(id);
+            self.big.forget(id);
             self.word.forget(id);
             self.find.current = None;
             self.focus_editor = true;
@@ -968,6 +1007,7 @@ impl KladdApp {
         self.recovery.forget(doc.id);
         self.hl.forget(doc.id);
         self.hl.forget(doc.id | (1 << 62));
+        self.big.forget(doc.id);
         self.word.forget(doc.id);
         if self.docs.is_empty() {
             self.active = 0;
@@ -1036,6 +1076,10 @@ impl KladdApp {
         let Some(doc) = self.docs.get(self.active) else { return Arc::default() };
         let word = doc.word_view;
         let spec = self.find.spec(word);
+        if !word && self.big.has_view(doc.id) {
+            // Stor fil: sökning i bitar med tak, utan att hasha hela texten varje bildruta.
+            return self.big.search(&self.docs[self.active], &spec);
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (doc.id, word).hash(&mut h);
         crate::word::layout::fast_hash(&doc.text).hash(&mut h);
@@ -1068,6 +1112,11 @@ impl KladdApp {
     /// Markerar träffen i editorn och rullar dit.
     fn select_match(&mut self, ctx: &egui::Context, m: &Match) {
         let Some(doc) = self.docs.get(self.active) else { return };
+        if let Some(v) = self.big.view(doc.id) {
+            v.select(m.start, m.end);
+            self.find.current = Some(m.start);
+            return;
+        }
         let id = editor_id(doc.id);
         let doc_id = doc.id;
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
@@ -1090,16 +1139,20 @@ impl KladdApp {
             return;
         }
         let id = editor_id(doc.id);
-        let state = TextEditState::load(ctx, id).unwrap_or_default();
-        let (sa, sb) = state
-            .cursor
-            .char_range()
-            .map(|r| {
-                let [a, b] = r.sorted_cursors();
-                (a.index.0, b.index.0)
-            })
-            .unwrap_or((0, 0));
-        let (ba, bb) = (char_to_byte(&doc.text, sa), char_to_byte(&doc.text, sb));
+        let (ba, bb) = if let Some(v) = self.big.view(doc.id) {
+            v.selection()
+        } else {
+            let state = TextEditState::load(ctx, id).unwrap_or_default();
+            let (sa, sb) = state
+                .cursor
+                .char_range()
+                .map(|r| {
+                    let [a, b] = r.sorted_cursors();
+                    (a.index.0, b.index.0)
+                })
+                .unwrap_or((0, 0));
+            (char_to_byte(&doc.text, sa), char_to_byte(&doc.text, sb))
+        };
         let pick = match how {
             Seek::FromSelectionStart => matches.iter().find(|m| m.start >= ba).or(matches.first()),
             Seek::Next => {
@@ -1149,6 +1202,15 @@ impl KladdApp {
         } else {
             let spec = self.find.spec(false);
             let Some(doc) = self.docs.get_mut(self.active) else { return };
+            if let Some(view) = self.big.view(doc.id) {
+                // Stor fil: ersätt bara på träffens rad (med ångra), inte hela texten.
+                if crate::bigfiles::replace_one(view, &mut doc.text, &spec, &repl, cur) {
+                    doc.on_edited();
+                }
+                self.find.current = None;
+                self.seek(ctx, Seek::FromSelectionStart);
+                return;
+            }
             if let Some(r) = search::replace_text(&doc.text, &spec, &repl, Some(cur)) {
                 doc.text = r.text;
                 doc.on_edited();
@@ -1190,6 +1252,7 @@ impl KladdApp {
             let Some(r) = search::replace_text(&doc.text, &spec, &repl, None) else { return };
             doc.text = r.text;
             doc.on_edited();
+            self.big.invalidate(doc.id);
             n = r.count;
         }
         self.find.current = None;
@@ -1897,7 +1960,7 @@ impl KladdApp {
                             ui.label(RichText::new(s).font(font.clone()).color(p.muted));
                             return;
                         }
-                        let words = doc.text.split_whitespace().count();
+                        let words = self.big.words(doc.id).unwrap_or_else(|| doc.text.split_whitespace().count());
                         let words = if words == 1 { t("1 ord").to_owned() } else { tf!("{words} ord", words = words) };
                         ui.label(RichText::new(words).font(font.clone()).color(p.muted));
                         ui.add_space(10.0);
@@ -1916,7 +1979,7 @@ impl KladdApp {
     fn preview(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(doc) = self.docs.get(self.active) else { return };
         // I delad vy ryms ingen förhandsvisning bredvid två rutor.
-        if self.panes.is_split() || !(self.settings.preview && doc.is_markdown()) || self.word_mode() {
+        if self.panes.is_split() || !(self.settings.preview && doc.is_markdown()) || self.word_mode() || self.big.has_view(doc.id) {
             return;
         }
         let width = ui.available_width();
@@ -2000,6 +2063,10 @@ impl KladdApp {
                 let vim_lines = std::mem::take(&mut self.vim_scroll_lines);
                 let mut vim_vis = (usize::MAX, 0usize);
 
+                if self.big.is_big(&self.docs[self.active]) {
+                    self.editor_big(ui, p, &matches, focus);
+                    return;
+                }
                 let git_gutter = self.git_gutter(ui.ctx());
                 let mut git_hunk: Option<(usize, egui::Pos2)> = None;
                 let ac_on = self.autocorrect_active(false);
@@ -2181,6 +2248,24 @@ impl KladdApp {
                     self.find.current = None;
                 }
             });
+    }
+
+    /// Stora textfiler: den virtualiserade vyn (`bigtext`) i stället för `TextEdit`.
+    fn editor_big(&mut self, ui: &mut Ui, p: &Palette, matches: &[(usize, usize, bool)], focus: bool) {
+        let (font_size, line_numbers) = (self.settings.font_size, self.settings.line_numbers);
+        let doc = &mut self.docs[self.active];
+        let Some(view) = self.big.view(doc.id) else { return };
+        let o = crate::bigtext::Opts { id: editor_id(doc.id), palette: p, font_size, line_numbers, matches, focus };
+        let changed = view.show(ui, &mut doc.text, &o);
+        let (line, col) = view.line_col(&doc.text);
+        let (a, b) = view.selection();
+        // Stora markeringar räknas i byte (att räkna tecken i 100 MB varje bildruta vore för dyrt).
+        let sel = if b - a > 1_000_000 { b - a } else { doc.text.get(a..b).map_or(0, |t| t.chars().count()) };
+        self.cursor = (line + 1, col + 1, sel);
+        if changed {
+            doc.on_edited();
+            self.find.current = None;
+        }
     }
 
     // ---------------------------------------------------------------- delad vy
@@ -2466,6 +2551,9 @@ impl KladdApp {
                                 t("Inga träffar").to_owned()
                             } else if let Some(i) = current_idx {
                                 tf!("{i} av {n}", i = i + 1, n = matches.len())
+                            } else if results.partial {
+                                // Stor fil: sökningen pågår eller stannade vid taket.
+                                tf!("{n}+ träffar", n = matches.len())
                             } else {
                                 tf!("{n} träffar", n = matches.len())
                             };
@@ -2998,6 +3086,7 @@ impl KladdApp {
                 let note = new.open_note.take();
                 self.docs[idx] = new;
                 self.hl.forget(id);
+                self.big.forget(id);
                 self.word.forget(id);
                 self.find.open = false;
                 self.focus_editor = true;
@@ -3666,6 +3755,10 @@ impl eframe::App for KladdApp {
         self.handle_incoming(ctx);
         self.update.tick(ctx, &mut self.settings);
         self.update_outs(ctx);
+        self.poll_big_loads(ctx);
+        if self.big.scanning() {
+            ctx.request_repaint();
+        }
         self.recovery.tick(ctx, &self.docs, self.settings.autosave_recovery);
         self.autosave_tick(ctx);
         self.lsp_tick(ctx);
@@ -3682,6 +3775,7 @@ impl eframe::App for KladdApp {
 
         self.sync_panes();
         self.handle_dialogs(&ctx);
+        self.big.show_progress(&ctx, &p);
         self.handle_drops(&ctx);
         self.handle_shortcuts(&ctx);
         self.pdf_sync_fullscreen(&ctx);

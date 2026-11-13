@@ -162,14 +162,35 @@ impl Cache {
             page_boxes: Arc::default(),
         });
         if st.text != text {
+            // Stora dokument: tolka bara om stycket med ändringen (samma resultat som `analyze`) och
+            // behåll tabeller, bilder och typsnitt som ändringen inte rört.
+            let delta = match Arc::get_mut(&mut st.analysis) {
+                Some(a) => super::incr::analyze_incremental(&st.text, a, text),
+                None => None,
+            };
             st.text.clear();
             st.text.push_str(text);
             st.rev += 1;
-            st.analysis = Arc::new(markup::analyze(text));
-            st.tables = None;
-            st.images = None;
+            match delta {
+                Some(d) => {
+                    if d.touched_table || st.tables.as_ref().is_some_and(|t| t.iter().any(|x| x.region.end > d.ws)) {
+                        st.tables = None;
+                    }
+                    if !d.same_images {
+                        st.images = None;
+                    }
+                    if st.fonts.as_ref().is_some_and(|f| !d.fonts.is_subset(f)) {
+                        st.fonts = None;
+                    }
+                }
+                None => {
+                    st.analysis = Arc::new(markup::analyze(text));
+                    st.tables = None;
+                    st.images = None;
+                    st.fonts = None;
+                }
+            }
             st.headings = None;
-            st.fonts = None;
         }
         st
     }
