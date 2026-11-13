@@ -55,6 +55,14 @@ pub struct ImageRef {
     pub align: Option<Float>,
 }
 
+/// Spårad ändring som biten ligger i: slag, nummer och författarens färgindex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RevMark {
+    pub kind: crate::review::RevKind,
+    pub id: u32,
+    pub color: u8,
+}
+
 /// En bit av texten med enhetlig stil. Bitarna täcker hela texten i ordning, utan glapp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Piece {
@@ -81,6 +89,10 @@ pub struct Piece {
     pub span: Option<Arc<SpanStyle>>,
     /// Justering från omslutande `<div align>`; `Left` annars.
     pub align: Align,
+    /// Spårad ändring (`<ins>`/`<del>`) som biten ligger i.
+    pub rev: Option<RevMark>,
+    /// Kommentarstråden (rotkommentarens nummer) vars område biten ligger i.
+    pub comment: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +162,8 @@ struct St {
     fndef: Option<u32>,
     span: Option<u32>,
     align: Align,
+    rev: Option<RevMark>,
+    comment: Option<u32>,
 }
 
 impl Default for St {
@@ -170,6 +184,8 @@ impl Default for St {
             fndef: None,
             span: None,
             align: Align::Left,
+            rev: None,
+            comment: None,
         }
     }
 }
@@ -495,6 +511,8 @@ fn parse(text: &str) -> Parsed {
         }
     }
 
+    mark_review(text, &mut st);
+
     // Spans och divar läggs på efter att alla händelser lästs: yttre först, så att den inre vinner.
     let mut styles: Vec<Arc<SpanStyle>> = Vec::new();
     hspans.sort_by_key(|h| h.open.start);
@@ -538,6 +556,36 @@ fn parse(text: &str) -> Parsed {
     Parsed { pieces, spans, hspans, defaults }
 }
 
+/// Spårade ändringar och kommentarer: taggar, markörer och poster döljs; innehållet får sin
+/// ändring respektive kommentarstråd.
+fn mark_review(text: &str, st: &mut [St]) {
+    if !crate::review::has_review(text) {
+        return;
+    }
+    let sc = crate::review::scan(text);
+    let authors = crate::review::authors(&sc);
+    for r in &sc.revs {
+        let color = sc.rev_rec(r.id).map_or(0, |x| crate::review::author_color_index(&authors, &x.author));
+        fill(st, r.open.clone(), |s| s.markup = true);
+        fill(st, r.close.clone(), |s| s.markup = true);
+        fill(st, r.inner(), |s| s.rev = Some(RevMark { kind: r.kind, id: r.id, color }));
+    }
+    for c in &sc.comments {
+        let thread = sc.comment_rec(c.id).map_or(c.id, |x| x.parent.unwrap_or(x.id));
+        fill(st, c.start.clone(), |s| s.markup = true);
+        fill(st, c.end.clone(), |s| s.markup = true);
+        fill(st, c.inner(), |s| s.comment = Some(thread));
+        // Skyddet mot HTML-block framför en markör i radens början (`&#8203;`) döljs också.
+        let g = "&#8203;";
+        if c.start.start >= g.len() && text[..c.start.start].ends_with(g) {
+            fill(st, c.start.start - g.len()..c.start.start, |s| s.markup = true);
+        }
+    }
+    for r in sc.rev_recs.iter().map(|(_, r)| r).chain(sc.comment_recs.iter().map(|(_, r)| r)) {
+        fill(st, r.clone(), |s| s.markup = true);
+    }
+}
+
 fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>], labels: &[String]) -> Piece {
     Piece {
         range,
@@ -556,6 +604,8 @@ fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<Sp
         footnote_def: s.fndef.and_then(|i| labels.get(i as usize).cloned()),
         span: s.span.and_then(|i| styles.get(i as usize).cloned()),
         align: s.align,
+        rev: s.rev,
+        comment: s.comment,
     }
 }
 
@@ -1400,6 +1450,11 @@ struct Prefix {
     end: usize,
     indent: usize,
     kind: Option<Block>,
+}
+
+/// Längden på radens prefix (indrag, `#`, `-`, `1.`, `>`) i byte.
+pub(crate) fn line_prefix_len(line: &str) -> usize {
+    parse_prefix(line).end
 }
 
 fn parse_prefix(line: &str) -> Prefix {
@@ -3297,6 +3352,10 @@ pub fn count(_text: &str, a: &Analysis) -> (usize, usize) {
         if p.image.is_some() || p.footnote_ref.is_some() || p.footnote_def.is_some() {
             continue;
         }
+        // Struken text (spårad radering) räknas inte.
+        if p.rev.is_some_and(|r| r.kind == crate::review::RevKind::Del) {
+            continue;
+        }
         if p.markup {
             // Tabellens `|` skiljer ord åt.
             if p.block == Block::Table {
@@ -3329,6 +3388,28 @@ mod tests {
         let p = piece_at(&a, i).unwrap().clone();
         assert!(p.range.end >= i + needle.len(), "{needle:?} delas över flera bitar: {a:?}");
         p
+    }
+
+    #[test]
+    fn spårade_ändringar_och_kommentarer_i_analysen() {
+        use crate::review::RevKind;
+        let t = "Hej <ins data-k=\"1\">nya</ins> <del data-k=\"2\">gamla</del> <!--k:c:3-->ord<!--k:/c:3--> &#8203;<!--k:c:4-->x<!--k:/c:4-->\n\n<!--k:r id=\"1\" author=\"Ada\" date=\"d\"-->\n<!--k:r id=\"2\" author=\"Bo\" date=\"d\"-->\n<!--k:c id=\"3\" author=\"Ada\" date=\"d\" text=\"hej\"-->\n<!--k:c id=\"4\" parent=\"3\" author=\"Bo\" date=\"d\" text=\"svar\"-->\n";
+        let ins = pc(t, "nya");
+        assert_eq!(ins.rev.map(|r| (r.kind, r.id)), Some((RevKind::Ins, 1)));
+        assert!(!ins.markup);
+        let del = pc(t, "gamla");
+        assert_eq!(del.rev.map(|r| (r.kind, r.id)), Some((RevKind::Del, 2)));
+        // Olika författare får olika färger.
+        assert_ne!(ins.rev.unwrap().color, del.rev.unwrap().color);
+        assert!(pc(t, "<ins data-k=\"1\">").markup && pc(t, "</del>").markup);
+        // Kommentarsområdet hör till trådens rot (svaret 4 delar tråd 3).
+        assert_eq!(pc(t, "ord").comment, Some(3));
+        let a = analyze(t);
+        assert_eq!(piece_at(&a, t.find("x<!--k:/c:4-->").unwrap()).unwrap().comment, Some(3));
+        assert!(pc(t, "<!--k:c:3-->").markup && pc(t, "&#8203;").markup);
+        assert!(pc(t, "<!--k:r id=\"1\"").markup && pc(t, "<!--k:c id=\"3\"").markup);
+        // Struken text räknas inte som ord.
+        assert_eq!(count(t, &analyze(t)).0, 4, "Hej nya ord x");
     }
 
     fn markup_str(text: &str) -> String {

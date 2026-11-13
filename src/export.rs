@@ -44,6 +44,8 @@ fn options() -> Options {
 
 /// Bygger en fristående HTML-fil (UTF-8) av Markdown-text.
 pub fn html(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+    let cleaned = crate::review::clean_for_export(markdown);
+    let markdown = cleaned.as_str();
     let (text, defaults) = prepare(markdown);
     let mut imgs = Images::new(Mode::Html, resolve);
     let model = build(&text, Mode::Html, &mut imgs);
@@ -67,6 +69,8 @@ pub fn html(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>
 
 /// Bygger en EPUB 3-fil av Markdown-text. Kapitlen delas vid rubriker på nivå 1.
 pub fn epub(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+    let cleaned = crate::review::clean_for_export(markdown);
+    let markdown = cleaned.as_str();
     let (text, defaults) = prepare(markdown);
     let mut imgs = Images::new(Mode::Epub, resolve);
     let model = build(&text, Mode::Epub, &mut imgs);

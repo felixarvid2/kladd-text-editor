@@ -6,6 +6,9 @@
 /// Rensar `markdown` för förhandsvisning i ett enda svep. Kodstycken (``` / ~~~) och
 /// kodspann lämnas orörda, liksom tecken efter ett backslash (`\<span` är vanlig text).
 pub fn clean(markdown: &str) -> String {
+    // Spårade ändringar godkänns och kommentarer utelämnas i förhandsvisningen.
+    let cleaned = crate::review::clean_for_export(markdown);
+    let markdown = cleaned.as_str();
     let mut out = String::with_capacity(markdown.len());
     // Öppet kodstaket: (tecken, antal).
     let mut fence: Option<(u8, usize)> = None;

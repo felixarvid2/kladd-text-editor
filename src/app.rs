@@ -79,6 +79,10 @@ pub struct Settings {
     pub autosave_recovery: bool,
     /// Navigeringsfönstret (rubrikträd) för Markdown-baserade flikar.
     pub nav_pane: bool,
+    /// Namnet som skrivs på spårade ändringar och kommentarer ("Ditt namn"); tomt = användarnamnet.
+    pub author_name: String,
+    /// Visa kommentarerna (markerade områden och kommentarsfältet) i dokumentläget.
+    pub word_comments: bool,
     /// Visningsläget (sida, zoom, rotation) för senast öppnade PDF-filer, nyast först.
     pub pdf_memory: Vec<(String, ViewMemory)>,
     /// Sök efter nya versioner av Kladd (högst en gång per dygn).
@@ -116,6 +120,8 @@ impl Default for Settings {
             grammar_ack: false,
             autosave_recovery: true,
             nav_pane: false,
+            author_name: String::new(),
+            word_comments: true,
             pdf_memory: Vec::new(),
             auto_update_check: true,
             update_last_check: 0,

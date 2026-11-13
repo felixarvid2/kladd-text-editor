@@ -20,6 +20,7 @@ mod search;
 mod preview;
 mod print;
 mod recovery;
+mod review;
 mod highlight;
 mod history;
 mod history_ui;

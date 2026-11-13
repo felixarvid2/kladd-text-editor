@@ -432,3 +432,75 @@ när sidan fylls. Referensen är ett litet upphöjt nummer. En enskild not som �
 
 **HTML/EPUB** (`export.rs`) hade redan fotnoter via pulldown (`<aside class="footnote">`, EPUB-`noteref`);
 kontrollerat med de befintliga testerna.
+
+## Granska: spårade ändringar och kommentarer
+
+Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad `docx`), gränssnitt i
+`src/word/reviewui.rs`.
+
+**Modellen** (Markdown-dialekten):
+
+- Infogad text `<ins data-k="3">text</ins>`, raderad text `<del data-k="4">text</del>`. `data-k` är ändringens
+  nummer; flera taggar kan dela nummer (en Word-ändring över körningar med olika format blir en tagg per
+  körning, och godkänn/avvisa tar alla med samma nummer). Taggarna ligger utanför `**`/`<u>`/`<span>` och
+  inom ett stycke; en ändring går aldrig över en radbrytning. Författare och datum står inte i taggen utan i
+  en postrad `<!--k:r id="3" author="Ada" date="2026-05-01T10:00:00Z"-->`.
+- Kommentarens område `<!--k:c:ID-->…<!--k:/c:ID-->` i texten (dold markup som `<!--k:N-->`). Börjar
+  området först på raden skyddas det av `&#8203;` framför (annars blir raden ett HTML-block, som för
+  objektmarkörerna), och `&#8203;` döljs. Kommentaren själv är en postrad
+  `<!--k:c id="1" parent="0" author="Ada" date="…" done="1" text="Hej &amp; hå"-->` (text och namn
+  XML-skyddade, `&#10;` för radbrytning). Ett svar har `parent` (trådens rot) och delar områdets läge med
+  roten (markörerna ligger intill förälderns). Rotkommentarens nummer är trådens nummer.
+- Postraderna ligger sist i dokumentet (efter fotnoterna), en per rad. De är tomma rader i dokumentläget
+  (hela raden är dold markup och kollapsar som `<!-- … -->`-rader).
+- `review::scan` hittar taggar, markörer och poster (hoppar över kodstaket). `markup::analyze` döljer dem
+  och ger bitarna `Piece::rev` (`RevMark`: slag, nummer, författarens färgindex) och `Piece::comment`
+  (trådens nummer). Färgindex är författarens plats i ordningen de först förekommer (`review::authors`),
+  så två författare aldrig delar färg. Raderad text räknas inte som ord och stavningskontrolleras inte.
+
+**Operationer** (`review.rs`, alla `&str` → `String`/`Edit`): `accept_all`, `reject_all`, `resolve_range`
+(godkänn/avvisa det som rör markeringen), `next_change`/`prev_change`, `add_comment`, `add_reply`,
+`delete_comment`, `edit_comment`, `threads`, `thread_at`, `prune` samt `clean_for_export` (godkänner allt och
+tar bort kommentarer: används av PDF, HTML, EPUB, ODT och förhandsvisningen). Ett stycke som bara bestod av en
+godkänd radering tas bort helt.
+
+**Spåra ändringar vid skrivning** (`review::track_edit`): editorn är fortfarande en vanlig `TextEdit`. Efter
+bildrutan jämförs texten före och efter (gemensamt prefix/suffix) och redigeringen skrivs om:
+
+- infogad text får `<ins>` (skriver man inne i, eller direkt efter, sin egen infogning utökas den i stället för
+  att få en ny tagg), radbrytningar och radprefix (`#`, `-`, `1.`, `>`) ingår inte;
+- raderad text får `<del>`; text i sin egen infogning försvinner på riktigt, text som redan är struken och
+  taggar/markörer/radbrytningar stannar; Backspace/Delete över en dold tagg går vidare till nästa synliga tecken;
+  en radering intill sin egen radering slås ihop med den; markören står före (Backspace) eller efter (Delete);
+- infogning inne i en tagg, i en radering eller i någon annans infogning flyttas till efter den;
+- ersättning av en markering ger `<del>` följt av `<ins>`; kodblock spåras inte;
+- ögonblicksbilden tas bara när tangenter som kan redigera trycktes (inte vid Ctrl+Z/Y), så texten klonas inte
+  varje bildruta. Radbrytningar (Enter) och formateringsknappar spåras inte (formatering skrivs direkt).
+
+**Dokumentläget**: infogat understruket och raderat genomstruket i författarens färg (`layout::piece_format`),
+kommentarsområdet med gul bakgrund (`review::comments_visible`, inställningen "Visa kommentarer"), och ett fält
+till höger om sidan (`reviewui::paint_pane`, 250 px + 16 px luft; sidan flyttas åt vänster och zoomen anpassas så
+att båda ryms). Korten ligger vid sin text och skjuts ned så att de inte överlappar; ett klick på ett kort
+markerar området, ett dubbelklick redigerar kommentarens text, det valda kortet (markören i området) har svarsfält
+samt *Svara*, *Löst* och *Ta bort*. Verktygsraden har *Spåra: på/av* och menyn *Granska* (spåra `Ctrl+Skift+E`,
+godkänn/avvisa ändring, godkänn/avvisa alla, föregående/nästa, ny kommentar `Ctrl+Alt+M`, svara, ta bort, visa
+kommentarer, *Ditt namn…*). Inställningarna `author_name` (tomt = `$USER`/`$USERNAME`) och `word_comments` ligger
+i `Settings`; spårning är per flik och sparas inte.
+
+**Word** (`docx.rs`, `docx_review.rs`): `w:ins`/`w:moveTo` och `w:del`/`w:moveFrom` (utanför styckemarkeringens
+`w:rPr`) ger taggar med nytt löpnummer och en postrad (`w:author`, `w:date`); `w:delText` läses som text.
+Flyttar blir vanlig infogning och radering (ett `w:del` inuti ett `w:ins` behåller bara raderingen).
+`w:commentRangeStart/End` blir markörer och `w:commentReference`-körningen försvinner (den skrivs igen vid
+slutmarkören). `comments.xml` ger postrader; svar och löst läses ur `commentsExtended.xml`
+(`w15:paraIdParent`, `w15:done`, via styckets `w14:paraId`). Bara kommentarer med ett område i texten tas med.
+Vid skrivning: orörda stycken behåller sin ursprungliga XML (med ändringar och kommentarer), omskrivna stycken
+får `w:ins`/`w:del` (`w:id` från 5 000 000, författare och datum ur posterna) och
+`w:commentRangeStart`/`End` + referens. `comments.xml` följer med orörd om alla poster är oförändrade;
+annars byggs den av posterna (oförändrade kommentarer ordagrant, nya med `w14:paraId`) och
+`commentsExtended.xml` skrivs om (eller skapas, med relation och innehållstyp). Kommentarer utan område i
+brödtexten tas bort. Spårade formateringsändringar (`rPrChange`, `pPrChange`) tas fortfarande bort när ett
+stycke skrivs om och rapporteras som "spårade formateringsändringar".
+
+**ODT**: `text:tracked-changes` godkänns vid läsning (infogad text stannar, raderad text kommer inte med),
+`office:annotation` tas bort som förut, och `odt::write` godkänner ändringarna och utelämnar kommentarerna.
+Spårade ändringar och kommentarer i .odt är alltså inte stödda fullt ut.

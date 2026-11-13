@@ -17,6 +17,7 @@ use pulldown_cmark::{CowStr, Event as MdEvent, HeadingLevel, Options, Parser, Ta
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
+use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::word::markup::{self, Float};
 
@@ -120,6 +121,8 @@ pub struct Source {
     page: DocDefaults,
     /// Formatmallarna så som de lästes ur `styles.xml` (se `docx_styles`).
     styles: style::StyleSet,
+    /// Originalets kommentarer (comments.xml), om dokumentet har några.
+    comments: Option<review_xml::CmPart>,
 }
 
 // ============================================================== läsning
@@ -715,6 +718,8 @@ struct Fmt {
     code: bool,
     /// Typsnitt, storlek och färger som avviker från grundformatet (`<span style="…">`).
     span: SpanStyle,
+    /// Spårad ändring (`w:ins`/`w:del`) som körningen ligger i: slag och ändringens nummer.
+    rev: Option<(RevKind, u32)>,
 }
 
 #[derive(Clone)]
@@ -766,8 +771,8 @@ struct Tbl {
     span: usize,
 }
 
-/// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade ändringar godtas
-/// när ett stycke skrivs om.
+/// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade formateringsändringar
+/// godtas när ett stycke skrivs om (infogningar, raderingar och kommentarer bevaras).
 #[derive(Default)]
 struct Dropped {
     tracked: bool,
@@ -777,7 +782,7 @@ impl Dropped {
     fn list(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.tracked {
-            v.push("spårade ändringar");
+            v.push("spårade formateringsändringar");
         }
         v
     }
@@ -796,6 +801,12 @@ struct BodyInfo {
     tokens: Vec<Opaque>,
     /// Fotnotsreferenserna i dokumentordning (referens nummer N är `[^N]`).
     fn_refs: Vec<FnRefInfo>,
+    /// Läs spårade ändringar och kommentarer till Kladds markörer (huvuddokumentet, inte fotnoterna).
+    track: bool,
+    /// Författare och datum per spårad ändring (numret är `data-k`).
+    revs: Vec<RevRec>,
+    /// Kommentarer som har ett område i texten.
+    comment_ids: Vec<u32>,
 }
 
 pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
@@ -859,8 +870,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let mut dropped = Dropped::default();
 
     let mut found: Vec<FoundImage> = Vec::new();
-    let mut info = BodyInfo::default();
+    let mut info = BodyInfo { track: true, ..Default::default() };
     let blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info)?;
+    // Kommentarerna: posterna läggs sist i texten, och bara de som har ett område.
+    let comments = match find_part("/comments") {
+        Some(name) => {
+            let ext = review_xml::ext_rel_target(&rels, dir);
+            review_xml::read_comments(&mut pkg, &name, ext.as_deref())?
+        }
+        None => None,
+    };
 
     // Fotnoterna: texten läses ur footnotes.xml och läggs som definitioner sist i dokumentet.
     let footnotes = match find_part("/footnotes") {
@@ -905,6 +924,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
             markdown.push_str(&format!("[^{}]: {md}\n", i + 1));
         }
     }
+    let mut comments = comments;
+    let mut comment_recs: Vec<CommentRec> = Vec::new();
+    if let Some((part, recs)) = comments.as_mut() {
+        comment_recs = recs.iter().filter(|c| info.comment_ids.contains(&c.id)).cloned().collect();
+        part.items.retain(|i| info.comment_ids.contains(&i.id));
+    }
+    if !info.revs.is_empty() || !comment_recs.is_empty() {
+        markdown = review::put_records(&markdown, &info.revs, &comment_recs);
+    }
+    let comments = comments.map(|(p, _)| p);
     let comment = base.to_comment();
     // Formatmallarna som `write` får tillbaka ur kommentarraden (avrundade som i texten).
     let read_styles = DocDefaults::from_comment(&comment).map(|d| d.styles).unwrap_or_default();
@@ -963,7 +992,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 e.fn_ids.push(r.id.clone());
             }
         }
-        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles })
+        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles, comments })
     });
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
@@ -1619,6 +1648,11 @@ fn parse_body(
     let mut run_found_mark = 0usize;
     let mut omath_start: Option<usize> = None;
     let mut simple_fields: Vec<()> = Vec::new();
+    // Spårade ändringar: öppna `w:ins`/`w:del` och den som gäller just nu.
+    let mut rev_stack: Vec<Option<(RevKind, u32)>> = Vec::new();
+    let mut cur_rev: Option<(RevKind, u32)> = None;
+    // Körningen är bara en kommentarsreferens: den ersätts av områdets slutmarkör.
+    let mut run_drop = false;
     // Bara dokument som nämner en innehållsförteckning behöver sökas igenom efter en.
     let toc_hint = xml.contains("Table of Contents") || xml.contains("TOC");
 
@@ -1765,7 +1799,9 @@ fn parse_body(
                     apply_rpr_elem(&mut direct, &name, e, theme);
                 }
                 // Objekt Kladd inte visar: hela körningen blir en markör när den tar slut.
-                if in_run
+                if in_run && name == b"commentReference" && info.track && attr(e, b"id").is_some() {
+                    run_drop = true;
+                } else if in_run
                     && matches!(
                         name.as_slice(),
                         b"endnoteReference" | b"commentReference" | b"fldChar" | b"instrText" | b"sym" | b"object"
@@ -1805,6 +1841,18 @@ fn parse_body(
                         }
                     }
                     // Bokmärken och kommentarsankare mellan körningar.
+                    b"commentRangeStart" | b"commentRangeEnd"
+                        if info.track && empty && !in_run && para.is_some() && attr(e, b"id").and_then(|v| v.parse::<u32>().ok()).is_some() =>
+                    {
+                        let id = attr(e, b"id").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                        let start = name == b"commentRangeStart";
+                        if start && !info.comment_ids.contains(&id) {
+                            info.comment_ids.push(id);
+                        }
+                        let text = if start { review::marker_start(id) } else { review::marker_end(id) };
+                        let p = para.get_or_insert_with(Para::new);
+                        p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
+                    }
                     b"bookmarkStart" | b"bookmarkEnd" | b"commentRangeStart" | b"commentRangeEnd" | b"permStart" | b"permEnd"
                         if empty && !in_run && para.is_some() =>
                     {
@@ -1821,16 +1869,36 @@ fn parse_body(
                         push_token(&mut para, info, &begin);
                         simple_fields.push(());
                     }
+                    // Spårade ändringar runt körningar (inte styckemarkeringens `w:ins`/`w:del` i `w:rPr`).
+                    b"ins" | b"del" | b"moveTo" | b"moveFrom" if info.track && !empty && !in_rpr && !in_ppr => {
+                        let kind = if matches!(name.as_slice(), b"ins" | b"moveTo") { RevKind::Ins } else { RevKind::Del };
+                        let id = info.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+                        info.revs.push(RevRec { id, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default() });
+                        cur_rev = Some((kind, id));
+                        rev_stack.push(cur_rev);
+                    }
                     b"del" | b"moveFrom" => {
+                        if !empty && !in_rpr && !in_ppr {
+                            skip = 1;
+                        }
+                    }
+                    b"ins" | b"moveTo" => {}
+                    b"pPrChange" | b"rPrChange" => {
                         dropped.tracked = true;
                         if !empty {
                             skip = 1;
                         }
                     }
-                    b"ins" | b"moveTo" => dropped.tracked = true,
-                    b"sdtPr" | b"sdtEndPr" | b"instrText" | b"delText" | b"pPrChange" | b"rPrChange"
-                    | b"sectPr" | b"tblPr" | b"trPr" | b"fldData" => {
+                    b"sdtPr" | b"sdtEndPr" | b"instrText" | b"sectPr" | b"tblPr" | b"trPr" | b"fldData" => {
                         if !empty {
+                            skip = 1;
+                        }
+                    }
+                    // Raderad text ligger i `w:delText`; utan spårning är den borta redan.
+                    b"delText" => {
+                        if info.track {
+                            in_t = !empty;
+                        } else if !empty {
                             skip = 1;
                         }
                     }
@@ -1895,8 +1963,10 @@ fn parse_body(
                             run_opaque = false;
                             run_mark = para.as_ref().map_or((0, 0), |p| (p.runs.len(), p.runs.last().map_or(0, |l| l.text.len())));
                             run_found_mark = found.len();
+                            run_drop = false;
                         }
                         fmt = Fmt::default();
+                        fmt.rev = cur_rev;
                         direct = RProps::default();
                         run_rstyle = None;
                         let linked = link.last().is_some_and(Option::is_some);
@@ -2040,14 +2110,25 @@ fn parse_body(
                             fmt.span = run_span(styles, &base, para.as_ref(), &direct, run_rstyle.as_deref(), linked, fmt.code);
                         }
                     }
-                    b"t" => in_t = false,
+                    b"t" | b"delText" => in_t = false,
+                    b"ins" | b"del" | b"moveTo" | b"moveFrom" if info.track && !in_rpr && !in_ppr && rev_stack.pop().is_some() => {
+                        cur_rev = rev_stack.last().copied().flatten();
+                    }
                     b"r" => {
                         fmt = Fmt::default();
                         if in_run {
                             in_run = false;
                             let run_xml = &xml[run_start..after];
                             let fnref = run_fnref.take();
-                            if let (false, Some(id)) = (run_opaque, fnref) {
+                            if run_drop && !run_opaque {
+                                // Kommentarsreferensen: det som står kvar är slutmarkören före den.
+                                if let Some(p) = para.as_mut() {
+                                    p.runs.truncate(run_mark.0);
+                                    if let Some(l) = p.runs.last_mut() {
+                                        l.text.truncate(run_mark.1);
+                                    }
+                                }
+                            } else if let (false, Some(id)) = (run_opaque, fnref) {
                                 // Backa körningen och lägg `[^N]` i stället; N räknas i dokumentordning.
                                 if let Some(p) = para.as_mut() {
                                     p.runs.truncate(run_mark.0);
@@ -2076,6 +2157,7 @@ fn parse_body(
                                 }
                             }
                             run_opaque = false;
+                            run_drop = false;
                         }
                     }
                     b"fldSimple" => {
@@ -2273,6 +2355,9 @@ fn inline_md(run: &Run) -> String {
         }
         if let Some(url) = &run.link {
             s = format!("[{s}]({})", url.replace(' ', "%20").replace(')', "%29"));
+        }
+        if let Some((kind, id)) = run.fmt.rev {
+            s = format!("{}{s}{}", review::open_tag(kind, id), review::close_tag(kind));
         }
         parts.push(s);
     }
@@ -2551,6 +2636,10 @@ struct Ctx<'a> {
     links: Vec<(String, String)>,
     /// Befintliga bilder: (relations-id, innehåll).
     media: Vec<(String, &'a [u8])>,
+    /// Författare och datum per spårad ändring (efter `data-k`).
+    revs: HashMap<u32, RevRec>,
+    /// Kommentarer som finns som poster (områden utan post skrivs inte).
+    comments: std::collections::HashSet<u32>,
 }
 
 /// En enhet i den skrivna brödtexten (stycke, listpunkt, tabell …) som kan bytas mot originalet.
@@ -2599,6 +2688,13 @@ struct Writer<'a> {
     in_footnote: bool,
     /// Antal innehållsförteckningar skrivna hittills (för unika id).
     toc_n: u32,
+    /// Öppen `<ins>`/`<del>`.
+    rev: Option<(RevKind, u32)>,
+    /// Nästa `w:id` för en skriven ändring.
+    rev_next: u32,
+    /// Kommentarsområden som redan skrivits (ett område får bara finnas en gång).
+    c_started: std::collections::HashSet<u32>,
+    c_ended: std::collections::HashSet<u32>,
 }
 
 /// En fotnotsdefinition som skrivits ur Markdown.
@@ -2655,6 +2751,10 @@ impl<'a> Writer<'a> {
             fn_order: Vec::new(),
             in_footnote: false,
             toc_n: 0,
+            rev: None,
+            rev_next: 5_000_000,
+            c_started: Default::default(),
+            c_ended: Default::default(),
         }
     }
 
@@ -2891,6 +2991,22 @@ impl<'a> Writer<'a> {
             }
         }
         xml.push_str("</w:r>");
+        if let Some((kind, id)) = self.rev {
+            let rec = self.ctx.revs.get(&id).cloned().unwrap_or_else(|| RevRec { id, author: "Okänd".into(), date: String::new() });
+            let (tag, ins) = match kind {
+                RevKind::Ins => ("w:ins", true),
+                RevKind::Del => ("w:del", false),
+            };
+            if !ins {
+                xml = xml.replace("<w:t ", "<w:delText ").replace("</w:t>", "</w:delText>");
+            }
+            let (mut a, mut d) = (String::new(), String::new());
+            xml_escape(&rec.author, &mut a);
+            xml_escape(&rec.date, &mut d);
+            let date = if d.is_empty() { String::new() } else { format!(" w:date=\"{d}\"") };
+            self.rev_next += 1;
+            xml = format!("<{tag} w:id=\"{}\" w:author=\"{a}\"{date}>{xml}</{tag}>", self.rev_next);
+        }
         if let Some(url) = self.fmt.link.clone() {
             let id = self.link_rel(&url);
             self.body.push_str(&format!("<w:hyperlink xmlns:r=\"{R_NS}\" r:id=\"{id}\" w:history=\"1\">{xml}</w:hyperlink>"));
@@ -2916,6 +3032,25 @@ impl<'a> Writer<'a> {
         if n < self.ctx.tokens {
             self.open_para();
             self.body.push_str(&marker(n));
+        }
+    }
+
+    /// Kommentarsområdets början eller slut (med referensen efter slutet).
+    fn comment_marker(&mut self, start: bool, id: u32) {
+        if self.in_footnote || !self.ctx.comments.contains(&id) {
+            return;
+        }
+        if start {
+            if !self.c_started.insert(id) {
+                return;
+            }
+            self.open_para();
+            self.body.push_str(&format!("<w:commentRangeStart w:id=\"{id}\"/>"));
+        } else if self.c_started.contains(&id) && self.c_ended.insert(id) {
+            self.open_para();
+            self.body.push_str(&format!(
+                "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr><w:commentReference w:id=\"{id}\"/></w:r>"
+            ));
         }
     }
 
@@ -3389,6 +3524,12 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     for n in ns {
                         w.token(n);
                     }
+                } else if let Some((start, id)) = review::parse_marker(s.trim()) {
+                    w.comment_marker(start, id);
+                } else if let Some(open) = review::parse_open_tag(s.trim()) {
+                    w.rev = Some(open);
+                } else if review::is_close_tag(s.trim()) {
+                    w.rev = None;
                 } else if let Some(img) = parse_img(&s) {
                     w.image_ref(&img.src, &img.alt, (img.width, img.height), img.align, resolve);
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
@@ -4077,13 +4218,29 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         Some(d) => (d, markdown[first.len()..].trim_start_matches(['\n', '\r'])),
         None => (DocDefaults::default(), markdown),
     };
+    // Ändrings- och kommentarsposterna sist i texten är inte text i dokumentet.
+    let (markdown, revs, comments) = review::split_records(markdown);
+    let rv = Review { revs, comments };
     match source {
-        Some(src) => write_patched(src, defaults, markdown, title, resolve),
-        None => write_fresh(defaults, markdown, title, resolve),
+        Some(src) => write_patched(src, defaults, &markdown, title, resolve, &rv),
+        None => write_fresh(defaults, &markdown, title, resolve, &rv),
     }
 }
 
-fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+/// Posterna för spårade ändringar och kommentarer ur Markdown-texten.
+struct Review {
+    revs: Vec<RevRec>,
+    comments: Vec<CommentRec>,
+}
+
+impl Review {
+    fn apply(&self, ctx: &mut Ctx<'_>) {
+        ctx.revs = self.revs.iter().map(|r| (r.id, r.clone())).collect();
+        ctx.comments = self.comments.iter().map(|c| c.id).collect();
+    }
+}
+
+fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let mut taken: std::collections::HashSet<String> = [
         "[content_types].xml",
         "_rels/.rels",
@@ -4098,13 +4255,14 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     .into_iter()
     .map(str::to_owned)
     .collect();
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         num_base: 1,
         doc_pr_start: 1,
         max_width: text_width_emu(&defaults),
         used_ids: ["rId1", "rId2", "rId3"].into_iter().map(str::to_owned).collect(),
         ..Default::default()
     };
+    rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     let mut body = std::mem::take(&mut w.body);
     // Ett dokument som slutar med en tabell måste ha ett stycke efter den.
@@ -4112,6 +4270,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         body.push_str("<w:p/>");
     }
     let (body, footnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None);
+    let comments_out = review_xml::build_comments(None, &rv.comments, &review_xml::anchored_ids(&body));
     let mut extras = Extras::default();
     let fields = style::Fields::for_export(title, "docx");
     let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut w.ids, &mut taken);
@@ -4129,6 +4288,14 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     if footnotes_xml.is_some() {
         doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdFn1" Type="{REL_NS}/footnotes" Target="footnotes.xml"/>"#));
         extras.types.push_str(&format!(r#"<Override PartName="/word/footnotes.xml" ContentType="{FOOTNOTES_MIME}"/>"#));
+    }
+    if let Some(c) = &comments_out {
+        doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdCm1" Type="{REL_NS}/comments" Target="comments.xml"/>"#));
+        extras.types.push_str(&format!(r#"<Override PartName="/word/comments.xml" ContentType="{}"/>"#, review_xml::COMMENTS_MIME));
+        if c.ext.is_some() {
+            doc_rels.push_str(&review_xml::ext_rel_xml("rIdKladdCm2", "commentsExtended.xml"));
+            extras.types.push_str(&format!(r#"<Override PartName="/word/commentsExtended.xml" ContentType="{}"/>"#, review_xml::COMMENTS_EXT_MIME));
+        }
     }
     doc_rels.push_str("</Relationships>");
 
@@ -4151,6 +4318,12 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         let settings = SETTINGS.replace("<w:compat>", r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:compat>"#);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
             p.1 = settings.into_bytes();
+        }
+    }
+    if let Some(c) = comments_out {
+        parts.push(("word/comments.xml".into(), c.xml.into_bytes()));
+        if let Some(e) = c.ext {
+            parts.push(("word/commentsExtended.xml".into(), e.into_bytes()));
         }
     }
     parts.extend(extras.parts);
@@ -4510,7 +4683,7 @@ fn fix_head(head: &str) -> String {
     h
 }
 
-fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let main_dir = src.main.rsplit_once('/').map_or("", |(d, _)| d);
     let main_file = src.main.rsplit('/').next().unwrap_or("document.xml");
     let rels_name = if main_dir.is_empty() { format!("_rels/{main_file}.rels") } else { format!("{main_dir}/_rels/{main_file}.rels") };
@@ -4535,7 +4708,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         .max()
         .map_or(1, |m| m + 1);
     let mut taken: std::collections::HashSet<String> = src.parts.iter().map(|(n, _)| n.trim_start_matches('/').to_lowercase()).collect();
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         tokens: src.tokens.len(),
         num_base,
         doc_pr_start,
@@ -4548,7 +4721,9 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
             .filter(|(_, (_, k, e))| !*e && k.ends_with("/image"))
             .filter_map(|(id, (t, _, _))| src.part(&resolve_target(main_dir, t)).map(|b| (id.clone(), b)))
             .collect(),
+        ..Default::default()
     };
+    rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     w.units.sort_by_key(|u| u.range.start);
     // Fotnotsreferenserna (index i `fn_order`) i varje enhet.
@@ -4730,6 +4905,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         body.push_str("<w:p/>");
     }
     let (body, footnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref());
+    let comments_out = review_xml::build_comments(src.comments.as_ref(), &rv.comments, &review_xml::anchored_ids(&body));
 
     // ---- sida, sidhuvud och sidfot
     let page_changed = !same_page(&defaults, &src.page);
@@ -4790,15 +4966,17 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
             n += 1;
         };
         let mut k = 1;
+        let short = kind.rsplit('/').next().unwrap_or(kind);
         let rid = loop {
-            let id = format!("rIdKladd{kind}{k}");
+            let id = format!("rIdKladd{short}{k}");
             if ids.insert(id.clone()) {
                 break id;
             }
             k += 1;
         };
         let target = part.strip_prefix(&format!("{main_dir}/")).unwrap_or(&part).to_owned();
-        doc_rel_add.push_str(&format!(r#"<Relationship Id="{rid}" Type="{REL_NS}/{kind}" Target="{target}"/>"#));
+        let rel_type = if kind.contains("://") { kind.to_owned() } else { format!("{REL_NS}/{kind}") };
+        doc_rel_add.push_str(&format!(r#"<Relationship Id="{rid}" Type="{rel_type}" Target="{target}"/>"#));
         type_add.push_str(&format!(r#"<Override PartName="/{part}" ContentType="{mime}"/>"#));
         (part, xml)
     };
@@ -4878,6 +5056,48 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
                         let patched = format!("{}{add}{}", &x[..at], &x[at..]);
                         replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
                     }
+                }
+            }
+        }
+    }
+
+    // ---- kommentarer
+    if let Some(c) = comments_out {
+        match &src.comments {
+            Some(o) => {
+                replaced.insert(o.name.trim_start_matches('/').to_lowercase(), fix_decl(&c.xml).into_bytes());
+                if let Some(ext) = c.ext {
+                    match &o.ext_name {
+                        Some(n) => {
+                            replaced.insert(n.trim_start_matches('/').to_lowercase(), fix_decl(&ext).into_bytes());
+                        }
+                        None => {
+                            let (part, xml) = fresh_part(
+                                "word/commentsExtended.xml",
+                                "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                                review_xml::COMMENTS_EXT_MIME,
+                                ext,
+                                &mut doc_rel_add,
+                                &mut type_add,
+                            );
+                            new_parts.push((part, xml.into_bytes()));
+                        }
+                    }
+                }
+            }
+            None => {
+                let (part, xml) = fresh_part("word/comments.xml", "comments", review_xml::COMMENTS_MIME, c.xml, &mut doc_rel_add, &mut type_add);
+                new_parts.push((part, xml.into_bytes()));
+                if let Some(ext) = c.ext {
+                    let (part, xml) = fresh_part(
+                        "word/commentsExtended.xml",
+                        "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                        review_xml::COMMENTS_EXT_MIME,
+                        ext,
+                        &mut doc_rel_add,
+                        &mut type_add,
+                    );
+                    new_parts.push((part, xml.into_bytes()));
                 }
             }
         }
@@ -6045,3 +6265,6 @@ mod manual {
 #[cfg(test)]
 #[path = "docx_fn_tests.rs"]
 mod fn_tests;
+
+#[path = "docx_review.rs"]
+mod review_xml;

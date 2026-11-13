@@ -1547,6 +1547,9 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
 
 /// Bygger en PDF av Markdown-text.
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
+    // Ändringar godkänns och kommentarer utelämnas i PDF.
+    let cleaned = crate::review::clean_for_export(markdown);
+    let markdown = cleaned.as_str();
     let (blocks, notes) = parse_blocks_notes(markdown);
     let defaults = doc_defaults(markdown);
     let mut lay = lay_out(&blocks, &notes, &defaults, resolve);

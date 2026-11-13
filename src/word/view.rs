@@ -122,6 +122,8 @@ pub struct State {
     highlight: Option<[u8; 3]>,
     /// Fotnotshopp som väntar på att musknappen släpps (layouten ändras när markören flyttas vid nedtryckning).
     fn_pending: Option<usize>,
+    /// Granska: spårade ändringar och kommentarer.
+    pub(crate) review: super::reviewui::ReviewState,
 }
 
 impl State {
@@ -152,6 +154,7 @@ enum BarAct {
     Align(markup::Align),
     TextColor(Option<[u8; 3]>),
     Highlight(Option<[u8; 3]>),
+    Review(super::reviewui::ReviewAct),
 }
 
 fn block_label(b: Block) -> String {
@@ -424,6 +427,7 @@ impl KladdApp {
         self.word_table_keys(ctx);
         self.word_footnote_keys(ctx);
         self.word_paste_html(ctx);
+        self.review_keys(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
         let shift = ctx.input(|i| i.modifiers.shift);
@@ -490,6 +494,9 @@ impl KladdApp {
         let analysis = self.word.analysis(doc.id, &doc.text);
         let act = markup::active(&doc.text, &analysis, sel);
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
+        let tracking = self.review_tracking();
+        let review_changes = self.review_changes();
+        let comments_shown = self.settings.word_comments;
 
         let mut acts: Vec<BarAct> = Vec::new();
         // Typsnitt i dokumentet (grundtypsnittet först), och de som är installerade.
@@ -689,6 +696,17 @@ impl KladdApp {
                             acts.push(BarAct::Toc);
                         }
                     });
+                    // Granska: spåra ändringar och kommentarer.
+                    let track_label = if tracking { "Spårar: på" } else { "Spåra: av" };
+                    if crate::app::status_button(ui, p, track_label, "Spåra ändringar (Ctrl+Shift+E)").clicked() {
+                        acts.push(BarAct::Review(super::reviewui::ReviewAct::ToggleTrack));
+                    }
+                    let review = crate::app::status_button(ui, p, "Granska \u{25BE}", "Spårade ändringar och kommentarer");
+                    Popup::menu(&review).gap(4.0).width(250.0).show(|ui| {
+                        if let Some(a) = super::reviewui::menu(ui, p, tracking, comments_shown, review_changes) {
+                            acts.push(BarAct::Review(a));
+                        }
+                    });
                     if in_table {
                         divider(ui, p);
                         if let Some(op) = tables::bar_group(ui, p) {
@@ -751,6 +769,7 @@ impl KladdApp {
                 }
                 BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
                 BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
+                BarAct::Review(a) => self.review_act(&ctx, a),
                 BarAct::Zoom(d) => self.word_zoom_step(d),
                 BarAct::ZoomReset => self.settings.word_zoom = 1.0,
                 BarAct::ToMarkdown => {
@@ -840,18 +859,21 @@ impl KladdApp {
             let doc_id = self.docs[self.active].id;
             let id = editor_id(doc_id);
             let analysis = self.word.analysis(doc_id, &self.docs[self.active].text);
+            // Granska: trådar, kommentarsfältets bredd och ögonblicksbild för spårade ändringar.
+            let sel_rv = self.word_selection(&ctx);
+            let rv = self.review_prep(&ctx, doc_id, &sel_rv);
 
             // Sidans mått kommer från dokumentets grundformat; zoomen anpassas så att sidan ryms.
             let avail_w = ui.available_width();
             let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
             let geom1 = pages::Geom::new(1.0, &analysis.defaults);
-            if avail_w < geom1.page_w * z + 2.0 * GAP {
-                z = ((avail_w - 2.0 * GAP) / geom1.page_w).max(0.4);
+            if avail_w < geom1.page_w * z + 2.0 * GAP + rv.side {
+                z = ((avail_w - 2.0 * GAP - rv.side) / geom1.page_w).max(0.4);
             }
             let geom = pages::Geom::new(z, &analysis.defaults);
             let page_w = geom.page_w;
             let text_w = geom.text_w();
-            let area_w = avail_w.max(page_w + 2.0 * GAP);
+            let area_w = avail_w.max(page_w + 2.0 * GAP + rv.side);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
             let refs = self.word.images(doc_id, &self.docs[self.active].text);
@@ -892,6 +914,7 @@ impl KladdApp {
                                     || pc.code
                                     || pc.link
                                     || pc.image.is_some()
+                                    || pc.rev.is_some_and(|r| r.kind == crate::review::RevKind::Del)
                                     || matches!(pc.block, Block::Code | Block::Table)
                                 {
                                     continue;
@@ -999,11 +1022,15 @@ impl KladdApp {
             let mut open_hf_dlg: Option<(bool, usize)> = None;
             let mut fn_jump: Option<usize> = None;
             let mut fn_pending = self.wv.fn_pending.take();
+            let mut rstate = std::mem::take(&mut self.wv.review);
+            let mut rv_before = rv.before.clone();
+            let mut pane_act: Option<super::reviewui::PaneAct> = None;
+            let mut pending_track: Option<crate::review::Tracked> = None;
 
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id, crate::panes::salt())).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let origin = ui.cursor().min;
-                let page_left = origin.x + (area_w - page_w) / 2.0;
+                let page_left = origin.x + (area_w - page_w - rv.side) / 2.0;
                 let page_top = origin.y + GAP;
                 let shadow_slot = ui.painter().add(Shape::Noop);
                 let page_slot = ui.painter().add(Shape::Noop);
@@ -1044,6 +1071,10 @@ impl KladdApp {
                 if out.response.changed() {
                     doc.on_edited();
                     edited = true;
+                    // Spåra ändringar: skrivet blir infogat och raderat blir struket.
+                    if let Some((old, osel)) = rv_before.take() {
+                        pending_track = crate::review::track_edit(&old, &doc.text, osel, &rv.author, &rv.date);
+                    }
                 }
                 if focus {
                     ui.memory_mut(|m| m.request_focus(id));
@@ -1150,6 +1181,12 @@ impl KladdApp {
                     fn_jump = fn_pending.take();
                 } else if !down {
                     fn_pending = None;
+                }
+
+                // Kommentarsfältet till höger om sidan.
+                if rv.side > 0.0 && !edited {
+                    let pane_x = page_left + page_w + super::reviewui::PANE_GAP;
+                    pane_act = super::reviewui::paint_pane(ui, p, &rv, &mut rstate, &galley, gpos, text, pane_x);
                 }
 
                 // Ett ark per sida, med luft emellan.
@@ -1570,6 +1607,14 @@ impl KladdApp {
 
             self.wv.pages = page_pos;
             self.wv.fn_pending = fn_pending;
+            self.wv.review = rstate;
+            if let Some(t) = pending_track {
+                self.review_apply_tracked(&ctx, t);
+            }
+            if let Some(a) = pane_act {
+                self.review_pane_act(&ctx, a);
+            }
+            self.review_name_window(&ctx);
             if let Some(b) = toc_click {
                 self.goto_byte(&ctx, b);
             }

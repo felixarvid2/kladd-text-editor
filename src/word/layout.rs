@@ -376,6 +376,8 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         }
         .hash(&mut h);
         pc.object.hash(&mut h);
+        pc.rev.map(|r| (r.kind, r.color)).hash(&mut h);
+        (pc.comment.is_some() && crate::review::comments_visible()).hash(&mut h);
         pc.footnote_ref.is_some().hash(&mut h);
         pc.footnote_def.is_some().hash(&mut h);
         pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
@@ -734,6 +736,21 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     }
     if pc.strike {
         f.strikethrough = stroke;
+    }
+    // Spårade ändringar: infogat understryks och raderat stryks, i författarens färg.
+    if let Some(r) = pc.rev {
+        let rc = crate::review::AUTHOR_COLORS[usize::from(r.color) % crate::review::AUTHOR_COLORS.len()];
+        let c = adapt_text_color(rc, pal.page, pal.dark);
+        f.color = c;
+        let st = Stroke::new(zoom.max(1.0), c);
+        match r.kind {
+            crate::review::RevKind::Ins => f.underline = st,
+            crate::review::RevKind::Del => f.strikethrough = st,
+        }
+    }
+    // Kommentarens område markeras som med en överstrykningspenna.
+    if pc.comment.is_some() && crate::review::comments_visible() {
+        f.background = if pal.dark { Color32::from_rgb(84, 74, 24) } else { Color32::from_rgb(255, 240, 168) };
     }
     f
 }

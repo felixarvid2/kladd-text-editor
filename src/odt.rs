@@ -13,6 +13,9 @@
 //! - Fotnoter och slutnoter (`text:note`) blir `[^N]` och en definition `[^N]: text` sist i dokumentet
 //!   (slutnoter blir fotnoter). Kommentarer (`office:annotation`) tas bort ur texten och rapporteras
 //!   som borttagna ("kommentarer"), på samma sätt som för .docx.
+//! - Spårade ändringar (`text:tracked-changes`, `text:change-start`) godkänns: infogad text blir vanlig text
+//!   och raderad text (som ligger i `text:changed-region`) kommer inte med. Kommentarer och ändringar
+//!   skrivs inte till .odt (se `review::clean_for_export`).
 //! - Diagram, former och inbäddade objekt (`draw:*` utom bilder) rapporteras som borttagna.
 //! - Länkade bilder (utanför paketet) och bildformat som Kladd inte kan visa (svg, wmf …) likaså.
 //! - Fält i sidhuvud/sidfot blir `{sida}`, `{sidor}`, `{datum}`, `{titel}` och `{fil}`, flikar delar i
@@ -2740,6 +2743,9 @@ fn manifest_xml(media: &[(String, Vec<u8>, &'static str)]) -> String {
 /// Bygger ett komplett .odt-paket av Markdown-text.
 /// `resolve` hämtar bilddata för en bildkälla (`bild:namn`, en sökväg …).
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+    // Spårade ändringar och kommentarer kan inte skrivas i .odt: ändringarna godkänns, kommentarerna utelämnas.
+    let cleaned = crate::review::clean_for_export(markdown);
+    let markdown = cleaned.as_str();
     let first = markdown.lines().next().unwrap_or("");
     let (defaults, markdown) = match DocDefaults::from_comment(first) {
         Some(d) => (d, markdown[first.len()..].trim_start_matches(['\n', '\r'])),
@@ -3126,6 +3132,15 @@ Slut.
 <text:p text:style-name="Text_20_body"><draw:frame draw:name="Bild1" text:anchor-type="as-char" svg:width="0.0265cm" svg:height="0.0265cm"><draw:image xlink:href="Pictures/a.png" xlink:type="simple"/><svg:desc>Alternativtext</svg:desc></draw:frame></text:p>
 <text:p text:style-name="Text_20_body">Sista</text:p>
 </office:text></office:body></office:document-content>"##;
+
+    #[test]
+    fn tracked_changes_are_accepted_and_deleted_text_stays_out() {
+        let c = r##"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.3"><office:body><office:text><text:tracked-changes text:track-changes="true"><text:changed-region text:id="ct1"><text:insertion><office:change-info><dc:creator>Ada</dc:creator><dc:date>2026-05-01T10:00:00</dc:date></office:change-info></text:insertion></text:changed-region><text:changed-region text:id="ct2"><text:deletion><office:change-info><dc:creator>Bo</dc:creator><dc:date>2026-05-02T10:00:00</dc:date></office:change-info><text:p text:style-name="Standard">Borttagen</text:p></text:deletion></text:changed-region></text:tracked-changes><text:p text:style-name="Standard">Hej <text:change-start text:change-id="ct1"/>nya<text:change-end text:change-id="ct1"/> värld<text:change text:change-id="ct2"/>.</text:p></office:text></office:body></office:document-content>"##;
+        let l = read(&make_odt(c, LO_STYLES, &[])).unwrap();
+        assert!(l.markdown.contains("Hej nya värld."), "{}", l.markdown);
+        assert!(!l.markdown.contains("Borttagen"), "{}", l.markdown);
+    }
 
     #[test]
     fn reads_libreoffice_style_document() {

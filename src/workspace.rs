@@ -442,12 +442,13 @@ fn paint_icon(painter: &Painter, r: Rect, kind: Kind, open: bool, p: &Palette) {
 
 impl KladdApp {
     /// Hela panelens och dialogernas ritning och hantering av tangentbordet hör hit.
-    /// Kortkommandon: Ctrl+Skift+E (panelen), Ctrl+E (snabböppna).
+    /// Kortkommandon: Ctrl+Skift+E (panelen), Ctrl+E (snabböppna). I dokumentläget är båda
+    /// upptagna (spåra ändringar respektive centrera, som i Word); där nås de via menyn.
     /// Anropas före Ctrl+F i `handle_shortcuts` eftersom Skift-varianterna måste tas först.
     pub(crate) fn workspace_shortcuts(&mut self, ctx: &egui::Context) {
         let ctrl = Modifiers::COMMAND;
         let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(m, k)));
-        if hit(ctrl | Modifiers::SHIFT, Key::E) {
+        if !self.word_mode() && hit(ctrl | Modifiers::SHIFT, Key::E) {
             self.toggle_workspace_panel(ctx);
         } else if !self.word_mode() && hit(ctrl, Key::E) {
             // I dokumentläget är Ctrl+E "centrera"; där finns snabböppna bara i menyn.
