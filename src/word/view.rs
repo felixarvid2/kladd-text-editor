@@ -20,11 +20,15 @@ use super::grid;
 use super::images;
 use super::layout::{self, px};
 use super::pages;
+use super::secpages;
+use super::sections;
 use super::markup::{self, Block, Inline, SpanProp};
 use super::nav;
 use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
+use crate::i18n::t;
 use crate::icons::{self, GlyphStyle, Icon};
+use crate::tf;
 use crate::theme::Palette;
 
 /// Storlekarna (pt) i storleksväljaren, som i Word.
@@ -84,6 +88,16 @@ struct SpellTarget {
     suggestions: Vec<String>,
 }
 
+/// Blå (grammatik) och bärnstensgul (stil) våglinje, för att skilja dem från röd stavning.
+const GRAMMAR_COLOR: Color32 = Color32::from_rgb(70, 130, 230);
+const STYLE_COLOR: Color32 = Color32::from_rgb(225, 150, 20);
+
+enum GramAct {
+    Replace(Range<usize>, String),
+    Ignore(crate::grammar::Match),
+    IgnoreRule(String),
+}
+
 enum SpellAct {
     Replace(Range<usize>, String),
     Ignore(String),
@@ -97,15 +111,32 @@ pub struct State {
     /// Vald bild, pågående storleksändring.
     img: images::State,
     target: Option<SpellTarget>,
+    /// Grammatikträffen som högerklickats.
+    gtarget: Option<crate::grammar::Match>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
     /// Öppen dialog "Sidinställningar".
     pub(crate) page_dlg: Option<pages::PageDialog>,
+    /// Öppen dialog "Sidhuvud och sidfot".
+    pub(crate) hf_dlg: Option<super::headers::HfDialog>,
+    /// Öppen dialog "Ändra formatmall".
+    pub(crate) styles_dlg: Option<super::stylesdlg::StylesDialog>,
+    /// Öppen dialog "Spalter" (avsnitt).
+    pub(crate) cols_dlg: Option<super::sectionui::ColumnsDialog>,
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
     /// Fotnotshopp som väntar på att musknappen släpps (layouten ändras när markören flyttas vid nedtryckning).
     fn_pending: Option<usize>,
+    /// Granska: spårade ändringar och kommentarer.
+    pub(crate) review: super::reviewui::ReviewState,
+}
+
+impl State {
+    /// Aktiv ruta byts i delad vy: en vald bild hör till den förra rutan.
+    pub(crate) fn pane_switched(&mut self) {
+        self.img.deselect();
+    }
 }
 
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
@@ -117,8 +148,13 @@ enum BarAct {
     Table,
     Footnote,
     Toc,
+    SectionBreak,
+    Landscape(bool),
+    ColumnBreak,
+    Columns,
     TableOp(TableOp),
     PageSetup,
+    EditStyles,
     Undo,
     Redo,
     Zoom(f32),
@@ -128,23 +164,24 @@ enum BarAct {
     Align(markup::Align),
     TextColor(Option<[u8; 3]>),
     Highlight(Option<[u8; 3]>),
+    Review(super::reviewui::ReviewAct),
 }
 
 fn block_label(b: Block) -> String {
     match b {
-        Block::Normal => "Brödtext".into(),
-        Block::Heading(n) => format!("Rubrik {n}"),
-        Block::Quote => "Citat".into(),
-        Block::Bullet => "Punktlista".into(),
-        Block::Numbered => "Numrerad lista".into(),
-        Block::Code => "Kod".into(),
-        Block::Table => "Tabell".into(),
-        Block::Footnote => "Fotnot".into(),
+        Block::Normal => t("Brödtext").into(),
+        Block::Heading(n) => tf!("Rubrik {n}", n = n),
+        Block::Quote => t("Citat").into(),
+        Block::Bullet => t("Punktlista").into(),
+        Block::Numbered => t("Numrerad lista").into(),
+        Block::Code => t("Kod").into(),
+        Block::Table => t("Tabell").into(),
+        Block::Footnote => t("Fotnot").into(),
     }
 }
 
 fn fmt_size(pt: f32) -> String {
-    if pt.fract() == 0.0 { format!("{pt}") } else { format!("{pt}").replace('.', ",") }
+    if pt.fract() == 0.0 { format!("{pt}") } else { crate::i18n::num(f64::from(pt), 1) }
 }
 
 /// Nästa storlek i listan (`dir` = 1 större, -1 mindre) som i Words Ctrl+Shift+>/<.
@@ -400,6 +437,7 @@ impl KladdApp {
         self.word_table_keys(ctx);
         self.word_footnote_keys(ctx);
         self.word_paste_html(ctx);
+        self.review_keys(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
         let shift = ctx.input(|i| i.modifiers.shift);
@@ -461,11 +499,16 @@ impl KladdApp {
             self.speller = Some(crate::spell::Speller::new(self.settings.spell_lang.as_deref()));
         }
         let sel = self.word_selection(&ctx);
+        let sel_start = sel.start;
         let doc = &self.docs[self.active];
         let in_table = markup::table_at(&doc.text, sel.start).is_some();
         let analysis = self.word.analysis(doc.id, &doc.text);
         let act = markup::active(&doc.text, &analysis, sel);
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
+        let tracking = self.review_tracking();
+        let review_changes = self.review_changes();
+        let comments_shown = self.settings.word_comments;
+        let cur_landscape = analysis.sections[sections::index_at(&analysis.sections, sel_start)].landscape();
 
         let mut acts: Vec<BarAct> = Vec::new();
         // Typsnitt i dokumentet (grundtypsnittet först), och de som är installerade.
@@ -499,7 +542,7 @@ impl KladdApp {
                 ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
                     ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
                     // Stil
-                    egui::ComboBox::from_id_salt("kladd-word-style")
+                    let style_combo = egui::ComboBox::from_id_salt("kladd-word-style")
                         .width(98.0)
                         .selected_text(block_label(act.block))
                         .show_ui(ui, |ui| {
@@ -515,6 +558,12 @@ impl KladdApp {
                                 }
                             }
                         });
+                    if style_combo.response.secondary_clicked() {
+                        acts.push(BarAct::EditStyles);
+                    }
+                    if status_button(ui, p, t("Ändra formatmall…"), t("Ändra utseendet på Brödtext, rubriker och citat (högerklicka på stilvalet)")).clicked() {
+                        acts.push(BarAct::EditStyles);
+                    }
                     // Typsnitt och storlek
                     egui::ComboBox::from_id_salt("kladd-word-font")
                         .width(112.0)
@@ -553,10 +602,10 @@ impl KladdApp {
                         });
                     // Tecken
                     for (glyph, style, on, tip, m) in [
-                        ("F", GlyphStyle::Bold, act.bold, "Fetstil (Ctrl+B)", Inline::Bold),
-                        ("K", GlyphStyle::Italic, act.italic, "Kursiv (Ctrl+I)", Inline::Italic),
-                        ("U", GlyphStyle::Underline, act.underline, "Understruken (Ctrl+U)", Inline::Underline),
-                        ("S", GlyphStyle::Strike, act.strike, "Genomstruken", Inline::Strike),
+                        (t("F"), GlyphStyle::Bold, act.bold, t("Fetstil (Ctrl+B)"), Inline::Bold),
+                        (t("K"), GlyphStyle::Italic, act.italic, t("Kursiv (Ctrl+I)"), Inline::Italic),
+                        ("U", GlyphStyle::Underline, act.underline, t("Understruken (Ctrl+U)"), Inline::Underline),
+                        ("S", GlyphStyle::Strike, act.strike, t("Genomstruken"), Inline::Strike),
                     ] {
                         if icons::glyph_toggle(ui, p, glyph, style, on, tip).clicked() {
                             acts.push(BarAct::Inline(m));
@@ -569,8 +618,8 @@ impl KladdApp {
                         p,
                         Icon::TextColor,
                         rgb_color(text_color),
-                        "Textfärg",
-                        "Välj textfärg",
+                        t("Textfärg"),
+                        t("Välj textfärg"),
                     );
                     if main.clicked() {
                         acts.push(BarAct::Span(SpanProp::Color(Some(text_color))));
@@ -587,7 +636,7 @@ impl KladdApp {
                                     .collect()
                             })
                             .collect();
-                        if let Some(c) = color_popup(ui, p, "Automatisk", &rows, act.span.color) {
+                        if let Some(c) = color_popup(ui, p, t("Automatisk"), &rows, act.span.color) {
                             acts.push(BarAct::Span(SpanProp::Color(c)));
                             acts.push(BarAct::TextColor(c));
                         }
@@ -597,8 +646,8 @@ impl KladdApp {
                         p,
                         Icon::Highlight,
                         rgb_color(highlight),
-                        "Markera text",
-                        "Välj markeringsfärg",
+                        t("Markera text"),
+                        t("Välj markeringsfärg"),
                     );
                     if main.clicked() {
                         acts.push(BarAct::Span(SpanProp::Background(Some(highlight))));
@@ -608,11 +657,11 @@ impl KladdApp {
                             .iter()
                             .filter_map(|(id, name)| {
                                 let rgb = crate::style::highlight_rgb(id)?;
-                                Some((format!("{name} ({})", crate::style::hex(rgb)), rgb))
+                                Some((format!("{} ({})", t(*name), crate::style::hex(rgb)), rgb))
                             })
                             .collect();
                         let rows = vec![all[..8].to_vec(), all[8..].to_vec()];
-                        if let Some(c) = color_popup(ui, p, "Ingen färg", &rows, act.span.background) {
+                        if let Some(c) = color_popup(ui, p, t("Ingen färg"), &rows, act.span.background) {
                             acts.push(BarAct::Span(SpanProp::Background(c)));
                             acts.push(BarAct::Highlight(c));
                         }
@@ -620,10 +669,10 @@ impl KladdApp {
                     divider(ui, p);
                     // Justering
                     for (icon, al, tip) in [
-                        (Icon::AlignLeft, markup::Align::Left, "Vänsterjustera (Ctrl+L)"),
-                        (Icon::AlignCenter, markup::Align::Center, "Centrera (Ctrl+E)"),
-                        (Icon::AlignRight, markup::Align::Right, "Högerjustera (Ctrl+R)"),
-                        (Icon::AlignJustify, markup::Align::Justify, "Marginaljustera (Ctrl+J)"),
+                        (Icon::AlignLeft, markup::Align::Left, t("Vänsterjustera (Ctrl+L)")),
+                        (Icon::AlignCenter, markup::Align::Center, t("Centrera (Ctrl+E)")),
+                        (Icon::AlignRight, markup::Align::Right, t("Högerjustera (Ctrl+R)")),
+                        (Icon::AlignJustify, markup::Align::Justify, t("Marginaljustera (Ctrl+J)")),
                     ] {
                         if icons::toggle_button(ui, p, icon, act.align == al, tip).clicked() {
                             acts.push(BarAct::Align(al));
@@ -632,9 +681,9 @@ impl KladdApp {
                     divider(ui, p);
                     // Listor och citat
                     for (icon, b, tip) in [
-                        (Icon::BulletList, Block::Bullet, "Punktlista"),
-                        (Icon::NumberedList, Block::Numbered, "Numrerad lista"),
-                        (Icon::Quote, Block::Quote, "Citat"),
+                        (Icon::BulletList, Block::Bullet, t("Punktlista")),
+                        (Icon::NumberedList, Block::Numbered, t("Numrerad lista")),
+                        (Icon::Quote, Block::Quote, t("Citat")),
                     ] {
                         let on = act.block == b;
                         if icons::toggle_button(ui, p, icon, on, tip).clicked() {
@@ -643,20 +692,46 @@ impl KladdApp {
                     }
                     divider(ui, p);
                     // Infoga: bild, tabell, fotnot och innehållsförteckning i en meny, som i Word.
-                    let insert = crate::app::status_button(ui, p, "Infoga \u{25BE}", "Infoga bild, tabell, fotnot eller innehållsförteckning");
-                    Popup::menu(&insert).gap(4.0).width(230.0).show(|ui| {
+                    let insert = crate::app::status_button(ui, p, &format!("{} \u{25BE}", t("Infoga")), t("Infoga bild, tabell, fotnot, innehållsförteckning, avsnittsbrytning eller spalter"));
+                    Popup::menu(&insert).gap(4.0).width(250.0).show(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        if crate::app::menu_item(ui, p, "Bild…", "Ctrl+Shift+I", None, true) {
+                        if crate::app::menu_item(ui, p, t("Bild…"), "Ctrl+Shift+I", None, true) {
                             acts.push(BarAct::Image);
                         }
-                        if crate::app::menu_item(ui, p, "Tabell", "", None, true) {
+                        if crate::app::menu_item(ui, p, t("Tabell"), "", None, true) {
                             acts.push(BarAct::Table);
                         }
-                        if crate::app::menu_item(ui, p, "Fotnot", "Ctrl+Alt+F", None, true) {
+                        if crate::app::menu_item(ui, p, t("Fotnot"), "Ctrl+Alt+F", None, true) {
                             acts.push(BarAct::Footnote);
                         }
-                        if crate::app::menu_item(ui, p, "Innehållsförteckning", "", None, true) {
+                        if crate::app::menu_item(ui, p, t("Innehållsförteckning"), "", None, true) {
                             acts.push(BarAct::Toc);
+                        }
+                        menu_divider(ui, p);
+                        if crate::app::menu_item(ui, p, t("Avsnittsbrytning (ny sida)"), "", None, true) {
+                            acts.push(BarAct::SectionBreak);
+                        }
+                        let (label, to_landscape) =
+                            if cur_landscape { (t("Stående sidor härifrån"), false) } else { (t("Liggande sidor härifrån"), true) };
+                        if crate::app::menu_item(ui, p, label, "", None, true) {
+                            acts.push(BarAct::Landscape(to_landscape));
+                        }
+                        if crate::app::menu_item(ui, p, &format!("{}\u{2026}", t("Spalter")), "", None, true) {
+                            acts.push(BarAct::Columns);
+                        }
+                        if crate::app::menu_item(ui, p, t("Spaltbrytning"), "", None, true) {
+                            acts.push(BarAct::ColumnBreak);
+                        }
+                    });
+                    // Granska: spåra ändringar och kommentarer.
+                    let track_label = if tracking { t("Spårar: på") } else { t("Spåra: av") };
+                    if crate::app::status_button(ui, p, track_label, t("Spåra ändringar (Ctrl+Shift+E)")).clicked() {
+                        acts.push(BarAct::Review(super::reviewui::ReviewAct::ToggleTrack));
+                    }
+                    let review = crate::app::status_button(ui, p, &format!("{} \u{25BE}", t("Granska")), t("Spårade ändringar och kommentarer"));
+                    Popup::menu(&review).gap(4.0).width(250.0).show(|ui| {
+                        if let Some(a) = super::reviewui::menu(ui, p, tracking, comments_shown, review_changes) {
+                            acts.push(BarAct::Review(a));
                         }
                     });
                     if in_table {
@@ -666,30 +741,30 @@ impl KladdApp {
                         }
                     }
                     divider(ui, p);
-                    if icons::button(ui, p, Icon::Undo, 28.0, false, "Ångra (Ctrl+Z)", p.chrome).clicked() {
+                    if icons::button(ui, p, Icon::Undo, 28.0, false, t("Ångra (Ctrl+Z)"), p.chrome).clicked() {
                         acts.push(BarAct::Undo);
                     }
-                    if icons::button(ui, p, Icon::Redo, 28.0, false, "Gör om (Ctrl+Y)", p.chrome).clicked() {
+                    if icons::button(ui, p, Icon::Redo, 28.0, false, t("Gör om (Ctrl+Y)"), p.chrome).clicked() {
                         acts.push(BarAct::Redo);
                     }
                 });
 
                 ui.scope_builder(UiBuilder::new().max_rect(right).layout(Layout::right_to_left(Align::Center)), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if status_button(ui, p, "Markdown", "Visa dokumentet som Markdown-text").clicked() {
+                    if status_button(ui, p, "Markdown", t("Visa dokumentet som Markdown-text")).clicked() {
                         acts.push(BarAct::ToMarkdown);
                     }
-                    if icons::button(ui, p, Icon::Page, 28.0, false, "Sidinställningar", p.chrome).clicked() {
+                    if icons::button(ui, p, Icon::Page, 28.0, false, t("Sidinställningar"), p.chrome).clicked() {
                         acts.push(BarAct::PageSetup);
                     }
                     divider(ui, p);
-                    if icons::button(ui, p, Icon::Plus, 28.0, false, "Zooma in (Ctrl+plus)", p.chrome).clicked() {
+                    if icons::button(ui, p, Icon::Plus, 28.0, false, t("Zooma in (Ctrl+plus)"), p.chrome).clicked() {
                         acts.push(BarAct::Zoom(1.0));
                     }
-                    if status_button(ui, p, &format!("{zoom_pct} %"), "Klicka för 100 %").clicked() {
+                    if status_button(ui, p, &format!("{zoom_pct} %"), t("Klicka för 100 %")).clicked() {
                         acts.push(BarAct::ZoomReset);
                     }
-                    if icons::button(ui, p, Icon::Minus, 28.0, false, "Zooma ut (Ctrl+minus)", p.chrome).clicked() {
+                    if icons::button(ui, p, Icon::Minus, 28.0, false, t("Zooma ut (Ctrl+minus)"), p.chrome).clicked() {
                         acts.push(BarAct::Zoom(-1.0));
                     }
                 });
@@ -703,10 +778,18 @@ impl KladdApp {
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
                 BarAct::Toc => self.insert_toc(&ctx),
+                BarAct::SectionBreak => self.section_break(&ctx),
+                BarAct::Landscape(l) => self.section_landscape(&ctx, l),
+                BarAct::ColumnBreak => self.column_break(&ctx),
+                BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
                 BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
+                BarAct::EditStyles => {
+                    let sel = crate::style::StyleId::for_block(act.block);
+                    self.open_styles_dialog(sel)
+                }
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
                 BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
@@ -717,6 +800,7 @@ impl KladdApp {
                 }
                 BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
                 BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
+                BarAct::Review(a) => self.review_act(&ctx, a),
                 BarAct::Zoom(d) => self.word_zoom_step(d),
                 BarAct::ZoomReset => self.settings.word_zoom = 1.0,
                 BarAct::ToMarkdown => {
@@ -727,6 +811,7 @@ impl KladdApp {
                 }
             }
         }
+        self.columns_dialog(&ctx, p);
     }
 
     /// Läser in en bild (en gång per dokument och källa) och registrerar bytes för ritning.
@@ -806,28 +891,38 @@ impl KladdApp {
             let doc_id = self.docs[self.active].id;
             let id = editor_id(doc_id);
             let analysis = self.word.analysis(doc_id, &self.docs[self.active].text);
+            // Granska: trådar, kommentarsfältets bredd och ögonblicksbild för spårade ändringar.
+            let sel_rv = self.word_selection(&ctx);
+            let rv = self.review_prep(&ctx, doc_id, &sel_rv);
 
             // Sidans mått kommer från dokumentets grundformat; zoomen anpassas så att sidan ryms.
             let avail_w = ui.available_width();
             let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-            let geom1 = pages::Geom::new(1.0, &analysis.defaults);
-            if avail_w < geom1.page_w * z + 2.0 * GAP {
-                z = ((avail_w - 2.0 * GAP) / geom1.page_w).max(0.4);
+            let geom1 = pages::Geom::for_sections(1.0, &analysis.defaults, &analysis.sections);
+            if avail_w < geom1.max_page_w() * z + 2.0 * GAP + rv.side {
+                z = ((avail_w - 2.0 * GAP - rv.side) / geom1.max_page_w()).max(0.4);
             }
-            let geom = pages::Geom::new(z, &analysis.defaults);
-            let page_w = geom.page_w;
-            let text_w = geom.text_w();
-            let area_w = avail_w.max(page_w + 2.0 * GAP);
+            let geom = pages::Geom::for_sections(z, &analysis.defaults, &analysis.sections);
+            let page_w = geom.max_page_w();
+            // Textytans bredd för TextEdit (med avsnitt: från den vänstraste till den högraste textkanten).
+            let text_w = geom.edit_w();
+            let area_w = avail_w.max(page_w + 2.0 * GAP + rv.side);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
             let refs = self.word.images(doc_id, &self.docs[self.active].text);
             let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
-            for img in refs.iter().cloned() {
+            // Bilderna i dokumentordning och var de står (för spaltbredden i avsnitt).
+            let img_starts: Vec<usize> =
+                analysis.pieces.iter().filter(|pc| pc.image.is_some()).map(|pc| pc.range.start).collect();
+            for (k, img) in refs.iter().cloned().enumerate() {
                 self.word_image(&ctx, &img.src);
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
-                    let max_w = geom1.text_w();
-                    sizes.insert(images::size_key(&img), images::display_size(info.size, &img, max_w, z));
+                    // Bilder är aldrig bredare än spalten de står i.
+                    let sec = img_starts.get(k).map_or(0, |b| sections::index_at(&analysis.sections, *b));
+                    let max_w = geom1.wrap_for(sec);
+                    let size = images::display_size(info.size, &img, max_w, z);
+                    sizes.entry(images::size_key(&img)).and_modify(|s| if size.x < s.x { *s = size }).or_insert(size);
                 }
             }
             let image_size = |src: &str| sizes.get(src).copied();
@@ -858,6 +953,7 @@ impl KladdApp {
                                     || pc.code
                                     || pc.link
                                     || pc.image.is_some()
+                                    || pc.rev.is_some_and(|r| r.kind == crate::review::RevKind::Del)
                                     || matches!(pc.block, Block::Code | Block::Table)
                                 {
                                     continue;
@@ -882,6 +978,41 @@ impl KladdApp {
                 }
             }
 
+            // Grammatik och stil: bara i bakgrunden och bara för ändrade stycken (se grammar.rs).
+            self.grammar_dialog(&ctx);
+            let mut gmatches: Arc<Vec<crate::grammar::Match>> = Arc::default();
+            if let Some(cfg) = self.grammar_config() {
+                if !self.grammar.has_wake() {
+                    let c = ctx.clone();
+                    self.grammar.set_wake(Arc::new(move || c.request_repaint()));
+                }
+                gmatches = self.grammar.update(
+                    &cfg,
+                    doc_id,
+                    rev,
+                    &self.docs[self.active].text,
+                    || {
+                        analysis
+                            .pieces
+                            .iter()
+                            .map(|pc| {
+                                let skip = pc.markup
+                                    || pc.code
+                                    || pc.link
+                                    || pc.list_marker
+                                    || pc.object.is_some()
+                                    || pc.footnote_ref.is_some()
+                                    || pc.footnote_def.is_some()
+                                    || pc.image.is_some()
+                                    || matches!(pc.block, Block::Code | Block::Table);
+                                (pc.range.clone(), !skip)
+                            })
+                            .collect()
+                    },
+                    &mut |d| ctx.request_repaint_after(d),
+                );
+            }
+
             // Markupen visas bara på markörens rader när editorn har fokus.
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
@@ -898,6 +1029,9 @@ impl KladdApp {
             let mut painted: Vec<images::Painted> = Vec::new();
             let mut img_index = 0usize;
             let secondary_target = self.wv.target.clone();
+            let secondary_gtarget = self.wv.gtarget.clone();
+            let mut new_gtarget: Option<Option<crate::grammar::Match>> = None;
+            let mut gram_act: Option<GramAct> = None;
 
             // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
             // bara slår upp dem (en okänd familj kraschar egui).
@@ -924,20 +1058,25 @@ impl KladdApp {
             let mut table_act: Option<TableOp> = None;
             let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
-            let mut open_page_dlg = false;
+            let mut open_hf_dlg: Option<(bool, usize)> = None;
             let mut fn_jump: Option<usize> = None;
             let mut fn_pending = self.wv.fn_pending.take();
+            let mut rstate = std::mem::take(&mut self.wv.review);
+            let mut rv_before = rv.before.clone();
+            let mut pane_act: Option<super::reviewui::PaneAct> = None;
+            let mut pending_track: Option<crate::review::Tracked> = None;
 
-            ScrollArea::both().id_salt(("kladd-wscroll", doc_id)).auto_shrink(false).show(ui, |ui| {
+            ScrollArea::both().id_salt(("kladd-wscroll", doc_id, crate::panes::salt())).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let origin = ui.cursor().min;
-                let page_left = origin.x + (area_w - page_w) / 2.0;
+                // Skrivbordsytans vänsterkant för arken (de centreras om de är olika breda).
+                let page_left = origin.x + (area_w - page_w - rv.side) / 2.0;
                 let page_top = origin.y + GAP;
                 let shadow_slot = ui.painter().add(Shape::Noop);
                 let page_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
-                    pos2(page_left + geom.left, page_top + geom.top),
+                    pos2(page_left + geom.origin_x(), page_top + geom.top),
                     vec2(text_w, f32::INFINITY),
                 );
                 let params = layout::Params {
@@ -972,6 +1111,10 @@ impl KladdApp {
                 if out.response.changed() {
                     doc.on_edited();
                     edited = true;
+                    // Spåra ändringar: skrivet blir infogat och raderat blir struket.
+                    if let Some((old, osel)) = rv_before.take() {
+                        pending_track = crate::review::track_edit(&old, &doc.text, osel, &rv.author, &rv.date);
+                    }
                 }
                 if focus {
                     ui.memory_mut(|m| m.request_focus(id));
@@ -981,6 +1124,17 @@ impl KladdApp {
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
+                // Arken (med avsnitt olika stora, med spalter) från omläggningen som TextEdit just gjorde.
+                let origin_y = page_top + geom.top;
+                let mut boxes = word.page_boxes(doc_id, text);
+                if boxes.is_empty() {
+                    boxes = Arc::new(geom.uniform_boxes(pages::page_count(&galley, &geom)));
+                }
+                let total = boxes.len();
+                // Spalten (vänsterkant relativt galleriet, bredd) vid en punkt i galleriet.
+                let col_at = |x: f32, y: f32| -> (f32, f32) {
+                    if geom.multi() { secpages::column_at(&boxes, geom.origin_x(), x, y) } else { (0.0, text_w) }
+                };
                 // Tabeller: kolumnkanter att dra i, pekarens träffyta och markören i cellens innehåll.
                 let tview = if edited { None } else { word.table_view(doc_id, text) };
                 let mut vtabs: Vec<VisTable> = Vec::new();
@@ -1041,6 +1195,9 @@ impl KladdApp {
                     }
                     tables::pointer_fix(ui.ctx(), id, text, &galley, gpos, geoms, &out.response, on_edge);
                 }
+                if geom.multi() && !on_edge {
+                    secpages::pointer_fix(ui.ctx(), id, text, &galley, gpos, &boxes, geom.origin_x(), &out.response);
+                }
                 // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
                 tables::fix_caret(ui.ctx(), id, text);
 
@@ -1049,7 +1206,8 @@ impl KladdApp {
                     if let Some(start) = markup::footnote_area_start(text, &analysis) {
                         let r = galley.pos_from_cursor(CCursor::new(byte_to_char(text, start))).translate(gpos.to_vec2());
                         let y = (r.top() - px(z, 5.0)).round() + 0.5;
-                        painter_line(ui, p, gpos.x, y, text_w / 3.0, z);
+                        let (cl, cw) = col_at(r.left() - gpos.x, r.top() - gpos.y);
+                        painter_line(ui, p, gpos.x + cl, y, cw / 3.0, z);
                     }
                     let hover = ui.input(|i| i.pointer.hover_pos()).filter(|q| te_rect.contains(*q));
                     if let Some(q) = hover {
@@ -1060,7 +1218,7 @@ impl KladdApp {
                             let hit = Rect::from_min_max(ra.min, rb.max).expand2(vec2(3.0, 0.0));
                             if hit.contains(q) {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                let tip = if is_def { "Tillbaka till texten" } else { "Gå till fotnot (Ctrl+klick)" };
+                                let tip = if is_def { t("Tillbaka till texten") } else { t("Gå till fotnot (Ctrl+klick)") };
                                 egui::Tooltip::always_open(ui.ctx().clone(), out.response.layer_id, out.response.id.with("fotnot"), egui::PopupAnchor::Pointer)
                                     .show(|ui| ui.label(tip));
                                 let (ctrl, pressed) = ui.input(|i| (i.modifiers.command, i.pointer.primary_pressed()));
@@ -1080,30 +1238,37 @@ impl KladdApp {
                     fn_pending = None;
                 }
 
+                // Kommentarsfältet till höger om sidan.
+                if rv.side > 0.0 && !edited {
+                    let pane_x = page_left + page_w + super::reviewui::PANE_GAP;
+                    pane_act = super::reviewui::paint_pane(ui, p, &rv, &mut rstate, &galley, gpos, text, pane_x);
+                }
+
                 // Ett ark per sida, med luft emellan.
-                let total = pages::page_count(&galley, &geom);
                 let clip = ui.clip_rect();
-                let (shadows, sheets) = pages::sheet_shapes(p, &geom, page_left, page_top, total, clip);
+                let (shadows, sheets) = pages::sheet_shapes(p, &boxes, page_left, origin_y, clip);
                 ui.painter().set(shadow_slot, shadows);
                 ui.painter().set(page_slot, sheets);
-                let last_bottom = pages::sheet_rect(&geom, page_left, page_top, total - 1).bottom();
+                let last_bottom = boxes[total - 1].rect(page_left, origin_y).bottom();
                 ui.allocate_rect(
                     Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),
                     Sense::hover(),
                 );
-                // Sidhuvud och sidfot (skrivskyddade här; dubbelklick öppnar sidinställningarna).
+                // Sidhuvud och sidfot (skrivskyddade här; dubbelklick öppnar redigeringsdialogen).
                 let hf_font = pages::header_font(
                     z,
                     &analysis.defaults,
                     font_family(Some(analysis.defaults.font()), false, false),
                 );
-                for k in 0..total {
-                    let sheet = pages::sheet_rect(&geom, page_left, page_top, k);
+                let hf_fields = crate::style::Fields::new(1, total, &doc.title());
+                for (k, b) in boxes.iter().enumerate() {
+                    let sheet = b.rect(page_left, origin_y);
                     if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
                         continue;
                     }
-                    if pages::header_footer(ui, p, &geom, sheet, k, total, &analysis.defaults, hf_font.clone(), doc_id) {
-                        open_page_dlg = true;
+                    // Varje ark har sin egen storlek: sidhuvudet och sidfoten följer arkets mått.
+                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, total, &analysis.defaults, &hf_fields, hf_font.clone(), doc_id) {
+                        open_hf_dlg = Some((footer, k));
                     }
                 }
                 let painter = ui.painter().clone();
@@ -1112,10 +1277,10 @@ impl KladdApp {
                 let mut conv = ByteToChar::new(text);
 
                 // Punkter för dolda listmarkörer, citatstreck och bilder.
-                let mut bar: Option<(f32, f32)> = None;
-                let flush_bar = |bar: &mut Option<(f32, f32)>| {
-                    if let Some((y0, y1)) = bar.take() {
-                        let x = gpos.x - px(z, 5.0);
+                let mut bar: Option<(f32, f32, f32)> = None;
+                let flush_bar = |bar: &mut Option<(f32, f32, f32)>| {
+                    if let Some((y0, y1, left)) = bar.take() {
+                        let x = gpos.x + left - px(z, 5.0);
                         painter.rect_filled(
                             Rect::from_min_max(pos2(x - 3.0, y0), pos2(x, y1)),
                             0.0,
@@ -1168,11 +1333,12 @@ impl KladdApp {
                         let ra = galley.pos_from_cursor(CCursor::new(a)).translate(gpos.to_vec2());
                         let rb = galley.pos_from_cursor(CCursor::new(b)).translate(gpos.to_vec2());
                         let (y0, y1) = (ra.top(), rb.bottom());
+                        let left = col_at(ra.left() - gpos.x, ra.top() - gpos.y).0;
                         bar = match bar {
-                            Some((c0, c1)) if y0 <= c1 + 1.0 => Some((c0, c1.max(y1))),
+                            Some((c0, c1, l)) if y0 <= c1 + 1.0 && l == left => Some((c0, c1.max(y1), l)),
                             other => {
                                 flush_bar(&mut { other });
-                                Some((y0, y1))
+                                Some((y0, y1, left))
                             }
                         };
                     }
@@ -1188,9 +1354,10 @@ impl KladdApp {
                             {
                                 let uri = image_uri(&img.src, doc_id);
                                 let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
+                                let (cl, cw) = col_at(r.left() - gpos.x, top - gpos.y);
                                 let min = match side {
-                                    Some((markup::Float::Left, _)) => pos2(gpos.x, top),
-                                    Some((markup::Float::Right, _)) => pos2(gpos.x + text_w - sz.x, top),
+                                    Some((markup::Float::Left, _)) => pos2(gpos.x + cl, top),
+                                    Some((markup::Float::Right, _)) => pos2(gpos.x + cl + cw - sz.x, top),
                                     None => r.min,
                                 };
                                 let rect = Rect::from_min_size(min, *sz);
@@ -1227,7 +1394,8 @@ impl KladdApp {
                             .pos_from_cursor(CCursor::new(text[..line.start].chars().count()))
                             .translate(gpos.to_vec2())
                             .min;
-                        let rect = Rect::from_min_size(pos2(gpos.x, top.y), vec2(text_w, toc_h));
+                        let (cl, cw) = col_at(top.x - gpos.x, top.y - gpos.y);
+                        let rect = Rect::from_min_size(pos2(gpos.x + cl, top.y), vec2(cw, toc_h));
                         if rect.bottom() < clip.top() || rect.top() > clip.bottom() {
                             continue;
                         }
@@ -1235,7 +1403,7 @@ impl KladdApp {
                         let page_nums: Vec<usize> = entries
                             .iter()
                             .take(shown)
-                            .map(|h| geom.page_of(galley.pos_from_cursor(CCursor::new(c2.at(h.start))).min.y) + 1)
+                            .map(|h| secpages::page_index(&boxes, galley.pos_from_cursor(CCursor::new(c2.at(h.start))).min.y) + 1)
                             .collect();
                         let fam = |bold: bool| font_family(Some(analysis.defaults.font()), bold, false);
                         if let Some(b) = super::navui::paint_toc(
@@ -1256,11 +1424,11 @@ impl KladdApp {
                 }
 
                 // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
-                let max_w = text_w;
+                let max_w = (0..geom.secs.len().max(1)).map(|i| geom.wrap_for(i)).fold(0.0, f32::max);
                 // Var en dragen bild skulle hamna: raden under pekaren, före eller efter beroende på
                 // om pekaren står över eller under radens mitt. Bara över ett ark.
                 let drop_at = |pos: egui::Pos2| -> Option<images::Drop> {
-                    if !(0..total).any(|k| pages::sheet_rect(&geom, page_left, page_top, k).contains(pos)) {
+                    if !boxes.iter().any(|b| b.rect(page_left, origin_y).contains(pos)) {
                         return None;
                     }
                     let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
@@ -1278,8 +1446,8 @@ impl KladdApp {
                         target: if after { line.end } else { line.start },
                         after,
                         y: if after { bottom } else { top },
-                        x0: gpos.x,
-                        x1: gpos.x + text_w,
+                        x0: gpos.x + col_at(pos.x - gpos.x, pos.y - gpos.y).0,
+                        x1: gpos.x + col_at(pos.x - gpos.x, pos.y - gpos.y).0 + col_at(pos.x - gpos.x, pos.y - gpos.y).1,
                     })
                 };
                 img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
@@ -1315,7 +1483,7 @@ impl KladdApp {
 
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
-                page_pos = ((geom.page_of(caret_y) + 1).min(total), total);
+                page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
 
                 // Röd våglinje under felstavade ord.
                 if !misspelled.is_empty() {
@@ -1354,8 +1522,68 @@ impl KladdApp {
                     }
                 }
 
+                // Blå/bärnstensgul våglinje under grammatik- och stilträffar (inte där ordet är felstavat).
+                if !gmatches.is_empty() {
+                    let mut conv = ByteToChar::new(text);
+                    let amp = 1.2 * z.max(0.8);
+                    let half = 2.0 * z.max(0.8);
+                    let g0 = gmatches.partition_point(|r| r.range.end < vis.start);
+                    for m in gmatches[g0..].iter().take_while(|m| m.range.start <= vis.end) {
+                        if misspelled.iter().any(|r| r.start < m.range.end && m.range.start < r.end) {
+                            continue;
+                        }
+                        let (a, b) = (conv.at(m.range.start), conv.at(m.range.end));
+                        let ra = galley.pos_from_cursor(CCursor::new(a)).translate(gpos.to_vec2());
+                        if ra.bottom() < clip.top() || ra.top() > clip.bottom() {
+                            continue;
+                        }
+                        let rb = galley.pos_from_cursor(CCursor::new(b)).translate(gpos.to_vec2());
+                        if (ra.top() - rb.top()).abs() > 1.0 {
+                            continue; // träffen bryts över två rader
+                        }
+                        let y = ra.bottom() - 1.0 + amp;
+                        let mut pts = Vec::new();
+                        let mut x = ra.left();
+                        let mut up = false;
+                        while x < rb.left() {
+                            pts.push(pos2(x, if up { y - amp } else { y + amp }));
+                            x += half;
+                            up = !up;
+                        }
+                        pts.push(pos2(rb.left(), if up { y - amp } else { y + amp }));
+                        if pts.len() >= 2 {
+                            let col = if m.style { STYLE_COLOR } else { GRAMMAR_COLOR };
+                            painter.add(Shape::line(pts, Stroke::new(1.0, col)));
+                        }
+                    }
+                }
+                // Håll muspekaren över en träff: meddelandet som verktygstips.
+                if !gmatches.is_empty() && !out.response.secondary_clicked() {
+                    if let Some(pos) = out.response.hover_pos() {
+                        let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
+                        let hit = gmatches.iter().find(|m| m.range.start <= b && b < m.range.end);
+                        if let Some(m) = hit.filter(|_| !misspelled.iter().any(|r| r.start <= b && b < r.end)) {
+                            egui::Response::clone(&out.response).on_hover_ui_at_pointer(|ui| {
+                                ui.set_max_width(320.0);
+                                ui.label(&m.message);
+                                if !m.replacements.is_empty() {
+                                    ui.label(egui::RichText::new(m.replacements.join(" · ")).color(p.muted));
+                                }
+                            });
+                        }
+                    }
+                }
+
                 // Högerklick på ett felstavat ord.
                 if out.response.secondary_clicked() {
+                    let mut gfound = None;
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
+                        if !misspelled.iter().any(|r| r.start <= b && b < r.end) {
+                            gfound = gmatches.iter().find(|m| m.range.start <= b && b < m.range.end).cloned();
+                        }
+                    }
+                    new_gtarget = Some(gfound);
                     let mut found = None;
                     if let Some(pos) = ui.ctx().pointer_interact_pos() {
                         let ci = galley.cursor_from_pos(pos - gpos).index.0;
@@ -1374,27 +1602,50 @@ impl KladdApp {
                     Some(t) => t.clone(),
                     None => secondary_target.clone(),
                 };
+                let gtarget = match &new_gtarget {
+                    Some(t) => t.clone(),
+                    None => secondary_gtarget.clone(),
+                };
                 let in_table_menu = table_menu.unwrap_or_else(|| tables::menu_open(ui.ctx()));
-                if target.is_some() || in_table_menu {
+                if target.is_some() || in_table_menu || gtarget.is_some() {
                     out.response.context_menu(|ui| {
                         ui.set_min_width(210.0);
                         ui.set_max_width(260.0);
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        if let Some(t) = &target {
-                            if t.suggestions.is_empty() {
-                                ui.add_enabled(false, egui::Label::new("Inga förslag"));
+                        if let Some(tg) = &target {
+                            if tg.suggestions.is_empty() {
+                                ui.add_enabled(false, egui::Label::new(t("Inga förslag")));
                             }
-                            for s in t.suggestions.iter().take(6) {
+                            for s in tg.suggestions.iter().take(6) {
                                 if menu_item(ui, p, s, "", None, true) {
-                                    spell_act = Some(SpellAct::Replace(t.range.clone(), s.clone()));
+                                    spell_act = Some(SpellAct::Replace(tg.range.clone(), s.clone()));
                                 }
                             }
                             menu_divider(ui, p);
-                            if menu_item(ui, p, "Ignorera alla", "", None, true) {
-                                spell_act = Some(SpellAct::Ignore(t.word.clone()));
+                            if menu_item(ui, p, t("Ignorera alla"), "", None, true) {
+                                spell_act = Some(SpellAct::Ignore(tg.word.clone()));
                             }
-                            if menu_item(ui, p, "Lägg till i ordlistan", "", None, true) {
-                                spell_act = Some(SpellAct::Add(t.word.clone()));
+                            if menu_item(ui, p, t("Lägg till i ordlistan"), "", None, true) {
+                                spell_act = Some(SpellAct::Add(tg.word.clone()));
+                            }
+                            if in_table_menu {
+                                menu_divider(ui, p);
+                            }
+                        }
+                        if let (Some(m), None) = (&gtarget, &target) {
+                            ui.add(egui::Label::new(egui::RichText::new(&m.message).color(p.text)).wrap());
+                            ui.add_space(4.0);
+                            for s in m.replacements.iter().take(5) {
+                                if menu_item(ui, p, s, "", None, true) {
+                                    gram_act = Some(GramAct::Replace(m.range.clone(), s.clone()));
+                                }
+                            }
+                            menu_divider(ui, p);
+                            if menu_item(ui, p, t("Ignorera"), "", None, true) {
+                                gram_act = Some(GramAct::Ignore(m.clone()));
+                            }
+                            if menu_item(ui, p, t("Ignorera regeln"), "", None, true) {
+                                gram_act = Some(GramAct::IgnoreRule(m.rule_id.clone()));
                             }
                             if in_table_menu {
                                 menu_divider(ui, p);
@@ -1414,6 +1665,14 @@ impl KladdApp {
 
             self.wv.pages = page_pos;
             self.wv.fn_pending = fn_pending;
+            self.wv.review = rstate;
+            if let Some(t) = pending_track {
+                self.review_apply_tracked(&ctx, t);
+            }
+            if let Some(a) = pane_act {
+                self.review_pane_act(&ctx, a);
+            }
+            self.review_name_window(&ctx);
             if let Some(b) = toc_click {
                 self.goto_byte(&ctx, b);
             }
@@ -1422,11 +1681,29 @@ impl KladdApp {
             if let (Some(act), Some(r)) = (img_act, img_range) {
                 self.word_image_act(&ctx, act, r);
             }
-            if open_page_dlg {
-                self.open_page_dialog();
+            if let Some((footer, page)) = open_hf_dlg {
+                self.open_header_dialog(footer, page);
             }
             if let Some(t) = new_target {
                 self.wv.target = t;
+            }
+            if let Some(t) = new_gtarget {
+                self.wv.gtarget = t;
+            }
+            match gram_act {
+                Some(GramAct::Replace(r, s)) => {
+                    self.word_edit(&ctx, |t, _| {
+                        let mut text = String::with_capacity(t.len() + s.len());
+                        text.push_str(&t[..r.start]);
+                        text.push_str(&s);
+                        text.push_str(&t[r.end..]);
+                        let end = r.start + s.len();
+                        markup::Edit { text, sel: end..end }
+                    });
+                }
+                Some(GramAct::Ignore(m)) => self.grammar.ignore_match(&m),
+                Some(GramAct::IgnoreRule(id)) => self.grammar.ignore_rule(&id),
+                None => {}
             }
             if edited {
                 self.find.current = None;
@@ -1480,6 +1757,7 @@ impl KladdApp {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
             label(ui, format!("{zoom_pct} %"));
+            let mut gram_toggle = false;
             if let Some(sp) = self.speller.as_mut() {
                 let finished = sp.poll_download();
                 let busy = sp.downloading().map(str::to_owned);
@@ -1489,24 +1767,25 @@ impl KladdApp {
                 let langs: Vec<(String, String)> =
                     sp.languages().iter().map(|l| (l.code.clone(), l.name.clone())).collect();
                 let name = match (&busy, sp.lang()) {
-                    (Some(n), _) => format!("Hämtar {n}…"),
+                    (Some(n), _) => tf!("Hämtar {n}…", n = n),
                     (None, Some(l)) => l.name.clone(),
-                    (None, None) => "Ingen ordlista".to_owned(),
+                    (None, None) => t("Ingen ordlista").to_owned(),
                 };
                 let hint = if langs.is_empty() {
-                    "Ingen ordlista för stavningskontroll är installerad – klicka för att hämta en"
+                    t("Ingen ordlista för stavningskontroll är installerad – klicka för att hämta en")
                 } else {
-                    "Språk för stavningskontroll"
+                    t("Språk för stavningskontroll")
                 };
                 let btn = status_button(ui, p, &name, hint);
                 let current = sp.lang().map(|l| l.code.clone());
                 let mut pick: Option<String> = None;
                 let mut fetch: Option<String> = None;
                 let mut spell = self.settings.spell;
+                let gram_on = self.settings.grammar;
                 Popup::menu(&btn).align(RectAlign::TOP_END).gap(6.0).width(260.0).show(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     if !langs.is_empty() {
-                        if menu_item(ui, p, "Stavningskontroll", "", Some(spell), true) {
+                        if menu_item(ui, p, t("Stavningskontroll"), "", Some(spell), true) {
                             spell = !spell;
                         }
                         menu_divider(ui, p);
@@ -1520,22 +1799,26 @@ impl KladdApp {
                     let missing: Vec<&crate::spell::Download> =
                         crate::spell::DOWNLOADS.iter().filter(|d| !langs.iter().any(|(c, _)| c == d.code)).collect();
                     if let Some(n) = &busy {
-                        ui.label(egui::RichText::new(format!("Hämtar {n}…")).font(font.clone()).color(p.muted));
+                        ui.label(egui::RichText::new(tf!("Hämtar {n}…", n = n)).font(font.clone()).color(p.muted));
                     } else if !missing.is_empty() {
                         if !langs.is_empty() {
-                            ui.label(egui::RichText::new("Hämta fler språk…").font(font.clone()).color(p.muted));
+                            ui.label(egui::RichText::new(t("Hämta fler språk…")).font(font.clone()).color(p.muted));
                         }
                         for d in missing {
                             let label =
-                                if d.code == "sv_SE" { "Hämta svensk ordlista".to_owned() } else { format!("Hämta {}", d.name) };
+                                if d.code == "sv_SE" { t("Hämta svensk ordlista").to_owned() } else { tf!("Hämta {name}", name = t(d.name)) };
                             if menu_item(ui, p, &label, "", None, true) {
                                 fetch = Some(d.code.to_owned());
                             }
                         }
                     }
+                    menu_divider(ui, p);
+                    if menu_item(ui, p, t("Grammatik"), "", Some(gram_on), true) {
+                        gram_toggle = true;
+                    }
                     ui.add_space(4.0);
                     ui.add(
-                        egui::Label::new(egui::RichText::new(crate::spell::LICENSE_NOTE).font(font.clone()).color(p.muted))
+                        egui::Label::new(egui::RichText::new(t(crate::spell::LICENSE_NOTE)).font(font.clone()).color(p.muted))
                             .wrap(),
                     );
                 });
@@ -1555,14 +1838,32 @@ impl KladdApp {
                                 self.settings.spell_lang = Some(c);
                             }
                             self.settings.spell = true;
-                            self.notify(&ctx, format!("Ordlistan {n} är hämtad"), false);
+                            self.notify(&ctx, tf!("Ordlistan {n} är hämtad", n = n), false);
                         }
-                        Err(e) => self.notify(&ctx, format!("Kunde inte hämta ordlistan: {e}"), true),
+                        Err(e) => self.notify(&ctx, tf!("Kunde inte hämta ordlistan: {e}", e = e), true),
                     }
                 }
             }
-            label(ui, if words == 1 { "1 ord".to_owned() } else { format!("{words} ord") });
-            label(ui, format!("Sida {cur} av {total}"));
+            if gram_toggle {
+                self.grammar_toggle();
+            }
+            label(ui, if words == 1 { t("1 ord").to_owned() } else { tf!("{words} ord", words = words) });
+            {
+                let st = self.grammar.status().clone();
+                let (text, hint) = if !self.settings.grammar {
+                    (t("Grammatik: av").to_owned(), t("Slå på grammatik- och stilkontroll (LanguageTool)").to_owned())
+                } else if let Some(e) = &st.error {
+                    (t("Grammatik: fel").to_owned(), tf!("Grammatikkontrollen misslyckades: {e}", e = e))
+                } else if st.pending && st.count == 0 {
+                    (t("Grammatik: kontrollerar…").to_owned(), t("Grammatik och stil").to_owned())
+                } else {
+                    (tf!("Grammatik: {n}", n = st.count), t("Grammatik och stil: inställningar").to_owned())
+                };
+                if status_button(ui, p, &text, &hint).clicked() {
+                    self.open_grammar_dialog(false);
+                }
+            }
+            label(ui, tf!("Sida {cur} av {total}", cur = cur, total = total));
         });
     }
 }

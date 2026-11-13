@@ -27,8 +27,13 @@ Chrome och PdfCraft (storytold/pdfcraft, Rust + egui + hayro).
 |---|---|
 | `engine.rs` | `PdfEngine`: öppnar med hayro, trådpool, prioritetskö, rendering, textutdragning, omfärgning |
 | `text.rs` | `PageText`: glyfer, rader, ord, sökning, träffrektanglar, markering |
+| `forms.rs` | `FormState`: AcroForm-fält (läsning, ifyllnad med egui ovanpå sidan, Tab-ordning) och `apply` som skriver `/V`, `/AS` och utseendeströmmar |
 | `meta.rs` | `PdfMeta`: innehållsförteckning, länkar, sidetiketter, dokumentinfo (lopdf) |
 | `view.rs` | `PdfView`: själva visaren (layout, zoom, rendering till texturer, navigering, markering, sök, länkar) |
+| `organize.rs` | Sidoperationer på PDF-bytes med lopdf (ordna, ta bort, rotera, extrahera, infoga) och `History` för Ångra |
+| `pages.rs` | Kopplar `organize` till fliken: `OrgOp`, urval, omladdning av visaren, Ångra/Gör om, `PdfTab::pages_changed` |
+| `ocr.rs` | `OcrState`: letar skannade sidor, renderar i 300 dpi på egen motor, kör Tesseract (`crate::ocr`) och ger `PageText` via `PdfView::set_ocr_text` |
+| `annot.rs` | Nya anteckningar (markering, understruken, genomstruken, lapp, textruta, penna): minneslista i visningspunkter, verktygsrad, överlägg, `apply` skriver `/Annots` med `/AP` via lopdf |
 | `chrome.rs` | Verktygsrad, sidopanel (miniatyrer, innehåll), sökfält, egenskaper, presentationsläge, statusrad |
 
 ## Förbättringar (minst 40)
@@ -93,7 +98,9 @@ Fil och verktyg
 45. Statusrad: sidetikett, "Sida x av y", zoom i procent.
 46. Kopiera sidan som bild.
 47. Trasiga sidor visar ett felmeddelande på sidan i stället för att krascha.
-48. PDF-flikar räknas inte som ändrade och frågar aldrig om att spara.
+48. PDF-flikar är bara ändrade efter sidändringar (`pages_changed`, se punkt 51) och frågar annars aldrig om att spara.
+
+48. PDF-flikar räknas som ändrade bara när formulärfält fyllts i (Ctrl+S sparar, stängning frågar); annars frågar de aldrig om att spara.
 49. ⌘ i stället för Ctrl på Mac i alla kortkommandon.
 50. Formulärfält och anteckningar visas (hayro ritar deras utseende).
 
@@ -213,3 +220,27 @@ impl PdfView {
     pub fn reload(&mut self, engine: PdfEngine, meta: PdfMeta, bytes: Arc<Vec<u8>>);
 }
 ```
+
+## Ordna sidor
+
+- `organize.rs` arbetar på bytes: `reorder`, `delete`, `rotate`, `extract`, `insert`. Sidträdet plattas ut först (ärvda `Resources`/`MediaBox`/`CropBox`/`Rotate` skrivs in på sidorna). Vid borttagning blir referenser till borttagna sidor `null` och `prune_objects` rensar oanvänt. `insert` numrerar om den infogade filens objekt (`renumber_objects_with`) och flyttar in dem; dess bokmärken och formulär tas inte med.
+- Krypterade filer avkrypteras (som `print::decrypted_pdf`) vid första ändringen. Resultatet är okrypterat, och sparas det över originalet försvinner lösenordsskyddet.
+- `pages::run` gör ändringen, läser om visaren (`PdfView::reload`) och lägger föregående bytes i `History` (högst 30 versioner och 256 MB). `PdfTab::pages_changed` sätter `Document::dirty`; Ctrl+S skriver bytes över originalet med `write_atomic`. Ändrad fil på disk läses inte om automatiskt medan sidändringar är osparade.
+51. Miniatyrer: flerval, drag för att flytta, högerklicksmeny, Delete, Ångra/Gör om, Slå ihop med PDF.
+
+## Anteckningar (`annot.rs`)
+
+- `PdfView.annot` (`AnnotState`) håller verktyg, färg och väntande `NewAnnot` per sida i visningspunkter. view.rs har några krokar: `annot.paint` i `paint_overlays`, `annot_pointer` (lapp/textruta/penna tar över musen), `annot_from_selection` (markering → markup vid musknapp upp) och `annot.show_editor` i `show`.
+- Fliken är ändrad (`Document::dirty`) så länge `annot.has_pending()`; Ctrl+S → `KladdApp::pdf_save` skriver `annot::apply` atomiskt och läser om visaren. Krypterade PDF:er skrivs avkrypterade.
+- Koordinater tillbaka till användarrymd: `to_user` (invers av `Geo::point`, med /Rotate och CropBox). Lapp och textruta får `/Matrix` så att de står upprätt på roterade sidor.
+- Utanför omfånget: ändra eller ta bort anteckningar som redan sparats i filen (hayro ritar dem); inkrementell uppdatering som bevarar signaturer.
+## Formulär (`forms.rs`)
+
+- `read_fields(bytes, password)` går igenom `/AcroForm /Fields` med ärvda `/FT /Ff /V /DA /Opt /MaxLen /Q`
+  och ger `Field { kind, value, options, widgets: [Widget { page, rect, on }] }`. Rektanglarna är
+  visningspunkter som länkarna i `meta`. Tryckknappar, signaturer, dolda widgetar och krypterade PDF:er hoppas över.
+- `FormState` ligger i `PdfView::forms`. Visarens enda krok är `forms.page_ui(ui, page, &xf)` i `draw_pages`;
+  raden under verktygsraden (`forms::bar`) och tangenterna (`forms.pre_keys`) anropas från `app.rs`.
+- `apply(bytes, password, &[(fält-id, Value)])` sätter `/V`, `/AS` (kryss/alternativ) och bygger nya `/AP /N` för
+  text- och valfält med typsnitt och storlek ur `/DA` (Helvetica `/Helv` ur `/DR` om det finns, annars eget med WinAnsi);
+  `/NeedAppearances true` sätts också. Sparning (Ctrl+S) är atomisk och visaren läses om efteråt.

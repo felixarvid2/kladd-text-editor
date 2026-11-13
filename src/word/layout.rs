@@ -120,6 +120,8 @@ struct DocState {
     tick: u64,
     /// Flytande bilder i senaste utläggningen: bildens byteläge och sida.
     float_starts: Vec<(usize, Float, usize)>,
+    /// Arken i senaste utläggningen (läge, mått och spalter), se `secpages`.
+    page_boxes: Arc<Vec<super::secpages::PageBox>>,
 }
 
 #[derive(Default)]
@@ -157,6 +159,7 @@ impl Cache {
             geoms: Arc::default(),
             tick: 0,
             float_starts: Vec::new(),
+            page_boxes: Arc::default(),
         });
         if st.text != text {
             st.text.clear();
@@ -174,6 +177,11 @@ impl Cache {
     /// Revisionsnummer: ändras exakt när texten ändrats sedan förra anropet.
     pub fn rev(&mut self, doc_id: u64, text: &str) -> u64 {
         self.state(doc_id, text).rev
+    }
+
+    /// Arken från senaste omläggningen av `text` (tom om den inte gjorts med sidbrytning).
+    pub fn page_boxes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::secpages::PageBox>> {
+        self.state(doc_id, text).page_boxes.clone()
     }
 
     pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
@@ -337,6 +345,7 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         para.float.map(|f| (f.side, f.size.x.to_bits(), f.size.y.to_bits(), f.alone)).hash(&mut h);
         para.reserve.map(f32::to_bits).hash(&mut h);
         para.toc_h.to_bits().hash(&mut h);
+        (para.space_before.to_bits(), para.first_indent.to_bits()).hash(&mut h);
     }
     // Markörens rader i förhållande till fönstret.
     if intersects(&p.reveal, w) {
@@ -375,6 +384,8 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         }
         .hash(&mut h);
         pc.object.hash(&mut h);
+        pc.rev.map(|r| (r.kind, r.color)).hash(&mut h);
+        (pc.comment.is_some() && crate::review::comments_visible()).hash(&mut h);
         pc.footnote_ref.is_some().hash(&mut h);
         pc.footnote_def.is_some().hash(&mut h);
         pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
@@ -432,8 +443,20 @@ fn relayout(
     let mut starts: Vec<(usize, Float, usize)> = Vec::new();
     let mut all: Vec<Arc<Galley>> = Vec::new();
     let mut geoms: Vec<TableGeom> = Vec::new();
+    let mut geom_rows: Vec<usize> = Vec::new();
     let mut row_groups: Vec<Range<usize>> = Vec::new();
+    // Avsnitt och spaltbrytningar per rad (för dokument med avsnitt).
+    let multi = pages.is_some_and(|g| g.multi());
+    let mut row_sec: Vec<u32> = Vec::new();
+    let mut col_breaks: Vec<usize> = Vec::new();
+    let page_wrap = wrap_width;
     for (pr, w, tbl) in groups.iter() {
+        // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
+        let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
+        let wrap_width = match pages {
+            Some(g) if multi => g.wrap_for(sec),
+            _ => page_wrap,
+        };
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
@@ -467,6 +490,7 @@ fn relayout(
         };
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
+            wrap_width.to_bits().hash(&mut h);
             for f in &rel {
                 (f.0, f.1.to_bits(), f.2.to_bits()).hash(&mut h);
             }
@@ -496,8 +520,20 @@ fn relayout(
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
             (gs, geom)
         };
+        if multi {
+            let n: usize = galleys.iter().map(|g| g.rows.len()).sum();
+            row_sec.extend(std::iter::repeat(sec as u32).take(n));
+            let mut r = row_no;
+            for (q, lg) in gp.iter().zip(galleys.iter()) {
+                if q.col_break {
+                    col_breaks.push(r);
+                }
+                r += lg.rows.len();
+            }
+        }
         if let Some(g) = &tgeom {
             geoms.push(g.abs(w.start));
+            geom_rows.push(row_no);
             for lg in galleys.iter().filter(|lg| lg.rows.len() > 1) {
                 let _ = lg;
             }
@@ -523,7 +559,6 @@ fn relayout(
     st.units.retain(|_, u| u.used == tick);
     st.float_starts = starts;
 
-    st.geoms = Arc::new(geoms);
     let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
     job.wrap.max_width = wrap_width;
     job.sections.push(LayoutSection {
@@ -532,9 +567,23 @@ fn relayout(
         format: TextFormat::default(),
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
-    if let Some(geom) = pages {
-        super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+    match pages {
+        Some(geom) if multi => {
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks);
+            // Tabellernas kolumnkanter följer med raderna i sidled.
+            for (t, r) in geoms.iter_mut().zip(&geom_rows) {
+                let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
+                t.col_x.iter_mut().for_each(|x| *x += dx);
+            }
+            st.page_boxes = Arc::new(paged.boxes);
+        }
+        Some(geom) => {
+            super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+            st.page_boxes = Arc::new(geom.uniform_boxes(super::pages::page_count(&g, geom)));
+        }
+        None => st.page_boxes = Arc::default(),
     }
+    st.geoms = Arc::new(geoms);
     g
 }
 
@@ -594,6 +643,9 @@ fn layout_table_lines(
         .collect()
 }
 
+/// Radhöjd för enkelt radavstånd, gånger teckenstorleken (formatmallarnas `line-spacing`).
+pub const LINE_SINGLE: f32 = 1.25;
+
 /// Storlek (pt) för blockets text; `body` = dokumentets brödtextstorlek.
 fn block_size_pt(b: Block, mono: bool, body: f32) -> f32 {
     if mono {
@@ -642,8 +694,13 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     let mono = pc.code || matches!(pc.block, Block::Code) || table_raw;
     let heading = matches!(pc.block, Block::Heading(_));
     let body_family = |bold: bool, italic: bool| (p.font_family)(Some(d.font()), bold, italic);
-    let block_pt = block_size_pt(pc.block, mono, d.size());
-    let lh_for = |size: f32| if heading { size * 1.3 } else { size * 1.4 };
+    let ov = if mono { None } else { d.styles.for_block(pc.block) };
+    let block_pt = ov.and_then(|o| o.size).unwrap_or_else(|| block_size_pt(pc.block, mono, d.size()));
+    let lh_for = |size: f32| match ov.and_then(|o| o.line_spacing) {
+        Some(m) => size * LINE_SINGLE * m,
+        None if heading => size * 1.3,
+        None => size * 1.4,
+    };
     let family_plain = if mono { FontFamily::Monospace } else { body_family(false, false) };
 
     if pc.markup {
@@ -668,13 +725,16 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     let span = pc.span.as_deref();
     let size = px(zoom, span.and_then(|s| s.font_size).unwrap_or(block_pt));
     let header = grid == Some(true);
-    let bold = pc.bold || heading || header;
-    let italic = pc.italic || matches!(pc.block, Block::Quote);
+    let bold = pc.bold || ov.and_then(|o| o.bold).unwrap_or(heading) || header;
+    let italic = pc.italic || ov.and_then(|o| o.italic).unwrap_or(matches!(pc.block, Block::Quote));
     let family = if mono {
         FontFamily::Monospace
     } else {
         match span.and_then(|s| s.font_family.as_deref()) {
             Some(name) => (p.font_family)(Some(name), bold, italic),
+            None if ov.is_some_and(|o| o.font_family.is_some()) => {
+                (p.font_family)(ov.and_then(|o| o.font_family.as_deref()), bold, italic)
+            }
             // Rubriker behåller Kladds eget typsnitt (Carlito) om inte texten har ett eget.
             None if heading => theme::doc_font(bold, italic),
             None => body_family(bold, italic),
@@ -687,6 +747,9 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         Block::Quote => pal.page_muted,
         _ => pal.page_text,
     };
+    if let Some(c) = ov.and_then(|o| o.color) {
+        color = adapt_text_color(c, pal.page, pal.dark);
+    }
     if let Some(c) = span.and_then(|s| s.color) {
         color = adapt_text_color(c, pal.page, pal.dark);
     }
@@ -719,6 +782,21 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     }
     if pc.strike {
         f.strikethrough = stroke;
+    }
+    // Spårade ändringar: infogat understryks och raderat stryks, i författarens färg.
+    if let Some(r) = pc.rev {
+        let rc = crate::review::AUTHOR_COLORS[usize::from(r.color) % crate::review::AUTHOR_COLORS.len()];
+        let c = adapt_text_color(rc, pal.page, pal.dark);
+        f.color = c;
+        let st = Stroke::new(zoom.max(1.0), c);
+        match r.kind {
+            crate::review::RevKind::Ins => f.underline = st,
+            crate::review::RevKind::Del => f.strikethrough = st,
+        }
+    }
+    // Kommentarens område markeras som med en överstrykningspenna.
+    if pc.comment.is_some() && crate::review::comments_visible() {
+        f.background = if pal.dark { Color32::from_rgb(84, 74, 24) } else { Color32::from_rgb(255, 240, 168) };
     }
     f
 }
@@ -815,13 +893,15 @@ pub fn needed_fonts(a: &Analysis) -> BTreeSet<(String, bool, bool)> {
             continue;
         }
         let heading = matches!(pc.block, Block::Heading(_));
+        let ov = d.styles.for_block(pc.block);
         let span_font = pc.span.as_deref().and_then(|s| s.font_family.as_deref());
-        if heading && span_font.is_none() {
+        let style_font = ov.and_then(|o| o.font_family.as_deref());
+        if heading && span_font.is_none() && style_font.is_none() {
             continue; // Carlito
         }
-        let name = span_font.unwrap_or(d.font()).to_owned();
-        let italic = pc.italic || matches!(pc.block, Block::Quote);
-        set.insert((name.clone(), pc.bold || heading, italic));
+        let name = span_font.or(style_font).unwrap_or(d.font()).to_owned();
+        let italic = pc.italic || ov.and_then(|o| o.italic).unwrap_or(matches!(pc.block, Block::Quote));
+        set.insert((name.clone(), pc.bold || ov.and_then(|o| o.bold).unwrap_or(heading), italic));
         if pc.block == Block::Table {
             set.insert((name.clone(), true, false));
             set.insert((name, false, false));
@@ -1187,6 +1267,13 @@ struct Para {
     reserve: Option<f32>,
     /// Innehållsförteckning (`<!-- kladd: toc -->`, dold): radens höjd i px, annars 0.
     toc_h: f32,
+    /// Formatmallens luft ovanför stycket (px). Luften under föregående stycke ligger här också:
+    /// egui:s `Galley::concat` staplar styckena efter radernas höjd, så den kan bara läggas ovanför.
+    space_before: f32,
+    /// Formatmallens indrag av styckets första rad (px).
+    first_indent: f32,
+    /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
+    col_break: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1216,6 +1303,8 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
     let mut out: Vec<Para> = Vec::new();
     // Innehållsförteckningens höjd räknas först när en sådan rad hittas (beror på rubrikerna).
     let mut toc_h: Option<f32> = None;
+    // Formatmallarnas "luft efter" per stycke, flyttas till nästa synliga stycke nedan.
+    let mut after: Vec<f32> = Vec::new();
     let mut s = 0;
     loop {
         let e = text[s..].find('\n').map_or(text.len(), |i| s + i);
@@ -1239,11 +1328,23 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             1
         });
 
-        let align = ps
-            .iter()
-            .find(|pc| !pc.markup && !body(pc).trim().is_empty())
-            .or(ps.first())
-            .map_or(Align::Left, |pc| pc.align);
+        let lead = ps.iter().find(|pc| !pc.markup && !body(pc).trim().is_empty()).or(ps.first());
+        // Formatmallens justering gäller när stycket inte har en egen (`<div align>`).
+        let style = lead.filter(|_| !is_tag).and_then(|pc| a.defaults.styles.for_block(pc.block).map(|o| (pc.block, o)));
+        let mut align = lead.map_or(Align::Left, |pc| pc.align);
+        if align == Align::Left {
+            align = style.and_then(|(_, o)| o.align).unwrap_or(Align::Left);
+        }
+        // Luft och indrag gäller vanliga stycken, rubriker och citat (inte listor).
+        let (space_before, space_after, first_indent) = match style {
+            Some((Block::Normal | Block::Heading(_) | Block::Quote, o)) => (
+                px(p.zoom, o.space_before.unwrap_or(0.0)),
+                px(p.zoom, o.space_after.unwrap_or(0.0)),
+                px(p.zoom, o.first_indent.unwrap_or(0.0)),
+            ),
+            _ => (0.0, 0.0, 0.0),
+        };
+        after.push(space_after);
         let list = ps.iter().find(|pc| pc.list_marker && pc.range.start >= s && !pc.range.is_empty()).and_then(|pc| {
             if !text[s..pc.range.start].chars().all(|c| c == ' ' || c == '\t') {
                 return None; // t.ex. ett objekt i ett citat: ingen indragning
@@ -1279,11 +1380,32 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         } else {
             None
         };
-        out.push(Para { range, align, list, image_w, collapse, toc_h: toc.unwrap_or(0.0), float, reserve: None });
+        let col_break = super::sections::is_column_break(t);
+        out.push(Para {
+            range,
+            align,
+            list,
+            image_w,
+            collapse,
+            toc_h: toc.unwrap_or(0.0),
+            float,
+            reserve: None,
+            space_before,
+            first_indent,
+            col_break,
+        });
         if e >= text.len() {
             break;
         }
         s = e + 1;
+    }
+    let mut carry = 0.0;
+    for (para, a) in out.iter_mut().zip(&after) {
+        if para.collapse {
+            continue;
+        }
+        para.space_before += carry;
+        carry = *a;
     }
     // Tomma rader närmast en dold taggrad (efter en öppning, före en stängning) kollapsar också,
     // så att en centrerad div inte får fyra gånger så stort radavstånd som vanliga stycken.
@@ -1517,6 +1639,11 @@ fn layout_piece(
         None => avail,
     };
     pj.wrap.max_width = wrap_w;
+    if para.first_indent > 0.0 && !cont && list.is_none() && !para.collapse {
+        if let Some(s) = pj.sections.first_mut() {
+            s.leading_space = para.first_indent;
+        }
+    }
     let mut g = fonts.layout_job(pj.clone());
 
     let mut consumed = None;
@@ -1538,8 +1665,10 @@ fn layout_piece(
 
     let finite = avail.is_finite();
     let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0);
+    // Formatmallens luft: ovanför första delen.
+    let before = if cont { 0.0 } else { para.space_before };
     if !shifts {
-        return (g, consumed);
+        return (add_space(g, before), consumed);
     }
     let round = |x: f32| (x * ppp).round() / ppp;
     let gm = Arc::make_mut(&mut g);
@@ -1572,7 +1701,21 @@ fn layout_piece(
         gm.rows[i].pos.x = round(x + x0);
         char_off += row.glyphs.len();
     }
-    (g, consumed)
+    (add_space(g, before), consumed)
+}
+
+/// Lägger `before` px ovanför ett utlagt stycke (formatmallens luft).
+fn add_space(mut g: Arc<Galley>, before: f32) -> Arc<Galley> {
+    if before <= 0.0 || g.rows.is_empty() {
+        return g;
+    }
+    let gm = Arc::make_mut(&mut g);
+    for r in &mut gm.rows {
+        r.pos.y += before;
+    }
+    gm.rect.max.y += before;
+    gm.mesh_bounds = gm.mesh_bounds.translate(Vec2::new(0.0, before));
+    g
 }
 
 /// Lägger ut hela jobbet stycke för stycke och fogar ihop styckena till ett galleri som
@@ -2177,6 +2320,91 @@ mod tests {
         let at = t.find("<!-- kladd").unwrap();
         let (h2, _) = run(at..at + 5);
         assert!(h2 < 40.0, "{h2}");
+    }
+
+    #[test]
+    fn style_overrides_change_heading_and_body() {
+        let t = "<!-- kladd: h1: \"Georgia\" 30pt nobold #FF0000 line-spacing 2; body: 14pt italic -->\n\n# Rubrik\n\nBrödtext\n\n> citat\n";
+        let georgia = FontFamily::Name("georgia".into());
+        let ff = |n: Option<&str>, b: bool, i: bool| match n {
+            Some("Georgia") => georgia.clone(),
+            _ => theme::doc_font(b, i),
+        };
+        let pal = theme::palette(false);
+        let img = |_: &str| None;
+        let p = Params {
+            palette: &pal,
+            zoom: 1.0,
+            reveal: 0..0,
+            matches: &[],
+            image_size: &img,
+            measure: &measure,
+            font_family: &ff,
+            fonts_gen: 0,
+        };
+        let a = markup::analyze(t);
+        let job = layout_job(t, &a, &p);
+        let h = sec_at(&job, t.find("Rubrik").unwrap());
+        assert_eq!(h.format.font_id.size, px(1.0, 30.0));
+        assert_eq!(h.format.font_id.family, georgia);
+        assert_eq!(h.format.color, Color32::from_rgb(255, 0, 0));
+        assert_eq!(h.format.line_height, Some(px(1.0, 30.0) * LINE_SINGLE * 2.0));
+        let b = sec_at(&job, t.find("Brödtext").unwrap());
+        assert_eq!(b.format.font_id.size, px(1.0, 14.0));
+        assert_eq!(b.format.line_height, Some(px(1.0, 14.0) * 1.4));
+        assert!(needed_fonts(&a).contains(&("Georgia".to_owned(), false, false)));
+        // Utan formatmallar gäller Kladds eget utseende.
+        let plain = "# Rubrik\n";
+        let job = layout_job(plain, &markup::analyze(plain), &p);
+        assert_eq!(sec_at(&job, 2).format.font_id.size, px(1.0, 18.0));
+        assert_eq!(sec_at(&job, 2).format.line_height, Some(px(1.0, 18.0) * 1.3));
+    }
+
+    #[test]
+    fn style_spacing_align_and_indent_reach_paragraphs() {
+        let t = "<!-- kladd: h1: center space-before 12pt space-after 6pt; body: indent 18pt -->\n\n# Rubrik\n\nBrödtext\n";
+        let pal = theme::palette(false);
+        let img = |_: &str| None;
+        let p = Params {
+            palette: &pal,
+            zoom: 1.0,
+            reveal: 0..0,
+            matches: &[],
+            image_size: &img,
+            measure: &measure,
+            font_family: &fam,
+            fonts_gen: 0,
+        };
+        let a = markup::analyze(t);
+        let paras = paragraphs(t, &a, &p);
+        let h = paras.iter().find(|q| t[q.range.clone()].starts_with("# Rubrik")).unwrap();
+        assert_eq!((h.space_before, h.align), (px(1.0, 12.0), Align::Center));
+        // Luften under rubriken ligger ovanför nästa (tomma) stycke.
+        let hi = paras.iter().position(|q| std::ptr::eq(q, h)).unwrap();
+        assert_eq!(paras[hi + 1].space_before, px(1.0, 6.0));
+        let b = paras.iter().find(|q| &t[q.range.clone()] == "Brödtext").unwrap();
+        assert_eq!((b.first_indent, b.space_before), (px(1.0, 18.0), 0.0));
+        // Kommentarraden får ingen luft.
+        assert_eq!(paras[0].space_before, 0.0);
+        // Galleriet blir högre med luften.
+        let height = |text: &str| {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let mut out = 0.0;
+            for _ in 0..2 {
+                let o = ctx.run_ui(Default::default(), |ui| {
+                    ui.ctx().fonts_mut(|f| {
+                        let an = markup::analyze(text);
+                        let job = layout_job(text, &an, &p);
+                        out = layout_galley(f, job, &an, &p, 400.0, 1.0).rect.height();
+                    });
+                });
+                std::mem::forget(o);
+            }
+            out
+        };
+        let plain = t.replace("space-before 12pt space-after 6pt", "");
+        assert!((height(t) - height(&plain) - px(1.0, 18.0)).abs() < 0.5);
     }
 
     #[test]

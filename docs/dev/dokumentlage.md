@@ -218,7 +218,22 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Sida, sidhuvud och sidfot** står i grundformatskommentaren (`style::DocDefaults`):
   `<!-- kladd: page-size: A4; page-margin: 25mm 20mm; header: "Rapport"; header-align: right;
   footer: "Sida {sida} av {sidor}"; footer-align: center -->`. Standard är A4 med en tums
-  marginaler och inget sidhuvud eller sidfot. `style::fill_fields` fyller i `{sida}`/`{sidor}`.
+  marginaler och inget sidhuvud eller sidfot. `style::fill_fields` fyller i `{sida}`, `{sidor}`, `{datum}`,
+  `{titel}` och `{fil}` (`style::Fields`). `|` delar i vänster|mitten|höger (`style::parts_of`,
+  `join_parts`; `\|` är ett riktigt streck) och `header-first`/`footer-first` är första sidans
+  varianter (`Some("")` = tom första sida; `DocDefaults::header_template(sida)`). Dialogen för
+  redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
+  fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
+- **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
+  grundformatskommentaren, `h1`–`h6`, `body`, `quote`, med ord i valfri ordning: `"Typsnitt"`,
+  `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
+  `space-before L`, `space-after L`, `line-spacing N` (gånger enkelt, `LINE_SINGLE` = 1,25 i
+  layouten), `indent L` (första raden). Layouten läser dem i `piece_format` (typsnitt, storlek,
+  färg, radhöjd) och `paragraphs` (justering, luft, indrag). Luft efter ett stycke läggs som luft
+  före nästa, eftersom `Galley::concat` staplar efter radernas höjd. Docx: `docx_styles.rs`
+  läser Normal/Heading1–6/Quote ur `styles.xml` (bara det mallen själv anger, minus det Kladds
+  egna mallar anger) och skriver tillbaka bara de egenskaper som ändrats. Odt: `Styles::style_set`
+  och `apply_style_overrides`. Dialogen: `word/stylesdlg.rs`.
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
@@ -256,7 +271,7 @@ Formatmallar (`office:styles` och `office:automatic-styles` i `styles.xml`/`cont
 `style:parent-style-name`; bara det som skiljer sig från grundformatet (standardstycket + Standard)
 blir `<span style>`. Fotnoter, kommentarer, former/diagram och länkade bilder tas bort och rapporteras
 som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/sidfot (`text:page-number`
-→ `{sida}`, `text:page-count` → `{sidor}`) hamnar i grundformatskommentaren. Vid skrivning ligger
+→ `{sida}`, `text:page-count` → `{sidor}`, `text:date`, `text:title`, `text:file-name`, flikar och `style:header-first`) hamnar i grundformatskommentaren. Vid skrivning ligger
 `mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
 `language()` visar "OpenDocument".
 
@@ -417,3 +432,179 @@ när sidan fylls. Referensen är ett litet upphöjt nummer. En enskild not som �
 
 **HTML/EPUB** (`export.rs`) hade redan fotnoter via pulldown (`<aside class="footnote">`, EPUB-`noteref`);
 kontrollerat med de befintliga testerna.
+
+## Granska: spårade ändringar och kommentarer
+
+Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad `docx`), gränssnitt i
+`src/word/reviewui.rs`.
+
+**Modellen** (Markdown-dialekten):
+
+- Infogad text `<ins data-k="3">text</ins>`, raderad text `<del data-k="4">text</del>`. `data-k` är ändringens
+  nummer; flera taggar kan dela nummer (en Word-ändring över körningar med olika format blir en tagg per
+  körning, och godkänn/avvisa tar alla med samma nummer). Taggarna ligger utanför `**`/`<u>`/`<span>` och
+  inom ett stycke; en ändring går aldrig över en radbrytning. Författare och datum står inte i taggen utan i
+  en postrad `<!--k:r id="3" author="Ada" date="2026-05-01T10:00:00Z"-->`.
+- Kommentarens område `<!--k:c:ID-->…<!--k:/c:ID-->` i texten (dold markup som `<!--k:N-->`). Börjar
+  området först på raden skyddas det av `&#8203;` framför (annars blir raden ett HTML-block, som för
+  objektmarkörerna), och `&#8203;` döljs. Kommentaren själv är en postrad
+  `<!--k:c id="1" parent="0" author="Ada" date="…" done="1" text="Hej &amp; hå"-->` (text och namn
+  XML-skyddade, `&#10;` för radbrytning). Ett svar har `parent` (trådens rot) och delar områdets läge med
+  roten (markörerna ligger intill förälderns). Rotkommentarens nummer är trådens nummer.
+- Postraderna ligger sist i dokumentet (efter fotnoterna), en per rad. De är tomma rader i dokumentläget
+  (hela raden är dold markup och kollapsar som `<!-- … -->`-rader).
+- `review::scan` hittar taggar, markörer och poster (hoppar över kodstaket). `markup::analyze` döljer dem
+  och ger bitarna `Piece::rev` (`RevMark`: slag, nummer, författarens färgindex) och `Piece::comment`
+  (trådens nummer). Färgindex är författarens plats i ordningen de först förekommer (`review::authors`),
+  så två författare aldrig delar färg. Raderad text räknas inte som ord och stavningskontrolleras inte.
+
+**Operationer** (`review.rs`, alla `&str` → `String`/`Edit`): `accept_all`, `reject_all`, `resolve_range`
+(godkänn/avvisa det som rör markeringen), `next_change`/`prev_change`, `add_comment`, `add_reply`,
+`delete_comment`, `edit_comment`, `threads`, `thread_at`, `prune` samt `clean_for_export` (godkänner allt och
+tar bort kommentarer: används av PDF, HTML, EPUB, ODT och förhandsvisningen). Ett stycke som bara bestod av en
+godkänd radering tas bort helt.
+
+**Spåra ändringar vid skrivning** (`review::track_edit`): editorn är fortfarande en vanlig `TextEdit`. Efter
+bildrutan jämförs texten före och efter (gemensamt prefix/suffix) och redigeringen skrivs om:
+
+- infogad text får `<ins>` (skriver man inne i, eller direkt efter, sin egen infogning utökas den i stället för
+  att få en ny tagg), radbrytningar och radprefix (`#`, `-`, `1.`, `>`) ingår inte;
+- raderad text får `<del>`; text i sin egen infogning försvinner på riktigt, text som redan är struken och
+  taggar/markörer/radbrytningar stannar; Backspace/Delete över en dold tagg går vidare till nästa synliga tecken;
+  en radering intill sin egen radering slås ihop med den; markören står före (Backspace) eller efter (Delete);
+- infogning inne i en tagg, i en radering eller i någon annans infogning flyttas till efter den;
+- ersättning av en markering ger `<del>` följt av `<ins>`; kodblock spåras inte;
+- ögonblicksbilden tas bara när tangenter som kan redigera trycktes (inte vid Ctrl+Z/Y), så texten klonas inte
+  varje bildruta. Radbrytningar (Enter) och formateringsknappar spåras inte (formatering skrivs direkt).
+
+**Dokumentläget**: infogat understruket och raderat genomstruket i författarens färg (`layout::piece_format`),
+kommentarsområdet med gul bakgrund (`review::comments_visible`, inställningen "Visa kommentarer"), och ett fält
+till höger om sidan (`reviewui::paint_pane`, 250 px + 16 px luft; sidan flyttas åt vänster och zoomen anpassas så
+att båda ryms). Korten ligger vid sin text och skjuts ned så att de inte överlappar; ett klick på ett kort
+markerar området, ett dubbelklick redigerar kommentarens text, det valda kortet (markören i området) har svarsfält
+samt *Svara*, *Löst* och *Ta bort*. Verktygsraden har *Spåra: på/av* och menyn *Granska* (spåra `Ctrl+Skift+E`,
+godkänn/avvisa ändring, godkänn/avvisa alla, föregående/nästa, ny kommentar `Ctrl+Alt+M`, svara, ta bort, visa
+kommentarer, *Ditt namn…*). Inställningarna `author_name` (tomt = `$USER`/`$USERNAME`) och `word_comments` ligger
+i `Settings`; spårning är per flik och sparas inte.
+
+**Word** (`docx.rs`, `docx_review.rs`): `w:ins`/`w:moveTo` och `w:del`/`w:moveFrom` (utanför styckemarkeringens
+`w:rPr`) ger taggar med nytt löpnummer och en postrad (`w:author`, `w:date`); `w:delText` läses som text.
+Flyttar blir vanlig infogning och radering (ett `w:del` inuti ett `w:ins` behåller bara raderingen).
+`w:commentRangeStart/End` blir markörer och `w:commentReference`-körningen försvinner (den skrivs igen vid
+slutmarkören). `comments.xml` ger postrader; svar och löst läses ur `commentsExtended.xml`
+(`w15:paraIdParent`, `w15:done`, via styckets `w14:paraId`). Bara kommentarer med ett område i texten tas med.
+Vid skrivning: orörda stycken behåller sin ursprungliga XML (med ändringar och kommentarer), omskrivna stycken
+får `w:ins`/`w:del` (`w:id` från 5 000 000, författare och datum ur posterna) och
+`w:commentRangeStart`/`End` + referens. `comments.xml` följer med orörd om alla poster är oförändrade;
+annars byggs den av posterna (oförändrade kommentarer ordagrant, nya med `w14:paraId`) och
+`commentsExtended.xml` skrivs om (eller skapas, med relation och innehållstyp). Kommentarer utan område i
+brödtexten tas bort. Spårade formateringsändringar (`rPrChange`, `pPrChange`) tas fortfarande bort när ett
+stycke skrivs om och rapporteras som "spårade formateringsändringar".
+
+**ODT**: `text:tracked-changes` godkänns vid läsning (infogad text stannar, raderad text kommer inte med),
+`office:annotation` tas bort som förut, och `odt::write` godkänner ändringarna och utelämnar kommentarerna.
+Spårade ändringar och kommentarer i .odt är alltså inte stödda fullt ut.
+
+## Avsnitt: liggande sidor och spalter
+
+Som Words sektioner. En del av dokumentet kan ha egen sidstorlek (liggande), egna marginaler och flera
+spalter. Logiken ligger i `word/sections.rs` (modell, rad, redigering), `word/secpages.rs` (sidbrytning med
+spalter) och `word/sectionui.rs` (menyn och dialogen "Spalter"); dessutom `docx.rs`, `odt.rs` och `pdf_write.rs`.
+
+### Formatet
+
+Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som grundformatraden):
+
+```
+<!-- kladd: avsnitt; page: A4 landscape; page-margin: 20mm; columns: 2; column-gap: 12mm; type: continuous -->
+<!-- kladd: spaltbrytning -->
+```
+
+- `page` (även `page-size`) följer `page-size` i grundformatet (`A4`, `Letter`, `210mm 297mm`, `landscape` efter
+  namnet), `page-margin` (även `margin`) följer CSS, `columns` är 1–6, `column-gap` en längd (standard 35,4 pt
+  = 1,25 cm, Words 708 twips) och `type: continuous` låter avsnittet börja på samma sida (annars en ny sida).
+- **Egenskaper som saknas ärver dokumentets grundformat**, inte föregående avsnitt. Ett avsnitt utan egenskaper
+  är alltså "tillbaka till grundformatet".
+- En avsnittsrad som står före all text (bara tomma rader och grundformatraden före) gäller **första avsnittet**
+  och börjar ingen ny sida. Så får hela dokumentet spalter eller liggande sidor.
+- Raden räknas som markup: dold utom när markören står på den (som `<!-- kladd: toc -->`), ingen ordräkning,
+  ingen stavningskontroll. `DocDefaults::from_comment` ger `None` för den (den är aldrig grundformat). Rader i
+  kodstaket räknas inte.
+- `sections::scan(text, &defaults) -> Vec<Section>` ger avsnitten (alltid minst ett) med egenskaperna
+  uträknade; `Analysis::sections` har dem. `SectionProps::{from_comment, to_comment}` läser och skriver raden.
+  Redigering: `insert_break`, `insert_column_break`, `update_current`, `set_landscape_from`.
+
+### Gränssnittet
+
+*Infoga* i formateringsfältet: *Avsnittsbrytning (ny sida)* (det nya avsnittet börjar som det nuvarande),
+*Liggande sidor härifrån* / *Stående sidor härifrån* (ändrar avsnittet om inget står före markören i det,
+annars börjar ett nytt avsnitt där), *Spalter…* (dialog: 1–3 spalter och mellanrum i mm; gäller avsnittet
+som markören står i och skriver om dess rad, eller lägger en rad före all text i första avsnittet) och
+*Spaltbrytning*.
+
+### Utläggning och sidbrytning
+
+Galleriet är fortfarande ett enda `Galley` för TextEdit. `layout::relayout` lägger ut varje stycke med
+**spaltens bredd** i dess avsnitt (`Geom::wrap_for`; bredden är med i styckecachens nyckel) och samlar per rad
+avsnittet (`row_sec`) och spaltbrytningarna. `secpages::paginate_sections` flyttar sedan raderna i x och y:
+
+- en spalt fylls uppifrån och ned, sedan nästa spalt, sedan ett nytt ark (samma regler som `paginate`: rader
+  delas aldrig, en rad högre än spalten står ensam, `groups` flyttas ihop, flytande bilder räknas som en rad);
+- ett nytt avsnitt börjar på ett nytt ark med avsnittets storlek och marginaler. Ett **löpande** avsnitt
+  (`type: continuous`) med samma sidstorlek och marginaler fortsätter på samma ark under det förra
+  (`PageBox::regions`: en del per spaltindelning); spalterna i avsnittet före ett löpande byte **jämnas ut**
+  (`balanced_height`) om det ryms på sidan;
+- ark med olika storlek centreras på skrivbordet (`Geom::sheet_left`). Galleriets x = 0 ligger vid den
+  vänstraste textkanten (`Geom::origin_x`), så alla rader har x ≥ 0 och TextEdits yta (`Geom::edit_w`) täcker allt;
+- resultatet är `Paged { boxes: Vec<PageBox>, dx }`; `Cache::page_boxes` ger arken till vyn (ritning av ark,
+  sidhuvud/sidfot per ark, sidnummer med `secpages::page_index`). Sidnumren löper över avsnitten och
+  sidhuvud/sidfot är gemensamma. Ett vanligt dokument (`Geom::for_sections` ger en `Geom` utan `secs`) går
+  den gamla vägen (`pages::paginate`) och får `uniform_boxes`, så ritningen är gemensam.
+- Tabeller och bilder anpassas till spaltens bredd (tabellplanen och `images::display_size` får spaltbredden;
+  en bild i ett smalare avsnitt kläms mot det avsnittets spalt). Tabellernas kolumnkanter (`TableGeom::col_x`)
+  flyttas med radernas dx.
+- Raderna i olika spalter överlappar i y, som cellerna i en tabell. `secpages::pointer_fix` sätter därför om
+  markören vid klick och drag i flerspaltiga delar (`column_hit`: raden söks bland spaltens egna rader).
+  Upp/Ned går rad för rad i läsordningen (egui räknar radindex), så det går över spaltgränsen utan särskild kod.
+- Citatstreck, fotnotsavskiljare, flytande bilder, innehållsförteckning och bildflytt använder spaltens
+  vänsterkant och bredd (`col_at` i `word_page`).
+
+Begränsningar: en tabell som delas mellan två spalter får bara första radens x för draghandtag och träffyta;
+fotnoterna hamnar sist i dokumentet (som förut).
+
+### Word (`docx.rs`)
+
+Läsning: ett toppnivåstycke med `w:pPr/w:sectPr` slutar ett avsnitt; stycket läses som vanligt och följs av
+en avsnittsrad med **nästa** avsnitts egenskaper (sista avsnittets kommer från brödtextens `w:sectPr`). Egenskaperna
+är `w:pgSz` (w, h, orient), `w:pgMar`, `w:cols` (num, space; olika breda spalter räknas som lika breda) och
+`w:type` (`continuous`; övriga typer blir ny sida) och skrivs bara om de skiljer sig från grundformatet. **Grundformatet
+(sida, sidhuvud, sidfot) läses ur första avsnittets `sectPr`**, inte det sista. `w:br w:type="column"` blir
+`<!-- kladd: spaltbrytning -->`.
+
+Skrivning: en avsnittsrad blir ett tomt stycke med `w:sectPr` (`SECT_PARA`), en spaltbrytning ett stycke med
+`<w:br w:type="column"/>`. `fix_sections` går igenom alla `w:sectPr` i stycken i ordning och `apply_section`
+sätter sida, marginaler, spalter och typ efter avsnitten i texten, och brödtextens `w:sectPr` får sista
+avsnittets. **Är allt redan lika lämnas XML:en orörd**, så orörda dokument sparas byte för byte som förut (en
+avsnittsrad är en enhet, `p|…`, som matchas mot originalets stycke precis som innehållsförteckningen; ett
+ändrat stycke får behålla originalets `w:pPr` med dess `sectPr`). Sidhuvudets/sidfotens referenser läggs i första
+avsnittet om det saknar egna (de ärvs av senare avsnitt), och ändras sidhuvudet byts de i alla avsnitt som hade egna
+(`Source::first_refs`).
+
+### OpenDocument (`odt.rs`)
+
+Skrivning: varje avsnitt som börjar på en ny sida får en sidmall `M1`, `M2` … med eget sidformat, delar sidhuvud
+och sidfot med `Standard`, och stycket efter brytningen får ett automatiskt format med `style:master-page-name`
+(ett tomt bärarstycke före block som inte är stycken, och före ett flerspaltigt avsnitt). **Spalter ligger i ett
+`text:section`** med `style:columns` (LibreOffice jämnar ut dem), som ett löpande byte; spaltbrytning är
+`fo:break-before="column"` (`page` utan spalter). Läsning: ett stycke vars format har `style:master-page-name`
+som skiljer sig från gällande sidmall ger en avsnittsrad med sidmallens mått (och `style:columns` i
+sidformatet), och ett `text:section` med spalter ger en löpande rad före och en som återställer efter.
+ODT sparas inte förlustfritt, så markören följer med bara så långt `render` når.
+
+### PDF och utskrift (`pdf_write.rs`)
+
+`Block::SectionBreak`/`ColumnBreak`; varje sida bär sina mått (`PageOps::geom`) och PDF-sidorna skapas med
+rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_page` går till nästa spalt innan en
+ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
+ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Skillnad mot dokumentläget:
+spalterna före ett löpande byte jämnas **inte** ut i PDF:en.

@@ -115,17 +115,17 @@ fn build(doc: &Document, bytes: &[u8]) -> PdfMeta {
 
 /// Sidans beskärningsruta (användarrymd) och rotation.
 #[derive(Clone, Copy, Debug)]
-struct Geo {
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
+pub(crate) struct Geo {
+    pub(crate) x0: f32,
+    pub(crate) y0: f32,
+    pub(crate) x1: f32,
+    pub(crate) y1: f32,
     /// 0, 90, 180 eller 270 (medurs).
-    rot: u16,
+    pub(crate) rot: u16,
 }
 
 impl Geo {
-    fn of(doc: &Document, page: ObjectId) -> Geo {
+    pub(crate) fn of(doc: &Document, page: ObjectId) -> Geo {
         let rect = |key: &[u8]| inherited(doc, page, key).and_then(|o| rect_of(doc, &o));
         let (x0, y0, x1, y1) = rect(b"CropBox").or_else(|| rect(b"MediaBox")).unwrap_or((0.0, 0.0, 612.0, 792.0));
         let rot = inherited(doc, page, b"Rotate").and_then(|o| o.as_i64().ok()).unwrap_or(0);
@@ -140,7 +140,7 @@ impl Geo {
     }
 
     /// Användarrymd (x, y uppåt) → visningspunkter (origo uppe till vänster, y nedåt).
-    fn point(&self, x: f32, y: f32) -> (f32, f32) {
+    pub(crate) fn point(&self, x: f32, y: f32) -> (f32, f32) {
         let (w, h) = (self.x1 - self.x0, self.y1 - self.y0);
         let (u, v) = (x - self.x0, self.y1 - y); // oroterat, y nedåt
         match self.rot {
@@ -153,7 +153,7 @@ impl Geo {
 
     /// Rektangel i användarrymd (x0, y0, x1, y1) → normaliserad rektangel i visningspunkter,
     /// begränsad till sidan.
-    fn rect(&self, a: (f32, f32, f32, f32)) -> egui::Rect {
+    pub(crate) fn rect(&self, a: (f32, f32, f32, f32)) -> egui::Rect {
         let (ax, ay) = self.point(a.0, a.1);
         let (bx, by) = self.point(a.2, a.3);
         let (w, h) = self.size();
@@ -189,13 +189,13 @@ fn inherited(doc: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
     None
 }
 
-fn num(doc: &Document, o: &Object) -> Option<f32> {
+pub(crate) fn num(doc: &Document, o: &Object) -> Option<f32> {
     let v = doc.dereference(o).ok()?.1.as_float().ok()?;
     v.is_finite().then_some(v)
 }
 
 /// `[x0 y0 x1 y1]` normaliserad (min/max); `None` om tom eller ogiltig.
-fn rect_of(doc: &Document, o: &Object) -> Option<(f32, f32, f32, f32)> {
+pub(crate) fn rect_of(doc: &Document, o: &Object) -> Option<(f32, f32, f32, f32)> {
     let a = o.as_array().ok()?;
     let v: Vec<f32> = a.iter().filter_map(|x| num(doc, x)).collect();
     if v.len() < 4 {
@@ -215,7 +215,7 @@ const PDFDOC_80: [char; 33] = [
 const PDFDOC_18: [char; 8] = ['\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}', '\u{02DC}'];
 
 /// PDF-textsträng: UTF-16BE/LE med BOM, UTF-8 med BOM eller PDFDocEncoding.
-fn decode_text(b: &[u8]) -> String {
+pub(crate) fn decode_text(b: &[u8]) -> String {
     let s: String = if b.starts_with(&[0xFE, 0xFF]) || b.starts_with(&[0xFF, 0xFE]) {
         let le = b[0] == 0xFF;
         let u: Vec<u16> = b[2..]
@@ -571,6 +571,26 @@ fn format_date(s: &str) -> String {
     out
 }
 
+/// Gör om ett datum från `format_date` ("2026-11-12 14:30") till språkets stil: ISO och 24 timmar
+/// på svenska, "Nov 12, 2026 2:30 PM" på engelska. Ofullständiga datum lämnas som de är.
+pub fn display_date(s: &str) -> String {
+    let (day, time) = match s.split_once(' ') {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let nums: Vec<u32> = day.split('-').map_while(|p| p.parse().ok()).collect();
+    let (&[y, mo, d], true) = (nums.as_slice(), day.split('-').count() == 3) else { return s.to_owned() };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return s.to_owned();
+    }
+    let date = crate::i18n::date(y as i32, mo, d);
+    let hm = time.and_then(|t| t.split_once(':')).and_then(|(h, m)| Some((h.parse::<u32>().ok()?, m.parse::<u32>().ok()?)));
+    match hm {
+        Some((h, m)) if h < 24 && m < 60 => format!("{date} {}", crate::i18n::clock(h, m)),
+        _ => date,
+    }
+}
+
 fn parse_version(s: &str) -> Option<(u32, u32)> {
     let (a, b) = s.trim().split_once('.')?;
     Some((a.parse().ok()?, b.parse().ok()?))
@@ -881,6 +901,11 @@ mod tests {
         assert_eq!(format_date("D:2026"), "2026");
         assert_eq!(format_date("D:2026111214"), "2026-11-12 14:00");
         assert_eq!(format_date("igår"), "igår");
+        // Visningsformen är ISO med 24 timmar på svenska (standardspråket i testerna).
+        assert_eq!(display_date("2026-11-12 14:30"), "2026-11-12 14:30");
+        assert_eq!(display_date("2026-11-12"), "2026-11-12");
+        assert_eq!(display_date("2026-11"), "2026-11");
+        assert_eq!(display_date("igår"), "igår");
         assert_eq!(header_version(b"%PDF-1.7\n..."), Some((1, 7)));
         assert_eq!(header_version(b"junk"), None);
         // Katalogens /Version vinner när den är högre än huvudet.

@@ -4,9 +4,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod autosave;
 mod doc;
 mod docx;
+mod docx_styles;
 mod export;
+mod grammar;
+mod grammar_ui;
+mod ocr;
 mod odt;
 mod pdf_read;
 mod pdf_write;
@@ -15,16 +20,26 @@ mod search;
 mod preview;
 mod print;
 mod recovery;
+mod review;
 mod highlight;
+mod history;
+mod history_ui;
+mod i18n;
 mod icons;
 mod keys;
+mod macopen;
+mod multicursor;
 mod paste;
+mod panes;
 mod platform;
 mod single;
 mod spell;
 mod style;
 mod theme;
+mod update;
 mod word;
+mod workspace;
+mod find_files;
 
 use std::path::PathBuf;
 
@@ -38,12 +53,13 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         if s == "--help" || s == "-h" {
-            println!(
+            i18n::set_lang(i18n::LangSetting::Auto.resolve());
+            println!("{}", i18n::t(
                 "Användning: kladd [--new-window] [FIL ...]\n\n\
                  Öppnar filerna i varsin flik. Om Kladd redan är öppet läggs\n\
                  filerna till som nya flikar där.\n\n\
                  -n, --new-window   öppna ett separat fönster"
-            );
+            ));
             return Ok(());
         }
         if s == "--new-window" || s == "-n" {
@@ -60,7 +76,8 @@ fn main() -> eframe::Result {
         if !path.exists() {
             // Skapa filen så att `kladd ny.md` fungerar som i andra editorer.
             if let Err(e) = std::fs::write(&path, "") {
-                eprintln!("kladd: kunde inte skapa {}: {e}", path.display());
+                i18n::set_lang(i18n::LangSetting::Auto.resolve());
+                eprintln!("{}", crate::tf!("kladd: kunde inte skapa {path}: {e}", path = path.display(), e = e));
                 continue;
             }
         }

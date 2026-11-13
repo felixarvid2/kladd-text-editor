@@ -17,6 +17,8 @@ use pulldown_cmark::{CowStr, Event as MdEvent, HeadingLevel, Options, Parser, Ta
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
+use crate::review::{self, CommentRec, RevKind, RevRec};
+use crate::word::sections;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::word::markup::{self, Float};
 
@@ -118,6 +120,12 @@ pub struct Source {
     footnotes: Option<FnPart>,
     /// Sida, sidhuvud och sidfot så som de lästes (övriga fält i DocDefaults är tomma).
     page: DocDefaults,
+    /// Formatmallarna så som de lästes ur `styles.xml` (se `docx_styles`).
+    styles: style::StyleSet,
+    /// Originalets kommentarer (comments.xml), om dokumentet har några.
+    comments: Option<review_xml::CmPart>,
+    /// Sidhuvuds- och sidfotsreferenserna i första avsnittets `w:sectPr` (de gäller också senare avsnitt).
+    first_refs: String,
 }
 
 // ============================================================== läsning
@@ -128,7 +136,7 @@ fn check_entry_count(bytes: &[u8]) -> Result<(), String> {
     const EOCD: &[u8] = b"PK\x05\x06";
     let start = bytes.len().saturating_sub(22 + 65_535);
     let Some(rel) = bytes[start..].windows(4).rposition(|w| w == EOCD) else {
-        return Err("Filen är inte ett giltigt Word-dokument (zip-katalogen saknas).".into());
+        return Err(crate::i18n::t("Filen är inte ett giltigt Word-dokument (zip-katalogen saknas).").into());
     };
     let at = start + rel;
     let total = bytes
@@ -148,12 +156,12 @@ fn check_entry_count(bytes: &[u8]) -> Result<(), String> {
                     .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
                     .unwrap_or(u64::MAX);
                 if n > MAX_ENTRIES {
-                    return Err("Word-dokumentet innehåller orimligt många delar och öppnas inte.".into());
+                    return Err(crate::i18n::t("Word-dokumentet innehåller orimligt många delar och öppnas inte.").into());
                 }
             }
         }
     } else if total > MAX_ENTRIES {
-        return Err("Word-dokumentet innehåller orimligt många delar och öppnas inte.".into());
+        return Err(crate::i18n::t("Word-dokumentet innehåller orimligt många delar och öppnas inte.").into());
     }
     Ok(())
 }
@@ -198,15 +206,15 @@ impl Package<'_> {
         let room = MAX_PART_BYTES.min(MAX_TOTAL_BYTES.saturating_sub(self.total));
         let Ok(mut file) = self.zip.by_name(&real) else { return Ok(None) };
         if file.size() > room {
-            return Err("En del av Word-dokumentet är för stor för att öppnas.".into());
+            return Err(crate::i18n::t("En del av Word-dokumentet är för stor för att öppnas.").into());
         }
         let mut buf = Vec::with_capacity(file.size() as usize);
         let res = file.by_ref().take(room + 1).read_to_end(&mut buf);
         // Räkna det som packats upp även om läsningen misslyckas (jfr WordCraft #3723).
         self.total += buf.len() as u64;
-        res.map_err(|e| format!("Word-dokumentet är skadat: {e}"))?;
+        res.map_err(|e| crate::tf!("Word-dokumentet är skadat: {e}", e = e))?;
         if buf.len() as u64 > room {
-            return Err("En del av Word-dokumentet är för stor för att öppnas.".into());
+            return Err(crate::i18n::t("En del av Word-dokumentet är för stor för att öppnas.").into());
         }
         Ok(Some(buf))
     }
@@ -713,6 +721,8 @@ struct Fmt {
     code: bool,
     /// Typsnitt, storlek och färger som avviker från grundformatet (`<span style="…">`).
     span: SpanStyle,
+    /// Spårad ändring (`w:ins`/`w:del`) som körningen ligger i: slag och ändringens nummer.
+    rev: Option<(RevKind, u32)>,
 }
 
 #[derive(Clone)]
@@ -764,8 +774,8 @@ struct Tbl {
     span: usize,
 }
 
-/// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade ändringar godtas
-/// när ett stycke skrivs om.
+/// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade formateringsändringar
+/// godtas när ett stycke skrivs om (infogningar, raderingar och kommentarer bevaras).
 #[derive(Default)]
 struct Dropped {
     tracked: bool,
@@ -775,7 +785,7 @@ impl Dropped {
     fn list(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.tracked {
-            v.push("spårade ändringar");
+            v.push(crate::i18n::t("spårade formateringsändringar"));
         }
         v
     }
@@ -789,28 +799,36 @@ struct BodyInfo {
     head: String,
     tail: String,
     sect_pr: Option<String>,
+    /// `w:sectPr` i stycken (slut på varje avsnitt utom det sista), i dokumentordning.
+    sects: Vec<String>,
     /// XML för varje toppnivåelement utom `w:sectPr`.
     elems: Vec<String>,
     tokens: Vec<Opaque>,
     /// Fotnotsreferenserna i dokumentordning (referens nummer N är `[^N]`).
     fn_refs: Vec<FnRefInfo>,
+    /// Läs spårade ändringar och kommentarer till Kladds markörer (huvuddokumentet, inte fotnoterna).
+    track: bool,
+    /// Författare och datum per spårad ändring (numret är `data-k`).
+    revs: Vec<RevRec>,
+    /// Kommentarer som har ett område i texten.
+    comment_ids: Vec<u32>,
 }
 
 pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
         return Err(
-            "Dokumentet är lösenordsskyddat eller sparat i det gamla .doc-formatet. Öppna det i Word och spara som .docx utan lösenord."
+            crate::i18n::t("Dokumentet är lösenordsskyddat eller sparat i det gamla .doc-formatet. Öppna det i Word och spara som .docx utan lösenord.")
                 .into(),
         );
     }
     if !bytes.starts_with(b"PK") {
-        return Err("Filen är inte ett Word-dokument (.docx).".into());
+        return Err(crate::i18n::t("Filen är inte ett Word-dokument (.docx).").into());
     }
     if bytes.len() > MAX_FILE_BYTES {
-        return Err("Word-dokumentet är för stort för att öppnas.".into());
+        return Err(crate::i18n::t("Word-dokumentet är för stort för att öppnas.").into());
     }
     check_entry_count(bytes)?;
-    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("Word-dokumentet är skadat: {e}"))?;
+    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| crate::tf!("Word-dokumentet är skadat: {e}", e = e))?;
     let mut pkg = Package { zip, total: 0 };
 
     // Huvuddokumentet pekas ut av paketets relationer.
@@ -825,7 +843,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         .unwrap_or_else(|| "word/document.xml".to_owned());
     let (dir, file) = main.rsplit_once('/').unwrap_or(("", main.as_str()));
     let Some(doc_xml) = pkg.part(&main)? else {
-        return Err("Word-dokumentet saknar sitt huvudinnehåll.".into());
+        return Err(crate::i18n::t("Word-dokumentet saknar sitt huvudinnehåll.").into());
     };
 
     let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
@@ -838,8 +856,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     // Temats typsnitt behövs för `w:asciiTheme` i formatmallarna och texten.
     let theme_part = find_part("/theme").unwrap_or_else(|| "word/theme/theme1.xml".to_owned());
     let theme = pkg.part(&theme_part)?.map(|x| parse_theme(&x)).unwrap_or_default();
+    let mut style_set = style::StyleSet::default();
     let styles = match find_part("/styles") {
-        Some(p) => pkg.part(&p)?.map(|x| parse_styles(&x, &theme)).unwrap_or_default(),
+        Some(p) => pkg
+            .part(&p)?
+            .map(|x| {
+                let kladd = format!("<w:styles>{}</w:styles>", kladd_styles());
+                style_set = crate::docx_styles::read_relative(&x, &|t| theme.font(t), &kladd);
+                parse_styles(&x, &theme)
+            })
+            .unwrap_or_default(),
         None => Styles::default(),
     };
     let numbering = match find_part("/numbering") {
@@ -849,8 +875,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let mut dropped = Dropped::default();
 
     let mut found: Vec<FoundImage> = Vec::new();
-    let mut info = BodyInfo::default();
-    let blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info)?;
+    let mut info = BodyInfo { track: true, ..Default::default() };
+    let mut blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info)?;
+    // Kommentarerna: posterna läggs sist i texten, och bara de som har ett område.
+    let comments = match find_part("/comments") {
+        Some(name) => {
+            let ext = review_xml::ext_rel_target(&rels, dir);
+            review_xml::read_comments(&mut pkg, &name, ext.as_deref())?
+        }
+        None => None,
+    };
 
     // Fotnoterna: texten läses ur footnotes.xml och läggs som definitioner sist i dokumentet.
     let footnotes = match find_part("/footnotes") {
@@ -858,11 +892,14 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         None => None,
     };
 
-    // Sida, sidhuvud och sidfot ur sista sektionen.
-    let page = match info.sect_pr.as_deref() {
+    // Sida, sidhuvud och sidfot ur första avsnittet (de övriga avsnitten blir avsnittsrader).
+    let page = match info.sects.first().or(info.sect_pr.as_ref()) {
         Some(sect) => read_page(sect, &mut pkg, &rels, dir)?,
         None => DocDefaults::default(),
     };
+    let mut all_sects: Vec<&str> = info.sects.iter().map(String::as_str).collect();
+    all_sects.extend(info.sect_pr.as_deref());
+    fill_section_rows(&mut blocks, &all_sects, &page);
 
     // Packa upp bilderna som dokumentet faktiskt använder.
     let mut images: Vec<(String, Image)> = Vec::new();
@@ -882,6 +919,9 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     base.header_align = page.header_align;
     base.footer = page.footer.clone();
     base.footer_align = page.footer_align;
+    base.header_first = page.header_first.clone();
+    base.footer_first = page.footer_first.clone();
+    base.styles = style_set;
     if !info.fn_refs.is_empty() {
         markdown.push('\n');
         for (i, r) in info.fn_refs.iter().enumerate() {
@@ -892,7 +932,19 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
             markdown.push_str(&format!("[^{}]: {md}\n", i + 1));
         }
     }
+    let mut comments = comments;
+    let mut comment_recs: Vec<CommentRec> = Vec::new();
+    if let Some((part, recs)) = comments.as_mut() {
+        comment_recs = recs.iter().filter(|c| info.comment_ids.contains(&c.id)).cloned().collect();
+        part.items.retain(|i| info.comment_ids.contains(&i.id));
+    }
+    if !info.revs.is_empty() || !comment_recs.is_empty() {
+        markdown = review::put_records(&markdown, &info.revs, &comment_recs);
+    }
+    let comments = comments.map(|(p, _)| p);
     let comment = base.to_comment();
+    // Formatmallarna som `write` får tillbaka ur kommentarraden (avrundade som i texten).
+    let read_styles = DocDefaults::from_comment(&comment).map(|d| d.styles).unwrap_or_default();
     if !comment.is_empty() {
         markdown = format!("{comment}\n\n{markdown}");
     }
@@ -948,7 +1000,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 e.fn_ids.push(r.id.clone());
             }
         }
-        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page })
+        let first_refs = info.sects.first().or(info.sect_pr.as_ref()).map(|x| header_refs(x)).unwrap_or_default();
+        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles, comments, first_refs })
     });
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
@@ -1121,6 +1174,91 @@ fn collect_parts(pkg: &mut Package<'_>) -> Option<Vec<(String, Vec<u8>)>> {
     Some(out)
 }
 
+/// Sida, spalter och avsnittstyp ur en `w:sectPr` (utan sidhuvud och sidfot).
+#[derive(Debug, Clone, PartialEq)]
+struct RawSect {
+    size: Option<(f32, f32)>,
+    margin: Option<[f32; 4]>,
+    cols: usize,
+    /// Mellanrum mellan spalter i pt.
+    gap: Option<f32>,
+    continuous: bool,
+}
+
+fn read_sect(sect: &str) -> RawSect {
+    let mut o = RawSect { size: None, margin: None, cols: 1, gap: None, continuous: false };
+    let mut mar = [style::DEFAULT_MARGIN; 4];
+    let mut r = Reader::from_str(sect);
+    let tw = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e) | Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"pgSz" => {
+                    if let (Some(w), Some(h)) = (tw(&e, b"w"), tw(&e, b"h")) {
+                        if w > 0.0 && h > 0.0 {
+                            let (w, h) = (w / 20.0, h / 20.0);
+                            let land = attr(&e, b"orient").as_deref() == Some("landscape");
+                            o.size = Some(if land && w < h { (h, w) } else { (w, h) });
+                        }
+                    }
+                }
+                b"pgMar" => {
+                    for (i, n) in [b"top".as_slice(), b"right", b"bottom", b"left"].into_iter().enumerate() {
+                        if let Some(v) = tw(&e, n) {
+                            mar[i] = (v / 20.0).max(0.0);
+                            o.margin = Some(mar);
+                        }
+                    }
+                }
+                b"cols" => {
+                    o.cols = attr(&e, b"num").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, sections::MAX_COLUMNS);
+                    o.gap = tw(&e, b"space").map(|v| v / 20.0);
+                }
+                // Olika breda spalter: antalet räknas, mellanrummet tas från första spalten.
+                b"col" => {
+                    if o.gap.is_none() {
+                        o.gap = tw(&e, b"space").map(|v| v / 20.0);
+                    }
+                }
+                b"type" => o.continuous = attr(&e, b"val").as_deref() == Some("continuous"),
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    o
+}
+
+/// Avsnittsradens egenskaper för ett avsnitt vars `w:sectPr` är `sect`, mot dokumentets grundformat `d`.
+fn section_props(sect: Option<&str>, d: &DocDefaults) -> sections::SectionProps {
+    let Some(sect) = sect else { return sections::SectionProps::default() };
+    let raw = read_sect(sect);
+    let mut p = sections::SectionProps::default();
+    p.page_size = raw.size.filter(|s| !style::same_size(*s, d.page()));
+    p.page_margin = raw.margin.filter(|m| m.iter().zip(d.margins()).any(|(a, b)| (a - b).abs() > 0.6));
+    if raw.cols > 1 {
+        p.columns = Some(raw.cols);
+        p.column_gap = raw.gap.filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
+    }
+    p.continuous = raw.continuous;
+    p
+}
+
+/// Byter platshållarna i avsnittsraderna mot raderna med respektive avsnitts egenskaper.
+/// `sects[n]` är `w:sectPr` för avsnitt n (0 = första); rad n börjar avsnitt n + 1.
+fn fill_section_rows(blocks: &mut [Block], sects: &[&str], d: &DocDefaults) {
+    for b in blocks {
+        let Block::Para(p) = b else { continue };
+        let [run] = p.runs.as_mut_slice() else { continue };
+        let Some(n) = run.text.strip_prefix('\u{E010}').and_then(|r| r.strip_suffix('\u{E011}')).and_then(|r| r.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        run.text = section_props(sects.get(n + 1).copied(), d).to_comment();
+    }
+}
+
 /// Sidstorlek, marginaler, sidhuvud och sidfot ur en `w:sectPr`.
 fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, String, bool)>, dir: &str) -> Result<DocDefaults, String> {
     let mut d = DocDefaults::default();
@@ -1129,6 +1267,9 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
     let mut has_mar = false;
     let mut hdr: Option<String> = None;
     let mut ftr: Option<String> = None;
+    let mut hdr_first: Option<String> = None;
+    let mut ftr_first: Option<String> = None;
+    let mut title_pg = false;
     let mut r = Reader::from_str(sect);
     let twips = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
     loop {
@@ -1152,14 +1293,17 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
                         }
                     }
                 }
-                b"headerReference" | b"footerReference" if attr(&e, b"type").as_deref() == Some("default") => {
+                b"headerReference" | b"footerReference" if matches!(attr(&e, b"type").as_deref(), Some("default" | "first")) => {
                     let id = attr(&e, b"id");
-                    if local(e.name().as_ref()) == b"headerReference" {
-                        hdr = id;
-                    } else {
-                        ftr = id;
+                    let (header, first) = (local(e.name().as_ref()) == b"headerReference", attr(&e, b"type").as_deref() == Some("first"));
+                    match (header, first) {
+                        (true, false) => hdr = id,
+                        (true, true) => hdr_first = id,
+                        (false, false) => ftr = id,
+                        (false, true) => ftr_first = id,
                     }
                 }
+                b"titlePg" => title_pg = !matches!(attr(&e, b"val").as_deref(), Some("0" | "false" | "off")),
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
@@ -1181,23 +1325,55 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
             }
         }
     }
+    // Annorlunda första sida (`w:titlePg`): en saknad eller oläslig del blir en tom första sida.
+    if title_pg {
+        for (id, header) in [(hdr_first, true), (ftr_first, false)] {
+            let mut found = None;
+            if let Some((target, _, false)) = id.and_then(|i| rels.get(&i)) {
+                if let Some(xml) = pkg.part(&resolve_target(dir, target))? {
+                    found = hf_text(&xml);
+                }
+            }
+            let text = found.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
+            if header {
+                d.header_first = Some(text);
+                if d.header.is_none() {
+                    d.header_align = found.map_or(Align::Left, |(_, a)| a);
+                }
+            } else {
+                d.footer_first = Some(text);
+                if d.footer.is_none() {
+                    d.footer_align = found.map_or(Align::Left, |(_, a)| a);
+                }
+            }
+        }
+    }
     Ok(d)
 }
 
-/// `{sida}` för PAGE och `{sidor}` för NUMPAGES/SECTIONPAGES.
+/// `{sida}` för PAGE, `{sidor}` för NUMPAGES/SECTIONPAGES, `{datum}` för DATE/TIME, `{titel}` för
+/// TITLE och `{fil}` för FILENAME.
 fn field_placeholder(instr: &str) -> Option<&'static str> {
     match instr.split_whitespace().next().map(str::to_ascii_uppercase).as_deref() {
         Some("PAGE") => Some("{sida}"),
         Some("NUMPAGES" | "SECTIONPAGES") => Some("{sidor}"),
+        Some("DATE" | "TIME") => Some("{datum}"),
+        Some("TITLE") => Some("{titel}"),
+        Some("FILENAME") => Some("{fil}"),
         _ => None,
     }
 }
 
-/// Texten i ett sidhuvud eller en sidfot: styckenas text sammanfogad med mellanslag, sidnummerfält
-/// som `{sida}`/`{sidor}`, och det första styckets justering.
+/// Texten i ett sidhuvud eller en sidfot: styckenas text sammanfogad med mellanslag, fält som
+/// `{sida}`/`{sidor}`/`{datum}`/`{titel}`/`{fil}`, och det första styckets justering. Ett enda
+/// stycke med en eller två flikar blir vänster|mitten|höger (`a|b|c`); `|` i texten skrivs `\|`.
 fn hf_text(xml: &str) -> Option<(String, Align)> {
     let mut r = Reader::from_str(xml);
     let mut paras: Vec<String> = Vec::new();
+    // Styckenas delar uppdelade vid flikar, och det senaste styckets egna tabbstopp.
+    let mut para_segs: Vec<Vec<String>> = Vec::new();
+    let mut segs: Vec<String> = Vec::new();
+    let mut tab_stops: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut align: Option<Align> = None;
     let mut seen_p = false;
@@ -1218,6 +1394,8 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
                     b"p" if !empty => {
                         in_p = true;
                         cur.clear();
+                        segs.clear();
+                        tab_stops.clear();
                         if !seen_p {
                             seen_p = true;
                         }
@@ -1226,7 +1404,12 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
                     b"jc" if in_ppr && align.is_none() && paras.is_empty() => align = attr(e, b"val").map(|v| Align::from_jc(&v)),
                     b"t" => in_t = !empty,
                     b"instrText" => in_instr = !empty,
-                    b"tab" if in_p && !in_ppr => cur.push(' '),
+                    b"tab" if in_p && !in_ppr => segs.push(std::mem::take(&mut cur)),
+                    b"tab" if in_ppr => {
+                        if let Some(v) = attr(e, b"val").filter(|v| v != "clear") {
+                            tab_stops.push(v);
+                        }
+                    }
                     b"fldChar" => match attr(e, b"fldCharType").as_deref() {
                         Some("begin") => fields.push((String::new(), false, None)),
                         Some("separate") => {
@@ -1258,9 +1441,18 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
             Event::End(e) => match local(e.name().as_ref()) {
                 b"p" => {
                     if in_p {
-                        let t = cur.trim();
+                        segs.push(std::mem::take(&mut cur));
+                        let parts: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
+                        let t = parts.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
                         if !t.is_empty() {
-                            paras.push(t.to_owned());
+                            paras.push(t);
+                            // Två delar utan egna tabbstopp: Words standard är mitt och höger.
+                            let mut p = parts;
+                            if p.len() == 2 {
+                                let right = tab_stops.len() == 1 && tab_stops[0] == "right";
+                                p = if right { vec![p[0].clone(), String::new(), p[1].clone()] } else { vec![p[0].clone(), p[1].clone(), String::new()] };
+                            }
+                            para_segs.push(p);
                         } else if paras.is_empty() {
                             // Ett tomt första stycke ger ingen justering.
                             align = None;
@@ -1290,6 +1482,11 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
                 }
             }
             _ => {}
+        }
+    }
+    if let [p] = para_segs.as_slice() {
+        if p.len() == 3 {
+            return Some((p.join("|"), Align::Left));
         }
     }
     let text = paras.join(" ");
@@ -1454,6 +1651,19 @@ fn run_span(
 }
 
 /// Slutet (exklusivt) på elementet som börjar vid `from` i `xml`.
+/// Ett stycke med bara en rad råtext (Kladds egna markörer: avsnitt, spaltbrytning).
+fn raw_para(text: String, origin: usize) -> Para {
+    let mut p = Para::new();
+    p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
+    p.origin = origin;
+    p
+}
+
+/// Platshållare för avsnittsraden n; fylls i när alla avsnitts egenskaper lästs.
+fn section_placeholder(n: usize) -> String {
+    format!("\u{E010}{n}\u{E011}")
+}
+
 fn element_end(xml: &str, from: usize) -> Option<usize> {
     let mut r = Reader::from_str(&xml[from..]);
     let mut depth = 0usize;
@@ -1516,6 +1726,9 @@ fn parse_body(
     let mut blocks: Vec<Block> = Vec::new();
 
     let mut para: Option<Para> = None;
+    // Avsnittsslut (`w:sectPr` i `w:pPr`) och spaltbrytning i stycket som läses.
+    let mut para_sect: Option<String> = None;
+    let mut para_col_break = false;
     let mut fmt = Fmt::default();
     // Körningens egna egenskaper (`w:rPr`) och teckenmall (`w:rStyle`).
     let mut direct = RProps::default();
@@ -1545,6 +1758,11 @@ fn parse_body(
     let mut run_found_mark = 0usize;
     let mut omath_start: Option<usize> = None;
     let mut simple_fields: Vec<()> = Vec::new();
+    // Spårade ändringar: öppna `w:ins`/`w:del` och den som gäller just nu.
+    let mut rev_stack: Vec<Option<(RevKind, u32)>> = Vec::new();
+    let mut cur_rev: Option<(RevKind, u32)> = None;
+    // Körningen är bara en kommentarsreferens: den ersätts av områdets slutmarkör.
+    let mut run_drop = false;
     // Bara dokument som nämner en innehållsförteckning behöver sökas igenom efter en.
     let toc_hint = xml.contains("Table of Contents") || xml.contains("TOC");
 
@@ -1562,7 +1780,7 @@ fn parse_body(
 
     loop {
         let before = r.buffer_position() as usize;
-        let ev = r.read_event().map_err(|e| format!("Word-dokumentet innehåller trasig XML: {e}"))?;
+        let ev = r.read_event().map_err(|e| crate::tf!("Word-dokumentet innehåller trasig XML: {e}", e = e))?;
         let after = r.buffer_position() as usize;
         // Toppnivåelementen i w:body sparas som de är.
         match &ev {
@@ -1691,7 +1909,9 @@ fn parse_body(
                     apply_rpr_elem(&mut direct, &name, e, theme);
                 }
                 // Objekt Kladd inte visar: hela körningen blir en markör när den tar slut.
-                if in_run
+                if in_run && name == b"commentReference" && info.track && attr(e, b"id").is_some() {
+                    run_drop = true;
+                } else if in_run
                     && matches!(
                         name.as_slice(),
                         b"endnoteReference" | b"commentReference" | b"fldChar" | b"instrText" | b"sym" | b"object"
@@ -1731,6 +1951,18 @@ fn parse_body(
                         }
                     }
                     // Bokmärken och kommentarsankare mellan körningar.
+                    b"commentRangeStart" | b"commentRangeEnd"
+                        if info.track && empty && !in_run && para.is_some() && attr(e, b"id").and_then(|v| v.parse::<u32>().ok()).is_some() =>
+                    {
+                        let id = attr(e, b"id").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                        let start = name == b"commentRangeStart";
+                        if start && !info.comment_ids.contains(&id) {
+                            info.comment_ids.push(id);
+                        }
+                        let text = if start { review::marker_start(id) } else { review::marker_end(id) };
+                        let p = para.get_or_insert_with(Para::new);
+                        p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
+                    }
                     b"bookmarkStart" | b"bookmarkEnd" | b"commentRangeStart" | b"commentRangeEnd" | b"permStart" | b"permEnd"
                         if empty && !in_run && para.is_some() =>
                     {
@@ -1747,16 +1979,45 @@ fn parse_body(
                         push_token(&mut para, info, &begin);
                         simple_fields.push(());
                     }
+                    // Spårade ändringar runt körningar (inte styckemarkeringens `w:ins`/`w:del` i `w:rPr`).
+                    b"ins" | b"del" | b"moveTo" | b"moveFrom" if info.track && !empty && !in_rpr && !in_ppr => {
+                        let kind = if matches!(name.as_slice(), b"ins" | b"moveTo") { RevKind::Ins } else { RevKind::Del };
+                        let id = info.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+                        info.revs.push(RevRec { id, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default() });
+                        cur_rev = Some((kind, id));
+                        rev_stack.push(cur_rev);
+                    }
                     b"del" | b"moveFrom" => {
+                        if !empty && !in_rpr && !in_ppr {
+                            skip = 1;
+                        }
+                    }
+                    b"ins" | b"moveTo" => {}
+                    b"pPrChange" | b"rPrChange" => {
                         dropped.tracked = true;
                         if !empty {
                             skip = 1;
                         }
                     }
-                    b"ins" | b"moveTo" => dropped.tracked = true,
-                    b"sdtPr" | b"sdtEndPr" | b"instrText" | b"delText" | b"pPrChange" | b"rPrChange"
-                    | b"sectPr" | b"tblPr" | b"trPr" | b"fldData" => {
+                    // Avsnittsslut i ett toppnivåstycke: egenskaperna blir en avsnittsrad efter stycket.
+                    b"sectPr" if in_ppr && tables.is_empty() && para.is_some() && para_sect.is_none() => {
+                        if empty {
+                            para_sect = Some(xml[before..after].to_owned());
+                        } else if let Some(end) = element_end(xml, before) {
+                            para_sect = Some(xml[before..end].to_owned());
+                            skip = 1;
+                        }
+                    }
+                    b"sdtPr" | b"sdtEndPr" | b"instrText" | b"sectPr" | b"tblPr" | b"trPr" | b"fldData" => {
                         if !empty {
+                            skip = 1;
+                        }
+                    }
+                    // Raderad text ligger i `w:delText`; utan spårning är den borta redan.
+                    b"delText" => {
+                        if info.track {
+                            in_t = !empty;
+                        } else if !empty {
                             skip = 1;
                         }
                     }
@@ -1821,8 +2082,10 @@ fn parse_body(
                             run_opaque = false;
                             run_mark = para.as_ref().map_or((0, 0), |p| (p.runs.len(), p.runs.last().map_or(0, |l| l.text.len())));
                             run_found_mark = found.len();
+                            run_drop = false;
                         }
                         fmt = Fmt::default();
+                        fmt.rev = cur_rev;
                         direct = RProps::default();
                         run_rstyle = None;
                         let linked = link.last().is_some_and(Option::is_some);
@@ -1855,6 +2118,9 @@ fn parse_body(
                     b"t" => in_t = !empty,
                     b"tab" if !in_ppr && para.is_some() && !hidden(&field_depth) => {
                         push_text(&mut para, "\t", &fmt, &link.last().cloned().flatten())
+                    }
+                    b"br" if !hidden(&field_depth) && attr(e, b"type").as_deref() == Some("column") && tables.is_empty() => {
+                        para_col_break = true;
                     }
                     b"br" | b"cr" if !hidden(&field_depth) => {
                         push_text(&mut para, "\n", &Fmt::default(), &None);
@@ -1966,14 +2232,25 @@ fn parse_body(
                             fmt.span = run_span(styles, &base, para.as_ref(), &direct, run_rstyle.as_deref(), linked, fmt.code);
                         }
                     }
-                    b"t" => in_t = false,
+                    b"t" | b"delText" => in_t = false,
+                    b"ins" | b"del" | b"moveTo" | b"moveFrom" if info.track && !in_rpr && !in_ppr && rev_stack.pop().is_some() => {
+                        cur_rev = rev_stack.last().copied().flatten();
+                    }
                     b"r" => {
                         fmt = Fmt::default();
                         if in_run {
                             in_run = false;
                             let run_xml = &xml[run_start..after];
                             let fnref = run_fnref.take();
-                            if let (false, Some(id)) = (run_opaque, fnref) {
+                            if run_drop && !run_opaque {
+                                // Kommentarsreferensen: det som står kvar är slutmarkören före den.
+                                if let Some(p) = para.as_mut() {
+                                    p.runs.truncate(run_mark.0);
+                                    if let Some(l) = p.runs.last_mut() {
+                                        l.text.truncate(run_mark.1);
+                                    }
+                                }
+                            } else if let (false, Some(id)) = (run_opaque, fnref) {
                                 // Backa körningen och lägg `[^N]` i stället; N räknas i dokumentordning.
                                 if let Some(p) = para.as_mut() {
                                     p.runs.truncate(run_mark.0);
@@ -2002,6 +2279,7 @@ fn parse_body(
                                 }
                             }
                             run_opaque = false;
+                            run_drop = false;
                         }
                     }
                     b"fldSimple" => {
@@ -2039,8 +2317,20 @@ fn parse_body(
                                 }
                             } else {
                                 p.origin = info.elems.len().wrapping_sub(1);
+                                // Spaltbrytning före stycket (eller ensam), avsnittsrad efter det.
+                                let origin = p.origin;
+                                if std::mem::take(&mut para_col_break) {
+                                    blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
+                                }
                                 blocks.push(Block::Para(p));
+                                if let Some(x) = para_sect.take() {
+                                    info.sects.push(x);
+                                    blocks.push(Block::Para(raw_para(section_placeholder(info.sects.len() - 1), origin)));
+                                }
                             }
+                        } else {
+                            para_sect = None;
+                            para_col_break = false;
                         }
                     }
                     b"tc" => {
@@ -2200,6 +2490,9 @@ fn inline_md(run: &Run) -> String {
         if let Some(url) = &run.link {
             s = format!("[{s}]({})", url.replace(' ', "%20").replace(')', "%29"));
         }
+        if let Some((kind, id)) = run.fmt.rev {
+            s = format!("{}{s}{}", review::open_tag(kind, id), review::close_tag(kind));
+        }
         parts.push(s);
     }
     parts.concat()
@@ -2302,8 +2595,15 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 if without_tokens(&text).trim().is_empty() {
                     continue;
                 }
-                // Kodblock justeras inte.
-                let align = if p.kind == ParaKind::Code { Align::Left } else { p.align };
+                // Kodblock justeras inte; Kladds egna markörrader följer omgivningen.
+                let is_marker = matches!(p.runs.as_slice(), [r] if r.raw && r.text.starts_with("<!-- kladd:"));
+                let align = if p.kind == ParaKind::Code {
+                    Align::Left
+                } else if is_marker {
+                    cur_align
+                } else {
+                    p.align
+                };
                 let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_));
                 let same_list = match &p.list {
                     Some((num, 0)) => top_num.as_deref() == Some(num.as_str()),
@@ -2477,6 +2777,12 @@ struct Ctx<'a> {
     links: Vec<(String, String)>,
     /// Befintliga bilder: (relations-id, innehåll).
     media: Vec<(String, &'a [u8])>,
+    /// Författare och datum per spårad ändring (efter `data-k`).
+    revs: HashMap<u32, RevRec>,
+    /// Kommentarer som finns som poster (områden utan post skrivs inte).
+    comments: std::collections::HashSet<u32>,
+    /// Första avsnittsraden står före all text och gäller första avsnittet (ingen sektionsbrytning).
+    lead_section: bool,
 }
 
 /// En enhet i den skrivna brödtexten (stycke, listpunkt, tabell …) som kan bytas mot originalet.
@@ -2525,6 +2831,13 @@ struct Writer<'a> {
     in_footnote: bool,
     /// Antal innehållsförteckningar skrivna hittills (för unika id).
     toc_n: u32,
+    /// Öppen `<ins>`/`<del>`.
+    rev: Option<(RevKind, u32)>,
+    /// Nästa `w:id` för en skriven ändring.
+    rev_next: u32,
+    /// Kommentarsområden som redan skrivits (ett område får bara finnas en gång).
+    c_started: std::collections::HashSet<u32>,
+    c_ended: std::collections::HashSet<u32>,
 }
 
 /// En fotnotsdefinition som skrivits ur Markdown.
@@ -2581,6 +2894,10 @@ impl<'a> Writer<'a> {
             fn_order: Vec::new(),
             in_footnote: false,
             toc_n: 0,
+            rev: None,
+            rev_next: 5_000_000,
+            c_started: Default::default(),
+            c_ended: Default::default(),
         }
     }
 
@@ -2817,6 +3134,22 @@ impl<'a> Writer<'a> {
             }
         }
         xml.push_str("</w:r>");
+        if let Some((kind, id)) = self.rev {
+            let rec = self.ctx.revs.get(&id).cloned().unwrap_or_else(|| RevRec { id, author: "Okänd".into(), date: String::new() });
+            let (tag, ins) = match kind {
+                RevKind::Ins => ("w:ins", true),
+                RevKind::Del => ("w:del", false),
+            };
+            if !ins {
+                xml = xml.replace("<w:t ", "<w:delText ").replace("</w:t>", "</w:delText>");
+            }
+            let (mut a, mut d) = (String::new(), String::new());
+            xml_escape(&rec.author, &mut a);
+            xml_escape(&rec.date, &mut d);
+            let date = if d.is_empty() { String::new() } else { format!(" w:date=\"{d}\"") };
+            self.rev_next += 1;
+            xml = format!("<{tag} w:id=\"{}\" w:author=\"{a}\"{date}>{xml}</{tag}>", self.rev_next);
+        }
         if let Some(url) = self.fmt.link.clone() {
             let id = self.link_rel(&url);
             self.body.push_str(&format!("<w:hyperlink xmlns:r=\"{R_NS}\" r:id=\"{id}\" w:history=\"1\">{xml}</w:hyperlink>"));
@@ -2842,6 +3175,25 @@ impl<'a> Writer<'a> {
         if n < self.ctx.tokens {
             self.open_para();
             self.body.push_str(&marker(n));
+        }
+    }
+
+    /// Kommentarsområdets början eller slut (med referensen efter slutet).
+    fn comment_marker(&mut self, start: bool, id: u32) {
+        if self.in_footnote || !self.ctx.comments.contains(&id) {
+            return;
+        }
+        if start {
+            if !self.c_started.insert(id) {
+                return;
+            }
+            self.open_para();
+            self.body.push_str(&format!("<w:commentRangeStart w:id=\"{id}\"/>"));
+        } else if self.c_started.contains(&id) && self.c_ended.insert(id) {
+            self.open_para();
+            self.body.push_str(&format!(
+                "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr><w:commentReference w:id=\"{id}\"/></w:r>"
+            ));
         }
     }
 
@@ -3315,11 +3667,28 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     for n in ns {
                         w.token(n);
                     }
+                } else if let Some((start, id)) = review::parse_marker(s.trim()) {
+                    w.comment_marker(start, id);
+                } else if let Some(open) = review::parse_open_tag(s.trim()) {
+                    w.rev = Some(open);
+                } else if review::is_close_tag(s.trim()) {
+                    w.rev = None;
                 } else if let Some(img) = parse_img(&s) {
                     w.image_ref(&img.src, &img.alt, (img.width, img.height), img.align, resolve);
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.toc(md);
+                } else if sections::SectionProps::from_comment(&s).is_some() && w.table.is_none() && w.quote == 0 {
+                    // Avsnittsslut: ett tomt stycke med `w:sectPr` (egenskaperna sätts av `fix_sections`).
+                    w.close_para();
+                    if std::mem::take(&mut w.ctx.lead_section) {
+                        // Första avsnittets egenskaper: ingen brytning.
+                    } else {
+                        w.body.push_str(SECT_PARA);
+                    }
+                } else if sections::is_column_break(&s) && w.table.is_none() && w.quote == 0 {
+                    w.close_para();
+                    w.body.push_str("<w:p><w:r><w:br w:type=\"column\"/></w:r></w:p>");
                 } else if s.trim().eq_ignore_ascii_case("<br>") || s.trim().eq_ignore_ascii_case("<br/>") {
                     w.line_break();
                 } else if let Some(style) = style::parse_span_open(&s) {
@@ -3377,7 +3746,9 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         // Ett HTML-block är bara en enhet när det är en ensam bild.
                         let ok = code != EvEnd::Html
                             || (key.to_ascii_lowercase().starts_with("<img") && !key.contains('\n'))
-                            || key == crate::word::nav::TOC_LINE;
+                            || key == crate::word::nav::TOC_LINE
+                            || sections::SectionProps::from_comment(&key).is_some()
+                            || sections::is_column_break(&key);
                         if ok && !key.is_empty() {
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
                         }
@@ -3678,14 +4049,14 @@ fn edit_tag(x: &str, start: &str, f: impl Fn(&str) -> String) -> String {
 }
 
 /// Tar bort `w:headerReference`/`w:footerReference` av typen "default".
-fn remove_default_ref(x: &str, tag: &str) -> String {
+fn remove_default_ref(x: &str, tag: &str, ty: &str) -> String {
     let mut out = String::new();
     let mut rest = x;
     while let Some(i) = rest.find(tag) {
         let Some(j) = rest[i..].find('>') else { break };
         let one = &rest[i..i + j + 1];
         out.push_str(&rest[..i]);
-        if !one.contains("w:type=\"default\"") {
+        if !one.contains(&format!("w:type=\"{ty}\"")) {
             out.push_str(one);
         }
         rest = &rest[i + j + 1..];
@@ -3694,9 +4065,25 @@ fn remove_default_ref(x: &str, tag: &str) -> String {
     out
 }
 
-/// Anpassar originalets `w:sectPr` efter ändrad sida (`page`) eller ändrat sidhuvud/sidfot
-/// (`Some(None)` tar bort standardreferensen, `Some(Some(id))` byter den).
-fn patch_sect(orig: &str, d: &DocDefaults, page: bool, hdr: Option<Option<&str>>, ftr: Option<Option<&str>>) -> String {
+/// Ändringar av sidhuvud och sidfot i en sektion: `Some(None)` tar bort referensen, `Some(Some(id))`
+/// byter den. `title_pg` slår på eller av annorlunda första sida.
+#[derive(Default)]
+struct SectEdit {
+    hdr: Option<Option<String>>,
+    hdr_first: Option<Option<String>>,
+    ftr: Option<Option<String>>,
+    ftr_first: Option<Option<String>>,
+    title_pg: Option<bool>,
+}
+
+impl SectEdit {
+    fn is_empty(&self) -> bool {
+        self.hdr.is_none() && self.hdr_first.is_none() && self.ftr.is_none() && self.ftr_first.is_none() && self.title_pg.is_none()
+    }
+}
+
+/// Anpassar originalets `w:sectPr` efter ändrad sida (`page`) eller ändrat sidhuvud/sidfot.
+fn patch_sect(orig: &str, d: &DocDefaults, page: bool, edit: &SectEdit) -> String {
     let mut x = orig.to_owned();
     if x.trim_end().ends_with("/>") && !x.contains("</w:sectPr>") {
         x = format!("{}></w:sectPr>", x.trim_end().trim_end_matches("/>").trim_end());
@@ -3717,38 +4104,280 @@ fn patch_sect(orig: &str, d: &DocDefaults, page: bool, hdr: Option<Option<&str>>
             t
         });
     }
-    for (tag, change) in [("<w:footerReference", ftr), ("<w:headerReference", hdr)] {
-        let Some(new) = change else { continue };
-        x = remove_default_ref(&x, tag);
+    for (tag, ty, change) in [
+        ("<w:footerReference", "first", &edit.ftr_first),
+        ("<w:headerReference", "first", &edit.hdr_first),
+        ("<w:footerReference", "default", &edit.ftr),
+        ("<w:headerReference", "default", &edit.hdr),
+    ] {
+        let Some(new) = change.as_ref() else { continue };
+        x = remove_default_ref(&x, tag, ty);
         if let Some(rid) = new {
             if let Some(open_end) = x.find('>') {
-                x.insert_str(open_end + 1, &format!("{tag} w:type=\"default\" r:id=\"{rid}\"/>"));
+                x.insert_str(open_end + 1, &format!("{tag} w:type=\"{ty}\" r:id=\"{rid}\"/>"));
             }
+        }
+    }
+    if let Some(on) = edit.title_pg {
+        x = remove_title_pg(&x);
+        if on {
+            x = insert_title_pg(&x);
         }
     }
     x
 }
 
+/// Lägger `<w:titlePg/>` på rätt plats i en sektion.
+fn insert_title_pg(x: &str) -> String {
+    // `w:titlePg` står före textriktning, `w:docGrid` m.fl. i schemat.
+    let at = ["<w:textDirection", "<w:bidi", "<w:rtlGutter", "<w:docGrid", "<w:printerSettings", "</w:sectPr>"]
+        .iter()
+        .filter_map(|m| x.find(m))
+        .min();
+    match at {
+        Some(at) => format!("{}<w:titlePg/>{}", &x[..at], &x[at..]),
+        None => x.to_owned(),
+    }
+}
+
+/// Tar bort `<w:titlePg …/>` ur en sektion.
+fn remove_title_pg(x: &str) -> String {
+    let Some(i) = x.find("<w:titlePg") else { return x.to_owned() };
+    let Some(j) = x[i..].find('>') else { return x.to_owned() };
+    format!("{}{}", &x[..i], &x[i + j + 1..])
+}
+
+/// Relations-id:n för sidhuvuden och sidfötter som ska refereras.
+#[derive(Default)]
+struct HfRefs {
+    hdr: Option<String>,
+    hdr_first: Option<String>,
+    ftr: Option<String>,
+    ftr_first: Option<String>,
+}
+
+impl HfRefs {
+    /// Skriver de delar av `d` som har text och ger deras id:n.
+    fn make(extras: &mut Extras, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> HfRefs {
+        let mut one = |header: bool, text: Option<&str>| text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, d, f, ids, taken));
+        HfRefs {
+            hdr: one(true, d.header.as_deref()),
+            hdr_first: one(true, d.header_first.as_deref()),
+            ftr: one(false, d.footer.as_deref()),
+            ftr_first: one(false, d.footer_first.as_deref()),
+        }
+    }
+}
+
+/// Tomt stycke som avslutar ett avsnitt; `fix_sections` fyller i egenskaperna.
+const SECT_PARA: &str = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:pPr></w:p>";
+
+fn same_pt(a: f32, b: f32, tol: f32) -> bool {
+    (a - b).abs() <= tol
+}
+
+/// Tar bort första taggen som börjar med `start` (`<w:type`), hela elementet om det har innehåll.
+fn remove_tag(x: &str, start: &str) -> String {
+    let Some(i) = x.find(start) else { return x.to_owned() };
+    let Some(j) = x[i..].find('>') else { return x.to_owned() };
+    let mut end = i + j + 1;
+    if !x[i..end].ends_with("/>") {
+        let close = format!("</{}>", &start[1..]);
+        if let Some(k) = x[end..].find(&close) {
+            end += k + close.len();
+        }
+    }
+    format!("{}{}", &x[..i], &x[end..])
+}
+
+/// Sätter sida, marginaler, spalter och avsnittstyp i en `w:sectPr` efter avsnittet `sec`. Är allt
+/// redan lika lämnas XML:en orörd (förlustfri sparning). `refs` = sidhuvud- och sidfotsreferenser att
+/// lägga först om `x` saknar egna (första avsnittet när brödtextens sectPr bär dem).
+fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> String {
+    let raw = read_sect(orig);
+    let (w, h) = sec.page;
+    let size_ok = raw.size.is_some_and(|(rw, rh)| same_pt(rw, w, 1.0) && same_pt(rh, h, 1.0));
+    let mar_ok = raw.margin.is_some_and(|m| m.iter().zip(sec.margin).all(|(a, b)| same_pt(*a, b, 0.6)));
+    let cols_ok = raw.cols == sec.columns && (sec.columns == 1 || raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)));
+    let type_ok = raw.continuous == sec.continuous;
+    let refs_add = refs.filter(|r| !r.is_empty() && !orig.contains("headerReference") && !orig.contains("footerReference"));
+    if size_ok && mar_ok && cols_ok && type_ok && refs_add.is_none() {
+        return orig.to_owned();
+    }
+    let mut x = orig.to_owned();
+    if x.trim_end().ends_with("/>") && !x.contains("</w:sectPr>") {
+        x = format!("{}></w:sectPr>", x.trim_end().trim_end_matches("/>").trim_end());
+    }
+    if !size_ok {
+        x = edit_tag(&x, "<w:pgSz", |t| {
+            let t = set_xml_attr(t, "w:w", &twips(w).to_string());
+            let t = set_xml_attr(&t, "w:h", &twips(h).to_string());
+            if w > h { set_xml_attr(&t, "w:orient", "landscape") } else { remove_xml_attr(&t, "w:orient") }
+        });
+    }
+    if !mar_ok {
+        x = edit_tag(&x, "<w:pgMar", |t| {
+            let mut t = t.to_owned();
+            for (n, v) in ["top", "right", "bottom", "left"].into_iter().zip(sec.margin) {
+                t = set_xml_attr(&t, &format!("w:{n}"), &twips(v).to_string());
+            }
+            for n in ["header", "footer"] {
+                if !t.contains(&format!("w:{n}=")) {
+                    t = set_xml_attr(&t, &format!("w:{n}"), "708");
+                }
+            }
+            if !t.contains("w:gutter=") {
+                t = set_xml_attr(&t, "w:gutter", "0");
+            }
+            t
+        });
+    }
+    if !cols_ok {
+        x = remove_tag(&x, "<w:cols");
+        let cols = if sec.columns > 1 {
+            format!("<w:cols w:num=\"{}\" w:space=\"{}\"/>", sec.columns, twips(sec.gap))
+        } else {
+            "<w:cols w:space=\"708\"/>".to_owned()
+        };
+        // Schemat: cols kommer efter pgMar och före docGrid.
+        x = if x.contains("<w:docGrid") {
+            insert_before(&x, "<w:docGrid", &cols)
+        } else {
+            insert_before(&x, "</w:sectPr>", &cols)
+        };
+    }
+    if !type_ok {
+        x = remove_tag(&x, "<w:type");
+        if sec.continuous {
+            let tag = "<w:type w:val=\"continuous\"/>";
+            x = if x.contains("<w:pgSz") { insert_before(&x, "<w:pgSz", tag) } else { insert_before(&x, "</w:sectPr>", tag) };
+        }
+    }
+    if let Some(r) = refs_add {
+        if let Some(open_end) = x.find('>') {
+            x.insert_str(open_end + 1, r);
+        }
+        if r.contains("w:type=\"first\"") && !x.contains("<w:titlePg") {
+            x = insert_title_pg(&x);
+        }
+    }
+    x
+}
+
+/// Alla sidhuvuds- och sidfotsreferenser (standard och första sida) i en `w:sectPr`.
+fn header_refs(sect: &str) -> String {
+    let mut out = String::new();
+    for tag in ["<w:headerReference", "<w:footerReference"] {
+        let mut rest = sect;
+        while let Some(i) = rest.find(tag) {
+            let Some(j) = rest[i..].find('>') else { break };
+            let one = &rest[i..i + j + 1];
+            if one.contains("w:type=\"default\"") || one.contains("w:type=\"first\"") {
+                out.push_str(one);
+            }
+            rest = &rest[i + j + 1..];
+        }
+    }
+    out
+}
+
+/// Referenserna för sektionen `sect` med originalets första avsnitt (`base`) som reserv per plats:
+/// en plats som ändrats (`changed`: huvud, huvud första, fot, fot första) tas bara från `sect`.
+fn merge_refs(sect: &str, base: &str, changed: [bool; 4]) -> String {
+    let (own, old) = (header_refs(sect), base);
+    let mut out = String::new();
+    for (k, (tag, ty)) in [("<w:headerReference", "default"), ("<w:headerReference", "first"), ("<w:footerReference", "default"), ("<w:footerReference", "first")].into_iter().enumerate() {
+        let pick = |from: &str| {
+            let mut rest = from;
+            while let Some(i) = rest.find(tag) {
+                let Some(j) = rest[i..].find('>') else { break };
+                let one = &rest[i..i + j + 1];
+                if one.contains(&format!("w:type=\"{ty}\"")) {
+                    return Some(one.to_owned());
+                }
+                rest = &rest[i + j + 1..];
+            }
+            None
+        };
+        if let Some(one) = pick(&own).or_else(|| if changed[k] { None } else { pick(old) }) {
+            out.push_str(&one);
+        }
+    }
+    out
+}
+
+/// Sätter egenskaperna för avsnittens slut (`w:sectPr` i stycken, i ordning) efter avsnitten i texten.
+/// `refs` = sidhuvuds- och sidfotsreferenserna som också ska gälla första avsnittet om det saknar egna.
+fn fix_sections(body: &str, secs: &[sections::Section], refs: &str, replace_refs: bool) -> String {
+    if secs.len() < 2 || !body.contains("<w:sectPr") {
+        return body.to_owned();
+    }
+    let mut out = String::with_capacity(body.len() + 256);
+    let mut rest = body;
+    let mut k = 0;
+    while let Some(i) = rest.find("<w:sectPr") {
+        let Some(j) = rest[i..].find('>') else { break };
+        let open_end = i + j + 1;
+        let end = if rest[i..open_end].ends_with("/>") {
+            open_end
+        } else {
+            match rest[open_end..].find("</w:sectPr>") {
+                Some(e) => open_end + e + "</w:sectPr>".len(),
+                None => break,
+            }
+        };
+        out.push_str(&rest[..i]);
+        let mut one = rest[i..end].to_owned();
+        // Ändrat sidhuvud eller sidfot gäller alla avsnitt som hade egna referenser.
+        if replace_refs && !one.ends_with("/>") && (one.contains("<w:headerReference") || one.contains("<w:footerReference")) {
+            for (tag, ty) in [("<w:headerReference", "default"), ("<w:headerReference", "first"), ("<w:footerReference", "default"), ("<w:footerReference", "first")] {
+                one = remove_default_ref(&one, tag, ty);
+            }
+            if let Some(oe) = one.find('>') {
+                one.insert_str(oe + 1, refs);
+            }
+            one = remove_title_pg(&one);
+            if refs.contains("w:type=\"first\"") {
+                one = insert_title_pg(&one);
+            }
+        }
+        let one = one.as_str();
+        match secs.get(k).filter(|_| k + 1 < secs.len()) {
+            Some(sec) => out.push_str(&apply_section(one, sec, (k == 0).then_some(refs))),
+            None => out.push_str(one),
+        }
+        rest = &rest[end..];
+        k += 1;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Ny `w:sectPr` av DocDefaults.
-fn sect_pr_new(d: &DocDefaults, hdr: Option<&str>, ftr: Option<&str>) -> String {
+fn sect_pr_new(d: &DocDefaults, refs: &HfRefs) -> String {
     let (w, h) = d.page();
     let m = d.margins();
     let mut s = String::from("<w:sectPr>");
-    if let Some(id) = hdr {
-        s.push_str(&format!("<w:headerReference w:type=\"default\" r:id=\"{id}\"/>"));
-    }
-    if let Some(id) = ftr {
-        s.push_str(&format!("<w:footerReference w:type=\"default\" r:id=\"{id}\"/>"));
+    for (tag, ty, id) in [
+        ("header", "default", &refs.hdr),
+        ("header", "first", &refs.hdr_first),
+        ("footer", "default", &refs.ftr),
+        ("footer", "first", &refs.ftr_first),
+    ] {
+        if let Some(id) = id {
+            s.push_str(&format!("<w:{tag}Reference w:type=\"{ty}\" r:id=\"{id}\"/>"));
+        }
     }
     let orient = if w > h { " w:orient=\"landscape\"" } else { "" };
     s.push_str(&format!(
-        "<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/><w:cols w:space=\"708\"/></w:sectPr>",
+        "<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/><w:cols w:space=\"708\"/>{title_pg}</w:sectPr>",
         twips(w),
         twips(h),
         twips(m[0]),
         twips(m[1]),
         twips(m[2]),
-        twips(m[3])
+        twips(m[3]),
+        title_pg = if d.different_first() { "<w:titlePg/>" } else { "" }
     ));
     s
 }
@@ -3760,17 +4389,21 @@ fn field_runs(instr: &str, shown: &str) -> String {
     )
 }
 
-/// Ett sidhuvud (`hdr`) eller en sidfot (`ftr`) med ett stycke; `{sida}`/`{sidor}` blir fält.
-fn hf_part(root: &str, text: &str, align: Align) -> String {
+/// Körningar för en text där fälten (`{sida}` …) blir Word-fält med värdena i `f` som förhandsvisning.
+fn hf_runs(text: &str, f: &style::Fields) -> String {
+    let fields: [(&str, &str, String); 5] = [
+        ("{sida}", "PAGE", f.page.to_string()),
+        ("{sidor}", "NUMPAGES", f.pages.to_string()),
+        ("{datum}", "DATE \\@ \"yyyy-MM-dd\"", f.date.clone()),
+        ("{titel}", "TITLE", f.title.clone()),
+        ("{fil}", "FILENAME", f.file.clone()),
+    ];
     let mut runs = String::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let next = [("{sida}", "PAGE", "1"), ("{sidor}", "NUMPAGES", "1")]
-            .into_iter()
-            .filter_map(|(p, i, sh)| rest.find(p).map(|at| (at, p, i, sh)))
-            .min_by_key(|(at, ..)| *at);
+        let next = fields.iter().filter_map(|(p, i, sh)| rest.find(p).map(|at| (at, p.len(), i, sh))).min_by_key(|(at, ..)| *at);
         let (plain, field) = match next {
-            Some((at, p, i, sh)) => (&rest[..at], Some((p.len(), i, sh))),
+            Some((at, len, i, sh)) => (&rest[..at], Some((len, i, sh))),
             None => (rest, None),
         };
         if !plain.is_empty() {
@@ -3780,14 +4413,33 @@ fn hf_part(root: &str, text: &str, align: Align) -> String {
         }
         match field {
             Some((len, i, sh)) => {
-                runs.push_str(&field_runs(i, sh));
+                let mut shown = String::new();
+                xml_escape(sh, &mut shown);
+                runs.push_str(&field_runs(i, &shown));
                 rest = &rest[plain.len() + len..];
             }
             None => rest = "",
         }
     }
-    let jc = if align == Align::Left { String::new() } else { format!("<w:pPr><w:jc w:val=\"{}\"/></w:pPr>", align.as_jc()) };
-    format!("{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p>{jc}{runs}</w:p></w:{root}>")
+    runs
+}
+
+/// Ett sidhuvud (`hdr`) eller en sidfot (`ftr`) med ett stycke. Fälten blir Word-fält; en mall med
+/// `|` blir vänster, mitten och höger med flikar (mitt och höger tabbstopp över textbredden
+/// `text_w` i twips).
+fn hf_part(root: &str, template: &str, align: Align, text_w: i64, f: &style::Fields) -> String {
+    let (ppr, runs) = if style::split_parts(template).is_some() {
+        let p = style::parts_of(template, align);
+        let tab = "<w:r><w:tab/></w:r>";
+        let ppr = format!("<w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\"{}\"/><w:tab w:val=\"right\" w:pos=\"{text_w}\"/></w:tabs></w:pPr>", text_w / 2);
+        (ppr, format!("{}{tab}{}{tab}{}", hf_runs(&p[0], f), hf_runs(&p[1], f), hf_runs(&p[2], f)))
+    } else {
+        let [l, c, r] = style::parts_of(template, align);
+        let text = [l, c, r].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+        let ppr = if align == Align::Left { String::new() } else { format!("<w:pPr><w:jc w:val=\"{}\"/></w:pPr>", align.as_jc()) };
+        (ppr, hf_runs(&text, f))
+    };
+    format!("{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p>{ppr}{runs}</w:p></w:{root}>")
 }
 
 /// Delar som läggs till i ett paket: relationer, innehållstyper och nya filer.
@@ -3800,7 +4452,9 @@ struct Extras {
 
 impl Extras {
     /// Lägger till sidhuvud/sidfot och ger dess relations-id.
-    fn header_footer(&mut self, header: bool, text: &str, align: Align, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> String {
+    fn header_footer(&mut self, header: bool, text: &str, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> String {
+        let align = if header { d.header_align } else { d.footer_align };
+        let text_w = twips(((d.page().0 - d.margins()[1] - d.margins()[3]).max(36.0)) as f32) as i64;
         let (stem, root, kind, mime) = if header {
             ("header", "hdr", "header", "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml")
         } else {
@@ -3824,7 +4478,7 @@ impl Extras {
         };
         self.rels.push_str(&format!(r#"<Relationship Id="{rid}" Type="{REL_NS}/{kind}" Target="{stem}{n}.xml"/>"#));
         self.types.push_str(&format!(r#"<Override PartName="/{name}" ContentType="{mime}"/>"#));
-        self.parts.push((name, hf_part(root, text, align).into_bytes()));
+        self.parts.push((name, hf_part(root, text, align, text_w, f).into_bytes()));
         rid
     }
 }
@@ -3910,13 +4564,29 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         Some(d) => (d, markdown[first.len()..].trim_start_matches(['\n', '\r'])),
         None => (DocDefaults::default(), markdown),
     };
+    // Ändrings- och kommentarsposterna sist i texten är inte text i dokumentet.
+    let (markdown, revs, comments) = review::split_records(markdown);
+    let rv = Review { revs, comments };
     match source {
-        Some(src) => write_patched(src, defaults, markdown, resolve),
-        None => write_fresh(defaults, markdown, title, resolve),
+        Some(src) => write_patched(src, defaults, &markdown, title, resolve, &rv),
+        None => write_fresh(defaults, &markdown, title, resolve, &rv),
     }
 }
 
-fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+/// Posterna för spårade ändringar och kommentarer ur Markdown-texten.
+struct Review {
+    revs: Vec<RevRec>,
+    comments: Vec<CommentRec>,
+}
+
+impl Review {
+    fn apply(&self, ctx: &mut Ctx<'_>) {
+        ctx.revs = self.revs.iter().map(|r| (r.id, r.clone())).collect();
+        ctx.comments = self.comments.iter().map(|c| c.id).collect();
+    }
+}
+
+fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let mut taken: std::collections::HashSet<String> = [
         "[content_types].xml",
         "_rels/.rels",
@@ -3931,13 +4601,16 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     .into_iter()
     .map(str::to_owned)
     .collect();
-    let ctx = Ctx {
+    let secs = sections::scan(markdown, &defaults);
+    let mut ctx = Ctx {
         num_base: 1,
         doc_pr_start: 1,
         max_width: text_width_emu(&defaults),
         used_ids: ["rId1", "rId2", "rId3"].into_iter().map(str::to_owned).collect(),
+        lead_section: secs[0].marker.is_some(),
         ..Default::default()
     };
+    rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     let mut body = std::mem::take(&mut w.body);
     // Ett dokument som slutar med en tabell måste ha ett stycke efter den.
@@ -3945,10 +4618,15 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         body.push_str("<w:p/>");
     }
     let (body, footnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None);
+    let comments_out = review_xml::build_comments(None, &rv.comments, &review_xml::anchored_ids(&body));
     let mut extras = Extras::default();
-    let hdr = defaults.header.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(true, t, defaults.header_align, &mut w.ids, &mut taken));
-    let ftr = defaults.footer.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(false, t, defaults.footer_align, &mut w.ids, &mut taken));
-    let sect = sect_pr_new(&defaults, hdr.as_deref(), ftr.as_deref());
+    let fields = style::Fields::for_export(title, "docx");
+    let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut w.ids, &mut taken);
+    let sect = sect_pr_new(&defaults, &refs);
+    let body = fix_sections(&body, &secs, &header_refs(&sect), false);
+    // Sidhuvud och sidfot hör till första avsnittet (de senare ärver); annorlunda första sida gäller bara det.
+    let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
+    let sect = if secs.len() > 1 { remove_title_pg(&sect) } else { sect };
     let document = format!(
         r#"{XML_DECL}
 <w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}"><w:body>{body}{sect}</w:body></w:document>"#
@@ -3963,6 +4641,14 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdFn1" Type="{REL_NS}/footnotes" Target="footnotes.xml"/>"#));
         extras.types.push_str(&format!(r#"<Override PartName="/word/footnotes.xml" ContentType="{FOOTNOTES_MIME}"/>"#));
     }
+    if let Some(c) = &comments_out {
+        doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdCm1" Type="{REL_NS}/comments" Target="comments.xml"/>"#));
+        extras.types.push_str(&format!(r#"<Override PartName="/word/comments.xml" ContentType="{}"/>"#, review_xml::COMMENTS_MIME));
+        if c.ext.is_some() {
+            doc_rels.push_str(&review_xml::ext_rel_xml("rIdKladdCm2", "commentsExtended.xml"));
+            extras.types.push_str(&format!(r#"<Override PartName="/word/commentsExtended.xml" ContentType="{}"/>"#, review_xml::COMMENTS_EXT_MIME));
+        }
+    }
     doc_rels.push_str("</Relationships>");
 
     let mut parts: Vec<(String, Vec<u8>)> = vec![
@@ -3972,7 +4658,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
         ("docProps/core.xml".into(), core_xml(title, "").into_bytes()),
         ("docProps/app.xml".into(), APP_XML.as_bytes().to_vec()),
-        ("word/styles.xml".into(), styles_xml(&defaults).into_bytes()),
+        ("word/styles.xml".into(), crate::docx_styles::patch_styles(&styles_xml(&defaults), &style::StyleSet::default(), &defaults.styles).into_bytes()),
         ("word/numbering.xml".into(), numbering_xml(&w.ordered_nums).into_bytes()),
         (
             "word/settings.xml".into(),
@@ -3984,6 +4670,12 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         let settings = SETTINGS.replace("<w:compat>", r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:compat>"#);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
             p.1 = settings.into_bytes();
+        }
+    }
+    if let Some(c) = comments_out {
+        parts.push(("word/comments.xml".into(), c.xml.into_bytes()));
+        if let Some(e) = c.ext {
+            parts.push(("word/commentsExtended.xml".into(), e.into_bytes()));
         }
     }
     parts.extend(extras.parts);
@@ -3998,6 +4690,15 @@ fn same_page(a: &DocDefaults, b: &DocDefaults) -> bool {
     let (pa, pb) = (a.page(), b.page());
     let (ma, mb) = (a.margins(), b.margins());
     (pa.0 - pb.0).abs() < 1.0 && (pa.1 - pb.1).abs() < 1.0 && ma.iter().zip(mb).all(|(x, y)| (x - y).abs() < 0.6)
+}
+
+/// Har första sidans sidhuvud/sidfot ändrats? `None` = ingen egen första sida, `Some("")` = tom.
+fn first_changed(new: Option<&str>, new_align: Align, old: Option<&str>, old_align: Align) -> bool {
+    match (new, old) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a != b || (!a.is_empty() && new_align != old_align),
+        _ => true,
+    }
 }
 
 /// Har sidhuvudets/sidfotens text eller justering ändrats?
@@ -4334,7 +5035,7 @@ fn fix_head(head: &str) -> String {
     h
 }
 
-fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let main_dir = src.main.rsplit_once('/').map_or("", |(d, _)| d);
     let main_file = src.main.rsplit('/').next().unwrap_or("document.xml");
     let rels_name = if main_dir.is_empty() { format!("_rels/{main_file}.rels") } else { format!("{main_dir}/_rels/{main_file}.rels") };
@@ -4359,8 +5060,10 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
         .max()
         .map_or(1, |m| m + 1);
     let mut taken: std::collections::HashSet<String> = src.parts.iter().map(|(n, _)| n.trim_start_matches('/').to_lowercase()).collect();
-    let ctx = Ctx {
+    let secs = sections::scan(markdown, &defaults);
+    let mut ctx = Ctx {
         tokens: src.tokens.len(),
+        lead_section: secs[0].marker.is_some(),
         num_base,
         doc_pr_start,
         max_width: text_width_emu(&defaults),
@@ -4372,7 +5075,9 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
             .filter(|(_, (_, k, e))| !*e && k.ends_with("/image"))
             .filter_map(|(id, (t, _, _))| src.part(&resolve_target(main_dir, t)).map(|b| (id.clone(), b)))
             .collect(),
+        ..Default::default()
     };
+    rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     w.units.sort_by_key(|u| u.range.start);
     // Fotnotsreferenserna (index i `fn_order`) i varje enhet.
@@ -4554,28 +5259,48 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
         body.push_str("<w:p/>");
     }
     let (body, footnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref());
+    let comments_out = review_xml::build_comments(src.comments.as_ref(), &rv.comments, &review_xml::anchored_ids(&body));
 
     // ---- sida, sidhuvud och sidfot
     let page_changed = !same_page(&defaults, &src.page);
     let hdr_changed = hf_changed(defaults.header.as_deref(), defaults.header_align, src.page.header.as_deref(), src.page.header_align);
     let ftr_changed = hf_changed(defaults.footer.as_deref(), defaults.footer_align, src.page.footer.as_deref(), src.page.footer_align);
+    let hdr1_changed = first_changed(defaults.header_first.as_deref(), defaults.header_align, src.page.header_first.as_deref(), src.page.header_align);
+    let ftr1_changed = first_changed(defaults.footer_first.as_deref(), defaults.footer_align, src.page.footer_first.as_deref(), src.page.footer_align);
     let mut extras = Extras::default();
     let mut ids = w.ids.clone();
-    let mut new_hdr: Option<Option<String>> = None;
-    let mut new_ftr: Option<Option<String>> = None;
+    let fields = style::Fields::for_export(title, "docx");
     // Utan originalets sektionsegenskaper skrivs allt om.
-    let (hdr_changed, ftr_changed) = if src.sect_pr.is_none() { (true, true) } else { (hdr_changed, ftr_changed) };
-    if hdr_changed {
-        new_hdr = Some(defaults.header.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(true, t, defaults.header_align, &mut ids, &mut taken)));
-    }
-    if ftr_changed {
-        new_ftr = Some(defaults.footer.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(false, t, defaults.footer_align, &mut ids, &mut taken)));
-    }
+    let refs_changed = src.sect_pr.is_some() && (hdr_changed || ftr_changed || hdr1_changed || ftr1_changed);
     let sect = match &src.sect_pr {
-        Some(orig) if !page_changed && new_hdr.is_none() && new_ftr.is_none() => orig.clone(),
-        Some(orig) => patch_sect(orig, &defaults, page_changed, new_hdr.as_ref().map(|o| o.as_deref()), new_ftr.as_ref().map(|o| o.as_deref())),
-        None => sect_pr_new(&defaults, new_hdr.flatten().as_deref(), new_ftr.flatten().as_deref()),
+        None => {
+            let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut ids, &mut taken);
+            sect_pr_new(&defaults, &refs)
+        }
+        Some(orig) => {
+            let mut edit = SectEdit::default();
+            let mut make = |header: bool, text: Option<&str>| text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, &defaults, &fields, &mut ids, &mut taken));
+            if hdr_changed {
+                edit.hdr = Some(make(true, defaults.header.as_deref()));
+            }
+            if ftr_changed {
+                edit.ftr = Some(make(false, defaults.footer.as_deref()));
+            }
+            if hdr1_changed {
+                edit.hdr_first = Some(make(true, defaults.header_first.as_deref()));
+            }
+            if ftr1_changed {
+                edit.ftr_first = Some(make(false, defaults.footer_first.as_deref()));
+            }
+            if defaults.different_first() != src.page.different_first() {
+                edit.title_pg = Some(defaults.different_first());
+            }
+            if !page_changed && edit.is_empty() { orig.clone() } else { patch_sect(orig, &defaults, page_changed, &edit) }
+        }
     };
+    let refs = merge_refs(&sect, &src.first_refs, [hdr_changed, hdr1_changed, ftr_changed, ftr1_changed]);
+    let body = fix_sections(&body, &secs, &refs, refs_changed);
+    let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
     let document = format!("{}{body}{sect}{}", fix_head(&src.head), src.tail);
 
     // ---- formatmallar och numrering: originalen kompletteras bara
@@ -4599,15 +5324,17 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
             n += 1;
         };
         let mut k = 1;
+        let short = kind.rsplit('/').next().unwrap_or(kind);
         let rid = loop {
-            let id = format!("rIdKladd{kind}{k}");
+            let id = format!("rIdKladd{short}{k}");
             if ids.insert(id.clone()) {
                 break id;
             }
             k += 1;
         };
         let target = part.strip_prefix(&format!("{main_dir}/")).unwrap_or(&part).to_owned();
-        doc_rel_add.push_str(&format!(r#"<Relationship Id="{rid}" Type="{REL_NS}/{kind}" Target="{target}"/>"#));
+        let rel_type = if kind.contains("://") { kind.to_owned() } else { format!("{REL_NS}/{kind}") };
+        doc_rel_add.push_str(&format!(r#"<Relationship Id="{rid}" Type="{rel_type}" Target="{target}"/>"#));
         type_add.push_str(&format!(r#"<Override PartName="/{part}" ContentType="{mime}"/>"#));
         (part, xml)
     };
@@ -4618,14 +5345,19 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
                 .filter(|(id, _)| !xml.contains(&format!("w:styleId=\"{id}\"")))
                 .map(|(_, x)| x)
                 .collect();
-            if !missing.is_empty() {
-                let patched = insert_before(&xml, "</w:styles>", &missing);
+            let mut patched = if missing.is_empty() { xml.clone() } else { insert_before(&xml, "</w:styles>", &missing) };
+            // Formatmallar som ändrats i Kladd skrivs in; oförändrade lämnas som de var.
+            if defaults.styles != src.styles {
+                patched = crate::docx_styles::patch_styles(&patched, &src.styles, &defaults.styles);
+            }
+            if patched != xml {
                 replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
             }
         }
         Some(_) => {}
         None => {
-            let (part, xml) = fresh_part("word/styles.xml", "styles", "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml", styles_xml(&defaults), &mut doc_rel_add, &mut type_add);
+            let styles = crate::docx_styles::patch_styles(&styles_xml(&defaults), &style::StyleSet::default(), &defaults.styles);
+            let (part, xml) = fresh_part("word/styles.xml", "styles", "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml", styles, &mut doc_rel_add, &mut type_add);
             new_parts.push((part, xml.into_bytes()));
         }
     }
@@ -4682,6 +5414,48 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
                         let patched = format!("{}{add}{}", &x[..at], &x[at..]);
                         replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
                     }
+                }
+            }
+        }
+    }
+
+    // ---- kommentarer
+    if let Some(c) = comments_out {
+        match &src.comments {
+            Some(o) => {
+                replaced.insert(o.name.trim_start_matches('/').to_lowercase(), fix_decl(&c.xml).into_bytes());
+                if let Some(ext) = c.ext {
+                    match &o.ext_name {
+                        Some(n) => {
+                            replaced.insert(n.trim_start_matches('/').to_lowercase(), fix_decl(&ext).into_bytes());
+                        }
+                        None => {
+                            let (part, xml) = fresh_part(
+                                "word/commentsExtended.xml",
+                                "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                                review_xml::COMMENTS_EXT_MIME,
+                                ext,
+                                &mut doc_rel_add,
+                                &mut type_add,
+                            );
+                            new_parts.push((part, xml.into_bytes()));
+                        }
+                    }
+                }
+            }
+            None => {
+                let (part, xml) = fresh_part("word/comments.xml", "comments", review_xml::COMMENTS_MIME, c.xml, &mut doc_rel_add, &mut type_add);
+                new_parts.push((part, xml.into_bytes()));
+                if let Some(ext) = c.ext {
+                    let (part, xml) = fresh_part(
+                        "word/commentsExtended.xml",
+                        "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                        review_xml::COMMENTS_EXT_MIME,
+                        ext,
+                        &mut doc_rel_add,
+                        &mut type_add,
+                    );
+                    new_parts.push((part, xml.into_bytes()));
                 }
             }
         }
@@ -5040,7 +5814,7 @@ Sist vänster.
             format!("{}{}{}", &x[..start], body, &x[end..])
         });
         let back = read(&bytes).unwrap();
-        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt -->
+        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt; h1: \"Georgia\" 20pt #2F5496 -->
 
 # Titel
 
@@ -5224,6 +5998,108 @@ Marginal
         assert_eq!(part_text(&out, "word/styles.xml").contains("Brodtext2"), true);
         // Ingen ny sektion eller sidhuvud skapas.
         assert!(zip::ZipArchive::new(Cursor::new(&out)).unwrap().file_names().all(|n| n != "word/header2.xml"));
+    }
+
+    // ---------------------------------------------------------- sidhuvud och sidfot: fält, delar, första sidan
+
+    const WNS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+    /// `rich_docx` med Words sidhuvud (vänster, titel och datum med flikar), en sidfot med bara ett
+    /// högerställt sidnummer och en egen första sida (tomt sidhuvud, sidfot "Omslag").
+    fn word_hf_docx() -> (Vec<u8>, String, String) {
+        let hdr = format!(
+            r#"<w:hdr xmlns:w="{WNS}"><w:p><w:pPr><w:tabs><w:tab w:val="center" w:pos="4680"/><w:tab w:val="right" w:pos="9360"/></w:tabs></w:pPr><w:r><w:t>Rapport</w:t></w:r><w:r><w:tab/></w:r><w:fldSimple w:instr=" TITLE "><w:r><w:t>Min titel</w:t></w:r></w:fldSimple><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> DATE \@ "d MMMM yyyy" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1 januari 2020</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:hdr>"#
+        );
+        let ftr = format!(
+            r#"<w:ftr xmlns:w="{WNS}"><w:p><w:pPr><w:tabs><w:tab w:val="right" w:pos="9360"/></w:tabs></w:pPr><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:ftr>"#
+        );
+        let ftr1 = format!(r#"<w:ftr xmlns:w="{WNS}"><w:p><w:r><w:t>Omslag</w:t></w:r></w:p></w:ftr>"#);
+        let hdr1 = format!(r#"<w:hdr xmlns:w="{WNS}"><w:p/></w:hdr>"#);
+        let sect = SECT
+            .replace(
+                r#"<w:footerReference w:type="default" r:id="rId11"/>"#,
+                r#"<w:footerReference w:type="default" r:id="rId11"/><w:headerReference w:type="first" r:id="rId13"/><w:footerReference w:type="first" r:id="rId14"/>"#,
+            )
+            .replace("</w:sectPr>", "<w:titlePg/></w:sectPr>");
+        let mut b = patch_part(&rich_docx(), "word/header1.xml", |_| hdr.clone());
+        b = patch_part(&b, "word/footer1.xml", |_| ftr.clone());
+        b = patch_part(&b, "word/header2.xml", |_| hdr1.clone());
+        b = patch_part(&b, "word/footer2.xml", |_| ftr1.clone());
+        b = patch_part(&b, "word/document.xml", |x| x.replace(SECT, &sect));
+        b = patch_part(&b, "word/_rels/document.xml.rels", |x| {
+            x.replace(
+                "</Relationships>",
+                &format!(
+                    r#"<Relationship Id="rId13" Type="{REL_NS}/header" Target="header2.xml"/><Relationship Id="rId14" Type="{REL_NS}/footer" Target="footer2.xml"/></Relationships>"#
+                ),
+            )
+        });
+        (b, hdr, ftr)
+    }
+
+    #[test]
+    fn word_header_with_tabs_fields_and_first_page_imports() {
+        let (docx, ..) = word_hf_docx();
+        let l = read(&docx).unwrap();
+        let d = DocDefaults::from_comment(l.markdown.lines().next().unwrap()).expect("grundformat");
+        assert_eq!(d.header.as_deref(), Some("Rapport|{titel}|{datum}"));
+        assert_eq!(d.footer.as_deref(), Some("||{sida}"));
+        assert_eq!(d.header_first.as_deref(), Some(""));
+        assert_eq!(d.footer_first.as_deref(), Some("Omslag"));
+        assert!(d.different_first());
+        // Utan `w:titlePg` ignoreras första sidans delar.
+        let no_first = patch_part(&docx, "word/document.xml", |x| x.replace("<w:titlePg/>", ""));
+        let d2 = DocDefaults::from_comment(read(&no_first).unwrap().markdown.lines().next().unwrap()).unwrap();
+        assert!(!d2.different_first());
+    }
+
+    #[test]
+    fn word_header_unchanged_keeps_original_parts_and_changes_are_patched() {
+        let (docx, hdr, ftr) = word_hf_docx();
+        let l = read(&docx).unwrap();
+        let src = l.source.as_ref();
+        // Oförändrat: dokument, sidhuvud och sidfot är orörda.
+        let out = write(&l.markdown, "x", &|_| None, src).unwrap().bytes;
+        assert_eq!(part_text(&out, "word/header1.xml"), hdr);
+        assert_eq!(part_text(&out, "word/footer1.xml"), ftr);
+        assert!(part_text(&out, "word/document.xml").contains("<w:titlePg/>"));
+        // Nytt sidhuvud: en ny del ersätter standardreferensen, första sidan och `titlePg` består.
+        let md = l.markdown.replacen("header: \"Rapport|{titel}|{datum}\"", "header: \"Ny|{titel}|{sida}\"", 1);
+        assert_ne!(md, l.markdown);
+        let out = write(&md, "x", &|_| None, src).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert!(doc.contains("<w:titlePg/>") && doc.contains(r#"w:type="first""#), "{doc}");
+        assert!(doc.contains(r#"<w:headerReference w:type="default" r:id="rIdKladdHdr1"/>"#), "{doc}");
+        assert_eq!(part_text(&out, "word/footer1.xml"), ftr);
+        let back = read(&out).unwrap();
+        assert!(back.markdown.contains("header: \"Ny|{titel}|{sida}\""), "{}", back.markdown);
+        // Utan första sida: referenserna och `titlePg` tas bort.
+        let md = l.markdown.replace("; header-first: \"\"", "").replace("; footer-first: \"Omslag\"", "");
+        assert!(!md.contains("-first"), "{md}");
+        let out = write(&md, "x", &|_| None, src).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert!(!doc.contains("titlePg") && !doc.contains(r#"w:type="first""#), "{doc}");
+        assert!(!read(&out).unwrap().markdown.contains("-first"));
+    }
+
+    #[test]
+    fn written_header_has_fields_tabs_and_first_page_variant() {
+        let md = "<!-- kladd: header: \"Rapport|{titel}|{datum}\"; footer: \"Sida {sida} av {sidor}\"; footer-align: center; header-first: \"\"; footer-first: \"Omslag\" -->\n\nText\n";
+        let out = write(md, "Min rapport", &|_| None, None).unwrap().bytes;
+        let hdr = part_text(&out, "word/header1.xml");
+        assert!(hdr.contains(" TITLE ") && hdr.contains("DATE ") && hdr.contains("<w:tab/>"), "{hdr}");
+        assert!(hdr.contains("w:val=\"center\"") && hdr.contains("w:val=\"right\""), "{hdr}");
+        assert!(hdr.contains("<w:t>Min rapport</w:t>"), "förhandsvisning av titeln: {hdr}");
+        let ftr = part_text(&out, "word/footer1.xml");
+        assert!(ftr.contains(" PAGE ") && ftr.contains(" NUMPAGES ") && !ftr.contains("<w:tab/>"), "{ftr}");
+        assert!(part_text(&out, "word/footer2.xml").contains("Omslag"));
+        let doc = part_text(&out, "word/document.xml");
+        assert!(doc.contains("<w:titlePg/>") && doc.contains(r#"<w:footerReference w:type="first""#), "{doc}");
+        // Tomt första sidhuvud ger ingen del, och allt läses tillbaka.
+        assert!(!doc.contains(r#"<w:headerReference w:type="first""#), "{doc}");
+        let want = DocDefaults::from_comment(md.lines().next().unwrap()).unwrap();
+        let back = read(&out).unwrap();
+        assert_eq!(DocDefaults::from_comment(back.markdown.lines().next().unwrap()), Some(want));
     }
 
     #[test]
@@ -5747,3 +6623,10 @@ mod manual {
 #[cfg(test)]
 #[path = "docx_fn_tests.rs"]
 mod fn_tests;
+
+#[path = "docx_review.rs"]
+mod review_xml;
+
+#[cfg(test)]
+#[path = "docx_section_tests.rs"]
+mod section_tests;

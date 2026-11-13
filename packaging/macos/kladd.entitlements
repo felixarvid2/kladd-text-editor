@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Kladd är en vanlig Rust-binär utan JIT och utan inläsning av tredjepartsbibliotek,
+	     och är inte sandlådad, så härdad körmiljö behöver inga undantag. Lägg bara till
+	     nycklar här om notariseringen eller programmet bevisligen kräver dem. -->
+</dict>
+</plist>

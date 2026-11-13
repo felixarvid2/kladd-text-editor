@@ -11,7 +11,7 @@
 //!   skarp längre ritas den gamla utsträckt tills den nya kommer (zoom och omfärgning).
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ use egui::{
 use super::engine::{EngineEvent, PageSize, PdfEngine, Recolor, RenderRequest, effective_scale};
 use super::meta::{Dest, LinkTarget, PdfMeta};
 use super::text::PageText;
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::Palette;
 
 /// egui-punkter per pt vid zoom 1,0 (96 dpi).
@@ -43,7 +45,6 @@ const MAX_THUMBS: usize = 240;
 const SPINNER_AFTER: Duration = Duration::from_millis(400);
 /// Så länge efter en zoomändring väntar vi med att begära skarpa bilder för sidor som redan har en.
 const ZOOM_SETTLE: Duration = Duration::from_millis(150);
-const TEXT_ERROR_PREFIX: &str = "Texten";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum ZoomMode {
@@ -496,11 +497,23 @@ pub struct PdfView {
     thumb_wants: HashMap<usize, (f32, u64)>,
 
     texts: HashMap<usize, Arc<PageText>>,
+    /// Sidor vars textlager kommer från OCR (motorns text får inte skriva över det).
+    ocr_pages: HashSet<usize>,
     want_all_text: bool,
     sel: Option<Sel>,
     drag_anchor: Option<Unit>,
+    /// Dragsteg: tecken, eller ord/rad när draget började med dubbel-/trippelklick.
+    drag_mode: UnitMode,
+    /// Senaste knapptryckningen (tid, plats, antal i följd) för att känna igen dubbel- och trippelklick vid drag.
+    press_hist: Option<(f64, Pos2, u8)>,
+    /// Blanksteg hålls nere; `true` när det använts för att dra (då ska det inte bläddra).
+    space: Option<SpaceHold>,
     find: Option<Find>,
     pending_uri: Option<String>,
+    /// Nya anteckningar som inte sparats än (annot.rs).
+    pub annot: super::annot::AnnotState,
+    /// Formulärfält (AcroForm): värden och redigering; se `forms.rs`.
+    pub forms: super::forms::FormState,
 }
 
 impl PdfView {
@@ -541,11 +554,17 @@ impl PdfView {
             thumbs: HashMap::new(),
             thumb_wants: HashMap::new(),
             texts: HashMap::new(),
+            ocr_pages: HashSet::new(),
             want_all_text: false,
             sel: None,
+            annot: Default::default(),
             drag_anchor: None,
+            drag_mode: UnitMode::Char,
+            press_hist: None,
+            space: None,
             find: None,
             pending_uri: None,
+            forms: Default::default(),
         };
         if let Some(m) = memory {
             v.zoom_mode = m.zoom_mode;
@@ -675,6 +694,20 @@ impl PdfView {
         &self.bytes
     }
 
+    /// Lägger textigenkänd text som sidans textlager (sök, markering och kopiering).
+    pub fn set_ocr_text(&mut self, page: usize, text: Arc<PageText>) {
+        if page < self.sizes.len() {
+            self.texts.insert(page, text);
+            self.ocr_pages.insert(page);
+            self.sel = None;
+            // En pågående sökning ska också titta i den nya texten.
+            if let Some(f) = &self.find {
+                let (q, c, w) = (f.query.clone(), f.case_sensitive, f.whole_word);
+                self.find_set(&q, c, w);
+            }
+        }
+    }
+
     /// Uri som användaren klickat på; chrome frågar om den ska öppnas. Tas bara en gång.
     pub fn take_pending_uri(&mut self) -> Option<String> {
         self.pending_uri.take()
@@ -697,8 +730,10 @@ impl PdfView {
         self.thumbs.clear();
         self.thumb_wants.clear();
         self.texts.clear();
+        self.ocr_pages.clear();
         self.sel = None;
         self.drag_anchor = None;
+        self.space = None;
         self.layout = None;
         self.history = History::default();
         let page = page.min(n.saturating_sub(1));
@@ -855,6 +890,7 @@ impl PdfView {
             self.set_zoom_mode(ZoomMode::PageFit);
         }
         if typing {
+            self.space = None;
             return;
         }
         // Historik (23).
@@ -887,8 +923,23 @@ impl PdfView {
         }
         // Sid- och skärmsteg (20).
         let screen = (self.vp.y * 0.9).max(100.0);
-        let page_down = key(Modifiers::NONE, Key::PageDown) || key(Modifiers::NONE, Key::Space);
-        let page_up = key(Modifiers::NONE, Key::PageUp) || key(Modifiers::SHIFT, Key::Space);
+        // Blanksteg: dra med musen panorerar (som handverktyget); bara ett tryck utan drag bläddrar,
+        // och då först när tangenten släpps.
+        let (space_down, space_up) = (key(Modifiers::NONE, Key::Space), key(Modifiers::SHIFT, Key::Space));
+        if (space_down || space_up) && self.space.is_none() {
+            self.space = Some(SpaceHold { back: space_up, dragged: false });
+        }
+        let mut space_page = None;
+        if let Some(hold) = self.space {
+            if !ctx.input(|i| i.key_down(Key::Space)) {
+                self.space = None;
+                if !hold.dragged {
+                    space_page = Some(hold.back);
+                }
+            }
+        }
+        let page_down = key(Modifiers::NONE, Key::PageDown) || space_page == Some(false);
+        let page_up = key(Modifiers::NONE, Key::PageUp) || space_page == Some(true);
         if page_down {
             if self.fits_height() { self.step_row(1) } else { self.scroll_by(vec2(0.0, screen)) }
         }
@@ -1138,10 +1189,12 @@ impl PdfView {
             match ev {
                 EngineEvent::Rendered { req, image } => self.on_rendered(ctx, req, image),
                 EngineEvent::Text { page, text } => {
-                    self.texts.insert(page, text);
+                    if !self.ocr_pages.contains(&page) {
+                        self.texts.insert(page, text);
+                    }
                 }
                 EngineEvent::Failed { page, error } => {
-                    if error.starts_with(TEXT_ERROR_PREFIX) {
+                    if super::engine::is_text_error(&error) {
                         // Sidan saknar användbar text; ett tomt lager hindrar nya försök.
                         self.texts.insert(page, Arc::new(PageText::default()));
                     } else {
@@ -1229,6 +1282,22 @@ enum UnitMode {
     Line,
 }
 
+/// Blanksteg som hålls nere.
+#[derive(Clone, Copy, Debug)]
+struct SpaceHold {
+    /// Trycktes med Skift (bläddra bakåt).
+    back: bool,
+    dragged: bool,
+}
+
+/// Antal tryck i följd: ett nytt tryck nära förra i tid och rum räknas vidare, annars börjar det om på 1.
+fn next_press_count(prev: Option<(f64, Pos2, u8)>, now: f64, pos: Pos2) -> u8 {
+    match prev {
+        Some((t, p, n)) if now - t <= 0.5 && p.distance(pos) <= 6.0 => (n % 3) + 1,
+        _ => 1,
+    }
+}
+
 fn close(a: f32, b: f32) -> bool {
     (a / b - 1.0).abs() < 0.02
 }
@@ -1268,6 +1337,8 @@ impl PdfView {
         } else {
             self.show_scroll(ui, &ctx, palette, dark);
         }
+        let sizes = &self.sizes;
+        self.annot.show_editor(&ctx, &|p| sizes.get(p).map_or((0.0, 0.0), |s| (s.width, s.height)));
         self.after_frame(&ctx);
     }
 
@@ -1408,6 +1479,7 @@ impl PdfView {
                 self.paint_page(ui, ctx, p, r, pal, dark, true);
                 let xf = self.xf(layout, p, origin);
                 self.paint_overlays(ui, p, &xf);
+                self.forms.page_ui(ui, p, &xf);
             }
         }
         self.interact(ui, ctx, &resp, origin);
@@ -1432,7 +1504,7 @@ impl PdfView {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                format!("Sidan kunde inte visas\n{err}"),
+                format!("{}\n{err}", t("Sidan kunde inte visas")),
                 FontId::proportional(14.0),
                 pal.error,
             );
@@ -1449,6 +1521,7 @@ impl PdfView {
 
     /// Sökträffar (gult, aktuell orange) och markering (blått) ovanpå sidan.
     fn paint_overlays(&self, ui: &Ui, p: usize, xf: &PageXf) {
+        self.annot.paint(ui.painter(), p, xf);
         let Some(t) = self.texts.get(&p) else { return };
         let painter = ui.painter();
         if let Some(f) = &self.find {
@@ -1480,10 +1553,21 @@ impl PdfView {
     fn interact(&mut self, ui: &Ui, ctx: &Context, resp: &egui::Response, origin: Pos2) {
         // Panorera: handverktyget eller mittenknappen (26).
         let middle = resp.dragged_by(PointerButton::Middle);
-        let hand = self.tool == Tool::Hand && resp.dragged_by(PointerButton::Primary);
+        let space_pan = self.space.is_some() && resp.dragged_by(PointerButton::Primary);
+        if space_pan {
+            if let Some(hold) = &mut self.space {
+                hold.dragged = true;
+            }
+        }
+        let hand = (self.tool == Tool::Hand || space_pan) && resp.dragged_by(PointerButton::Primary);
         if middle || hand {
             ui.scroll_with_delta_animation(resp.drag_delta(), ScrollAnimation::none());
             ctx.set_cursor_icon(CursorIcon::Grabbing);
+            return;
+        }
+
+        // Anteckningsverktygen (lapp, textruta, penna) tar hand om musen själva.
+        if self.annot.tool.is_some() && self.annot_pointer(ctx, resp, origin) {
             return;
         }
 
@@ -1495,10 +1579,10 @@ impl PdfView {
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
                 let tip = match &target {
                     LinkTarget::Uri(u) => u.clone(),
-                    LinkTarget::Page(d) => format!("Gå till sidan {}", d.page + 1),
+                    LinkTarget::Page(d) => tf!("Gå till sidan {n}", n = d.page + 1),
                 };
                 resp.clone().on_hover_text(tip);
-            } else if self.tool == Tool::Hand {
+            } else if self.tool == Tool::Hand || self.space.is_some() {
                 ctx.set_cursor_icon(CursorIcon::Grab);
             } else if let Some((page, pt)) = self.hit(h, origin, false) {
                 let on_text = self
@@ -1541,17 +1625,30 @@ impl PdfView {
         } else if resp.clicked_by(PointerButton::Primary) {
             self.sel = None;
         }
+        // Antal tryck i följd, räknat vid trycket så att ett drag efter dubbel-/trippelklick känns igen.
+        if resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
+                let now = ctx.input(|i| i.time);
+                let n = next_press_count(self.press_hist, now, pos);
+                self.press_hist = Some((now, pos, n));
+            }
+        }
         if resp.drag_started_by(PointerButton::Primary) {
+            self.drag_mode = match self.press_hist.map_or(1, |h| h.2) {
+                2 => UnitMode::Word,
+                n if n >= 3 => UnitMode::Line,
+                _ => UnitMode::Char,
+            };
             self.drag_anchor = ctx
                 .input(|i| i.pointer.press_origin())
                 .and_then(|o| self.hit(o, origin, false))
-                .and_then(|(page, pt)| self.unit_at(page, pt, UnitMode::Char));
-            self.sel = None;
+                .and_then(|(page, pt)| self.unit_at(page, pt, self.drag_mode));
+            self.sel = self.drag_anchor.filter(|_| self.drag_mode != UnitMode::Char).map(|(a, b)| Sel { start: a, end: b });
         }
         if resp.dragged_by(PointerButton::Primary) {
             if let (Some(anchor), Some(pos)) = (self.drag_anchor, ctx.pointer_latest_pos()) {
                 if let Some((page, pt)) = self.hit(pos, origin, true) {
-                    if let Some(head) = self.unit_at(page, pt, UnitMode::Char) {
+                    if let Some(head) = self.unit_at(page, pt, self.drag_mode) {
                         self.sel = Some(union_units(anchor, head));
                     }
                 }
@@ -1572,7 +1669,34 @@ impl PdfView {
         }
         if resp.drag_stopped() {
             self.drag_anchor = None;
+            self.drag_mode = UnitMode::Char;
         }
+        self.annot_from_selection(resp);
+    }
+
+    fn annot_pointer(&mut self, ctx: &Context, resp: &egui::Response, origin: Pos2) -> bool {
+        let mut a = std::mem::take(&mut self.annot);
+        let hit = |s: Pos2, nearest: bool| self.hit(s, origin, nearest);
+        let size = |p: usize| (self.sizes[p].width, self.sizes[p].height);
+        let took = a.pointer(ctx, resp, &hit, &size);
+        self.annot = a;
+        took
+    }
+
+    /// Markera/understruken/genomstruken: musen släpps efter en markering → ny anteckning på texten.
+    fn annot_from_selection(&mut self, resp: &egui::Response) {
+        let Some(tool) = self.annot.tool.filter(|t| t.is_markup()) else { return };
+        let done = resp.drag_stopped_by(PointerButton::Primary) || resp.double_clicked() || resp.triple_clicked();
+        let Some(sel) = self.sel.filter(|_| done) else { return };
+        let mut per_page = Vec::new();
+        for p in sel.start.0..=sel.end.0.min(self.sizes.len().saturating_sub(1)) {
+            let Some(t) = self.texts.get(&p) else { continue };
+            if let Some(r) = sel_range_on_page(&sel, p, t.glyphs.len()) {
+                per_page.push((p, t.rects(r)));
+            }
+        }
+        self.annot.add_markup(tool, per_page);
+        self.sel = None;
     }
 
     /// Presentationsläge (43): svart bakgrund, en sida anpassad till skärmen.
@@ -1888,6 +2012,21 @@ mod tests {
     }
 
     #[test]
+    fn tryck_i_följd_räknas() {
+        let p = Pos2::new(10.0, 10.0);
+        let one = next_press_count(None, 1.0, p);
+        assert_eq!(one, 1);
+        let two = next_press_count(Some((1.0, p, one)), 1.3, Pos2::new(12.0, 10.0));
+        assert_eq!(two, 2);
+        let three = next_press_count(Some((1.3, p, two)), 1.6, p);
+        assert_eq!(three, 3);
+        // Fjärde trycket börjar om; för långsamt eller för långt bort också.
+        assert_eq!(next_press_count(Some((1.6, p, three)), 1.8, p), 1);
+        assert_eq!(next_press_count(Some((1.0, p, 1)), 2.0, p), 1);
+        assert_eq!(next_press_count(Some((1.0, p, 1)), 1.2, Pos2::new(40.0, 10.0)), 1);
+    }
+
+    #[test]
     fn markering_ordnas_över_sidor() {
         let a: Unit = ((2, 5), (2, 6));
         let b: Unit = ((0, 7), (0, 9));
@@ -1946,6 +2085,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         panic!("tidsgräns");
+    }
+
+    #[test]
+    fn ocr_text_ersatter_textlagret_och_sparas_over_motorn() {
+        let ctx = Context::default();
+        let mut v = open_view(&ctx, 1);
+        let t = Arc::new(PageText::new(vec![super::super::text::Glyph { text: "Å".into(), rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(8.0, 12.0)) }]));
+        v.set_ocr_text(0, t);
+        v.set_ocr_text(99, Arc::new(PageText::default()));
+        v.find_set("å", false, false);
+        run_until(&ctx, &mut v, |v| v.find_status().done_pages > 0);
+        // Motorns text kommer efter och får inte skriva över.
+        for _ in 0..10 {
+            frame(&ctx, &mut v);
+        }
+        assert_eq!(v.texts.get(&0).map(|t| t.text().to_owned()).as_deref(), Some("Å"));
+        // Bara sida 0 räknas: testdokumentet kan ha en sida till vars text (med "a", som matchar
+        // "å" när diakritiska tecken ignoreras) hinner komma eller inte.
+        assert_eq!(v.find.as_ref().map(|f| f.matches[0].len()), Some(1));
+        assert!(!v.texts.contains_key(&99));
     }
 
     #[test]

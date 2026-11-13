@@ -3,12 +3,13 @@
 //! `app.rs` äger fliken i `Document::pdfv` och utför de `Action` som raden och dialogerna ger.
 //! Visaren själv (`PdfView`) används bara via API-kontraktet i `docs/dev/pdfvisare.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant, SystemTime};
 
+use egui::style::ScrollAnimation;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
@@ -17,10 +18,13 @@ use egui::{
 };
 
 use super::engine::{OpenError, PdfEngine, Recolor, RenderRequest};
-use super::meta::{Dest, OutlineItem};
+use super::meta::{Dest, OutlineItem, display_date};
+use super::pages::{self, OrgOp, OrgState};
 use super::view::{FindStatus, PdfView, Spread, Tool, ZoomMode};
 use crate::app::{menu_divider, menu_item, quiet_button, text_toggle};
+use crate::i18n::{self, t};
 use crate::icons::{self, Icon};
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Filens ändringstid och storlek, för att märka när den ändrats på disk.
@@ -43,8 +47,12 @@ pub enum Action {
     OpenExternal,
     Reload,
     CopyImage,
+    /// Känn igen text (OCR) på skannade sidor.
+    Ocr,
     /// Öppna en bekräftad extern länk.
     OpenUri(String),
+    /// Ändra sidor (flytta, ta bort, rotera, extrahera, infoga, ångra).
+    Organize(OrgOp),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,10 +92,45 @@ pub struct PdfTab {
     pub confirm_edit: bool,
     pub confirm_uri: Option<String>,
     pub copy_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    /// Sidorna har ändrats (flyttats, tagits bort, roterats, infogats) och är inte sparade.
+    pub pages_changed: bool,
+    pub org: OrgState,
+    pub ocr: super::ocr::OcrState,
+    /// Anteckningsverktygen (annot.rs) visas under verktygsraden.
+    pub annotate: bool,
 }
 
 impl PdfTab {
-    pub fn new(view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
+    /// Osparade ändringar i fliken: sidordning, nya anteckningar eller ifyllda formulärfält.
+    pub fn unsaved(&self) -> bool {
+        self.pages_changed || self.view.annot.has_pending() || self.view.forms.dirty()
+    }
+
+    /// PDF:en med alla osparade ändringar: sidändringarna finns redan i visarens bytes,
+    /// formulärvärden och anteckningar läggs på här (objektnumren behålls, så ordningen spelar ingen roll).
+    pub fn edited_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut out = self.view.bytes().as_ref().clone();
+        if self.view.forms.dirty() {
+            // Formulär visas bara för okrypterade PDF:er.
+            out = crate::pdfview::forms::apply(&out, None, &self.view.forms.changes())?;
+        }
+        if self.view.annot.has_pending() {
+            // Efter sidändringar är bytes redan avkrypterade och lösenordet behövs inte.
+            let pw = if self.pages_changed { None } else { self.password.as_deref() };
+            out = crate::pdfview::annot::apply(&out, pw, self.view.annot.pending())?;
+        }
+        Ok(out)
+    }
+
+    /// Efter en lyckad sparning: inga ändringar kvar.
+    pub fn mark_saved(&mut self) {
+        self.pages_changed = false;
+        self.view.annot.clear();
+        self.reload_forms();
+    }
+
+    pub fn new(mut view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
+        view.forms = super::forms::FormState::load(view.bytes(), password.as_deref());
         let has_outline = !view.meta().outline.is_empty();
         Self {
             view,
@@ -106,7 +149,16 @@ impl PdfTab {
             confirm_edit: false,
             confirm_uri: None,
             copy_rx: None,
+            pages_changed: false,
+            org: OrgState::default(),
+            ocr: Default::default(),
+            annotate: false,
         }
+    }
+
+    /// Läser formulärfälten på nytt ur visarens bytes (efter sparning eller omläsning).
+    pub fn reload_forms(&mut self) {
+        self.view.forms = super::forms::FormState::load(self.view.bytes(), self.password.as_deref());
     }
 
     /// Är någon dialog öppen (då ska kortkommandon vänta)?
@@ -174,13 +226,13 @@ pub fn parse_page_input(input: &str, labels: &[String], count: usize) -> Option<
 pub fn page_status(label: &str, page: usize, total: usize) -> String {
     let n = page + 1;
     if !label.is_empty() && label != n.to_string() {
-        format!("{label} ({n} av {total})")
+        tf!("{label} ({n} av {total})", label = label, n = n, total = total)
     } else {
-        format!("Sida {n} av {total}")
+        tf!("Sida {n} av {total}", n = n, total = total)
     }
 }
 
-/// Filstorlek på svenska: "532 B", "12,5 kB", "3,4 MB".
+/// Filstorlek med språkets decimaltecken: "12,5 kB" (svenska) / "12.5 kB" (engelska).
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "kB", "MB", "GB"];
     if bytes < 1024 {
@@ -192,8 +244,7 @@ pub fn format_size(bytes: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    let s = if v >= 100.0 { format!("{v:.0}") } else { format!("{v:.1}") };
-    format!("{} {}", s.replace('.', ","), UNITS[u])
+    format!("{} {}", i18n::num(v, if v >= 100.0 { 0 } else { 1 }), UNITS[u])
 }
 
 /// Punkter (1/72 tum) till millimeter.
@@ -212,10 +263,11 @@ pub fn paper_name(w_mm: f32, h_mm: f32) -> Option<&'static str> {
 /// "210 × 297 mm (A4, stående)".
 pub fn page_size_text(w_pt: f32, h_pt: f32) -> String {
     let (w, h) = (pt_to_mm(w_pt), pt_to_mm(h_pt));
-    let orient = if w > h + 0.5 { "liggande" } else { "stående" };
+    let orient = if w > h + 0.5 { t("liggande") } else { t("stående") };
+    let (ws, hs) = (format!("{w:.0}"), format!("{h:.0}"));
     match paper_name(w, h) {
-        Some(name) => format!("{w:.0} × {h:.0} mm ({name}, {orient})"),
-        None => format!("{w:.0} × {h:.0} mm ({orient})"),
+        Some(name) => tf!("{w} × {h} mm ({name}, {orient})", w = ws, h = hs, name = name, orient = orient),
+        None => tf!("{w} × {h} mm ({orient})", w = ws, h = hs, orient = orient),
     }
 }
 
@@ -261,8 +313,8 @@ pub fn current_zoom_choice(mode: ZoomMode, zoom: f32) -> Option<ZoomChoice> {
 /// Texten i zoomlistan: lägets namn, eller procent vid egen zoom.
 pub fn zoom_label(mode: ZoomMode, zoom: f32) -> String {
     match current_zoom_choice(mode, zoom) {
-        Some(c) => ZOOM_CHOICES.iter().find(|(_, x)| *x == c).map(|(l, _)| (*l).to_owned()).unwrap_or_default(),
-        None => format!("{} %", (zoom * 100.0).round() as i32),
+        Some(c) => ZOOM_CHOICES.iter().find(|(_, x)| *x == c).map(|(l, _)| t(*l).to_owned()).unwrap_or_default(),
+        None => tf!("{pct} %", pct = (zoom * 100.0).round() as i32),
     }
 }
 
@@ -279,15 +331,16 @@ pub fn find_status_text(s: &FindStatus, page_count: usize, has_query: bool) -> S
         return String::new();
     }
     if s.searching && s.done_pages < page_count && s.total == 0 {
-        return format!("Söker… ({}/{} sidor)", s.done_pages, page_count);
+        return tf!("Söker… ({done}/{pages} sidor)", done = s.done_pages, pages = page_count);
     }
     if s.total == 0 {
-        return "Hittades inte".to_owned();
+        return t("Hittades inte").to_owned();
     }
     let suffix = if s.searching { "+" } else { "" };
     match s.current {
-        Some(i) => format!("{} av {}{suffix}", i + 1, s.total),
-        None => format!("{}{suffix} träffar", s.total),
+        Some(i) => tf!("{n} av {total}{suffix}", n = i + 1, total = s.total, suffix = suffix),
+        None if s.total == 1 && !s.searching => t("1 träff").to_owned(),
+        None => tf!("{total}{suffix} träffar", total = s.total, suffix = suffix),
     }
 }
 
@@ -461,21 +514,21 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 let total = tab.view.page_count();
                 let cur = tab.view.current_page();
 
-                if tool_btn(ui, p, G::Sidebar, tab.sidebar, true, "Sidopanel (F4)").clicked() {
+                if tool_btn(ui, p, G::Sidebar, tab.sidebar, true, t("Sidopanel (F4)")).clicked() {
                     tab.toggle_sidebar();
                 }
                 bar_divider(ui, p);
                 // Historik
-                if tool_btn(ui, p, G::Left, false, tab.view.can_back(), "Bakåt (Alt+Vänster)").clicked() {
+                if tool_btn(ui, p, G::Left, false, tab.view.can_back(), t("Bakåt (Alt+Vänster)")).clicked() {
                     tab.view.back();
                 }
-                if tool_btn(ui, p, G::Right, false, tab.view.can_forward(), "Framåt (Alt+Höger)").clicked() {
+                if tool_btn(ui, p, G::Right, false, tab.view.can_forward(), t("Framåt (Alt+Höger)")).clicked() {
                     tab.view.forward();
                 }
                 bar_divider(ui, p);
 
                 // Sidor
-                if tool_btn(ui, p, G::Std(Icon::ChevronUp), false, cur > 0, "Föregående sida (PgUp)").clicked() {
+                if tool_btn(ui, p, G::Std(Icon::ChevronUp), false, cur > 0, t("Föregående sida (PgUp)")).clicked() {
                     tab.view.go_to_page(cur - 1);
                 }
                 let field_id = Id::unique("kladd-pdf-page");
@@ -497,7 +550,7 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                     st.store(&ctx, field_id);
                     tab.page_focus = false;
                 }
-                field.clone().on_hover_text(crate::keys::shortcut("Gå till sida (Ctrl+G)"));
+                field.clone().on_hover_text(crate::keys::shortcut(t("Gå till sida (Ctrl+G)")));
                 if field.lost_focus() {
                     if ui.input(|i| i.key_pressed(Key::Enter)) {
                         let labels = &tab.view.meta().labels;
@@ -509,13 +562,13 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                     tab.page_text = tab.view.page_label(tab.view.current_page());
                 }
                 ui.label(RichText::new(format!("/ {total}")).color(p.muted));
-                if tool_btn(ui, p, G::Std(Icon::ChevronDown), false, cur + 1 < total, "Nästa sida (PgDn)").clicked() {
+                if tool_btn(ui, p, G::Std(Icon::ChevronDown), false, cur + 1 < total, t("Nästa sida (PgDn)")).clicked() {
                     tab.view.go_to_page(cur + 1);
                 }
                 bar_divider(ui, p);
 
                 // Zoom
-                if tool_btn(ui, p, G::Std(Icon::Minus), false, true, "Zooma ut (Ctrl+−)").clicked() {
+                if tool_btn(ui, p, G::Std(Icon::Minus), false, true, t("Zooma ut (Ctrl+−)")).clicked() {
                     tab.view.zoom_out();
                 }
                 let (mode, zoom) = (tab.view.zoom_mode(), tab.view.zoom());
@@ -525,7 +578,7 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                     .show_ui(ui, |ui| {
                         let now = current_zoom_choice(mode, zoom);
                         for (label, choice) in ZOOM_CHOICES {
-                            if ui.selectable_label(now == Some(choice), label).clicked() {
+                            if ui.selectable_label(now == Some(choice), t(label)).clicked() {
                                 match zoom_choice_target(choice) {
                                     (m, None) => tab.view.set_zoom_mode(m),
                                     (_, Some(z)) => tab.view.set_zoom(z),
@@ -533,91 +586,127 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                             }
                         }
                     });
-                if tool_btn(ui, p, G::Std(Icon::Plus), false, true, "Zooma in (Ctrl+plus)").clicked() {
+                if tool_btn(ui, p, G::Std(Icon::Plus), false, true, t("Zooma in (Ctrl+plus)")).clicked() {
                     tab.view.zoom_in();
                 }
                 bar_divider(ui, p);
 
-                if tool_btn(ui, p, G::RotL, false, true, "Rotera åt vänster (Shift+R)").clicked() {
+                if tool_btn(ui, p, G::RotL, false, true, t("Rotera åt vänster (Shift+R)")).clicked() {
                     tab.view.rotate(false);
                 }
-                if tool_btn(ui, p, G::RotR, false, true, "Rotera åt höger (R)").clicked() {
+                if tool_btn(ui, p, G::RotR, false, true, t("Rotera åt höger (R)")).clicked() {
                     tab.view.rotate(true);
                 }
-                let view_btn = menu_trigger(ui, p, "Visa");
+                let view_btn = menu_trigger(ui, p, t("Visa"));
                 Popup::menu(&view_btn).width(270.0).align(RectAlign::BOTTOM_START).gap(6.0).show(|ui| {
                     view_menu(ui, p, tab, &mut act);
                 });
                 bar_divider(ui, p);
-                if tool_btn(ui, p, G::Search, tab.find.open, true, "Sök i dokumentet (Ctrl+F)").clicked() {
+                if tool_btn(ui, p, G::Search, tab.find.open, true, t("Sök i dokumentet (Ctrl+F)")).clicked() {
                     if tab.find.open {
                         tab.close_find();
                     } else {
                         tab.open_find();
                     }
                 }
-                if tool_btn(ui, p, G::Print, false, true, "Skriv ut (Ctrl+P)").clicked() {
+                if tool_btn(ui, p, G::Print, false, true, t("Skriv ut (Ctrl+P)")).clicked() {
                     act = Some(Action::Print);
+                }
+                bar_divider(ui, p);
+                let on = tab.annotate;
+                let label = RichText::new(t("Anteckna")).color(if on { p.accent } else { p.text });
+                let btn = egui::Button::new(label).fill(if on { p.accent.gamma_multiply(0.16) } else { Color32::TRANSPARENT }).stroke(Stroke::NONE);
+                if ui.add(btn).on_hover_text(t("Överstryk, understryk, skriv anteckningar och rita i PDF:en")).clicked() {
+                    tab.annotate = !on;
+                    if on {
+                        tab.view.annot.tool = None;
+                    }
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let edit = egui::Button::new(
-                        RichText::new("Redigera").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                        RichText::new(t("Redigera")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                     )
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
                     .corner_radius(8)
                     .min_size(vec2(92.0, 28.0));
-                    if ui.add(edit).on_hover_text("Gör om PDF:en till ett redigerbart dokument").clicked() {
+                    if ui.add(edit).on_hover_text(t("Gör om PDF:en till ett redigerbart dokument")).clicked() {
                         tab.confirm_edit = true;
                     }
                 });
             });
         });
+    if tab.annotate {
+        Panel::top("kladd-pdf-annot-bar")
+            .exact_size(BAR_H)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 5)))
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().hline((r.left() - 12.0)..=(r.right() + 12.0), r.bottom() + 5.0, Stroke::new(1.0, p.line));
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| crate::pdfview::annot::tool_row(ui, p, &mut tab.view.annot));
+            });
+    }
     act
 }
 
 /// Innehållet i "Visa"-menyn.
 fn view_menu(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, act: &mut Option<Action>) {
     ui.spacing_mut().item_spacing.y = 0.0;
-    menu_heading(ui, p, "Uppslag");
+    menu_heading(ui, p, t("Uppslag"));
     let sp = tab.view.spread();
     for (label, s) in [("En sida", Spread::None), ("Två sidor, udda till vänster", Spread::Odd), ("Två sidor, jämna till vänster", Spread::Even)] {
-        if menu_item(ui, p, label, "", Some(sp == s), true) {
+        if menu_item(ui, p, t(label), "", Some(sp == s), true) {
             tab.view.set_spread(s);
         }
     }
     menu_divider(ui, p);
-    menu_heading(ui, p, "Färger");
+    menu_heading(ui, p, t("Färger"));
     let rc = tab.view.recolor();
     for (label, r) in [("Normala färger", Recolor::None), ("Inverterade färger", Recolor::Invert), ("Sepia", Recolor::Sepia)] {
-        if menu_item(ui, p, label, "", Some(rc == r), true) {
+        if menu_item(ui, p, t(label), "", Some(rc == r), true) {
             tab.view.set_recolor(r);
         }
     }
     menu_divider(ui, p);
     let hand = tab.view.tool() == Tool::Hand;
-    if menu_item(ui, p, "Handverktyg", "H", Some(hand), true) {
+    if menu_item(ui, p, t("Handverktyg"), "H", Some(hand), true) {
         tab.view.set_tool(if hand { Tool::Select } else { Tool::Hand });
     }
-    if menu_item(ui, p, "Presentationsläge", "F5", None, true) {
+    if menu_item(ui, p, t("Presentationsläge"), "F5", None, true) {
         tab.present();
     }
     menu_divider(ui, p);
-    if menu_item(ui, p, "Läs om", "", None, true) {
+    menu_heading(ui, p, t("Sidor"));
+    if menu_item(ui, p, t("Slå ihop med PDF…"), "", None, true) {
+        *act = Some(Action::Organize(OrgOp::InsertAt(tab.view.page_count())));
+    }
+    if menu_item(ui, p, t("Ångra sidändring"), "Ctrl+Z", None, tab.org.history.can_undo()) {
+        *act = Some(Action::Organize(OrgOp::Undo));
+    }
+    if menu_item(ui, p, t("Gör om sidändring"), "Ctrl+Shift+Z", None, tab.org.history.can_redo()) {
+        *act = Some(Action::Organize(OrgOp::Redo));
+    }
+    menu_divider(ui, p);
+    if menu_item(ui, p, t("Läs om"), "", None, true) {
         *act = Some(Action::Reload);
     }
-    if menu_item(ui, p, "Spara kopia…", "Ctrl+S", None, true) {
+    if menu_item(ui, p, t("Spara kopia…"), if tab.pages_changed { "" } else { "Ctrl+S" }, None, true) {
         *act = Some(Action::SaveCopy);
     }
-    if menu_item(ui, p, "Kopiera sidan som bild", "", None, true) {
+    if menu_item(ui, p, t("Kopiera sidan som bild"), "", None, true) {
         *act = Some(Action::CopyImage);
     }
-    if menu_item(ui, p, "Dokumentegenskaper…", "", None, true) {
+    if menu_item(ui, p, t("Känn igen text (OCR)"), "", None, !tab.ocr.running()) {
+        *act = Some(Action::Ocr);
+    }
+    if menu_item(ui, p, t("Dokumentegenskaper…"), "", None, true) {
         tab.props = true;
     }
-    if menu_item(ui, p, "Öppna i systemets PDF-visare", "", None, true) {
+    if menu_item(ui, p, t("Öppna i systemets PDF-visare"), "", None, true) {
         *act = Some(Action::OpenExternal);
     }
 }
@@ -629,9 +718,10 @@ const THUMB_GAP: f32 = 10.0;
 const OUTLINE_ROW_H: f32 = 26.0;
 
 /// Panelen till vänster med miniatyrer och innehållsförteckning (F4).
-pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) {
+pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
+    let mut act = None;
     if !tab.sidebar {
-        return;
+        return act;
     }
     let ctx = ui.ctx().clone();
     let has_outline = !tab.view.meta().outline.is_empty();
@@ -647,19 +737,20 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
             ui.horizontal(|ui| {
-                if side_tab_button(ui, p, "Miniatyrer", tab.side_tab == SideTab::Thumbs).clicked() {
+                if side_tab_button(ui, p, t("Miniatyrer"), tab.side_tab == SideTab::Thumbs).clicked() {
                     tab.side_tab = SideTab::Thumbs;
                 }
-                if has_outline && side_tab_button(ui, p, "Innehåll", tab.side_tab == SideTab::Outline).clicked() {
+                if has_outline && side_tab_button(ui, p, t("Innehåll"), tab.side_tab == SideTab::Outline).clicked() {
                     tab.side_tab = SideTab::Outline;
                 }
             });
             ui.add_space(8.0);
             match tab.side_tab {
-                SideTab::Thumbs => thumbnails(ui, p, tab, &ctx),
+                SideTab::Thumbs => act = thumbnails(ui, p, tab, &ctx).map(Action::Organize),
                 SideTab::Outline => outline(ui, p, tab),
             }
         });
+    act
 }
 
 fn side_tab_button(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> Response {
@@ -677,7 +768,7 @@ fn side_tab_button(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> Respon
     resp
 }
 
-fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
+fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) -> Option<OrgOp> {
     let n = tab.view.page_count();
     let cur = tab.view.current_page();
     let w = ui.available_width();
@@ -701,6 +792,15 @@ fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
     tab.last_page = Some(cur);
     let ppp = ctx.pixels_per_point();
     let mut jump = None;
+    let mut op = None;
+    let panel = ui.max_rect();
+    // Ett tryck utanför panelen (inte i en meny) släpper urvalet, så att Delete inte träffar sidor man glömt.
+    if !tab.org.sel.is_empty() && !Popup::is_any_open(ctx) {
+        let outside = ctx.input(|i| i.pointer.primary_pressed() && i.pointer.press_origin().is_some_and(|o| !panel.contains(o)));
+        if outside {
+            tab.org.sel.clear();
+        }
+    }
     ScrollArea::vertical().id_salt("kladd-pdf-thumbs").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         ui.allocate_space(vec2(w, y));
         let origin = ui.min_rect().min;
@@ -712,9 +812,12 @@ fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
         let hi = tops.partition_point(|t| *t < viewport.bottom() + 300.0).min(n);
         for i in lo..hi {
             let item = Rect::from_min_size(origin + vec2(0.0, tops[i]), vec2(w, item_h(i)));
-            let resp = ui.interact(item, Id::unique(("kladd-pdf-thumb", i)), Sense::click());
+            let resp = ui.interact(item, Id::unique(("kladd-pdf-thumb", i)), Sense::click_and_drag());
             let is_cur = i == cur;
-            if is_cur {
+            let chosen = tab.org.sel.contains(&i);
+            if chosen {
+                ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), 8.0, p.accent.gamma_multiply(if is_cur { 0.30 } else { 0.22 }));
+            } else if is_cur {
                 ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), 8.0, p.accent.gamma_multiply(0.16));
             } else if resp.hovered() {
                 ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), 8.0, p.surface_hover);
@@ -747,15 +850,108 @@ fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
                 if is_cur { p.accent } else { p.muted },
             );
             if resp.clicked() {
-                jump = Some(i);
+                let m = ui.input(|i| i.modifiers);
+                let (sel, anchor) = pages::click_selection(&tab.org.sel, tab.org.anchor, i, m.shift, m.command, cur);
+                tab.org.sel = sel;
+                tab.org.anchor = anchor;
+                if !m.shift && !m.command {
+                    jump = Some(i);
+                }
+            }
+            if resp.secondary_clicked() && !tab.org.sel.contains(&i) {
+                tab.org.sel = BTreeSet::from([i]);
+                tab.org.anchor = Some(i);
+            }
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                if !tab.org.sel.contains(&i) {
+                    tab.org.sel = BTreeSet::from([i]);
+                    tab.org.anchor = Some(i);
+                }
+                tab.org.drag_active = true;
+            }
+            Popup::context_menu(&resp).width(230.0).show(|ui| {
+                if let Some(o) = page_menu(ui, p, tab, n, i) {
+                    op = Some(o);
+                }
+            });
+        }
+        // Drag av miniatyrer: markera var de hamnar (före vilken sida) och flytta när musen släpps.
+        if tab.org.drag_active {
+            let pointer = ctx.pointer_latest_pos();
+            let clip = ui.clip_rect();
+            tab.org.drop = pointer.filter(|pos| clip.contains(*pos)).map(|pos| {
+                let y = pos.y - origin.y;
+                (0..n).find(|&k| y < tops[k] + item_h(k) / 2.0).unwrap_or(n)
+            });
+            if let (Some(before), true) = (tab.org.drop, n > 0) {
+                let ly = origin.y + tops[before] - THUMB_GAP / 2.0 + 2.0;
+                ui.painter().line_segment([pos2(origin.x + 6.0, ly), pos2(origin.x + w - 6.0, ly)], Stroke::new(3.0, p.accent));
+            }
+            if let Some(pos) = pointer {
+                let edge = if pos.y < clip.top() + 24.0 { 14.0 } else if pos.y > clip.bottom() - 24.0 { -14.0 } else { 0.0 };
+                if edge != 0.0 && pos.x >= clip.left() && pos.x <= clip.right() {
+                    ui.scroll_with_delta_animation(vec2(0.0, edge), ScrollAnimation::none());
+                    ctx.request_repaint();
+                }
+                let label = if tab.org.sel.len() == 1 { t("1 sida").to_owned() } else { tf!("{n} sidor", n = tab.org.sel.len()) };
+                let font = FontId::new(12.0, theme::medium());
+                let galley = ui.painter().layout_no_wrap(label, font, p.on_accent);
+                let r = Rect::from_min_size(pos + vec2(12.0, 8.0), galley.size() + vec2(14.0, 8.0));
+                ui.painter().rect_filled(r, 6.0, p.accent);
+                ui.painter().galley(r.min + vec2(7.0, 4.0), galley, p.on_accent);
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                tab.org.drag_active = false;
+                if let Some(before) = tab.org.drop.take() {
+                    op = Some(OrgOp::Move { pages: tab.org.sel.clone(), before });
+                }
             }
         }
     });
+    if op.is_some() {
+        return op;
+    }
     if let Some(i) = jump {
         tab.view.go_to_page(i);
         // Miniaturen man klickade på syns redan; panelen ska inte hoppa.
         tab.last_page = Some(i);
     }
+    None
+}
+
+/// Högerklicksmenyn på en miniatyr. `page` är den klickade sidan, som alltid ingår i urvalet.
+fn page_menu(ui: &mut Ui, p: &Palette, tab: &PdfTab, count: usize, page: usize) -> Option<OrgOp> {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let mut pages: Vec<usize> = tab.org.sel.iter().copied().collect();
+    if pages.is_empty() {
+        pages.push(page);
+    }
+    let all = pages.len() >= count;
+    let first = pages[0];
+    let last = pages[pages.len() - 1];
+    let mut op = None;
+    if menu_item(ui, p, t("Rotera åt höger"), "", None, true) {
+        op = Some(OrgOp::Rotate { pages: pages.clone(), clockwise: true });
+    }
+    if menu_item(ui, p, t("Rotera åt vänster"), "", None, true) {
+        op = Some(OrgOp::Rotate { pages: pages.clone(), clockwise: false });
+    }
+    menu_divider(ui, p);
+    if menu_item(ui, p, t("Ta bort"), "Delete", None, !all) {
+        op = Some(OrgOp::Delete(pages.clone()));
+    }
+    if menu_item(ui, p, t("Extrahera till ny PDF…"), "", None, true) {
+        op = Some(OrgOp::Extract(pages.clone()));
+    }
+    menu_divider(ui, p);
+    if menu_item(ui, p, t("Infoga PDF före…"), "", None, true) {
+        op = Some(OrgOp::InsertAt(first));
+    }
+    if menu_item(ui, p, t("Infoga PDF efter…"), "", None, true) {
+        op = Some(OrgOp::InsertAt(last + 1));
+    }
+    op
 }
 
 struct OutRow {
@@ -875,7 +1071,7 @@ pub fn find_bar(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, anchor: Rect
                     let q = ui.add(
                         TextEdit::singleline(&mut tab.find.query)
                             .id(qid)
-                            .hint_text("Sök i dokumentet")
+                            .hint_text(t("Sök i dokumentet"))
                             .desired_width(field_w)
                             .margin(Margin::symmetric(8, 5)),
                     );
@@ -902,19 +1098,19 @@ pub fn find_bar(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, anchor: Rect
                         FontId::new(12.0, FontFamily::Proportional),
                         if bad { p.error } else { p.muted },
                     );
-                    if icons::button(ui, p, Icon::CaseSensitive, 26.0, tab.find.case_sensitive, "Skilj på stora och små bokstäver", p.surface).clicked() {
+                    if icons::button(ui, p, Icon::CaseSensitive, 26.0, tab.find.case_sensitive, t("Skilj på stora och små bokstäver"), p.surface).clicked() {
                         tab.find.case_sensitive = !tab.find.case_sensitive;
                     }
-                    if text_toggle(ui, p, "ab", tab.find.whole_word, "Hela ord").clicked() {
+                    if text_toggle(ui, p, "ab", tab.find.whole_word, t("Hela ord")).clicked() {
                         tab.find.whole_word = !tab.find.whole_word;
                     }
-                    if icons::button(ui, p, Icon::ChevronUp, 26.0, false, "Föregående (Shift+Enter)", p.surface).clicked() {
+                    if icons::button(ui, p, Icon::ChevronUp, 26.0, false, t("Föregående (Shift+Enter)"), p.surface).clicked() {
                         step = Some(true);
                     }
-                    if icons::button(ui, p, Icon::ChevronDown, 26.0, false, "Nästa (Enter)", p.surface).clicked() {
+                    if icons::button(ui, p, Icon::ChevronDown, 26.0, false, t("Nästa (Enter)"), p.surface).clicked() {
                         step = Some(false);
                     }
-                    if icons::button(ui, p, Icon::Close, 26.0, false, "Stäng (Esc)", p.surface).clicked() {
+                    if icons::button(ui, p, Icon::Close, 26.0, false, t("Stäng (Esc)"), p.surface).clicked() {
                         tab.find.open = false;
                     }
                     // Skicka sökningen till visaren när något ändrats.
@@ -969,21 +1165,25 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
         let mut choice = None;
         let m = modal(ctx, p, "kladd-pdf-edit").show(ctx, |ui| {
             ui.set_width(420.0);
-            ui.label(RichText::new("Redigera PDF:en?").font(FontId::new(17.0, theme::semibold())).color(p.text));
+            ui.label(RichText::new(t("Redigera PDF:en?")).font(FontId::new(17.0, theme::semibold())).color(p.text));
             ui.add_space(6.0);
             ui.label(
-                RichText::new(
+                RichText::new(t(
                     "PDF:en görs om till ett redigerbart dokument. Text, rubriker, listor, tabeller och bilder följer med men layouten kan ändras. Originalfilen ändras inte förrän du sparar.",
-                )
+                ))
                 .color(p.muted),
             );
+            if tab.ocr.edit_offer() {
+                ui.add_space(10.0);
+                ui.checkbox(&mut tab.ocr.edit_ocr, t("Känn igen texten på skannade sidor först (OCR)"));
+            }
             ui.add_space(22.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                if ui.add(accent_button(p, "Redigera", 92.0)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                if ui.add(accent_button(p, t("Redigera"), 92.0)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                     choice = Some(true);
                 }
-                if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     choice = Some(false);
                 }
             });
@@ -1004,17 +1204,17 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
         let mut choice = None;
         let m = modal(ctx, p, "kladd-pdf-uri").show(ctx, |ui| {
             ui.set_width(420.0);
-            ui.label(RichText::new("Öppna länken i webbläsaren?").font(FontId::new(17.0, theme::semibold())).color(p.text));
+            ui.label(RichText::new(t("Öppna länken i webbläsaren?")).font(FontId::new(17.0, theme::semibold())).color(p.text));
             ui.add_space(8.0);
             let shown = if uri.chars().count() > 160 { format!("{}…", uri.chars().take(159).collect::<String>()) } else { uri.clone() };
             ui.add(egui::Label::new(RichText::new(shown).color(p.accent)).wrap());
             ui.add_space(22.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                if ui.add(accent_button(p, "Öppna", 84.0)).clicked() {
+                if ui.add(accent_button(p, t("Öppna"), 84.0)).clicked() {
                     choice = Some(true);
                 }
-                if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     choice = Some(false);
                 }
             });
@@ -1033,7 +1233,7 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
         let mut close = false;
         let m = modal(ctx, p, "kladd-pdf-props").show(ctx, |ui| {
             ui.set_width(460.0);
-            ui.label(RichText::new("Dokumentegenskaper").font(FontId::new(17.0, theme::semibold())).color(p.text));
+            ui.label(RichText::new(t("Dokumentegenskaper")).font(FontId::new(17.0, theme::semibold())).color(p.text));
             ui.add_space(12.0);
             let rows = property_rows(tab, path);
             for (k, v) in rows {
@@ -1047,7 +1247,7 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
             }
             ui.add_space(20.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(accent_button(p, "Stäng", 84.0)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                if ui.add(accent_button(p, t("Stäng"), 84.0)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                     close = true;
                 }
             });
@@ -1068,23 +1268,23 @@ fn property_rows(tab: &PdfTab, path: Option<&Path>) -> Vec<(&'static str, String
             rows.push((label, s.to_owned()));
         }
     };
-    opt("Titel", &info.title);
-    opt("Författare", &info.author);
-    opt("Ämne", &info.subject);
-    opt("Nyckelord", &info.keywords);
-    opt("Skapad", &info.created);
-    opt("Ändrad", &info.modified);
-    opt("Skapad med", &info.creator);
-    opt("PDF-skapare", &info.producer);
+    opt(t("Titel"), &info.title);
+    opt(t("Författare"), &info.author);
+    opt(t("Ämne"), &info.subject);
+    opt(t("Nyckelord"), &info.keywords);
+    opt(t("Skapad"), &info.created.as_deref().map(display_date));
+    opt(t("Ändrad"), &info.modified.as_deref().map(display_date));
+    opt(t("Skapad med"), &info.creator);
+    opt(t("PDF-skapare"), &info.producer);
     if !info.version.is_empty() {
-        rows.push(("PDF-version", info.version.clone()));
+        rows.push((t("PDF-version"), info.version.clone()));
     }
     let size = tab.view.engine().page_size(tab.view.current_page());
-    rows.push(("Sidstorlek", page_size_text(size.width, size.height)));
-    rows.push(("Antal sidor", tab.view.page_count().to_string()));
-    rows.push(("Filstorlek", format_size(tab.view.bytes().len() as u64)));
+    rows.push((t("Sidstorlek"), page_size_text(size.width, size.height)));
+    rows.push((t("Antal sidor"), tab.view.page_count().to_string()));
+    rows.push((t("Filstorlek"), format_size(tab.view.bytes().len() as u64)));
     if let Some(p) = path {
-        rows.push(("Plats", p.display().to_string()));
+        rows.push((t("Plats"), p.display().to_string()));
     }
     rows
 }
@@ -1099,7 +1299,10 @@ pub fn status(ui: &mut Ui, p: &Palette, font: &FontId, tab: &PdfTab) {
     };
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 18.0;
-        label(ui, format!("{} %", (tab.view.zoom() * 100.0).round() as i32));
+        if let Some(s) = super::ocr::status_text(&tab.ocr) {
+            label(ui, s);
+        }
+        label(ui, tf!("{pct} %", pct = (tab.view.zoom() * 100.0).round() as i32));
         let v = &tab.view.meta().info.version;
         if !v.is_empty() {
             label(ui, format!("PDF {v}"));
@@ -1124,7 +1327,7 @@ pub fn render_page_image(
         let res = (|| {
             let engine = PdfEngine::open(bytes, password.as_deref(), ctx.clone()).map_err(|e| match e {
                 OpenError::Invalid(m) => m,
-                _ => "Kunde inte öppna PDF:en".to_owned(),
+                _ => t("Kunde inte öppna PDF:en").to_owned(),
             })?;
             // Dubbel upplösning mot 96 dpi.
             let req = RenderRequest { page, scale: 2.0 * 96.0 / 72.0, rotation, recolor: Recolor::None };
@@ -1139,7 +1342,7 @@ pub fn render_page_image(
                     }
                 }
                 if start.elapsed() > Duration::from_secs(20) {
-                    return Err("Renderingen tog för lång tid".to_owned());
+                    return Err(t("Renderingen tog för lång tid").to_owned());
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }

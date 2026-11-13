@@ -14,6 +14,8 @@ use super::layout::px;
 use super::markup::DocDefaults;
 use super::nav::{self, Heading};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Navigeringsfönstrets tillstånd.
@@ -112,7 +114,7 @@ impl KladdApp {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let filter = TextEdit::singleline(&mut self.nav.filter)
                     .id(Id::unique("kladd-nav-filter"))
-                    .hint_text("Sök i rubriker")
+                    .hint_text(t("Sök i rubriker"))
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(8, 5));
                 if ui.add(filter).has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -122,12 +124,12 @@ impl KladdApp {
                 ScrollArea::vertical().id_salt(("kladd-nav-scroll", doc_id)).auto_shrink([false, false]).show(ui, |ui| {
                     if heads.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Inga rubriker i dokumentet").size(12.5).color(p.muted));
+                        ui.label(egui::RichText::new(t("Inga rubriker i dokumentet")).size(12.5).color(p.muted));
                         return;
                     }
                     if shown.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Inga träffar").size(12.5).color(p.muted));
+                        ui.label(egui::RichText::new(t("Inga träffar")).size(12.5).color(p.muted));
                         return;
                     }
                     for &i in &shown {
@@ -172,7 +174,7 @@ impl KladdApp {
                         }
                         let tx = x0 + 16.0;
                         let (label, color) = if h.text.is_empty() {
-                            ("(utan text)".to_owned(), p.faint)
+                            (t("(utan text)").to_owned(), p.faint)
                         } else {
                             (h.text.clone(), if is_cur { p.accent } else if h.level <= 1 { p.text } else { p.muted })
                         };
@@ -190,7 +192,7 @@ impl KladdApp {
                         if resp.clicked() {
                             goto = Some(h.start);
                         }
-                        resp.on_hover_text(format!("Rubrik {}: {}", h.level, h.text));
+                        resp.on_hover_text(tf!("Rubrik {level}: {text}", level = h.level, text = h.text));
                     }
                     ui.add_space(16.0);
                 });
@@ -232,7 +234,7 @@ pub fn paint_toc(
     let font = FontId::new(size, family(false));
     let mut y = rect.top() + title_h;
     if entries.is_empty() {
-        painter.text(pos2(rect.left(), y), Align2::LEFT_TOP, "Inga rubriker i dokumentet", font, p.page_muted);
+        painter.text(pos2(rect.left(), y), Align2::LEFT_TOP, t("Inga rubriker i dokumentet"), font, p.page_muted);
         return None;
     }
     let dot_w = painter.layout_no_wrap(". ".into(), font.clone(), Color32::WHITE).size().x.max(1.0);

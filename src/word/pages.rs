@@ -9,20 +9,23 @@ use std::hash::{Hash, Hasher};
 
 use egui::epaint::text::Galley;
 use egui::{
-    Align, Align2, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Painter, Rect, RichText, Sense, Shape, Stroke,
-    Ui, pos2, vec2,
+    Align, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Rect, RichText, Shape, Stroke,
+    Ui, vec2,
 };
 
 use super::layout::px;
 use super::markup::{self, Align as HAlign, DocDefaults};
+use super::secpages::PageBox;
 use crate::app::{KladdApp, quiet_button};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Luft (px, ozoomad) mellan två ark på skrivbordet.
 pub const SHEET_GAP: f32 = 24.0;
 
 /// Sidans mått i px vid en given zoom.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Geom {
     pub page_w: f32,
     pub page_h: f32,
@@ -31,6 +34,9 @@ pub struct Geom {
     pub bottom: f32,
     pub left: f32,
     pub gap: f32,
+    /// Avsnittens sidgeometri när dokumentet har avsnitt med egen sida eller spalter
+    /// (`Geom::for_sections`); tom för ett vanligt dokument.
+    pub secs: std::sync::Arc<Vec<super::secpages::SecGeom>>,
 }
 
 impl Geom {
@@ -47,11 +53,26 @@ impl Geom {
             bottom: px(zoom, cap(b, h)),
             left: px(zoom, cap(l, w)),
             gap: SHEET_GAP,
+            secs: Default::default(),
         }
     }
 
     pub fn text_w(&self) -> f32 {
         (self.page_w - self.left - self.right).max(1.0)
+    }
+
+    /// Måtten för ett ark (marginalerna till sidhuvud och sidfot).
+    pub fn for_page(&self, b: &PageBox) -> Geom {
+        Geom {
+            page_w: b.w,
+            page_h: b.h,
+            top: b.margin[0],
+            right: b.margin[1],
+            bottom: b.margin[2],
+            left: b.margin[3],
+            gap: self.gap,
+            secs: Default::default(),
+        }
     }
 
     pub fn text_h(&self) -> f32 {
@@ -67,6 +88,7 @@ impl Geom {
         for v in [self.page_w, self.page_h, self.top, self.right, self.bottom, self.left, self.gap] {
             v.to_bits().hash(h);
         }
+        self.hash_secs(h);
     }
 
     /// Sidan (från 0) som y-värdet (px från galleriets överkant) ligger på.
@@ -143,13 +165,13 @@ pub fn page_count(g: &Galley, geom: &Geom) -> usize {
     g.rows.last().map_or(1, |r| geom.page_of(r.pos.y) + 1)
 }
 
-/// Ritar arken (skugga och vitt papper) för `count` sidor. `first_top` är y för första arkets
-/// överkant. Bara ark som syns inom `clip` ritas.
-pub fn sheet_shapes(p: &Palette, geom: &Geom, left: f32, first_top: f32, count: usize, clip: Rect) -> (Shape, Shape) {
+/// Ritar arken (skugga och vitt papper). `base` är skrivbordsytans vänsterkant och `origin_y` y för
+/// galleriets y = 0 (textytans överkant på första sidan). Bara ark som syns inom `clip` ritas.
+pub fn sheet_shapes(p: &Palette, boxes: &[PageBox], base: f32, origin_y: f32, clip: Rect) -> (Shape, Shape) {
     let mut shadows = Vec::new();
     let mut sheets = Vec::new();
-    for k in 0..count {
-        let r = sheet_rect(geom, left, first_top, k);
+    for b in boxes {
+        let r = b.rect(base, origin_y);
         if r.bottom() + 8.0 < clip.top() || r.top() - 8.0 > clip.bottom() {
             continue;
         }
@@ -157,48 +179,6 @@ pub fn sheet_shapes(p: &Palette, geom: &Geom, left: f32, first_top: f32, count: 
         sheets.push(Shape::rect_filled(r, 1.0, p.page));
     }
     (Shape::Vec(shadows), Shape::Vec(sheets))
-}
-
-pub fn sheet_rect(geom: &Geom, left: f32, first_top: f32, k: usize) -> Rect {
-    Rect::from_min_size(pos2(left, first_top + k as f32 * geom.stride()), vec2(geom.page_w, geom.page_h))
-}
-
-/// Ritar sidhuvud och sidfot på ett ark och ger `true` vid dubbelklick på någon av dem.
-#[allow(clippy::too_many_arguments)]
-pub fn header_footer(
-    ui: &mut Ui,
-    p: &Palette,
-    geom: &Geom,
-    sheet: Rect,
-    k: usize,
-    total: usize,
-    d: &DocDefaults,
-    font: FontId,
-    doc_id: u64,
-) -> bool {
-    let mut open = false;
-    let painter: Painter = ui.painter().clone();
-    let zones = [
-        (false, Rect::from_min_max(sheet.min, pos2(sheet.right(), sheet.top() + geom.top)), &d.header, d.header_align),
-        (true, Rect::from_min_max(pos2(sheet.left(), sheet.bottom() - geom.bottom), sheet.max), &d.footer, d.footer_align),
-    ];
-    for (footer, zone, text, align) in zones {
-        let resp = ui.interact(zone, ui.make_persistent_id(("kladd-hf", doc_id, k, footer)), Sense::click());
-        if resp.double_clicked() {
-            open = true;
-        }
-        let Some(t) = text.as_deref().filter(|t| !t.is_empty()) else { continue };
-        let t = crate::style::fill_fields(t, k + 1, total);
-        let y = zone.center().y;
-        let (x, anchor) = match align {
-            HAlign::Center => (sheet.center().x, Align2::CENTER_CENTER),
-            HAlign::Right => (sheet.right() - geom.right, Align2::RIGHT_CENTER),
-            _ => (sheet.left() + geom.left, Align2::LEFT_CENTER),
-        };
-        painter.text(pos2(x, y), anchor, t, font.clone(), p.page_muted);
-        resp.on_hover_text("Dubbelklicka för att ändra sidhuvud och sidfot");
-    }
-    open
 }
 
 /// Sidhuvudets/sidfotens typsnitt: brödtextens, 0,9 gånger så stort.
@@ -306,7 +286,7 @@ impl PageDialog {
     fn paper_label(&self) -> String {
         if self.paper == CUSTOM {
             let (w, h) = self.custom;
-            format!("Eget ({:.0} × {:.0} mm)", w / MM, h / MM)
+            tf!("Eget ({w} × {h} mm)", w = format!("{:.0}", w / MM), h = format!("{:.0}", h / MM))
         } else {
             PAPERS[self.paper].0.to_owned()
         }
@@ -316,7 +296,7 @@ impl PageDialog {
 fn align_row(ui: &mut Ui, id: &str, value: &mut HAlign) {
     ui.horizontal(|ui| {
         let _ = id;
-        for (a, name) in [(HAlign::Left, "Vänster"), (HAlign::Center, "Centrerad"), (HAlign::Right, "Höger")] {
+        for (a, name) in [(HAlign::Left, t("Vänster")), (HAlign::Center, t("Centrerad")), (HAlign::Right, t("Höger"))] {
             ui.selectable_value(value, a, name);
         }
     });
@@ -350,10 +330,10 @@ impl KladdApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(460.0);
-                ui.label(RichText::new("Sidinställningar").font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.label(RichText::new(t("Sidinställningar")).font(FontId::new(17.0, theme::semibold())).color(p.text));
                 ui.add_space(14.0);
                 egui::Grid::new("kladd-page-grid").num_columns(2).spacing(vec2(14.0, 10.0)).show(ui, |ui| {
-                    ui.label(RichText::new("Pappersstorlek").color(p.muted));
+                    ui.label(RichText::new(t("Pappersstorlek")).color(p.muted));
                     egui::ComboBox::from_id_salt("kladd-page-paper").selected_text(d.paper_label()).width(220.0).show_ui(
                         ui,
                         |ui| {
@@ -368,17 +348,17 @@ impl KladdApp {
                     );
                     ui.end_row();
 
-                    ui.label(RichText::new("Orientering").color(p.muted));
+                    ui.label(RichText::new(t("Orientering")).color(p.muted));
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut d.landscape, false, "Stående");
-                        ui.selectable_value(&mut d.landscape, true, "Liggande");
+                        ui.selectable_value(&mut d.landscape, false, t("Stående"));
+                        ui.selectable_value(&mut d.landscape, true, t("Liggande"));
                     });
                     ui.end_row();
 
-                    ui.label(RichText::new("Marginaler").color(p.muted));
+                    ui.label(RichText::new(t("Marginaler")).color(p.muted));
                     ui.horizontal(|ui| {
                         for (label, m) in [("Normala (25,4 mm)", 25.4), ("Smala (12,7 mm)", 12.7), ("Breda (50,8 mm)", 50.8)] {
-                            if ui.add(quiet_button(label, p)).clicked() {
+                            if ui.add(quiet_button(t(label), p)).clicked() {
                                 d.margins = [m; 4];
                             }
                         }
@@ -389,7 +369,7 @@ impl KladdApp {
                     ui.horizontal(|ui| {
                         for (label, i) in [("Överkant", 0), ("Höger", 1), ("Nederkant", 2), ("Vänster", 3)] {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(label).color(p.muted).size(12.0));
+                                ui.label(RichText::new(t(label)).color(p.muted).size(12.0));
                                 ui.add(
                                     egui::DragValue::new(&mut d.margins[i]).range(0.0..=120.0).speed(0.5).suffix(" mm").max_decimals(1),
                                 );
@@ -398,7 +378,7 @@ impl KladdApp {
                     });
                     ui.end_row();
 
-                    ui.label(RichText::new("Sidhuvud").color(p.muted));
+                    ui.label(RichText::new(t("Sidhuvud")).color(p.muted));
                     ui.add(
                         egui::TextEdit::singleline(&mut d.header).desired_width(300.0).margin(Margin::symmetric(8, 5)),
                     );
@@ -407,7 +387,7 @@ impl KladdApp {
                     align_row(ui, "kladd-page-halign", &mut d.header_align);
                     ui.end_row();
 
-                    ui.label(RichText::new("Sidfot").color(p.muted));
+                    ui.label(RichText::new(t("Sidfot")).color(p.muted));
                     ui.add(
                         egui::TextEdit::singleline(&mut d.footer).desired_width(300.0).margin(Margin::symmetric(8, 5)),
                     );
@@ -417,23 +397,27 @@ impl KladdApp {
                     ui.end_row();
                 });
                 ui.add_space(6.0);
-                ui.label(RichText::new("Använd {sida} och {sidor} för sidnummer").color(p.muted).size(12.5));
+                ui.label(
+                    RichText::new(t("Fält: {sida} {sidor} {datum} {titel} {fil}. Med | delas texten i vänster, mitten och höger. Dubbelklicka på sidhuvudet i dokumentet för fler val."))
+                        .color(p.muted)
+                        .size(12.5),
+                );
                 ui.add_space(6.0);
-                if ui.add(quiet_button("Sidnummer i sidfoten", p)).clicked() {
+                if ui.add(quiet_button(t("Sidnummer i sidfoten"), p)).clicked() {
                     d.footer = "{sida}".to_owned();
                     d.footer_align = HAlign::Center;
                 }
                 ui.add_space(20.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let ok = egui::Button::new(RichText::new("OK").font(FontId::new(13.5, theme::medium())).color(p.on_accent))
+                    let ok = egui::Button::new(RichText::new(t("OK")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
                         .fill(p.accent)
                         .stroke(Stroke::NONE)
                         .min_size(vec2(84.0, 32.0));
                     if ui.add(ok).clicked() {
                         act = Some(Act::Ok);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         act = Some(Act::Cancel);
                     }
                 });
@@ -462,7 +446,7 @@ mod tests {
     use std::sync::Arc;
 
     fn geom() -> Geom {
-        Geom { page_w: 300.0, page_h: 400.0, top: 40.0, right: 30.0, bottom: 40.0, left: 30.0, gap: 24.0 }
+        Geom { page_w: 300.0, page_h: 400.0, top: 40.0, right: 30.0, bottom: 40.0, left: 30.0, gap: 24.0, secs: Default::default() }
     }
 
     /// Ett galleri med många rader (en per stycke) som `paginate` sedan bryter.

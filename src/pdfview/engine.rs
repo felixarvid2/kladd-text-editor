@@ -26,6 +26,18 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
 use hayro::{RenderCache, RenderSettings, render_into};
 
+use crate::i18n::t;
+
+/// Felet när en sidas text inte kunde läsas (sidan saknar då användbar text, vilket inte är ett visningsfel).
+pub fn text_error() -> &'static str {
+    t("Texten kunde inte läsas")
+}
+
+/// Om `error` är [`text_error`] (på aktuellt språk).
+pub fn is_text_error(error: &str) -> bool {
+    error == text_error()
+}
+
 use super::text::{PageText, extract_page};
 
 /// Största antal bildpunkter per renderad sida.
@@ -127,18 +139,18 @@ impl PdfEngine {
     pub fn open(bytes: Arc<Vec<u8>>, password: Option<&str>, ctx: egui::Context) -> Result<Self, OpenError> {
         let pw = password.unwrap_or("");
         let parsed = catch_unwind(AssertUnwindSafe(|| Pdf::new_with_password(bytes, pw)))
-            .map_err(|_| OpenError::Invalid("Filen kunde inte läsas".into()))?;
+            .map_err(|_| OpenError::Invalid(t("Filen kunde inte läsas").into()))?;
         let pdf = parsed.map_err(|e| match e {
             LoadPdfError::Decryption(d) => {
                 use DecryptionError as D;
                 match d {
                     D::PasswordProtected if pw.is_empty() => OpenError::NeedsPassword,
                     D::PasswordProtected => OpenError::WrongPassword,
-                    D::UnsupportedAlgorithm => OpenError::Invalid("Krypteringen stöds inte".into()),
-                    _ => OpenError::Invalid("Ogiltig kryptering".into()),
+                    D::UnsupportedAlgorithm => OpenError::Invalid(t("Krypteringen stöds inte").into()),
+                    _ => OpenError::Invalid(t("Ogiltig kryptering").into()),
                 }
             }
-            LoadPdfError::Invalid => OpenError::Invalid("Filen är ingen giltig PDF".into()),
+            LoadPdfError::Invalid => OpenError::Invalid(t("Filen är ingen giltig PDF").into()),
         })?;
         let sizes = catch_unwind(AssertUnwindSafe(|| {
             pdf.pages()
@@ -149,9 +161,9 @@ impl PdfEngine {
                 })
                 .collect::<Vec<_>>()
         }))
-        .map_err(|_| OpenError::Invalid("Sidorna kunde inte läsas".into()))?;
+        .map_err(|_| OpenError::Invalid(t("Sidorna kunde inte läsas").into()))?;
         if sizes.is_empty() {
-            return Err(OpenError::Invalid("Dokumentet har inga sidor".into()));
+            return Err(OpenError::Invalid(t("Dokumentet har inga sidor").into()));
         }
 
         let pdf = Arc::new(pdf);
@@ -167,7 +179,7 @@ impl PdfEngine {
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || worker(pdf, shared, tx, ctx, sizes));
             if spawned.is_err() && i == 0 {
-                return Err(OpenError::Invalid("Kunde inte starta arbetstråd".into()));
+                return Err(OpenError::Invalid(t("Kunde inte starta arbetstråd").into()));
             }
         }
         Ok(PdfEngine { shared, rx: Mutex::new(rx), sizes })
@@ -291,14 +303,14 @@ fn worker(pdf: Arc<Pdf>, shared: Arc<Shared>, tx: Sender<EngineEvent>, ctx: egui
                     }));
                     match res {
                         Ok(image) => (EngineEvent::Rendered { req: req.clone(), image }, false),
-                        Err(_) => (EngineEvent::Failed { page: req.page, error: "Sidan kunde inte renderas".into() }, true),
+                        Err(_) => (EngineEvent::Failed { page: req.page, error: t("Sidan kunde inte renderas").into() }, true),
                     }
                 }
                 Job::Text(p) => {
                     let res = catch_unwind(AssertUnwindSafe(|| extract_page(&pages[*p], &interp_cache)));
                     match res {
                         Ok(t) => (EngineEvent::Text { page: *p, text: Arc::new(t) }, false),
-                        Err(_) => (EngineEvent::Failed { page: *p, error: "Texten kunde inte läsas".into() }, true),
+                        Err(_) => (EngineEvent::Failed { page: *p, error: text_error().into() }, true),
                     }
                 }
             };

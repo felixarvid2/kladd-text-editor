@@ -7,6 +7,7 @@ use std::ops::Range;
 use egui::{Color32, CursorIcon, FontId, Id, LayerId, Order, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
 use super::markup::{self, Align, Float, ImageRef};
+use crate::i18n::t;
 use crate::icons::{self, Icon};
 use crate::theme::Palette;
 
@@ -466,11 +467,11 @@ fn toolbar(ui: &mut Ui, r: Rect, p: &Palette, float: Option<Float>) -> (Option<A
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     for (label, a) in [
-                        ("Vänster", Act::Align(Align::Left)),
-                        ("Centrera", Act::Align(Align::Center)),
-                        ("Höger", Act::Align(Align::Right)),
-                        ("Originalstorlek", Act::Original),
-                        ("Ta bort", Act::Delete),
+                        (t("Vänster"), Act::Align(Align::Left)),
+                        (t("Centrera"), Act::Align(Align::Center)),
+                        (t("Höger"), Act::Align(Align::Right)),
+                        (t("Originalstorlek"), Act::Original),
+                        (t("Ta bort"), Act::Delete),
                     ] {
                         if ui.add(egui::Button::new(label).small()).clicked() {
                             act = Some(a);
@@ -479,9 +480,9 @@ fn toolbar(ui: &mut Ui, r: Rect, p: &Palette, float: Option<Float>) -> (Option<A
                     ui.add_space(4.0);
                     // Radbrytning: bilden på en egen rad, eller text som flyter runt den.
                     for (icon, to, tip) in [
-                        (Icon::WrapInline, None, "Radbrytning: I texten"),
-                        (Icon::WrapLeft, Some(Float::Left), "Radbrytning: Vänster (text till höger om bilden)"),
-                        (Icon::WrapRight, Some(Float::Right), "Radbrytning: Höger (text till vänster om bilden)"),
+                        (Icon::WrapInline, None, t("Radbrytning: I texten")),
+                        (Icon::WrapLeft, Some(Float::Left), t("Radbrytning: Vänster (text till höger om bilden)")),
+                        (Icon::WrapRight, Some(Float::Right), t("Radbrytning: Höger (text till vänster om bilden)")),
                     ] {
                         if icons::toggle_button(ui, p, icon, float == to, tip).clicked() {
                             act = Some(Act::Float(to));

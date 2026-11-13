@@ -4,6 +4,9 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+
+use crate::i18n::t;
+use crate::tf;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -37,7 +40,7 @@ fn lang_name(code: &str) -> String {
     NAMES
         .iter()
         .find(|(c, _)| *c == code)
-        .map(|(_, n)| n.to_string())
+        .map(|(_, n)| t(n).to_string())
         .unwrap_or_else(|| code.to_string())
 }
 
@@ -198,7 +201,7 @@ fn locale_to_code(tag: &str) -> Option<String> {
 }
 
 /// Språkkod från miljön: `$LANG`, annars operativsystemets språk.
-fn system_locale_code() -> Option<String> {
+pub(crate) fn system_locale_code() -> Option<String> {
     std::env::var("LANG")
         .ok()
         .and_then(|l| locale_to_code(&l))
@@ -360,13 +363,13 @@ fn download_to(d: &Download, dir: &Path) -> Result<(), String> {
         .timeout_global(Some(std::time::Duration::from_secs(120)))
         .build()
         .into();
-    std::fs::create_dir_all(dir).map_err(|e| format!("kunde inte skapa {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| tf!("kunde inte skapa {path}: {e}", path = dir.display(), e = e))?;
     let aff = http_get(&agent, d.aff)?;
     let dic = http_get(&agent, d.dic)?;
     let save = |name: String, bytes: &[u8]| -> Result<(), String> {
         let tmp = dir.join(format!("{name}.part"));
-        std::fs::write(&tmp, bytes).map_err(|e| format!("kunde inte spara {name}: {e}"))?;
-        std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("kunde inte spara {name}: {e}"))
+        std::fs::write(&tmp, bytes).map_err(|e| tf!("kunde inte spara {name}: {e}", name = name, e = e))?;
+        std::fs::rename(&tmp, dir.join(&name)).map_err(|e| tf!("kunde inte spara {name}: {e}", name = name, e = e))
     };
     // Licensen är bara en bonus: misslyckas den får ordlistan ändå användas.
     if let Some(lic) = d.license {
@@ -380,7 +383,7 @@ fn download_to(d: &Download, dir: &Path) -> Result<(), String> {
 
 /// Hämtar ordlistan `code` till `dir` (blockerar; kör i egen tråd).
 pub fn download_dictionary(code: &str, dir: &Path) -> Result<(), String> {
-    let d = DOWNLOADS.iter().find(|d| d.code == code).ok_or_else(|| format!("okänt språk: {code}"))?;
+    let d = DOWNLOADS.iter().find(|d| d.code == code).ok_or_else(|| tf!("okänt språk: {code}", code = code))?;
     download_to(d, dir)
 }
 
@@ -461,7 +464,7 @@ impl Speller {
         std::thread::spawn(move || {
             let _ = tx.send(download_to(d, &dir));
         });
-        self.download = Some((d.code.to_string(), d.name.to_string(), rx));
+        self.download = Some((d.code.to_string(), t(d.name).to_string(), rx));
     }
 
     /// Visningsnamnet på ordlistan som hämtas just nu.
@@ -476,7 +479,7 @@ impl Speller {
         let res = match rx.try_recv() {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => Err("hämtningen avbröts".to_owned()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(t("hämtningen avbröts").to_owned()),
         };
         let (code, name) = (code.clone(), name.clone());
         self.download = None;
@@ -486,7 +489,7 @@ impl Speller {
                 .langs
                 .iter()
                 .position(|l| l.code == code)
-                .ok_or("ordlistan hittades inte efter hämtningen")?;
+                .ok_or_else(|| t("ordlistan hittades inte efter hämtningen").to_owned())?;
             self.cur = Some(i);
             self.start_loading();
             self.bump();
