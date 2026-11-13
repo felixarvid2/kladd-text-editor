@@ -84,9 +84,14 @@ impl Ui {
             .with_accessibility_check(false)
             // Systemtypsnitt läses inte in i testerna; tecken som saknas i de inbäddade ritas som tofu.
             .allow_missing_glyphs()
+            // Fler steg än standard: bakgrundsarbete (typsnitt, git, LSP) kan ta några bilder under last.
+            .with_max_steps(64)
             .build_eframe(move |cc| {
                 // Ingen enkelinstans (inget uttag), standardinställningar utan sparad konfiguration.
                 let mut app = KladdApp::new(cc, Vec::new(), false);
+                // Testerna delar en tillfällig datakatalog och körs parallellt: en annan tests sparade
+                // inställningar (arbetsmapp, delad vy, språk …) får inte läcka in. Börja alltid från standard.
+                app.settings = crate::app::Settings::default();
                 app.settings.lang = crate::i18n::LangSetting::Sv;
                 crate::i18n::set_lang(crate::i18n::Lang::Sv);
                 // Aldrig någon uppdateringskontroll i testerna.
@@ -96,7 +101,10 @@ impl Ui {
                 }
                 app
             });
-        h.run();
+        // Bakgrundstrådar (git, språkservrar, typsnitt) kan be om fler bilder under start; under hög
+        // belastning hinner de inte alltid bli klara inom `max_steps`, så starten får inte paniken.
+        h.run_ok();
+        h.run_steps(2);
         Self { h, dir }
     }
 

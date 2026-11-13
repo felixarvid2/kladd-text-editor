@@ -36,6 +36,8 @@ mod macopen;
 mod menubar;
 mod multicursor;
 mod palette;
+mod vim;
+mod vim_ui;
 mod paste;
 mod panes;
 mod platform;

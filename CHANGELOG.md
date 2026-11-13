@@ -38,6 +38,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Språkservrar (LSP) för kodfiler.** Kladd startar rust-analyzer, pyright-langserver/pylsp, typescript-language-server, gopls eller clangd (de som finns på PATH) när en kodfil öppnas och visar fel och varningar som krumelurer, ikoner i marginalen och hovertext, med en *Problem*-panel där ett klick hoppar till platsen. Komplettering (efter utlösartecken eller `Ctrl+Space`), hover, gå till definition (`F12`, `Ctrl+klick`, även till andra filer), referenser (`Skift+F12`), byt namn (`F2`), formatera (`Skift+Alt+F`) och signaturhjälp. Ändringar skickas inkrementellt med rätt UTF-16-positioner, och statusraden visar serverns förlopp (*rust-analyzer: indexerar…*). *Språkservrar…* i menyn ställer in kommandon per språk.
 
+- **Vim-läge i textläget.** Ny inställning *Vim-läge* i huvudmenyn (av som standard; inte i dokumentläget eller PDF) med lägena normal, infoga, markera (tecken, rad, block), ersätt och kommandorad. Normalläget har antal, rörelser (`h j k l w W b B e E ge 0 ^ $ gg G f F t T ; , % { } H M L Ctrl+d Ctrl+u`), operatorer (`d c y > < gu gU ~`) med rörelser och textobjekt (`iw aw iW ip ap i" a" i' i( a( i[ i{ it`), `x X s S r J p P u Ctrl+r . o O a A i I`, register (`"a`–`"z`, `"+`), markeringar, sökning (`/ ? n N * #`) och makron (`q`, `@`). Kommandoraden har `:w :q :wq :x :q! :e`, `:s`/`:%s` (Rusts regex), `:<rad>`, `:set nu/nonu/wrap/nowrap`, `:noh` och `:sp`/`:vs`. Blockmarkör, läge (`-- INFOGA --`) och väntande kommando visas i statusraden. Logiken är en ren tillståndsmaskin (`src/vim.rs`) med många enhetstester.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

@@ -117,6 +117,8 @@ pub struct Settings {
     pub lsp: bool,
     /// Egna serverkommandon per språk (nyckel i `lsp::config`, kommandorad); saknas ett används standardvalet.
     pub lsp_commands: Vec<(String, String)>,
+    /// Vim-tangentbindningar i textläget (av som standard).
+    pub vim: bool,
 }
 
 impl Default for Settings {
@@ -152,6 +154,7 @@ impl Default for Settings {
             recent_commands: Vec::new(),
             lsp: true,
             lsp_commands: Vec::new(),
+            vim: false,
         }
     }
 }
@@ -282,6 +285,11 @@ pub struct KladdApp {
     pub(crate) panes: crate::panes::Panes,
     /// Extra markörer och kolumnmarkering i textläget.
     mc: crate::multicursor::State,
+    /// Vim-läget (`vim.rs`, `vim_ui.rs`): tillstånd, rulning och synliga rader från förra bilden.
+    vimui: crate::vim_ui::State,
+    vim_scroll: Option<usize>,
+    vim_scroll_lines: i32,
+    vim_view: crate::vim::View,
     /// Filträd och snabböppna (`workspace.rs`).
     pub(crate) ws: crate::workspace::State,
     /// Sök i filer (`find_files.rs`).
@@ -405,6 +413,10 @@ impl KladdApp {
             focus_editor: false,
             editor_rect: Rect::NOTHING,
             mc: Default::default(),
+            vimui: Default::default(),
+            vim_scroll: None,
+            vim_scroll_lines: 0,
+            vim_view: Default::default(),
             last_title: String::new(),
             last_active_id: None,
             incoming: None,
@@ -1290,10 +1302,113 @@ impl KladdApp {
         }
     }
 
+    /// Vim-läget är på och gäller den aktiva fliken (inte dokumentläget eller PDF).
+    fn vim_active(&self) -> bool {
+        self.settings.vim && !self.docs.is_empty() && !self.pdf_mode() && !self.word_mode()
+    }
+
+    /// Vim-läget: tar tangenterna före resten och utför det Vim ber om.
+    fn vim_step(&mut self, ctx: &egui::Context) {
+        if !self.vim_active() {
+            return;
+        }
+        let view = self.vim_view;
+        let doc = &mut self.docs[self.active];
+        let id = editor_id(doc.id);
+        let step = self.vimui.pre(ctx, id, doc.id, &mut doc.text, view);
+        if step.edited {
+            doc.on_edited();
+            self.find.current = None;
+        }
+        if step.scroll_to.is_some() {
+            self.vim_scroll = step.scroll_to;
+        }
+        self.vim_scroll_lines += step.scroll_lines;
+        for e in step.effects {
+            self.vim_effect(ctx, e);
+        }
+    }
+
+    fn vim_path(&self, name: &str) -> PathBuf {
+        let p = if let Some(rest) = name.strip_prefix("~/") {
+            home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(name))
+        } else {
+            PathBuf::from(name)
+        };
+        if p.is_absolute() {
+            return p;
+        }
+        self.docs.get(self.active).and_then(|d| d.base_dir()).or_else(home_dir).unwrap_or_default().join(p)
+    }
+
+    fn vim_effect(&mut self, ctx: &egui::Context, e: crate::vim::Effect) {
+        use crate::vim::{Effect as E, Setting};
+        let idx = self.active;
+        match e {
+            E::Save => self.save_doc(ctx, idx, false, false),
+            E::SaveAs(name) => {
+                let path = self.vim_path(&name);
+                self.write_doc(ctx, idx, &path, false, false);
+            }
+            E::SaveQuit => {
+                if self.panes.is_split() {
+                    self.save_doc(ctx, idx, false, false);
+                    self.panes.close();
+                } else {
+                    let last = self.docs.len() <= 1;
+                    self.save_doc(ctx, idx, true, last);
+                }
+            }
+            E::Quit { force } => {
+                if self.panes.is_split() {
+                    self.panes.close();
+                } else if self.docs[idx].dirty && !force {
+                    self.notify(ctx, t("E37: Ändringar sparades inte (lägg till ! för att strunta i dem)"), true);
+                } else {
+                    let last = self.docs.len() <= 1;
+                    self.close_tab_now(idx);
+                    if last {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+            E::QuitAll { force } => {
+                if !force && self.docs.iter().any(|d| d.dirty) {
+                    self.notify(ctx, t("E37: Ändringar sparades inte (lägg till ! för att strunta i dem)"), true);
+                } else {
+                    self.allow_exit = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+            E::Edit(name) => {
+                let path = self.vim_path(&name);
+                self.open_path(ctx, &path);
+            }
+            E::Split { vertical } => {
+                let o = if vertical { Orient::Vertical } else { Orient::Horizontal };
+                if self.panes.orient != Some(o) {
+                    self.toggle_split(o);
+                }
+            }
+            E::CloseSplit => {
+                if self.panes.is_split() {
+                    self.panes.close();
+                }
+            }
+            E::Set(Setting::Number, v) => self.settings.line_numbers = v.unwrap_or(!self.settings.line_numbers),
+            E::Set(Setting::Wrap, v) => self.settings.wrap = v.unwrap_or(!self.settings.wrap),
+            E::Notify(msg, err) => self.notify(ctx, msg, err),
+            E::Clipboard(s) => ctx.copy_text(s),
+            E::Scroll(n) => self.vim_scroll_lines += n,
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.pending_close.is_some() || self.history.is_some() || self.templates.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.wv.hf_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
             return;
         }
+        // Vim först: den tar sina tangenter (även Ctrl+O i normalläget) före Kladds genvägar.
+        self.vim_step(ctx);
         // COMMAND = ⌘ på Mac, Ctrl annars.
         let ctrl = Modifiers::COMMAND;
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
@@ -1690,6 +1805,16 @@ impl KladdApp {
                         ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
                     self.git_status_chip(ui, p);
+                    if self.vim_active() {
+                        let (left, right) = self.vimui.status();
+                        let mono = FontId::new(12.0, FontFamily::Monospace);
+                        if !left.is_empty() {
+                            ui.label(RichText::new(left).font(mono.clone()).color(p.accent).strong());
+                        }
+                        if !right.is_empty() {
+                            ui.label(RichText::new(right).font(mono).color(p.muted));
+                        }
+                    }
                     let now = Self::now(&ctx);
                     if let Some(t) = &self.toast {
                         if t.until > now {
@@ -1870,11 +1995,16 @@ impl KladdApp {
                 let matches = self.search_highlights();
                 let scroll_to = self.scroll_to_char.take();
                 let focus = std::mem::take(&mut self.focus_editor);
+                let vim_on = self.settings.vim;
+                let vim_scroll = self.vim_scroll.take();
+                let vim_lines = std::mem::take(&mut self.vim_scroll_lines);
+                let mut vim_vis = (usize::MAX, 0usize);
 
                 let git_gutter = self.git_gutter(ui.ctx());
                 let mut git_hunk: Option<(usize, egui::Pos2)> = None;
                 let ac_on = self.autocorrect_active(false);
                 let ac_lang = self.autocorrect_lang();
+                let vimui = &self.vimui;
                 let ac_cfg = &self.settings.autocorrect;
                 let doc = &mut self.docs[self.active];
                 let hl = &mut self.hl;
@@ -1932,6 +2062,9 @@ impl KladdApp {
                                 hl.galley(ui.ctx(), buf.as_str(), &params, if wrap { wrap_width } else { f32::INFINITY })
                             };
                             let avail_w = ui.available_width();
+                            if vim_on && vimui.hides_caret() {
+                                ui.visuals_mut().text_cursor.stroke.width = 0.0;
+                            }
                             let out = TextEdit::multiline(&mut doc.text)
                                 .id(id)
                                 .frame(Frame::NONE)
@@ -1955,6 +2088,9 @@ impl KladdApp {
                             }
                             mc.post(ui, id, &doc.text, &out, font_size);
                             lsp.post(ui, p, id, doc, &out, gutter);
+                            if vim_on {
+                                vimui.paint(ui, p, &out.galley, out.galley_pos, &doc.text, font_size);
+                            }
                             if focus {
                                 ui.memory_mut(|m| m.request_focus(id));
                             }
@@ -1977,6 +2113,9 @@ impl KladdApp {
                             for row in &galley.rows {
                                 let r = row.rect().translate(origin);
                                 let this = logical;
+                                if vim_on && r.bottom() >= ui.clip_rect().top() && r.top() <= ui.clip_rect().bottom() {
+                                    vim_vis = (vim_vis.0.min(this - 1), vim_vis.1.max(this - 1));
+                                }
                                 let is_start = starts_line;
                                 starts_line = row.ends_with_newline;
                                 if row.ends_with_newline {
@@ -2020,6 +2159,13 @@ impl KladdApp {
                                 let r = galley.pos_from_cursor(CCursor::new(ci)).translate(origin);
                                 ui.scroll_to_rect(r.expand2(vec2(80.0, 60.0)), Some(Align::Center));
                             }
+                            if vim_lines != 0 {
+                                let rh = galley.rows.first().map_or(18.0, |r| r.rect().height());
+                                ui.scroll_with_delta(vec2(0.0, -(vim_lines as f32) * rh));
+                            } else if let Some(ci) = vim_scroll {
+                                let r = galley.pos_from_cursor(CCursor::new(ci)).translate(origin);
+                                ui.scroll_to_rect(r.expand2(vec2(40.0, 40.0)), None);
+                            }
                             (line, col, sel)
                         })
                         .inner
@@ -2027,6 +2173,9 @@ impl KladdApp {
                 self.cursor = result.inner;
                 if let (Some(g), Some((idx, anchor))) = (&git_gutter, git_hunk) {
                     self.git_open_hunk(g, idx, anchor);
+                }
+                if vim_on && vim_vis.0 != usize::MAX {
+                    self.vim_view = crate::vim::View { top: vim_vis.0, lines: vim_vis.1 - vim_vis.0 + 1 };
                 }
                 if edited {
                     self.find.current = None;

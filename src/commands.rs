@@ -356,6 +356,7 @@ pub static ALL: &[Command] = &[
     Command::new("view.other_pane", "Växla ruta", View, "F6", |e| e.is_split, |a, _| a.focus_pane(1 - a.panes.active)),
     Command::new("view.wrap", "Radbrytning", View, "Alt+Z", always, |a, _| a.settings.wrap = !a.settings.wrap).checked(|e| e.settings.wrap).sep(),
     Command::new("view.line_numbers", "Radnummer", View, "", always, |a, _| a.settings.line_numbers = !a.settings.line_numbers).checked(|e| e.settings.line_numbers),
+    Command::new("view.vim", "Vim-läge", View, "", always, |a, _| { a.settings.vim = !a.settings.vim; a.vimui.vim.switch_doc(); }).checked(|e| e.settings.vim),
     Command::new("view.nav_pane", "Navigeringsfönster", View, "Ctrl+Shift+O", |e| e.markdown, |a, _| a.settings.nav_pane = !a.settings.nav_pane).checked(|e| e.settings.nav_pane),
     Command::new("view.preview", "Förhandsvisa Markdown", View, "Ctrl+Shift+M", always, |a, _| a.settings.preview = !a.settings.preview).checked(|e| e.settings.preview),
     Command::new("view.workspace", "Mappträd", View, "Ctrl+Shift+E", always, |a, c| a.toggle_workspace_panel(c)).checked(|e| e.settings.workspace_panel),
