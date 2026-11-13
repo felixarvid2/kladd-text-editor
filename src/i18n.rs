@@ -75,15 +75,31 @@ pub fn lang_from_locale(locale: &str) -> Lang {
     if l == "sv" || l.starts_with("sv-") || l.starts_with("sv_") { Lang::Sv } else { Lang::En }
 }
 
+#[cfg(not(test))]
 static CURRENT: AtomicU8 = AtomicU8::new(0);
+
+// I tester har varje testtråd sitt eget språk, så att ett test som byter till engelska inte
+// påverkar de andra som kör samtidigt.
+#[cfg(test)]
+thread_local! {
+    static CURRENT: AtomicU8 = const { AtomicU8::new(0) };
+}
 
 /// Sätter aktuellt språk. Gäller direkt för alla efterföljande `t()`-anrop.
 pub fn set_lang(l: Lang) {
-    CURRENT.store(if l == Lang::En { 1 } else { 0 }, Ordering::Relaxed);
+    let v = if l == Lang::En { 1 } else { 0 };
+    #[cfg(not(test))]
+    CURRENT.store(v, Ordering::Relaxed);
+    #[cfg(test)]
+    CURRENT.with(|c| c.store(v, Ordering::Relaxed));
 }
 
 pub fn lang() -> Lang {
-    if CURRENT.load(Ordering::Relaxed) == 1 { Lang::En } else { Lang::Sv }
+    #[cfg(not(test))]
+    let v = CURRENT.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let v = CURRENT.with(|c| c.load(Ordering::Relaxed));
+    if v == 1 { Lang::En } else { Lang::Sv }
 }
 
 static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {

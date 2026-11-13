@@ -288,6 +288,11 @@ pub struct KladdApp {
     pub(crate) csv: crate::csv::view::State,
 }
 
+/// Gränssnittstester som kör hela appen utan fönster (se `docs/dev/gransnittstester.md`).
+#[cfg(test)]
+#[path = "ui_tests/mod.rs"]
+mod ui_tests;
+
 pub(crate) fn editor_id(doc_id: u64) -> Id {
     Id::unique(("kladd-editor", doc_id, crate::panes::salt()))
 }
@@ -3407,6 +3412,7 @@ pub(crate) fn menu_divider(ui: &mut Ui, p: &Palette) {
 /// En menyrad: valfri bock, etikett och kortkommando.
 pub(crate) fn menu_item(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, checked: Option<bool>, enabled: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     if !ui.is_rect_visible(rect) {
         return false;
     }
@@ -3444,6 +3450,7 @@ pub(crate) fn status_button(ui: &mut Ui, p: &Palette, text: &str, tooltip: &str)
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, p.muted);
     let size = vec2(galley.size().x + 14.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     let resp = resp.on_hover_text(crate::keys::shortcut(tooltip));
     let color = if resp.hovered() { p.text } else { p.muted };
     if resp.hovered() {

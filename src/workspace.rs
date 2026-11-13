@@ -970,6 +970,7 @@ impl KladdApp {
                                 None => ("", full.as_str()),
                             };
                             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, full));
                             if row == q.selected {
                                 ui.painter().rect_filled(rect, 6.0, p.selection);
                             } else if resp.hovered() {
@@ -1018,6 +1019,7 @@ impl KladdApp {
 /// `git`: bokstav (bara för filer) och färg från Git-status.
 fn tree_row(ui: &mut Ui, p: &Palette, depth: usize, e: &Entry, open: bool, active: Option<&Path>, git: Option<(Option<char>, Color32)>, actions: &mut Vec<Action>) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &e.name));
     let is_active = !e.is_dir && active == Some(e.path.as_path());
     if is_active {
         ui.painter().rect_filled(rect, 5.0, p.selection);

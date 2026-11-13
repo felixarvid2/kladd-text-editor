@@ -8,18 +8,41 @@ use std::process::Command;
 /// Linux behåller gemener (som tidigare), macOS och Windows använder versal.
 const APP_DIR: &str = if cfg!(any(target_os = "macos", windows)) { "Kladd" } else { "kladd" };
 
+/// Rotmapp som gränssnittstesterna pekar om alla användarmappar till (se `ui_tests`), så att de
+/// aldrig rör den riktiga konfigurationen, historiken eller återställningsfilerna.
+#[cfg(test)]
+static TEST_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Pekar om data-, konfigurations- och hemmapp till undermappar av `root` (bara i tester, en gång).
+#[cfg(test)]
+pub fn set_test_root(root: PathBuf) {
+    let _ = TEST_ROOT.set(root);
+}
+
 /// Kladds datamapp: `$XDG_DATA_HOME/kladd`, `~/Library/Application Support/Kladd` eller `%APPDATA%\Kladd`.
 pub fn data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_ROOT.get() {
+        return root.join("data").join(APP_DIR);
+    }
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".local/share")).join(APP_DIR)
 }
 
 /// Kladds konfigurationsmapp: `$XDG_CONFIG_HOME/kladd`, `~/Library/Application Support/Kladd` eller `%APPDATA%\Kladd`.
 pub fn config_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_ROOT.get() {
+        return root.join("config").join(APP_DIR);
+    }
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config")).join(APP_DIR)
 }
 
 /// Användarens hemmapp.
 pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_ROOT.get() {
+        return Some(root.join("home"));
+    }
     dirs::home_dir()
 }
 

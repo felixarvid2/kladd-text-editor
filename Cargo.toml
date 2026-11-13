@@ -61,6 +61,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[dev-dependencies]
+egui_kittest = { version = "0.37", default-features = false, features = ["eframe"] }
+
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
