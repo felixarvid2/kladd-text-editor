@@ -35,6 +35,8 @@ mod style;
 mod theme;
 mod update;
 mod word;
+mod workspace;
+mod find_files;
 
 use std::path::PathBuf;
 

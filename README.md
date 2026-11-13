@@ -34,6 +34,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`, med alternativ för versaler, hela ord och reguljära uttryck (`$1` och `${namn}` fungerar i ersättningen). I dokumentläget söker Kladd i den synliga texten, så "fet text" hittar `**fet** text`. Du kan också söka på formatering (fetstil, kursiv, färg, markering, rubrik) och låta *Ersätt* lägga på eller ta bort formatering på träffarna.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
 - **Delad vy** – `Ctrl+\` delar fönstret i två rutor bredvid varandra, `Ctrl+Shift+\` över varandra (eller *Dela vyn* / *Dela vågrätt* i menyn). Välj flik per ruta i rutans egen väljare, eller visa samma dokument två gånger med egen rullning. Dra skiljelinjen för att ändra storleken; `F6` byter aktiv ruta.
+- **Arbetsmapp** (`Ctrl+Shift+E`): filträd i en sidopanel med nytt, byt namn och ta bort (till papperskorgen), **snabböppna** (`Ctrl+E`) med suddig filnamnssökning och **sök i filer** (`Ctrl+Shift+F`) i mappen eller alla flikar, med ersättning över flera filer.
 - **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
 - **Två teman** – *Gryning* och *Skymning*.
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
@@ -236,6 +237,9 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Nästa / föregående flik |
 | `Ctrl+Shift+I` | Infoga bild |
 | `Ctrl+F` / `Ctrl+H` | Sök / ersätt |
+| `Ctrl+Shift+F` | Sök i filer (arbetsmappen eller alla flikar) |
+| `Ctrl+E` | Snabböppna fil i arbetsmappen (inte i dokumentläget, där är det centrera) |
+| `Ctrl+Shift+E` | Mappträd (arbetsmapp) på/av |
 | `F3` / `Shift+F3` | Nästa / föregående träff |
 | `Esc` | Stäng sökning |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Textstorlek (i dokumentläge: zoom av sidan) |

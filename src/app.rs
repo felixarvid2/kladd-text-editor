@@ -91,6 +91,12 @@ pub struct Settings {
     pub autosave: bool,
     /// Första rutans andel av ytan i delad vy.
     pub split_ratio: f32,
+    /// Arbetsmappen (filträdet och sök i filer).
+    pub workspace: Option<PathBuf>,
+    /// Filträdet är synligt.
+    pub workspace_panel: bool,
+    /// Dolda filer och mappar som .git, target och node_modules visas i trädet.
+    pub workspace_hidden: bool,
 }
 
 impl Default for Settings {
@@ -116,6 +122,9 @@ impl Default for Settings {
             update_skip: None,
             autosave: false,
             split_ratio: 0.5,
+            workspace: None,
+            workspace_panel: false,
+            workspace_hidden: false,
         }
     }
 }
@@ -242,6 +251,10 @@ pub struct KladdApp {
     pub(crate) panes: crate::panes::Panes,
     /// Extra markörer och kolumnmarkering i textläget.
     mc: crate::multicursor::State,
+    /// Filträd och snabböppna (`workspace.rs`).
+    pub(crate) ws: crate::workspace::State,
+    /// Sök i filer (`find_files.rs`).
+    pub(crate) ff: crate::find_files::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -273,7 +286,7 @@ fn line_col(text: &str, ci: usize) -> (usize, usize) {
     (line, col)
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
     } else {
@@ -355,6 +368,8 @@ impl KladdApp {
             pdf_fullscreen: false,
             update: Default::default(),
             panes: Default::default(),
+            ws: Default::default(),
+            ff: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -402,7 +417,7 @@ impl KladdApp {
         self.settings.recent.truncate(MAX_RECENT);
     }
 
-    fn open_path(&mut self, ctx: &egui::Context, path: &Path) {
+    pub(crate) fn open_path(&mut self, ctx: &egui::Context, path: &Path) {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if let Some(i) = self.docs.iter().position(|d| d.path.as_deref() == Some(&canonical)) {
             self.active = i;
@@ -798,7 +813,7 @@ impl KladdApp {
         self.focus_editor = true;
     }
 
-    fn index_of(&self, doc_id: u64) -> Option<usize> {
+    pub(crate) fn index_of(&self, doc_id: u64) -> Option<usize> {
         self.docs.iter().position(|d| d.id == doc_id)
     }
 
@@ -1126,6 +1141,8 @@ impl KladdApp {
             return;
         }
         let pdf = self.pdf_mode();
+        // Före Ctrl+F: Skift-varianterna måste tas först.
+        self.workspace_shortcuts(ctx);
 
         if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
             self.new_tab();
@@ -1499,6 +1516,20 @@ impl KladdApp {
         if menu_item(ui, p, "Versionshistorik…", "", None, hist) {
             self.open_history(ctx);
         }
+        menu_divider(ui, p);
+        if menu_item(ui, p, "Öppna mapp…", "", None, true) {
+            self.request_folder(ctx);
+        }
+        if menu_item(ui, p, "Mappträd", "Ctrl+Shift+E", Some(self.settings.workspace_panel), true) {
+            self.toggle_workspace_panel(ctx);
+        }
+        if menu_item(ui, p, "Stäng mapp", "", None, self.settings.workspace.is_some()) {
+            self.close_workspace();
+        }
+        if menu_item(ui, p, "Snabböppna…", "Ctrl+E", None, true) {
+            self.open_quick(ctx);
+        }
+        menu_divider(ui, p);
         if menu_item(ui, p, "Stäng flik", "Ctrl+W", None, has_doc) {
             self.request_close_tab(self.active);
         }
@@ -1514,6 +1545,9 @@ impl KladdApp {
         }
         if menu_item(ui, p, "Sök och ersätt", "Ctrl+H", None, has_doc && !pdf) {
             self.open_find(ctx, true);
+        }
+        if menu_item(ui, p, "Sök i filer…", "Ctrl+Shift+F", None, true) {
+            self.open_find_files(ctx);
         }
         menu_divider(ui, p);
         let split = self.panes.orient;
@@ -3388,11 +3422,15 @@ impl eframe::App for KladdApp {
         self.pdf_bar(ui, &p);
         self.status_bar(ui, &p);
         self.update.banner(ui, &ctx, &p, &mut self.settings);
+        self.find_files_panel(ui, &p);
         self.pdf_sidebar(ui, &p);
+        self.workspace_panel(ui, &p);
         self.nav_pane(ui, &p);
         self.preview(ui, &p);
         self.central(ui, &p);
         self.find_bar(&ctx, &p);
+        self.quick_open_popup(&ctx, &p);
+        self.workspace_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
         self.close_dialog(&ctx, &p);
         self.recovery_dialog(&ctx, &p);
