@@ -46,6 +46,7 @@ ureq = "3.5.2"
 sys-locale = "0.3.2"
 interprocess = "2.4.8"
 dirs = "7.0.0"
+similar = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 # Bara på Windows-värdar: bäddar in ikon och versionsinfo i kladd.exe.

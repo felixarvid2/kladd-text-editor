@@ -70,6 +70,8 @@ pub struct Settings {
     pub update_last_check: u64,
     /// Version som användaren valt att hoppa över.
     pub update_skip: Option<String>,
+    /// Spara ändrade flikar med sökväg automatiskt när skrivandet stannat (av som standard).
+    pub autosave: bool,
 }
 
 impl Default for Settings {
@@ -90,6 +92,7 @@ impl Default for Settings {
             auto_update_check: true,
             update_last_check: 0,
             update_skip: None,
+            autosave: false,
         }
     }
 }
@@ -182,6 +185,8 @@ pub struct KladdApp {
     dialog: Option<Receiver<DialogResult>>,
     pending_close: Option<PendingClose>,
     pending_docx: Option<PendingDocx>,
+    autosave: crate::autosave::Autosave,
+    history: Option<crate::history_ui::Dialog>,
     pending_password: Option<PendingPassword>,
     allow_exit: bool,
     toast: Option<Toast>,
@@ -291,6 +296,8 @@ impl KladdApp {
             dialog: None,
             pending_close: None,
             pending_docx: None,
+            autosave: Default::default(),
+            history: None,
             pending_password: None,
             allow_exit: false,
             toast: None,
@@ -414,6 +421,7 @@ impl KladdApp {
             self.active = self.docs.len() - 1;
         }
         self.remember(canonical);
+        self.autosave.record_stamp(self.docs[self.active].id, canonical);
         self.focus_editor = true;
         if let Some(note) = self.docs[self.active].open_note.take() {
             self.notify(ctx, note, false);
@@ -573,6 +581,99 @@ impl KladdApp {
         self.write_doc(ctx, idx, &path, then_close, exit);
     }
 
+    /// Efter varje lyckad sparning av flikens egen fil: minns filens stämpel och lagrar en version.
+    fn after_save(&mut self, idx: usize, path: &Path) {
+        let Some(doc) = self.docs.get(idx) else { return };
+        self.autosave.record_stamp(doc.id, path);
+        if let Ok(bytes) = std::fs::read(path) {
+            let _ = crate::history::record(&crate::history::root(), path, &bytes, crate::history::now_ms(), &Default::default());
+        }
+    }
+
+    /// Automatisk sparning (när inställningen är på): sparar ändrade flikar som reglerna tillåter.
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let steps = self.autosave.poll(&self.docs, self.active, Self::now(ctx), focused, self.settings.autosave);
+        for step in steps {
+            match step {
+                crate::autosave::Step::Notice(text) => self.notify(ctx, text, true),
+                crate::autosave::Step::Save(id) => {
+                    let Some(idx) = self.index_of(id) else { continue };
+                    let Some(path) = self.docs[idx].path.clone() else { continue };
+                    match self.docs[idx].save_to(&path) {
+                        Ok(warnings) => {
+                            self.after_save(idx, &path);
+                            if warnings.is_empty() {
+                                self.notify(ctx, "Sparat automatiskt", false);
+                            } else {
+                                let list: Vec<&str> = warnings.iter().map(String::as_str).collect();
+                                let what = if list.len() == 1 { "bilden" } else { "bilderna" };
+                                self.notify(ctx, format!("Sparat automatiskt, men hittade inte {what} {}", join_sv(&list)), true);
+                            }
+                        }
+                        Err(e) => {
+                            self.autosave.mark_failed(id, &self.docs[idx].text);
+                            self.notify(ctx, format!("Automatisk sparning misslyckades: {e}"), true);
+                        }
+                    }
+                }
+            }
+        }
+        if self.autosave.pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    }
+
+    fn open_history(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        match doc.path.clone() {
+            Some(path) => self.history = Some(crate::history_ui::Dialog::new(doc, &path)),
+            None => self.notify(ctx, "Spara filen först, så börjar historiken.", false),
+        }
+    }
+
+    fn history_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        use crate::history_ui::Action;
+        let Some(mut dlg) = self.history.take() else { return };
+        let action = dlg.show(ctx, p, crate::history::now_ms());
+        let (ts, restore) = match action {
+            Action::None => {
+                self.history = Some(dlg);
+                return;
+            }
+            Action::Close => return,
+            Action::Restore(ts) => (ts, true),
+            Action::OpenNew(ts) => (ts, false),
+        };
+        let loaded = crate::history::read(&crate::history::root(), &dlg.path, ts)
+            .map_err(|e| format!("Versionen kunde inte läsas: {e}"))
+            .and_then(|bytes| Document::from_version(self.next_id, &dlg.path, &bytes));
+        let version = match loaded {
+            Ok(v) => v,
+            Err(e) => {
+                self.notify(ctx, e, true);
+                self.history = Some(dlg);
+                return;
+            }
+        };
+        if restore {
+            let Some(idx) = self.index_of(dlg.doc_id) else { return };
+            self.active = idx;
+            crate::history_ui::restore_into(ctx, &mut self.docs[idx], version);
+            let id = self.docs[idx].id;
+            self.hl.forget(id);
+            self.word.forget(id);
+            self.find.current = None;
+            self.focus_editor = true;
+            self.notify(ctx, "Återställde versionen (ångra med Ctrl+Z)", false);
+        } else {
+            self.next_id += 1;
+            self.docs.push(version);
+            self.active = self.docs.len() - 1;
+            self.focus_editor = true;
+        }
+    }
+
     fn write_doc(
         &mut self,
         ctx: &egui::Context,
@@ -602,6 +703,7 @@ impl KladdApp {
                     self.hl.forget(doc.id);
                 }
                 self.remember(path);
+                self.after_save(idx, path);
                 if warnings.is_empty() {
                     self.notify(ctx, format!("Sparade {title}"), false);
                 } else {
@@ -636,6 +738,7 @@ impl KladdApp {
         }
         self.store_pdf_memory(idx);
         let doc = self.docs.remove(idx);
+        self.autosave.forget(doc.id);
         self.recovery.forget(doc.id);
         self.hl.forget(doc.id);
         self.word.forget(doc.id);
@@ -949,7 +1052,7 @@ impl KladdApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
+        if self.pending_close.is_some() || self.history.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
             return;
         }
         // COMMAND = ⌘ på Mac, Ctrl annars.
@@ -1316,6 +1419,10 @@ impl KladdApp {
         if menu_item(ui, p, "Skriv ut…", "Ctrl+P", None, has_doc) {
             self.open_print(ctx);
         }
+        let hist = self.docs.get(self.active).is_some_and(|d| d.path.is_some() && d.pdfv.is_none());
+        if menu_item(ui, p, "Versionshistorik…", "", None, hist) {
+            self.open_history(ctx);
+        }
         if menu_item(ui, p, "Stäng flik", "Ctrl+W", None, has_doc) {
             self.request_close_tab(self.active);
         }
@@ -1368,6 +1475,9 @@ impl KladdApp {
         }
         if menu_item(ui, p, "Sök efter uppdateringar", "", None, true) {
             self.update.check_now(ctx);
+        }
+        if menu_item(ui, p, "Spara automatiskt", "", Some(self.settings.autosave), true) {
+            self.settings.autosave = !self.settings.autosave;
         }
         menu_divider(ui, p);
         if menu_item(ui, p, "Avsluta", "Ctrl+Q", None, true) {
@@ -2783,6 +2893,7 @@ impl eframe::App for KladdApp {
         self.update.tick(ctx, &mut self.settings);
         self.update_outs(ctx);
         self.recovery.tick(ctx, &self.docs, self.settings.autosave_recovery);
+        self.autosave_tick(ctx);
         if self.docs.get(self.active).map(|d| d.id) != self.last_active_id {
             self.last_active_id = self.docs.get(self.active).map(|d| d.id);
             self.find.current = None;
@@ -2821,6 +2932,7 @@ impl eframe::App for KladdApp {
         self.update.dialogs(&ctx, &p, &mut self.settings);
         self.update_outs(&ctx);
         self.docx_dialog(&ctx, &p);
+        self.history_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);

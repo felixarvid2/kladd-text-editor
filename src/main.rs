@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod autosave;
 mod doc;
 mod docx;
 mod export;
@@ -16,6 +17,8 @@ mod preview;
 mod print;
 mod recovery;
 mod highlight;
+mod history;
+mod history_ui;
 mod icons;
 mod keys;
 mod macopen;

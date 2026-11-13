@@ -189,6 +189,23 @@ impl Document {
         Self::load_bytes(id, path, bytes, &ext).map_err(LoadError::Message)
     }
 
+    /// Läser en sparad version (de sparade byten) som ett namnlöst, ändrat dokument i filens format.
+    /// `name` ger format (filändelse) och titel.
+    pub fn from_version(id: u64, name: &Path, bytes: &[u8]) -> Result<Self, String> {
+        let ext = ext_of(name);
+        let mut doc = if ext == "pdf" || bytes.starts_with(b"%PDF-") {
+            Self::from_pdf_text(id, name, bytes, None).map_err(|e| match e {
+                LoadError::NeedsPassword | LoadError::WrongPassword => "PDF-versionen är lösenordsskyddad.".to_owned(),
+                LoadError::Message(m) => m,
+            })?
+        } else {
+            Self::load_bytes(id, name, bytes.to_vec(), &ext)?
+        };
+        doc.path = None;
+        doc.dirty = true;
+        Ok(doc)
+    }
+
     /// Gör om en PDF till redigerbar Markdown-text (dagens väg, används av Redigera i PDF-visaren).
     pub fn from_pdf_text(id: u64, path: &Path, bytes: &[u8], password: Option<&str>) -> Result<Self, LoadError> {
         let loaded = crate::pdf_read::read(bytes, password).map_err(|e| match e {
