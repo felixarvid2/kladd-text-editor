@@ -65,6 +65,8 @@ pub struct Document {
     saved_hash: u64,
     saved_meta: (TextEncoding, LineEnding),
     untitled_index: usize,
+    /// Räknas upp vid varje ändring av texten (för cachar som inte vill hasha hela texten).
+    pub rev: u64,
 }
 
 /// Filtyper som visas i öppna/spara-dialogerna.
@@ -168,6 +170,7 @@ impl Document {
             saved_hash: hash_text(""),
             saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
             untitled_index,
+            rev: 0,
         }
     }
 
@@ -245,6 +248,7 @@ impl Document {
             images: loaded.images,
             docx_source: None,
             untitled_index: 0,
+            rev: 0,
         })
     }
 
@@ -282,6 +286,7 @@ impl Document {
                 images: loaded.images,
                 docx_source: loaded.source.map(std::sync::Arc::new),
                 untitled_index: 0,
+                rev: 0,
             });
         }
         // OpenDocument-text visas i samma dokumentläge som Word.
@@ -308,6 +313,7 @@ impl Document {
                 images: loaded.images,
                 docx_source: None,
                 untitled_index: 0,
+                rev: 0,
             });
         }
         if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
@@ -341,6 +347,7 @@ impl Document {
             images: Vec::new(),
             docx_source: None,
             untitled_index: 0,
+            rev: 0,
         })
     }
 
@@ -458,6 +465,7 @@ impl Document {
 
     /// Ska anropas när texten har ändrats i editorn.
     pub fn on_edited(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
         self.dirty = hash_text(&self.text) != self.saved_hash
             || (self.encoding, self.line_ending) != self.saved_meta;
     }

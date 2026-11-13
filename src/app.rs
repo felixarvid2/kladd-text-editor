@@ -284,6 +284,8 @@ pub struct KladdApp {
     pub(crate) cmd: commands::State,
     /// Git: status, marginal, källkontroll (`git_ui.rs`).
     pub(crate) git: crate::git_ui::State,
+    /// Tabellvyn för csv/tsv (`csv/`): vyinställningar per flik.
+    pub(crate) csv: crate::csv::view::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -411,6 +413,7 @@ impl KladdApp {
             ff: Default::default(),
             cmd: Default::default(),
             git: Default::default(),
+            csv: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -1040,6 +1043,7 @@ impl KladdApp {
     fn select_match(&mut self, ctx: &egui::Context, m: &Match) {
         let Some(doc) = self.docs.get(self.active) else { return };
         let id = editor_id(doc.id);
+        let doc_id = doc.id;
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
         let (ca, cb) = (byte_to_char(&doc.text, m.start), byte_to_char(&doc.text, m.end));
         state
@@ -1048,6 +1052,7 @@ impl KladdApp {
         state.store(ctx, id);
         self.find.current = Some(m.start);
         self.scroll_to_char = Some(ca);
+        self.csv.goto_byte(doc_id, m.start);
     }
 
     fn seek(&mut self, ctx: &egui::Context, how: Seek) {
@@ -1692,6 +1697,19 @@ impl KladdApp {
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        // Tabell/Text för csv, tsv och annan avgränsad text.
+                        let (mut csv_avail, mut csv_grid) = (false, false);
+                        if !(doc.docx || doc.pdf) {
+                            let tb = self.csv.tab_for(doc);
+                            (csv_avail, csv_grid) = (tb.available, tb.grid);
+                        }
+                        if csv_avail {
+                            if let Some(g) = crate::csv::view::mode_switch(ui, p, csv_grid) {
+                                self.csv.tab_for(doc).set_grid(g, doc);
+                                self.focus_editor = true;
+                            }
+                            ui.add_space(6.0);
+                        }
                         if doc.docx || doc.pdf {
                             let (label, tip) = if doc.pdf {
                                 (t("PDF-dokument"), t("Texten visas som Markdown och sparas som en ny PDF"))
@@ -1734,6 +1752,11 @@ impl KladdApp {
                         });
                         }
                         ui.add_space(10.0);
+                        if csv_avail && csv_grid {
+                            let s = crate::csv::view::status_text(self.csv.tab_for(doc));
+                            ui.label(RichText::new(s).font(font.clone()).color(p.muted));
+                            return;
+                        }
                         let words = doc.text.split_whitespace().count();
                         let words = if words == 1 { t("1 ord").to_owned() } else { tf!("{words} ord", words = words) };
                         ui.label(RichText::new(words).font(font.clone()).color(p.muted));
@@ -1812,6 +1835,10 @@ impl KladdApp {
         }
         if self.word_mode() {
             self.word_page(ui, p);
+            return;
+        }
+        if self.csv_mode() {
+            self.csv_page(ui, p);
             return;
         }
         CentralPanel::default()
@@ -3471,6 +3498,7 @@ impl eframe::App for KladdApp {
         if self.docs.get(self.active).map(|d| d.id) != self.last_active_id {
             self.last_active_id = self.docs.get(self.active).map(|d| d.id);
             self.find.current = None;
+            self.csv.retain_docs(self.docs.iter().map(|d| d.id));
         }
     }
 

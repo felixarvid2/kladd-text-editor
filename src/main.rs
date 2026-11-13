@@ -6,6 +6,7 @@
 mod app;
 mod autocorrect;
 mod autocorrect_ui;
+mod csv;
 mod autosave;
 mod doc;
 mod docx;
