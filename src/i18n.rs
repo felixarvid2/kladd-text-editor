@@ -81,7 +81,7 @@ pub fn lang() -> Lang {
 
 static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
-    for tab in tables() {
+    for &tab in tables() {
         for &(sv, en) in tab {
             m.insert(sv, en);
         }
@@ -89,8 +89,8 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     m
 });
 
-fn tables() -> [&'static [(&'static str, &'static str)]; 7] {
-    [en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN]
+fn tables() -> &'static [&'static [(&'static str, &'static str)]] {
+    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn tables_are_consistent() {
         let mut seen: HashMap<&str, &str> = HashMap::new();
-        for tab in tables() {
+        for &tab in tables() {
             for &(sv, en) in tab {
                 if let Some(prev) = seen.insert(sv, en) {
                     assert_eq!(prev, en, "dubblett med olika översättning: {sv:?}");
