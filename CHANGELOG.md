@@ -46,6 +46,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - **Dokumentläge, stora dokument.** Efter en ändring i ett dokument på hundratals sidor tolkas bara stycket med ändringen om (med kontroll mot resten), och tabeller, bilder och typsnitt återanvänds: skrivning på sida 1500 av 2000 gick från ~740 till ~300 ms per bildruta. Rubrikträdet ritar bara synliga rader när det finns tusentals rubriker.
 - **PDF med tusentals sidor.** Sökningen släpper textlagret för sidor långt från vyn: minnet vid sökning i 1 800 sidor föll från ~360 till ~90 MB. Träffnumret räknas utan att bygga hela träfflistan.
 
+- **Ekvationer med LaTeX-syntax.** `$…$` (löpande) och `$$…$$` (egen rad, centrerad) visas som riktigt satt matematik i dokumentläget och i Markdown-förhandsvisningen: upphöjt och nedsänkt, bråk, rötter med index, summa/integral/produkt med gränser, `\left( \right)`, grekiska och vanliga symboler, `\text`, `\mathbf`/`\mathbb`/`\mathcal`, matriser, `cases`, `aligned`, accenter och mellanrum. Källtexten visas när markören står på raden. *Infoga → Ekvation* lägger in `$$ $$` med markören inuti, och en palett (bråk, rot, summa, integral, gräns, parenteser, matris …) sätter in färdiga strukturer. Formlerna följer med till `.docx` (Office Math, `m:oMath`; formler i Word-dokument läses tillbaka som LaTeX), `.odt` (formelobjekt med MathML och ersättningsbild), PDF (ritade glyfer), HTML och EPUB (MathML). Typsnittet är STIX Two Math (OFL).
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

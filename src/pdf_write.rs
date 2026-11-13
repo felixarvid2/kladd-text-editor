@@ -118,6 +118,8 @@ struct Style {
     span: SpanStyle,
     /// Fotnotsnummer (1-baserat): texten ritas som litet upphöjt nummer.
     fnref: Option<usize>,
+    /// Formel (LaTeX-kod, egen rad): ritas som glyfer; `Span::text` är koden.
+    math: Option<(String, bool)>,
 }
 
 #[derive(Clone)]
@@ -226,6 +228,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_MATH);
     // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
     let mut note_labels: Vec<String> = Vec::new();
     let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
@@ -265,6 +268,10 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
             return;
         }
         let taken = std::mem::take(spans);
+        // En rad som bara är en `$$…$$`-formel centreras.
+        let lone_display = taken.iter().filter(|s| !s.text.trim().is_empty()).count() == 1
+            && taken.iter().any(|s| s.style.math.as_ref().is_some_and(|m| m.1));
+        let align = if lone_display && align == Align::Left { Align::Center } else { align };
         let indent = indent_now(lists, quote);
         if let Some(h) = heading {
             blocks.push(Block::Heading(h, taken, align));
@@ -287,6 +294,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
 
     let mut table_src: Option<crate::word::markup::TableSrc> = None;
     for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
+        let is_display = matches!(ev, MdEvent::DisplayMath(_));
         let align = aligns.last().copied().unwrap_or_default();
         style.span = span_stack.iter().fold(SpanStyle::default(), |acc, s| acc.merged(s));
         style.bold = bold > 0;
@@ -432,6 +440,18 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 s.code = true;
                 push_text(&mut spans, &t, &s);
             }
+            MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => {
+                let display = is_display;
+                let src = t.trim().to_owned();
+                if crate::math::formula(&src, display).is_some() && image.is_none() {
+                    let mut s = style.clone();
+                    s.math = Some((src.clone(), display));
+                    spans.push(Span { text: src, style: s });
+                } else {
+                    let d = if display { "$$" } else { "$" };
+                    push_text(&mut spans, &format!("{d}{t}{d}"), &style);
+                }
+            }
             MdEvent::SoftBreak | MdEvent::HardBreak => push_text(&mut spans, "\n", &style),
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 // Ett HTML-block kan ha flera rader; varje rad som är en känd tagg tolkas för sig.
@@ -502,7 +522,6 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 let st = Style { fnref: Some(n), ..style.clone() };
                 spans.push(Span { text: n.to_string(), style: st });
             }
-            MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => push_text(&mut spans, &t, &style),
         }
     }
     flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, aligns.last().copied().unwrap_or_default());
@@ -519,6 +538,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
 enum Op {
     Text { x: f32, y: f32, face: Face, size: f32, text: String, color: (u8, u8, u8), italic: bool },
     Rect { x: f32, y: f32, w: f32, h: f32, color: (u8, u8, u8) },
+    /// Formel med origo på baslinjen (`y`), `em` pt per em.
+    Math { x: f32, y: f32, src: String, display: bool, em: f32, color: (u8, u8, u8) },
     Line { x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: (u8, u8, u8) },
     Image { x: f32, y: f32, w: f32, h: f32, index: usize },
     Link { x: f32, y: f32, w: f32, h: f32, url: String },
@@ -1032,6 +1053,14 @@ impl<'a> Layout<'a> {
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
             let sz = if s.style.fnref.is_some() { sz * 0.65 } else { sz };
+            if let Some((src, disp)) = &s.style.math {
+                if let Some(f) = crate::math::formula(src, *disp) {
+                    // Raden ska rymma formeln: storleken höjs så att över- och underdelen får plats.
+                    let eff = sz.max(f.layout.asc * sz / 1.08).max(f.layout.desc * sz / (self.line - 1.08).max(0.1));
+                    out.push(Piece { text: String::new(), face, size: eff, width: f.layout.w * sz, style: s.style.clone(), space: false, newline: false });
+                    continue;
+                }
+            }
             for (li, line) in s.text.split('\n').enumerate() {
                 if li > 0 {
                     out.push(Piece { text: String::new(), face, size: sz, width: 0.0, style: s.style.clone(), space: false, newline: true });
@@ -1229,7 +1258,7 @@ impl<'a> Layout<'a> {
             let mut runs = Vec::new();
             for p in line.pieces {
                 match run.as_mut() {
-                    Some((_, text, f, sz, st, w)) if !stretched && *f == p.face && *sz == p.size && *st == p.style => {
+                    Some((_, text, f, sz, st, w)) if !stretched && st.math.is_none() && *f == p.face && *sz == p.size && *st == p.style => {
                         text.push_str(&p.text);
                         *w += p.width;
                     }
@@ -1246,6 +1275,14 @@ impl<'a> Layout<'a> {
                 runs.push(r);
             }
             for (rx, text, face, sz, st, w) in runs {
+                if let Some((src, disp)) = &st.math {
+                    if let Some(f) = crate::math::formula(src, *disp) {
+                        let em = if f.layout.w > 0.0 { w / f.layout.w } else { size };
+                        let c = st.span.color.map_or(color, |sc| (sc[0], sc[1], sc[2]));
+                        self.page().ops.push(Op::Math { x: rx, y: baseline, src: src.clone(), display: *disp, em, color: c });
+                    }
+                    continue;
+                }
                 if st.code {
                     self.page().ops.push(Op::Rect { x: rx - 1.5, y: baseline - sz * 0.95, w: w + 3.0, h: sz * 1.3, color: CODE_BG });
                 }
@@ -1611,6 +1648,62 @@ fn p_clone(p: &Piece) -> Piece {
     Piece { text: String::new(), face: p.face, size: p.size, width: 0.0, style: p.style.clone(), space: p.space, newline: p.newline }
 }
 
+/// Ritar en formel som fyllda konturer (glyfer) och rektanglar. `(x, y)` = vänster kant på baslinjen.
+fn draw_math(s: &mut krilla::surface::Surface<'_>, src: &str, display: bool, x: f32, y: f32, em: f32, color: (u8, u8, u8)) {
+    use crate::math::layout::Item;
+    let (Some(f), Some(font)) = (crate::math::formula(src, display), crate::math::font::font()) else { return };
+    s.set_stroke(None);
+    s.set_fill(Some(fill(color)));
+    for it in &f.layout.items {
+        let mut pb = PathBuilder::new();
+        match *it {
+            Item::Glyph { gid, x: gx, y: gy, s: gs } => {
+                struct B<'a> {
+                    pb: &'a mut PathBuilder,
+                    ox: f32,
+                    oy: f32,
+                    k: f32,
+                }
+                impl ttf_parser::OutlineBuilder for B<'_> {
+                    fn move_to(&mut self, x: f32, y: f32) {
+                        self.pb.move_to(self.ox + x * self.k, self.oy - y * self.k);
+                    }
+                    fn line_to(&mut self, x: f32, y: f32) {
+                        self.pb.line_to(self.ox + x * self.k, self.oy - y * self.k);
+                    }
+                    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+                        self.pb.quad_to(self.ox + x1 * self.k, self.oy - y1 * self.k, self.ox + x * self.k, self.oy - y * self.k);
+                    }
+                    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+                        self.pb.cubic_to(
+                            self.ox + x1 * self.k,
+                            self.oy - y1 * self.k,
+                            self.ox + x2 * self.k,
+                            self.oy - y2 * self.k,
+                            self.ox + x * self.k,
+                            self.oy - y * self.k,
+                        );
+                    }
+                    fn close(&mut self) {
+                        self.pb.close();
+                    }
+                }
+                let mut b = B { pb: &mut pb, ox: x + gx * em, oy: y - gy * em, k: gs * em / font.upem };
+                font.outline(gid, &mut b);
+            }
+            Item::Rule { x: rx, y: ry, w, h } => {
+                let h = h.max(0.012);
+                if let Some(r) = Rect::from_xywh(x + rx * em, y - (ry + h) * em, w * em, h * em) {
+                    pb.push_rect(r);
+                }
+            }
+        }
+        if let Some(path) = pb.finish() {
+            s.draw_path(&path);
+        }
+    }
+}
+
 fn make_image(bytes: &[u8]) -> Option<Image> {
     let data = || krilla::Data::from(bytes.to_vec());
     match crate::docx::image_ext(bytes) {
@@ -1716,6 +1809,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                             }
                         }
                     }
+                    Op::Math { x, y, src, display, em, color } => draw_math(&mut s, src, *display, *x, *y, *em, *color),
                     Op::Line { x1, y1, x2, y2, width, color } => {
                         let mut pb = PathBuilder::new();
                         pb.move_to(*x1, *y1);

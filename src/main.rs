@@ -36,6 +36,7 @@ mod keys;
 mod lsp;
 mod macopen;
 mod menubar;
+mod math;
 mod multicursor;
 mod palette;
 mod vim;

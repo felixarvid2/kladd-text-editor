@@ -146,6 +146,8 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    /// Ekvation: tom (`None`) eller en mall ur paletten.
+    Equation(Option<usize>),
     Footnote,
     Toc,
     SectionBreak,
@@ -701,6 +703,14 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Tabell"), "", None, true) {
                             acts.push(BarAct::Table);
                         }
+                        if crate::app::menu_item(ui, p, t("Ekvation"), "", None, true) {
+                            acts.push(BarAct::Equation(None));
+                        }
+                        for (i, (label, _)) in crate::math::insert::PALETTE.iter().enumerate() {
+                            if crate::app::menu_item(ui, p, &format!("   {}", t(label)), "", None, true) {
+                                acts.push(BarAct::Equation(Some(i)));
+                            }
+                        }
                         if crate::app::menu_item(ui, p, t("Fotnot"), "Ctrl+Alt+F", None, true) {
                             acts.push(BarAct::Footnote);
                         }
@@ -784,6 +794,13 @@ impl KladdApp {
                 BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
+                BarAct::Equation(which) => self.word_edit(&ctx, |t, s| {
+                    let e = match which.and_then(|i| crate::math::insert::PALETTE.get(i)) {
+                        Some((_, tpl)) => crate::math::insert::insert_template(t, s, tpl),
+                        None => crate::math::insert::insert_equation(t, s.end),
+                    };
+                    markup::Edit { text: e.text, sel: e.sel }
+                }),
                 BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::EditStyles => {
@@ -1313,6 +1330,23 @@ impl KladdApp {
                 }
                 for pc in &analysis.pieces[i0..i1] {
                     let shown = overlaps(&pc.range, &reveal);
+                    // Formler: källan är dold; formeln ritas där den reserverade platsen börjar.
+                    if let (Some(m), false) = (&pc.math, shown) {
+                        if let Some(g) = layout::piece_math_geom(pc, &params, &analysis.defaults) {
+                            let ci = conv.at(pc.range.start);
+                            let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
+                            if r.bottom() >= clip.top() && r.top() <= clip.bottom() {
+                                // Baslinjen: grannarnas på raden, annars radens underkant minus formelns.
+                                let row = galley.rows.iter().find(|row| (row.pos.y + gpos.y - r.min.y).abs() < 0.6);
+                                let base = row
+                                    .and_then(|row| row.glyphs.iter().find(|gl| gl.font_height > 2.0).map(|gl| row.pos.y + gl.pos.y + gpos.y))
+                                    .unwrap_or(r.max.y - g.below);
+                                let size = layout::piece_font_size(pc, &params, &analysis.defaults);
+                                let col = p.page_text;
+                                crate::math::gui::paint(ui.ctx(), &painter, &m.src, m.display, size, pos2(r.left() - g.w, base), col);
+                            }
+                        }
+                    }
                     if pc.list_marker && pc.markup && !shown && !edited {
                         // Punkten ritas 12 pt före textens början (markören efter dold markör).
                         let ci = conv.at(pc.range.end);

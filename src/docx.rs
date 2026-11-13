@@ -2225,8 +2225,15 @@ fn parse_body(
                     skip -= 1;
                     if skip == 0 {
                         if let Some(start) = omath_start.take() {
-                            // Formel: hela elementet blir en markör.
-                            push_token(&mut para, info, &xml[start..after]);
+                            // Formel: LaTeX om den går att uttrycka, annars en markör.
+                            match crate::math::omml::to_latex(&xml[start..after]) {
+                                Some((latex, display)) => {
+                                    let d = if display { "$$" } else { "$" };
+                                    let p = para.get_or_insert_with(Para::new);
+                                    p.runs.push(Run { text: format!("{d}{latex}{d}"), fmt: Fmt::default(), link: None, raw: true });
+                                }
+                                None => push_token(&mut para, info, &xml[start..after]),
+                            }
                         }
                     }
                     continue;
@@ -3195,6 +3202,21 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// En formel (`$…$`/`$$…$$`) som Office Math. Går den inte att tolka skrivs källtexten som text.
+    fn math(&mut self, src: &str, display: bool) {
+        let src = src.trim();
+        match crate::math::parse::parse(src) {
+            Ok(nodes) if !nodes.is_empty() => {
+                self.open_para();
+                self.body.push_str(&crate::math::omml::to_omml(&nodes, display));
+            }
+            _ => {
+                let d = if display { "$$" } else { "$" };
+                self.run(&format!("{d}{src}{d}"), false);
+            }
+        }
+    }
+
     fn run(&mut self, text: &str, code: bool) {
         if text.is_empty() {
             return;
@@ -3530,6 +3552,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_MATH);
     let mut next_num: u32 = base + 1; // base = punktlistor
     // Enheter (stycke, listpunkt, tabell …) i brödtexten, för att kunna bytas mot originalet.
     let mut cur: Option<OpenUnit> = None;
@@ -3801,6 +3824,8 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 }
             }
             MdEvent::Code(t) => w.run(&t, true),
+            MdEvent::InlineMath(t) => w.math(&t, false),
+            MdEvent::DisplayMath(t) => w.math(&t, true),
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 let s = t.to_string();
                 let single_line = s.trim().lines().count() == 1;
@@ -3882,7 +3907,6 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"{ph}\"/></w:r>"
                 ));
             }
-            MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => w.run(&t, false),
         }
         match ended {
             EvEnd::None => {}

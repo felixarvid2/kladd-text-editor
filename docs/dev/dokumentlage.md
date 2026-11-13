@@ -660,3 +660,27 @@ rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_p
 ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
 ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Skillnad mot dokumentläget:
 spalterna före ett löpande byte jämnas **inte** ut i PDF:en.
+
+## Ekvationer (`src/math/`)
+
+`$…$`/`$$…$$` tolkas av pulldown-cmark (`ENABLE_MATH`, så kod och `\$` är rätt) och blir i
+`markup::analyze` en `Piece` med `math: Some(MathRef { src, display })` för innehållet; `$`-tecknen är `markup`.
+Bara formler på en rad som `math::formula` kan tolka markeras, annars är texten vanlig.
+
+Moduler: `parse` (LaTeX → `ast::Node`), `layout` (TeX:s regler med MATH-tabellen ur STIX Two Math, läst av `font`
+eftersom ttf-parser saknar MATH; ger glyfer och linjer i em), `raster` (alfamask, nollskild lindning), `gui`
+(egui-texturer, cachade per formel och storlek), `latex`/`mathml`/`omml` (träd ↔ format), `preview` (PNG för
+förhandsvisningen), `insert` (Infoga-menyn).
+
+Dokumentläget: i `layout::build_sections` får en dold formel första tecknets sektion `leading_space = bredd` och
+`line_height = höjd` (som bilder reserverar höjd); `Builder::lead` bär bredden till `LayoutSection`. En rad som bara är en
+`$$`-formel centreras som stycke. `view.rs` ritar texturen där platsen börjar: vänsterkant = markörens x minus bredden,
+baslinje = grannglyfernas på raden, annars radens underkant minus formelns djup (`layout::MathGeom`). Går markören
+till raden visas källan i vanlig stil. Känd begränsning: en löpande formel som är djupare än radens underdel
+(t.ex. ett bråk) sticker ned i raden under, eftersom egui bottenjusterar radens sektioner.
+
+Export: docx skriver `m:oMath`/`m:oMathPara` med `xmlns:m` på elementet (`omml::to_omml`) och läser `m:oMath` till
+`$…$` när `omml::to_latex` lyckas (annars ogenomskinlig markör som förut). odt: `Object N/content.xml` (MathML med
+`math:`-prefix) och `ObjectReplacements/Object N` (PNG). pdf: `Style::math`, en `Piece` per formel, `Op::Math`
+ritas som fyllda glyfkonturer via krilla. html/epub: `export::map_events` byter matematikhändelser mot
+`<math>`; EPUB-posten får `properties="mathml"`.

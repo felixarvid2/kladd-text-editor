@@ -2470,6 +2470,53 @@ impl<'a> W<'a> {
         self.after_space = true;
     }
 
+    /// En formel som inbäddat formelobjekt (MathML i `Object N/content.xml`). Går den inte att
+    /// tolka skrivs källtexten som text.
+    fn math(&mut self, src: &str, display: bool) {
+        let src = src.trim();
+        let (Ok(nodes), Some(f)) = (crate::math::parse::parse(src), crate::math::formula(src, display)) else {
+            let d = if display { "$$" } else { "$" };
+            return self.run(&format!("{d}{src}{d}"), false);
+        };
+        if nodes.is_empty() {
+            return;
+        }
+        let n = self.media.iter().filter(|m| m.0.ends_with('/')).count() + 1;
+        let dir = format!("Object {n}");
+        let ns = crate::math::mathml::NS;
+        let content = format!(
+            "{XML_DECL}<math:math xmlns:math=\"{ns}\"><math:semantics><math:mrow>{}</math:mrow></math:semantics></math:math>",
+            crate::math::mathml::body(&nodes, "math:")
+        );
+        self.media.push((format!("{dir}/"), Vec::new(), "application/vnd.oasis.opendocument.formula"));
+        self.media.push((format!("{dir}/content.xml"), content.into_bytes(), "text/xml"));
+        let cm = |em: f32| format!("{:.3}cm", em * 11.0 * 0.0352778);
+        // Ersättningsbild för program utan formelmodul (visas om objektet inte kan läsas).
+        let mut replacement = String::new();
+        if let Some(png) = crate::math::preview::png_exact(src, display, 48.0) {
+            let path = format!("ObjectReplacements/{dir}");
+            replacement = format!("<draw:image xlink:href=\"./{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\"/>");
+            self.media.push((path, png, "image/png"));
+        }
+        let frame = format!(
+            "<draw:frame draw:name=\"Formel{n}\" text:anchor-type=\"as-char\" svg:width=\"{}\" svg:height=\"{}\"><draw:object xlink:href=\"./{dir}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\"/>{replacement}</draw:frame>",
+            cm(f.layout.w.max(0.2)),
+            cm((f.layout.asc + f.layout.desc).max(0.5))
+        );
+        if display {
+            self.close_para();
+            self.aligns.push(Align::Center);
+            self.open_para();
+            self.body.push_str(&frame);
+            self.close_para();
+            self.aligns.pop();
+        } else {
+            self.open_para();
+            self.body.push_str(&frame);
+            self.after_space = false;
+        }
+    }
+
     fn close_link(&mut self) {
         // `text:change-start`/`-end` är tomma punktmarkörer och behöver inte omsluta länken: en ändring
         // som sträcker sig över en länk förblir en region.
@@ -2849,6 +2896,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_MATH);
     // Pågående fotnotsdefinition: (etikett, brödtexten som lagts åt sidan).
     let mut note_cur: Option<(String, String)> = None;
     for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
@@ -3054,7 +3102,8 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 w.body.push_str("<text:p text:style-name=\"Horizontal_20_Line\"/>");
             }
             MdEvent::TaskListMarker(done) => w.run(if done { "☒ " } else { "☐ " }, false),
-            MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => w.run(&t, false),
+            MdEvent::InlineMath(t) => w.math(&t, false),
+            MdEvent::DisplayMath(t) => w.math(&t, true),
         }
     }
     w.close_para();
@@ -3466,7 +3515,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
             zip.start_file(name, deflated).map_err(|e| e.to_string())?;
             zip.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
         }
-        for (path, bytes, _) in &w.media {
+        for (path, bytes, _) in w.media.iter().filter(|m| !m.0.ends_with('/')) {
             zip.start_file(path.as_str(), stored).map_err(|e| e.to_string())?;
             zip.write_all(bytes).map_err(|e| e.to_string())?;
         }
