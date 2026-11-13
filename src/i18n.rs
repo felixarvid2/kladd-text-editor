@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+mod en_annot2;
 mod en_app;
 mod en_autocorrect;
 mod en_doc;
@@ -91,7 +92,7 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
 });
 
 fn tables() -> &'static [&'static [(&'static str, &'static str)]] {
-    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN]
+    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.

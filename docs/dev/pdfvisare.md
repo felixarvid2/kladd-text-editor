@@ -34,6 +34,7 @@ Chrome och PdfCraft (storytold/pdfcraft, Rust + egui + hayro).
 | `pages.rs` | Kopplar `organize` till fliken: `OrgOp`, urval, omladdning av visaren, Ångra/Gör om, `PdfTab::pages_changed` |
 | `ocr.rs` | `OcrState`: letar skannade sidor, renderar i 300 dpi på egen motor, kör Tesseract (`crate::ocr`) och ger `PageText` via `PdfView::set_ocr_text` |
 | `incremental.rs` | Inkrementell uppdatering (ändrade objekt sist i filen, xref-tabell eller xref-ström, `/Prev`) och signaturräkning |
+| `annot_edit.rs` | Befintliga anteckningar: läsa `/Annots`, välja, redigera och ta bort, kommentarlistan |
 | `annot.rs` | Nya anteckningar (markering, understruken, genomstruken, lapp, textruta, penna): minneslista i visningspunkter, verktygsrad, överlägg, `apply` skriver `/Annots` med `/AP` via lopdf |
 | `chrome.rs` | Verktygsrad, sidopanel (miniatyrer, innehåll), sökfält, egenskaper, presentationsläge, statusrad |
 
@@ -235,6 +236,16 @@ impl PdfView {
 - Fliken är ändrad (`Document::dirty`) så länge `annot.has_pending()`; Ctrl+S → `KladdApp::pdf_save` skriver `annot::apply` atomiskt och läser om visaren. Krypterade PDF:er skrivs avkrypterade.
 - Koordinater tillbaka till användarrymd: `to_user` (invers av `Geo::point`, med /Rotate och CropBox). Lapp och textruta får `/Matrix` så att de står upprätt på roterade sidor.
 - Utanför omfånget: ändra eller ta bort anteckningar som redan sparats i filen (hayro ritar dem).
+- Utanför omfånget: inkrementell uppdatering som bevarar signaturer.
+
+### Befintliga anteckningar (`annot_edit.rs`)
+
+- `ExState` (`AnnotState.ex`) läser sidornas `/Annots` med lopdf när fliken öppnas, sparas eller sidorna ändras (`PdfTab::new`/`reload_forms`): Highlight, Underline, StrikeOut, Squiggly, Text, FreeText, Ink, Square, Circle, Line (Link, Widget, Popup och dolda hoppas över) som `ExAnnot` med rektangel, rader, streck, färg, författare `/T`, datum `/M`, `/Contents` och popup, allt i visningspunkter via `Geo`.
+- Ändringar är `Edits` (objektnummer → ny text, ny färg, borttagen) och ingår i `has_pending()`/`unsaved()`. `annot::apply_all` kör `edit_doc` före de nya anteckningarna: borttagning tar bort posten ur `/Annots`, objektet, dess `/Popup` och svar (`/IRT`); ändring skriver `/Contents`, `/C`, `/M` och ritar om `/AP` med `annot::parts` för markering, understruken, genomstruken, lapp, textruta (höjden växer med texten) och penna. Övriga typer behåller sitt `/AP` och får bara ny text.
+- Klick i Anteckna-läget (utan verktyg eller med markeringsverktyg) väljer anteckningen (`hit`: rader, strecknära, ramkant, rektangel): ram och ruta med författare, datum, kommentar, färgval och *Ta bort*. Högerklick med ett verktyg tar också bort. Verktygstips med författare och text visas för alla anteckningar, även utanför Anteckna-läget.
+- Visarens `bytes` förblir originalet; efter varje ändring öppnas en ny motor på de ändrade bytes (`PdfView::rerender_annots`) så att borttagna anteckningar försvinner och nya färger syns direkt.
+- Ångra (knappen och Ctrl+Z) går i omvänd ordning över nya och befintliga ändringar (`ExState::can_undo` jämför antalet nya anteckningar då ändringen gjordes). Skrivs text ångras den som ett steg.
+- Sidopanelens flik *Kommentarer* (`comments_ui`) listar alla anteckningar (befintliga och nya) med sida, författare och text; ett klick väljer och hoppar dit.
 ## Formulär (`forms.rs`)
 
 - `read_fields(bytes, password)` går igenom `/AcroForm /Fields` med ärvda `/FT /Ff /V /DA /Opt /MaxLen /Q`

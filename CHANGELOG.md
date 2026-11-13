@@ -13,6 +13,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Autokorrigering medan du skriver.** I dokumentläget (och, om du väljer det i *Autokorrigering…* i huvudmenyn, i Markdown och vanlig text, aldrig i kodfiler) rättas texten när du skriver mellanslag, skiljetecken eller Enter: typografiska citattecken efter språk (svenska ”…” och ’, engelska “…” och ‘…’), `--` till – och `---` till —, `...` till …, `(c)` till ©, stor bokstav efter punkt, frågetecken och utropstecken och i början av stycken (inte efter förkortningar som t.ex., bl.a. och e.g., inte i tal som 3.5 eller i webbadresser), två inledande versaler (SVerige blir Sverige), vanliga svenska och engelska stavfel och egna ersättningar (till exempel `mvh` till *Med vänliga hälsningar*). Markdown-syntax, kod, länkar och kommentarer lämnas orörda. Ctrl+Z direkt efter en rättelse tar bara tillbaka rättelsen. Varje regel kan slås av i dialogen, och språket följer stavningskontrollen.
 
+- **Redigera och ta bort befintliga PDF-anteckningar.** Anteckningar som redan finns i filen (markering, understruken, genomstruken, vågig, lapp, textruta, penna, rektangel, ellips, linje) kan väljas med ett klick i *Anteckna*-läget: en ruta visar författare och datum och låter dig ändra kommentaren och färgen eller *Ta bort*. Pekaren över en anteckning visar författare och text, också utanför Anteckna-läget. Ändringarna är osparade tills du sparar (Ctrl+S, *Spara kopia*) och kan ångras (*Ångra*, Ctrl+Z). Utseendet ritas om för det Kladd kan rita; övriga typer behåller sitt utseende och får bara ny text. Fliken *Kommentarer* i sidopanelen listar alla anteckningar med sida, författare och text, och ett klick hoppar dit.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

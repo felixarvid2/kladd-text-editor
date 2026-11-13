@@ -59,6 +59,7 @@ pub enum Action {
 enum SideTab {
     Thumbs,
     Outline,
+    Comments,
 }
 
 /// Sökfältets tillstånd.
@@ -129,7 +130,7 @@ impl PdfTab {
                 super::forms::apply_doc(doc, v)?;
             }
             if let Some(a) = annots {
-                super::annot::apply_doc(doc, a);
+                super::annot::apply_doc(doc, a, self.view.annot.ex.edits());
             }
             Ok(())
         });
@@ -143,7 +144,7 @@ impl PdfTab {
             out = super::forms::apply(&out, None, &v)?;
         }
         if let Some(a) = annots {
-            out = super::annot::apply(&out, pw, a)?;
+            out = super::annot::apply_all(&out, pw, a, self.view.annot.ex.edits())?;
         }
         Ok(out)
     }
@@ -163,6 +164,8 @@ impl PdfTab {
 
     pub fn new(mut view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
         view.forms = super::forms::FormState::load(view.bytes(), password.as_deref());
+        let bytes = view.bytes().clone();
+        view.annot.ex.load(&bytes, password.as_deref());
         let has_outline = !view.meta().outline.is_empty();
         Self {
             view,
@@ -195,6 +198,8 @@ impl PdfTab {
     pub fn reload_forms(&mut self) {
         self.signatures = None;
         self.view.forms = super::forms::FormState::load(self.view.bytes(), self.password.as_deref());
+        let bytes = self.view.bytes().clone();
+        self.view.annot.ex.load(&bytes, self.password.as_deref());
     }
 
     /// Är någon dialog öppen (då ska kortkommandon vänta)?
@@ -654,6 +659,7 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 let btn = egui::Button::new(label).fill(if on { p.accent.gamma_multiply(0.16) } else { Color32::TRANSPARENT }).stroke(Stroke::NONE);
                 if ui.add(btn).on_hover_text(t("Överstryk, understryk, skriv anteckningar och rita i PDF:en")).clicked() {
                     tab.annotate = !on;
+                    tab.view.annot.ex.set_active(!on);
                     if on {
                         tab.view.annot.tool = None;
                     }
@@ -761,7 +767,11 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
     }
     let ctx = ui.ctx().clone();
     let has_outline = !tab.view.meta().outline.is_empty();
-    if !has_outline {
+    if !has_outline && tab.side_tab == SideTab::Outline {
+        tab.side_tab = SideTab::Thumbs;
+    }
+    let has_comments = tab.view.annot.ex.visible().next().is_some() || !tab.view.annot.pending().is_empty();
+    if !has_comments && tab.side_tab == SideTab::Comments {
         tab.side_tab = SideTab::Thumbs;
     }
     let width = ui.available_width();
@@ -779,11 +789,19 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 if has_outline && side_tab_button(ui, p, t("Innehåll"), tab.side_tab == SideTab::Outline).clicked() {
                     tab.side_tab = SideTab::Outline;
                 }
+                if has_comments && side_tab_button(ui, p, t("Kommentarer"), tab.side_tab == SideTab::Comments).clicked() {
+                    tab.side_tab = SideTab::Comments;
+                }
             });
             ui.add_space(8.0);
             match tab.side_tab {
                 SideTab::Thumbs => act = thumbnails(ui, p, tab, &ctx).map(Action::Organize),
                 SideTab::Outline => outline(ui, p, tab),
+                SideTab::Comments => {
+                    if let Some((page, y)) = crate::pdfview::annot_edit::comments_ui(ui, p, &mut tab.view.annot) {
+                        tab.view.go_to(&crate::pdfview::meta::Dest { page, y: Some((y - 40.0).max(0.0)) });
+                    }
+                }
             }
         });
     act

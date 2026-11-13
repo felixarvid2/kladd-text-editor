@@ -1339,6 +1339,11 @@ impl PdfView {
         }
         let sizes = &self.sizes;
         self.annot.show_editor(&ctx, &|p| sizes.get(p).map_or((0.0, 0.0), |s| (s.width, s.height)));
+        let new_len = self.annot.pending().len();
+        self.annot.ex.show_popover(&ctx, new_len);
+        if self.annot.ex.take_stale() {
+            self.rerender_annots(&ctx);
+        }
         self.after_frame(&ctx);
     }
 
@@ -1522,6 +1527,7 @@ impl PdfView {
     /// Sökträffar (gult, aktuell orange) och markering (blått) ovanpå sidan.
     fn paint_overlays(&self, ui: &Ui, p: usize, xf: &PageXf) {
         self.annot.paint(ui.painter(), p, xf);
+        self.annot.ex.paint(ui.painter(), p, xf);
         let Some(t) = self.texts.get(&p) else { return };
         let painter = ui.painter();
         if let Some(f) = &self.find {
@@ -1568,6 +1574,11 @@ impl PdfView {
 
         // Anteckningsverktygen (lapp, textruta, penna) tar hand om musen själva.
         if self.annot.tool.is_some() && self.annot_pointer(ctx, resp, origin) {
+            return;
+        }
+
+        // Befintliga anteckningar: välj med klick i Anteckna-läget, verktygstips med författare och text.
+        if self.annot_existing(ctx, resp, origin) {
             return;
         }
 
@@ -1672,6 +1683,52 @@ impl PdfView {
             self.drag_mode = UnitMode::Char;
         }
         self.annot_from_selection(resp);
+    }
+
+    /// Befintliga anteckningar under pekaren (annot_edit.rs). Sant när ett klick valde en anteckning.
+    fn annot_existing(&mut self, ctx: &Context, resp: &egui::Response, origin: Pos2) -> bool {
+        let at = |this: &Self, s: Pos2| this.hit(s, origin, false).and_then(|(p, pt)| this.annot.ex.hit(p, pt));
+        if let Some(h) = resp.hover_pos() {
+            if let Some(id) = at(self, h).filter(|_| self.link_at(h, origin).is_none()) {
+                if self.annot.ex.is_active() {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if self.annot.ex.selected != Some(id) {
+                    if let Some(tip) = self.annot.ex.tooltip(id) {
+                        resp.clone().on_hover_ui(|ui| super::annot_edit::show_tooltip(ui, &tip));
+                    }
+                }
+            }
+        }
+        if resp.clicked_by(PointerButton::Primary) {
+            match resp.interact_pointer_pos().and_then(|p| at(self, p)) {
+                Some(id) if self.annot.ex.is_active() => {
+                    self.annot.ex.select(id);
+                    return true;
+                }
+                _ => self.annot.ex.deselect(),
+            }
+        }
+        false
+    }
+
+    /// Ritar om sidorna med väntande ändringar av befintliga anteckningar (borttagna syns inte längre).
+    /// Visarens `bytes` förblir originalet; bara motorn får de ändrade.
+    fn rerender_annots(&mut self, ctx: &Context) {
+        let edits = self.annot.ex.edits().clone();
+        let pw = self.annot.ex.password().map(str::to_owned);
+        let bytes = if edits.is_empty() {
+            self.bytes.clone()
+        } else {
+            match super::annot::apply_all(&self.bytes, pw.as_deref(), &[], &edits) {
+                Ok(b) => Arc::new(b),
+                Err(_) => return,
+            }
+        };
+        let Ok(engine) = PdfEngine::open(bytes, pw.as_deref(), ctx.clone()) else { return };
+        let (meta, hist, orig) = (self.meta.clone(), std::mem::take(&mut self.history), self.bytes.clone());
+        self.reload(engine, meta, orig);
+        self.history = hist;
     }
 
     fn annot_pointer(&mut self, ctx: &Context, resp: &egui::Response, origin: Pos2) -> bool {

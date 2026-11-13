@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use egui::{Color32, Pos2, Rect, Stroke, pos2, vec2};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictionary};
 
+use super::annot_edit::Edits;
 use super::meta::Geo;
 use super::view::PageXf;
 use crate::i18n::t;
@@ -24,9 +25,9 @@ pub const INK_COLORS: [(&str, [u8; 3]); 5] =
     [("Svart", [20, 20, 20]), ("Röd", [213, 38, 38]), ("Blå", [30, 90, 200]), ("Grön", [30, 140, 60]), ("Orange", [235, 130, 20])];
 
 /// Anteckningslappens storlek och textrutans bredd och teckenstorlek (pt).
-const NOTE_SIZE: f32 = 18.0;
-const FREE_WIDTH: f32 = 220.0;
-const FREE_SIZE: f32 = 12.0;
+pub(super) const NOTE_SIZE: f32 = 18.0;
+pub(super) const FREE_WIDTH: f32 = 220.0;
+pub(super) const FREE_SIZE: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnnotTool {
@@ -103,18 +104,20 @@ pub struct AnnotState {
     stroke: Option<(usize, Vec<Pos2>)>,
     editing: Option<Editing>,
     editor_id: egui::Id,
+    /// Anteckningar som redan finns i PDF:en: ändringar, urval och ruta (annot_edit.rs).
+    pub ex: super::annot_edit::ExState,
 }
 
 impl Default for AnnotState {
     fn default() -> Self {
-        Self { tool: None, hl_color: 0, ink_color: 1, width: 2.0, list: Vec::new(), stroke: None, editing: None, editor_id: egui::Id::unique("kladd-annot-editor") }
+        Self { tool: None, hl_color: 0, ink_color: 1, width: 2.0, list: Vec::new(), stroke: None, editing: None, editor_id: egui::Id::unique("kladd-annot-editor"), ex: Default::default() }
     }
 }
 
 impl AnnotState {
     /// Finns anteckningar som inte sparats än (då är fliken "ändrad")?
     pub fn has_pending(&self) -> bool {
-        !self.list.is_empty()
+        !self.list.is_empty() || self.ex.dirty()
     }
 
     pub fn pending(&self) -> &[NewAnnot] {
@@ -125,14 +128,19 @@ impl AnnotState {
         self.list.clear();
         self.stroke = None;
         self.editing = None;
+        self.ex.clear();
     }
 
     pub fn add(&mut self, a: NewAnnot) {
         self.list.push(a);
     }
 
-    /// Ångra: tar bort den senast tillagda. Sant om något togs bort.
+    /// Ångra: tar bort den senast tillagda eller ändrade (nya och befintliga i den ordning de gjordes).
+    /// Sant om något ångrades.
     pub fn undo(&mut self) -> bool {
+        if self.ex.can_undo(self.list.len()) && self.ex.undo() {
+            return true;
+        }
         self.list.pop().is_some()
     }
 
@@ -182,7 +190,9 @@ impl AnnotState {
         let Some(tool) = self.tool else { return false };
         if resp.secondary_clicked() {
             if let Some((page, pt)) = resp.interact_pointer_pos().and_then(|p| hit(p, false)) {
-                self.delete_at(page, pt);
+                if !self.delete_at(page, pt) {
+                    self.ex.delete_at(page, pt, self.list.len());
+                }
             }
         }
         if tool.is_markup() {
@@ -339,7 +349,7 @@ impl AnnotState {
 }
 
 /// Linjetjocklek för understruken/genomstruken efter radens höjd.
-fn markup_width(r: Rect) -> f32 {
+pub(super) fn markup_width(r: Rect) -> f32 {
     (r.height() * 0.07).clamp(0.6, 1.5)
 }
 
@@ -411,7 +421,7 @@ pub fn tool_row(ui: &mut egui::Ui, p: &crate::theme::Palette, st: &mut AnnotStat
         (AnnotTool::StrikeOut, "Genomstruken", "Stryk över markerad text"),
         (AnnotTool::Note, "Anteckning", "Klicka på sidan och skriv en anteckning"),
         (AnnotTool::FreeText, "Textruta", "Klicka på sidan och skriv en textruta"),
-        (AnnotTool::Pen, "Penna", "Rita fritt (dra); högerklick tar bort en ny anteckning"),
+        (AnnotTool::Pen, "Penna", "Rita fritt (dra); högerklick tar bort en anteckning"),
     ];
     for (tool, label, tip) in tools {
         let on = st.tool == Some(tool);
@@ -449,7 +459,7 @@ pub fn tool_row(ui: &mut egui::Ui, p: &crate::theme::Palette, st: &mut AnnotStat
         st.undo();
     }
     if st.has_pending() {
-        ui.label(egui::RichText::new(tf!("{n} osparade", n = st.list.len())).color(p.muted));
+        ui.label(egui::RichText::new(tf!("{n} osparade", n = st.list.len() + st.ex.edit_count())).color(p.muted));
     }
 }
 
@@ -459,11 +469,11 @@ fn r(v: f32) -> Object {
     Object::Real(v)
 }
 
-fn real_array(v: &[f32]) -> Object {
+pub(super) fn real_array(v: &[f32]) -> Object {
     Object::Array(v.iter().map(|x| r(*x)).collect())
 }
 
-fn color_array(c: [u8; 3]) -> Object {
+pub(super) fn color_array(c: [u8; 3]) -> Object {
     real_array(&[c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
 }
 
@@ -472,7 +482,7 @@ fn rgb_ops(c: [u8; 3]) -> String {
 }
 
 /// PDF-textsträng: ASCII som den är, annars UTF-16BE med BOM.
-fn text_string(s: &str) -> Object {
+pub(super) fn text_string(s: &str) -> Object {
     let bytes = if s.is_ascii() {
         s.as_bytes().to_vec()
     } else {
@@ -486,7 +496,7 @@ fn text_string(s: &str) -> Object {
 }
 
 /// Text i innehållsström (WinAnsi ≈ Latin-1; övriga tecken blir `?`).
-fn content_string(s: &str) -> Vec<u8> {
+pub(super) fn content_string(s: &str) -> Vec<u8> {
     let mut out = vec![b'('];
     for ch in s.chars() {
         let b = match ch as u32 {
@@ -502,7 +512,7 @@ fn content_string(s: &str) -> Vec<u8> {
     out
 }
 
-fn author() -> String {
+pub(super) fn author() -> String {
     ["USER", "USERNAME", "LOGNAME"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
@@ -510,12 +520,12 @@ fn author() -> String {
         .unwrap_or_else(|| "Kladd".to_owned())
 }
 
-fn pdf_date() -> String {
+pub(super) fn pdf_date() -> String {
     chrono::Utc::now().format("D:%Y%m%d%H%M%SZ").to_string()
 }
 
 /// Visningspunkter → användarrymd (invers av `Geo::point`).
-fn to_user(g: &Geo, p: Pos2) -> (f32, f32) {
+pub(super) fn to_user(g: &Geo, p: Pos2) -> (f32, f32) {
     let (w, h) = (g.x1 - g.x0, g.y1 - g.y0);
     let (u, v) = match g.rot {
         90 => (p.y, h - p.x),
@@ -527,7 +537,7 @@ fn to_user(g: &Geo, p: Pos2) -> (f32, f32) {
 }
 
 /// Rektangel i visningspunkter → (l, b, r, t) i användarrymd.
-fn user_rect(g: &Geo, rc: Rect) -> [f32; 4] {
+pub(super) fn user_rect(g: &Geo, rc: Rect) -> [f32; 4] {
     let a = to_user(g, rc.min);
     let b = to_user(g, rc.max);
     [a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)]
@@ -551,6 +561,15 @@ fn n(v: f32) -> String {
 
 /// Bygger `/Annots`-posten (och dess utseende) för en anteckning; `geo` är sidans geometri.
 fn build(doc: &mut Document, page: ObjectId, g: &Geo, a: &NewAnnot, who: &str, date: &str) -> Option<ObjectId> {
+    let (mut d, ap) = parts(page, g, a, who, date)?;
+    let ap_id = doc.add_object(ap);
+    d.set("AP", dictionary! { "N" => ap_id });
+    Some(doc.add_object(d))
+}
+
+/// Postens ordbok (utan `/AP`) och utseendeströmmen för en anteckning. Används också när en
+/// befintlig anteckning ritas om efter ändrad färg eller text (`annot_edit`).
+pub(super) fn parts(page: ObjectId, g: &Geo, a: &NewAnnot, who: &str, date: &str) -> Option<(Dictionary, Stream)> {
     let mut d = dictionary! {
         "Type" => "Annot",
         "P" => page,
@@ -669,9 +688,7 @@ fn build(doc: &mut Document, page: ObjectId, g: &Geo, a: &NewAnnot, who: &str, d
         }
     };
     d.set("Rect", real_array(&rect));
-    let ap_id = doc.add_object(ap);
-    d.set("AP", dictionary! { "N" => ap_id });
-    Some(doc.add_object(d))
+    Some((d, ap))
 }
 
 /// Matris som gör att ett utseende ritat upprätt i vyn blir upprätt på en sida med `/Rotate`.
@@ -706,8 +723,29 @@ fn push_annots(doc: &mut Document, page: ObjectId, new: Vec<ObjectId>) {
     }
 }
 
-/// Lägger `annots` i det inlästa dokumentet (nya anteckningsobjekt, utseendeströmmar och sidans `/Annots`).
-pub fn apply_doc(doc: &mut Document, annots: &[NewAnnot]) {
+/// Läser PDF:en med lösenordet och avkrypterar den (kommer ut utan `/Encrypt`).
+pub(super) fn open_doc(bytes: &[u8], password: Option<&str>) -> Result<Document, String> {
+    let mut opts = lopdf::LoadOptions::default();
+    opts.password = password.map(str::to_owned);
+    let mut doc = Document::load_mem_with_options(bytes, opts).map_err(|e| tf!("PDF:en kunde inte läsas: {e}", e = e))?;
+    if doc.is_encrypted() {
+        doc.decrypt(password.unwrap_or("")).map_err(|_| t("PDF:en kunde inte avkrypteras").to_owned())?;
+    }
+    doc.trailer.remove(b"Encrypt");
+    doc.encryption_state = None;
+    Ok(doc)
+}
+
+/// Skriver `annots` in i PDF:en och ger de nya bytes. En krypterad PDF kommer ut avkrypterad
+/// (lösenordet behövs för att öppna den). Fel ger ett meddelande, aldrig panik.
+pub fn apply(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot]) -> Result<Vec<u8>, String> {
+    apply_all(bytes, password, annots, &Edits::new())
+}
+
+/// Utför ändringar och borttagningar av befintliga anteckningar och lägger till nya, i det inlästa
+/// dokumentet (används både av omskrivningen och av den inkrementella sparningen).
+pub fn apply_doc(doc: &mut Document, annots: &[NewAnnot], edits: &Edits) {
+    super::annot_edit::edit_doc(doc, edits);
     let pages: BTreeMap<u32, ObjectId> = doc.get_pages();
     let ids: Vec<ObjectId> = pages.values().copied().collect();
     let (who, date) = (author(), pdf_date());
@@ -724,19 +762,11 @@ pub fn apply_doc(doc: &mut Document, annots: &[NewAnnot]) {
     }
 }
 
-/// Skriver `annots` in i PDF:en och ger de nya bytes (hela filen skrivs om). En krypterad PDF kommer ut
-/// avkrypterad (lösenordet behövs för att öppna den). Fel ger ett meddelande, aldrig panik.
-/// Okrypterade filer sparas i stället inkrementellt, se `incremental::edit`.
-pub fn apply(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot]) -> Result<Vec<u8>, String> {
-    let mut opts = lopdf::LoadOptions::default();
-    opts.password = password.map(str::to_owned);
-    let mut doc = Document::load_mem_with_options(bytes, opts).map_err(|e| tf!("PDF:en kunde inte läsas: {e}", e = e))?;
-    if doc.is_encrypted() {
-        doc.decrypt(password.unwrap_or("")).map_err(|_| t("PDF:en kunde inte avkrypteras").to_owned())?;
-    }
-    doc.trailer.remove(b"Encrypt");
-    doc.encryption_state = None;
-    apply_doc(&mut doc, annots);
+/// Som `apply`, men utför först ändringar och borttagningar av anteckningar som redan finns i PDF:en.
+/// Hela filen skrivs om; okrypterade filer sparas i stället inkrementellt, se `incremental::edit`.
+pub fn apply_all(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot], edits: &Edits) -> Result<Vec<u8>, String> {
+    let mut doc = open_doc(bytes, password)?;
+    apply_doc(&mut doc, annots, edits);
     let mut out = Vec::new();
     doc.save_to(&mut out).map_err(|e| tf!("PDF:en kunde inte skrivas: {e}", e = e))?;
     Ok(out)

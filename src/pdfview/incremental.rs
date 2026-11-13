@@ -458,7 +458,7 @@ mod tests {
             let a = NewAnnot { page: 0, color: [255, 235, 59], kind: NewKind::Note { pos: egui::pos2(50.0, 60.0), text: "Hej".into() } };
             let out = edit(&o, None, |d| {
                 forms::apply_doc(d, &[(tx, Value::Text("värde".into()))])?;
-                apply_doc(d, std::slice::from_ref(&a));
+                apply_doc(d, std::slice::from_ref(&a), &Default::default());
                 Ok(())
             })
             .unwrap()
