@@ -105,6 +105,8 @@ pub struct Settings {
     pub workspace_hidden: bool,
     /// Språk för gränssnittet ("Språk / Language").
     pub lang: crate::i18n::LangSetting,
+    /// Autokorrigering medan man skriver (dialogen Autokorrigering…).
+    pub autocorrect: crate::autocorrect::Config,
 }
 
 impl Default for Settings {
@@ -136,6 +138,7 @@ impl Default for Settings {
             workspace_panel: false,
             workspace_hidden: false,
             lang: Default::default(),
+            autocorrect: Default::default(),
         }
     }
 }
@@ -252,6 +255,7 @@ pub struct KladdApp {
     pub(crate) speller: Option<crate::spell::Speller>,
     pub(crate) grammar: crate::grammar::Checker,
     pub(crate) grammar_dlg: Option<crate::grammar_ui::Dialog>,
+    pub(crate) autocorrect_dlg: Option<crate::autocorrect_ui::Dialog>,
     pub(crate) wv: crate::word::view::State,
     pub(crate) print: crate::print::PrintState,
     pub(crate) nav: crate::word::navui::State,
@@ -381,6 +385,7 @@ impl KladdApp {
             speller: None,
             grammar: Default::default(),
             grammar_dlg: None,
+            autocorrect_dlg: None,
             wv: Default::default(),
             print: Default::default(),
             nav: Default::default(),
@@ -1622,6 +1627,9 @@ impl KladdApp {
         if menu_item(ui, p, t("Spara automatiskt"), "", Some(self.settings.autosave), true) {
             self.settings.autosave = !self.settings.autosave;
         }
+        if menu_item(ui, p, t("Autokorrigering…"), "", None, true) {
+            self.open_autocorrect_dialog();
+        }
         menu_divider(ui, p);
         // Ett klick byter till nästa språkval (Automatiskt, Svenska, English).
         let cur = self.settings.lang;
@@ -1818,6 +1826,9 @@ impl KladdApp {
                 let scroll_to = self.scroll_to_char.take();
                 let focus = std::mem::take(&mut self.focus_editor);
 
+                let ac_on = self.autocorrect_active(false);
+                let ac_lang = self.autocorrect_lang();
+                let ac_cfg = &self.settings.autocorrect;
                 let doc = &mut self.docs[self.active];
                 let hl = &mut self.hl;
                 let mc = &mut self.mc;
@@ -1830,6 +1841,8 @@ impl KladdApp {
                 let mut edited = false;
                 let mut scroll_to = scroll_to;
                 let had_focus = ui.memory(|m| m.has_focus(id));
+                let ac_on = ac_on && !mc.is_multi();
+                let ac_typed = if ac_on && had_focus { crate::autocorrect_ui::typed_char(ui.ctx()) } else { None };
                 let pre = mc.pre(ui.ctx(), id, doc_id, &mut doc.text, had_focus, self.editor_rect);
                 if pre.edited {
                     doc.on_edited();
@@ -1878,6 +1891,12 @@ impl KladdApp {
                                 .show(ui);
 
                             if out.response.changed() {
+                                // Autokorrigering efter ett skrivet tecken (Markdown och vanlig text).
+                                if let Some(c) = ac_typed
+                                    && crate::autocorrect_ui::run_in_editor(ui.ctx(), id, &mut doc.text, ac_cfg, ac_lang, c)
+                                {
+                                    ui.ctx().request_repaint();
+                                }
                                 doc.on_edited();
                                 edited = true;
                             }
@@ -3474,6 +3493,7 @@ impl eframe::App for KladdApp {
         self.quick_open_popup(&ctx, &p);
         self.workspace_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
+        self.autocorrect_dialog(&ctx);
         self.close_dialog(&ctx, &p);
         self.recovery_dialog(&ctx, &p);
         self.update.dialogs(&ctx, &p, &mut self.settings);

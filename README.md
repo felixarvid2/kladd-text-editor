@@ -186,6 +186,19 @@ Kladd använder Hunspell-ordlistor (`.aff` och `.dic`). Språk och på/av välje
 
 Ordlistor i mappen som `$DICPATH` pekar på hittas på alla system.
 
+### Autokorrigering
+
+Kladd rättar texten medan du skriver, när du avslutar ett ord eller en mening med mellanslag, skiljetecken eller Enter. Det gäller i dokumentläget; i *Autokorrigering…* (huvudmenyn) kan du också slå på det för Markdown och vanlig text (aldrig kodfiler) och slå av varje regel för sig:
+
+- typografiska citattecken efter språk: svenska ”…” och ’, engelska “…” och ‘…’
+- `--` blir – och `---` blir —, `...` blir …, `(c)` blir ©, `(r)` blir ® och `(tm)` blir ™
+- stor bokstav i början av meningar och stycken, men inte efter förkortningar (t.ex., bl.a., e.g.), i tal som 3.5, i webbadresser eller i ord som iPhone
+- två inledande versaler rättas (SVerige blir Sverige)
+- en liten inbyggd lista med vanliga svenska och engelska stavfel
+- egna ersättningar, till exempel `mvh` till *Med vänliga hälsningar* (versal i början följer med: `Mvh`)
+
+Språket följer stavningskontrollen (eller väljs i dialogen). Markdown-syntax, kodspann och kodstaket, länkar, HTML och kommentarer lämnas orörda. Ctrl+Z direkt efter en rättelse tar bara tillbaka rättelsen, som i Word. Autokorrigeringen är av medan ändringar spåras.
+
 ### Grammatik och stil
 
 Grammatikkontrollen använder [LanguageTool](https://languagetool.org/http-api/) och är **av som standard**. Klicka på *Grammatik* i statusfältet (eller välj *Grammatik* i menyn bakom språket) för att slå på den och välja server: *LanguageTools server (api.languagetool.org)* eller en egen adress, till exempel `http://localhost:8081` för en lokalt installerad LanguageTool. Med den publika servern skickas texten du skriver över internet; det förklaras en gång innan funktionen slås på. Språket följer stavningsspråket (annars väljer servern automatiskt).

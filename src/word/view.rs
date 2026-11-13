@@ -1048,6 +1048,13 @@ impl KladdApp {
             };
             let fonts_gen = self.doc_fonts.generation();
 
+            // Autokorrigering: tecknet som skrivs den här bilden (inte när ändringar spåras).
+            let ac_typed = if rv.before.is_none() && self.autocorrect_active(true) && ui.memory(|m| m.has_focus(id)) {
+                crate::autocorrect_ui::typed_char(&ctx)
+            } else {
+                None
+            };
+
             let doc = &mut self.docs[self.active];
             let word = &mut self.word;
             let speller = &mut self.speller;
@@ -1717,6 +1724,9 @@ impl KladdApp {
             }
             if let Some((at, dashes)) = col_resize {
                 self.word_edit(&ctx, |t, s| markup::table_set_widths(t, at, s, &dashes));
+            }
+            if let (true, Some(c)) = (edited, ac_typed) {
+                self.autocorrect_after_edit(&ctx, c);
             }
             match spell_act {
                 Some(SpellAct::Replace(r, s)) => {

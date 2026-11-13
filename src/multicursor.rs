@@ -538,6 +538,11 @@ fn set_primary(state: &mut TextEditState, s: Sel) {
 }
 
 impl State {
+    /// Finns det minst två markörer?
+    pub fn is_multi(&self) -> bool {
+        self.cur.is_some()
+    }
+
     /// Kör före `TextEdit::show`. `focused`: editorn har tangentbordsfokus. `rect`: editorns yta.
     pub fn pre(&mut self, ctx: &Context, id: Id, doc_id: u64, text: &mut String, focused: bool, rect: Rect) -> Outcome {
         let mut out = Outcome::default();
