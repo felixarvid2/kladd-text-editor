@@ -49,6 +49,15 @@ Ladda ner det senaste paketet för ditt system från [Releases](https://github.c
 sudo apt install ./kladd_*.deb
 ```
 
+**Linux (alla distributioner)** – hämta `Kladd-<version>-x86_64.AppImage`, gör den körbar och starta den:
+
+```bash
+chmod +x Kladd-*-x86_64.AppImage
+./Kladd-*-x86_64.AppImage
+```
+
+(Saknar systemet FUSE kan du köra `./Kladd-*-x86_64.AppImage --appimage-extract-and-run`.)
+
 **Windows** – kör `Kladd-<version>-windows-x64-setup.exe`. Installationen sker för din användare och kräver inte administratör (dialogen låter dig välja installation för alla). Du kan lägga till en genväg på skrivbordet och låta Kladd synas under *Öppna med* för `.docx`, `.odt`, `.md` och `.txt`. Vill du slippa installera finns även `Kladd-<version>-windows-x64.zip`: packa upp och kör `kladd.exe`. Programmet är inte signerat, så Windows SmartScreen varnar vid första starten: välj *Mer information* och sedan *Kör ändå*.
 
 **macOS** (11 eller nyare, Apple Silicon och Intel) – öppna `Kladd-<version>-macos-universal.dmg` och dra Kladd till mappen Program. Programmet är inte notariserat, så första gången måste du högerklicka på Kladd och välja *Öppna* (och bekräfta). Alternativt tar du bort karantänmärkningen i Terminalen:
@@ -58,6 +67,8 @@ xattr -dr com.apple.quarantine /Applications/Kladd.app
 ```
 
 På macOS går det ännu inte att öppna filer från Finder med *Öppna med* eller genom att dra dem till ikonen i Dock. Öppna dem i stället med *Öppna…* i menyn (`⌘O`) eller genom att dra dem till Kladd-fönstret.
+
+**Signering:** just nu är varken Windows- eller macOS-paketen signerade (därav varningarna ovan) och AppImagen är osignerad. Release-workflowen kan signera och notarisera så fort certifikat finns, se [docs/dev/signering.md](docs/dev/signering.md).
 
 Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
 

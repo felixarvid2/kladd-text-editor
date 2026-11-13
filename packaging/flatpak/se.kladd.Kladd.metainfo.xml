@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream-metadata för Kladd (Flathub, programbutiker). Validera med:
+       appstreamcli validate packaging/flatpak/se.kladd.Kladd.metainfo.xml
+     Skärmbilderna måste läggas till (och finnas på en publik adress) före inlämning till Flathub. -->
+<component type="desktop-application">
+  <id>se.kladd.Kladd</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Kladd</name>
+  <name xml:lang="sv">Kladd</name>
+  <summary>A calm and simple text editor for text, Markdown, code, Word and PDF</summary>
+  <summary xml:lang="sv">En lugn och snygg texteditor för text, Markdown, kod, Word och PDF</summary>
+  <developer id="se.kladd">
+    <name>Felix</name>
+  </developer>
+  <description>
+    <p>Kladd is a simple, fast and good-looking text editor. It opens and saves plain text, Markdown, source code, Word documents (.docx) and PDF files, with tabs, line numbers, syntax highlighting, find and replace, Markdown preview and spell checking in Swedish and English.</p>
+    <p xml:lang="sv">Kladd är en enkel, snabb och snygg texteditor. Den öppnar och sparar vanlig text, Markdown, kod, Word-dokument (.docx) och PDF, med flikar, radnummer, syntaxfärgning, sök och ersätt, förhandsvisning av Markdown och stavningskontroll på svenska och engelska.</p>
+  </description>
+  <launchable type="desktop-id">se.kladd.Kladd.desktop</launchable>
+  <url type="homepage">https://github.com/felixarvid2/kladd-text-editor</url>
+  <url type="bugtracker">https://github.com/felixarvid2/kladd-text-editor/issues</url>
+  <categories>
+    <category>Utility</category>
+    <category>TextEditor</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>kladd</binary>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <releases>
+    <release version="1.9.0" date="2026-11-12"/>
+  </releases>
+</component>

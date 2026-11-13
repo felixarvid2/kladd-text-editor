@@ -1,0 +1,60 @@
+# Flatpak-manifest för Kladd, förberett för en framtida inlämning till Flathub.
+# Byggs INTE i CI. Se docs/dev/signering.md (avsnittet Flatpak) för vad som återstår.
+#
+# Lokalt test (kräver flatpak-builder och att Rust-tillägget är installerat):
+#   flatpak install flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 \
+#       org.freedesktop.Sdk.Extension.rust-stable//24.08
+#   flatpak-builder --user --install --force-clean build-dir packaging/flatpak/se.kladd.Kladd.yml
+#   flatpak run se.kladd.Kladd
+#
+# Flathub bygger utan nätverk: före inlämning måste beroendena listas i en genererad
+# cargo-sources.json (flatpak-cargo-generator.py Cargo.lock) och `--share=network` tas bort
+# från build-args nedan. Källan ska då också peka på en taggad version, inte på katalogen.
+app-id: se.kladd.Kladd
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: kladd
+
+finish-args:
+  # Grafik: Wayland med X11 som reserv, och GPU för egui/glow.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Kladd öppnar och sparar filer var som helst i hemkatalogen.
+  - --filesystem=home
+  - --share=ipc
+  # Inställningar, stavningsordlistor och filväljare via portalerna.
+  - --talk-name=org.freedesktop.portal.Desktop
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/kladd/cargo
+  # Bara för lokal provbygge. Tas bort när cargo-sources.json används.
+  build-args:
+    - --share=network
+
+modules:
+  - name: kladd
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/kladd /app/bin/kladd
+      # Flatpak kräver att skrivbordsfil och ikoner heter som app-id:t.
+      - sed -e 's/^Icon=kladd$/Icon=se.kladd.Kladd/' packaging/kladd.desktop > se.kladd.Kladd.desktop
+      - install -Dm644 se.kladd.Kladd.desktop /app/share/applications/se.kladd.Kladd.desktop
+      - install -Dm644 packaging/icons/kladd.svg /app/share/icons/hicolor/scalable/apps/se.kladd.Kladd.svg
+      - install -Dm644 packaging/icons/48/kladd.png /app/share/icons/hicolor/48x48/apps/se.kladd.Kladd.png
+      - install -Dm644 packaging/icons/128/kladd.png /app/share/icons/hicolor/128x128/apps/se.kladd.Kladd.png
+      - install -Dm644 packaging/icons/256/kladd.png /app/share/icons/hicolor/256x256/apps/se.kladd.Kladd.png
+      - install -Dm644 packaging/flatpak/se.kladd.Kladd.metainfo.xml /app/share/metainfo/se.kladd.Kladd.metainfo.xml
+      - install -Dm644 assets/fonts/OFL.txt /app/share/doc/kladd/FONT-LICENSE
+      - install -Dm644 assets/fonts/Carlito-OFL.txt /app/share/doc/kladd/CARLITO-FONT-LICENSE
+      - install -Dm644 LICENSE /app/share/licenses/se.kladd.Kladd/LICENSE
+    sources:
+      # Byt mot { type: git, url: ..., tag: v<version>, commit: ... } vid inlämning.
+      - type: dir
+        path: ../..

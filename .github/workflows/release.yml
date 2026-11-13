@@ -1,5 +1,9 @@
-# Bygger paket för Linux (.deb), Windows (installationsprogram och zip) och
+# Bygger paket för Linux (.deb och AppImage), Windows (installationsprogram och zip) och
 # macOS (.dmg, universell) och skapar en GitHub-release med alla.
+#
+# Kodsignering är valfri och styrs av repots hemligheter (Settings → Secrets and variables
+# → Actions). Saknas hemligheterna byggs allt osignerat (Windows) respektive ad hoc-signerat
+# (macOS), precis som förut. Se docs/dev/signering.md för namn och hur man skaffar dem.
 #
 # Två sätt att släppa en ny version (höj först `version` i Cargo.toml):
 #   1. Pusha en tagg:  git tag v1.4.0 && git push origin v1.4.0
@@ -109,14 +113,10 @@ jobs:
           path: target/debian/*.deb
           if-no-files-found: error
 
-  windows:
+  appimage:
     needs: meta
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
-    env:
-      VERSION: ${{ needs.meta.outputs.version }}
+    # 22.04 (äldre glibc) så att AppImagen går att köra på så många system som möjligt.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -126,6 +126,48 @@ jobs:
 
       - name: Bygg
         run: cargo build --release --locked
+
+      - name: Bygg AppImage
+        # linuxdeploy tar inte med libGL, libEGL, libwayland, libX* m.fl. (grafiken kommer
+        # från värden). Skriptet kör verktygen med APPIMAGE_EXTRACT_AND_RUN eftersom FUSE saknas.
+        run: packaging/linux/build-appimage.sh "${{ needs.meta.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kladd-appimage
+          path: dist/Kladd-*-x86_64.AppImage
+          if-no-files-found: error
+
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      # Valfri signering: hemligheter kan inte användas direkt i `if:`, därför går de via env.
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bygg
+        run: cargo build --release --locked
+
+      - name: Signera kladd.exe
+        # Hoppas över utan certifikat. Signeras före zip och installationsprogram så att
+        # båda innehåller den signerade filen.
+        if: env.WINDOWS_CERT_PFX_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != ''
+        shell: pwsh
+        run: |
+          . packaging\windows\sign.ps1
+          Initialize-Signing
+          Sign-File target\release\kladd.exe
 
       - name: Zip
         run: |
@@ -146,6 +188,15 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" packaging\windows\kladd.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Signera installationsprogrammet
+        if: env.WINDOWS_CERT_PFX_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != ''
+        shell: pwsh
+        run: |
+          . packaging\windows\sign.ps1
+          Initialize-Signing
+          Get-ChildItem dist\*-setup.exe | ForEach-Object { Sign-File $_.FullName }
+          Remove-Item -Force $env:RUNNER_TEMP\kladd-cert.pfx
+
       - uses: actions/upload-artifact@v4
         with:
           name: kladd-windows
@@ -159,6 +210,13 @@ jobs:
     runs-on: macos-latest
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+      # Valfri signering och notarisering (se docs/dev/signering.md). Utan dem används ad hoc-signering.
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -187,8 +245,35 @@ jobs:
           cp LICENSE README.md "$app/Contents/Resources/licenses/"
           cp assets/fonts/OFL.txt "$app/Contents/Resources/licenses/FONT-LICENSE.txt"
           cp assets/fonts/Carlito-OFL.txt "$app/Contents/Resources/licenses/CARLITO-FONT-LICENSE.txt"
-          # Ad hoc-signering (ingen utvecklarfil) krävs för att appen ska starta på Apple Silicon.
-          codesign --force --deep -s - "$app"
+
+      - name: Importera certifikat
+        # Läggs i en tillfällig nyckelring som tas bort sist i jobbet.
+        if: env.MACOS_CERT_P12_BASE64 != '' && env.MACOS_CERT_PASSWORD != '' && env.MACOS_SIGN_IDENTITY != ''
+        run: |
+          keychain="$RUNNER_TEMP/kladd-signing.keychain-db"
+          kcpass=$(uuidgen)
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kcpass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kcpass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kcpass" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "KLADD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Signera Kladd.app
+        run: |
+          app="dist/dmg/Kladd.app"
+          if [ -n "${KLADD_KEYCHAIN:-}" ]; then
+            # Developer ID: härdad körmiljö och tidsstämpel krävs för notarisering.
+            codesign --force --deep --options runtime --timestamp \
+              --entitlements packaging/macos/kladd.entitlements \
+              -s "$MACOS_SIGN_IDENTITY" --keychain "$KLADD_KEYCHAIN" "$app"
+          else
+            # Ad hoc-signering (ingen utvecklarfil) krävs för att appen ska starta på Apple Silicon.
+            codesign --force --deep -s - "$app"
+          fi
           codesign --verify --deep --strict "$app"
 
       - name: Skapa .dmg
@@ -197,6 +282,26 @@ jobs:
           hdiutil create -volname Kladd -srcfolder dist/dmg -ov -format UDZO \
             "dist/Kladd-${VERSION}-macos-universal.dmg"
 
+      - name: Signera .dmg
+        if: env.MACOS_CERT_P12_BASE64 != '' && env.MACOS_CERT_PASSWORD != '' && env.MACOS_SIGN_IDENTITY != ''
+        run: |
+          codesign --force --timestamp -s "$MACOS_SIGN_IDENTITY" --keychain "$KLADD_KEYCHAIN" \
+            "dist/Kladd-${VERSION}-macos-universal.dmg"
+
+      - name: Notarisera och nita fast kvittot
+        # Kräver också Apple-kontouppgifterna. Utan dem blir .dmg:n signerad men inte notariserad.
+        if: env.MACOS_CERT_P12_BASE64 != '' && env.MACOS_CERT_PASSWORD != '' && env.MACOS_SIGN_IDENTITY != '' && env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != ''
+        run: |
+          dmg="dist/Kladd-${VERSION}-macos-universal.dmg"
+          xcrun notarytool submit "$dmg" --wait \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+      - name: Ta bort nyckelringen
+        if: always() && env.MACOS_CERT_P12_BASE64 != ''
+        run: security delete-keychain "$RUNNER_TEMP/kladd-signing.keychain-db" || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: kladd-macos
@@ -204,7 +309,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [meta, deb, windows, macos]
+    needs: [meta, deb, appimage, windows, macos]
     if: github.ref_type == 'tag' || inputs.publish
     runs-on: ubuntu-22.04
     steps:

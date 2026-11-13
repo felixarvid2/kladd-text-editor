@@ -4,6 +4,14 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **AppImage för Linux.** Varje release innehåller nu `Kladd-<version>-x86_64.AppImage` som körs på de flesta distributioner utan installation.
+
+### Ändrat
+
+- **Valfri kodsignering i release-bygget.** Windows (signtool) och macOS (Developer ID, notarisering) signeras om certifikat finns som hemligheter i repot; annars byggs paketen som förut. Beskrivet i `docs/dev/signering.md`. Ett utkast till Flatpak-paket finns i `packaging/flatpak/`.
+
 ## [1.9.0] – 2026-11-12
 
 ### Nytt
