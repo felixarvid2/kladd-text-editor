@@ -13,6 +13,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictio
 
 use super::meta::Geo;
 use super::view::PageXf;
+use crate::i18n::t;
+use crate::tf;
 
 /// Markeringsfärger: gul, grön, blå, rosa.
 pub const HIGHLIGHT_COLORS: [(&str, [u8; 3]); 4] =
@@ -245,7 +247,7 @@ impl AnnotState {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(240.0);
-                    let title = if ed.tool == AnnotTool::Note { "Anteckning" } else { "Textruta" };
+                    let title = if ed.tool == AnnotTool::Note { t("Anteckning") } else { t("Textruta") };
                     ui.label(egui::RichText::new(title).strong());
                     let edit = ui.add(egui::TextEdit::multiline(&mut ed.text).desired_width(f32::INFINITY).desired_rows(3));
                     if ed.fresh {
@@ -253,12 +255,12 @@ impl AnnotState {
                         ed.fresh = false;
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Lägg till").clicked()
+                        if ui.button(t("Lägg till")).clicked()
                             || ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
                         {
                             done = Some(true);
                         }
-                        if ui.button("Avbryt").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        if ui.button(t("Avbryt")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             done = Some(false);
                         }
                     });
@@ -413,15 +415,15 @@ pub fn tool_row(ui: &mut egui::Ui, p: &crate::theme::Palette, st: &mut AnnotStat
     ];
     for (tool, label, tip) in tools {
         let on = st.tool == Some(tool);
-        let text = egui::RichText::new(label).color(if on { p.accent } else { p.text });
+        let text = egui::RichText::new(t(label)).color(if on { p.accent } else { p.text });
         let b = egui::Button::new(text).fill(if on { p.accent.gamma_multiply(0.16) } else { Color32::TRANSPARENT }).stroke(Stroke::NONE);
-        if ui.add(b).on_hover_text(tip).clicked() {
+        if ui.add(b).on_hover_text(t(tip)).clicked() {
             st.tool = if on { None } else { Some(tool) };
             st.editing = None;
         }
     }
     ui.separator();
-    let (colors, sel): (&[(&str, [u8; 3])], &mut usize) = if st.tool == Some(AnnotTool::Highlight) {
+    let (colors, sel): (&[(&'static str, [u8; 3])], &mut usize) = if st.tool == Some(AnnotTool::Highlight) {
         (&HIGHLIGHT_COLORS, &mut st.hl_color)
     } else {
         (&INK_COLORS, &mut st.ink_color)
@@ -433,21 +435,21 @@ pub fn tool_row(ui: &mut egui::Ui, p: &crate::theme::Palette, st: &mut AnnotStat
         if *sel == i {
             ui.painter().circle_stroke(rect.center(), 9.0, Stroke::new(1.5, p.accent));
         }
-        if resp.on_hover_text(*name).clicked() {
+        if resp.on_hover_text(t(*name)).clicked() {
             *sel = i;
         }
     }
     if st.tool == Some(AnnotTool::Pen) {
         ui.separator();
-        ui.label(egui::RichText::new("Bredd").color(p.muted));
+        ui.label(egui::RichText::new(t("Bredd")).color(p.muted));
         ui.add(egui::DragValue::new(&mut st.width).range(0.5..=12.0).speed(0.1).suffix(" pt"));
     }
     ui.separator();
-    if ui.add_enabled(st.has_pending(), egui::Button::new("Ångra").fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).on_hover_text("Ta bort den senaste anteckningen").clicked() {
+    if ui.add_enabled(st.has_pending(), egui::Button::new(t("Ångra")).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).on_hover_text(t("Ta bort den senaste anteckningen")).clicked() {
         st.undo();
     }
     if st.has_pending() {
-        ui.label(egui::RichText::new(format!("{} osparade", st.list.len())).color(p.muted));
+        ui.label(egui::RichText::new(tf!("{n} osparade", n = st.list.len())).color(p.muted));
     }
 }
 
@@ -709,9 +711,9 @@ fn push_annots(doc: &mut Document, page: ObjectId, new: Vec<ObjectId>) {
 pub fn apply(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot]) -> Result<Vec<u8>, String> {
     let mut opts = lopdf::LoadOptions::default();
     opts.password = password.map(str::to_owned);
-    let mut doc = Document::load_mem_with_options(bytes, opts).map_err(|e| format!("PDF:en kunde inte läsas: {e}"))?;
+    let mut doc = Document::load_mem_with_options(bytes, opts).map_err(|e| tf!("PDF:en kunde inte läsas: {e}", e = e))?;
     if doc.is_encrypted() {
-        doc.decrypt(password.unwrap_or("")).map_err(|_| "PDF:en kunde inte avkrypteras".to_owned())?;
+        doc.decrypt(password.unwrap_or("")).map_err(|_| t("PDF:en kunde inte avkrypteras").to_owned())?;
     }
     doc.trailer.remove(b"Encrypt");
     doc.encryption_state = None;
@@ -730,7 +732,7 @@ pub fn apply(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot]) -> Resul
         push_annots(&mut doc, ids[p], new);
     }
     let mut out = Vec::new();
-    doc.save_to(&mut out).map_err(|e| format!("PDF:en kunde inte skrivas: {e}"))?;
+    doc.save_to(&mut out).map_err(|e| tf!("PDF:en kunde inte skrivas: {e}", e = e))?;
     Ok(out)
 }
 

@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use lopdf::{Document, Object, ObjectId};
 
+use crate::i18n::t;
+use crate::tf;
+
 /// Högsta antal sparade versioner för Ångra.
 pub const MAX_HISTORY: usize = 30;
 /// Högsta sammanlagda storlek på sparade versioner (byte).
@@ -23,9 +26,9 @@ fn load(bytes: &[u8], password: Option<&str>) -> Result<Document, String> {
     let pw = password.unwrap_or("");
     let mut opts = lopdf::LoadOptions::default();
     opts.password = Some(pw.to_owned());
-    let mut doc = Document::load_mem_with_options(bytes, opts).map_err(|e| format!("PDF:en kunde inte läsas: {e}"))?;
+    let mut doc = Document::load_mem_with_options(bytes, opts).map_err(|e| tf!("PDF:en kunde inte läsas: {e}", e = e))?;
     if doc.is_encrypted() {
-        doc.decrypt(pw).map_err(|_| "PDF:en är lösenordsskyddad".to_owned())?;
+        doc.decrypt(pw).map_err(|_| t("PDF:en är lösenordsskyddad").to_owned())?;
     }
     doc.trailer.remove(b"Encrypt");
     doc.encryption_state = None;
@@ -35,7 +38,7 @@ fn load(bytes: &[u8], password: Option<&str>) -> Result<Document, String> {
 fn save(mut doc: Document) -> Result<Vec<u8>, String> {
     doc.prune_objects();
     let mut out = Vec::new();
-    doc.save_to(&mut out).map_err(|e| format!("PDF:en kunde inte skrivas: {e}"))?;
+    doc.save_to(&mut out).map_err(|e| tf!("PDF:en kunde inte skrivas: {e}", e = e))?;
     Ok(out)
 }
 
@@ -43,7 +46,7 @@ fn pages_root(doc: &Document) -> Result<ObjectId, String> {
     doc.catalog()
         .and_then(|c| c.get(b"Pages"))
         .and_then(Object::as_reference)
-        .map_err(|_| "PDF:en saknar sidträd".to_owned())
+        .map_err(|_| t("PDF:en saknar sidträd").to_owned())
 }
 
 /// Skriver in ärvda sidegenskaper på varje sida och gör sidorna till direkta barn av roten.
@@ -96,7 +99,7 @@ pub fn reorder(bytes: &[u8], order: &[usize]) -> Result<Vec<u8>, String> {
     let ids = flatten(&mut doc)?;
     let uniq: HashSet<usize> = order.iter().copied().collect();
     if order.len() != ids.len() || uniq.len() != ids.len() || order.iter().any(|&i| i >= ids.len()) {
-        return Err("Ogiltig sidordning".to_owned());
+        return Err(t("Ogiltig sidordning").to_owned());
     }
     let root = pages_root(&doc)?;
     let new: Vec<ObjectId> = order.iter().map(|&i| ids[i]).collect();
@@ -127,7 +130,7 @@ fn retain_pages(doc: &mut Document, keep: &BTreeSet<usize>) -> Result<(), String
 fn check_pages(pages: &[usize], count: usize) -> Result<BTreeSet<usize>, String> {
     let set: BTreeSet<usize> = pages.iter().copied().collect();
     if set.is_empty() || set.iter().any(|&p| p >= count) {
-        return Err("Ogiltigt sidurval".to_owned());
+        return Err(t("Ogiltigt sidurval").to_owned());
     }
     Ok(set)
 }
@@ -138,7 +141,7 @@ pub fn delete(bytes: &[u8], pages: &[usize]) -> Result<Vec<u8>, String> {
     let count = doc.page_iter().count();
     let del = check_pages(pages, count)?;
     if del.len() >= count {
-        return Err("Minst en sida måste vara kvar".to_owned());
+        return Err(t("Minst en sida måste vara kvar").to_owned());
     }
     let keep: BTreeSet<usize> = (0..count).filter(|i| !del.contains(i)).collect();
     retain_pages(&mut doc, &keep)?;
@@ -172,11 +175,11 @@ pub fn rotate(bytes: &[u8], pages: &[usize], quarter_turns: i32) -> Result<Vec<u
 pub fn insert(bytes: &[u8], other: &[u8], other_password: Option<&str>, at: usize) -> Result<Vec<u8>, String> {
     let mut doc = load(bytes, None)?;
     let mut ids = flatten(&mut doc)?;
-    let mut add = load(other, other_password).map_err(|e| format!("Den infogade filen: {e}"))?;
+    let mut add = load(other, other_password).map_err(|e| tf!("Den infogade filen: {e}", e = e))?;
     add.renumber_objects_with(doc.max_id + 1);
     let add_ids = flatten(&mut add)?;
     if add_ids.is_empty() {
-        return Err("Den infogade filen har inga sidor".to_owned());
+        return Err(t("Den infogade filen har inga sidor").to_owned());
     }
     let root = pages_root(&doc)?;
     doc.max_id = doc.max_id.max(add.objects.keys().map(|k| k.0).max().unwrap_or(0));

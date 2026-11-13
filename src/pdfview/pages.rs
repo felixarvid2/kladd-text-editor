@@ -11,6 +11,8 @@ use super::chrome::PdfTab;
 use super::engine::{OpenError, PdfEngine};
 use super::meta::read_meta;
 use super::organize::{self, History};
+use crate::i18n::t;
+use crate::tf;
 
 /// Det sidpanelen, menyn och tangenterna ber om.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,7 +68,7 @@ pub fn click_selection(sel: &BTreeSet<usize>, anchor: Option<usize>, page: usize
 fn open_error(e: OpenError) -> String {
     match e {
         OpenError::Invalid(m) => m,
-        _ => "lösenordet stämmer inte".to_owned(),
+        _ => t("lösenordet stämmer inte").to_owned(),
     }
 }
 
@@ -82,7 +84,7 @@ fn plain(tab: &PdfTab) -> Result<Vec<u8>, String> {
         tab.view.bytes()
     };
     match tab.password.as_deref() {
-        Some(pw) => crate::print::decrypted_pdf(bytes, pw).ok_or_else(|| "PDF:en kunde inte avkrypteras".to_owned()),
+        Some(pw) => crate::print::decrypted_pdf(bytes, pw).ok_or_else(|| t("PDF:en kunde inte avkrypteras").to_owned()),
         None => Ok(bytes.to_vec()),
     }
 }
@@ -127,7 +129,7 @@ pub fn run(ctx: &egui::Context, tab: &mut PdfTab, op: &OrgOp) -> Result<String, 
             let after = organize::page_count(&out)?;
             commit(ctx, tab, out, organize::selection_after_delete(after, first))?;
             let n = pages.iter().collect::<BTreeSet<_>>().len();
-            Ok(if n == 1 { "Tog bort 1 sida".to_owned() } else { format!("Tog bort {n} sidor") })
+            Ok(if n == 1 { t("Tog bort 1 sida").to_owned() } else { tf!("Tog bort {n} sidor", n = n) })
         }
         OrgOp::Move { pages, before } => {
             let (order, sel) = organize::move_order(count, pages, *before);
@@ -141,18 +143,19 @@ pub fn run(ctx: &egui::Context, tab: &mut PdfTab, op: &OrgOp) -> Result<String, 
         OrgOp::Undo | OrgOp::Redo => {
             // Äldre versioner saknar de osparade anteckningarna och fältvärdena, som annars skulle försvinna.
             if tab.view.annot.has_pending() || tab.view.forms.dirty() {
-                return Err("Spara först: det finns osparade anteckningar eller formulärvärden.".to_owned());
+                return Err(t("Spara först: det finns osparade anteckningar eller formulärvärden.").to_owned());
             }
             let cur = tab.view.bytes().clone();
-            let (next, what) = if *op == OrgOp::Undo { (tab.org.history.undo(cur), "Ångrade") } else { (tab.org.history.redo(cur), "Gjorde om") };
+            let undo = *op == OrgOp::Undo;
+            let next = if undo { tab.org.history.undo(cur) } else { tab.org.history.redo(cur) };
             let Some(bytes) = next else { return Ok(String::new()) };
             install(ctx, tab, bytes)?;
             tab.pages_changed = true;
             tab.reload_forms();
             tab.org.sel.clear();
-            Ok(format!("{what} sidändringen"))
+            Ok(if undo { t("Ångrade sidändringen") } else { t("Gjorde om sidändringen") }.to_owned())
         }
-        OrgOp::Extract(_) | OrgOp::InsertAt(_) => Err("Åtgärden behöver en fil".to_owned()),
+        OrgOp::Extract(_) | OrgOp::InsertAt(_) => Err(t("Åtgärden behöver en fil").to_owned()),
     }
 }
 
@@ -168,7 +171,7 @@ pub fn insert_bytes(ctx: &egui::Context, tab: &mut PdfTab, other: &[u8], at: usi
     let out = organize::insert(&plain(tab)?, other, None, at)?;
     let added = organize::page_count(&out)?.saturating_sub(before);
     commit(ctx, tab, out, (at..at + added).collect())?;
-    Ok(if added == 1 { "Infogade 1 sida".to_owned() } else { format!("Infogade {added} sidor") })
+    Ok(if added == 1 { t("Infogade 1 sida").to_owned() } else { tf!("Infogade {added} sidor", added = added) })
 }
 
 #[cfg(test)]

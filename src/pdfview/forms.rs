@@ -21,6 +21,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
 use super::meta::{Geo, decode_text, num, rect_of};
 use super::view::PageXf;
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 const MAX_FIELDS: usize = 5000;
@@ -355,13 +357,13 @@ fn on_state(doc: &Document, w: ObjectId) -> String {
 /// Skriver värdena (fält-id → värde) till PDF:en och ger de nya bytena.
 pub fn apply(bytes: &[u8], password: Option<&str>, values: &[(ObjectId, Value)]) -> Result<Vec<u8>, String> {
     catch_unwind(AssertUnwindSafe(|| apply_inner(bytes, password, values)))
-        .unwrap_or_else(|_| Err("Formulärvärdena kunde inte skrivas".to_owned()))
+        .unwrap_or_else(|_| Err(t("Formulärvärdena kunde inte skrivas").to_owned()))
 }
 
 fn apply_inner(bytes: &[u8], password: Option<&str>, values: &[(ObjectId, Value)]) -> Result<Vec<u8>, String> {
-    let mut doc = load_doc(bytes, password).ok_or("PDF:en kunde inte läsas")?;
+    let mut doc = load_doc(bytes, password).ok_or(t("PDF:en kunde inte läsas"))?;
     if doc.trailer.get(b"Encrypt").is_ok() {
-        return Err("Krypterade PDF:er kan inte fyllas i ännu".to_owned());
+        return Err(t("Krypterade PDF:er kan inte fyllas i ännu").to_owned());
     }
     let fields = read_doc(&doc);
     let mut helv = None;
@@ -373,7 +375,7 @@ fn apply_inner(bytes: &[u8], password: Option<&str>, values: &[(ObjectId, Value)
         acro.set("NeedAppearances", Object::Boolean(true));
     }
     let mut out = Vec::new();
-    doc.save_to(&mut out).map_err(|e| format!("PDF:en kunde inte sparas: {e}"))?;
+    doc.save_to(&mut out).map_err(|e| tf!("PDF:en kunde inte sparas: {e}", e = e))?;
     Ok(out)
 }
 
@@ -1221,19 +1223,19 @@ pub fn bar(ui: &mut Ui, p: &Palette, forms: &mut FormState) -> Option<FormAction
             ui.painter().hline((r.left() - 12.0)..=(r.right() + 12.0), r.bottom() + 4.0, Stroke::new(1.0, p.line));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(RichText::new("Det här dokumentet har formulärfält").font(FontId::new(13.0, theme::medium())).color(p.text));
-                let txt = RichText::new("Markera fält").color(if forms.highlight { p.on_accent } else { p.text });
+                ui.label(RichText::new(t("Det här dokumentet har formulärfält")).font(FontId::new(13.0, theme::medium())).color(p.text));
+                let txt = RichText::new(t("Markera fält")).color(if forms.highlight { p.on_accent } else { p.text });
                 let b = egui::Button::new(txt).fill(if forms.highlight { p.accent } else { p.surface_hover }).stroke(Stroke::NONE);
-                if ui.add(b).on_hover_text("Markera ifyllbara fält med ljusblått").clicked() {
+                if ui.add(b).on_hover_text(t("Markera ifyllbara fält med ljusblått")).clicked() {
                     forms.highlight = !forms.highlight;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if forms.dirty() {
-                        let save = egui::Button::new(RichText::new("Spara").color(p.on_accent)).fill(p.accent).stroke(Stroke::NONE);
-                        if ui.add(save).on_hover_text(crate::keys::shortcut("Spara ändringarna i PDF:en (Ctrl+S)")).clicked() {
+                        let save = egui::Button::new(RichText::new(t("Spara")).color(p.on_accent)).fill(p.accent).stroke(Stroke::NONE);
+                        if ui.add(save).on_hover_text(crate::keys::shortcut(t("Spara ändringarna i PDF:en (Ctrl+S)"))).clicked() {
                             act = Some(FormAction::Save);
                         }
-                        ui.label(RichText::new("Osparade ändringar").color(p.muted));
+                        ui.label(RichText::new(t("Osparade ändringar")).color(p.muted));
                     }
                 });
             });

@@ -14,7 +14,9 @@ use super::chrome::{Action, PdfTab};
 use super::engine::{EngineEvent, PdfEngine, Recolor, RenderRequest};
 use super::text::{Glyph, PageText};
 use super::view::PdfView;
+use crate::i18n::t;
 use crate::ocr::{self, Tesseract, Word};
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Renderingsskala för igenkänning: 300 dpi mot PDF:ens 72 punkter per tum.
@@ -95,21 +97,21 @@ impl OcrState {
     /// Startar igenkänning av de skannade sidor som saknar resultat. Fel är läsbara meddelanden.
     pub fn start(&mut self, view: &PdfView, password: Option<&str>, ctx: &egui::Context, edit_after: bool) -> Result<(), String> {
         if self.running() {
-            return Err("Textigenkänning pågår redan".to_owned());
+            return Err(t("Textigenkänning pågår redan").to_owned());
         }
         if !self.probed {
             if self.probe.is_none() && ocr::find_exe().is_none() {
                 return Err(ocr::install_hint().to_owned());
             }
-            return Err("Letar efter skannade sidor, försök igen om en stund".to_owned());
+            return Err(t("Letar efter skannade sidor, försök igen om en stund").to_owned());
         }
         let Some(tess) = self.tess.clone() else { return Err(ocr::install_hint().to_owned()) };
         if tess.lang_arg().is_none() {
-            return Err(format!("Tesseract har inga språkpaket. {}", ocr::install_hint()));
+            return Err(tf!("Tesseract har inga språkpaket. {hint}", hint = ocr::install_hint()));
         }
         let pages: Vec<usize> = self.scanned.iter().copied().filter(|p| !self.texts.contains_key(p)).collect();
         if pages.is_empty() {
-            return Err(if self.scanned.is_empty() { "Inga skannade sidor hittades" } else { "Texten är redan igenkänd" }.to_owned());
+            return Err(if self.scanned.is_empty() { t("Inga skannade sidor hittades") } else { t("Texten är redan igenkänd") }.to_owned());
         }
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -166,7 +168,7 @@ impl OcrState {
                     Ok(Msg::Done(r)) => finished = Some(r),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        finished.get_or_insert(Err("Textigenkänningen avbröts".to_owned()));
+                        finished.get_or_insert(Err(t("Textigenkänningen avbröts").to_owned()));
                         break;
                     }
                 }
@@ -179,11 +181,12 @@ impl OcrState {
             match r {
                 Ok(()) => {
                     let n = self.texts.len();
-                    out.notices.push((format!("Textigenkänningen är klar ({n} {})", if n == 1 { "sida" } else { "sidor" }), false));
+                    let msg = if n == 1 { t("Textigenkänningen är klar (1 sida)").to_owned() } else { tf!("Textigenkänningen är klar ({n} sidor)", n = n) };
+                    out.notices.push((msg, false));
                     out.edit_now = edit;
                 }
                 Err(e) => {
-                    out.notices.push((format!("Textigenkänningen misslyckades: {e}"), true));
+                    out.notices.push((tf!("Textigenkänningen misslyckades: {e}", e = e), true));
                     // Redigera fortsätter ändå med de sidor som hann bli klara.
                     out.edit_now = edit && !self.texts.is_empty();
                 }
@@ -260,12 +263,12 @@ fn pages_with_images(bytes: &[u8], password: Option<&str>) -> Vec<bool> {
 }
 
 fn run_job(bytes: Arc<Vec<u8>>, password: Option<String>, pages: Vec<usize>, tess: Tesseract, ctx: egui::Context, cancel: Arc<AtomicBool>, tx: &Sender<Msg>) -> Result<(), String> {
-    let engine = PdfEngine::open(bytes, password.as_deref(), ctx.clone()).map_err(|_| "kunde inte öppna PDF:en".to_owned())?;
+    let engine = PdfEngine::open(bytes, password.as_deref(), ctx.clone()).map_err(|_| t("kunde inte öppna PDF:en").to_owned())?;
     let total = pages.len();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     for (i, &page) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return Err("avbröts".to_owned());
+            return Err(t("avbröts").to_owned());
         }
         let _ = tx.send(Msg::Progress { done: i, total });
         ctx.request_repaint();
@@ -276,22 +279,22 @@ fn run_job(bytes: Arc<Vec<u8>>, password: Option<String>, pages: Vec<usize>, tes
             for ev in engine.poll() {
                 match ev {
                     EngineEvent::Rendered { req, image } if req.page == page => got = Some(Ok(image)),
-                    EngineEvent::Failed { page: pg, error } if pg == page && !error.starts_with("Texten") => got = Some(Err(error)),
+                    EngineEvent::Failed { page: pg, error } if pg == page && !super::engine::is_text_error(&error) => got = Some(Err(error)),
                     _ => {}
                 }
             }
             match got {
                 Some(r) => break r?,
-                None if start.elapsed() > Duration::from_secs(60) => return Err("renderingen tog för lång tid".to_owned()),
-                None if cancel.load(Ordering::Relaxed) => return Err("avbröts".to_owned()),
+                None if start.elapsed() > Duration::from_secs(60) => return Err(t("renderingen tog för lång tid").to_owned()),
+                None if cancel.load(Ordering::Relaxed) => return Err(t("avbröts").to_owned()),
                 None => std::thread::sleep(Duration::from_millis(15)),
             }
         };
         let [w, h] = image.size;
         let raw: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
         let png = std::env::temp_dir().join(format!("kladd-ocr-{}-{}.png", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
-        let img = image::RgbaImage::from_raw(w as u32, h as u32, raw).ok_or("bilden kunde inte skrivas")?;
-        img.save_with_format(&png, image::ImageFormat::Png).map_err(|e| format!("bilden kunde inte skrivas: {e}"))?;
+        let img = image::RgbaImage::from_raw(w as u32, h as u32, raw).ok_or(t("bilden kunde inte skrivas"))?;
+        img.save_with_format(&png, image::ImageFormat::Png).map_err(|e| tf!("bilden kunde inte skrivas: {e}", e = e))?;
         let words = tess.recognize(&png);
         let _ = std::fs::remove_file(&png);
         let words = words?;
@@ -348,10 +351,10 @@ pub fn notice_bar(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, anchor: Re
             .shadow(ui.visuals().popup_shadow)
             .show(ui, |ui| {
                 ui.set_width(width - 28.0);
-                ui.label(RichText::new("Sidorna är skannade. Känn igen texten för att kunna söka och markera.").color(p.text));
+                ui.label(RichText::new(t("Sidorna är skannade. Känn igen texten för att kunna söka och markera.")).color(p.text));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let b = egui::Button::new(RichText::new("Känn igen text").font(FontId::new(13.5, theme::medium())).color(p.on_accent))
+                    let b = egui::Button::new(RichText::new(t("Känn igen text")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
                         .fill(p.accent)
                         .stroke(Stroke::NONE)
                         .min_size(vec2(0.0, 30.0));
@@ -359,7 +362,7 @@ pub fn notice_bar(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, anchor: Re
                         act = Some(Action::Ocr);
                         close = true;
                     }
-                    if ui.add(egui::Button::new(RichText::new("Inte nu").color(p.muted)).frame(false).min_size(vec2(0.0, 30.0))).clicked() {
+                    if ui.add(egui::Button::new(RichText::new(t("Inte nu")).color(p.muted)).frame(false).min_size(vec2(0.0, 30.0))).clicked() {
                         close = true;
                     }
                 });
@@ -373,7 +376,7 @@ pub fn notice_bar(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, anchor: Re
 
 /// Texten i statusraden medan igenkänning pågår.
 pub fn status_text(s: &OcrState) -> Option<String> {
-    s.progress.map(|(d, t)| format!("Känner igen text: sida {} av {t}", (d + 1).min(t)))
+    s.progress.map(|(d, total)| tf!("Känner igen text: sida {n} av {total}", n = (d + 1).min(total), total = total))
 }
 
 /// En PDF med en enda sida som bara är en RGB-bild (som en skanning), för tester.

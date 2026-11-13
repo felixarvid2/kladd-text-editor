@@ -571,6 +571,26 @@ fn format_date(s: &str) -> String {
     out
 }
 
+/// Gör om ett datum från `format_date` ("2026-11-12 14:30") till språkets stil: ISO och 24 timmar
+/// på svenska, "Nov 12, 2026 2:30 PM" på engelska. Ofullständiga datum lämnas som de är.
+pub fn display_date(s: &str) -> String {
+    let (day, time) = match s.split_once(' ') {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let nums: Vec<u32> = day.split('-').map_while(|p| p.parse().ok()).collect();
+    let (&[y, mo, d], true) = (nums.as_slice(), day.split('-').count() == 3) else { return s.to_owned() };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return s.to_owned();
+    }
+    let date = crate::i18n::date(y as i32, mo, d);
+    let hm = time.and_then(|t| t.split_once(':')).and_then(|(h, m)| Some((h.parse::<u32>().ok()?, m.parse::<u32>().ok()?)));
+    match hm {
+        Some((h, m)) if h < 24 && m < 60 => format!("{date} {}", crate::i18n::clock(h, m)),
+        _ => date,
+    }
+}
+
 fn parse_version(s: &str) -> Option<(u32, u32)> {
     let (a, b) = s.trim().split_once('.')?;
     Some((a.parse().ok()?, b.parse().ok()?))
@@ -881,6 +901,11 @@ mod tests {
         assert_eq!(format_date("D:2026"), "2026");
         assert_eq!(format_date("D:2026111214"), "2026-11-12 14:00");
         assert_eq!(format_date("igår"), "igår");
+        // Visningsformen är ISO med 24 timmar på svenska (standardspråket i testerna).
+        assert_eq!(display_date("2026-11-12 14:30"), "2026-11-12 14:30");
+        assert_eq!(display_date("2026-11-12"), "2026-11-12");
+        assert_eq!(display_date("2026-11"), "2026-11");
+        assert_eq!(display_date("igår"), "igår");
         assert_eq!(header_version(b"%PDF-1.7\n..."), Some((1, 7)));
         assert_eq!(header_version(b"junk"), None);
         // Katalogens /Version vinner när den är högre än huvudet.

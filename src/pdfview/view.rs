@@ -27,6 +27,8 @@ use egui::{
 use super::engine::{EngineEvent, PageSize, PdfEngine, Recolor, RenderRequest, effective_scale};
 use super::meta::{Dest, LinkTarget, PdfMeta};
 use super::text::PageText;
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::Palette;
 
 /// egui-punkter per pt vid zoom 1,0 (96 dpi).
@@ -43,7 +45,6 @@ const MAX_THUMBS: usize = 240;
 const SPINNER_AFTER: Duration = Duration::from_millis(400);
 /// Så länge efter en zoomändring väntar vi med att begära skarpa bilder för sidor som redan har en.
 const ZOOM_SETTLE: Duration = Duration::from_millis(150);
-const TEXT_ERROR_PREFIX: &str = "Texten";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum ZoomMode {
@@ -1193,7 +1194,7 @@ impl PdfView {
                     }
                 }
                 EngineEvent::Failed { page, error } => {
-                    if error.starts_with(TEXT_ERROR_PREFIX) {
+                    if super::engine::is_text_error(&error) {
                         // Sidan saknar användbar text; ett tomt lager hindrar nya försök.
                         self.texts.insert(page, Arc::new(PageText::default()));
                     } else {
@@ -1503,7 +1504,7 @@ impl PdfView {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                format!("Sidan kunde inte visas\n{err}"),
+                format!("{}\n{err}", t("Sidan kunde inte visas")),
                 FontId::proportional(14.0),
                 pal.error,
             );
@@ -1578,7 +1579,7 @@ impl PdfView {
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
                 let tip = match &target {
                     LinkTarget::Uri(u) => u.clone(),
-                    LinkTarget::Page(d) => format!("Gå till sidan {}", d.page + 1),
+                    LinkTarget::Page(d) => tf!("Gå till sidan {n}", n = d.page + 1),
                 };
                 resp.clone().on_hover_text(tip);
             } else if self.tool == Tool::Hand || self.space.is_some() {

@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::i18n::t;
+use crate::tf;
+
 /// Ord med lägre säkerhet än så (0–100) slängs: oftast brus från bilden.
 const MIN_CONF: f32 = 20.0;
 /// Längsta tid för en sida innan Tesseract avbryts.
@@ -160,7 +163,7 @@ pub fn find_exe() -> Option<PathBuf> {
 fn run(cmd: &mut Command, timeout: Duration) -> Result<(String, String), String> {
     crate::platform::quiet(cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("kunde inte starta Tesseract: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| tf!("kunde inte starta Tesseract: {e}", e = e))?;
     fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -178,15 +181,15 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<(String, String), String>
             Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Tesseract tog för lång tid".to_owned());
+                return Err(t("Tesseract tog för lång tid").to_owned());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("Tesseract: {e}")),
+            Err(e) => return Err(tf!("Tesseract: {e}", e = e)),
         }
     };
     let out = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
     let err = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
-    if status.success() { Ok((out, err)) } else { Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("okänt fel").trim().to_owned()) }
+    if status.success() { Ok((out, err)) } else { Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(t("okänt fel")).trim().to_owned()) }
 }
 
 /// Språkkoderna ur `--list-langs` (första raden är en rubrik; `osd` är inget språk).
@@ -218,7 +221,7 @@ impl Tesseract {
 
     /// Känner igen texten i en PNG. Blockerar: kör i bakgrundstråd.
     pub fn recognize(&self, png: &Path) -> Result<Vec<Word>, String> {
-        let lang = self.lang_arg().ok_or("Tesseract har inga språkpaket installerade")?;
+        let lang = self.lang_arg().ok_or(t("Tesseract har inga språkpaket installerade"))?;
         let mut cmd = Command::new(&self.exe);
         cmd.arg(png).arg("stdout").args(["-l", &lang, "--dpi", "300", "tsv"]);
         let (out, _) = run(&mut cmd, PAGE_TIMEOUT)?;
@@ -265,11 +268,11 @@ pub fn pick_langs(available: &[String], locale: Option<&str>) -> Option<String> 
 /// Hur Tesseract installeras på det här systemet.
 pub fn install_hint() -> &'static str {
     if cfg!(target_os = "windows") {
-        "Installera Tesseract med installationsprogrammet från UB Mannheim (github.com/UB-Mannheim/tesseract/wiki) och välj svenska språkdata."
+        t("Installera Tesseract med installationsprogrammet från UB Mannheim (github.com/UB-Mannheim/tesseract/wiki) och välj svenska språkdata.")
     } else if cfg!(target_os = "macos") {
-        "Installera Tesseract: brew install tesseract tesseract-lang"
+        t("Installera Tesseract: brew install tesseract tesseract-lang")
     } else {
-        "Installera Tesseract: sudo apt install tesseract-ocr tesseract-ocr-swe"
+        t("Installera Tesseract: sudo apt install tesseract-ocr tesseract-ocr-swe")
     }
 }
 
