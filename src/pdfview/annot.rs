@@ -706,8 +706,27 @@ fn push_annots(doc: &mut Document, page: ObjectId, new: Vec<ObjectId>) {
     }
 }
 
-/// Skriver `annots` in i PDF:en och ger de nya bytes. En krypterad PDF kommer ut avkrypterad
-/// (lösenordet behövs för att öppna den). Fel ger ett meddelande, aldrig panik.
+/// Lägger `annots` i det inlästa dokumentet (nya anteckningsobjekt, utseendeströmmar och sidans `/Annots`).
+pub fn apply_doc(doc: &mut Document, annots: &[NewAnnot]) {
+    let pages: BTreeMap<u32, ObjectId> = doc.get_pages();
+    let ids: Vec<ObjectId> = pages.values().copied().collect();
+    let (who, date) = (author(), pdf_date());
+    let mut per_page: BTreeMap<usize, Vec<ObjectId>> = BTreeMap::new();
+    for a in annots {
+        let Some(&page) = ids.get(a.page) else { continue };
+        let g = Geo::of(doc, page);
+        if let Some(id) = build(doc, page, &g, a, &who, &date) {
+            per_page.entry(a.page).or_default().push(id);
+        }
+    }
+    for (p, new) in per_page {
+        push_annots(doc, ids[p], new);
+    }
+}
+
+/// Skriver `annots` in i PDF:en och ger de nya bytes (hela filen skrivs om). En krypterad PDF kommer ut
+/// avkrypterad (lösenordet behövs för att öppna den). Fel ger ett meddelande, aldrig panik.
+/// Okrypterade filer sparas i stället inkrementellt, se `incremental::edit`.
 pub fn apply(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot]) -> Result<Vec<u8>, String> {
     let mut opts = lopdf::LoadOptions::default();
     opts.password = password.map(str::to_owned);
@@ -717,20 +736,7 @@ pub fn apply(bytes: &[u8], password: Option<&str>, annots: &[NewAnnot]) -> Resul
     }
     doc.trailer.remove(b"Encrypt");
     doc.encryption_state = None;
-    let pages: BTreeMap<u32, ObjectId> = doc.get_pages();
-    let ids: Vec<ObjectId> = pages.values().copied().collect();
-    let (who, date) = (author(), pdf_date());
-    let mut per_page: BTreeMap<usize, Vec<ObjectId>> = BTreeMap::new();
-    for a in annots {
-        let Some(&page) = ids.get(a.page) else { continue };
-        let g = Geo::of(&doc, page);
-        if let Some(id) = build(&mut doc, page, &g, a, &who, &date) {
-            per_page.entry(a.page).or_default().push(id);
-        }
-    }
-    for (p, new) in per_page {
-        push_annots(&mut doc, ids[p], new);
-    }
+    apply_doc(&mut doc, annots);
     let mut out = Vec::new();
     doc.save_to(&mut out).map_err(|e| tf!("PDF:en kunde inte skrivas: {e}", e = e))?;
     Ok(out)

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 mod en_app;
 mod en_doc;
+mod en_incr;
 mod en_misc;
 mod en_pdf;
 mod en_review;
@@ -87,8 +88,8 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     m
 });
 
-fn tables() -> [&'static [(&'static str, &'static str)]; 6] {
-    [en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN]
+fn tables() -> [&'static [(&'static str, &'static str)]; 7] {
+    [en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.

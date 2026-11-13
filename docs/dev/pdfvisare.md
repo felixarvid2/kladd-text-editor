@@ -33,6 +33,7 @@ Chrome och PdfCraft (storytold/pdfcraft, Rust + egui + hayro).
 | `organize.rs` | Sidoperationer på PDF-bytes med lopdf (ordna, ta bort, rotera, extrahera, infoga) och `History` för Ångra |
 | `pages.rs` | Kopplar `organize` till fliken: `OrgOp`, urval, omladdning av visaren, Ångra/Gör om, `PdfTab::pages_changed` |
 | `ocr.rs` | `OcrState`: letar skannade sidor, renderar i 300 dpi på egen motor, kör Tesseract (`crate::ocr`) och ger `PageText` via `PdfView::set_ocr_text` |
+| `incremental.rs` | Inkrementell uppdatering (ändrade objekt sist i filen, xref-tabell eller xref-ström, `/Prev`) och signaturräkning |
 | `annot.rs` | Nya anteckningar (markering, understruken, genomstruken, lapp, textruta, penna): minneslista i visningspunkter, verktygsrad, överlägg, `apply` skriver `/Annots` med `/AP` via lopdf |
 | `chrome.rs` | Verktygsrad, sidopanel (miniatyrer, innehåll), sökfält, egenskaper, presentationsläge, statusrad |
 
@@ -233,7 +234,7 @@ impl PdfView {
 - `PdfView.annot` (`AnnotState`) håller verktyg, färg och väntande `NewAnnot` per sida i visningspunkter. view.rs har några krokar: `annot.paint` i `paint_overlays`, `annot_pointer` (lapp/textruta/penna tar över musen), `annot_from_selection` (markering → markup vid musknapp upp) och `annot.show_editor` i `show`.
 - Fliken är ändrad (`Document::dirty`) så länge `annot.has_pending()`; Ctrl+S → `KladdApp::pdf_save` skriver `annot::apply` atomiskt och läser om visaren. Krypterade PDF:er skrivs avkrypterade.
 - Koordinater tillbaka till användarrymd: `to_user` (invers av `Geo::point`, med /Rotate och CropBox). Lapp och textruta får `/Matrix` så att de står upprätt på roterade sidor.
-- Utanför omfånget: ändra eller ta bort anteckningar som redan sparats i filen (hayro ritar dem); inkrementell uppdatering som bevarar signaturer.
+- Utanför omfånget: ändra eller ta bort anteckningar som redan sparats i filen (hayro ritar dem).
 ## Formulär (`forms.rs`)
 
 - `read_fields(bytes, password)` går igenom `/AcroForm /Fields` med ärvda `/FT /Ff /V /DA /Opt /MaxLen /Q`
@@ -244,3 +245,10 @@ impl PdfView {
 - `apply(bytes, password, &[(fält-id, Value)])` sätter `/V`, `/AS` (kryss/alternativ) och bygger nya `/AP /N` för
   text- och valfält med typsnitt och storlek ur `/DA` (Helvetica `/Helv` ur `/DR` om det finns, annars eget med WinAnsi);
   `/NeedAppearances true` sätts också. Sparning (Ctrl+S) är atomisk och visaren läses om efteråt.
+
+## Inkrementell sparning (`incremental.rs`)
+
+- `Changes` är en generell lista: nya/ändrade objekt (`objects`, id till objekt) och borttagna id (`removed`, blir lediga xref-poster). `Changes::diff(före, efter)` bygger den ur två inlästa `lopdf`-dokument, så att `annot::apply_doc` och `forms::apply_doc` (som ändrar ett `Document` i minnet) inte behöver veta något om filformatet. Raderade eller ändrade befintliga anteckningar passar in utan ny kod: ändra dokumentet och låt diffen ta resten.
+- `edit(bytes, lösenord, |doc| ..)` läser, ändrar och lägger skillnaden sist; `append` skriver själva avsnittet: objekten, ett xref-avsnitt (klassisk tabell om originalets sista xref är en tabell, annars en xref-ström med `/W [1 4 2]` som vi skriver själva, eftersom `lopdf` inte kan skriva ett avsnitt med bara ändrade poster), trailer med `/Root`, `/Info`, `/ID` (första elementet behålls, det andra byts), `/Size` och `/Prev` till föregående `startxref`, och `%%EOF`. Originalbytena är alltid ett exakt prefix.
+- Ger `Ok(None)` för krypterade filer (nya objekt skulle behöva krypteras) och `Err` om sista `startxref` inte pekar på en xref (filen reparerades vid inläsning). `PdfTab::edited_bytes` faller då tillbaka på hela omskrivningen (`forms::apply`, `annot::apply`, avkrypterat). Formulär och anteckningar blir ETT avsnitt.
+- Sidändringar (`organize.rs`) skriver fortfarande om hela filen. `signature_count` räknar `/FT /Sig`-fält med `/V`; egenskapsdialogen visar det, och `app.rs::pdf_organize` frågar (`PdfTab::confirm_org`) innan en signerad PDF ordnas. Anteckningar och formulär bryter inte signaturerna (de ändrar bara efter `/ByteRange`).

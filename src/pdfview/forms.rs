@@ -365,18 +365,28 @@ fn apply_inner(bytes: &[u8], password: Option<&str>, values: &[(ObjectId, Value)
     if doc.trailer.get(b"Encrypt").is_ok() {
         return Err(t("Krypterade PDF:er kan inte fyllas i ännu").to_owned());
     }
-    let fields = read_doc(&doc);
-    let mut helv = None;
-    for (id, val) in values {
-        let Some(f) = fields.iter().find(|f| f.id == *id) else { continue };
-        write_field(&mut doc, f, val, &mut helv)?;
-    }
-    if let Some(acro) = acroform_mut(&mut doc) {
-        acro.set("NeedAppearances", Object::Boolean(true));
-    }
+    apply_doc(&mut doc, values)?;
     let mut out = Vec::new();
     doc.save_to(&mut out).map_err(|e| tf!("PDF:en kunde inte sparas: {e}", e = e))?;
     Ok(out)
+}
+
+/// Skriver värdena till det inlästa dokumentet (fältens `/V`, `/AS`, `/AP` och `/NeedAppearances`).
+pub fn apply_doc(doc: &mut Document, values: &[(ObjectId, Value)]) -> Result<(), String> {
+    catch_unwind(AssertUnwindSafe(|| apply_doc_inner(doc, values))).unwrap_or_else(|_| Err(t("Formulärvärdena kunde inte skrivas").to_owned()))
+}
+
+fn apply_doc_inner(doc: &mut Document, values: &[(ObjectId, Value)]) -> Result<(), String> {
+    let fields = read_doc(doc);
+    let mut helv = None;
+    for (id, val) in values {
+        let Some(f) = fields.iter().find(|f| f.id == *id) else { continue };
+        write_field(doc, f, val, &mut helv)?;
+    }
+    if let Some(acro) = acroform_mut(doc) {
+        acro.set("NeedAppearances", Object::Boolean(true));
+    }
+    Ok(())
 }
 
 fn acroform_mut(doc: &mut Document) -> Option<&mut Dictionary> {

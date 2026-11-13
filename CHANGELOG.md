@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Ändrat
+
+- **PDF sparas som inkrementell uppdatering.** Anteckningar och ifyllda formulärfält läggs sist i den ursprungliga filen (nya objekt, nytt xref-avsnitt och trailer med `/Prev`) i stället för att hela filen skrivs om, så digitala signaturer fortsätter gälla och filen struktureras inte om. Krypterade PDF:er skrivs som förut om avkrypterade. Egenskapsdialogen visar *Signerad: ja (n signaturer)*, och att ordna sidor i en signerad PDF frågar först (*Att ordna sidor tar bort signaturerna*).
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

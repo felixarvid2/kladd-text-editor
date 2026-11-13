@@ -3132,6 +3132,12 @@ impl KladdApp {
         let Some(doc) = self.docs.get_mut(idx) else { return };
         let doc_id = doc.id;
         let Some(tab) = doc.pdfv.as_deref_mut() else { return };
+        // Sidändringar skriver om hela filen och tar bort signaturerna: fråga först (en gång per bekräftelse).
+        let restructures = matches!(op, PdfOrgOp::Rotate { .. } | PdfOrgOp::Delete(_) | PdfOrgOp::Move { .. } | PdfOrgOp::InsertAt(_));
+        if restructures && !std::mem::take(&mut tab.org_confirmed) && tab.signature_count() > 0 {
+            tab.confirm_org = Some(op);
+            return;
+        }
         let (kind, pages) = match &op {
             PdfOrgOp::Extract(pages) => (0, pages.clone()),
             PdfOrgOp::InsertAt(at) => (1, vec![*at]),
