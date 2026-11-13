@@ -30,6 +30,10 @@ pub struct State {
     scan: Option<((u64, usize, u64), Arc<Vec<Heading>>)>,
     /// Rubriken som markören stod i förra bildrutan (för att rulla fram den i listan).
     last_current: Option<usize>,
+    /// Trädets synliga rubriker, cachade (nyckel: flik, rubriklistans adress, filter, hopfällningsversion).
+    shown: Option<((u64, usize, String, u64), Arc<Vec<usize>>)>,
+    /// Räknas upp när en rubrik fälls ihop eller ut.
+    collapse_gen: u64,
 }
 
 const ROW_H: f32 = 26.0;
@@ -48,7 +52,12 @@ impl KladdApp {
         if doc.word_view {
             return self.word.headings(doc.id, &doc.text);
         }
-        let key = (doc.id, doc.text.len(), crate::word::layout::fast_hash(&doc.text));
+        // Stora filer: ändringsräknaren i stället för en hash över hela texten varje bildruta.
+        let rev = match self.big.rev(doc.id) {
+            Some(r) => r,
+            None => crate::word::layout::fast_hash(&doc.text),
+        };
+        let key = (doc.id, doc.text.len(), rev);
         if let Some((k, h)) = &self.nav.scan {
             if *k == key {
                 return h.clone();
@@ -62,6 +71,9 @@ impl KladdApp {
     /// Markörens byteposition i den aktiva fliken.
     fn nav_caret(&self, ctx: &egui::Context) -> usize {
         let Some(doc) = self.docs.get(self.active) else { return 0 };
+        if let Some(head) = self.big.caret(doc.id) {
+            return head;
+        }
         TextEditState::load(ctx, editor_id(doc.id))
             .and_then(|s| s.cursor.char_range())
             .map_or(0, |r| char_to_byte(&doc.text, r.primary.index.0))
@@ -70,6 +82,13 @@ impl KladdApp {
     /// Flyttar markören till `byte` och rullar dit (dokumentläget: till sidpositionen, textläget: till raden).
     pub(crate) fn goto_byte(&mut self, ctx: &egui::Context, byte: usize) {
         let Some(doc) = self.docs.get(self.active) else { return };
+        if let Some(v) = self.big.view(doc.id) {
+            v.select(byte, byte);
+            self.focus_editor = true;
+            self.find.current = None;
+            ctx.request_repaint();
+            return;
+        }
         let id = editor_id(doc.id);
         let ci = byte_to_char(&doc.text, byte);
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
@@ -99,8 +118,19 @@ impl KladdApp {
         let min_level = heads.iter().map(|h| h.level).min().unwrap_or(1);
         let width = ui.available_width();
         let filtering = !self.nav.filter.trim().is_empty();
-        let is_collapsed = |set: &HashSet<(u64, u8, String)>, h: &Heading| set.contains(&(doc_id, h.level, h.text.clone()));
-        let shown = nav::visible(&heads, &self.nav.filter, &|h| is_collapsed(&self.nav.collapsed, h));
+        let is_collapsed = |set: &HashSet<(u64, u8, String)>, h: &Heading| {
+            !set.is_empty() && set.contains(&(doc_id, h.level, h.text.clone()))
+        };
+        // Med tusentals rubriker byggs listan bara om när något ändrats (inte varje bildruta).
+        let shown_key = (doc_id, Arc::as_ptr(&heads) as usize, self.nav.filter.clone(), self.nav.collapse_gen);
+        let shown = match &self.nav.shown {
+            Some((k, s)) if *k == shown_key => s.clone(),
+            _ => {
+                let s = Arc::new(nav::visible(&heads, &self.nav.filter, &|h| is_collapsed(&self.nav.collapsed, h)));
+                self.nav.shown = Some((shown_key, s.clone()));
+                s
+            }
+        };
 
         let mut goto: Option<usize> = None;
         let mut toggle: Option<usize> = None;
@@ -132,7 +162,25 @@ impl KladdApp {
                         ui.label(egui::RichText::new(t("Inga träffar")).size(12.5).color(p.muted));
                         return;
                     }
-                    for &i in &shown {
+                    // Tusentals rubriker: bara raderna som syns får en egen plats, resten blir ett tomt block.
+                    let (first, last) = if shown.len() > 3000 {
+                        let (clip, top) = (ui.clip_rect(), ui.next_widget_position().y);
+                        let first = (((clip.top() - top) / ROW_H).floor().max(0.0) as usize).min(shown.len());
+                        let last = ((((clip.bottom() - top) / ROW_H).ceil().max(0.0) as usize) + 1).min(shown.len());
+                        if scroll_cur {
+                            if let Some(pos) = shown.iter().position(|&i| Some(i) == cur) {
+                                let at = pos2(ui.next_widget_position().x, top + pos as f32 * ROW_H);
+                                ui.scroll_to_rect(Rect::from_min_size(at, vec2(ui.available_width(), ROW_H)), None);
+                            }
+                        }
+                        (first, last)
+                    } else {
+                        (0, shown.len())
+                    };
+                    if first > 0 {
+                        ui.allocate_space(vec2(ui.available_width(), first as f32 * ROW_H));
+                    }
+                    for &i in &shown[first..last] {
                         let h = &heads[i];
                         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
                         let is_cur = cur == Some(i);
@@ -194,6 +242,9 @@ impl KladdApp {
                         }
                         resp.on_hover_text(tf!("Rubrik {level}: {text}", level = h.level, text = h.text));
                     }
+                    if last < shown.len() {
+                        ui.allocate_space(vec2(ui.available_width(), (shown.len() - last) as f32 * ROW_H));
+                    }
                     ui.add_space(16.0);
                 });
             });
@@ -204,6 +255,7 @@ impl KladdApp {
             if !self.nav.collapsed.remove(&key) {
                 self.nav.collapsed.insert(key);
             }
+            self.nav.collapse_gen += 1;
         }
         if let Some(b) = goto {
             self.goto_byte(&ctx, b);

@@ -6,7 +6,9 @@
 use super::*;
 use std::collections::HashSet;
 
+use crate::review::fmt::{CharFmt, ParaFmt};
 use crate::review::{CommentRec, comment_line};
+use crate::word::markup::Block as MdBlock;
 
 pub(super) const COMMENTS_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
 pub(super) const COMMENTS_EXT_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml";
@@ -14,6 +16,176 @@ const COMMENTS_EXT_REL: &str = "http://schemas.microsoft.com/office/2011/relatio
 const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
 const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+// ------------------------------------------------------------------ spårad formatering
+
+/// Numret på en formateringsändring: samma författare, datum och gamla format delar nummer (en Word-ändring
+/// över flera körningar eller stycken godkänns och avvisas tillsammans).
+pub(super) fn fmt_rev_id(info: &mut BodyInfo, mut rec: RevRec) -> u32 {
+    if let Some(r) = info.revs.iter().find(|r| r.old.is_some() && r.author == rec.author && r.date == rec.date && r.old == rec.old) {
+        return r.id;
+    }
+    rec.id = info.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+    let id = rec.id;
+    info.revs.push(rec);
+    id
+}
+
+/// Det gamla teckenformatet ur ett `w:rPrChange` (hela elementet).
+pub(super) fn parse_old_rpr(xml: &str, styles: &Styles, base: &DocDefaults, para: Option<&Para>, theme: &Theme, linked: bool) -> CharFmt {
+    let mut f = CharFmt::default();
+    let mut rp = RProps::default();
+    let mut rstyle: Option<String> = None;
+    let mut code = false;
+    let mut r = Reader::from_str(xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e) | Event::Empty(e)) => {
+                let name = local(e.name().as_ref()).to_vec();
+                match name.as_slice() {
+                    b"b" | b"bCs" => f.bold = on_off(&e),
+                    b"i" | b"iCs" => f.italic = on_off(&e),
+                    b"strike" | b"dstrike" => f.strike = on_off(&e),
+                    b"u" => f.underline = on_off(&e),
+                    b"rStyle" => {
+                        rstyle = attr(&e, b"val");
+                        let s = rstyle.clone().unwrap_or_default().to_lowercase();
+                        code |= s.contains("code") || s.contains("kod");
+                        f.bold |= s == "strong" || s.contains("fet");
+                        f.italic |= s == "emphasis" || s.contains("betoning");
+                    }
+                    b"rFonts" => {
+                        let face = attr(&e, b"ascii").unwrap_or_default().to_lowercase();
+                        code |= ["courier", "consolas", "mono", "menlo", "monaco"].iter().any(|m| face.contains(m));
+                        apply_rpr_elem(&mut rp, &name, &e, theme);
+                    }
+                    _ => apply_rpr_elem(&mut rp, &name, &e, theme),
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    f.span = run_span(styles, base, para, &rp, rstyle.as_deref(), linked, code);
+    f
+}
+
+/// Det gamla styckeformatet ur ett `w:pPrChange` (hela elementet): slag och justering.
+pub(super) fn parse_old_ppr(xml: &str, styles: &Styles, numbering: &Numbering) -> ParaFmt {
+    let mut style: Option<String> = None;
+    let mut outline: Option<u8> = None;
+    let mut list: Option<(String, u8)> = None;
+    let mut jc: Option<Align> = None;
+    let mut r = Reader::from_str(xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e) | Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"pStyle" => style = attr(&e, b"val"),
+                b"outlineLvl" => outline = attr(&e, b"val").and_then(|v| v.parse().ok()),
+                b"ilvl" => {
+                    let lvl = attr(&e, b"val").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0).min(8);
+                    let id = list.as_ref().map(|l| l.0.clone()).unwrap_or_default();
+                    list = Some((id, lvl));
+                }
+                b"numId" => {
+                    let id = attr(&e, b"val").unwrap_or_default();
+                    let lvl = list.as_ref().map_or(0, |l| l.1);
+                    list = (id != "0").then_some((id, lvl));
+                }
+                b"jc" => jc = attr(&e, b"val").map(|v| Align::from_jc(&v)),
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    let mut kind = style.as_deref().map_or(ParaKind::Normal, |s| kind_for_style(&styles.map, s));
+    if let Some(l) = outline.filter(|l| *l < 9) {
+        kind = ParaKind::Heading((l + 1).min(6));
+    }
+    let list = match list {
+        Some((n, l)) if n.is_empty() => style.as_deref().and_then(|s| list_for_style(&styles.map, s)).map(|(n, _)| (n, l)),
+        Some(x) => Some(x),
+        None => style.as_deref().and_then(|s| list_for_style(&styles.map, s)),
+    };
+    let block = match (kind, &list) {
+        (ParaKind::Heading(n), _) => MdBlock::Heading(n),
+        (_, Some((num, lvl))) => {
+            if numbering.ordered.get(num).and_then(|v| v.get(usize::from(*lvl))).copied().unwrap_or(false) {
+                MdBlock::Numbered
+            } else {
+                MdBlock::Bullet
+            }
+        }
+        (ParaKind::Quote, None) => MdBlock::Quote,
+        (ParaKind::Code, None) => MdBlock::Code,
+        _ => MdBlock::Normal,
+    };
+    ParaFmt { block, align: jc.or_else(|| styles.jc(style.as_deref())).unwrap_or(Align::Left) }
+}
+
+/// `w:rPr`-innehållet för ett gammalt teckenformat (samma ordning som `Writer::run`).
+pub(super) fn old_rpr_xml(f: &CharFmt) -> String {
+    let mut rpr = String::new();
+    if let Some(name) = &f.span.font_family {
+        let mut n = String::new();
+        xml_escape(name, &mut n);
+        rpr.push_str(&format!("<w:rFonts w:ascii=\"{n}\" w:hAnsi=\"{n}\" w:cs=\"{n}\" w:eastAsia=\"{n}\"/>"));
+    }
+    if f.bold {
+        rpr.push_str("<w:b/>");
+    }
+    if f.italic {
+        rpr.push_str("<w:i/>");
+    }
+    if f.strike {
+        rpr.push_str("<w:strike/>");
+    }
+    if let Some(c) = f.span.color {
+        rpr.push_str(&format!("<w:color w:val=\"{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
+    }
+    if let Some(pt) = f.span.font_size {
+        let half = (pt * 2.0).round().max(1.0) as u32;
+        rpr.push_str(&format!("<w:sz w:val=\"{half}\"/><w:szCs w:val=\"{half}\"/>"));
+    }
+    let shading = f.span.background.and_then(|bg| match style::highlight_name(bg) {
+        Some(name) => {
+            rpr.push_str(&format!("<w:highlight w:val=\"{name}\"/>"));
+            None
+        }
+        None => Some(bg),
+    });
+    if f.underline {
+        rpr.push_str("<w:u w:val=\"single\"/>");
+    }
+    if let Some(c) = shading {
+        rpr.push_str(&format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
+    }
+    rpr
+}
+
+/// `w:pPr`-innehållet för ett gammalt styckeformat. `ordered` = dokumentet har en numrerad lista att peka på
+/// (numrerade listor får numId `num_base + 1`).
+pub(super) fn old_ppr_xml(f: &ParaFmt, num_base: u32, ordered: bool) -> String {
+    let mut s = String::new();
+    match f.block {
+        MdBlock::Heading(n) => s.push_str(&format!("<w:pStyle w:val=\"Heading{n}\"/>")),
+        MdBlock::Quote => s.push_str("<w:pStyle w:val=\"Quote\"/>"),
+        MdBlock::Code => s.push_str("<w:pStyle w:val=\"Code\"/>"),
+        MdBlock::Bullet => s.push_str(&format!("<w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{num_base}\"/></w:numPr>")),
+        MdBlock::Numbered => {
+            s.push_str("<w:pStyle w:val=\"ListParagraph\"/>");
+            if ordered {
+                s.push_str(&format!("<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{}\"/></w:numPr>", num_base + 1));
+            }
+        }
+        _ => {}
+    }
+    if f.align != Align::Left {
+        s.push_str(&format!("<w:jc w:val=\"{}\"/>", f.align.as_jc()));
+    }
+    s
+}
 
 /// En kommentar i originalets comments.xml: nummer, raden den gav i Markdown och hela elementet.
 #[derive(Clone, Debug)]

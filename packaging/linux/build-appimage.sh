@@ -32,6 +32,7 @@ rm -rf "$appdir"
 mkdir -p "$appdir/usr/share/doc/kladd"
 cp assets/fonts/OFL.txt "$appdir/usr/share/doc/kladd/FONT-LICENSE"
 cp assets/fonts/Carlito-OFL.txt "$appdir/usr/share/doc/kladd/CARLITO-FONT-LICENSE"
+cp assets/fonts/STIXTwo-OFL.txt "$appdir/usr/share/doc/kladd/STIXTWO-FONT-LICENSE"
 cp LICENSE README.md "$appdir/usr/share/doc/kladd/"
 
 # linuxdeploy tar med delade bibliotek utom dem på sin standardlista över systembibliotek

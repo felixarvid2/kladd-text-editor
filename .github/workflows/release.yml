@@ -176,6 +176,7 @@ jobs:
           cp target/release/kladd.exe README.md LICENSE "dist/$name/"
           cp assets/fonts/OFL.txt "dist/$name/licenses/FONT-LICENSE.txt"
           cp assets/fonts/Carlito-OFL.txt "dist/$name/licenses/CARLITO-FONT-LICENSE.txt"
+          cp assets/fonts/STIXTwo-OFL.txt "dist/$name/licenses/STIXTWO-FONT-LICENSE.txt"
           powershell -NoProfile -Command "Compress-Archive -Path 'dist/$name' -DestinationPath 'dist/$name.zip'"
           rm -rf "dist/$name"
 
@@ -245,6 +246,7 @@ jobs:
           cp LICENSE README.md "$app/Contents/Resources/licenses/"
           cp assets/fonts/OFL.txt "$app/Contents/Resources/licenses/FONT-LICENSE.txt"
           cp assets/fonts/Carlito-OFL.txt "$app/Contents/Resources/licenses/CARLITO-FONT-LICENSE.txt"
+          cp assets/fonts/STIXTwo-OFL.txt "$app/Contents/Resources/licenses/STIXTWO-FONT-LICENSE.txt"
 
       - name: Importera certifikat
         # Läggs i en tillfällig nyckelring som tas bort sist i jobbet.

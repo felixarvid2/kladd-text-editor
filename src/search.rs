@@ -99,6 +99,8 @@ pub struct Results {
     pub matches: Vec<Match>,
     /// Ogiltigt reguljärt uttryck: felet, och då finns inga träffar.
     pub error: Option<String>,
+    /// Sökningen är inte klar eller avbröts vid taket (stora filer): träffarna är de första.
+    pub partial: bool,
 }
 
 /// Formatering som "Ersätt" kan lägga på träffen.
@@ -343,8 +345,28 @@ fn plain_match(r: Range<usize>) -> Match {
 /// Textläget: söker direkt i texten. Formatfiltret används inte.
 pub fn search_text(text: &str, spec: &Spec) -> Results {
     match engine(spec) {
-        Ok(e) => Results { matches: e.find(text).into_iter().map(plain_match).collect(), error: None },
-        Err(err) => Results { matches: Vec::new(), error: Some(err) },
+        Ok(e) => Results { matches: e.find(text).into_iter().map(plain_match).collect(), ..Default::default() },
+        Err(err) => Results { error: Some(err), ..Default::default() },
+    }
+}
+
+/// Förberedd textsökning för stora filer: söker i bitar (se `bigfiles`).
+pub struct TextSearcher(Engine);
+
+impl TextSearcher {
+    pub fn new(spec: &Spec) -> Result<Self, String> {
+        engine(spec).map(Self)
+    }
+
+    /// Träffar som börjar i `from..to`, sökta i `from..scan_to` (så att en träff får sluta efter `to`).
+    pub fn find_chunk(&self, text: &str, from: usize, to: usize, scan_to: usize) -> Vec<Match> {
+        let hay = &text[from..scan_to];
+        self.0
+            .find(hay)
+            .into_iter()
+            .filter(|r| from + r.start < to)
+            .map(|r| plain_match(from + r.start..from + r.end))
+            .collect()
     }
 }
 
@@ -380,8 +402,8 @@ fn doc_hits(text: &str, a: &Analysis, spec: &Spec) -> Result<DocHits, String> {
 /// Dokumentläget: söker i den synliga texten.
 pub fn search_doc(text: &str, a: &Analysis, spec: &Spec) -> Results {
     match doc_hits(text, a, spec) {
-        Ok(h) => Results { matches: h.matches, error: None },
-        Err(err) => Results { matches: Vec::new(), error: Some(err) },
+        Ok(h) => Results { matches: h.matches, ..Default::default() },
+        Err(err) => Results { error: Some(err), ..Default::default() },
     }
 }
 

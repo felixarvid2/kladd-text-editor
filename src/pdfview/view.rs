@@ -42,6 +42,9 @@ const MAX_ZOOM: f32 = 25.0;
 /// Tak för texturcachen (bytes).
 const CACHE_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_THUMBS: usize = 240;
+/// Tak för antalet sidors textlager i minnet (stora dokument: sökningen läser en sida i taget och
+/// släpper den). Sidor nära vyn och sidor med OCR-text rörs aldrig.
+const MAX_TEXT_PAGES: usize = 160;
 const SPINNER_AFTER: Duration = Duration::from_millis(400);
 /// Så länge efter en zoomändring väntar vi med att begära skarpa bilder för sidor som redan har en.
 const ZOOM_SETTLE: Duration = Duration::from_millis(150);
@@ -1124,7 +1127,10 @@ impl PdfView {
 
     pub fn find_status(&self) -> FindStatus {
         let Some(f) = &self.find else { return FindStatus::default() };
-        let current = f.current.and_then(|c| self.find_list().iter().position(|x| *x == c));
+        // Träffens nummer räknas fram utan att bygga hela träfflistan (den kan ha hundratusentals poster).
+        let current = f.current.and_then(|(p, i)| {
+            (p < f.matches.len() && i < f.matches[p].len()).then(|| f.matches[..p].iter().map(Vec::len).sum::<usize>() + i)
+        });
         FindStatus { searching: f.done < f.matches.len(), current, total: f.total, done_pages: f.done }
     }
 
@@ -1248,6 +1254,27 @@ impl PdfView {
     }
 
     /// Tar bort bilder långt från vyn när cachen blir för stor.
+    /// Släpper textlager långt från vyn när det blivit för många (1000+ sidor), så att minnet inte
+    /// växer med dokumentets storlek. Allt behålls vid "markera allt".
+    fn evict_texts(&mut self) {
+        if self.texts.len() <= MAX_TEXT_PAGES || self.want_all_text {
+            return;
+        }
+        let cur = self.cur_page as i64;
+        let keep = |p: &usize| {
+            self.visible.contains(p)
+                || self.ocr_pages.contains(p)
+                || (*p as i64 - cur).abs() <= 3
+                || self.find.as_ref().is_some_and(|f| f.current.is_some_and(|c| c.0 == *p) || f.searched.get(*p) == Some(&false))
+        };
+        let mut far: Vec<usize> = self.texts.keys().copied().filter(|p| !keep(p)).collect();
+        far.sort_by_key(|p| -(*p as i64 - cur).abs());
+        let drop = self.texts.len() - MAX_TEXT_PAGES * 3 / 4;
+        for p in far.into_iter().take(drop) {
+            self.texts.remove(&p);
+        }
+    }
+
     fn evict_textures(&mut self) {
         if self.tex_bytes <= CACHE_LIMIT {
             return;
@@ -1339,6 +1366,11 @@ impl PdfView {
         }
         let sizes = &self.sizes;
         self.annot.show_editor(&ctx, &|p| sizes.get(p).map_or((0.0, 0.0), |s| (s.width, s.height)));
+        let new_len = self.annot.pending().len();
+        self.annot.ex.show_popover(&ctx, new_len);
+        if self.annot.ex.take_stale() {
+            self.rerender_annots(&ctx);
+        }
         self.after_frame(&ctx);
     }
 
@@ -1522,6 +1554,7 @@ impl PdfView {
     /// Sökträffar (gult, aktuell orange) och markering (blått) ovanpå sidan.
     fn paint_overlays(&self, ui: &Ui, p: usize, xf: &PageXf) {
         self.annot.paint(ui.painter(), p, xf);
+        self.annot.ex.paint(ui.painter(), p, xf);
         let Some(t) = self.texts.get(&p) else { return };
         let painter = ui.painter();
         if let Some(f) = &self.find {
@@ -1568,6 +1601,11 @@ impl PdfView {
 
         // Anteckningsverktygen (lapp, textruta, penna) tar hand om musen själva.
         if self.annot.tool.is_some() && self.annot_pointer(ctx, resp, origin) {
+            return;
+        }
+
+        // Befintliga anteckningar: välj med klick i Anteckna-läget, verktygstips med författare och text.
+        if self.annot_existing(ctx, resp, origin) {
             return;
         }
 
@@ -1674,6 +1712,52 @@ impl PdfView {
         self.annot_from_selection(resp);
     }
 
+    /// Befintliga anteckningar under pekaren (annot_edit.rs). Sant när ett klick valde en anteckning.
+    fn annot_existing(&mut self, ctx: &Context, resp: &egui::Response, origin: Pos2) -> bool {
+        let at = |this: &Self, s: Pos2| this.hit(s, origin, false).and_then(|(p, pt)| this.annot.ex.hit(p, pt));
+        if let Some(h) = resp.hover_pos() {
+            if let Some(id) = at(self, h).filter(|_| self.link_at(h, origin).is_none()) {
+                if self.annot.ex.is_active() {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if self.annot.ex.selected != Some(id) {
+                    if let Some(tip) = self.annot.ex.tooltip(id) {
+                        resp.clone().on_hover_ui(|ui| super::annot_edit::show_tooltip(ui, &tip));
+                    }
+                }
+            }
+        }
+        if resp.clicked_by(PointerButton::Primary) {
+            match resp.interact_pointer_pos().and_then(|p| at(self, p)) {
+                Some(id) if self.annot.ex.is_active() => {
+                    self.annot.ex.select(id);
+                    return true;
+                }
+                _ => self.annot.ex.deselect(),
+            }
+        }
+        false
+    }
+
+    /// Ritar om sidorna med väntande ändringar av befintliga anteckningar (borttagna syns inte längre).
+    /// Visarens `bytes` förblir originalet; bara motorn får de ändrade.
+    fn rerender_annots(&mut self, ctx: &Context) {
+        let edits = self.annot.ex.edits().clone();
+        let pw = self.annot.ex.password().map(str::to_owned);
+        let bytes = if edits.is_empty() {
+            self.bytes.clone()
+        } else {
+            match super::annot::apply_all(&self.bytes, pw.as_deref(), &[], &edits) {
+                Ok(b) => Arc::new(b),
+                Err(_) => return,
+            }
+        };
+        let Ok(engine) = PdfEngine::open(bytes, pw.as_deref(), ctx.clone()) else { return };
+        let (meta, hist, orig) = (self.meta.clone(), std::mem::take(&mut self.history), self.bytes.clone());
+        self.reload(engine, meta, orig);
+        self.history = hist;
+    }
+
     fn annot_pointer(&mut self, ctx: &Context, resp: &egui::Response, origin: Pos2) -> bool {
         let mut a = std::mem::take(&mut self.annot);
         let hit = |s: Pos2, nearest: bool| self.hit(s, origin, nearest);
@@ -1777,13 +1861,23 @@ impl PdfView {
         // Text: synliga sidor och grannar för markering, sedan alla vid sökning/markera allt.
         let mut tw: Vec<usize> = vis.iter().chain(near.iter()).copied().filter(|p| !self.texts.contains_key(p)).collect();
         if self.find.is_some() || self.want_all_text {
-            let mut rest: Vec<usize> = (0..n).filter(|p| !self.texts.contains_key(p) && !tw.contains(p)).collect();
+            // Redan sökta sidor hämtas inte om (deras text kan ha släppts), bara vid "markera allt".
+            let searched = |p: &usize| !self.want_all_text && self.find.as_ref().is_some_and(|f| f.searched.get(*p) == Some(&true));
+            let mut rest: Vec<usize> =
+                (0..n).filter(|p| !self.texts.contains_key(p) && !tw.contains(p) && !searched(p)).collect();
             rest.sort_by_key(|p| (*p as i64 - cur).abs());
             tw.extend(rest.into_iter().take(32));
+        }
+        // Sidan med den aktuella träffen behöver sin text för att kunna rullas fram och markeras.
+        if let Some((p, _)) = self.find.as_ref().and_then(|f| f.current) {
+            if !self.texts.contains_key(&p) && !tw.contains(&p) {
+                tw.insert(0, p);
+            }
         }
         if !tw.is_empty() {
             self.engine.request_text(tw);
         }
+        self.evict_texts();
 
         let visible = self.visible.clone();
         self.waiting.retain(|p, _| visible.contains(p));
@@ -2228,5 +2322,87 @@ mod tests {
         assert_eq!(v.zoom(), MIN_ZOOM);
         v.set_zoom_mode(ZoomMode::ActualSize);
         assert_eq!(v.zoom(), 1.0);
+    }
+
+    #[test]
+    fn textlager_i_minnet_har_tak_och_behaller_det_som_behovs() {
+        let ctx = Context::default();
+        let mut v = open_view(&ctx, 3);
+        // Många sidors textlager (som vid sökning i ett dokument med tusentals sidor).
+        for p in 100..100 + MAX_TEXT_PAGES * 2 {
+            v.texts.insert(p, Arc::new(PageText::default()));
+        }
+        v.texts.insert(0, Arc::new(PageText::default()));
+        v.ocr_pages.insert(100);
+        v.evict_texts();
+        assert!(v.texts.len() <= MAX_TEXT_PAGES, "{}", v.texts.len());
+        assert!(v.texts.contains_key(&0), "sidan vid vyn behålls");
+        assert!(v.texts.contains_key(&100), "OCR-text släpps aldrig");
+        // "Markera allt" behåller allt.
+        for p in 1000..1400 {
+            v.texts.insert(p, Arc::new(PageText::default()));
+        }
+        v.want_all_text = true;
+        let n = v.texts.len();
+        v.evict_texts();
+        assert_eq!(v.texts.len(), n);
+    }
+
+    #[test]
+    fn traffnumret_raknas_utan_traffista() {
+        let ctx = Context::default();
+        let mut v = open_view(&ctx, 3);
+        v.find_set("Stycke nummer", true, false);
+        run_until(&ctx, &mut v, |v| !v.find_status().searching);
+        v.find_next(false);
+        v.find_next(false);
+        let list = v.find_list();
+        let cur = v.find.as_ref().unwrap().current.unwrap();
+        assert_eq!(v.find_status().current, list.iter().position(|x| *x == cur));
+        assert_eq!(v.find_status().current, Some(2));
+    }
+
+    /// Mätning: PDF med många sidor (`KLADD_BENCH_PDF_PAGES`, standard 1200).
+    #[test]
+    #[ignore]
+    fn bench_pdf_many_pages() {
+        let pages: usize = std::env::var("KLADD_BENCH_PDF_PAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(1200);
+        let rss = || {
+            let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let f = |k: &str| s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0;
+            (f("VmRSS:"), f("VmHWM:"))
+        };
+        let t = Instant::now();
+        let bytes = make_pdf(pages);
+        println!("PDF: skapa {} sidor, {} MB: {:.0} ms", pages, bytes.len() / 1_000_000, t.elapsed().as_secs_f64() * 1000.0);
+        let r0 = rss().0;
+        let ctx = Context::default();
+        let t = Instant::now();
+        let engine = PdfEngine::open(bytes.clone(), None, ctx.clone()).expect("öppna");
+        let meta = super::super::meta::read_meta(&bytes, None);
+        let mut v = PdfView::new(engine, meta, bytes, None);
+        println!("PDF: öppna {:.0} ms ({} sidor)", t.elapsed().as_secs_f64() * 1000.0, v.page_count());
+        run_until(&ctx, &mut v, |v| !v.tex.is_empty());
+        let mut worst = 0.0f64;
+        for _ in 0..30 {
+            let t = Instant::now();
+            frame(&ctx, &mut v);
+            worst = worst.max(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("PDF: bildruta (rullat till början) värsta {worst:.1} ms");
+        let t = Instant::now();
+        v.find_set("Stycke nummer 40000", true, false);
+        let mut peak_texts = 0;
+        let end = Instant::now() + Duration::from_secs(300);
+        while v.find_status().searching && Instant::now() < end {
+            frame(&ctx, &mut v);
+            peak_texts = peak_texts.max(v.texts.len());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!("PDF: sök i alla sidor {:.0} ms, träffar {}, mest textlager i minnet {}", t.elapsed().as_secs_f64() * 1000.0, v.find_status().total, peak_texts);
+        let (r1, hwm) = rss();
+        println!("PDF: minne +{:.0} MB (topp {hwm:.0})", r1 - r0);
+        v.go_to_page(pages - 1);
+        run_until(&ctx, &mut v, |v| v.current_page() == pages - 1);
     }
 }

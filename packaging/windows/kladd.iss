@@ -77,6 +77,7 @@ Source: "{#Root}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\assets\fonts\OFL.txt"; DestDir: "{app}\licenses"; DestName: "FONT-LICENSE.txt"; Flags: ignoreversion
 Source: "{#Root}\assets\fonts\Carlito-OFL.txt"; DestDir: "{app}\licenses"; DestName: "CARLITO-FONT-LICENSE.txt"; Flags: ignoreversion
+Source: "{#Root}\assets\fonts\STIXTwo-OFL.txt"; DestDir: "{app}\licenses"; DestName: "STIXTWO-FONT-LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

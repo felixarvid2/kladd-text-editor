@@ -1,6 +1,6 @@
 [package]
 name = "kladd"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Kladd – en lugn och snygg texteditor för txt, Markdown och kod"
 authors = ["Felix"]
@@ -28,6 +28,7 @@ lopdf = { version = "0.47", default-features = false }
 hayro = "0.9"
 unicode-normalization = "0.1"
 rustybuzz = "0.20"
+ttf-parser = "0.25"
 egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
 rfd = "0.18"
 arboard = { version = "3.6", default-features = false }
@@ -61,6 +62,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[dev-dependencies]
+egui_kittest = { version = "0.37", default-features = false, features = ["eframe"] }
+
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
@@ -93,5 +97,6 @@ assets = [
     ["packaging/icons/256/kladd.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["assets/fonts/OFL.txt", "usr/share/doc/kladd/FONT-LICENSE", "644"],
     ["assets/fonts/Carlito-OFL.txt", "usr/share/doc/kladd/CARLITO-FONT-LICENSE", "644"],
+    ["assets/fonts/STIXTwo-OFL.txt", "usr/share/doc/kladd/STIXTWO-FONT-LICENSE", "644"],
     ["README.md", "usr/share/doc/kladd/README.md", "644"],
 ]

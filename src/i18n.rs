@@ -15,11 +15,23 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+mod en_annot2;
 mod en_app;
+mod en_autocorrect;
+mod en_csv;
 mod en_doc;
+mod en_incr;
+mod en_menus;
+mod en_git;
+mod en_lsp;
+mod en_math;
 mod en_misc;
+mod en_odtrev;
 mod en_pdf;
 mod en_review;
+mod en_templates;
+mod en_track2;
+mod en_vim;
 mod en_word;
 
 /// Språket gränssnittet visas på.
@@ -66,20 +78,36 @@ pub fn lang_from_locale(locale: &str) -> Lang {
     if l == "sv" || l.starts_with("sv-") || l.starts_with("sv_") { Lang::Sv } else { Lang::En }
 }
 
+#[cfg(not(test))]
 static CURRENT: AtomicU8 = AtomicU8::new(0);
+
+// I tester har varje testtråd sitt eget språk, så att ett test som byter till engelska inte
+// påverkar de andra som kör samtidigt.
+#[cfg(test)]
+thread_local! {
+    static CURRENT: AtomicU8 = const { AtomicU8::new(0) };
+}
 
 /// Sätter aktuellt språk. Gäller direkt för alla efterföljande `t()`-anrop.
 pub fn set_lang(l: Lang) {
-    CURRENT.store(if l == Lang::En { 1 } else { 0 }, Ordering::Relaxed);
+    let v = if l == Lang::En { 1 } else { 0 };
+    #[cfg(not(test))]
+    CURRENT.store(v, Ordering::Relaxed);
+    #[cfg(test)]
+    CURRENT.with(|c| c.store(v, Ordering::Relaxed));
 }
 
 pub fn lang() -> Lang {
-    if CURRENT.load(Ordering::Relaxed) == 1 { Lang::En } else { Lang::Sv }
+    #[cfg(not(test))]
+    let v = CURRENT.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let v = CURRENT.with(|c| c.load(Ordering::Relaxed));
+    if v == 1 { Lang::En } else { Lang::Sv }
 }
 
 static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
-    for tab in tables() {
+    for &tab in tables() {
         for &(sv, en) in tab {
             m.insert(sv, en);
         }
@@ -87,8 +115,8 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     m
 });
 
-fn tables() -> [&'static [(&'static str, &'static str)]; 6] {
-    [en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN]
+fn tables() -> &'static [&'static [(&'static str, &'static str)]] {
+    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN, en_menus::EN, en_git::EN, en_templates::EN, en_track2::EN, en_csv::EN, en_lsp::EN, en_vim::EN, en_math::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.
@@ -97,6 +125,20 @@ pub fn t(sv: &'static str) -> &'static str {
         Lang::Sv => sv,
         Lang::En => EN.get(sv).copied().unwrap_or(sv),
     }
+}
+
+/// Texten på ett bestämt språk, oavsett aktuellt språk (kommandopaletten söker i båda).
+pub fn translate(sv: &'static str, lang: Lang) -> &'static str {
+    match lang {
+        Lang::Sv => sv,
+        Lang::En => EN.get(sv).copied().unwrap_or(sv),
+    }
+}
+
+/// Finns en engelsk översättning av den svenska texten?
+#[allow(dead_code)]
+pub fn has_en(sv: &str) -> bool {
+    EN.contains_key(sv)
 }
 
 /// Översätter mallen och byter ut `{namn}` mot värdena. Se `tf!`.
@@ -194,7 +236,7 @@ mod tests {
     #[test]
     fn tables_are_consistent() {
         let mut seen: HashMap<&str, &str> = HashMap::new();
-        for tab in tables() {
+        for &tab in tables() {
             for &(sv, en) in tab {
                 if let Some(prev) = seen.insert(sv, en) {
                     assert_eq!(prev, en, "dubblett med olika översättning: {sv:?}");

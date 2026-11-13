@@ -65,6 +65,8 @@ pub struct Document {
     saved_hash: u64,
     saved_meta: (TextEncoding, LineEnding),
     untitled_index: usize,
+    /// Räknas upp vid varje ändring av texten (för cachar som inte vill hasha hela texten).
+    pub rev: u64,
 }
 
 /// Filtyper som visas i öppna/spara-dialogerna.
@@ -75,10 +77,44 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "csv", "tsv", "log", "tex", "rst", "org", "srt", "desktop", "service",
 ];
 
-fn hash_text(text: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+/// Fingeravtryck av en text (ändringsdetektor). Små texter hashas som förut; stora (över en
+/// megabyte) med en snabb hash som läser åtta byte åt gången, så att 100 MB tar ~15 ms.
+pub(crate) fn hash_text(text: &str) -> u64 {
+    if text.len() <= 1_000_000 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        return h.finish();
+    }
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ text.len() as u64;
+    let mut chunks = text.as_bytes().chunks_exact(8);
+    for c in &mut chunks {
+        let v = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        h = (h.rotate_left(5) ^ v).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+    for &b in chunks.remainder() {
+        h = (h.rotate_left(5) ^ b as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+    h
+}
+
+/// Läser en fil i bitar och rapporterar hur många byte som lästs (förloppsvisning vid stora filer).
+pub fn read_file_progress(path: &Path, progress: Option<&std::sync::atomic::AtomicU64>) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+    let mut buf = Vec::with_capacity(size + 1);
+    let mut chunk = vec![0u8; 8 << 20];
+    loop {
+        let n = f.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(p) = progress {
+            p.store(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    Ok(buf)
 }
 
 fn decode(bytes: &[u8]) -> Result<(String, TextEncoding), String> {
@@ -113,9 +149,44 @@ fn decode(bytes: &[u8]) -> Result<(String, TextEncoding), String> {
     }
 }
 
-fn encode(text: &str, enc: TextEncoding) -> Result<Vec<u8>, String> {
-    Ok(match enc {
-        TextEncoding::Utf8 => text.as_bytes().to_vec(),
+/// Som `decode`, men tar över byten: vanlig UTF-8 blir en `String` utan kopia.
+fn decode_owned(bytes: Vec<u8>) -> Result<(String, TextEncoding), String> {
+    let head = &bytes[..bytes.len().min(8192)];
+    let plain = !bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+        && !bytes.starts_with(&[0xFF, 0xFE])
+        && !bytes.starts_with(&[0xFE, 0xFF]);
+    if plain && !head.contains(&0) {
+        return match String::from_utf8(bytes) {
+            Ok(s) => Ok((s, TextEncoding::Utf8)),
+            Err(e) => {
+                let (text, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(e.as_bytes());
+                Ok((text.into_owned(), TextEncoding::Windows1252))
+            }
+        };
+    }
+    decode(&bytes)
+}
+
+/// Gör om CRLF till LF på plats (utan en andra kopia av texten).
+fn crlf_to_lf(text: String) -> String {
+    let mut b = text.into_bytes();
+    let mut w = 0;
+    for r in 0..b.len() {
+        if b[r] == b'\r' && b.get(r + 1) == Some(&b'\n') {
+            continue;
+        }
+        b[w] = b[r];
+        w += 1;
+    }
+    b.truncate(w);
+    // Bara ASCII-byte togs bort ur giltig UTF-8, så resultatet är giltigt.
+    String::from_utf8(b).unwrap_or_default()
+}
+
+fn encode(text: &str, enc: TextEncoding) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    use std::borrow::Cow;
+    Ok(Cow::Owned(match enc {
+        TextEncoding::Utf8 => return Ok(Cow::Borrowed(text.as_bytes())),
         TextEncoding::Utf8Bom => {
             let mut v = vec![0xEF, 0xBB, 0xBF];
             v.extend_from_slice(text.as_bytes());
@@ -145,7 +216,7 @@ fn encode(text: &str, enc: TextEncoding) -> Result<Vec<u8>, String> {
             }
             bytes.into_owned()
         }
-    })
+    }))
 }
 
 impl Document {
@@ -168,6 +239,7 @@ impl Document {
             saved_hash: hash_text(""),
             saved_meta: (TextEncoding::Utf8, LineEnding::Lf),
             untitled_index,
+            rev: 0,
         }
     }
 
@@ -181,7 +253,21 @@ impl Document {
     }
 
     pub fn load_with_password(id: u64, path: &Path, password: Option<&str>) -> Result<Self, LoadError> {
-        let bytes = std::fs::read(path).map_err(|e| LoadError::Message(describe_io_error(&e, path)))?;
+        Self::load_with_progress(id, path, password, None)
+    }
+
+    /// Som `load_with_password`; `progress` får antalet inlästa byte (för en bakgrundstråd).
+    pub fn load_with_progress(
+        id: u64,
+        path: &Path,
+        password: Option<&str>,
+        progress: Option<&std::sync::atomic::AtomicU64>,
+    ) -> Result<Self, LoadError> {
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > crate::bigtext::MAX_BYTES) {
+            return Err(LoadError::Message(crate::i18n::t("Filen är för stor för Kladd (över 2 GB).").to_owned()));
+        }
+        let bytes =
+            read_file_progress(path, progress).map_err(|e| LoadError::Message(describe_io_error(&e, path)))?;
         let ext = ext_of(path);
         if ext == "pdf" || bytes.starts_with(b"%PDF-") {
             return Self::from_pdf_text(id, path, &bytes, password);
@@ -245,6 +331,7 @@ impl Document {
             images: loaded.images,
             docx_source: None,
             untitled_index: 0,
+            rev: 0,
         })
     }
 
@@ -282,6 +369,7 @@ impl Document {
                 images: loaded.images,
                 docx_source: loaded.source.map(std::sync::Arc::new),
                 untitled_index: 0,
+                rev: 0,
             });
         }
         // OpenDocument-text visas i samma dokumentläge som Word.
@@ -308,17 +396,18 @@ impl Document {
                 images: loaded.images,
                 docx_source: None,
                 untitled_index: 0,
+                rev: 0,
             });
         }
         if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
             return Err(crate::i18n::t("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.").into());
         }
-        let (mut text, encoding) = decode(&bytes)?;
-        let crlf = text.matches("\r\n").count();
-        let lf = text.matches('\n').count();
+        let (mut text, encoding) = decode_owned(bytes)?;
+        let crlf = text.as_bytes().windows(2).filter(|w| w == b"\r\n").count();
+        let lf = text.bytes().filter(|&b| b == b'\n').count();
         // Bara rena CRLF-filer konverteras; blandade radslut lämnas orörda.
         let line_ending = if crlf > 0 && crlf == lf {
-            text = text.replace("\r\n", "\n");
+            text = crlf_to_lf(text);
             LineEnding::CrLf
         } else {
             LineEnding::Lf
@@ -341,6 +430,7 @@ impl Document {
             images: Vec::new(),
             docx_source: None,
             untitled_index: 0,
+            rev: 0,
         })
     }
 
@@ -366,25 +456,25 @@ impl Document {
         let to_pdf = ext_of(path) == "pdf";
         let mut warnings = Vec::new();
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let bytes = if to_pdf {
+        let bytes: std::borrow::Cow<[u8]> = if to_pdf {
             let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let images = &self.images;
             let written = crate::pdf_write::write(&self.text, &title, &|src| resolve_image(src, &base, images))?;
             warnings.extend(written.missing_images);
-            written.bytes
+            written.bytes.into()
         } else if to_odt {
             let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let images = &self.images;
             let written = crate::odt::write(&self.text, &title, &|src| resolve_image(src, &base, images))?;
             warnings.extend(written.missing_images);
-            written.bytes
+            written.bytes.into()
         } else if to_word {
             let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let images = &self.images;
             let source = self.docx_source.as_deref();
             let written = crate::docx::write(&self.text, &title, &|src| resolve_image(src, &base, images), source)?;
             warnings.extend(written.missing_images);
-            written.bytes
+            written.bytes.into()
         } else {
             if !self.images.is_empty() && self.text.contains(crate::docx::IMAGE_SCHEME) {
                 // Från Word till text: lägg bilderna i en mapp bredvid filen.
@@ -395,11 +485,11 @@ impl Document {
                 self.encoding = TextEncoding::Utf8;
                 self.line_ending = LineEnding::Lf;
             }
-            let text = match self.line_ending {
-                LineEnding::Lf => std::borrow::Cow::Borrowed(self.text.as_str()),
-                LineEnding::CrLf => std::borrow::Cow::Owned(self.text.replace('\n', "\r\n")),
-            };
-            encode(&text, self.encoding)?
+            match self.line_ending {
+                // Utan kopia av texten (vid 100 MB spelar det roll).
+                LineEnding::Lf => encode(&self.text, self.encoding)?,
+                LineEnding::CrLf => encode(&self.text.replace('\n', "\r\n"), self.encoding)?.into_owned().into(),
+            }
         };
         write_atomic(path, &bytes).map_err(|e| describe_io_error(&e, path))?;
         self.docx = to_word || to_odt;
@@ -458,6 +548,12 @@ impl Document {
 
     /// Ska anropas när texten har ändrats i editorn.
     pub fn on_edited(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
+        // Stora texter hashas inte vid varje tangenttryck: de räknas som ändrade efter första ändringen.
+        if self.text.len() >= crate::bigtext::BIG_BYTES {
+            self.dirty = true;
+            return;
+        }
         self.dirty = hash_text(&self.text) != self.saved_hash
             || (self.encoding, self.line_ending) != self.saved_meta;
     }
@@ -808,5 +904,55 @@ mod tests {
         let d = Document::load(2, &p).unwrap();
         assert_eq!(d.line_ending, LineEnding::Lf);
         assert_eq!(d.text, "a\r\nb\n");
+    }
+
+    #[test]
+    fn crlf_conversion_in_place_and_owned_decode() {
+        assert_eq!(crlf_to_lf("a\r\nb\r\n\u{e5}".to_owned()), "a\nb\n\u{e5}");
+        assert_eq!(crlf_to_lf("a\rb\r\n".to_owned()), "a\rb\n");
+        let (t, e) = decode_owned("h\u{e4}r".as_bytes().to_vec()).unwrap();
+        assert_eq!((t.as_str(), e), ("h\u{e4}r", TextEncoding::Utf8));
+        let (t, e) = decode_owned(vec![b'a', 0xE5]).unwrap();
+        assert_eq!((t.as_str(), e), ("a\u{e5}", TextEncoding::Windows1252));
+        assert!(decode_owned(vec![b'a', 0, b'b']).is_err());
+        let (_, e) = decode_owned([&[0xEF, 0xBB, 0xBF][..], b"x"].concat()).unwrap();
+        assert_eq!(e, TextEncoding::Utf8Bom);
+    }
+
+    #[test]
+    fn large_texts_hash_fast_but_distinguish_changes() {
+        let a = "x".repeat(2_000_000);
+        let mut b = a.clone();
+        b.replace_range(1_500_000..1_500_001, "y");
+        assert_ne!(hash_text(&a), hash_text(&b));
+        assert_eq!(hash_text(&a), hash_text(&a.clone()));
+        // Små texter hashas som förut (samma som DefaultHasher).
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        "kort".hash(&mut h);
+        assert_eq!(hash_text("kort"), h.finish());
+    }
+
+    #[test]
+    fn big_documents_are_dirty_after_edit_without_hashing_and_load_with_progress() {
+        let dir = std::env::temp_dir().join(format!("kladd-doc-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stor.log");
+        let text = "rad av en logg\r\n".repeat(crate::bigtext::BIG_BYTES / 10);
+        std::fs::write(&path, &text).unwrap();
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let mut d = Document::load_with_progress(1, &path, None, Some(&progress)).ok().unwrap();
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Relaxed), text.len() as u64);
+        assert_eq!(d.line_ending, LineEnding::CrLf);
+        assert!(!d.text.contains('\r') && !d.dirty);
+        d.text.push('x');
+        d.on_edited();
+        assert!(d.dirty);
+        // Sparar utan kopia och ger tillbaka CRLF.
+        let out = dir.join("ut.log");
+        d.save_to(&out).unwrap();
+        assert!(!d.dirty);
+        let back = std::fs::read_to_string(&out).unwrap();
+        assert!(back.ends_with("\r\nx") && back.len() == text.len() + 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

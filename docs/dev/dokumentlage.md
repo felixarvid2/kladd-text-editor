@@ -269,7 +269,7 @@ lägger dit.
 `.docx`: `odt::read(bytes) -> docx::Loaded` och `odt::write(markdown, titel, resolve) -> docx::Written`.
 Formatmallar (`office:styles` och `office:automatic-styles` i `styles.xml`/`content.xml`) löses längs
 `style:parent-style-name`; bara det som skiljer sig från grundformatet (standardstycket + Standard)
-blir `<span style>`. Fotnoter, kommentarer, former/diagram och länkade bilder tas bort och rapporteras
+blir `<span style>`. Spårade ändringar och kommentarer läses och skrivs (se *Granska* nedan). Fotnoter, former/diagram och länkade bilder tas bort och rapporteras
 som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/sidfot (`text:page-number`
 → `{sida}`, `text:page-count` → `{sidor}`, `text:date`, `text:title`, `text:file-name`, flikar och `style:header-first`) hamnar i grundformatskommentaren. Vid skrivning ligger
 `mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
@@ -445,6 +445,16 @@ Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad
   körning, och godkänn/avvisa tar alla med samma nummer). Taggarna ligger utanför `**`/`<u>`/`<span>` och
   inom ett stycke; en ändring går aldrig över en radbrytning. Författare och datum står inte i taggen utan i
   en postrad `<!--k:r id="3" author="Ada" date="2026-05-01T10:00:00Z"-->`.
+- Stycketecken och radbrytningar: `<!--k:pm ins 5-->` eller `<!--k:pm del 5-->` sist på raden, direkt före
+  radbrytningen (en eller flera `\n`), betyder att brytningen är infogad respektive struken (Words `w:ins`/`w:del`
+  i styckets `w:rPr`). Siffran är ändringens nummer (postrad som för `<ins>`). Kladd skriver `n=1` efter numret
+  (`<!--k:pm ins 5 n=1-->`) för antalet brytningar den själv infogade, så att *Avvisa* tar bort just dem och
+  lämnar en redan befintlig styckegräns; en markör från Word saknar `n` och gäller hela brytningen.
+- Formateringsändringar: `<fmt data-k="6">text</fmt>` runt text vars teckenformat ändrats (Words `w:rPrChange`)
+  och `<!--k:pm fmt 7-->` sist på ett stycke vars typ eller justering ändrats (`w:pPrChange`). Det gamla
+  formatet står i postradens `old` (`<!--k:r id="6" … old="b;color: #C00000"-->`): flaggor `b i u s` (fet, kursiv,
+  understruken, struken), semikolon och CSS för typsnitt, storlek, färg och markering; för styckeformat
+  `h2|center`, `bullet|left`, `numbered|left`, `quote|left`, `normal|right` (slag och justering).
 - Kommentarens område `<!--k:c:ID-->…<!--k:/c:ID-->` i texten (dold markup som `<!--k:N-->`). Börjar
   området först på raden skyddas det av `&#8203;` framför (annars blir raden ett HTML-block, som för
   objektmarkörerna), och `&#8203;` döljs. Kommentaren själv är en postrad
@@ -475,9 +485,28 @@ bildrutan jämförs texten före och efter (gemensamt prefix/suffix) och rediger
 - infogning inne i en tagg, i en radering eller i någon annans infogning flyttas till efter den;
 - ersättning av en markering ger `<del>` följt av `<ins>`; kodblock spåras inte;
 - ögonblicksbilden tas bara när tangenter som kan redigera trycktes (inte vid Ctrl+Z/Y), så texten klonas inte
-  varje bildruta. Radbrytningar (Enter) och formateringsknappar spåras inte (formatering skrivs direkt).
+  varje bildruta. 
+- **Enter, Backsteg och Delete över en radbrytning** (`review::para::track_newlines`): en infogad brytning får
+  `<!--k:pm ins N n=K-->` före sig (intill en egen markör räknas `n` upp, och mitt i en egen infogning delas
+  `<ins>` så att den aldrig går över en brytning); Backsteg direkt efter egen Enter tar bort brytningen på
+  riktigt; annars får brytningen `<!--k:pm del N-->` och markören hamnar före (Backsteg) eller efter (Delete) den.
+  Inklistrad text med flera rader och borttagning av en markering över en brytning ger markörer på samma sätt.
+  Brytningar i tabeller och kodblock spåras inte.
+- **Formatering** (`review::fmt::track_format`): formateringsknapparna, Ctrl+B/I/U, justering, listor, rubriker,
+  färg, markering, typsnitt och storlek går via `word_format`, som med spårning på jämför texten före och efter
+  operationen (bara markup ändras): tecken med nytt format får `<fmt>` (ett nummer per gammalt format) och
+  stycken med ny typ/justering `<!--k:pm fmt N-->`. Redan spårat format behåller sitt första gamla format, och
+  text i egen infogning, struken text, kod, tabeller och rubriker i kodstaket spåras inte.
+- **Godkänn och avvisa**: `fmt::restore` sätter tillbaka det gamla formatet med samma operationer som knapparna
+  (`toggle_inline`, `set_span_prop`, `set_block`, `set_align`); `para::join_marks` slår ihop stycken när en infogad
+  brytning avvisas eller en struken godkänns (nästa rads radprefix tas bort, och en tabell, ett kodstaket eller en
+  avsnittsrad efter stycket slås inte ihop: då försvinner bara markören). Byten, `change_count` och
+  föregående/nästa ändring räknar markörerna som egna ändringar.
 
 **Dokumentläget**: infogat understruket och raderat genomstruket i författarens färg (`layout::piece_format`),
+stycketecken som ¶ (struket när det är raderat) och ett streck i vänstermarginalen vid stycketecken och
+formateringsändringar, prickad understrykning under omformaterad text och verktygstipset *Formaterat: Fet
+(Ada)* (`reviewui::paint_marks`, ritat ovanpå texten; visas inte på raden där markupen visas),
 kommentarsområdet med gul bakgrund (`review::comments_visible`, inställningen "Visa kommentarer"), och ett fält
 till höger om sidan (`reviewui::paint_pane`, 250 px + 16 px luft; sidan flyttas åt vänster och zoomen anpassas så
 att båda ryms). Korten ligger vid sin text och skjuts ned så att de inte överlappar; ett klick på ett kort
@@ -498,12 +527,35 @@ får `w:ins`/`w:del` (`w:id` från 5 000 000, författare och datum ur posterna)
 `w:commentRangeStart`/`End` + referens. `comments.xml` följer med orörd om alla poster är oförändrade;
 annars byggs den av posterna (oförändrade kommentarer ordagrant, nya med `w14:paraId`) och
 `commentsExtended.xml` skrivs om (eller skapas, med relation och innehållstyp). Kommentarer utan område i
-brödtexten tas bort. Spårade formateringsändringar (`rPrChange`, `pPrChange`) tas fortfarande bort när ett
-stycke skrivs om och rapporteras som "spårade formateringsändringar".
+brödtexten tas bort. Stycketecken (`w:pPr/w:rPr/w:ins|w:del`) blir `<!--k:pm ins|del N-->` sist i stycket, och en infogad eller
+struken `w:br` får samma markör före sin `\n`; `w:rPrChange` ger `<fmt>` runt körningen och `w:pPrChange` ger
+`<!--k:pm fmt N-->`, med det gamla formatet (typsnitt, storlek, färg, markering, fet, kursiv, understruken,
+struken respektive formatmall, lista och justering) som `old` i posten; samma författare, datum och gamla format
+delar nummer. Vid skrivning läggs de tillbaka som `w:rPr/w:ins|del` i `w:pPr`, `w:ins`/`w:del` runt en
+`w:br`, `w:rPrChange` sist i körningens `w:rPr` och `w:pPrChange` sist i `w:pPr` (det gamla stycket
+får punktlistans numId, eller första numrerade listans om den finns). Orörda stycken behåller sin XML.
+Bara formatändringar på själva stycketecknet (`w:rPrChange` i `w:pPr/w:rPr`) tas fortfarande bort när ett stycke
+skrivs om och rapporteras som "spårade formateringsändringar".
 
-**ODT**: `text:tracked-changes` godkänns vid läsning (infogad text stannar, raderad text kommer inte med),
-`office:annotation` tas bort som förut, och `odt::write` godkänner ändringarna och utelämnar kommentarerna.
-Spårade ändringar och kommentarer i .odt är alltså inte stödda fullt ut.
+**ODT** (`odt.rs`, tester i `odt_review_tests.rs`, LibreOffice-fixtur i `tests/data/odt_review_lo.odt`): samma
+modell som Word. `odt::read` förbereder regionerna ur `text:tracked-changes` (`read_regions`: slag, `dc:creator`,
+`dc:date` och det raderade innehållet). `text:change-start`/`text:change-end` runt en `text:insertion` blir
+`<ins>` (kan gå över flera stycken, ett nummer och en post), och en `text:deletion` blir `<del>` med det raderade
+stycket inlagt där `text:change` (eller `text:change-start`) står; flera raderade stycken skarvas med mellanslag.
+`office:annotation` ger en post (`dc:creator`, `dc:date`, `text:p` som rader, `loext:resolved` = löst) och
+startmarkören; slutet kommer från `office:annotation-end` med samma `office:name` (saknas den blir området
+tomt). Ett svar (`loext:parent-name`) skrivs av LibreOffice efter förälderns slut, så svarets markörer sätts
+intill förälderns efter läsningen (`attach_replies`). Markörer och raderad text tas bort ur kodblock och
+`text:format-change` rapporteras som "spårade formatändringar". Orörda dokument skrivs om från Markdown som förut
+(ingen originalkopia, som i `.docx`), så allt som läses skrivs också.
+`odt::write` lyfter posterna ur texten (`review::split_records`) och skriver `text:tracked-changes` först i
+`office:text` med en region per infogning (`text:change-start`/`-end`, en ny region om infogningen bryts av en
+länk eller ett stycke) och per radering (`text:change` på platsen, texten i regionens `text:p`, intilliggande
+körningar i samma ändring delar region), samt `office:annotation` med `office:name="kladd-N"`,
+`loext:parent-name` och `loext:resolved` och `office:annotation-end` (inte för svar). Kommentarer utan område i
+texten och poster utan markörer utelämnas. Kontrollerat mot LibreOffice: det skrivna paketet konverteras till
+`.docx` och `.odt` utan fel och ändringarna och kommentarerna läses tillbaka (LibreOffices `.docx`-export
+skriver inga områden för svar och punktkommentarer, så de syns bara i `.odt`).
 
 ## Avsnitt: liggande sidor och spalter
 
@@ -608,3 +660,27 @@ rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_p
 ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
 ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Skillnad mot dokumentläget:
 spalterna före ett löpande byte jämnas **inte** ut i PDF:en.
+
+## Ekvationer (`src/math/`)
+
+`$…$`/`$$…$$` tolkas av pulldown-cmark (`ENABLE_MATH`, så kod och `\$` är rätt) och blir i
+`markup::analyze` en `Piece` med `math: Some(MathRef { src, display })` för innehållet; `$`-tecknen är `markup`.
+Bara formler på en rad som `math::formula` kan tolka markeras, annars är texten vanlig.
+
+Moduler: `parse` (LaTeX → `ast::Node`), `layout` (TeX:s regler med MATH-tabellen ur STIX Two Math, läst av `font`
+eftersom ttf-parser saknar MATH; ger glyfer och linjer i em), `raster` (alfamask, nollskild lindning), `gui`
+(egui-texturer, cachade per formel och storlek), `latex`/`mathml`/`omml` (träd ↔ format), `preview` (PNG för
+förhandsvisningen), `insert` (Infoga-menyn).
+
+Dokumentläget: i `layout::build_sections` får en dold formel första tecknets sektion `leading_space = bredd` och
+`line_height = höjd` (som bilder reserverar höjd); `Builder::lead` bär bredden till `LayoutSection`. En rad som bara är en
+`$$`-formel centreras som stycke. `view.rs` ritar texturen där platsen börjar: vänsterkant = markörens x minus bredden,
+baslinje = grannglyfernas på raden, annars radens underkant minus formelns djup (`layout::MathGeom`). Går markören
+till raden visas källan i vanlig stil. Känd begränsning: en löpande formel som är djupare än radens underdel
+(t.ex. ett bråk) sticker ned i raden under, eftersom egui bottenjusterar radens sektioner.
+
+Export: docx skriver `m:oMath`/`m:oMathPara` med `xmlns:m` på elementet (`omml::to_omml`) och läser `m:oMath` till
+`$…$` när `omml::to_latex` lyckas (annars ogenomskinlig markör som förut). odt: `Object N/content.xml` (MathML med
+`math:`-prefix) och `ObjectReplacements/Object N` (PNG). pdf: `Style::math`, en `Piece` per formel, `Op::Math`
+ritas som fyllda glyfkonturer via krilla. html/epub: `export::map_events` byter matematikhändelser mot
+`<math>`; EPUB-posten får `properties="mathml"`.

@@ -109,7 +109,7 @@ pub struct State {
     images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
     /// Vald bild, pågående storleksändring.
-    img: images::State,
+    pub(crate) img: images::State,
     target: Option<SpellTarget>,
     /// Grammatikträffen som högerklickats.
     gtarget: Option<crate::grammar::Match>,
@@ -146,6 +146,8 @@ enum BarAct {
     Block(Block),
     Image,
     Table,
+    /// Ekvation: tom (`None`) eller en mall ur paletten.
+    Equation(Option<usize>),
     Footnote,
     Toc,
     SectionBreak,
@@ -295,7 +297,7 @@ impl KladdApp {
         self.find.current = None;
     }
 
-    fn word_undo(&mut self, ctx: &egui::Context, redo: bool) {
+    pub(crate) fn word_undo(&mut self, ctx: &egui::Context, redo: bool) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let id = editor_id(doc.id);
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
@@ -319,13 +321,13 @@ impl KladdApp {
         self.focus_editor = true;
     }
 
-    fn word_toggle(&mut self, ctx: &egui::Context, m: Inline) {
-        self.word_edit(ctx, |t, s| markup::toggle_inline(t, s, m));
+    pub(crate) fn word_toggle(&mut self, ctx: &egui::Context, m: Inline) {
+        self.word_format(ctx, |t, s| markup::toggle_inline(t, s, m));
     }
 
     /// Större/mindre text ett steg i storlekslistan.
-    fn word_font_step(&mut self, ctx: &egui::Context, dir: i32) {
-        self.word_edit(ctx, |t, s| {
+    pub(crate) fn word_font_step(&mut self, ctx: &egui::Context, dir: i32) {
+        self.word_format(ctx, |t, s| {
             let a = markup::analyze(t);
             let act = markup::active(t, &a, s.clone());
             let cur = act.span.font_size.unwrap_or(a.defaults.size());
@@ -390,8 +392,8 @@ impl KladdApp {
         });
     }
 
-    fn word_block(&mut self, ctx: &egui::Context, b: Block) {
-        self.word_edit(ctx, |t, s| markup::set_block(t, s, b));
+    pub(crate) fn word_block(&mut self, ctx: &egui::Context, b: Block) {
+        self.word_format(ctx, |t, s| markup::set_block(t, s, b));
     }
 
     pub(crate) fn word_zoom_step(&mut self, dir: f32) {
@@ -463,7 +465,7 @@ impl KladdApp {
             (Key::J, markup::Align::Justify),
         ] {
             if hit(ctrl, k) {
-                self.word_edit(ctx, |t, s| markup::set_align(t, s, a));
+                self.word_format(ctx, |t, s| markup::set_align(t, s, a));
             }
         }
         // Teckenstorlek ett steg: Words Ctrl+Shift+> / < (på svenskt tangentbord Ctrl+Shift+<
@@ -561,7 +563,7 @@ impl KladdApp {
                     if style_combo.response.secondary_clicked() {
                         acts.push(BarAct::EditStyles);
                     }
-                    if status_button(ui, p, t("Ändra formatmall…"), t("Ändra utseendet på Brödtext, rubriker och citat (högerklicka på stilvalet)")).clicked() {
+                    if status_button(ui, p, t("Mallar…"), t("Ändra formatmall: utseendet på Brödtext, rubriker och citat (högerklicka på stilvalet)")).clicked() {
                         acts.push(BarAct::EditStyles);
                     }
                     // Typsnitt och storlek
@@ -701,6 +703,14 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Tabell"), "", None, true) {
                             acts.push(BarAct::Table);
                         }
+                        if crate::app::menu_item(ui, p, t("Ekvation"), "", None, true) {
+                            acts.push(BarAct::Equation(None));
+                        }
+                        for (i, (label, _)) in crate::math::insert::PALETTE.iter().enumerate() {
+                            if crate::app::menu_item(ui, p, &format!("   {}", t(label)), "", None, true) {
+                                acts.push(BarAct::Equation(Some(i)));
+                            }
+                        }
                         if crate::app::menu_item(ui, p, t("Fotnot"), "Ctrl+Alt+F", None, true) {
                             acts.push(BarAct::Footnote);
                         }
@@ -784,6 +794,13 @@ impl KladdApp {
                 BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
+                BarAct::Equation(which) => self.word_edit(&ctx, |t, s| {
+                    let e = match which.and_then(|i| crate::math::insert::PALETTE.get(i)) {
+                        Some((_, tpl)) => crate::math::insert::insert_template(t, s, tpl),
+                        None => crate::math::insert::insert_equation(t, s.end),
+                    };
+                    markup::Edit { text: e.text, sel: e.sel }
+                }),
                 BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::EditStyles => {
@@ -792,11 +809,11 @@ impl KladdApp {
                 }
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
-                BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
+                BarAct::Span(prop) => self.word_format(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
                 BarAct::Align(al) => {
                     // En vald bild justeras som sitt stycke, oavsett var markören står.
                     let img = self.wv.img.range.clone();
-                    self.word_edit(&ctx, |t, s| markup::set_align(t, img.unwrap_or(s), al))
+                    self.word_format(&ctx, |t, s| markup::set_align(t, img.unwrap_or(s), al))
                 }
                 BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
                 BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
@@ -1048,6 +1065,13 @@ impl KladdApp {
             };
             let fonts_gen = self.doc_fonts.generation();
 
+            // Autokorrigering: tecknet som skrivs den här bilden (inte när ändringar spåras).
+            let ac_typed = if rv.before.is_none() && self.autocorrect_active(true) && ui.memory(|m| m.has_focus(id)) {
+                crate::autocorrect_ui::typed_char(&ctx)
+            } else {
+                None
+            };
+
             let doc = &mut self.docs[self.active];
             let word = &mut self.word;
             let speller = &mut self.speller;
@@ -1244,6 +1268,11 @@ impl KladdApp {
                     pane_act = super::reviewui::paint_pane(ui, p, &rv, &mut rstate, &galley, gpos, text, pane_x);
                 }
 
+                // Spårade stycketecken och formateringsändringar: ¶, ändringsstreck, prickad understrykning.
+                if !edited {
+                    super::reviewui::paint_marks(ui, p, &analysis, text, &galley, gpos, &reveal, page_left + geom.origin_x() - px(z, 12.0), &out.response);
+                }
+
                 // Ett ark per sida, med luft emellan.
                 let clip = ui.clip_rect();
                 let (shadows, sheets) = pages::sheet_shapes(p, &boxes, page_left, origin_y, clip);
@@ -1301,6 +1330,23 @@ impl KladdApp {
                 }
                 for pc in &analysis.pieces[i0..i1] {
                     let shown = overlaps(&pc.range, &reveal);
+                    // Formler: källan är dold; formeln ritas där den reserverade platsen börjar.
+                    if let (Some(m), false) = (&pc.math, shown) {
+                        if let Some(g) = layout::piece_math_geom(pc, &params, &analysis.defaults) {
+                            let ci = conv.at(pc.range.start);
+                            let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
+                            if r.bottom() >= clip.top() && r.top() <= clip.bottom() {
+                                // Baslinjen: grannarnas på raden, annars radens underkant minus formelns.
+                                let row = galley.rows.iter().find(|row| (row.pos.y + gpos.y - r.min.y).abs() < 0.6);
+                                let base = row
+                                    .and_then(|row| row.glyphs.iter().find(|gl| gl.font_height > 2.0).map(|gl| row.pos.y + gl.pos.y + gpos.y))
+                                    .unwrap_or(r.max.y - g.below);
+                                let size = layout::piece_font_size(pc, &params, &analysis.defaults);
+                                let col = p.page_text;
+                                crate::math::gui::paint(ui.ctx(), &painter, &m.src, m.display, size, pos2(r.left() - g.w, base), col);
+                            }
+                        }
+                    }
                     if pc.list_marker && pc.markup && !shown && !edited {
                         // Punkten ritas 12 pt före textens början (markören efter dold markör).
                         let ci = conv.at(pc.range.end);
@@ -1717,6 +1763,9 @@ impl KladdApp {
             }
             if let Some((at, dashes)) = col_resize {
                 self.word_edit(&ctx, |t, s| markup::table_set_widths(t, at, s, &dashes));
+            }
+            if let (true, Some(c)) = (edited, ac_typed) {
+                self.autocorrect_after_edit(&ctx, c);
             }
             match spell_act {
                 Some(SpellAct::Replace(r, s)) => {

@@ -42,6 +42,7 @@ start. Använd rätt fil så att flera agenter inte krockar:
 | `en_word.rs` | `word/*` (dokumentläget, formatmallar, navigering, granskning), `style*.rs`, `search.rs`, `review.rs` |
 | `en_pdf.rs` | `pdfview/*`, `ocr.rs` |
 | `en_doc.rs` | `docx*.rs`, `odt.rs`, `pdf_read.rs`, `pdf_write.rs`, `export.rs`, `paste.rs`, `preview.rs` (felmeddelanden och notiser) |
+| `en_odtrev.rs` | `.odt`-granskning (spårade ändringar och kommentarer i `odt.rs`) |
 | `en_misc.rs` | `spell`, `grammar`, `grammar_ui`, `update`, `workspace`, `find_files`, `history*`, `print`, `recovery`, `autosave`, `panes`, `multicursor`, `single` … |
 
 Samma svenska text får finnas i flera tabeller bara om översättningen är **identisk**; enhetstestet

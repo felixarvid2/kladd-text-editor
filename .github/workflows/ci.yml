@@ -33,3 +33,24 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  # Sparade Word- och ODT-filer från korpusen ska gå att öppna i LibreOffice (tests/corpus).
+  libreoffice:
+    name: korpus i LibreOffice
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Installera LibreOffice
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer
+
+      - name: Korpustester med LibreOffice
+        env:
+          KLADD_CORPUS_SOFFICE: "1"
+        run: cargo test --locked corpus_soffice -- --ignored --test-threads=1

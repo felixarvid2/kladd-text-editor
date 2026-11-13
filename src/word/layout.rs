@@ -162,14 +162,35 @@ impl Cache {
             page_boxes: Arc::default(),
         });
         if st.text != text {
+            // Stora dokument: tolka bara om stycket med ändringen (samma resultat som `analyze`) och
+            // behåll tabeller, bilder och typsnitt som ändringen inte rört.
+            let delta = match Arc::get_mut(&mut st.analysis) {
+                Some(a) => super::incr::analyze_incremental(&st.text, a, text),
+                None => None,
+            };
             st.text.clear();
             st.text.push_str(text);
             st.rev += 1;
-            st.analysis = Arc::new(markup::analyze(text));
-            st.tables = None;
-            st.images = None;
+            match delta {
+                Some(d) => {
+                    if d.touched_table || st.tables.as_ref().is_some_and(|t| t.iter().any(|x| x.region.end > d.ws)) {
+                        st.tables = None;
+                    }
+                    if !d.same_images {
+                        st.images = None;
+                    }
+                    if st.fonts.as_ref().is_some_and(|f| !d.fonts.is_subset(f)) {
+                        st.fonts = None;
+                    }
+                }
+                None => {
+                    st.analysis = Arc::new(markup::analyze(text));
+                    st.tables = None;
+                    st.images = None;
+                    st.fonts = None;
+                }
+            }
             st.headings = None;
-            st.fonts = None;
         }
         st
     }
@@ -684,6 +705,34 @@ fn hidden_format(family: FontFamily) -> TextFormat {
     }
 }
 
+/// Formelns mått i px för brödtext med `em` px: bredd, radhöjd, och avståndet från radens
+/// underkant till baslinjen.
+#[derive(Clone, Copy, Debug)]
+pub struct MathGeom {
+    pub w: f32,
+    pub asc: f32,
+    pub desc: f32,
+    pub line_h: f32,
+    pub below: f32,
+}
+
+pub fn math_geom(src: &str, display: bool, em: f32) -> Option<MathGeom> {
+    let (w, asc, desc) = crate::math::gui::metrics(src, display, em)?;
+    let (top, below) = if display { (0.45 * em, desc.max(0.0) + 0.45 * em) } else { (1.0, desc.max(0.3 * em)) };
+    Some(MathGeom { w, asc, desc, line_h: top + asc + below, below })
+}
+
+/// Teckenstorleken (px) som formeln i `pc` läggs ut med.
+pub fn piece_font_size(pc: &Piece, p: &Params, d: &DocDefaults) -> f32 {
+    piece_format(pc, false, None, p, d).font_id.size
+}
+
+/// Måtten för formeln i biten `pc` (`None` om biten inte är en tolkbar formel).
+pub fn piece_math_geom(pc: &Piece, p: &Params, d: &DocDefaults) -> Option<MathGeom> {
+    let m = pc.math.as_ref()?;
+    math_geom(&m.src, m.display, piece_format(pc, false, None, p, d).font_id.size)
+}
+
 /// Format för en bit. `hide` = bitens markup ska döljas. `grid` = bitens tabell visas som rutnät
 /// (`Some(true)` = rubrikraden). Brödtextens typsnitt och storlek kommer från `d`, och en
 /// `<span>` på biten (`pc.span`) går före både dem och rubrikens värden.
@@ -792,6 +841,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         match r.kind {
             crate::review::RevKind::Ins => f.underline = st,
             crate::review::RevKind::Del => f.strikethrough = st,
+            crate::review::RevKind::Fmt => {}
         }
     }
     // Kommentarens område markeras som med en överstrykningspenna.
@@ -1009,6 +1059,8 @@ struct Builder {
     secs: Vec<(Range<usize>, TextFormat)>,
     cuts: BTreeSet<usize>,
     marks: Vec<(Range<usize>, TextFormat)>,
+    /// Formler: (byte där sektionen börjar, formelns bredd) som `leading_space`.
+    lead: Vec<(usize, f32)>,
     /// Bara sektioner inom fönstret byggs (hela texten för `layout_job`, ett stycke för cachen).
     win: Range<usize>,
 }
@@ -1115,7 +1167,7 @@ fn pieces_in<'a>(a: &'a Analysis, w: &Range<usize>) -> &'a [Piece] {
 /// stycke; bitar som sticker ut ur fönstret beskärs men bedöms med sitt hela intervall.
 fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Range<usize>) -> Vec<LayoutSection> {
     let bytes = text.as_bytes();
-    let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new(), win: win.clone() };
+    let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new(), lead: Vec::new(), win: win.clone() };
     let pcs = pieces_in(a, &win);
     // Tabeller är alltid rutnät, också med markören i dem: bara inline-markup i markörens cell
     // visas (via `reveal`), aldrig pipor eller avgränsarrad.
@@ -1154,6 +1206,22 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
             None
         };
 
+        // Formel: källtexten är dold och första tecknet reserverar formelns bredd och höjd.
+        if let (Some(m), true) = (&pc.math, hide) {
+            let _ = m;
+            if let Some(g) = piece_math_geom(pc, p, &a.defaults) {
+                let fam = (p.font_family)(Some(a.defaults.font()), false, false);
+                let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
+                let mut f1 = hidden_format(fam.clone());
+                f1.line_height = Some(g.line_h);
+                bld.lead.push((r.start, g.w));
+                bld.push(r.start..r.start + first, &f1);
+                if r.start + first < r.end {
+                    bld.push(r.start + first..r.end, &hidden_format(fam));
+                }
+                continue;
+            }
+        }
         if let Some(img) = &pc.image {
             if hide {
                 if let Some(h) = (p.image_size)(&super::images::size_key(img)).map(|s| s.y) {
@@ -1214,14 +1282,15 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
     // Slå ihop angränsande sektioner med samma format (inte där en sektion har leading_space).
     let mut job = LayoutJob { text: String::new(), ..Default::default() };
     for (range, format) in bld.secs {
+        let lead = bld.lead.iter().find(|(s, _)| *s == range.start).map_or(0.0, |(_, w)| *w);
         if let Some(last) = job.sections.last_mut() {
-            if last.format == format && last.byte_range.end.0 == range.start {
+            if lead == 0.0 && last.format == format && last.byte_range.end.0 == range.start {
                 last.byte_range.end = ByteIndex(range.end);
                 continue;
             }
         }
         job.sections.push(LayoutSection {
-            leading_space: 0.0,
+            leading_space: lead,
             byte_range: ByteIndex(range.start)..ByteIndex(range.end),
             format,
         });
@@ -1332,6 +1401,13 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         // Formatmallens justering gäller när stycket inte har en egen (`<div align>`).
         let style = lead.filter(|_| !is_tag).and_then(|pc| a.defaults.styles.for_block(pc.block).map(|o| (pc.block, o)));
         let mut align = lead.map_or(Align::Left, |pc| pc.align);
+        // En rad som bara är en `$$…$$`-formel centreras (när källan är dold).
+        if !intersects(&range, &p.reveal)
+            && ps.iter().any(|pc| pc.math.as_ref().is_some_and(|m| m.display))
+            && ps.iter().all(|pc| pc.markup || pc.math.is_some() || body(pc).trim().is_empty())
+        {
+            align = Align::Center;
+        }
         if align == Align::Left {
             align = style.and_then(|(_, o)| o.align).unwrap_or(Align::Left);
         }

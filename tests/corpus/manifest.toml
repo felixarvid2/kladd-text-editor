@@ -1,0 +1,1817 @@
+# Förväntningar för korpusen (se SOURCES.md för källor). En sektion per fil.
+# Uppmätta värden (headings, dropped, pages) skrivs om med KLADD_CORPUS_BLESS=1 cargo test corpus.
+# Handskrivna nycklar: error (förväntat läsfel), empty, note, skip_idempotent, skip_edit,
+# skip_render, skip_soffice (värdet är orsaken).
+
+["docx/docx4j-2010-mcAlternateContent-MDP.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-2010-mcAlternateContent-in-header.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-2010-mcAlternateContent.docx"]
+skip_soffice = "originalet går inte heller att öppna i LibreOffice"
+dropped = []
+headings = 0
+
+["docx/docx4j-2010-sample1.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-DrawingML_GraphicData_wps.docx"]
+dropped = []
+headings = 1
+
+["docx/docx4j-HelloWordOnline.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-LegacyForms.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-MERGEFIELD.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-NumberingImplicitNumId.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-NumberingIndents.docx"]
+dropped = []
+headings = 0
+skip_edit = "text som liknar XML med hakparenteser tolkas om vid sparning"
+skip_idempotent = "text som liknar XML med hakparenteser tolkas om vid sparning"
+
+["docx/docx4j-article-section-NotIsLgl.docx"]
+dropped = []
+headings = 6
+
+["docx/docx4j-article-section-isLgl.docx"]
+dropped = []
+headings = 6
+
+["docx/docx4j-bar-chart.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-br-5-hyperlink.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-br-6-cell.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-br-7-footer.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-cn-1-labels.docx"]
+dropped = []
+headings = 5
+skip_idempotent = "djupt nästlade listor (indrag på 4+ mellanslag) blir kodblock vid omläsning"
+
+["docx/docx4j-comments-one.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-comments-two.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-embedded-fonts.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-empty_p.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-header-section2.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-header-simple-plus-image.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-header-simple.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-headers_footers.docx"]
+dropped = []
+headings = 18
+
+["docx/docx4j-hyperlink.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-image-png1-scaled.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-image-png1.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-image-png2.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-invoice.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-numbering-linked-level-other-style.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-numbering-shared-abstract-styles.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-numbering-stories.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-numbering-unlinked-level-claim.docx"]
+dropped = []
+headings = 0
+skip_edit = "djupt nästlade listor (indrag på 4+ mellanslag) blir kodblock vid omläsning"
+
+["docx/docx4j-paragraph-single.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-paragraph-two.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-startOverride.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-w14_mcIgnorable-in-other-parts.docx"]
+dropped = []
+headings = 0
+
+["docx/docx4j-w14_texteffects.docx"]
+dropped = []
+headings = 0
+
+["docx/gen-bild-listor.docx"]
+dropped = []
+headings = 2
+
+["docx/gen-fotnoter-kommentarer.docx"]
+dropped = []
+headings = 1
+
+["docx/gen-innehall-formler.docx"]
+dropped = []
+headings = 2
+
+["docx/gen-sidhuvud-sektioner.docx"]
+dropped = []
+headings = 2
+
+["docx/gen-spara-andringar.docx"]
+dropped = []
+headings = 1
+
+["docx/gen-tabeller-sammanslagna.docx"]
+dropped = []
+headings = 1
+
+["docx/mammoth-comments.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-embedded-style-map.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-empty.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-endnotes.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-external-picture.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-footnote-hyperlink.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-footnotes.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-simple-list.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-single-paragraph.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-strict-format.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-strikethrough.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-tables.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-text-box.docx"]
+empty = true
+note = "innehållet är en textruta som bevaras orörd vid sparning men inte visas som text"
+dropped = []
+headings = 0
+
+["docx/mammoth-tiny-picture-target-base-relative.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-tiny-picture.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-underline.docx"]
+dropped = []
+headings = 0
+
+["docx/mammoth-utf8-bom.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-52288.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-52449.docx"]
+dropped = []
+headings = 3
+
+["docx/poi-55733.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-55966.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-56392.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-57312.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-58067.docx"]
+dropped = []
+headings = 2
+
+["docx/poi-58618.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-59030.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-59378.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-60293.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-60316.docx"]
+dropped = []
+headings = 4
+
+["docx/poi-60329.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-61470.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-61745.docx"]
+empty = true
+note = "innehållet är ett diagram som bevaras orört vid sparning men inte visas som text"
+dropped = []
+headings = 0
+
+["docx/poi-61787.docx"]
+dropped = []
+headings = 9
+
+["docx/poi-61991.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-65099.docx"]
+dropped = []
+headings = 1
+skip_idempotent = "formatmallsraden stabiliseras först efter en extra sparning"
+
+["docx/poi-Bug54771a.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug54771b.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug54849.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug55142.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug60337.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug60341.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug62859.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug64561.docx"]
+dropped = []
+headings = 0
+skip_idempotent = "formatmallsraden stabiliseras först efter en extra sparning"
+
+["docx/poi-Bug66263-paragraph.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug66263-table.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-Bug66988.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-ComplexNumberedLists.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-DiffFirstPageHeadFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-EmbeddedDocument.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-EmptyDocumentWithHeaderFooter.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-EnforcedWith.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-ExternalEntityInText.docx"]
+skip_soffice = "originalet går inte heller att öppna i LibreOffice"
+dropped = []
+headings = 0
+
+["docx/poi-FancyFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-FieldCodes.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-FldSimple.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-HeaderFooterUnicode.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-Headers.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-IllustrativeCases.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-NoHeadFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-Numbering.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-NumberingWOverrides.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-NumberingWithOutOfOrderId.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-PageSpecificHeadFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-SampleDoc.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-SimpleHeadThreeColFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-Styles.docx"]
+dropped = []
+headings = 3
+skip_idempotent = "formatmallsraden stabiliseras först efter en extra sparning"
+
+["docx/poi-TestDocument.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-TestPoiXMLDocumentCorePropertiesGetKeywords.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-TestTableCellAlign.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-TestTableColumns.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-ThreeColFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-ThreeColHead.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-ThreeColHeadFoot.docx"]
+dropped = []
+headings = 1
+
+["docx/poi-WithGIF.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-WithTabs.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-bookmarks.docx"]
+dropped = []
+headings = 2
+
+["docx/poi-bug-paragraph-alignment.docx"]
+dropped = []
+headings = 2
+
+["docx/poi-bug53475-password-is-pass.docx"]
+error = "Dokumentet är lösenordsskyddat eller sparat i det gamla .doc"
+
+["docx/poi-bug53475-password-is-solrcell.docx"]
+error = "Dokumentet är lösenordsskyddat eller sparat i det gamla .doc"
+
+["docx/poi-bug56075-changeTracking_off.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-bug56075-changeTracking_on.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-bug56076.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-bug57031.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-bug65738.docx"]
+dropped = []
+headings = 4
+
+["docx/poi-bug66312.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-bug69628.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-capitalized.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-checkboxes.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-clusterfuzz-testcase-minimized-POIFuzzer-6709287337197568.docx"]
+error = "Word-dokumentet är skadat: invalid Zip archive: Invalid CDFH"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-4791943399604224.docx"]
+error = "Word-dokumentet är skadat: invalid Zip archive: Invalid CDFH"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-4959857092198400.docx"]
+error = "Word-dokumentet är skadat: invalid Zip archive: Invalid CDFH"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-4961551840247808.docx"]
+error = "Filen är inte ett giltigt Word-dokument (zip-katalogen sakna"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-5166796835258368.docx"]
+error = "Word-dokumentet är skadat: invalid Zip archive: Invalid CDFH"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-5313273089884160.docx"]
+error = "Word-dokumentet är skadat: i/o error"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-5564805011079168.docx"]
+error = "Word-dokumentet är skadat: i/o error"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-5569740188549120.docx"]
+error = "Filen är inte ett giltigt Word-dokument (zip-katalogen sakna"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-6061520554164224.docx"]
+error = "Filen är inte ett giltigt Word-dokument (zip-katalogen sakna"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-6120975439364096.docx"]
+error = "Word-dokumentet är skadat: invalid Zip archive: Invalid CDFH"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-6442791109263360.docx"]
+error = "Word-dokumentet är skadat: invalid Zip archive: Could not fi"
+
+["docx/poi-clusterfuzz-testcase-minimized-POIXWPFFuzzer-6733884933668864.docx"]
+error = "Word-dokumentet är skadat: Invalid checksum"
+
+["docx/poi-comment.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-crash-517626e815e0afa9decd0ebb6d1dee63fb9907dd.docx"]
+error = "Filen är inte ett giltigt Word-dokument (zip-katalogen sakna"
+
+["docx/poi-deep-table-cell.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-delins.docx"]
+dropped = ["spårade formateringsändringar"]
+headings = 0
+
+["docx/poi-documentProperties.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-documentProtection_comments_no_password.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-documentProtection_forms_no_password.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-documentProtection_no_protection.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-documentProtection_no_protection_tag_existing.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-documentProtection_readonly_no_password.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-documentProtection_trackedChanges_no_password.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-drawing.docx"]
+dropped = []
+headings = 15
+skip_idempotent = "objekt ensamt på en rad i ett <div>-block flyttas ut ur blocket"
+
+["docx/poi-emptyPPr.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-endnotes.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-footnotes.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-form_footnotes.docx"]
+dropped = []
+headings = 2
+
+["docx/poi-headerFooter.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-headerPic.docx"]
+dropped = []
+headings = 0
+skip_idempotent = "formatmallsraden stabiliseras först efter en extra sparning"
+
+["docx/poi-heading123.docx"]
+dropped = []
+headings = 3
+
+["docx/poi-protected_sample.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-rtl.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-sample.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-shapes-with-text.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-smarttag-snippet.docx"]
+dropped = []
+headings = 3
+
+["docx/poi-table-alignment.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-table-indent.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-table_footnotes.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-testComment.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-truncated62886.docx"]
+error = "Filen är inte ett giltigt Word-dokument (zip-katalogen sakna"
+
+["docx/poi-unicode-path.docx"]
+dropped = []
+headings = 0
+
+["docx/poi-zero-length.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-blk-containing-table.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-blk-inner-content.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-blk-paras-and-tables.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-comments-rich-para.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-default-template.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-access-sections.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-add-section.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-coreprops.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-default.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-no-coreprops.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-odd-even-hdrs.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-doc-word-default-blank.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-fnt-color.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-having-images.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-hdr-header-footer.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-num-having-numbering-part.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-par-alignment.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-par-hlink-frags.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-par-hyperlinks.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-par-known-paragraphs.docx"]
+dropped = []
+headings = 1
+
+["docx/pydocx-par-known-styles.docx"]
+dropped = []
+headings = 1
+
+["docx/pydocx-par-rendered-page-breaks.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-run-char-style.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-run-enumerated-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sct-first-page-hdrftr.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sct-inner-content.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sct-section-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-set-no-settings-part.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-shp-inline-shape-access.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sty-behav-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sty-having-no-styles-part.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sty-having-styles-part.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-sty-known-styles.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tab-stops.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-2x2-table.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-cell-access.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-cell-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-col-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-having-applied-style.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-having-tables.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-on-off-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-tbl-props.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-test.docx"]
+dropped = []
+headings = 1
+
+["docx/pydocx-txt-font-highlight-color.docx"]
+dropped = []
+headings = 0
+
+["docx/pydocx-txt-font-props.docx"]
+dropped = []
+headings = 0
+
+["odt/gen-bild-listor.odt"]
+dropped = []
+headings = 2
+skip_idempotent = "blanksteg efter en bild i löpande text tappas"
+
+["odt/gen-fotnoter-kommentarer.odt"]
+dropped = []
+headings = 1
+
+["odt/gen-innehall-formler.odt"]
+dropped = ["diagram och former"]
+headings = 2
+
+["odt/gen-sidhuvud-sektioner.odt"]
+dropped = []
+headings = 2
+
+["odt/gen-spara-andringar.odt"]
+dropped = []
+headings = 1
+
+["odt/gen-tabeller-sammanslagna.odt"]
+dropped = []
+headings = 1
+
+["odt/lo-export-DUMMY2.odt"]
+dropped = ["diagram och former"]
+headings = 1
+skip_idempotent = "bild bredare än textytan krymps till textbredden"
+
+["odt/lo-export-DUMMY2B.odt"]
+dropped = ["diagram och former"]
+headings = 1
+skip_idempotent = "bild bredare än textytan krymps till textbredden"
+
+["odt/lo-export-MadeByLO7.odt"]
+dropped = ["diagram och former"]
+headings = 3
+
+["odt/lo-export-WordTest_edit.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-allow-overlap.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "tomt inledande avsnitt tappas"
+
+["odt/lo-export-arabic-zero-numbering.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-arabic-zero3-numbering.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-arabic-zero4-numbering.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-arabic-zero5-numbering.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-border_types.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-btlr-cell.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-btlr-frame.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-chapter-number-new-line.odt"]
+dropped = []
+headings = 1
+
+["odt/lo-export-charborder.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-fdo38244.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-fdo43807.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-fdo60769.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-fdo66811-1.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-fdo79358.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-fillbitmap3.odt"]
+dropped = ["diagram och former", "textrutor"]
+headings = 0
+
+["odt/lo-export-framebackgrounds.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-gerrit13858.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-gutter-left.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-listformat.odt"]
+dropped = []
+headings = 0
+skip_edit = "nästlad lista med indrag på 4+ mellanslag blir kodblock vid omläsning"
+
+["odt/lo-export-nestedTableInFooter.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-ooo321_stylepagenumber.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-page-content-bottom.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-page-content-top.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-pagestyle_background_lo64.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
+
+["odt/lo-export-pagestyle_background_lo70.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
+
+["odt/lo-export-pagestyle_background_ooo33.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
+
+["odt/lo-export-personalmetadata.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-qrcode-properties.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-redlineTextFrame.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-referencelanguage.odt"]
+dropped = []
+headings = 12
+
+["odt/lo-export-relh-page.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-relw-page.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-resolved-comment.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-rovas-numbering.odt"]
+error = "Filen är inte ett OpenDocument-textdokument (.odt)."
+
+["odt/lo-export-ruby-position.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-sha1_correct.odt"]
+error = "Dokumentet är lösenordsskyddat. Öppna det i LibreOffice och "
+
+["odt/lo-export-sha1_wrong.odt"]
+error = "Dokumentet är lösenordsskyddat. Öppna det i LibreOffice och "
+
+["odt/lo-export-shape-relsize.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-shape-with-hyperlink.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-shapes-hyperlink.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-spellout-numberingtypes.odt"]
+dropped = []
+headings = 1
+
+["odt/lo-export-sw_hatch.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-table-in-frame-in-table-in-header-base.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-table_styles_1.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-table_styles_2.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "fetstil i span i tabellcell tappas"
+
+["odt/lo-export-table_styles_3.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-table_styles_4.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf100492.odt"]
+dropped = ["diagram och former"]
+headings = 0
+skip_edit = "dokument med bara tomma avsnitt blir tomt"
+skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
+
+["odt/lo-export-tdf101710.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf101856.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf101856_overlapped.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf103567.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-tdf107292.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf107696.odt"]
+dropped = []
+headings = 7
+
+["odt/lo-export-tdf111891_frameVertStyle.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-tdf114287.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf115815.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf118637.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-tdf124470TableAndEmbeddedUsedFonts.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf131025_noZerosInTable.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "fetstil i span i tabellcell tappas"
+
+["odt/lo-export-tdf131812.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf132642_keepWithNextTable.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf135338_firstLeftPageFooter.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "tomt inledande avsnitt tappas"
+
+["odt/lo-export-tdf136645.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf139126.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf140437.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf142483.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf143605.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf145361.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf145871.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf146264.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf152710.odt"]
+dropped = ["diagram och former"]
+headings = 1
+
+["odt/lo-export-tdf159027.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf160700.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "tomt listobjekt blir bara siffran"
+
+["odt/lo-export-tdf160877.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf164712.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf169882.odt"]
+dropped = ["textrutor"]
+headings = 9
+
+["odt/lo-export-tdf57317_autoListName.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf66305.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "tomt inledande avsnitt tappas"
+
+["odt/lo-export-tdf71583.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-tdf77961.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-testTdf52065_centerTabs.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-textbox-rounded-corners.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-export-textframe-gradient.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-textframe-transparent-shadow.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-textframe-vertadjust.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-export-user-field-decl-fly.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-user-field-decl.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-userdefattr-tablecell.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-export-whitespace.odt"]
+dropped = ["diagram och former", "textrutor"]
+headings = 0
+
+["odt/lo-export-z-index-header.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-import-BibliographyEntryField.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-PageBackground.odt"]
+dropped = ["textrutor"]
+headings = 0
+skip_idempotent = "textfärg från sidmall tappas"
+
+["odt/lo-import-Word2010AsCharShape.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-ZoneMacroTest.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-annotation-formatting.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "förformaterad text blir kodblock vid omläsning"
+
+["odt/lo-import-borders_ooo33.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-dateFormFormats.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-empty-svg-family-name.odt"]
+dropped = []
+headings = 7
+
+["odt/lo-import-fdo37606.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo53210.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "tomt inledande avsnitt tappas"
+
+["odt/lo-import-fdo55814.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo56272.odt"]
+dropped = ["diagram och former"]
+headings = 2
+
+["odt/lo-import-fdo60842.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo68839.odt"]
+dropped = ["diagram och former", "textrutor"]
+headings = 0
+
+["odt/lo-import-fdo69862.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo69979.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo75872_aoo40.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-fdo75872_ooo33.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-fdo79269.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo79269_header.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo81223.odt"]
+dropped = ["textrutor"]
+headings = 0
+skip_edit = "ändrat stycke i högerjusterat dokument ger tomt block"
+
+["odt/lo-import-fdo82165.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fdo90130-1.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-import-fdo90130-2.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-import-feature_table.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_table_merged-cells.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_table_merged-cells_all.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_table_text.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_text.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_text_background-color.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_text_bold.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-feature_text_italic.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-fill-image-name-missing-definition.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-hello.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-incorrectsum.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-ooo77837-1.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "nästlad lista med indrag på 4+ mellanslag blir kodblock vid omläsning"
+
+["odt/lo-import-paste-first-para-direct-format.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-space.odt"]
+dropped = []
+headings = 2
+
+["odt/lo-import-spellmenu-redline.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf100033_1.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-import-tdf100033_2.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-import-tdf103025.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "tabellens streckbredd ändras med ett tecken"
+
+["odt/lo-import-tdf108482.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf109080_loext_ns.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf109080_style_ns.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf109228.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-tdf113289.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf123829.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf123968.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/lo-import-tdf128737.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-tdf133459.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf134971a.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf134971b.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf138879.odt"]
+dropped = []
+headings = 1
+
+["odt/lo-import-tdf146257.odt"]
+dropped = []
+headings = 0
+skip_edit = "nästlad lista med indrag på 4+ mellanslag blir kodblock vid omläsning"
+
+["odt/lo-import-tdf146597.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-tdf165156.odt"]
+dropped = []
+headings = 0
+skip_idempotent = "svart textfärg i span tappas"
+
+["odt/lo-import-tdf41542_borderlessPadding.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf74524.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf75221.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf76349_1columnBreak.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf92586.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf94882.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-tdf96113.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-timeFormFormats.odt"]
+dropped = ["diagram och former"]
+headings = 0
+
+["odt/lo-import-unreferenced_stream.odt"]
+dropped = []
+headings = 0
+
+["odt/lo-import-vmerge-cell-border.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-contextualspacing.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-definitionlists.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-headerfooter.odt"]
+dropped = []
+headings = 1
+
+["odt/odfpy-images.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-imageslabels.odt"]
+dropped = ["textrutor"]
+headings = 0
+
+["odt/odfpy-nasty.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-no_userfields.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-parastyles.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-serious_poem.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-simplelist.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-simplestyles.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-simpletable.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-twolevellist.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-userfields.odt"]
+dropped = []
+headings = 0
+
+["odt/odfpy-userfields_ooo3.odt"]
+dropped = []
+headings = 0
+
+["pdf/AutoCad_Simple.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/FormTestFromOo.pdf"]
+dropped = ["sidlayouten", "typsnitten", "formulärfält"]
+headings = 0
+pages = 1
+
+["pdf/Sample_Td-matrix.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 4
+pages = 1
+
+["pdf/box.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/bytes.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/commented.pdf"]
+dropped = ["sidlayouten", "typsnitten", "anteckningar och markeringar"]
+headings = 2
+pages = 1
+
+["pdf/crazyones.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 2
+pages = 1
+
+["pdf/encrypted-file.pdf"]
+error = "lösenord"
+
+["pdf/encryption-r4-aes-user-password.pdf"]
+error = "lösenord"
+
+["pdf/encryption-unencrypted.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/form.pdf"]
+dropped = ["sidlayouten", "typsnitten", "formulärfält"]
+headings = 0
+pages = 1
+
+["pdf/form_evince.pdf"]
+dropped = ["sidlayouten", "typsnitten", "formulärfält"]
+headings = 0
+pages = 1
+
+["pdf/gen-bild-listor.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 2
+pages = 1
+
+["pdf/gen-fotnoter-kommentarer.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 1
+pages = 1
+
+["pdf/gen-innehall-formler.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 3
+pages = 1
+
+["pdf/gen-sidhuvud-sektioner.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 1
+pages = 1
+
+["pdf/gen-tabeller-sammanslagna.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 1
+pages = 1
+
+["pdf/hello-world.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/imagemagick-ASCII85Decode.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/imagemagick-CCITTFaxDecode.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/imagemagick-images.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 6
+
+["pdf/imagemagick-lzw.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/inkscape-abc.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/issue-297.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/jpeg.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/libreoffice-form.pdf"]
+dropped = ["sidlayouten", "typsnitten", "formulärfält"]
+headings = 1
+pages = 1
+
+["pdf/libreoffice-writer-password.pdf"]
+error = "lösenord"
+
+["pdf/metadata.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/multilang.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/pdflatex-forms.pdf"]
+dropped = ["sidlayouten", "typsnitten", "formulärfält"]
+headings = 0
+pages = 1
+
+["pdf/pdflatex-outline.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 10
+pages = 4
+
+["pdf/reportlab-inline-image.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/superscript-pdftex.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/toy.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1
+
+["pdf/two-different-pages.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 2
+
+["pdf/visitor_text_position.pdf"]
+dropped = ["sidlayouten", "typsnitten"]
+headings = 0
+pages = 1

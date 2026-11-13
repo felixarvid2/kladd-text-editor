@@ -38,11 +38,15 @@ use crate::icons::{self, Icon};
 use crate::single::{self, Incoming};
 use crate::theme::{self, Palette};
 
+// Kommandoregistret är en undermodul till `app` så att det når appens privata funktioner.
+#[path = "commands.rs"]
+pub(crate) mod commands;
+
 const SETTINGS_KEY: &str = "kladd-settings";
 const TOPBAR_H: f32 = 46.0;
 const TOPBAR_PAD_TOP: f32 = 8.0;
 const STATUS_H: f32 = 28.0;
-const DEFAULT_FONT_SIZE: f32 = 15.0;
+pub(crate) const DEFAULT_FONT_SIZE: f32 = 15.0;
 const MAX_RECENT: usize = 8;
 const WINDOW_CONTROLS_W: f32 = 3.0 * 38.0 + 14.0;
 const RESIZE_EDGE: f32 = 6.0;
@@ -105,6 +109,16 @@ pub struct Settings {
     pub workspace_hidden: bool,
     /// Språk för gränssnittet ("Språk / Language").
     pub lang: crate::i18n::LangSetting,
+    /// Autokorrigering medan man skriver (dialogen Autokorrigering…).
+    pub autocorrect: crate::autocorrect::Config,
+    /// Senast körda kommandon (id ur kommandoregistret), nyast först; paletten visar dem överst.
+    pub recent_commands: Vec<String>,
+    /// Språkservrar (LSP) för kodfiler: fel, förslag, hover m.m.
+    pub lsp: bool,
+    /// Egna serverkommandon per språk (nyckel i `lsp::config`, kommandorad); saknas ett används standardvalet.
+    pub lsp_commands: Vec<(String, String)>,
+    /// Vim-tangentbindningar i textläget (av som standard).
+    pub vim: bool,
 }
 
 impl Default for Settings {
@@ -136,6 +150,11 @@ impl Default for Settings {
             workspace_panel: false,
             workspace_hidden: false,
             lang: Default::default(),
+            autocorrect: Default::default(),
+            recent_commands: Vec::new(),
+            lsp: true,
+            lsp_commands: Vec::new(),
+            vim: false,
         }
     }
 }
@@ -150,6 +169,8 @@ enum DialogResult {
     PdfExtract { doc_id: u64, path: Option<PathBuf>, pages: Vec<usize> },
     /// "Infoga PDF" / "Slå ihop med PDF": vald fil och plats.
     PdfInsert { doc_id: u64, path: Option<PathBuf>, at: usize },
+    /// "Importera .docx/.odt…" i mallgalleriet.
+    TemplateImport(Option<PathBuf>),
 }
 
 struct PendingPassword {
@@ -227,6 +248,8 @@ pub struct KladdApp {
     untitled_counter: usize,
     pub(crate) settings: Settings,
     hl: Highlighter,
+    /// Stora textfiler: virtualiserad vy, bakgrundsinläsning, sökning i bitar (`bigfiles`).
+    pub(crate) big: crate::bigfiles::State,
     md_cache: CommonMarkCache,
     pub(crate) find: Find,
     dialog: Option<Receiver<DialogResult>>,
@@ -234,6 +257,7 @@ pub struct KladdApp {
     pending_docx: Option<PendingDocx>,
     autosave: crate::autosave::Autosave,
     history: Option<crate::history_ui::Dialog>,
+    templates: Option<crate::templates_ui::Dialog>,
     pending_password: Option<PendingPassword>,
     allow_exit: bool,
     toast: Option<Toast>,
@@ -252,21 +276,40 @@ pub struct KladdApp {
     pub(crate) speller: Option<crate::spell::Speller>,
     pub(crate) grammar: crate::grammar::Checker,
     pub(crate) grammar_dlg: Option<crate::grammar_ui::Dialog>,
+    pub(crate) autocorrect_dlg: Option<crate::autocorrect_ui::Dialog>,
     pub(crate) wv: crate::word::view::State,
     pub(crate) print: crate::print::PrintState,
     pub(crate) nav: crate::word::navui::State,
     /// Fönstret är i helskärm för presentationsläget i en PDF-flik.
     pdf_fullscreen: bool,
-    update: crate::update::State,
+    pub(crate) update: crate::update::State,
     /// Delad vy: vilka flikar som visas i de två rutorna.
     pub(crate) panes: crate::panes::Panes,
     /// Extra markörer och kolumnmarkering i textläget.
     mc: crate::multicursor::State,
+    /// Vim-läget (`vim.rs`, `vim_ui.rs`): tillstånd, rulning och synliga rader från förra bilden.
+    vimui: crate::vim_ui::State,
+    vim_scroll: Option<usize>,
+    vim_scroll_lines: i32,
+    vim_view: crate::vim::View,
     /// Filträd och snabböppna (`workspace.rs`).
     pub(crate) ws: crate::workspace::State,
     /// Sök i filer (`find_files.rs`).
     pub(crate) ff: crate::find_files::State,
+    /// Kommandopalett och inställningsfönster (`commands.rs`).
+    pub(crate) cmd: commands::State,
+    /// Git: status, marginal, källkontroll (`git_ui.rs`).
+    pub(crate) git: crate::git_ui::State,
+    /// Tabellvyn för csv/tsv (`csv/`): vyinställningar per flik.
+    pub(crate) csv: crate::csv::view::State,
+    /// Språkserverklienten (`lsp/`).
+    pub(crate) lsp: crate::lsp::Lsp,
 }
+
+/// Gränssnittstester som kör hela appen utan fönster (se `docs/dev/gransnittstester.md`).
+#[cfg(test)]
+#[path = "ui_tests/mod.rs"]
+mod ui_tests;
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
     Id::unique(("kladd-editor", doc_id, crate::panes::salt()))
@@ -356,6 +399,7 @@ impl KladdApp {
             untitled_counter: 0,
             settings,
             hl: Highlighter::new(),
+            big: Default::default(),
             md_cache: CommonMarkCache::default(),
             find: Find::default(),
             dialog: None,
@@ -363,6 +407,7 @@ impl KladdApp {
             pending_docx: None,
             autosave: Default::default(),
             history: None,
+            templates: None,
             pending_password: None,
             allow_exit: false,
             toast: None,
@@ -371,6 +416,10 @@ impl KladdApp {
             focus_editor: false,
             editor_rect: Rect::NOTHING,
             mc: Default::default(),
+            vimui: Default::default(),
+            vim_scroll: None,
+            vim_scroll_lines: 0,
+            vim_view: Default::default(),
             last_title: String::new(),
             last_active_id: None,
             incoming: None,
@@ -381,6 +430,7 @@ impl KladdApp {
             speller: None,
             grammar: Default::default(),
             grammar_dlg: None,
+            autocorrect_dlg: None,
             wv: Default::default(),
             print: Default::default(),
             nav: Default::default(),
@@ -389,6 +439,10 @@ impl KladdApp {
             panes: Default::default(),
             ws: Default::default(),
             ff: Default::default(),
+            cmd: Default::default(),
+            git: Default::default(),
+            csv: Default::default(),
+            lsp: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -429,6 +483,103 @@ impl KladdApp {
         self.focus_editor = true;
     }
 
+    /// Öppnar en ny namnlös flik med mallens text: dokumentläget för Word-lika mallar, annars textvyn.
+    fn new_from_template(&mut self, text: String, doc: bool) {
+        self.new_tab();
+        let d = &mut self.docs[self.active];
+        d.text = text;
+        d.docx = doc;
+        d.word_view = doc;
+        d.on_edited();
+    }
+
+    fn open_templates(&mut self) {
+        self.templates = Some(crate::templates_ui::Dialog::gallery(&self.settings.author_name));
+    }
+
+    fn open_save_template(&mut self) {
+        let Some(d) = self.docs.get(self.active) else { return };
+        let stem = d.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = if stem.is_empty() && d.path.is_none() { String::new() } else { stem };
+        let doc = d.docx || d.word_view;
+        self.templates = Some(crate::templates_ui::Dialog::save_as(d.text.clone(), doc, &name, &self.settings.author_name));
+    }
+
+    fn templates_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        use crate::templates_ui::Action;
+        let Some(mut dlg) = self.templates.take() else { return };
+        match dlg.show(ctx, p) {
+            Action::None => self.templates = Some(dlg),
+            Action::Close => {}
+            Action::Create { text, doc } => self.new_from_template(text, doc),
+            Action::Done { message, error, close } => {
+                self.notify(ctx, message, error);
+                if !close {
+                    self.templates = Some(dlg);
+                }
+            }
+            Action::Import => {
+                self.templates = Some(dlg);
+                self.request_template_import(ctx);
+            }
+        }
+    }
+
+    fn request_template_import(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() {
+            self.notify(ctx, t("Stäng den öppna fildialogen först."), true);
+            return;
+        }
+        let (tx, rx) = channel();
+        self.dialog = Some(rx);
+        let ctx = ctx.clone();
+        let dir = self.start_dir();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title(t("Importera som mall"))
+                .add_filter(t("Word- och OpenDocument-filer"), &["docx", "dotx", "odt", "ott"]);
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let _ = tx.send(DialogResult::TemplateImport(dlg.pick_file()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Läser en vald .docx/.odt som egen mall och markerar den i galleriet.
+    fn import_template(&mut self, ctx: &egui::Context, path: &Path) {
+        let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = crate::templates::name_from_path(path);
+        let dir = crate::templates::user_dir();
+        let result = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| crate::templates::import_bytes(&b, &ext))
+            .and_then(|(text, images)| {
+                // Finns namnet redan får importen ett löpnummer så att ingen mall skrivs över.
+                let mut unique = name.clone();
+                let mut n = 1;
+                while crate::templates::sanitize_name(&unique).is_some_and(|id| dir.join(format!("{id}.md")).exists()) {
+                    n += 1;
+                    unique = format!("{name} {n}");
+                }
+                crate::templates::save_user(&dir, &unique, &text, true, false).map(|id| (id, images))
+            });
+        match result {
+            Ok((id, images)) => {
+                if let Some(dlg) = self.templates.as_mut() {
+                    dlg.select_user(&id);
+                }
+                let msg = if images > 0 {
+                    tf!("Importerade {name} som mall (bilderna följde inte med)", name = id)
+                } else {
+                    tf!("Importerade {name} som mall", name = id)
+                };
+                self.notify(ctx, msg, false);
+            }
+            Err(e) => self.notify(ctx, e, true),
+        }
+    }
+
     fn remember(&mut self, path: &Path) {
         let path = path.to_path_buf();
         self.settings.recent.retain(|p| p != &path);
@@ -450,6 +601,15 @@ impl KladdApp {
         let canonical = canonical.to_path_buf();
         if looks_like_pdf(&canonical) {
             self.open_pdf_tab(ctx, &canonical, password);
+            return;
+        }
+        // Stora filer läses in i en bakgrundstråd med förloppsvisning.
+        if crate::bigfiles::wants_background(&canonical) {
+            if !self.big.is_loading(&canonical) {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.big.spawn_load(ctx, id, &canonical, password.map(str::to_owned));
+            }
             return;
         }
         let loaded = Document::load_with_password(self.next_id, &canonical, password);
@@ -486,6 +646,7 @@ impl KladdApp {
             let old = self.docs[self.active].id;
             self.hl.forget(old);
             self.hl.forget(old | (1 << 62));
+            self.big.forget(old);
             self.word.forget(old);
             self.panes.forget_doc(old, Some(doc.id));
             self.docs[self.active] = doc;
@@ -498,6 +659,31 @@ impl KladdApp {
         self.focus_editor = true;
         if let Some(note) = self.docs[self.active].open_note.take() {
             self.notify(ctx, note, false);
+        }
+    }
+
+    /// Tar emot stora filer som lästs in i bakgrunden.
+    fn poll_big_loads(&mut self, ctx: &egui::Context) {
+        for (path, result) in self.big.poll_loads(ctx) {
+            match result {
+                Ok((doc, view)) => {
+                    // Redan öppnad under tiden (t.ex. dubbelklick två gånger): släng den nya.
+                    if self.docs.iter().any(|d| d.path.as_deref() == Some(&path)) {
+                        continue;
+                    }
+                    self.big.adopt(doc.id, view);
+                    self.install_doc(ctx, doc, &path);
+                    let id = self.docs[self.active].id;
+                    if self.big.has_view(id) {
+                        self.notify(ctx, t("Stor fil: radbrytning och färgning är avstängda för att redigeringen ska gå snabbt."), false);
+                    }
+                }
+                Err(LoadError::NeedsPassword) | Err(LoadError::WrongPassword) => {}
+                Err(LoadError::Message(m)) => {
+                    self.settings.recent.retain(|p| p != &path);
+                    self.notify(ctx, m, true);
+                }
+            }
         }
     }
 
@@ -551,6 +737,9 @@ impl KladdApp {
             format!("{}.{ext}", stem.unwrap_or_else(|| doc.title()))
         } else if doc.path.is_some() {
             doc.title()
+        } else if doc.docx {
+            // Ett namnlöst dokument i dokumentläget (t.ex. från en mall) sparas som Word.
+            format!("{}.docx", doc.title())
         } else {
             format!("{}.txt", doc.title())
         };
@@ -662,6 +851,7 @@ impl KladdApp {
     fn after_save(&mut self, idx: usize, path: &Path) {
         let Some(doc) = self.docs.get(idx) else { return };
         self.autosave.record_stamp(doc.id, path);
+        self.git.bump();
         if let Ok(bytes) = std::fs::read(path) {
             let _ = crate::history::record(&crate::history::root(), path, &bytes, crate::history::now_ms(), &Default::default());
         }
@@ -738,6 +928,7 @@ impl KladdApp {
             crate::history_ui::restore_into(ctx, &mut self.docs[idx], version);
             let id = self.docs[idx].id;
             self.hl.forget(id);
+            self.big.forget(id);
             self.word.forget(id);
             self.find.current = None;
             self.focus_editor = true;
@@ -816,6 +1007,7 @@ impl KladdApp {
         self.recovery.forget(doc.id);
         self.hl.forget(doc.id);
         self.hl.forget(doc.id | (1 << 62));
+        self.big.forget(doc.id);
         self.word.forget(doc.id);
         if self.docs.is_empty() {
             self.active = 0;
@@ -884,6 +1076,10 @@ impl KladdApp {
         let Some(doc) = self.docs.get(self.active) else { return Arc::default() };
         let word = doc.word_view;
         let spec = self.find.spec(word);
+        if !word && self.big.has_view(doc.id) {
+            // Stor fil: sökning i bitar med tak, utan att hasha hela texten varje bildruta.
+            return self.big.search(&self.docs[self.active], &spec);
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (doc.id, word).hash(&mut h);
         crate::word::layout::fast_hash(&doc.text).hash(&mut h);
@@ -916,7 +1112,13 @@ impl KladdApp {
     /// Markerar träffen i editorn och rullar dit.
     fn select_match(&mut self, ctx: &egui::Context, m: &Match) {
         let Some(doc) = self.docs.get(self.active) else { return };
+        if let Some(v) = self.big.view(doc.id) {
+            v.select(m.start, m.end);
+            self.find.current = Some(m.start);
+            return;
+        }
         let id = editor_id(doc.id);
+        let doc_id = doc.id;
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
         let (ca, cb) = (byte_to_char(&doc.text, m.start), byte_to_char(&doc.text, m.end));
         state
@@ -925,6 +1127,7 @@ impl KladdApp {
         state.store(ctx, id);
         self.find.current = Some(m.start);
         self.scroll_to_char = Some(ca);
+        self.csv.goto_byte(doc_id, m.start);
     }
 
     fn seek(&mut self, ctx: &egui::Context, how: Seek) {
@@ -936,16 +1139,20 @@ impl KladdApp {
             return;
         }
         let id = editor_id(doc.id);
-        let state = TextEditState::load(ctx, id).unwrap_or_default();
-        let (sa, sb) = state
-            .cursor
-            .char_range()
-            .map(|r| {
-                let [a, b] = r.sorted_cursors();
-                (a.index.0, b.index.0)
-            })
-            .unwrap_or((0, 0));
-        let (ba, bb) = (char_to_byte(&doc.text, sa), char_to_byte(&doc.text, sb));
+        let (ba, bb) = if let Some(v) = self.big.view(doc.id) {
+            v.selection()
+        } else {
+            let state = TextEditState::load(ctx, id).unwrap_or_default();
+            let (sa, sb) = state
+                .cursor
+                .char_range()
+                .map(|r| {
+                    let [a, b] = r.sorted_cursors();
+                    (a.index.0, b.index.0)
+                })
+                .unwrap_or((0, 0));
+            (char_to_byte(&doc.text, sa), char_to_byte(&doc.text, sb))
+        };
         let pick = match how {
             Seek::FromSelectionStart => matches.iter().find(|m| m.start >= ba).or(matches.first()),
             Seek::Next => {
@@ -995,6 +1202,15 @@ impl KladdApp {
         } else {
             let spec = self.find.spec(false);
             let Some(doc) = self.docs.get_mut(self.active) else { return };
+            if let Some(view) = self.big.view(doc.id) {
+                // Stor fil: ersätt bara på träffens rad (med ångra), inte hela texten.
+                if crate::bigfiles::replace_one(view, &mut doc.text, &spec, &repl, cur) {
+                    doc.on_edited();
+                }
+                self.find.current = None;
+                self.seek(ctx, Seek::FromSelectionStart);
+                return;
+            }
             if let Some(r) = search::replace_text(&doc.text, &spec, &repl, Some(cur)) {
                 doc.text = r.text;
                 doc.on_edited();
@@ -1036,6 +1252,7 @@ impl KladdApp {
             let Some(r) = search::replace_text(&doc.text, &spec, &repl, None) else { return };
             doc.text = r.text;
             doc.on_edited();
+            self.big.invalidate(doc.id);
             n = r.count;
         }
         self.find.current = None;
@@ -1066,6 +1283,11 @@ impl KladdApp {
             DialogResult::Open(files) => {
                 for f in files {
                     self.open_path(ctx, &f);
+                }
+            }
+            DialogResult::TemplateImport(path) => {
+                if let Some(path) = path {
+                    self.import_template(ctx, &path);
                 }
             }
             DialogResult::InsertImage { doc_id, path } => {
@@ -1143,10 +1365,113 @@ impl KladdApp {
         }
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.history.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.wv.hf_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
+    /// Vim-läget är på och gäller den aktiva fliken (inte dokumentläget eller PDF).
+    fn vim_active(&self) -> bool {
+        self.settings.vim && !self.docs.is_empty() && !self.pdf_mode() && !self.word_mode()
+    }
+
+    /// Vim-läget: tar tangenterna före resten och utför det Vim ber om.
+    fn vim_step(&mut self, ctx: &egui::Context) {
+        if !self.vim_active() {
             return;
         }
+        let view = self.vim_view;
+        let doc = &mut self.docs[self.active];
+        let id = editor_id(doc.id);
+        let step = self.vimui.pre(ctx, id, doc.id, &mut doc.text, view);
+        if step.edited {
+            doc.on_edited();
+            self.find.current = None;
+        }
+        if step.scroll_to.is_some() {
+            self.vim_scroll = step.scroll_to;
+        }
+        self.vim_scroll_lines += step.scroll_lines;
+        for e in step.effects {
+            self.vim_effect(ctx, e);
+        }
+    }
+
+    fn vim_path(&self, name: &str) -> PathBuf {
+        let p = if let Some(rest) = name.strip_prefix("~/") {
+            home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(name))
+        } else {
+            PathBuf::from(name)
+        };
+        if p.is_absolute() {
+            return p;
+        }
+        self.docs.get(self.active).and_then(|d| d.base_dir()).or_else(home_dir).unwrap_or_default().join(p)
+    }
+
+    fn vim_effect(&mut self, ctx: &egui::Context, e: crate::vim::Effect) {
+        use crate::vim::{Effect as E, Setting};
+        let idx = self.active;
+        match e {
+            E::Save => self.save_doc(ctx, idx, false, false),
+            E::SaveAs(name) => {
+                let path = self.vim_path(&name);
+                self.write_doc(ctx, idx, &path, false, false);
+            }
+            E::SaveQuit => {
+                if self.panes.is_split() {
+                    self.save_doc(ctx, idx, false, false);
+                    self.panes.close();
+                } else {
+                    let last = self.docs.len() <= 1;
+                    self.save_doc(ctx, idx, true, last);
+                }
+            }
+            E::Quit { force } => {
+                if self.panes.is_split() {
+                    self.panes.close();
+                } else if self.docs[idx].dirty && !force {
+                    self.notify(ctx, t("E37: Ändringar sparades inte (lägg till ! för att strunta i dem)"), true);
+                } else {
+                    let last = self.docs.len() <= 1;
+                    self.close_tab_now(idx);
+                    if last {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+            E::QuitAll { force } => {
+                if !force && self.docs.iter().any(|d| d.dirty) {
+                    self.notify(ctx, t("E37: Ändringar sparades inte (lägg till ! för att strunta i dem)"), true);
+                } else {
+                    self.allow_exit = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+            E::Edit(name) => {
+                let path = self.vim_path(&name);
+                self.open_path(ctx, &path);
+            }
+            E::Split { vertical } => {
+                let o = if vertical { Orient::Vertical } else { Orient::Horizontal };
+                if self.panes.orient != Some(o) {
+                    self.toggle_split(o);
+                }
+            }
+            E::CloseSplit => {
+                if self.panes.is_split() {
+                    self.panes.close();
+                }
+            }
+            E::Set(Setting::Number, v) => self.settings.line_numbers = v.unwrap_or(!self.settings.line_numbers),
+            E::Set(Setting::Wrap, v) => self.settings.wrap = v.unwrap_or(!self.settings.wrap),
+            E::Notify(msg, err) => self.notify(ctx, msg, err),
+            E::Clipboard(s) => ctx.copy_text(s),
+            E::Scroll(n) => self.vim_scroll_lines += n,
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.pending_close.is_some() || self.history.is_some() || self.templates.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.wv.hf_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
+            return;
+        }
+        // Vim först: den tar sina tangenter (även Ctrl+O i normalläget) före Kladds genvägar.
+        self.vim_step(ctx);
         // COMMAND = ⌘ på Mac, Ctrl annars.
         let ctrl = Modifiers::COMMAND;
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
@@ -1161,11 +1486,21 @@ impl KladdApp {
             self.pdf_shortcuts(ctx);
             return;
         }
+        // Ctrl+Skift+P före Ctrl+P (skriv ut): `consume_shortcut` bryr sig inte om extra Skift.
+        if hit(ctrl_shift, Key::P) {
+            self.open_palette();
+        }
+        if hit(ctrl, Key::Comma) {
+            self.open_settings(None);
+        }
         let pdf = self.pdf_mode();
         // Före Ctrl+F: Skift-varianterna måste tas först.
         self.workspace_shortcuts(ctx);
 
-        if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
+        // Ctrl+Skift+N före Ctrl+N: `consume_shortcut` bryr sig inte om extra Skift.
+        if hit(ctrl_shift, Key::N) {
+            self.open_templates();
+        } else if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
             self.new_tab();
         }
         // Ctrl+Skift+\ före Ctrl+\: `consume_shortcut` bryr sig inte om extra Skift.
@@ -1275,11 +1610,11 @@ impl KladdApp {
         }
     }
 
-    fn zoom(&mut self, delta: f32) {
+    pub(crate) fn zoom(&mut self, delta: f32) {
         self.settings.font_size = (self.settings.font_size + delta).clamp(9.0, 32.0);
     }
 
-    fn toggle_theme(&mut self, ctx: &egui::Context) {
+    pub(crate) fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.settings.dark = !self.settings.dark;
         theme::set_dark(ctx, self.settings.dark);
     }
@@ -1338,7 +1673,12 @@ impl KladdApp {
                 }
                 let show_preview_btn = self.docs.get(self.active).is_some_and(Document::is_markdown) && !self.word_mode();
                 let show_nav_btn = self.docs.get(self.active).is_some_and(Document::is_markdown);
-                let buttons = 2 + usize::from(show_preview_btn) + usize::from(show_nav_btn);
+                // Menyraden ligger bredvid flikarna när det finns plats; annars samlas menyerna i hamburgermenyn.
+                let cats = self.menu_categories();
+                let bar_w = crate::menubar::bar_width(ui, &cats);
+                let side_btns = 1 + usize::from(show_preview_btn) + usize::from(show_nav_btn);
+                let wide = full.width() - side_btns as f32 * 34.0 - WINDOW_CONTROLS_W - 8.0 - 90.0 - bar_w > crate::menubar::MIN_TABS_W;
+                let buttons = side_btns + usize::from(!wide);
                 let right_w = buttons as f32 * 34.0 + WINDOW_CONTROLS_W;
                 let left = Rect::from_min_max(full.min, pos2(full.right() - right_w - 8.0, full.bottom()));
                 let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
@@ -1348,6 +1688,10 @@ impl KladdApp {
                     |ui| {
                         self.wordmark(ui, p);
                         ui.add_space(14.0);
+                        if wide {
+                            self.menu_bar(ui, &ctx, p, &cats);
+                            ui.add_space(8.0);
+                        }
                         ScrollArea::horizontal()
                             .id_salt("kladd-tabs")
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1387,16 +1731,10 @@ impl KladdApp {
                         let (sep, _) = ui.allocate_exact_size(vec2(14.0, 30.0), Sense::hover());
                         ui.painter().vline(sep.center().x, sep.y_range().shrink(7.0), Stroke::new(1.0, p.line));
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let menu = icons::button(ui, p, Icon::Menu, 30.0, false, t("Meny"), p.chrome);
-                        Popup::menu(&menu)
-                            .width(312.0)
-                            .align(RectAlign::BOTTOM_END)
-                            .gap(6.0)
-                            .show(|ui| {
-                                // Menyn är längre än ett litet fönster: rulla i stället för att klippa.
-                                let max_h = (ctx.content_rect().height() - TOPBAR_H - 24.0).max(200.0);
-                                ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).auto_shrink([false, true]).show(ui, |ui| self.menu(ui, &ctx, p));
-                            });
+                        if !wide {
+                            let menu = icons::button(ui, p, Icon::Menu, 30.0, false, t("Meny"), p.chrome);
+                            Popup::menu(&menu).width(312.0).align(RectAlign::BOTTOM_END).gap(6.0).show(|ui| self.hamburger_menu(ui, &ctx, p));
+                        }
 
                         let (icon, tip) = if self.settings.dark {
                             (Icon::Sun, t("Byt till ljust tema (Ctrl+Shift+K)"))
@@ -1508,137 +1846,6 @@ impl KladdApp {
         }
     }
 
-    fn menu(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Palette) {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        let has_doc = !self.docs.is_empty();
-        let pdf = self.pdf_mode();
-        if menu_item(ui, p, t("Ny flik"), "Ctrl+T", None, true) {
-            self.new_tab();
-        }
-        if menu_item(ui, p, t("Öppna…"), "Ctrl+O", None, true) {
-            self.request_open(ctx);
-        }
-        let pdf_changed = self.pdf_unsaved();
-        if menu_item(ui, p, if pdf && !pdf_changed { t("Spara kopia…") } else { t("Spara") }, "Ctrl+S", None, has_doc) {
-            if pdf && pdf_changed {
-                self.pdf_save(ctx, self.active, false, false);
-            } else if pdf {
-                self.request_save_copy(ctx, self.active);
-            } else {
-                self.save_doc(ctx, self.active, false, false);
-            }
-        }
-        if pdf && pdf_changed && menu_item(ui, p, t("Spara kopia…"), "Ctrl+Shift+S", None, true) {
-            self.request_save_copy(ctx, self.active);
-        }
-        if menu_item(ui, p, t("Spara som…"), "Ctrl+Shift+S", None, has_doc && !pdf) {
-            self.request_save_as(ctx, self.active, false, false);
-        }
-        if menu_item(ui, p, t("Skriv ut…"), "Ctrl+P", None, has_doc) {
-            self.open_print(ctx);
-        }
-        let hist = self.docs.get(self.active).is_some_and(|d| d.path.is_some() && d.pdfv.is_none());
-        if menu_item(ui, p, t("Versionshistorik…"), "", None, hist) {
-            self.open_history(ctx);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Öppna mapp…"), "", None, true) {
-            self.request_folder(ctx);
-        }
-        if menu_item(ui, p, t("Mappträd"), "Ctrl+Shift+E", Some(self.settings.workspace_panel), true) {
-            self.toggle_workspace_panel(ctx);
-        }
-        if menu_item(ui, p, t("Stäng mapp"), "", None, self.settings.workspace.is_some()) {
-            self.close_workspace();
-        }
-        if menu_item(ui, p, t("Snabböppna…"), "Ctrl+E", None, true) {
-            self.open_quick(ctx);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Stäng flik"), "Ctrl+W", None, has_doc) {
-            self.request_close_tab(self.active);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Infoga bild…"), "Ctrl+Shift+I", None, has_doc && !pdf) {
-            self.request_insert_image(ctx);
-        }
-        if menu_item(ui, p, t("Infoga innehållsförteckning"), "", None, self.docs.get(self.active).is_some_and(Document::is_markdown)) {
-            self.insert_toc(ctx);
-        }
-        if menu_item(ui, p, t("Sök"), "Ctrl+F", None, has_doc) {
-            self.open_find(ctx, false);
-        }
-        if menu_item(ui, p, t("Sök och ersätt"), "Ctrl+H", None, has_doc && !pdf) {
-            self.open_find(ctx, true);
-        }
-        if menu_item(ui, p, t("Sök i filer…"), "Ctrl+Shift+F", None, true) {
-            self.open_find_files(ctx);
-        }
-        menu_divider(ui, p);
-        let split = self.panes.orient;
-        if menu_item(ui, p, t("Dela vyn"), "Ctrl+\\", Some(split == Some(Orient::Vertical)), has_doc) {
-            self.toggle_split(Orient::Vertical);
-        }
-        if menu_item(ui, p, t("Dela vågrätt"), "Ctrl+Shift+\\", Some(split == Some(Orient::Horizontal)), has_doc) {
-            self.toggle_split(Orient::Horizontal);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Radbrytning"), "Alt+Z", Some(self.settings.wrap), true) {
-            self.settings.wrap = !self.settings.wrap;
-        }
-        if menu_item(ui, p, t("Radnummer"), "", Some(self.settings.line_numbers), true) {
-            self.settings.line_numbers = !self.settings.line_numbers;
-        }
-        let md = self.docs.get(self.active).is_some_and(Document::is_markdown);
-        if menu_item(ui, p, t("Navigeringsfönster"), "Ctrl+Shift+O", Some(self.settings.nav_pane), md) {
-            self.settings.nav_pane = !self.settings.nav_pane;
-        }
-        if menu_item(ui, p, t("Förhandsvisa Markdown"), "Ctrl+Shift+M", Some(self.settings.preview), true) {
-            self.settings.preview = !self.settings.preview;
-        }
-        if menu_item(ui, p, t("Mörkt tema"), "Ctrl+Shift+K", Some(self.settings.dark), true) {
-            self.toggle_theme(ctx);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Större text"), "Ctrl++", None, true) {
-            self.zoom(1.0);
-        }
-        if menu_item(ui, p, t("Mindre text"), "Ctrl+−", None, true) {
-            self.zoom(-1.0);
-        }
-        if menu_item(ui, p, t("Normal textstorlek"), "Ctrl+0", None, true) {
-            self.settings.font_size = DEFAULT_FONT_SIZE;
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Säkerhetskopiera osparade ändringar"), "", Some(self.settings.autosave_recovery), true) {
-            self.settings.autosave_recovery = !self.settings.autosave_recovery;
-        }
-        if menu_item(ui, p, t("Sök efter uppdateringar automatiskt"), "", Some(self.settings.auto_update_check), true) {
-            self.settings.auto_update_check = !self.settings.auto_update_check;
-        }
-        if menu_item(ui, p, t("Sök efter uppdateringar"), "", None, true) {
-            self.update.check_now(ctx);
-        }
-        if menu_item(ui, p, t("Spara automatiskt"), "", Some(self.settings.autosave), true) {
-            self.settings.autosave = !self.settings.autosave;
-        }
-        menu_divider(ui, p);
-        // Ett klick byter till nästa språkval (Automatiskt, Svenska, English).
-        let cur = self.settings.lang;
-        let label = format!("Språk / Language: {}", cur.label());
-        if menu_item(ui, p, &label, "", None, true) {
-            let all = crate::i18n::LangSetting::ALL;
-            self.settings.lang = all[(all.iter().position(|l| *l == cur).unwrap_or(0) + 1) % all.len()];
-            // Gäller från nästa bild utan omstart.
-            crate::i18n::set_lang(self.settings.lang.resolve());
-            ctx.request_repaint();
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Avsluta"), "Ctrl+Q", None, true) {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
-        }
-    }
-
     fn status_bar(&mut self, ui: &mut Ui, p: &Palette) {
         let ctx = ui.ctx().clone();
         Panel::bottom("kladd-status")
@@ -1660,6 +1867,17 @@ impl KladdApp {
                         let lang = doc.language_label();
                         ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
+                    self.git_status_chip(ui, p);
+                    if self.vim_active() {
+                        let (left, right) = self.vimui.status();
+                        let mono = FontId::new(12.0, FontFamily::Monospace);
+                        if !left.is_empty() {
+                            ui.label(RichText::new(left).font(mono.clone()).color(p.accent).strong());
+                        }
+                        if !right.is_empty() {
+                            ui.label(RichText::new(right).font(mono).color(p.muted));
+                        }
+                    }
                     let now = Self::now(&ctx);
                     if let Some(t) = &self.toast {
                         if t.until > now {
@@ -1678,9 +1896,23 @@ impl KladdApp {
                         pdfui::status(ui, p, &font, tab);
                         return;
                     }
+                    self.lsp_status(ui, p, &font);
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        // Tabell/Text för csv, tsv och annan avgränsad text.
+                        let (mut csv_avail, mut csv_grid) = (false, false);
+                        if !(doc.docx || doc.pdf) {
+                            let tb = self.csv.tab_for(doc);
+                            (csv_avail, csv_grid) = (tb.available, tb.grid);
+                        }
+                        if csv_avail {
+                            if let Some(g) = crate::csv::view::mode_switch(ui, p, csv_grid) {
+                                self.csv.tab_for(doc).set_grid(g, doc);
+                                self.focus_editor = true;
+                            }
+                            ui.add_space(6.0);
+                        }
                         if doc.docx || doc.pdf {
                             let (label, tip) = if doc.pdf {
                                 (t("PDF-dokument"), t("Texten visas som Markdown och sparas som en ny PDF"))
@@ -1723,7 +1955,12 @@ impl KladdApp {
                         });
                         }
                         ui.add_space(10.0);
-                        let words = doc.text.split_whitespace().count();
+                        if csv_avail && csv_grid {
+                            let s = crate::csv::view::status_text(self.csv.tab_for(doc));
+                            ui.label(RichText::new(s).font(font.clone()).color(p.muted));
+                            return;
+                        }
+                        let words = self.big.words(doc.id).unwrap_or_else(|| doc.text.split_whitespace().count());
                         let words = if words == 1 { t("1 ord").to_owned() } else { tf!("{words} ord", words = words) };
                         ui.label(RichText::new(words).font(font.clone()).color(p.muted));
                         ui.add_space(10.0);
@@ -1742,7 +1979,7 @@ impl KladdApp {
     fn preview(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(doc) = self.docs.get(self.active) else { return };
         // I delad vy ryms ingen förhandsvisning bredvid två rutor.
-        if self.panes.is_split() || !(self.settings.preview && doc.is_markdown()) || self.word_mode() {
+        if self.panes.is_split() || !(self.settings.preview && doc.is_markdown()) || self.word_mode() || self.big.has_view(doc.id) {
             return;
         }
         let width = ui.available_width();
@@ -1766,7 +2003,8 @@ impl KladdApp {
                         ui.set_max_width(680.0f32.min(ui.available_width()));
                         // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
                         // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
-                        let mut text: std::borrow::Cow<str> = std::borrow::Cow::Owned(crate::preview::clean(&doc.text));
+                        let with_math = crate::math::preview::replace(&doc.text, ui.ctx(), 15.0, p.text, ui.available_width());
+                        let mut text: std::borrow::Cow<str> = std::borrow::Cow::Owned(crate::preview::clean(&with_math));
                         for (name, img) in &doc.images {
                             let enc = name.replace(' ', "%20");
                             let uri = format!("bytes://kladd/{}/{enc}", doc.id);
@@ -1803,6 +2041,10 @@ impl KladdApp {
             self.word_page(ui, p);
             return;
         }
+        if self.csv_mode() {
+            self.csv_page(ui, p);
+            return;
+        }
         CentralPanel::default()
             .frame(Frame::NONE.fill(p.editor))
             .show(ui, |ui| {
@@ -1817,7 +2059,21 @@ impl KladdApp {
                 let matches = self.search_highlights();
                 let scroll_to = self.scroll_to_char.take();
                 let focus = std::mem::take(&mut self.focus_editor);
+                let vim_on = self.settings.vim;
+                let vim_scroll = self.vim_scroll.take();
+                let vim_lines = std::mem::take(&mut self.vim_scroll_lines);
+                let mut vim_vis = (usize::MAX, 0usize);
 
+                if self.big.is_big(&self.docs[self.active]) {
+                    self.editor_big(ui, p, &matches, focus);
+                    return;
+                }
+                let git_gutter = self.git_gutter(ui.ctx());
+                let mut git_hunk: Option<(usize, egui::Pos2)> = None;
+                let ac_on = self.autocorrect_active(false);
+                let ac_lang = self.autocorrect_lang();
+                let vimui = &self.vimui;
+                let ac_cfg = &self.settings.autocorrect;
                 let doc = &mut self.docs[self.active];
                 let hl = &mut self.hl;
                 let mc = &mut self.mc;
@@ -1830,12 +2086,20 @@ impl KladdApp {
                 let mut edited = false;
                 let mut scroll_to = scroll_to;
                 let had_focus = ui.memory(|m| m.has_focus(id));
+                let ac_on = ac_on && !mc.is_multi();
+                let ac_typed = if ac_on && had_focus { crate::autocorrect_ui::typed_char(ui.ctx()) } else { None };
                 let pre = mc.pre(ui.ctx(), id, doc_id, &mut doc.text, had_focus, self.editor_rect);
                 if pre.edited {
                     doc.on_edited();
                     edited = true;
                 }
                 scroll_to = scroll_to.or(pre.scroll_to);
+                let lpre = self.lsp.pre(ui.ctx(), id, doc, had_focus, mc.multi());
+                if lpre.edited {
+                    edited = true;
+                }
+                scroll_to = scroll_to.or(lpre.scroll_to);
+                let lsp = &mut self.lsp;
                 let scroll = if wrap { ScrollArea::vertical() } else { ScrollArea::both() };
                 let result = scroll
                     .id_salt(("kladd-scroll", doc_id, crate::panes::salt()))
@@ -1847,7 +2111,7 @@ impl KladdApp {
                         let lines = hl.newlines(&doc.text, &line_params) + 1;
                         let digits = lines.to_string().len().max(2) as f32;
                         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&num_font, '0'));
-                        let gutter_w = if line_numbers { digits * char_w + 40.0 } else { 22.0 };
+                        let gutter_w = if line_numbers { digits * char_w + 40.0 } else { 22.0 } + git_gutter.as_ref().map_or(0.0, |g| g.extra_width());
 
                         ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1866,6 +2130,9 @@ impl KladdApp {
                                 hl.galley(ui.ctx(), buf.as_str(), &params, if wrap { wrap_width } else { f32::INFINITY })
                             };
                             let avail_w = ui.available_width();
+                            if vim_on && vimui.hides_caret() {
+                                ui.visuals_mut().text_cursor.stroke.width = 0.0;
+                            }
                             let out = TextEdit::multiline(&mut doc.text)
                                 .id(id)
                                 .frame(Frame::NONE)
@@ -1878,10 +2145,20 @@ impl KladdApp {
                                 .show(ui);
 
                             if out.response.changed() {
+                                // Autokorrigering efter ett skrivet tecken (Markdown och vanlig text).
+                                if let Some(c) = ac_typed
+                                    && crate::autocorrect_ui::run_in_editor(ui.ctx(), id, &mut doc.text, ac_cfg, ac_lang, c)
+                                {
+                                    ui.ctx().request_repaint();
+                                }
                                 doc.on_edited();
                                 edited = true;
                             }
                             mc.post(ui, id, &doc.text, &out, font_size);
+                            lsp.post(ui, p, id, doc, &out, gutter);
+                            if vim_on {
+                                vimui.paint(ui, p, &out.galley, out.galley_pos, &doc.text, font_size);
+                            }
                             if focus {
                                 ui.memory_mut(|m| m.request_focus(id));
                             }
@@ -1904,6 +2181,9 @@ impl KladdApp {
                             for row in &galley.rows {
                                 let r = row.rect().translate(origin);
                                 let this = logical;
+                                if vim_on && r.bottom() >= ui.clip_rect().top() && r.top() <= ui.clip_rect().bottom() {
+                                    vim_vis = (vim_vis.0.min(this - 1), vim_vis.1.max(this - 1));
+                                }
                                 let is_start = starts_line;
                                 starts_line = row.ends_with_newline;
                                 if row.ends_with_newline {
@@ -1931,6 +2211,11 @@ impl KladdApp {
                                         color,
                                     );
                                 }
+                                if let Some(g) = &git_gutter {
+                                    if let Some(h) = g.row(ui, p, gutter, r, this - 1, is_start) {
+                                        git_hunk = Some(h);
+                                    }
+                                }
                             }
                             if let Some(c) = cur {
                                 if sel == 0 {
@@ -1942,15 +2227,46 @@ impl KladdApp {
                                 let r = galley.pos_from_cursor(CCursor::new(ci)).translate(origin);
                                 ui.scroll_to_rect(r.expand2(vec2(80.0, 60.0)), Some(Align::Center));
                             }
+                            if vim_lines != 0 {
+                                let rh = galley.rows.first().map_or(18.0, |r| r.rect().height());
+                                ui.scroll_with_delta(vec2(0.0, -(vim_lines as f32) * rh));
+                            } else if let Some(ci) = vim_scroll {
+                                let r = galley.pos_from_cursor(CCursor::new(ci)).translate(origin);
+                                ui.scroll_to_rect(r.expand2(vec2(40.0, 40.0)), None);
+                            }
                             (line, col, sel)
                         })
                         .inner
                     });
                 self.cursor = result.inner;
+                if let (Some(g), Some((idx, anchor))) = (&git_gutter, git_hunk) {
+                    self.git_open_hunk(g, idx, anchor);
+                }
+                if vim_on && vim_vis.0 != usize::MAX {
+                    self.vim_view = crate::vim::View { top: vim_vis.0, lines: vim_vis.1 - vim_vis.0 + 1 };
+                }
                 if edited {
                     self.find.current = None;
                 }
             });
+    }
+
+    /// Stora textfiler: den virtualiserade vyn (`bigtext`) i stället för `TextEdit`.
+    fn editor_big(&mut self, ui: &mut Ui, p: &Palette, matches: &[(usize, usize, bool)], focus: bool) {
+        let (font_size, line_numbers) = (self.settings.font_size, self.settings.line_numbers);
+        let doc = &mut self.docs[self.active];
+        let Some(view) = self.big.view(doc.id) else { return };
+        let o = crate::bigtext::Opts { id: editor_id(doc.id), palette: p, font_size, line_numbers, matches, focus };
+        let changed = view.show(ui, &mut doc.text, &o);
+        let (line, col) = view.line_col(&doc.text);
+        let (a, b) = view.selection();
+        // Stora markeringar räknas i byte (att räkna tecken i 100 MB varje bildruta vore för dyrt).
+        let sel = if b - a > 1_000_000 { b - a } else { doc.text.get(a..b).map_or(0, |t| t.chars().count()) };
+        self.cursor = (line + 1, col + 1, sel);
+        if changed {
+            doc.on_edited();
+            self.find.current = None;
+        }
     }
 
     // ---------------------------------------------------------------- delad vy
@@ -2236,6 +2552,9 @@ impl KladdApp {
                                 t("Inga träffar").to_owned()
                             } else if let Some(i) = current_idx {
                                 tf!("{i} av {n}", i = i + 1, n = matches.len())
+                            } else if results.partial {
+                                // Stor fil: sökningen pågår eller stannade vid taket.
+                                tf!("{n}+ träffar", n = matches.len())
                             } else {
                                 tf!("{n} träffar", n = matches.len())
                             };
@@ -2768,6 +3087,7 @@ impl KladdApp {
                 let note = new.open_note.take();
                 self.docs[idx] = new;
                 self.hl.forget(id);
+                self.big.forget(id);
                 self.word.forget(id);
                 self.find.open = false;
                 self.focus_editor = true;
@@ -3132,6 +3452,12 @@ impl KladdApp {
         let Some(doc) = self.docs.get_mut(idx) else { return };
         let doc_id = doc.id;
         let Some(tab) = doc.pdfv.as_deref_mut() else { return };
+        // Sidändringar skriver om hela filen och tar bort signaturerna: fråga först (en gång per bekräftelse).
+        let restructures = matches!(op, PdfOrgOp::Rotate { .. } | PdfOrgOp::Delete(_) | PdfOrgOp::Move { .. } | PdfOrgOp::InsertAt(_));
+        if restructures && !std::mem::take(&mut tab.org_confirmed) && tab.signature_count() > 0 {
+            tab.confirm_org = Some(op);
+            return;
+        }
         let (kind, pages) = match &op {
             PdfOrgOp::Extract(pages) => (0, pages.clone()),
             PdfOrgOp::InsertAt(at) => (1, vec![*at]),
@@ -3342,6 +3668,7 @@ pub(crate) fn menu_divider(ui: &mut Ui, p: &Palette) {
 /// En menyrad: valfri bock, etikett och kortkommando.
 pub(crate) fn menu_item(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, checked: Option<bool>, enabled: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     if !ui.is_rect_visible(rect) {
         return false;
     }
@@ -3379,6 +3706,7 @@ pub(crate) fn status_button(ui: &mut Ui, p: &Palette, text: &str, tooltip: &str)
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, p.muted);
     let size = vec2(galley.size().x + 14.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     let resp = resp.on_hover_text(crate::keys::shortcut(tooltip));
     let color = if resp.hovered() { p.text } else { p.muted };
     if resp.hovered() {
@@ -3428,11 +3756,17 @@ impl eframe::App for KladdApp {
         self.handle_incoming(ctx);
         self.update.tick(ctx, &mut self.settings);
         self.update_outs(ctx);
+        self.poll_big_loads(ctx);
+        if self.big.scanning() {
+            ctx.request_repaint();
+        }
         self.recovery.tick(ctx, &self.docs, self.settings.autosave_recovery);
         self.autosave_tick(ctx);
+        self.lsp_tick(ctx);
         if self.docs.get(self.active).map(|d| d.id) != self.last_active_id {
             self.last_active_id = self.docs.get(self.active).map(|d| d.id);
             self.find.current = None;
+            self.csv.retain_docs(self.docs.iter().map(|d| d.id));
         }
     }
 
@@ -3442,6 +3776,7 @@ impl eframe::App for KladdApp {
 
         self.sync_panes();
         self.handle_dialogs(&ctx);
+        self.big.show_progress(&ctx, &p);
         self.handle_drops(&ctx);
         self.handle_shortcuts(&ctx);
         self.pdf_sync_fullscreen(&ctx);
@@ -3456,7 +3791,9 @@ impl eframe::App for KladdApp {
         self.top_bar(ui, &p);
         self.word_bar(ui, &p);
         self.pdf_bar(ui, &p);
+        self.git_tick(&ctx);
         self.status_bar(ui, &p);
+        self.lsp_panel(ui, &p);
         self.update.banner(ui, &ctx, &p, &mut self.settings);
         self.find_files_panel(ui, &p);
         self.pdf_sidebar(ui, &p);
@@ -3466,14 +3803,20 @@ impl eframe::App for KladdApp {
         self.central(ui, &p);
         self.find_bar(&ctx, &p);
         self.quick_open_popup(&ctx, &p);
+        self.command_palette(&ctx, &p);
+        self.settings_window(&ctx, &p);
         self.workspace_dialogs(&ctx, &p);
+        self.git_dialogs(&ctx, &p);
+        self.lsp_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
+        self.autocorrect_dialog(&ctx);
         self.close_dialog(&ctx, &p);
         self.recovery_dialog(&ctx, &p);
         self.update.dialogs(&ctx, &p, &mut self.settings);
         self.update_outs(&ctx);
         self.docx_dialog(&ctx, &p);
         self.history_dialog(&ctx, &p);
+        self.templates_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);
@@ -3485,6 +3828,7 @@ impl eframe::App for KladdApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.lsp.shutdown();
         self.recovery.shutdown(&self.docs);
         if self.owns_socket {
             single::cleanup();

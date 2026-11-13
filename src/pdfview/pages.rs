@@ -141,6 +141,10 @@ pub fn run(ctx: &egui::Context, tab: &mut PdfTab, op: &OrgOp) -> Result<String, 
             Ok(String::new())
         }
         OrgOp::Undo | OrgOp::Redo => {
+            // Ctrl+Z ångrar först senaste ändringen av en anteckning.
+            if *op == OrgOp::Undo && tab.view.annot.has_pending() && tab.view.annot.undo() {
+                return Ok(String::new());
+            }
             // Äldre versioner saknar de osparade anteckningarna och fältvärdena, som annars skulle försvinna.
             if tab.view.annot.has_pending() || tab.view.forms.dirty() {
                 return Err(t("Spara först: det finns osparade anteckningar eller formulärvärden.").to_owned());

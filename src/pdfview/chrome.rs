@@ -59,6 +59,7 @@ pub enum Action {
 enum SideTab {
     Thumbs,
     Outline,
+    Comments,
 }
 
 /// Sökfältets tillstånd.
@@ -98,6 +99,12 @@ pub struct PdfTab {
     pub ocr: super::ocr::OcrState,
     /// Anteckningsverktygen (annot.rs) visas under verktygsraden.
     pub annotate: bool,
+    /// Antal signaturer (cache, nollas när bytes ändras).
+    pub signatures: Option<usize>,
+    /// Sidändring som väntar på bekräftelse eftersom PDF:en är signerad.
+    pub confirm_org: Option<OrgOp>,
+    /// Bekräftelsen är given: nästa sidändring frågar inte igen.
+    pub org_confirmed: bool,
 }
 
 impl PdfTab {
@@ -106,20 +113,46 @@ impl PdfTab {
         self.pages_changed || self.view.annot.has_pending() || self.view.forms.dirty()
     }
 
-    /// PDF:en med alla osparade ändringar: sidändringarna finns redan i visarens bytes,
-    /// formulärvärden och anteckningar läggs på här (objektnumren behålls, så ordningen spelar ingen roll).
+    /// PDF:en med alla osparade ändringar: sidändringarna finns redan i visarens bytes, formulärvärden och
+    /// anteckningar läggs på här som EN inkrementell uppdatering sist i filen (originalets bytes och
+    /// därmed signaturer rörs inte). Krypterade filer skrivs i stället om avkrypterade.
     pub fn edited_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut out = self.view.bytes().as_ref().clone();
-        if self.view.forms.dirty() {
-            // Formulär visas bara för okrypterade PDF:er.
-            out = crate::pdfview::forms::apply(&out, None, &self.view.forms.changes())?;
+        let bytes = self.view.bytes();
+        let forms = self.view.forms.dirty().then(|| self.view.forms.changes());
+        let annots = self.view.annot.has_pending().then(|| self.view.annot.pending());
+        if forms.is_none() && annots.is_none() {
+            return Ok(bytes.as_ref().clone());
         }
-        if self.view.annot.has_pending() {
-            // Efter sidändringar är bytes redan avkrypterade och lösenordet behövs inte.
-            let pw = if self.pages_changed { None } else { self.password.as_deref() };
-            out = crate::pdfview::annot::apply(&out, pw, self.view.annot.pending())?;
+        // Efter sidändringar är bytes redan avkrypterade och lösenordet behövs inte.
+        let pw = if self.pages_changed { None } else { self.password.as_deref() };
+        let inc = super::incremental::edit(bytes, pw, |doc| {
+            if let Some(v) = &forms {
+                super::forms::apply_doc(doc, v)?;
+            }
+            if let Some(a) = annots {
+                super::annot::apply_doc(doc, a, self.view.annot.ex.edits());
+            }
+            Ok(())
+        });
+        if let Ok(Some(out)) = inc {
+            return Ok(out);
+        }
+        // Krypterad (eller ovanlig) fil: skriv om hela filen.
+        let mut out = bytes.as_ref().clone();
+        if let Some(v) = forms {
+            // Formulär visas bara för okrypterade PDF:er.
+            out = super::forms::apply(&out, None, &v)?;
+        }
+        if let Some(a) = annots {
+            out = super::annot::apply_all(&out, pw, a, self.view.annot.ex.edits())?;
         }
         Ok(out)
+    }
+
+    /// Antal digitala signaturer i visarens PDF (läses första gången och sparas tills filen ändras).
+    pub fn signature_count(&mut self) -> usize {
+        let (bytes, pw) = (self.view.bytes().clone(), self.password.clone());
+        *self.signatures.get_or_insert_with(|| super::incremental::signature_count(&bytes, pw.as_deref()))
     }
 
     /// Efter en lyckad sparning: inga ändringar kvar.
@@ -131,6 +164,8 @@ impl PdfTab {
 
     pub fn new(mut view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
         view.forms = super::forms::FormState::load(view.bytes(), password.as_deref());
+        let bytes = view.bytes().clone();
+        view.annot.ex.load(&bytes, password.as_deref());
         let has_outline = !view.meta().outline.is_empty();
         Self {
             view,
@@ -153,17 +188,23 @@ impl PdfTab {
             org: OrgState::default(),
             ocr: Default::default(),
             annotate: false,
+            signatures: None,
+            confirm_org: None,
+            org_confirmed: false,
         }
     }
 
     /// Läser formulärfälten på nytt ur visarens bytes (efter sparning eller omläsning).
     pub fn reload_forms(&mut self) {
+        self.signatures = None;
         self.view.forms = super::forms::FormState::load(self.view.bytes(), self.password.as_deref());
+        let bytes = self.view.bytes().clone();
+        self.view.annot.ex.load(&bytes, self.password.as_deref());
     }
 
     /// Är någon dialog öppen (då ska kortkommandon vänta)?
     pub fn dialog_open(&self) -> bool {
-        self.props || self.confirm_edit || self.confirm_uri.is_some()
+        self.props || self.confirm_edit || self.confirm_uri.is_some() || self.confirm_org.is_some()
     }
 
     pub fn open_find(&mut self) {
@@ -618,6 +659,7 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 let btn = egui::Button::new(label).fill(if on { p.accent.gamma_multiply(0.16) } else { Color32::TRANSPARENT }).stroke(Stroke::NONE);
                 if ui.add(btn).on_hover_text(t("Överstryk, understryk, skriv anteckningar och rita i PDF:en")).clicked() {
                     tab.annotate = !on;
+                    tab.view.annot.ex.set_active(!on);
                     if on {
                         tab.view.annot.tool = None;
                     }
@@ -725,7 +767,11 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
     }
     let ctx = ui.ctx().clone();
     let has_outline = !tab.view.meta().outline.is_empty();
-    if !has_outline {
+    if !has_outline && tab.side_tab == SideTab::Outline {
+        tab.side_tab = SideTab::Thumbs;
+    }
+    let has_comments = tab.view.annot.ex.visible().next().is_some() || !tab.view.annot.pending().is_empty();
+    if !has_comments && tab.side_tab == SideTab::Comments {
         tab.side_tab = SideTab::Thumbs;
     }
     let width = ui.available_width();
@@ -743,11 +789,19 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 if has_outline && side_tab_button(ui, p, t("Innehåll"), tab.side_tab == SideTab::Outline).clicked() {
                     tab.side_tab = SideTab::Outline;
                 }
+                if has_comments && side_tab_button(ui, p, t("Kommentarer"), tab.side_tab == SideTab::Comments).clicked() {
+                    tab.side_tab = SideTab::Comments;
+                }
             });
             ui.add_space(8.0);
             match tab.side_tab {
                 SideTab::Thumbs => act = thumbnails(ui, p, tab, &ctx).map(Action::Organize),
                 SideTab::Outline => outline(ui, p, tab),
+                SideTab::Comments => {
+                    if let Some((page, y)) = crate::pdfview::annot_edit::comments_ui(ui, p, &mut tab.view.annot) {
+                        tab.view.go_to(&crate::pdfview::meta::Dest { page, y: Some((y - 40.0).max(0.0)) });
+                    }
+                }
             }
         });
     act
@@ -1200,6 +1254,38 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
             None => {}
         }
     }
+    if let Some(op) = tab.confirm_org.clone() {
+        let mut choice = None;
+        let m = modal(ctx, p, "kladd-pdf-org-signed").show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(RichText::new(t("Att ordna sidor tar bort signaturerna")).font(FontId::new(17.0, theme::semibold())).color(p.text));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(t("PDF:en är digitalt signerad. Ändrade sidor skrivs om hela filen, och då slutar signaturerna att gälla. Anteckningar och ifyllda fält påverkar inte signaturerna. Originalfilen ändras inte förrän du sparar."))
+                    .color(p.muted),
+            );
+            ui.add_space(22.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui.add(accent_button(p, t("Fortsätt"), 92.0)).clicked() {
+                    choice = Some(true);
+                }
+                if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if m.should_close() && choice.is_none() {
+            choice = Some(false);
+        }
+        if let Some(go) = choice {
+            tab.confirm_org = None;
+            if go {
+                tab.org_confirmed = true;
+                out = Some(Action::Organize(op));
+            }
+        }
+    }
     if let Some(uri) = tab.confirm_uri.clone() {
         let mut choice = None;
         let m = modal(ctx, p, "kladd-pdf-uri").show(ctx, |ui| {
@@ -1230,6 +1316,7 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
         }
     }
     if tab.props {
+        let _ = tab.signature_count();
         let mut close = false;
         let m = modal(ctx, p, "kladd-pdf-props").show(ctx, |ui| {
             ui.set_width(460.0);
@@ -1283,6 +1370,11 @@ fn property_rows(tab: &PdfTab, path: Option<&Path>) -> Vec<(&'static str, String
     rows.push((t("Sidstorlek"), page_size_text(size.width, size.height)));
     rows.push((t("Antal sidor"), tab.view.page_count().to_string()));
     rows.push((t("Filstorlek"), format_size(tab.view.bytes().len() as u64)));
+    match tab.signatures.unwrap_or(0) {
+        0 => {}
+        1 => rows.push((t("Signerad"), t("ja (1 signatur)").to_owned())),
+        n => rows.push((t("Signerad"), tf!("ja ({n} signaturer)", n = n))),
+    }
     if let Some(p) = path {
         rows.push((t("Plats"), p.display().to_string()));
     }

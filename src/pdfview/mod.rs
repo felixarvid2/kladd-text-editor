@@ -2,9 +2,11 @@
 #![allow(dead_code)]
 
 pub mod annot;
+pub mod annot_edit;
 pub mod chrome;
 pub mod engine;
 pub mod forms;
+pub mod incremental;
 pub mod meta;
 pub mod organize;
 pub mod pages;

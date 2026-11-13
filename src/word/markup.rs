@@ -91,8 +91,21 @@ pub struct Piece {
     pub align: Align,
     /// Spårad ändring (`<ins>`/`<del>`) som biten ligger i.
     pub rev: Option<RevMark>,
+    /// Spårad teckenformatering (`<fmt>`) som biten ligger i (slaget är `Fmt`).
+    pub fmt: Option<RevMark>,
+    /// Biten är en stycke- eller radbrytningsmarkör `<!--k:pm …-->` (dold, `markup: true`).
+    pub pmark: Option<RevMark>,
     /// Kommentarstråden (rotkommentarens nummer) vars område biten ligger i.
     pub comment: Option<u32>,
+    /// `Some` för innehållet i en formel `$…$`/`$$…$$` (avgränsarna är `markup`).
+    pub math: Option<MathRef>,
+}
+
+/// En formel i texten: LaTeX-koden och om den står på egen rad (`$$`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathRef {
+    pub src: String,
+    pub display: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,7 +178,10 @@ struct St {
     span: Option<u32>,
     align: Align,
     rev: Option<RevMark>,
+    fmt: Option<RevMark>,
+    pmark: Option<RevMark>,
     comment: Option<u32>,
+    math: Option<u32>,
 }
 
 impl Default for St {
@@ -187,7 +203,10 @@ impl Default for St {
             span: None,
             align: Align::Left,
             rev: None,
+            fmt: None,
+            pmark: None,
             comment: None,
+            math: None,
         }
     }
 }
@@ -272,6 +291,7 @@ fn parse(text: &str) -> Parsed {
     let mut in_code_block = false;
     let mut last_text_end = 0usize;
     let mut labels: Vec<String> = Vec::new();
+    let mut maths: Vec<MathRef> = Vec::new();
 
     let opts = FOOTNOTE_OPTS;
     for (ev, r) in Parser::new_ext(text, opts).into_offset_iter() {
@@ -397,6 +417,21 @@ fn parse(text: &str) -> Parsed {
                     fill(&mut st, r.start..r.start + 2, |s| s.markup = true);
                     fill(&mut st, r.start + 2..r.end - 1, |s| s.fnref = Some(idx));
                     fill(&mut st, r.end - 1..r.end, |s| s.markup = true);
+                }
+            }
+            Event::InlineMath(_) | Event::DisplayMath(_) => {
+                // `$…$` på en rad som går att tolka: avgränsarna är markup, innehållet ritas som formel.
+                let d = tb[r.clone()].iter().take_while(|c| **c == b'$').count().min(2);
+                if r.len() > 2 * d && d > 0 && !text[r.start + d..r.end - d].contains('\n') {
+                    let src = text[r.start + d..r.end - d].trim().to_owned();
+                    let display = d == 2;
+                    if crate::math::formula(&src, display).is_some() {
+                        maths.push(MathRef { src, display });
+                        let idx = (maths.len() - 1) as u32;
+                        fill(&mut st, r.start..r.start + d, |s| s.markup = true);
+                        fill(&mut st, r.end - d..r.end, |s| s.markup = true);
+                        fill(&mut st, r.start + d..r.end - d, |s| s.math = Some(idx));
+                    }
                 }
             }
             Event::Code(_) => {
@@ -549,14 +584,14 @@ fn parse(text: &str) -> Parsed {
         match cur {
             Some((_, s)) if s == st[i] => {}
             Some((start, s)) => {
-                pieces.push(make_piece(start..i, &s, &images, &styles, &labels));
+                pieces.push(make_piece(start..i, &s, &images, &styles, &labels, &maths));
                 cur = Some((i, st[i]));
             }
             None => cur = Some((i, st[i])),
         }
     }
     if let Some((start, s)) = cur {
-        pieces.push(make_piece(start..n, &s, &images, &styles, &labels));
+        pieces.push(make_piece(start..n, &s, &images, &styles, &labels, &maths));
     }
     Parsed { pieces, spans, hspans, defaults }
 }
@@ -573,7 +608,19 @@ fn mark_review(text: &str, st: &mut [St]) {
         let color = sc.rev_rec(r.id).map_or(0, |x| crate::review::author_color_index(&authors, &x.author));
         fill(st, r.open.clone(), |s| s.markup = true);
         fill(st, r.close.clone(), |s| s.markup = true);
-        fill(st, r.inner(), |s| s.rev = Some(RevMark { kind: r.kind, id: r.id, color }));
+        let mark = Some(RevMark { kind: r.kind, id: r.id, color });
+        if r.kind == crate::review::RevKind::Fmt {
+            fill(st, r.inner(), |s| s.fmt = mark);
+        } else {
+            fill(st, r.inner(), |s| s.rev = mark);
+        }
+    }
+    for m in &sc.pmarks {
+        let color = sc.rev_rec(m.id).map_or(0, |x| crate::review::author_color_index(&authors, &x.author));
+        fill(st, m.range.clone(), |s| {
+            s.markup = true;
+            s.pmark = Some(RevMark { kind: m.kind, id: m.id, color });
+        });
     }
     for c in &sc.comments {
         let thread = sc.comment_rec(c.id).map_or(c.id, |x| x.parent.unwrap_or(x.id));
@@ -591,7 +638,7 @@ fn mark_review(text: &str, st: &mut [St]) {
     }
 }
 
-fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>], labels: &[String]) -> Piece {
+fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<SpanStyle>], labels: &[String], maths: &[MathRef]) -> Piece {
     Piece {
         range,
         block: s.block,
@@ -610,7 +657,10 @@ fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<Sp
         span: s.span.and_then(|i| styles.get(i as usize).cloned()),
         align: s.align,
         rev: s.rev,
+        fmt: s.fmt,
+        pmark: s.pmark,
         comment: s.comment,
+        math: s.math.and_then(|i| maths.get(i as usize).cloned()),
     }
 }
 
@@ -778,6 +828,11 @@ fn mark_table(text: &str, st: &mut [St], r: &Range<usize>) {
         idx += 1;
         pos = le + 1;
     }
+}
+
+/// Bitarna för en text som börjar vid en styckegräns (för den inkrementella analysen, se `incr`).
+pub(super) fn pieces_of(text: &str) -> Vec<Piece> {
+    parse(text).pieces
 }
 
 pub fn analyze(text: &str) -> Analysis {
@@ -2974,7 +3029,8 @@ pub fn set_align(text: &str, sel: Range<usize>, align: Align) -> Edit {
 pub const FOOTNOTE_OPTS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
-    .union(Options::ENABLE_FOOTNOTES);
+    .union(Options::ENABLE_FOOTNOTES)
+    .union(Options::ENABLE_MATH);
 
 /// Etikettens intervall och slutet på `]:` för definitionen som börjar på `start` (`[^etikett]:`).
 fn def_label(text: &str, start: usize) -> Option<(Range<usize>, usize)> {

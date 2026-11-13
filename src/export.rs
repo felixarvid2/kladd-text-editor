@@ -35,7 +35,7 @@ enum Mode {
 }
 
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_FOOTNOTES
+    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_FOOTNOTES | Options::ENABLE_MATH
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,8 +142,9 @@ pub fn epub(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>
     let mut manifest = String::new();
     manifest.push_str("<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n");
     manifest.push_str("<item id=\"css\" href=\"style.css\" media-type=\"text/css\"/>\n");
-    for (name, id, _) in &files {
-        manifest.push_str(&format!("<item id=\"{id}\" href=\"{name}\" media-type=\"application/xhtml+xml\"/>\n"));
+    for (name, id, xhtml) in &files {
+        let props = if xhtml.contains("<math ") { " properties=\"mathml\"" } else { "" };
+        manifest.push_str(&format!("<item id=\"{id}\" href=\"{name}\" media-type=\"application/xhtml+xml\"{props}/>\n"));
     }
     for (i, f) in imgs.files.iter().enumerate() {
         manifest.push_str(&format!(
@@ -474,6 +475,16 @@ fn map_events<'a>(
                     out.push(Event::Html(CowStr::from(format!("{TOC_MARK}\n"))));
                 } else {
                     out.push(ev.clone());
+                }
+            }
+            // Formler blir MathML; går LaTeX-koden inte att tolka visas den som text.
+            Event::InlineMath(t) | Event::DisplayMath(t) => {
+                let display = matches!(ev, Event::DisplayMath(_));
+                match crate::math::parse::parse(t.trim()) {
+                    Ok(nodes) if !nodes.is_empty() => {
+                        out.push(Event::InlineHtml(CowStr::from(crate::math::mathml::math_element(&nodes, display))));
+                    }
+                    _ => out.push(Event::Text(CowStr::from(format!("{}{}{}", if display { "$$" } else { "$" }, t, if display { "$$" } else { "$" })))),
                 }
             }
             Event::Start(Tag::BlockQuote(_) | Tag::List(_) | Tag::Item) => {

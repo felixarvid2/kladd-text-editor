@@ -4,7 +4,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod autocorrect;
+mod autocorrect_ui;
+mod csv;
 mod autosave;
+mod bigfiles;
+mod bigtext;
 mod doc;
 mod docx;
 mod docx_styles;
@@ -17,6 +22,7 @@ mod pdf_read;
 mod pdf_write;
 mod pdfview;
 mod search;
+mod settings_ui;
 mod preview;
 mod print;
 mod recovery;
@@ -27,19 +33,31 @@ mod history_ui;
 mod i18n;
 mod icons;
 mod keys;
+mod lsp;
 mod macopen;
+mod menubar;
+mod math;
 mod multicursor;
+mod palette;
+mod vim;
+mod vim_ui;
 mod paste;
 mod panes;
 mod platform;
 mod single;
 mod spell;
 mod style;
+mod templates;
+mod templates_ui;
 mod theme;
 mod update;
 mod word;
 mod workspace;
 mod find_files;
+mod git;
+mod git_ui;
+#[cfg(test)]
+mod corpus_tests;
 
 use std::path::PathBuf;
 
@@ -130,3 +148,6 @@ fn percent_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+#[cfg(test)]
+mod bigbench;

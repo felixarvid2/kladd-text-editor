@@ -1,0 +1,26 @@
+//! Engelska texter för Vim-läget (`vim.rs`, `vim_ui.rs` och menyvalet i `app.rs`).
+
+pub const EN: &[(&str, &str)] = &[
+    ("Vim-läge", "Vim Mode"),
+    ("-- INFOGA --", "-- INSERT --"),
+    ("-- MARKERA --", "-- VISUAL --"),
+    ("-- MARKERA RAD --", "-- VISUAL LINE --"),
+    ("-- MARKERA BLOCK --", "-- VISUAL BLOCK --"),
+    ("-- ERSÄTT --", "-- REPLACE --"),
+    ("registrerar @{reg}", "recording @{reg}"),
+    ("1 ersättning på 1 rad", "1 substitution on 1 line"),
+    ("{subs} ersättningar på {lines} rader", "{subs} substitutions on {lines} lines"),
+    ("E20: Markeringen är inte satt", "E20: Mark not set"),
+    ("E32: Inget filnamn", "E32: No file name"),
+    ("E35: Inget tidigare reguljärt uttryck", "E35: No previous regular expression"),
+    ("E146: Ogiltig avgränsare för :s", "E146: Invalid delimiter for :s"),
+    ("E353: Registret är tomt", "E353: Nothing in register"),
+    ("E383: Ogiltigt sökmönster: {e}", "E383: Invalid search pattern: {e}"),
+    ("E486: Hittade inte mönstret: {pat}", "E486: Pattern not found: {pat}"),
+    ("E492: Okänt kommando: {cmd}", "E492: Not an editor command: {cmd}"),
+    ("E518: Okänd inställning: {opt}", "E518: Unknown option: {opt}"),
+    ("E521: Talet behövs efter =: {opt}", "E521: Number required after =: {opt}"),
+    ("Redan äldsta ändringen", "Already at oldest change"),
+    ("Redan nyaste ändringen", "Already at newest change"),
+    ("E37: Ändringar sparades inte (lägg till ! för att strunta i dem)", "E37: No write since last change (add ! to override)"),
+];

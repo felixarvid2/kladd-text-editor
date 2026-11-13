@@ -456,6 +456,9 @@ impl KladdApp {
             // I dokumentläget är Ctrl+E "centrera"; där finns snabböppna bara i menyn.
             self.open_quick(ctx);
         }
+        if hit(ctrl | Modifiers::SHIFT, Key::G) {
+            self.git_shortcut(ctx);
+        }
         if hit(ctrl | Modifiers::SHIFT, Key::F) {
             self.open_find_files(ctx);
         }
@@ -580,6 +583,7 @@ impl KladdApp {
         let mut close = false;
         let mut pick = false;
         let mut hidden = self.settings.workspace_hidden;
+        let mut scm_actions = Vec::new();
 
         Panel::left("kladd-workspace")
             .resizable(true)
@@ -606,6 +610,26 @@ impl KladdApp {
                     });
                 });
                 ui.add_space(6.0);
+                // Med git och ett arkiv: växla mellan filträdet och källkontrollpanelen.
+                if self.git.repo().is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        if chip(ui, p, t("Filer"), !self.git.scm, t("Visa filträdet")).clicked() {
+                            self.git.scm = false;
+                        }
+                        let n = self.git.repo().map_or(0, |s| s.status.files.len());
+                        let label = if n > 0 { tf!("Källkontroll {n}", n = n) } else { t("Källkontroll").to_owned() };
+                        if chip(ui, p, &label, self.git.scm, t("Visa källkontroll (Ctrl+Shift+G)")).clicked() {
+                            self.git.scm = true;
+                            self.git.bump();
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if self.git.scm {
+                        scm_actions = self.git.scm_ui(ui, p);
+                        return;
+                    }
+                }
                 let mut rows: Vec<(usize, &Entry)> = Vec::new();
                 flatten(&self.ws.children, &self.ws.expanded, &root, 0, &mut rows);
                 // Bakgrunden läggs först så att raderna hamnar ovanpå och tar sina egna klick.
@@ -614,7 +638,8 @@ impl KladdApp {
                 let out = area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for &(depth, e) in &rows[range] {
-                        tree_row(ui, p, depth, e, self.ws.expanded.contains(&e.path), active_path.as_deref(), &mut actions);
+                        let mark = self.git.tree_mark(&root, &e.path, e.is_dir, p);
+                        tree_row(ui, p, depth, e, self.ws.expanded.contains(&e.path), active_path.as_deref(), mark, &mut actions);
                     }
                 });
                 if rows.is_empty() {
@@ -653,6 +678,7 @@ impl KladdApp {
         for a in actions {
             self.workspace_action(&ctx, a);
         }
+        self.git_apply(&ctx, scm_actions);
     }
 
     fn workspace_action(&mut self, ctx: &egui::Context, a: Action) {
@@ -944,6 +970,7 @@ impl KladdApp {
                                 None => ("", full.as_str()),
                             };
                             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, full));
                             if row == q.selected {
                                 ui.painter().rect_filled(rect, 6.0, p.selection);
                             } else if resp.hovered() {
@@ -989,8 +1016,10 @@ impl KladdApp {
     }
 }
 
-fn tree_row(ui: &mut Ui, p: &Palette, depth: usize, e: &Entry, open: bool, active: Option<&Path>, actions: &mut Vec<Action>) {
+/// `git`: bokstav (bara för filer) och färg från Git-status.
+fn tree_row(ui: &mut Ui, p: &Palette, depth: usize, e: &Entry, open: bool, active: Option<&Path>, git: Option<(Option<char>, Color32)>, actions: &mut Vec<Action>) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &e.name));
     let is_active = !e.is_dir && active == Some(e.path.as_path());
     if is_active {
         ui.painter().rect_filled(rect, 5.0, p.selection);
@@ -1016,8 +1045,23 @@ fn tree_row(ui: &mut Ui, p: &Palette, depth: usize, e: &Entry, open: bool, activ
         Align2::LEFT_CENTER,
         &e.name,
         FontId::new(13.0, FontFamily::Proportional),
-        if is_active { p.text } else if e.is_dir { p.text } else { p.muted.gamma_multiply(1.0) },
+        match git {
+            Some((_, c)) => c,
+            None if is_active || e.is_dir => p.text,
+            None => p.muted,
+        },
     );
+    if let Some((letter, color)) = git {
+        let at = pos2(rect.right() - 10.0, rect.center().y);
+        match letter {
+            Some(l) => {
+                painter.text(at, Align2::CENTER_CENTER, l.to_string(), FontId::new(11.5, theme::semibold()), color);
+            }
+            None => {
+                painter.circle_filled(at, 3.0, color);
+            }
+        }
+    }
     if resp.clicked() {
         actions.push(if e.is_dir { Action::Toggle(e.path.clone()) } else { Action::Open(e.path.clone()) });
     }

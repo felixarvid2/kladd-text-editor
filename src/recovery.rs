@@ -95,7 +95,7 @@ impl Snapshot {
 
 fn content_hash(doc: &Document) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    doc.text.hash(&mut h);
+    crate::doc::hash_text(&doc.text).hash(&mut h);
     (doc.encoding as u8).hash(&mut h);
     (doc.line_ending as u8).hash(&mut h);
     doc.images.len().hash(&mut h);

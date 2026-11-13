@@ -18,10 +18,18 @@ use std::ops::Range;
 
 use crate::word::markup::Edit;
 
+pub mod fmt;
+pub mod para;
+#[cfg(test)]
+mod track2_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RevKind {
     Ins,
     Del,
+    /// Formateringsändring: `<fmt data-k="5">text</fmt>` (teckenformat) eller, som styckemarkering,
+    /// `<!--k:pm fmt 5-->` (styckeformat). Det gamla formatet står i postradens `old`.
+    Fmt,
 }
 
 impl RevKind {
@@ -29,6 +37,7 @@ impl RevKind {
         match self {
             RevKind::Ins => "ins",
             RevKind::Del => "del",
+            RevKind::Fmt => "fmt",
         }
     }
 }
@@ -39,6 +48,9 @@ pub struct RevRec {
     pub id: u32,
     pub author: String,
     pub date: String,
+    /// Det som gällde före ändringen när det inte framgår av texten: för en formateringsändring det
+    /// gamla formatet (se `review::fmt`).
+    pub old: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -84,9 +96,21 @@ impl CommentSpan {
     }
 }
 
+/// Stycke- eller radbrytningsmarkör `<!--k:pm ins 5-->`, `<!--k:pm del 5-->` eller `<!--k:pm fmt 5-->`
+/// (`n` = antal infogade radbrytningar, bara för `ins` skapad av Kladd). Den står sist på raden,
+/// direkt före radbrytningen, och gäller den (för `fmt`: stycket raden hör till).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PMark {
+    pub kind: RevKind,
+    pub id: u32,
+    pub n: Option<u32>,
+    pub range: Range<usize>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scan {
     pub revs: Vec<RevSpan>,
+    pub pmarks: Vec<PMark>,
     pub comments: Vec<CommentSpan>,
     pub rev_recs: Vec<(RevRec, Range<usize>)>,
     pub comment_recs: Vec<(CommentRec, Range<usize>)>,
@@ -144,7 +168,41 @@ fn unesc(s: &str) -> String {
 }
 
 pub fn rev_line(r: &RevRec) -> String {
-    format!("<!--k:r id=\"{}\" author=\"{}\" date=\"{}\"-->", r.id, esc(&r.author), esc(&r.date))
+    match &r.old {
+        Some(o) => format!("<!--k:r id=\"{}\" author=\"{}\" date=\"{}\" old=\"{}\"-->", r.id, esc(&r.author), esc(&r.date), esc(o)),
+        None => format!("<!--k:r id=\"{}\" author=\"{}\" date=\"{}\"-->", r.id, esc(&r.author), esc(&r.date)),
+    }
+}
+
+/// Markören för en stycke- eller radbrytning.
+pub fn pmark_text(kind: RevKind, id: u32, n: Option<u32>) -> String {
+    match n {
+        Some(n) => format!("<!--k:pm {} {id} n={n}-->", kind.tag()),
+        None => format!("<!--k:pm {} {id}-->", kind.tag()),
+    }
+}
+
+/// `<!--k:pm ins 5-->` i början av `s`: slag, nummer, antal och längd.
+fn parse_pmark(s: &str) -> Option<(RevKind, u32, Option<u32>, usize)> {
+    let r = s.strip_prefix("<!--k:pm ")?;
+    let (kind, r) = if let Some(r) = r.strip_prefix("ins ") {
+        (RevKind::Ins, r)
+    } else if let Some(r) = r.strip_prefix("del ") {
+        (RevKind::Del, r)
+    } else {
+        (RevKind::Fmt, r.strip_prefix("fmt ")?)
+    };
+    let end = r.find("-->")?;
+    let mut parts = r[..end].split(' ');
+    let id: u32 = parts.next()?.parse().ok()?;
+    let n = match parts.next() {
+        Some(x) => Some(x.strip_prefix("n=")?.parse().ok()?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((kind, id, n, s.len() - r.len() + end + 3))
 }
 
 pub fn comment_line(c: &CommentRec) -> String {
@@ -179,7 +237,12 @@ fn attrs(s: &str) -> HashMap<String, String> {
 fn parse_rev_line(line: &str) -> Option<RevRec> {
     let body = line.strip_prefix("<!--k:r ")?.strip_suffix("-->")?;
     let a = attrs(body);
-    Some(RevRec { id: a.get("id")?.parse().ok()?, author: a.get("author").cloned().unwrap_or_default(), date: a.get("date").cloned().unwrap_or_default() })
+    Some(RevRec {
+        id: a.get("id")?.parse().ok()?,
+        author: a.get("author").cloned().unwrap_or_default(),
+        date: a.get("date").cloned().unwrap_or_default(),
+        old: a.get("old").cloned(),
+    })
 }
 
 fn parse_comment_line(line: &str) -> Option<CommentRec> {
@@ -201,6 +264,8 @@ fn parse_open(s: &str) -> Option<(RevKind, u32, usize)> {
         RevKind::Ins
     } else if s.starts_with("<del ") {
         RevKind::Del
+    } else if s.starts_with("<fmt ") {
+        RevKind::Fmt
     } else {
         return None;
     };
@@ -216,9 +281,15 @@ pub fn parse_open_tag(s: &str) -> Option<(RevKind, u32)> {
     (len == s.len()).then_some((kind, id))
 }
 
-/// `</ins>` eller `</del>`.
+/// Exakt en markör `<!--k:pm ins 5-->` (hela strängen): slag och nummer.
+pub fn parse_pmark_exact(s: &str) -> Option<(RevKind, u32)> {
+    let (kind, id, _, len) = parse_pmark(s)?;
+    (len == s.len()).then_some((kind, id))
+}
+
+/// `</ins>`, `</del>` eller `</fmt>`.
 pub fn is_close_tag(s: &str) -> bool {
-    s == "</ins>" || s == "</del>"
+    s == "</ins>" || s == "</del>" || s == "</fmt>"
 }
 
 /// `<!--k:c:N-->` (true) eller `<!--k:/c:N-->` (false) exakt.
@@ -245,11 +316,15 @@ pub fn is_record_line(line: &str) -> bool {
 /// Letar upp ändringar, områden och poster. Kodblock hoppas över.
 pub fn scan(text: &str) -> Scan {
     let mut out = Scan::default();
-    if !text.contains("<!--k:") && !text.contains("<ins ") && !text.contains("<del ") {
+    if !text.contains("<!--k:") && !text.contains("<ins ") && !text.contains("<del ") && !text.contains("<fmt ") {
         return out;
     }
-    let mut ins_stack: Vec<(u32, Range<usize>)> = Vec::new();
-    let mut del_stack: Vec<(u32, Range<usize>)> = Vec::new();
+    let mut stacks: [Vec<(u32, Range<usize>)>; 3] = Default::default();
+    let slot = |k: RevKind| match k {
+        RevKind::Ins => 0,
+        RevKind::Del => 1,
+        RevKind::Fmt => 2,
+    };
     let mut open_c: HashMap<u32, Range<usize>> = HashMap::new();
     let mut in_fence: Option<char> = None;
     let mut off = 0usize;
@@ -286,16 +361,23 @@ pub fn scan(text: &str) -> Scan {
             let rest = &t[p..];
             let at = ls + p;
             if let Some((kind, id, len)) = parse_open(rest) {
-                let st = if kind == RevKind::Ins { &mut ins_stack } else { &mut del_stack };
-                st.push((id, at..at + len));
+                stacks[slot(kind)].push((id, at..at + len));
                 i = p + len;
-            } else if rest.starts_with("</ins>") || rest.starts_with("</del>") {
-                let kind = if rest.starts_with("</ins>") { RevKind::Ins } else { RevKind::Del };
-                let st = if kind == RevKind::Ins { &mut ins_stack } else { &mut del_stack };
-                if let Some((id, open)) = st.pop() {
+            } else if rest.starts_with("</ins>") || rest.starts_with("</del>") || rest.starts_with("</fmt>") {
+                let kind = if rest.starts_with("</ins>") {
+                    RevKind::Ins
+                } else if rest.starts_with("</del>") {
+                    RevKind::Del
+                } else {
+                    RevKind::Fmt
+                };
+                if let Some((id, open)) = stacks[slot(kind)].pop() {
                     out.revs.push(RevSpan { kind, id, open, close: at..at + 6 });
                 }
                 i = p + 6;
+            } else if let Some((kind, id, n, len)) = parse_pmark(rest) {
+                out.pmarks.push(PMark { kind, id, n, range: at..at + len });
+                i = p + len;
             } else if let Some(r) = rest.strip_prefix("<!--k:c:") {
                 let digits: String = r.chars().take_while(char::is_ascii_digit).collect();
                 if !digits.is_empty() && r[digits.len()..].starts_with("-->") {
@@ -326,13 +408,14 @@ pub fn scan(text: &str) -> Scan {
         }
     }
     out.revs.sort_by_key(|r| r.open.start);
+    out.pmarks.sort_by_key(|m| m.range.start);
     out.comments.sort_by_key(|c| c.start.start);
     out
 }
 
 /// Alla kommentarer i texten (poster som saknar område räknas också).
 pub fn has_review(text: &str) -> bool {
-    text.contains("<!--k:c") || text.contains("<!--k:r ") || text.contains("data-k=\"")
+    text.contains("<!--k:c") || text.contains("<!--k:r ") || text.contains("<!--k:pm ") || text.contains("data-k=\"")
 }
 
 static COMMENTS_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -456,7 +539,7 @@ pub fn prune(text: &str) -> String {
         text = cut_ranges(&text, &mut cuts);
     }
     let sc = scan(&text);
-    let used_revs: HashSet<u32> = sc.revs.iter().map(|r| r.id).collect();
+    let used_revs: HashSet<u32> = sc.revs.iter().map(|r| r.id).chain(sc.pmarks.iter().map(|m| m.id)).collect();
     let anchored: HashSet<u32> = sc.comments.iter().map(|c| c.id).collect();
     let revs: Vec<RevRec> = sc.rev_recs.iter().map(|(r, _)| r.clone()).filter(|r| used_revs.contains(&r.id)).collect();
     let comments: Vec<CommentRec> = sc.comment_recs.iter().map(|(c, _)| c.clone()).filter(|c| anchored.contains(&c.id)).collect();
@@ -471,6 +554,67 @@ pub fn prune(text: &str) -> String {
     }
     let text = cut_ranges(&text, &mut cuts);
     put_records(&text, &revs, &comments)
+}
+
+/// Slår ihop `<ins data-k="1">a</ins><ins data-k="1">b</ins>` (samma ändring, direkt efter varandra) till en.
+/// Läsare ger en ändring per teckenformat, och det som skrivs och läses om delar upp annorlunda än originalet.
+pub fn merge_adjacent(text: &str) -> String {
+    let sc = scan(text);
+    let mut cuts: Vec<Range<usize>> = Vec::new();
+    for w in sc.revs.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if a.kind == b.kind && a.id == b.id && a.close.end == b.open.start {
+            cuts.push(a.close.clone());
+            cuts.push(b.open.clone());
+        }
+    }
+    if cuts.is_empty() {
+        return text.to_owned();
+    }
+    cut_ranges(text, &mut cuts)
+}
+
+/// Numrerar ändringarna 1, 2, 3 … i den ordning de först förekommer i texten (poster och markörer följer med).
+/// Läsare som tar bort tomma ändringar (`prune`) lämnar luckor; med fast numrering ger "spara oförändrad,
+/// läs om" samma text.
+pub fn renumber(text: &str) -> String {
+    let sc = scan(text);
+    let mut at: Vec<(usize, u32)> = sc.revs.iter().map(|r| (r.open.start, r.id)).chain(sc.pmarks.iter().map(|m| (m.range.start, m.id))).collect();
+    at.sort();
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    for (_, id) in at {
+        let n = map.len() as u32 + 1;
+        map.entry(id).or_insert(n);
+    }
+    if map.iter().all(|(a, b)| a == b) {
+        return text.to_owned();
+    }
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for r in &sc.revs {
+        if let Some(&n) = map.get(&r.id) {
+            edits.push((r.open.clone(), open_tag(r.kind, n)));
+        }
+    }
+    for m in &sc.pmarks {
+        if let Some(&n) = map.get(&m.id) {
+            edits.push((m.range.clone(), pmark_text(m.kind, n, m.n)));
+        }
+    }
+    for (r, range) in &sc.rev_recs {
+        if let Some(&n) = map.get(&r.id) {
+            edits.push((range.clone(), rev_line(&RevRec { id: n, ..r.clone() })));
+        }
+    }
+    edits.sort_by_key(|e| e.0.start);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (range, rep) in edits {
+        out.push_str(&text[last..range.start]);
+        out.push_str(&rep);
+        last = range.end;
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 fn cut_ranges(text: &str, cuts: &mut Vec<Range<usize>>) -> String {
@@ -493,12 +637,23 @@ fn cut_ranges(text: &str, cuts: &mut Vec<Range<usize>>) -> String {
 
 /// Godkänner (`accept`) eller avvisar de ändringar `pick` väljer: infogad text stannar (godkänd)
 /// eller tas bort (avvisad), struken text tas bort (godkänd) eller stannar (avvisad).
-fn resolve(text: &str, accept: bool, pick: &dyn Fn(&RevSpan) -> bool) -> String {
-    let sc = scan(text);
+fn resolve(text: &str, accept: bool, pick: &dyn Fn(u32) -> bool) -> String {
+    // Avvisade formateringsändringar återställer det gamla formatet; ändrade och infogade
+    // stycke- och radbrytningar slås ihop när de avvisas respektive raderingen godkänns.
+    let mut cur = text.to_owned();
+    if !accept {
+        cur = fmt::restore(&cur, pick);
+    }
+    cur = para::join_marks(&cur, accept, pick);
+    let sc = scan(&cur);
     let mut cuts: Vec<Range<usize>> = Vec::new();
     let mut emptied: Vec<usize> = Vec::new();
-    for r in sc.revs.iter().filter(|r| pick(r)) {
-        let keep = (r.kind == RevKind::Ins) == accept;
+    for r in sc.revs.iter().filter(|r| pick(r.id)) {
+        let keep = match r.kind {
+            RevKind::Ins => accept,
+            RevKind::Del => !accept,
+            RevKind::Fmt => true,
+        };
         if keep {
             cuts.push(r.open.clone());
             cuts.push(r.close.clone());
@@ -507,12 +662,14 @@ fn resolve(text: &str, accept: bool, pick: &dyn Fn(&RevSpan) -> bool) -> String 
             emptied.push(r.open.start);
         }
     }
+    // Markörer som blir kvar efter hopslagningen försvinner i båda fallen.
+    cuts.extend(sc.pmarks.iter().filter(|m| pick(m.id)).map(|m| m.range.clone()));
     if cuts.is_empty() {
-        return text.to_owned();
+        return if cur == text { cur } else { prune(&cur) };
     }
-    let out = cut_ranges(text, &mut cuts);
+    let out = cut_ranges(&cur, &mut cuts);
     // En rad som blev tom av borttagningen försvinner helt (hela stycket var ändringen).
-    let out = drop_emptied_lines(text, &out, &emptied, &sc);
+    let out = drop_emptied_lines(&cur, &out, &emptied, &sc);
     prune(&out)
 }
 
@@ -551,23 +708,28 @@ pub fn reject_all(text: &str) -> String {
     resolve(text, false, &|_| true)
 }
 
+/// Rad (start..slut utan radslut) som `pos` ligger på.
+fn line_of(text: &str, pos: usize) -> Range<usize> {
+    let pos = pos.min(text.len());
+    let s = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let e = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+    s..e
+}
+
 /// Godkänner/avvisar ändringarna (alla taggar med samma nummer) som rör `range`.
 pub fn resolve_range(text: &str, range: Range<usize>, accept: bool) -> Option<Edit> {
     let sc = scan(text);
-    let ids: HashSet<u32> = sc
-        .revs
-        .iter()
-        .filter(|r| {
-            let f = r.full();
-            if range.start == range.end { f.start <= range.start && range.start <= f.end } else { f.start < range.end && range.start < f.end }
-        })
-        .map(|r| r.id)
-        .collect();
+    let touches = |f: Range<usize>| {
+        if range.start == range.end { f.start <= range.start && range.start <= f.end } else { f.start < range.end && range.start < f.end }
+    };
+    let mut ids: HashSet<u32> = sc.revs.iter().filter(|r| touches(r.full())).map(|r| r.id).collect();
+    // Stycke- och radbrytningar gäller markören intill; en styckeformatering hela stycket.
+    ids.extend(sc.pmarks.iter().filter(|m| touches(if m.kind == RevKind::Fmt { line_of(text, m.range.start) } else { m.range.clone() })).map(|m| m.id));
     if ids.is_empty() {
         return None;
     }
-    let first = sc.revs.iter().filter(|r| ids.contains(&r.id)).map(|r| r.open.start).min().unwrap_or(range.start);
-    let new = resolve(text, accept, &|r| ids.contains(&r.id));
+    let first = sc.revs.iter().filter(|r| ids.contains(&r.id)).map(|r| r.open.start).chain(sc.pmarks.iter().filter(|m| ids.contains(&m.id)).map(|m| m.range.start)).min().unwrap_or(range.start);
+    let new = resolve(text, accept, &|id| ids.contains(&id));
     let caret = first.min(new.len());
     let caret = floor_char(&new, caret);
     Some(Edit { text: new, sel: caret..caret })
@@ -583,7 +745,8 @@ fn floor_char(s: &str, mut i: usize) -> usize {
 
 /// Antal ändringar (olika nummer).
 pub fn change_count(text: &str) -> usize {
-    scan(text).revs.iter().map(|r| r.id).collect::<HashSet<_>>().len()
+    let sc = scan(text);
+    sc.revs.iter().map(|r| r.id).chain(sc.pmarks.iter().map(|m| m.id)).collect::<HashSet<_>>().len()
 }
 
 /// Ändringarna (ett område per nummer) i textordning.
@@ -592,6 +755,11 @@ fn extents(sc: &Scan) -> Vec<(u32, Range<usize>)> {
     for r in &sc.revs {
         if !out.iter().any(|(id, _)| *id == r.id) {
             out.push((r.id, change_extent(sc, r.id)));
+        }
+    }
+    for m in &sc.pmarks {
+        if !out.iter().any(|(id, _)| *id == m.id) {
+            out.push((m.id, change_extent(sc, m.id)));
         }
     }
     out.sort_by_key(|(_, r)| r.start);
@@ -620,6 +788,10 @@ fn change_extent(sc: &Scan, id: u32) -> Range<usize> {
         s = s.min(r.open.start);
         e = e.max(r.close.end);
     }
+    for m in sc.pmarks.iter().filter(|m| m.id == id) {
+        s = s.min(m.range.start);
+        e = e.max(m.range.end);
+    }
     s..e
 }
 
@@ -644,7 +816,7 @@ pub fn clean_for_export(text: &str) -> String {
 // ------------------------------------------------------------------ spåra ändringar vid skrivning
 
 fn next_rev_id(sc: &Scan) -> u32 {
-    sc.revs.iter().map(|r| r.id).chain(sc.rev_recs.iter().map(|(r, _)| r.id)).max().unwrap_or(0) + 1
+    sc.revs.iter().map(|r| r.id).chain(sc.pmarks.iter().map(|m| m.id)).chain(sc.rev_recs.iter().map(|(r, _)| r.id)).max().unwrap_or(0) + 1
 }
 
 fn next_comment_id(sc: &Scan) -> u32 {
@@ -657,13 +829,17 @@ fn prefix_len(line: &str) -> usize {
 }
 
 /// Lägger taggar runt varje rad med text i `s` (utom radens prefix när `at_line_start`), så att
-/// en ändring aldrig går över ett stycke.
-fn wrap_lines(s: &str, at_line_start: bool, open: &str, close: &str) -> String {
+/// en ändring aldrig går över ett stycke. Varje infogad radbrytning (en följd av `\n`) får en
+/// `<!--k:pm ins-->` före sig; `mark(n)` ger markören för n brytningar.
+fn wrap_lines(s: &str, at_line_start: bool, open: &str, close: &str, mark: &mut dyn FnMut(u32) -> String) -> String {
     let mut out = String::new();
-    for (n, line) in s.split_inclusive('\n').enumerate() {
+    let lines: Vec<&str> = s.split_inclusive('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         let body = line.trim_end_matches('\n');
         let nl = &line[body.len()..];
-        let skip = if n > 0 || at_line_start { prefix_len(body).min(body.len()) } else { 0 };
+        let skip = if i > 0 || at_line_start { prefix_len(body).min(body.len()) } else { 0 };
         let (pre, rest) = body.split_at(skip);
         out.push_str(pre);
         if !rest.is_empty() {
@@ -671,7 +847,18 @@ fn wrap_lines(s: &str, at_line_start: bool, open: &str, close: &str) -> String {
             out.push_str(rest);
             out.push_str(close);
         }
-        out.push_str(nl);
+        if nl.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Följande tomma rader hör till samma brytning.
+        let mut run = 1u32;
+        while lines.get(i + run as usize).is_some_and(|l| *l == "\n") {
+            run += 1;
+        }
+        out.push_str(&mark(run));
+        out.push_str(&"\n".repeat(run as usize));
+        i += run as usize;
     }
     out
 }
@@ -687,6 +874,7 @@ fn token_ranges(sc: &Scan) -> Vec<Range<usize>> {
         v.push(c.start.clone());
         v.push(c.end.clone());
     }
+    v.extend(sc.pmarks.iter().map(|m| m.range.clone()));
     v.extend(sc.rev_recs.iter().map(|(_, r)| r.clone()));
     v.extend(sc.comment_recs.iter().map(|(_, r)| r.clone()));
     v.sort_by_key(|r| r.start);
@@ -715,6 +903,10 @@ fn in_code_fence(text: &str, pos: usize) -> bool {
 pub fn track_edit(old: &str, new: &str, old_sel: Range<usize>, author: &str, date: &str) -> Option<Tracked> {
     if old == new {
         return None;
+    }
+    // Enter, Backspace och Delete över en radbrytning: spårade stycke- och radbrytningar.
+    if let Some(t) = para::track_newlines(old, new, &old_sel, author, date) {
+        return Some(t);
     }
     // Gemensamt prefix och suffix ger det som ändrats.
     let mut p = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
@@ -760,7 +952,7 @@ pub fn track_edit(old: &str, new: &str, old_sel: Range<usize>, author: &str, dat
         let mut at = reg.start;
         loop {
             let moved = tokens.iter().find(|t| t.start < at && at < t.end).map(|t| t.end).or_else(|| {
-                sc.revs.iter().find(|r| (r.kind == RevKind::Del || !own(r)) && r.inner().start < at && at < r.inner().end).map(|r| r.close.end)
+                sc.revs.iter().find(|r| (r.kind == RevKind::Del || (r.kind == RevKind::Ins && !own(r))) && r.inner().start < at && at < r.inner().end).map(|r| r.close.end)
             });
             match moved {
                 Some(m) if m > at => at = m,
@@ -812,7 +1004,7 @@ pub fn track_edit(old: &str, new: &str, old_sel: Range<usize>, author: &str, dat
     let mut alloc = || {
         let id = next_id;
         next_id += 1;
-        new_recs.push(RevRec { id, author: author.to_owned(), date: date.to_owned() });
+        new_recs.push(RevRec { id, author: author.to_owned(), date: date.to_owned(), old: None });
         id
     };
 
@@ -820,7 +1012,7 @@ pub fn track_edit(old: &str, new: &str, old_sel: Range<usize>, author: &str, dat
     let only_del = segs.len() == 1 && segs[0].0 == Seg::Del && inserted.is_empty();
     let only_drop = segs.iter().all(|(k, _)| *k == Seg::Drop);
     // Där infogningen kan skrivas rakt in i en egen infogning (samma författare).
-    let ins_into = if !inserted.is_empty() && only_drop {
+    let ins_into = if !inserted.is_empty() && only_drop && !inserted.contains('\n') {
         if reg.is_empty() {
             let pos = reg.start;
             sc.revs
@@ -859,7 +1051,15 @@ pub fn track_edit(old: &str, new: &str, old_sel: Range<usize>, author: &str, dat
         let mut mid = String::new();
         for (kind, r) in &segs {
             match kind {
-                Seg::Keep => mid.push_str(&old[r.clone()]),
+                Seg::Keep => {
+                    // En struken radbrytning (följd av `\n` som börjar här) får en markör före sig.
+                    let seg = &old[r.clone()];
+                    if seg.starts_with('\n') && r.start > 0 && !old[..r.start].ends_with('\n') && !sc.pmarks.iter().any(|m| m.range.end == r.start) {
+                        let id = alloc();
+                        mid.push_str(&pmark_text(RevKind::Del, id, None));
+                    }
+                    mid.push_str(seg);
+                }
                 Seg::Drop => {}
                 Seg::Del => {
                     let id = alloc();
@@ -871,7 +1071,10 @@ pub fn track_edit(old: &str, new: &str, old_sel: Range<usize>, author: &str, dat
             String::new()
         } else {
             let id = alloc();
-            wrap_lines(inserted, at_line_start, &open_tag(RevKind::Ins, id), &close_tag(RevKind::Ins))
+            wrap_lines(inserted, at_line_start, &open_tag(RevKind::Ins, id), &close_tag(RevKind::Ins), &mut |n| {
+                let mid = alloc();
+                pmark_text(RevKind::Ins, mid, Some(n))
+            })
         };
         let head = &old[..reg.start];
         out = format!("{head}{mid}{ins_text}{}", &old[reg.end..]);
@@ -917,7 +1120,7 @@ fn rewrite_records(text: &str, caret: usize, revs: &[RevRec], comments: &[Commen
         caret = caret.min(body.len());
     }
     let sc = scan(&body);
-    let used: HashSet<u32> = sc.revs.iter().map(|r| r.id).collect();
+    let used: HashSet<u32> = sc.revs.iter().map(|r| r.id).chain(sc.pmarks.iter().map(|m| m.id)).collect();
     let anchored: HashSet<u32> = sc.comments.iter().map(|c| c.id).collect();
     let revs: Vec<RevRec> = revs.iter().filter(|r| used.contains(&r.id)).cloned().collect();
     let comments: Vec<CommentRec> = comments.iter().filter(|c| anchored.contains(&c.id)).cloned().collect();
@@ -1092,6 +1295,22 @@ mod tests {
     }
 
     #[test]
+    fn renumber_closes_gaps_in_order_of_appearance() {
+        let t = "a <ins data-k=\"3\">b</ins> <del data-k=\"7\">c</del>\n\n<!--k:r id=\"7\" author=\"Bo\" date=\"d\"-->\n<!--k:r id=\"3\" author=\"Ada\" date=\"d\"-->\n";
+        let r = renumber(t);
+        assert!(r.contains("<ins data-k=\"1\">b</ins> <del data-k=\"2\">c</del>"), "{r}");
+        assert!(r.contains("<!--k:r id=\"2\" author=\"Bo\""), "{r}");
+        assert!(r.contains("<!--k:r id=\"1\" author=\"Ada\""), "{r}");
+        assert_eq!(renumber(&r), r);
+    }
+
+    #[test]
+    fn merge_adjacent_joins_same_change_only() {
+        let t = "<ins data-k=\"1\">a</ins><ins data-k=\"1\">b</ins><ins data-k=\"2\">c</ins>";
+        assert_eq!(merge_adjacent(t), "<ins data-k=\"1\">ab</ins><ins data-k=\"2\">c</ins>");
+    }
+
+    #[test]
     fn scan_finds_spans_and_records() {
         let t = doc();
         let sc = scan(&t);
@@ -1110,7 +1329,7 @@ mod tests {
         let l = comment_line(&c);
         assert!(!l.contains('\n') && l.matches("-->").count() == 1);
         assert_eq!(parse_comment_line(&l), Some(c));
-        let r = RevRec { id: 9, author: "Å \"x\"".into(), date: DT.into() };
+        let r = RevRec { id: 9, author: "Å \"x\"".into(), date: DT.into(), old: Some("b;color: #C00000".into()) };
         assert_eq!(parse_rev_line(&rev_line(&r)), Some(r));
     }
 
@@ -1244,7 +1463,7 @@ mod tests {
         let old = "- punkt\n\nNästa\n";
         let new = "Nästa\n";
         let t = track_edit(old, new, 0..0, AU, DT).unwrap();
-        assert!(t.text.starts_with("- <del data-k=\"1\">punkt</del>\n\n"), "{}", t.text);
+        assert!(t.text.starts_with("- <del data-k=\"1\">punkt</del><!--k:pm del 2-->\n\n"), "{}", t.text);
         assert!(t.text.contains("<del data-k=\"2\">Nästa</del>") || t.text.contains("Nästa"), "{}", t.text);
     }
 
