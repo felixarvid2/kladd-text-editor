@@ -2,6 +2,7 @@
 //! kopplingen mellan inställningarna och `grammar::Checker`.
 
 use crate::app::KladdApp;
+use crate::i18n::t;
 use crate::grammar::{self, Server};
 
 /// Öppen dialog "Grammatik och stil" (redigerar en kopia tills man klickar OK).
@@ -51,18 +52,18 @@ impl KladdApp {
         let Some(mut dlg) = self.grammar_dlg.take() else { return };
         let mut done: Option<bool> = None;
         let mut open = true;
-        egui::Window::new("Grammatik och stil")
+        egui::Window::new(t("Grammatik och stil"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.set_max_width(420.0);
-                ui.checkbox(&mut dlg.enabled, "Kontrollera grammatik och stil med LanguageTool");
+                ui.checkbox(&mut dlg.enabled, t("Kontrollera grammatik och stil med LanguageTool"));
                 ui.add_space(6.0);
-                ui.label("Server:");
-                ui.radio_value(&mut dlg.public, true, grammar::PUBLIC_LABEL);
-                ui.radio_value(&mut dlg.public, false, "Egen server (till exempel en lokal LanguageTool)");
+                ui.label(t("Server:"));
+                ui.radio_value(&mut dlg.public, true, t(grammar::PUBLIC_LABEL));
+                ui.radio_value(&mut dlg.public, false, t("Egen server (till exempel en lokal LanguageTool)"));
                 ui.add_enabled_ui(!dlg.public, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut dlg.url)
@@ -72,21 +73,21 @@ impl KladdApp {
                 });
                 ui.add_space(6.0);
                 if dlg.public {
-                    ui.label(egui::RichText::new(grammar::PRIVACY_NOTE).strong());
+                    ui.label(egui::RichText::new(t(grammar::PRIVACY_NOTE)).strong());
                 } else {
-                    ui.label("Texten skickas till adressen du anger. Bara synlig text skickas, utan Markdown-syntax.");
+                    ui.label(t("Texten skickas till adressen du anger. Bara synlig text skickas, utan Markdown-syntax."));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let ok = if dlg.enabled && dlg.public && !self.settings.grammar_ack {
-                        "Godkänn och spara"
+                        t("Godkänn och spara")
                     } else {
                         "OK"
                     };
                     if ui.button(ok).clicked() {
                         done = Some(true);
                     }
-                    if ui.button("Avbryt").clicked() {
+                    if ui.button(t("Avbryt")).clicked() {
                         done = Some(false);
                     }
                 });

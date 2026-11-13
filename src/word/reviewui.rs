@@ -11,6 +11,7 @@ use egui::text_edit::TextEditState;
 use egui::{Color32, FontFamily, FontId, Frame, Key, KeyboardShortcut, Margin, Modifiers, Pos2, Rect, Sense, Stroke, TextEdit, Ui, UiBuilder, pos2, vec2};
 
 use super::tables;
+use crate::i18n::t;
 use crate::app::{KladdApp, byte_to_char, editor_id, menu_divider, menu_item};
 use crate::review::{self, Thread, Tracked};
 use crate::theme::Palette;
@@ -113,21 +114,21 @@ pub(crate) fn menu(ui: &mut Ui, p: &Palette, tracking: bool, comments_shown: boo
             act = Some(a);
         }
     };
-    item(ui, ReviewAct::ToggleTrack, "Spåra ändringar", "Ctrl+Shift+E", Some(tracking), true);
+    item(ui, ReviewAct::ToggleTrack, t("Spåra ändringar"), "Ctrl+Shift+E", Some(tracking), true);
     menu_divider(ui, p);
-    item(ui, ReviewAct::Accept, "Godkänn ändring", "", None, changes > 0);
-    item(ui, ReviewAct::Reject, "Avvisa ändring", "", None, changes > 0);
-    item(ui, ReviewAct::Prev, "Föregående ändring", "", None, changes > 0);
-    item(ui, ReviewAct::Next, "Nästa ändring", "", None, changes > 0);
-    item(ui, ReviewAct::AcceptAll, "Godkänn alla", "", None, changes > 0);
-    item(ui, ReviewAct::RejectAll, "Avvisa alla", "", None, changes > 0);
+    item(ui, ReviewAct::Accept, t("Godkänn ändring"), "", None, changes > 0);
+    item(ui, ReviewAct::Reject, t("Avvisa ändring"), "", None, changes > 0);
+    item(ui, ReviewAct::Prev, t("Föregående ändring"), "", None, changes > 0);
+    item(ui, ReviewAct::Next, t("Nästa ändring"), "", None, changes > 0);
+    item(ui, ReviewAct::AcceptAll, t("Godkänn alla"), "", None, changes > 0);
+    item(ui, ReviewAct::RejectAll, t("Avvisa alla"), "", None, changes > 0);
     menu_divider(ui, p);
-    item(ui, ReviewAct::NewComment, "Ny kommentar", "Ctrl+Alt+M", None, true);
-    item(ui, ReviewAct::Reply, "Svara", "", None, true);
-    item(ui, ReviewAct::DeleteComment, "Ta bort kommentar", "", None, true);
-    item(ui, ReviewAct::ToggleComments, "Visa kommentarer", "", Some(comments_shown), true);
+    item(ui, ReviewAct::NewComment, t("Ny kommentar"), "Ctrl+Alt+M", None, true);
+    item(ui, ReviewAct::Reply, t("Svara"), "", None, true);
+    item(ui, ReviewAct::DeleteComment, t("Ta bort kommentar"), "", None, true);
+    item(ui, ReviewAct::ToggleComments, t("Visa kommentarer"), "", Some(comments_shown), true);
     menu_divider(ui, p);
-    item(ui, ReviewAct::YourName, "Ditt namn…", "", None, true);
+    item(ui, ReviewAct::YourName, t("Ditt namn…"), "", None, true);
     act
 }
 
@@ -220,7 +221,7 @@ impl KladdApp {
             None => crate::word::markup::Edit { text: t.to_owned(), sel: s },
         });
         if none {
-            self.notify(ctx, "Ingen ändring här", false);
+            self.notify(ctx, t("Ingen ändring här"), false);
         }
     }
 
@@ -233,7 +234,7 @@ impl KladdApp {
                 if !on {
                     self.wv.review.tracking.remove(&doc_id);
                 }
-                self.notify(ctx, if on { "Spårar ändringar" } else { "Spårar inte ändringar" }, false);
+                self.notify(ctx, if on { t("Spårar ändringar") } else { t("Spårar inte ändringar") }, false);
             }
             ReviewAct::Accept | ReviewAct::Reject => {
                 let accept = act == ReviewAct::Accept;
@@ -258,7 +259,7 @@ impl KladdApp {
                         self.word_edit(ctx, |t, _| crate::word::markup::Edit { text: t.to_owned(), sel: r.clone() });
                         self.scroll_to_char = Some(ci);
                     }
-                    None => self.notify(ctx, "Inga fler ändringar", false),
+                    None => self.notify(ctx, t("Inga fler ändringar"), false),
                 }
             }
             ReviewAct::NewComment => self.review_new_comment(ctx),
@@ -271,7 +272,7 @@ impl KladdApp {
                         self.wv.review.selected = Some(id);
                         self.wv.review.focus_reply = true;
                     }
-                    None => self.notify(ctx, "Markören står inte i en kommentar", false),
+                    None => self.notify(ctx, t("Markören står inte i en kommentar"), false),
                 }
             }
             ReviewAct::DeleteComment => {
@@ -279,7 +280,7 @@ impl KladdApp {
                 let text = &self.docs[self.active].text;
                 match review::thread_at(text, sel.start).or(self.wv.review.selected) {
                     Some(id) => self.review_pane_act(ctx, PaneAct::Delete(id)),
-                    None => self.notify(ctx, "Markören står inte i en kommentar", false),
+                    None => self.notify(ctx, t("Markören står inte i en kommentar"), false),
                 }
             }
             ReviewAct::ToggleComments => self.settings.word_comments = !self.settings.word_comments,
@@ -378,14 +379,14 @@ impl KladdApp {
         }
         let mut open = true;
         let mut done = false;
-        egui::Window::new("Ditt namn").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label("Namnet som skrivs på dina ändringar och kommentarer.");
+        egui::Window::new(t("Ditt namn")).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(t("Namnet som skrivs på dina ändringar och kommentarer."));
             let hint = self.review_author();
             let r = ui.add(TextEdit::singleline(&mut self.settings.author_name).hint_text(hint).desired_width(260.0));
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 done = true;
             }
-            if ui.button("Klar").clicked() {
+            if ui.button(t("Klar")).clicked() {
                 done = true;
             }
         });
@@ -462,7 +463,7 @@ fn card(ui: &mut Ui, p: &Palette, authors: &[String], th: &Thread, sel: bool, st
             ui.label(egui::RichText::new(short_date(&c.date)).font(small.clone()).color(p.muted));
         });
         if st.editing == Some(c.id) {
-            let r = ui.add(TextEdit::multiline(&mut st.edit_buf).desired_rows(2).desired_width(f32::INFINITY).hint_text("Skriv en kommentar…").font(body.clone()));
+            let r = ui.add(TextEdit::multiline(&mut st.edit_buf).desired_rows(2).desired_width(f32::INFINITY).hint_text(t("Skriv en kommentar…")).font(body.clone()));
             if st.focus_edit {
                 r.request_focus();
                 st.focus_edit = false;
@@ -471,11 +472,11 @@ fn card(ui: &mut Ui, p: &Palette, authors: &[String], th: &Thread, sel: bool, st
                 *inner_click = true;
             }
             ui.horizontal(|ui| {
-                if ui.small_button("Spara").clicked() {
+                if ui.small_button(t("Spara")).clicked() {
                     *inner_click = true;
                     *act = Some(PaneAct::SetText(c.id, std::mem::take(&mut st.edit_buf)));
                 }
-                if ui.small_button("Avbryt").clicked() {
+                if ui.small_button(t("Avbryt")).clicked() {
                     *inner_click = true;
                     *act = Some(PaneAct::SetText(c.id, String::new()));
                 }
@@ -501,11 +502,11 @@ fn card(ui: &mut Ui, p: &Palette, authors: &[String], th: &Thread, sel: bool, st
         one(ui, r, false, st, act, inner_click);
     }
     if th.root.done {
-        ui.label(egui::RichText::new("Löst").font(small.clone()).color(p.muted));
+        ui.label(egui::RichText::new(t("Löst")).font(small.clone()).color(p.muted));
     }
     if sel && st.editing != Some(th.root.id) {
         ui.add_space(4.0);
-        let r = ui.add(TextEdit::singleline(&mut st.reply_buf).hint_text("Svara…").desired_width(f32::INFINITY).font(body.clone()));
+        let r = ui.add(TextEdit::singleline(&mut st.reply_buf).hint_text(t("Svara…")).desired_width(f32::INFINITY).font(body.clone()));
         if st.focus_reply {
             r.request_focus();
             st.focus_reply = false;
@@ -518,15 +519,15 @@ fn card(ui: &mut Ui, p: &Palette, authors: &[String], th: &Thread, sel: bool, st
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if ui.small_button("Svara").clicked() {
+            if ui.small_button(t("Svara")).clicked() {
                 *inner_click = true;
                 *act = Some(PaneAct::Reply(th.root.id, std::mem::take(&mut st.reply_buf)));
             }
-            if ui.small_button(if th.root.done { "Öppna igen" } else { "Löst" }).clicked() {
+            if ui.small_button(if th.root.done { t("Öppna igen") } else { t("Löst") }).clicked() {
                 *inner_click = true;
                 *act = Some(PaneAct::Done(th.root.id, !th.root.done));
             }
-            if ui.small_button("Ta bort").clicked() {
+            if ui.small_button(t("Ta bort")).clicked() {
                 *inner_click = true;
                 *act = Some(PaneAct::Delete(th.root.id));
             }

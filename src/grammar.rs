@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::i18n::t;
+use crate::tf;
+
 pub const PUBLIC_URL: &str = "https://api.languagetool.org";
 pub const PUBLIC_LABEL: &str = "LanguageTools server (api.languagetool.org)";
 /// Värde i inställningen `grammar_server` för den publika servern.
@@ -319,8 +322,8 @@ pub struct Match {
 
 /// Tolkar svaret från `/v2/check`. Stavningsträffar (`TYPOS`) tas bort: det är stavningskontrollens jobb.
 pub fn parse_response(body: &str) -> Result<Vec<RawMatch>, String> {
-    let v: Value = serde_json::from_str(body).map_err(|e| format!("oväntat svar: {e}"))?;
-    let arr = v.get("matches").and_then(Value::as_array).ok_or("oväntat svar: saknar träfflista")?;
+    let v: Value = serde_json::from_str(body).map_err(|e| tf!("oväntat svar: {e}", e = e))?;
+    let arr = v.get("matches").and_then(Value::as_array).ok_or_else(|| t("oväntat svar: saknar träfflista").to_owned())?;
     let mut out = Vec::new();
     for m in arr {
         let (Some(offset), Some(length)) =
@@ -719,8 +722,8 @@ fn request(url: &str, data: &str, lang: &str) -> Result<Vec<RawMatch>, String> {
         form.push(("preferredVariants", "en-US,de-DE,pt-PT"));
     }
     let mut resp = agent.post(url).send_form(form).map_err(|e| match e {
-        ureq::Error::StatusCode(429) => "för många anrop till servern, försöker igen strax".to_owned(),
-        ureq::Error::StatusCode(code) => format!("servern svarade {code}"),
+        ureq::Error::StatusCode(429) => t("för många anrop till servern, försöker igen strax").to_owned(),
+        ureq::Error::StatusCode(code) => tf!("servern svarade {code}", code = code),
         e => format!("{e}"),
     })?;
     let body = resp.body_mut().with_config().limit(8 * 1024 * 1024).read_to_string().map_err(|e| format!("{e}"))?;
