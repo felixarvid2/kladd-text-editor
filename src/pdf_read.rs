@@ -1157,10 +1157,10 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> Result<Loaded, ReadError> {
 /// infogas för sidor utan egen text.
 pub fn read_with_ocr(bytes: &[u8], password: Option<&str>, ocr: &HashMap<usize, String>) -> Result<Loaded, ReadError> {
     if bytes.len() > MAX_FILE_BYTES {
-        return Err(ReadError::Other("PDF-filen är för stor för att öppnas.".into()));
+        return Err(ReadError::Other(crate::i18n::t("PDF-filen är för stor för att öppnas.").into()));
     }
     if !bytes.windows(5).take(1024).any(|w| w == b"%PDF-") {
-        return Err(ReadError::Other("Filen är inte en PDF.".into()));
+        return Err(ReadError::Other(crate::i18n::t("Filen är inte en PDF.").into()));
     }
     let mut opts = lopdf::LoadOptions::default();
     opts.max_decompressed_size = Some(MAX_DECODED);
@@ -1170,7 +1170,7 @@ pub fn read_with_ocr(bytes: &[u8], password: Option<&str>, ocr: &HashMap<usize, 
     let doc = match Document::load_mem_with_options(bytes, opts) {
         Ok(d) => d,
         Err(lopdf::Error::InvalidPassword) => return Err(ReadError::WrongPassword),
-        Err(e) => return Err(ReadError::Other(format!("PDF-filen kunde inte läsas: {e}"))),
+        Err(e) => return Err(ReadError::Other(crate::tf!("PDF-filen kunde inte läsas: {e}", e = e))),
     };
     // Krypterad utan att lösenordet godtogs: be om lösenord.
     if doc.trailer.get(b"Encrypt").is_ok() && doc.is_encrypted() {
@@ -1278,19 +1278,19 @@ pub fn read_with_ocr(bytes: &[u8], password: Option<&str>, ocr: &HashMap<usize, 
         })
         .unwrap_or_default();
     let made_by_kladd = producer.starts_with("Kladd");
-    let mut dropped = if made_by_kladd { Vec::new() } else { vec!["sidlayouten", "typsnitten"] };
+    let mut dropped = if made_by_kladd { Vec::new() } else { vec![crate::i18n::t("sidlayouten"), crate::i18n::t("typsnitten")] };
     // Kladd sparar utan lösenord: säg till om originalet krävde ett.
     if password.is_some_and(|p| !p.is_empty()) {
-        dropped.push("lösenordsskyddet");
+        dropped.push(crate::i18n::t("lösenordsskyddet"));
     }
     if has_forms {
-        dropped.push("formulärfält");
+        dropped.push(crate::i18n::t("formulärfält"));
     }
     if has_annots {
-        dropped.push("anteckningar och markeringar");
+        dropped.push(crate::i18n::t("anteckningar och markeringar"));
     }
     if undecodable {
-        dropped.push("text i typsnitt som inte kan avkodas");
+        dropped.push(crate::i18n::t("text i typsnitt som inte kan avkodas"));
     }
     Ok(Loaded { markdown, images: found_images, dropped, pages_without_text, page_count: page_out.len() })
 }

@@ -129,7 +129,7 @@ fn parse_xml(xml: &str) -> Result<Node, String> {
         match r.read_event() {
             Ok(Event::Start(e)) => {
                 if stack.len() > MAX_DEPTH {
-                    return Err("OpenDocument-filen är för djupt nästlad för att öppnas.".into());
+                    return Err(crate::i18n::t("OpenDocument-filen är för djupt nästlad för att öppnas.").into());
                 }
                 stack.push(node_of(&e));
             }
@@ -155,7 +155,7 @@ fn parse_xml(xml: &str) -> Result<Node, String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(format!("OpenDocument-filen är skadad: {e}")),
+            Err(e) => return Err(crate::tf!("OpenDocument-filen är skadad: {e}", e = e)),
             _ => {}
         }
     }
@@ -191,14 +191,14 @@ impl Pkg<'_> {
         let room = MAX_PART_BYTES.min(MAX_TOTAL_BYTES.saturating_sub(self.total));
         let Ok(mut file) = self.zip.by_name(&real) else { return Ok(None) };
         if file.size() > room {
-            return Err("En del av dokumentet är för stor för att öppnas.".into());
+            return Err(crate::i18n::t("En del av dokumentet är för stor för att öppnas.").into());
         }
         let mut buf = Vec::with_capacity(file.size() as usize);
         let res = file.by_ref().take(room + 1).read_to_end(&mut buf);
         self.total += buf.len() as u64;
-        res.map_err(|e| format!("OpenDocument-filen är skadad: {e}"))?;
+        res.map_err(|e| crate::tf!("OpenDocument-filen är skadad: {e}", e = e))?;
         if buf.len() as u64 > room {
-            return Err("En del av dokumentet är för stor för att öppnas.".into());
+            return Err(crate::i18n::t("En del av dokumentet är för stor för att öppnas.").into());
         }
         Ok(Some(buf))
     }
@@ -653,16 +653,16 @@ impl Dropped {
     fn list(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.shapes {
-            v.push("diagram och former");
+            v.push(crate::i18n::t("diagram och former"));
         }
         if self.linked {
-            v.push("länkade bilder");
+            v.push(crate::i18n::t("länkade bilder"));
         }
         if self.textboxes {
-            v.push("textrutor");
+            v.push(crate::i18n::t("textrutor"));
         }
         if self.comments {
-            v.push("kommentarer");
+            v.push(crate::i18n::t("kommentarer"));
         }
         v
     }
@@ -1619,23 +1619,23 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults) {
 /// Läser ett OpenDocument-textdokument som Markdown.
 pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if !bytes.starts_with(b"PK") {
-        return Err("Filen är inte ett OpenDocument-textdokument (.odt).".into());
+        return Err(crate::i18n::t("Filen är inte ett OpenDocument-textdokument (.odt).").into());
     }
     if bytes.len() > MAX_FILE_BYTES {
-        return Err("Dokumentet är för stort för att öppnas.".into());
+        return Err(crate::i18n::t("Dokumentet är för stort för att öppnas.").into());
     }
-    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("OpenDocument-filen är skadad: {e}"))?;
+    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| crate::tf!("OpenDocument-filen är skadad: {e}", e = e))?;
     if zip.len() > MAX_ENTRIES {
-        return Err("Dokumentet innehåller orimligt många delar och öppnas inte.".into());
+        return Err(crate::i18n::t("Dokumentet innehåller orimligt många delar och öppnas inte.").into());
     }
     let mut pkg = Pkg { zip, total: 0 };
     if let Some(m) = pkg.text("mimetype")? {
         if !m.trim().starts_with("application/vnd.oasis.opendocument.text") {
-            return Err("Filen är inte ett OpenDocument-textdokument (.odt).".into());
+            return Err(crate::i18n::t("Filen är inte ett OpenDocument-textdokument (.odt).").into());
         }
     }
     if pkg.text("META-INF/manifest.xml")?.is_some_and(|m| m.contains("encryption-data")) {
-        return Err("Dokumentet är lösenordsskyddat. Öppna det i LibreOffice och spara det utan lösenord.".into());
+        return Err(crate::i18n::t("Dokumentet är lösenordsskyddat. Öppna det i LibreOffice och spara det utan lösenord.").into());
     }
     let content = pkg
         .text("content.xml")?
@@ -1661,7 +1661,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let body = croot
         .child("office:body")
         .and_then(|b| b.child("office:text"))
-        .ok_or_else(|| "Filen är inte ett OpenDocument-textdokument (.odt).".to_owned())?;
+        .ok_or_else(|| crate::i18n::t("Filen är inte ett OpenDocument-textdokument (.odt).").to_owned())?;
 
     let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
     // Formatmallar som avviker från Kladds egna (de Kladd själv skriver ger inga ändringar).

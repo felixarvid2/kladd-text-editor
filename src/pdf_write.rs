@@ -1807,7 +1807,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
             .language("sv".to_owned()),
     );
 
-    let bytes = doc.finish().map_err(|e| format!("PDF:en kunde inte skapas: {e:?}"))?;
+    let bytes = doc.finish().map_err(|e| crate::tf!("PDF:en kunde inte skapas: {e}", e = format!("{e:?}")))?;
     Ok(Written { bytes, missing_images: lay.missing })
 }
 

@@ -136,7 +136,7 @@ fn check_entry_count(bytes: &[u8]) -> Result<(), String> {
     const EOCD: &[u8] = b"PK\x05\x06";
     let start = bytes.len().saturating_sub(22 + 65_535);
     let Some(rel) = bytes[start..].windows(4).rposition(|w| w == EOCD) else {
-        return Err("Filen är inte ett giltigt Word-dokument (zip-katalogen saknas).".into());
+        return Err(crate::i18n::t("Filen är inte ett giltigt Word-dokument (zip-katalogen saknas).").into());
     };
     let at = start + rel;
     let total = bytes
@@ -156,12 +156,12 @@ fn check_entry_count(bytes: &[u8]) -> Result<(), String> {
                     .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
                     .unwrap_or(u64::MAX);
                 if n > MAX_ENTRIES {
-                    return Err("Word-dokumentet innehåller orimligt många delar och öppnas inte.".into());
+                    return Err(crate::i18n::t("Word-dokumentet innehåller orimligt många delar och öppnas inte.").into());
                 }
             }
         }
     } else if total > MAX_ENTRIES {
-        return Err("Word-dokumentet innehåller orimligt många delar och öppnas inte.".into());
+        return Err(crate::i18n::t("Word-dokumentet innehåller orimligt många delar och öppnas inte.").into());
     }
     Ok(())
 }
@@ -206,15 +206,15 @@ impl Package<'_> {
         let room = MAX_PART_BYTES.min(MAX_TOTAL_BYTES.saturating_sub(self.total));
         let Ok(mut file) = self.zip.by_name(&real) else { return Ok(None) };
         if file.size() > room {
-            return Err("En del av Word-dokumentet är för stor för att öppnas.".into());
+            return Err(crate::i18n::t("En del av Word-dokumentet är för stor för att öppnas.").into());
         }
         let mut buf = Vec::with_capacity(file.size() as usize);
         let res = file.by_ref().take(room + 1).read_to_end(&mut buf);
         // Räkna det som packats upp även om läsningen misslyckas (jfr WordCraft #3723).
         self.total += buf.len() as u64;
-        res.map_err(|e| format!("Word-dokumentet är skadat: {e}"))?;
+        res.map_err(|e| crate::tf!("Word-dokumentet är skadat: {e}", e = e))?;
         if buf.len() as u64 > room {
-            return Err("En del av Word-dokumentet är för stor för att öppnas.".into());
+            return Err(crate::i18n::t("En del av Word-dokumentet är för stor för att öppnas.").into());
         }
         Ok(Some(buf))
     }
@@ -785,7 +785,7 @@ impl Dropped {
     fn list(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.tracked {
-            v.push("spårade formateringsändringar");
+            v.push(crate::i18n::t("spårade formateringsändringar"));
         }
         v
     }
@@ -817,18 +817,18 @@ struct BodyInfo {
 pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
         return Err(
-            "Dokumentet är lösenordsskyddat eller sparat i det gamla .doc-formatet. Öppna det i Word och spara som .docx utan lösenord."
+            crate::i18n::t("Dokumentet är lösenordsskyddat eller sparat i det gamla .doc-formatet. Öppna det i Word och spara som .docx utan lösenord.")
                 .into(),
         );
     }
     if !bytes.starts_with(b"PK") {
-        return Err("Filen är inte ett Word-dokument (.docx).".into());
+        return Err(crate::i18n::t("Filen är inte ett Word-dokument (.docx).").into());
     }
     if bytes.len() > MAX_FILE_BYTES {
-        return Err("Word-dokumentet är för stort för att öppnas.".into());
+        return Err(crate::i18n::t("Word-dokumentet är för stort för att öppnas.").into());
     }
     check_entry_count(bytes)?;
-    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("Word-dokumentet är skadat: {e}"))?;
+    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| crate::tf!("Word-dokumentet är skadat: {e}", e = e))?;
     let mut pkg = Package { zip, total: 0 };
 
     // Huvuddokumentet pekas ut av paketets relationer.
@@ -843,7 +843,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         .unwrap_or_else(|| "word/document.xml".to_owned());
     let (dir, file) = main.rsplit_once('/').unwrap_or(("", main.as_str()));
     let Some(doc_xml) = pkg.part(&main)? else {
-        return Err("Word-dokumentet saknar sitt huvudinnehåll.".into());
+        return Err(crate::i18n::t("Word-dokumentet saknar sitt huvudinnehåll.").into());
     };
 
     let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
@@ -1780,7 +1780,7 @@ fn parse_body(
 
     loop {
         let before = r.buffer_position() as usize;
-        let ev = r.read_event().map_err(|e| format!("Word-dokumentet innehåller trasig XML: {e}"))?;
+        let ev = r.read_event().map_err(|e| crate::tf!("Word-dokumentet innehåller trasig XML: {e}", e = e))?;
         let after = r.buffer_position() as usize;
         // Toppnivåelementen i w:body sparas som de är.
         match &ev {

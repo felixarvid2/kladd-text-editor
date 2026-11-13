@@ -16,7 +16,7 @@ impl TextEncoding {
     pub fn label(self) -> &'static str {
         match self {
             Self::Utf8 => "UTF-8",
-            Self::Utf8Bom => "UTF-8 med BOM",
+            Self::Utf8Bom => crate::i18n::t("UTF-8 med BOM"),
             Self::Utf16Le => "UTF-16 LE",
             Self::Utf16Be => "UTF-16 BE",
             Self::Windows1252 => "Windows-1252",
@@ -85,7 +85,7 @@ fn decode(bytes: &[u8]) -> Result<(String, TextEncoding), String> {
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return match std::str::from_utf8(rest) {
             Ok(s) => Ok((s.to_owned(), TextEncoding::Utf8Bom)),
-            Err(_) => Err("Filen har en UTF-8-markering men innehåller ogiltiga tecken.".into()),
+            Err(_) => Err(crate::i18n::t("Filen har en UTF-8-markering men innehåller ogiltiga tecken.").into()),
         };
     }
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
@@ -96,13 +96,13 @@ fn decode(bytes: &[u8]) -> Result<(String, TextEncoding), String> {
         };
         let (text, had_errors) = enc.decode_with_bom_removal(bytes);
         if had_errors {
-            return Err("Filen ser ut som UTF-16 men är skadad.".into());
+            return Err(crate::i18n::t("Filen ser ut som UTF-16 men är skadad.").into());
         }
         return Ok((text.into_owned(), kind));
     }
     let head = &bytes[..bytes.len().min(8192)];
     if head.contains(&0) {
-        return Err("Filen verkar vara binär och kan inte öppnas som text.".into());
+        return Err(crate::i18n::t("Filen verkar vara binär och kan inte öppnas som text.").into());
     }
     match std::str::from_utf8(bytes) {
         Ok(s) => Ok((s.to_owned(), TextEncoding::Utf8)),
@@ -139,7 +139,7 @@ fn encode(text: &str, enc: TextEncoding) -> Result<Vec<u8>, String> {
             let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(text);
             if unmappable {
                 return Err(
-                    "Texten innehåller tecken som inte finns i Windows-1252. Byt kodning till UTF-8 i statusraden och spara igen."
+                    crate::i18n::t("Texten innehåller tecken som inte finns i Windows-1252. Byt kodning till UTF-8 i statusraden och spara igen.")
                         .into(),
                 );
             }
@@ -174,8 +174,8 @@ impl Document {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn load(id: u64, path: &Path) -> Result<Self, String> {
         Self::load_with_password(id, path, None).map_err(|e| match e {
-            LoadError::NeedsPassword => "PDF-filen är lösenordsskyddad.".to_owned(),
-            LoadError::WrongPassword => "Fel lösenord.".to_owned(),
+            LoadError::NeedsPassword => crate::i18n::t("PDF-filen är lösenordsskyddad.").to_owned(),
+            LoadError::WrongPassword => crate::i18n::t("Fel lösenord.").to_owned(),
             LoadError::Message(m) => m,
         })
     }
@@ -195,7 +195,7 @@ impl Document {
         let ext = ext_of(name);
         let mut doc = if ext == "pdf" || bytes.starts_with(b"%PDF-") {
             Self::from_pdf_text(id, name, bytes, None).map_err(|e| match e {
-                LoadError::NeedsPassword | LoadError::WrongPassword => "PDF-versionen är lösenordsskyddad.".to_owned(),
+                LoadError::NeedsPassword | LoadError::WrongPassword => crate::i18n::t("PDF-versionen är lösenordsskyddad.").to_owned(),
                 LoadError::Message(m) => m,
             })?
         } else {
@@ -220,10 +220,10 @@ impl Document {
         })?;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let open_note = if loaded.markdown.trim().is_empty() {
-            Some(format!("{name} innehåller ingen text som kan läsas (skannade sidor?)"))
+            Some(crate::tf!("{name} innehåller ingen text som kan läsas (skannade sidor?)", name = name))
         } else if loaded.pages_without_text > 0 {
             let n = loaded.pages_without_text;
-            Some(format!("{n} av {} sidor i {name} saknar text (skannade sidor?)", loaded.page_count))
+            Some(crate::tf!("{n} av {total} sidor i {name} saknar text (skannade sidor?)", n = n, total = loaded.page_count, name = name))
         } else {
             None
         };
@@ -276,7 +276,7 @@ impl Document {
                 pdfv: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    format!("{name} innehåller {} som inte visas i Kladd", join_sv(&loaded.dropped))
+                    crate::tf!("{name} innehåller {lost} som inte visas i Kladd", name = name, lost = join_sv(&loaded.dropped))
                 }),
                 docx_dropped: loaded.dropped,
                 images: loaded.images,
@@ -302,7 +302,7 @@ impl Document {
                 pdfv: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    format!("{name} innehåller {} som inte visas i Kladd", join_sv(&loaded.dropped))
+                    crate::tf!("{name} innehåller {lost} som inte visas i Kladd", name = name, lost = join_sv(&loaded.dropped))
                 }),
                 docx_dropped: loaded.dropped,
                 images: loaded.images,
@@ -311,7 +311,7 @@ impl Document {
             });
         }
         if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
-            return Err("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.".into());
+            return Err(crate::i18n::t("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.").into());
         }
         let (mut text, encoding) = decode(&bytes)?;
         let crlf = text.matches("\r\n").count();
@@ -536,6 +536,18 @@ impl Document {
         name.to_owned()
     }
 
+    /// `language()` för visning i statusraden (på aktuellt språk); jämför alltid mot `language()`.
+    #[allow(dead_code)] // tas i bruk av statusraden i app.rs (se rapport)
+    pub fn language_label(&self) -> String {
+        let l = self.language();
+        match l.as_str() {
+            "Konfiguration" => crate::i18n::t("Konfiguration").to_owned(),
+            "Logg" => crate::i18n::t("Logg").to_owned(),
+            "Undertexter" => crate::i18n::t("Undertexter").to_owned(),
+            _ => l,
+        }
+    }
+
     /// Namn som syntect kan slå upp en syntax med.
     pub fn syntax_hint(&self) -> String {
         if self.docx || self.pdf {
@@ -647,9 +659,9 @@ pub(crate) fn describe_io_error(e: &std::io::Error, path: &Path) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     match e.kind() {
-        std::io::ErrorKind::NotFound => format!("{name} finns inte längre."),
+        std::io::ErrorKind::NotFound => crate::tf!("{name} finns inte längre.", name = name),
         std::io::ErrorKind::PermissionDenied => {
-            format!("Du har inte behörighet till {name}.")
+            crate::tf!("Du har inte behörighet till {name}.", name = name)
         }
         _ => format!("{name}: {e}"),
     }
