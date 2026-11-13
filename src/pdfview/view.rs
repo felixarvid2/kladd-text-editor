@@ -2100,7 +2100,9 @@ mod tests {
             frame(&ctx, &mut v);
         }
         assert_eq!(v.texts.get(&0).map(|t| t.text().to_owned()).as_deref(), Some("Å"));
-        assert_eq!(v.find_status().total, 1);
+        // Bara sida 0 räknas: testdokumentet kan ha en sida till vars text (med "a", som matchar
+        // "å" när diakritiska tecken ignoreras) hinner komma eller inte.
+        assert_eq!(v.find.as_ref().map(|f| f.matches[0].len()), Some(1));
         assert!(!v.texts.contains_key(&99));
     }
 
