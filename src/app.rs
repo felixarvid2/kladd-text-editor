@@ -1074,6 +1074,11 @@ impl KladdApp {
                 }
             }
             DialogResult::SaveAs { doc_id, path, then_close, exit } => {
+                // Avbröts "Spara som" under ett avslut avbryts också avslutet: kör då inget
+                // installationsprogram vid ett senare avslut.
+                if exit && path.is_none() {
+                    self.update.cancel_launch();
+                }
                 if let (Some(path), Some(idx)) = (path, self.index_of(doc_id)) {
                     let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
                     let clash = self
