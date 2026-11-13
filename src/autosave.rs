@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::doc::Document;
+use crate::tf;
 
 /// Sekunder utan ändringar innan en flik sparas.
 pub const DELAY_SECS: f64 = 2.0;
@@ -190,10 +191,11 @@ impl Autosave {
                     if self.warned.get(&id) != Some(&current) {
                         self.warned.insert(id, current);
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        let what = if state == Disk::Missing { "har tagits bort" } else { "har ändrats på disk" };
-                        steps.push(Step::Notice(
-                            format!("{name} {what}. Sparar inte automatiskt. Spara manuellt för att skriva över."),
-                        ));
+                        steps.push(Step::Notice(if state == Disk::Missing {
+                            tf!("{name} har tagits bort. Sparar inte automatiskt. Spara manuellt för att skriva över.", name = name)
+                        } else {
+                            tf!("{name} har ändrats på disk. Sparar inte automatiskt. Spara manuellt för att skriva över.", name = name)
+                        }));
                     }
                 }
             }

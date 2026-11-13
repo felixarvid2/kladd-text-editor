@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::quiet_button;
 use crate::doc::{Document, LineEnding, TextEncoding};
+use crate::i18n::{self, t};
+use crate::tf;
 use crate::theme::{self, Palette};
 
 const INTERVAL: Duration = Duration::from_secs(30);
@@ -405,19 +407,18 @@ fn local_tm(t: u64) -> Tm {
     (dt.year(), dt.ordinal(), dt.hour(), dt.minute(), dt.day(), dt.month0() as usize)
 }
 
-/// "i dag 14:32", "i går 09:05" eller "3 nov 14:32".
-pub fn when(t: u64, now: u64) -> String {
-    const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "maj", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
-    let (a, n) = (local_tm(t), local_tm(now));
-    let clock = format!("{:02}:{:02}", a.2, a.3);
+/// "i dag 14:32", "i går 09:05" eller "2026-11-03 14:32" (engelska: "today 2:32 PM", "yesterday 9:05 AM",
+/// "Nov 3, 2026 2:32 PM").
+pub fn when(at: u64, now: u64) -> String {
+    let (a, n) = (local_tm(at), local_tm(now));
     let day = |tm: &Tm| (tm.0, tm.1);
     let yesterday = local_tm(now.saturating_sub(86_400));
     if day(&a) == day(&n) {
-        format!("i dag {clock}")
+        i18n::today_at(a.2, a.3)
     } else if day(&a) == day(&yesterday) {
-        format!("i går {clock}")
+        tf!("i går {clock}", clock = i18n::clock(a.2, a.3))
     } else {
-        format!("{} {} {clock}", a.4, MONTHS[a.5.min(11)])
+        format!("{} {}", i18n::date(a.0, a.5 as u32 + 1, a.4), i18n::clock(a.2, a.3))
     }
 }
 
@@ -438,12 +439,12 @@ pub fn dialog(ctx: &egui::Context, p: &Palette, prompt: &mut Prompt) -> Option<C
         .show(ctx, |ui| {
             ui.set_width(460.0);
             ui.label(
-                RichText::new("Återställ osparade ändringar?")
+                RichText::new(t("Återställ osparade ändringar?"))
                     .font(FontId::new(17.0, theme::semibold()))
                     .color(p.text),
             );
             ui.add_space(6.0);
-            ui.label(RichText::new("Kladd avslutades innan det här sparades.").color(p.muted));
+            ui.label(RichText::new(t("Kladd avslutades innan det här sparades.")).color(p.muted));
             ui.add_space(14.0);
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 for (found, checked) in &mut prompt.items {
@@ -453,7 +454,7 @@ pub fn dialog(ctx: &egui::Context, p: &Palette, prompt: &mut Prompt) -> Option<C
                         .as_ref()
                         .and_then(|p| p.parent())
                         .map(|d| d.display().to_string())
-                        .unwrap_or_else(|| "Ej sparad".into());
+                        .unwrap_or_else(|| t("Ej sparad").into());
                     ui.horizontal(|ui| {
                         ui.checkbox(checked, "");
                         ui.vertical(|ui| {
@@ -470,7 +471,7 @@ pub fn dialog(ctx: &egui::Context, p: &Palette, prompt: &mut Prompt) -> Option<C
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let any = prompt.items.iter().any(|(_, c)| *c);
                 let restore = egui::Button::new(
-                    RichText::new("Återställ markerade").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                    RichText::new(t("Återställ markerade")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                 )
                 .fill(p.accent)
                 .stroke(Stroke::NONE)
@@ -478,10 +479,10 @@ pub fn dialog(ctx: &egui::Context, p: &Palette, prompt: &mut Prompt) -> Option<C
                 if ui.add_enabled(any, restore).clicked() {
                     choice = Some(Choice::Restore);
                 }
-                if ui.add(quiet_button("Släng", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Släng"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     choice = Some(Choice::Discard);
                 }
-                if ui.add(quiet_button("Senare", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Senare"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     choice = Some(Choice::Later);
                 }
             });

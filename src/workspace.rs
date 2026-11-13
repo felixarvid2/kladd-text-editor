@@ -13,6 +13,8 @@ use egui::{
 };
 
 use crate::app::{KladdApp, quiet_button};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Mappar som döljs i trädet (och hoppas över vid sökning) om inte "Dolda filer" är på.
@@ -185,13 +187,13 @@ pub fn rank(query: &str, files: &[String], limit: usize) -> Vec<usize> {
 pub fn valid_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("Skriv ett namn.".into());
+        return Err(t("Skriv ett namn.").into());
     }
     if name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-        return Err("Namnet får inte innehålla snedstreck.".into());
+        return Err(t("Namnet får inte innehålla snedstreck.").into());
     }
     if cfg!(windows) && name.contains([':', '*', '?', '"', '<', '>', '|']) {
-        return Err("Namnet innehåller tecken som inte tillåts.".into());
+        return Err(t("Namnet innehåller tecken som inte tillåts.").into());
     }
     Ok(name)
 }
@@ -219,13 +221,13 @@ pub fn create_dir(dir: &Path, name: &str) -> Result<PathBuf, String> {
 /// Byter namn på en fil eller mapp (stannar i samma mapp). Skriver aldrig över något.
 pub fn rename_path(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     let name = valid_name(new_name)?;
-    let parent = path.parent().ok_or("Sökvägen saknar överordnad mapp.")?;
+    let parent = path.parent().ok_or(t("Sökvägen saknar överordnad mapp."))?;
     let target = parent.join(name);
     if target == path {
         return Ok(target);
     }
     if target.exists() {
-        return Err(format!("{name} finns redan."));
+        return Err(tf!("{name} finns redan.", name = name));
     }
     std::fs::rename(path, &target).map_err(|e| io_message(&e, name))?;
     Ok(target)
@@ -233,9 +235,9 @@ pub fn rename_path(path: &Path, new_name: &str) -> Result<PathBuf, String> {
 
 fn io_message(e: &std::io::Error, name: &str) -> String {
     match e.kind() {
-        std::io::ErrorKind::AlreadyExists => format!("{name} finns redan."),
-        std::io::ErrorKind::PermissionDenied => format!("Åtkomst nekad för {name}."),
-        _ => format!("Det gick inte: {e}"),
+        std::io::ErrorKind::AlreadyExists => tf!("{name} finns redan.", name = name),
+        std::io::ErrorKind::PermissionDenied => tf!("Åtkomst nekad för {name}.", name = name),
+        _ => tf!("Det gick inte: {e}", e = e),
     }
 }
 
@@ -482,7 +484,7 @@ impl KladdApp {
             .or_else(|| self.docs.get(self.active).and_then(|d| d.path.as_ref()).and_then(|p| p.parent().map(Path::to_path_buf)))
             .or_else(crate::platform::home_dir);
         std::thread::spawn(move || {
-            let mut dlg = rfd::FileDialog::new().set_title("Öppna mapp");
+            let mut dlg = rfd::FileDialog::new().set_title(t("Öppna mapp"));
             if let Some(d) = start {
                 dlg = dlg.set_directory(d);
             }
@@ -495,7 +497,7 @@ impl KladdApp {
     pub(crate) fn set_workspace(&mut self, ctx: &egui::Context, dir: &Path) {
         let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         if !canonical.is_dir() {
-            self.notify(ctx, "Mappen finns inte.", true);
+            self.notify(ctx, t("Mappen finns inte."), true);
             return;
         }
         self.settings.workspace = Some(canonical);
@@ -525,7 +527,7 @@ impl KladdApp {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.ws.folder_dialog = None;
-                    self.notify(ctx, "Fildialogen kunde inte öppnas. Installera paketet zenity och försök igen.", true);
+                    self.notify(ctx, t("Fildialogen kunde inte öppnas. Installera paketet zenity och försök igen."), true);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -535,7 +537,7 @@ impl KladdApp {
         if self.ws.loaded_root.as_ref() != Some(&root) {
             if !root.is_dir() {
                 self.close_workspace();
-                self.notify(ctx, "Arbetsmappen finns inte längre.", true);
+                self.notify(ctx, t("Arbetsmappen finns inte längre."), true);
                 return;
             }
             self.ws.expanded.clear();
@@ -592,13 +594,13 @@ impl KladdApp {
                     ui.label(RichText::new(name.to_uppercase()).font(FontId::new(11.5, theme::semibold())).color(p.muted))
                         .on_hover_text(root.display().to_string());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if crate::icons::button(ui, p, crate::icons::Icon::Close, 24.0, false, "Dölj mappträdet (Ctrl+Shift+E)", p.editor).clicked() {
+                        if crate::icons::button(ui, p, crate::icons::Icon::Close, 24.0, false, t("Dölj mappträdet (Ctrl+Shift+E)"), p.editor).clicked() {
                             close = true;
                         }
-                        if chip(ui, p, "Dolda", hidden, "Visa dolda filer och mappar som .git, target och node_modules").clicked() {
+                        if chip(ui, p, t("Dolda"), hidden, t("Visa dolda filer och mappar som .git, target och node_modules")).clicked() {
                             hidden = !hidden;
                         }
-                        if ui.add(quiet_button("Byt…", p).min_size(vec2(0.0, 24.0))).on_hover_text("Öppna en annan mapp").clicked() {
+                        if ui.add(quiet_button(t("Byt…"), p).min_size(vec2(0.0, 24.0))).on_hover_text(t("Öppna en annan mapp")).clicked() {
                             pick = true;
                         }
                     });
@@ -619,22 +621,22 @@ impl KladdApp {
                     ui.painter().text(
                         out.inner_rect.left_top() + vec2(8.0, 8.0),
                         Align2::LEFT_TOP,
-                        "Mappen är tom",
+                        t("Mappen är tom"),
                         FontId::new(12.5, FontFamily::Proportional),
                         p.muted,
                     );
                 }
                 // Högerklick på tom yta: ny fil/mapp i rotmappen.
                 rest.context_menu(|ui| {
-                    if ui.button("Ny fil").clicked() {
+                    if ui.button(t("Ny fil")).clicked() {
                         actions.push(Action::New(NameKind::NewFile, root.clone()));
                         ui.close();
                     }
-                    if ui.button("Ny mapp").clicked() {
+                    if ui.button(t("Ny mapp")).clicked() {
                         actions.push(Action::New(NameKind::NewDir, root.clone()));
                         ui.close();
                     }
-                    if ui.button("Visa i filhanteraren").clicked() {
+                    if ui.button(t("Visa i filhanteraren")).clicked() {
                         actions.push(Action::Reveal(root.clone()));
                         ui.close();
                     }
@@ -674,7 +676,7 @@ impl KladdApp {
             Action::Delete(path) => self.ws.prompt = Some(Prompt::Delete(path)),
             Action::Reveal(dir) => {
                 if let Err(e) = crate::platform::open(&dir) {
-                    self.notify(ctx, format!("Kunde inte öppna filhanteraren: {e}"), true);
+                    self.notify(ctx, tf!("Kunde inte öppna filhanteraren: {e}", e = e), true);
                 }
             }
         }
@@ -698,12 +700,12 @@ impl KladdApp {
             .show(ctx, |ui| {
                 ui.set_width(380.0);
                 let (title, action) = match prompt {
-                    Prompt::Name { kind: NameKind::NewFile, .. } => ("Ny fil".to_owned(), "Skapa"),
-                    Prompt::Name { kind: NameKind::NewDir, .. } => ("Ny mapp".to_owned(), "Skapa"),
-                    Prompt::Name { kind: NameKind::Rename, .. } => ("Byt namn".to_owned(), "Byt namn"),
+                    Prompt::Name { kind: NameKind::NewFile, .. } => (t("Ny fil").to_owned(), t("Skapa")),
+                    Prompt::Name { kind: NameKind::NewDir, .. } => (t("Ny mapp").to_owned(), t("Skapa")),
+                    Prompt::Name { kind: NameKind::Rename, .. } => (t("Byt namn").to_owned(), t("Byt namn")),
                     Prompt::Delete(path) => {
                         let n = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        (format!("Ta bort {n}?"), "Ta bort")
+                        (tf!("Ta bort {n}?", n = n), t("Ta bort"))
                     }
                 };
                 ui.label(RichText::new(title).font(FontId::new(17.0, theme::semibold())).color(p.text));
@@ -711,12 +713,12 @@ impl KladdApp {
                 match prompt {
                     Prompt::Name { input, focus, error, base, kind } => {
                         if *kind != NameKind::Rename {
-                            ui.label(RichText::new(format!("I {}", base.display())).size(12.5).color(p.muted));
+                            ui.label(RichText::new(tf!("I {folder}", folder = base.display())).size(12.5).color(p.muted));
                             ui.add_space(6.0);
                         }
                         let field = ui.add(
                             TextEdit::singleline(input)
-                                .hint_text("Namn")
+                                .hint_text(t("Namn"))
                                 .desired_width(f32::INFINITY)
                                 .margin(Margin::symmetric(10, 7)),
                         );
@@ -736,8 +738,8 @@ impl KladdApp {
                         }
                     }
                     Prompt::Delete(path) => {
-                        let what = if path.is_dir() { "Mappen och allt i den" } else { "Filen" };
-                        ui.label(RichText::new(format!("{what} flyttas till papperskorgen.")).color(p.muted));
+                        let what = if path.is_dir() { t("Mappen och allt i den flyttas till papperskorgen.") } else { t("Filen flyttas till papperskorgen.") };
+                        ui.label(RichText::new(what).color(p.muted));
                     }
                 }
                 ui.add_space(20.0);
@@ -751,7 +753,7 @@ impl KladdApp {
                     if ui.add(go).clicked() {
                         choice = Some(0);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(1);
                     }
                 });
@@ -802,10 +804,10 @@ impl KladdApp {
                     self.ws.expanded.retain(|d| !d.starts_with(&path));
                     self.ws.reload_all(hidden);
                     let open = self.docs.iter().any(|d| d.path.as_ref().is_some_and(|p| p.starts_with(&path)));
-                    let msg = if open { "Flyttade till papperskorgen. En öppen flik pekar på den borttagna filen." } else { "Flyttade till papperskorgen" };
+                    let msg = if open { t("Flyttade till papperskorgen. En öppen flik pekar på den borttagna filen.") } else { t("Flyttade till papperskorgen") };
                     self.notify(ctx, msg, false);
                 }
-                Err(e) => self.notify(ctx, format!("Kunde inte flytta till papperskorgen: {e}"), true),
+                Err(e) => self.notify(ctx, tf!("Kunde inte flytta till papperskorgen: {e}", e = e), true),
             },
         }
     }
@@ -916,7 +918,7 @@ impl KladdApp {
                     .show(ui, |ui| {
                         ui.set_width(width - 16.0);
                         ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
-                        let hint = if has_root { "Sök fil i mappen" } else { "Sök bland senaste filer" };
+                        let hint = if has_root { t("Sök fil i mappen") } else { t("Sök bland senaste filer") };
                         let field = ui.add(
                             TextEdit::singleline(&mut q.query)
                                 .hint_text(hint)
@@ -932,7 +934,7 @@ impl KladdApp {
                         }
                         ui.add_space(4.0);
                         if ranked.is_empty() {
-                            let msg = if scanning { "Läser mappen…" } else if q.files.is_empty() && !has_root { "Inga senaste filer" } else { "Inga träffar" };
+                            let msg = if scanning { t("Läser mappen…") } else if q.files.is_empty() && !has_root { t("Inga senaste filer") } else { t("Inga träffar") };
                             ui.label(RichText::new(msg).size(12.5).color(p.muted));
                         }
                         for (row, &i) in ranked.iter().enumerate() {
@@ -1021,25 +1023,25 @@ fn tree_row(ui: &mut Ui, p: &Palette, depth: usize, e: &Entry, open: bool, activ
     }
     resp.context_menu(|ui| {
         let dir = if e.is_dir { e.path.clone() } else { e.path.parent().map(Path::to_path_buf).unwrap_or_default() };
-        if ui.button("Ny fil").clicked() {
+        if ui.button(t("Ny fil")).clicked() {
             actions.push(Action::New(NameKind::NewFile, dir.clone()));
             ui.close();
         }
-        if ui.button("Ny mapp").clicked() {
+        if ui.button(t("Ny mapp")).clicked() {
             actions.push(Action::New(NameKind::NewDir, dir.clone()));
             ui.close();
         }
         ui.separator();
-        if ui.button("Byt namn").clicked() {
+        if ui.button(t("Byt namn")).clicked() {
             actions.push(Action::Rename(e.path.clone()));
             ui.close();
         }
-        if ui.button("Ta bort").clicked() {
+        if ui.button(t("Ta bort")).clicked() {
             actions.push(Action::Delete(e.path.clone()));
             ui.close();
         }
         ui.separator();
-        if ui.button("Visa i filhanteraren").clicked() {
+        if ui.button(t("Visa i filhanteraren")).clicked() {
             actions.push(Action::Reveal(dir));
             ui.close();
         }

@@ -12,6 +12,8 @@ use egui::{Align, Color32, FontId, Frame, Id, Key, Layout, Margin, RichText, Str
 use crate::platform;
 use crate::app::{KladdApp, quiet_button};
 use crate::doc::{Document, resolve_image};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Tillfälliga PDF-filer som är äldre än så här tas bort.
@@ -265,7 +267,7 @@ impl KladdApp {
         {
             self.print.result = None;
             match res {
-                Ok(name) => self.notify(ctx, format!("Skickat till {name}"), false),
+                Ok(name) => self.notify(ctx, tf!("Skickat till {name}", name = name), false),
                 Err(e) => self.notify(ctx, e, true),
             }
         }
@@ -292,16 +294,16 @@ impl KladdApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(400.0);
-                ui.label(RichText::new("Skriv ut").font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.label(RichText::new(t("Skriv ut")).font(FontId::new(17.0, theme::semibold())).color(p.text));
                 ui.add_space(14.0);
                 egui::Grid::new("kladd-print-grid").num_columns(2).spacing(vec2(14.0, 10.0)).show(ui, |ui| {
-                    ui.label(RichText::new("Skrivare").color(p.muted));
+                    ui.label(RichText::new(t("Skrivare")).color(p.muted));
                     match &d.printers {
                         None => {
-                            ui.label(RichText::new("Söker skrivare…").color(p.muted));
+                            ui.label(RichText::new(t("Söker skrivare…")).color(p.muted));
                         }
                         Some((list, _)) if list.is_empty() => {
-                            ui.label(RichText::new("Ingen skrivare hittades").color(p.error));
+                            ui.label(RichText::new(t("Ingen skrivare hittades")).color(p.error));
                         }
                         Some((list, _)) => {
                             egui::ComboBox::from_id_salt("kladd-print-printer")
@@ -316,16 +318,16 @@ impl KladdApp {
                     }
                     ui.end_row();
                     // På Windows väljs kopior och sidor i PDF-läsarens utskriftsdialog.
-                    let hint = "Välj kopior och sidor i PDF-läsarens utskriftsdialog";
-                    ui.label(RichText::new("Kopior").color(p.muted));
+                    let hint = t("Välj kopior och sidor i PDF-läsarens utskriftsdialog");
+                    ui.label(RichText::new(t("Kopior")).color(p.muted));
                     ui.add_enabled(!WINDOWS, egui::DragValue::new(&mut d.copies).range(1..=99).speed(0.2))
                         .on_disabled_hover_text(hint);
                     ui.end_row();
-                    ui.label(RichText::new("Sidor").color(p.muted));
+                    ui.label(RichText::new(t("Sidor")).color(p.muted));
                     ui.add_enabled_ui(!WINDOWS, |ui| {
                       ui.horizontal(|ui| {
-                        ui.radio_value(&mut d.all_pages, true, "Alla");
-                        ui.radio_value(&mut d.all_pages, false, "Sidor:");
+                        ui.radio_value(&mut d.all_pages, true, t("Alla"));
+                        ui.radio_value(&mut d.all_pages, false, t("Sidor:"));
                         ui.add_enabled(
                             !d.all_pages,
                             TextEdit::singleline(&mut d.range).hint_text("1-3,5").desired_width(110.0).margin(Margin::symmetric(8, 5)),
@@ -336,18 +338,18 @@ impl KladdApp {
                     .on_disabled_hover_text(hint);
                     ui.end_row();
                     ui.label("");
-                    ui.add_enabled(!WINDOWS, egui::Checkbox::new(&mut d.duplex, "Dubbelsidigt")).on_disabled_hover_text(hint);
+                    ui.add_enabled(!WINDOWS, egui::Checkbox::new(&mut d.duplex, t("Dubbelsidigt"))).on_disabled_hover_text(hint);
                     ui.end_row();
                 });
                 if !range_ok && !d.range.is_empty() {
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Ogiltigt sidintervall. Använd t.ex. 1-3,5.").color(p.error));
+                    ui.label(RichText::new(t("Ogiltigt sidintervall. Använd t.ex. 1-3,5.")).color(p.error));
                 }
                 ui.add_space(20.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let print = egui::Button::new(
-                        RichText::new("Skriv ut").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                        RichText::new(t("Skriv ut")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                     )
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
@@ -356,10 +358,10 @@ impl KladdApp {
                     if ui.add_enabled(can, print).clicked() || (can && ui.input(|i| i.key_pressed(Key::Enter))) {
                         action = Some(Action::Print);
                     }
-                    if ui.add(quiet_button("Öppna som PDF", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Öppna som PDF"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         action = Some(Action::OpenPdf);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         action = Some(Action::Cancel);
                     }
                 });
@@ -376,11 +378,11 @@ impl KladdApp {
         let title = doc.title();
         let pdf = match render_pdf(doc) {
             Ok(f) => f,
-            Err(e) => return self.notify(ctx, format!("Kunde inte skapa PDF: {e}"), true),
+            Err(e) => return self.notify(ctx, tf!("Kunde inte skapa PDF: {e}", e = e), true),
         };
         if matches!(action, Action::OpenPdf) {
             if let Err(e) = platform::open(&pdf) {
-                self.notify(ctx, format!("Kunde inte öppna PDF: {e}"), true);
+                self.notify(ctx, tf!("Kunde inte öppna PDF: {e}", e = e), true);
             }
             return;
         }
@@ -402,9 +404,9 @@ impl KladdApp {
                 Ok(o) if o.status.success() => Ok(printer),
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    Err(if err.is_empty() { "Utskriften misslyckades".to_string() } else { err })
+                    Err(if err.is_empty() { t("Utskriften misslyckades").to_string() } else { err })
                 }
-                Err(e) => Err(format!("Kunde inte skriva ut: {e}")),
+                Err(e) => Err(tf!("Kunde inte skriva ut: {e}", e = e)),
             };
             let _ = tx.send(res);
             repaint.request_repaint();

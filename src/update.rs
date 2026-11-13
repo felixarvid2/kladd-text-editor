@@ -19,6 +19,8 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::Deserialize;
 
 use crate::app::{Settings, quiet_button};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 const API_URL: &str = "https://api.github.com/repos/felixarvid2/kladd-text-editor/releases/latest";
@@ -131,12 +133,12 @@ impl Release {
     }
 
     fn notes(&self) -> &str {
-        self.body.as_deref().map(str::trim).filter(|b| !b.is_empty()).unwrap_or("Inga utgåvanteckningar.")
+        self.body.as_deref().map(str::trim).filter(|b| !b.is_empty()).unwrap_or(t("Inga utgåvanteckningar."))
     }
 }
 
 pub fn parse_release(json: &[u8]) -> Result<Release, String> {
-    serde_json::from_slice(json).map_err(|e| format!("kunde inte tolka svaret från GitHub: {e}"))
+    serde_json::from_slice(json).map_err(|e| tf!("kunde inte tolka svaret från GitHub: {e}", e = e))
 }
 
 // ------------------------------------------------------------------ installationssätt
@@ -243,13 +245,13 @@ pub fn fetch_latest() -> Result<Release, String> {
         .get(API_URL)
         .header("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| format!("kunde inte nå GitHub: {e}"))?;
+        .map_err(|e| tf!("kunde inte nå GitHub: {e}", e = e))?;
     let bytes = resp
         .body_mut()
         .with_config()
         .limit(4 * 1024 * 1024)
         .read_to_vec()
-        .map_err(|e| format!("kunde inte läsa svaret från GitHub: {e}"))?;
+        .map_err(|e| tf!("kunde inte läsa svaret från GitHub: {e}", e = e))?;
     parse_release(&bytes)
 }
 
@@ -265,13 +267,13 @@ pub struct Progress {
 /// storleken stämmer (blockerar; kan avbrytas via `prog`).
 pub fn download(asset: &Asset, dest: &Path, prog: &Progress) -> Result<(), String> {
     if !asset.browser_download_url.starts_with("https://") {
-        return Err("hämtningsadressen är inte https".into());
+        return Err(t("hämtningsadressen är inte https").into());
     }
     let mut part = dest.as_os_str().to_owned();
     part.push(".part");
     let part = PathBuf::from(part);
     let result = download_inner(asset, &part, prog).and_then(|()| {
-        std::fs::rename(&part, dest).map_err(|e| format!("kunde inte spara {}: {e}", dest.display()))
+        std::fs::rename(&part, dest).map_err(|e| tf!("kunde inte spara {path}: {e}", path = dest.display(), e = e))
     });
     if result.is_err() {
         let _ = std::fs::remove_file(&part);
@@ -280,7 +282,7 @@ pub fn download(asset: &Asset, dest: &Path, prog: &Progress) -> Result<(), Strin
 }
 
 fn download_inner(asset: &Asset, part: &Path, prog: &Progress) -> Result<(), String> {
-    let resp = agent().get(&asset.browser_download_url).call().map_err(|e| format!("hämtningen misslyckades: {e}"))?;
+    let resp = agent().get(&asset.browser_download_url).call().map_err(|e| tf!("hämtningen misslyckades: {e}", e = e))?;
     let total = resp
         .headers()
         .get("content-length")
@@ -292,24 +294,24 @@ fn download_inner(asset: &Asset, part: &Path, prog: &Progress) -> Result<(), Str
     prog.done.store(0, AtomicOrdering::Relaxed);
     let mut body = resp.into_body();
     let mut reader = body.with_config().limit(u64::MAX).reader();
-    let mut file = std::fs::File::create(part).map_err(|e| format!("kunde inte skapa {}: {e}", part.display()))?;
+    let mut file = std::fs::File::create(part).map_err(|e| tf!("kunde inte skapa {path}: {e}", path = part.display(), e = e))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut written = 0u64;
     loop {
         if prog.cancel.load(AtomicOrdering::Relaxed) {
             return Err("avbruten".into());
         }
-        let n = reader.read(&mut buf).map_err(|e| format!("hämtningen avbröts: {e}"))?;
+        let n = reader.read(&mut buf).map_err(|e| tf!("hämtningen avbröts: {e}", e = e))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("kunde inte skriva filen: {e}"))?;
+        file.write_all(&buf[..n]).map_err(|e| tf!("kunde inte skriva filen: {e}", e = e))?;
         written += n as u64;
         prog.done.store(written, AtomicOrdering::Relaxed);
     }
-    file.flush().map_err(|e| format!("kunde inte skriva filen: {e}"))?;
+    file.flush().map_err(|e| tf!("kunde inte skriva filen: {e}", e = e))?;
     if asset.size > 0 && written != asset.size {
-        return Err(format!("filen blev {written} byte men skulle vara {}", asset.size));
+        return Err(tf!("filen blev {written} byte men skulle vara {size}", written = written, size = asset.size));
     }
     Ok(())
 }
@@ -320,9 +322,9 @@ fn replace_appimage(new: &Path, old: &Path) -> Result<(), String> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("kunde inte göra filen körbar: {e}"))?;
+            .map_err(|e| tf!("kunde inte göra filen körbar: {e}", e = e))?;
     }
-    std::fs::rename(new, old).map_err(|e| format!("kunde inte ersätta {}: {e}", old.display()))
+    std::fs::rename(new, old).map_err(|e| tf!("kunde inte ersätta {path}: {e}", path = old.display(), e = e))
 }
 
 /// Ett filnamn utan sökväg, så att en utgåva aldrig kan skriva utanför målmappen.
@@ -392,7 +394,7 @@ impl State {
     pub fn check_now(&mut self, ctx: &egui::Context) {
         if self.check_rx.is_none() {
             self.start_check(ctx, true);
-            self.notify("Söker efter uppdateringar…", false);
+            self.notify(t("Söker efter uppdateringar…"), false);
         }
     }
 
@@ -434,14 +436,14 @@ impl State {
                 let v = rel.version();
                 if !is_newer(&v, CURRENT) {
                     if manual {
-                        self.notify(format!("Kladd är redan uppdaterat (version {CURRENT})"), false);
+                        self.notify(tf!("Kladd är redan uppdaterat (version {version})", version = CURRENT), false);
                     }
                 } else if manual || settings.update_skip.as_deref() != Some(v.as_str()) {
                     self.hidden = false;
                     self.available = Some(rel);
                 }
             }
-            Err(e) if manual => self.notify(format!("Uppdateringskontrollen misslyckades: {e}"), true),
+            Err(e) if manual => self.notify(tf!("Uppdateringskontrollen misslyckades: {e}", e = e), true),
             Err(e) => eprintln!("kladd: uppdateringskontroll: {e}"),
         }
     }
@@ -449,14 +451,14 @@ impl State {
     fn on_downloaded(&mut self, dl: Dl, result: Result<(), String>) {
         if let Err(e) = result {
             if e != "avbruten" {
-                self.notify(format!("Hämtningen misslyckades: {e}"), true);
+                self.notify(tf!("Hämtningen misslyckades: {e}", e = e), true);
             }
             return;
         }
         let path = match dl.target {
             Target::AppImage => {
                 let Some(old) = std::env::var_os("APPIMAGE").map(PathBuf::from) else {
-                    self.notify("Kunde inte hitta den körande AppImage-filen", true);
+                    self.notify(t("Kunde inte hitta den körande AppImage-filen"), true);
                     return;
                 };
                 if let Err(e) = replace_appimage(&dl.dest, &old) {
@@ -469,7 +471,7 @@ impl State {
             // Dessa två öppnas direkt (användaren har just klickat på hämta).
             Target::Mac | Target::Deb => {
                 if let Err(e) = crate::platform::open(&dl.dest) {
-                    self.notify(format!("Kunde inte öppna {}: {e}", dl.dest.display()), true);
+                    self.notify(tf!("Kunde inte öppna {path}: {e}", path = dl.dest.display(), e = e), true);
                 }
                 dl.dest.clone()
             }
@@ -512,7 +514,7 @@ impl State {
             return;
         };
         let Some(name) = safe_file_name(&asset.name) else {
-            self.notify("Ogiltigt filnamn i utgåvan", true);
+            self.notify(t("Ogiltigt filnamn i utgåvan"), true);
             return;
         };
         let dir = match target {
@@ -538,11 +540,11 @@ impl State {
 
     fn open_release_page(&mut self, rel: &Release) {
         if !rel.html_url.starts_with("https://github.com/") {
-            self.notify("Ogiltig adress till utgåvan", true);
+            self.notify(t("Ogiltig adress till utgåvan"), true);
             return;
         }
         if let Err(e) = crate::platform::open(Path::new(&rel.html_url)) {
-            self.notify(format!("Kunde inte öppna webbläsaren: {e}"), true);
+            self.notify(tf!("Kunde inte öppna webbläsaren: {e}", e = e), true);
         }
     }
 
@@ -563,23 +565,23 @@ impl State {
                 ui.painter().hline((r.left() - 14.0)..=(r.right() + 14.0), r.top(), Stroke::new(1.0, p.line));
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!("Kladd {} finns", rel.version()))
+                        RichText::new(tf!("Kladd {version} finns", version = rel.version()))
                             .font(FontId::new(13.5, theme::medium()))
                             .color(p.accent),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        if ui.add(quiet_button("Hoppa över", p)).clicked() {
+                        if ui.add(quiet_button(t("Hoppa över"), p)).clicked() {
                             skip = true;
                         }
-                        if ui.add(quiet_button("Senare", p)).clicked() {
+                        if ui.add(quiet_button(t("Senare"), p)).clicked() {
                             later = true;
                         }
-                        if ui.add(quiet_button("Visa nyheter", p)).clicked() {
+                        if ui.add(quiet_button(t("Visa nyheter"), p)).clicked() {
                             news = true;
                         }
                         let b = egui::Button::new(
-                            RichText::new("Hämta och installera").font(FontId::new(13.0, theme::medium())).color(p.on_accent),
+                            RichText::new(t("Hämta och installera")).font(FontId::new(13.0, theme::medium())).color(p.on_accent),
                         )
                         .fill(p.accent)
                         .stroke(Stroke::NONE);
@@ -624,7 +626,7 @@ impl State {
         let modal = modal(ctx, p, "kladd-update-news").show(ctx, |ui| {
             ui.set_width(560.0);
             ui.label(
-                RichText::new(format!("Nyheter i Kladd {}", rel.version()))
+                RichText::new(tf!("Nyheter i Kladd {version}", version = rel.version()))
                     .font(FontId::new(17.0, theme::semibold()))
                     .color(p.text),
             );
@@ -635,13 +637,13 @@ impl State {
             ui.add_space(16.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                if ui.add(primary_button("Hämta och installera", p)).clicked() {
+                if ui.add(primary_button(t("Hämta och installera"), p)).clicked() {
                     get = true;
                 }
-                if ui.add(quiet_button("Stäng", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Stäng"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     close = true;
                 }
-                if ui.add(quiet_button("Hoppa över den här versionen", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Hoppa över den här versionen"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     skip = true;
                 }
             });
@@ -670,19 +672,19 @@ impl State {
         modal(ctx, p, "kladd-update-download").show(ctx, |ui| {
             ui.set_width(380.0);
             ui.label(
-                RichText::new(format!("Hämtar Kladd {}", dl.version)).font(FontId::new(17.0, theme::semibold())).color(p.text),
+                RichText::new(tf!("Hämtar Kladd {version}", version = dl.version)).font(FontId::new(17.0, theme::semibold())).color(p.text),
             );
             ui.add_space(12.0);
             let bar = if total > 0 {
                 egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0))
-                    .text(format!("{:.1} av {:.1} MB", mb(done), mb(total)))
+                    .text(tf!("{done} av {total} MB", done = format!("{:.1}", mb(done)), total = format!("{:.1}", mb(total))))
             } else {
-                egui::ProgressBar::new(0.0).animate(true).text(format!("{:.1} MB", mb(done)))
+                egui::ProgressBar::new(0.0).animate(true).text(tf!("{done} MB", done = format!("{:.1}", mb(done))))
             };
             ui.add(bar.fill(p.accent));
             ui.add_space(16.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                     cancel = true;
                 }
             });
@@ -702,26 +704,26 @@ impl State {
         let (mut primary, mut close) = (false, false);
         let (title, body, label): (String, String, Option<&str>) = match r.target {
             Target::Windows => (
-                format!("Kladd {} är hämtad", r.version),
-                "Installationsprogrammet startar när Kladd avslutas. Osparade ändringar frågar Kladd efter först.".into(),
-                Some("Installera och avsluta"),
+                tf!("Kladd {version} är hämtad", version = r.version),
+                t("Installationsprogrammet startar när Kladd avslutas. Osparade ändringar frågar Kladd efter först.").into(),
+                Some(t("Installera och avsluta")),
             ),
             Target::Mac => (
-                format!("Kladd {} är hämtad", r.version),
-                "Skivavbilden har öppnats. Dra Kladd till Program i fönstret som öppnades och starta om Kladd.".into(),
+                tf!("Kladd {version} är hämtad", version = r.version),
+                t("Skivavbilden har öppnats. Dra Kladd till Program i fönstret som öppnades och starta om Kladd.").into(),
                 None,
             ),
             Target::Deb => (
-                format!("Kladd {} är hämtad", r.version),
-                format!("Paketet har öppnats i programinstallationen. Du kan också installera det i en terminal:\n\n{deb_cmd}"),
-                Some("Kopiera kommando"),
+                tf!("Kladd {version} är hämtad", version = r.version),
+                tf!("Paketet har öppnats i programinstallationen. Du kan också installera det i en terminal:\n\n{command}", command = deb_cmd),
+                Some(t("Kopiera kommando")),
             ),
             Target::AppImage => (
-                format!("Kladd {} är installerad", r.version),
-                "AppImage-filen har bytts ut. Starta om Kladd för att använda den nya versionen.".into(),
-                Some("Starta om"),
+                tf!("Kladd {version} är installerad", version = r.version),
+                t("AppImage-filen har bytts ut. Starta om Kladd för att använda den nya versionen.").into(),
+                Some(t("Starta om")),
             ),
-            Target::Other => (format!("Kladd {} är hämtad", r.version), path.display().to_string(), None),
+            Target::Other => (tf!("Kladd {version} är hämtad", version = r.version), path.display().to_string(), None),
         };
         let target = r.target;
         let modal = modal(ctx, p, "kladd-update-ready").show(ctx, |ui| {
@@ -737,7 +739,7 @@ impl State {
                         primary = true;
                     }
                 }
-                let text = if label.is_some() { "Senare" } else { "Stäng" };
+                let text = if label.is_some() { t("Senare") } else { t("Stäng") };
                 if ui.add(quiet_button(text, p).min_size(vec2(0.0, 32.0))).clicked() {
                     close = true;
                 }
@@ -758,7 +760,7 @@ impl State {
                 }
                 Target::Deb => {
                     ctx.copy_text(deb_cmd);
-                    self.notify("Kommandot är kopierat", false);
+                    self.notify(t("Kommandot är kopierat"), false);
                     return;
                 }
                 _ => {}

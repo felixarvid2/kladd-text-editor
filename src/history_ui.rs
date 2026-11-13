@@ -7,6 +7,8 @@ use egui::{Align, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, RichTe
 
 use crate::doc::Document;
 use crate::history::{self, DiffRow, LineKind, Version};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Större texter diffas inte (diffen körs i gränssnittstråden).
@@ -70,10 +72,10 @@ impl Dialog {
     fn make_diff(&self, ts: u64) -> View {
         let bytes = match history::read(&self.root, &self.path, ts) {
             Ok(b) => b,
-            Err(_) => return View::Message("Versionen kunde inte läsas.".into()),
+            Err(_) => return View::Message(t("Versionen kunde inte läsas.").into()),
         };
         if bytes.len() > MAX_DIFF_BYTES || self.current.len() > MAX_DIFF_BYTES {
-            return View::Message("Texten är för stor för att jämföras här. Återställ eller öppna versionen i en ny flik.".into());
+            return View::Message(t("Texten är för stor för att jämföras här. Återställ eller öppna versionen i en ny flik.").into());
         }
         match Document::from_version(0, &self.path, &bytes) {
             Ok(old) => {
@@ -102,14 +104,14 @@ impl Dialog {
                 let w = (ctx.content_rect().width() - 120.0).clamp(420.0, 920.0);
                 ui.set_width(w);
                 ui.label(
-                    RichText::new(format!("Versionshistorik för {name}"))
+                    RichText::new(tf!("Versionshistorik för {name}", name = name))
                         .font(FontId::new(17.0, theme::semibold()))
                         .color(p.text),
                 );
                 ui.add_space(10.0);
                 if self.versions.is_empty() {
                     ui.label(
-                        RichText::new("Inga tidigare versioner än. En version sparas varje gång du sparar filen.")
+                        RichText::new(t("Inga tidigare versioner än. En version sparas varje gång du sparar filen."))
                             .color(p.muted),
                     );
                 } else {
@@ -132,20 +134,20 @@ impl Dialog {
                 ui.add_space(16.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if ui.add(crate::app::quiet_button("Stäng", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(crate::app::quiet_button(t("Stäng"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         action = Action::Close;
                     }
                     if let Some(v) = self.selected.and_then(|i| self.versions.get(i)) {
-                        if ui.add(crate::app::quiet_button("Öppna som ny flik", p).min_size(vec2(0.0, 32.0))).clicked() {
+                        if ui.add(crate::app::quiet_button(t("Öppna som ny flik"), p).min_size(vec2(0.0, 32.0))).clicked() {
                             action = Action::OpenNew(v.ts_ms);
                         }
                         let restore = egui::Button::new(
-                            RichText::new("Återställ").font(FontId::new(13.5, theme::medium())).color(p.on_accent),
+                            RichText::new(t("Återställ")).font(FontId::new(13.5, theme::medium())).color(p.on_accent),
                         )
                         .fill(p.accent)
                         .stroke(Stroke::NONE)
                         .min_size(vec2(96.0, 32.0));
-                        if ui.add(restore).on_hover_text("Ersätter flikens innehåll med versionen. Går att ångra.").clicked() {
+                        if ui.add(restore).on_hover_text(t("Ersätter flikens innehåll med versionen. Går att ångra.")).clicked() {
                             action = Action::Restore(v.ts_ms);
                         }
                     }
@@ -165,7 +167,7 @@ impl Dialog {
         match &self.view {
             None => {
                 ui.label(
-                    RichText::new("Det här formatet kan inte jämföras som text. Återställ versionen eller öppna den i en ny flik.")
+                    RichText::new(t("Det här formatet kan inte jämföras som text. Återställ versionen eller öppna den i en ny flik."))
                         .color(p.muted),
                 );
             }
@@ -174,13 +176,13 @@ impl Dialog {
             }
             Some(View::Diff(rows)) => {
                 ui.label(
-                    RichText::new("Röd: finns i versionen men inte nu. Grön: finns nu men inte i versionen.")
+                    RichText::new(t("Röd: finns i versionen men inte nu. Grön: finns nu men inte i versionen."))
                         .font(FontId::new(12.0, FontFamily::Proportional))
                         .color(p.muted),
                 );
                 ui.add_space(4.0);
                 if rows.iter().all(|r| matches!(r, DiffRow::Gap(_))) {
-                    ui.label(RichText::new("Versionen är identisk med den aktuella texten.").color(p.muted));
+                    ui.label(RichText::new(t("Versionen är identisk med den aktuella texten.")).color(p.muted));
                     return;
                 }
                 let (add_bg, del_bg) = if p.dark {
@@ -197,7 +199,7 @@ impl Dialog {
                         for row in &rows[range] {
                             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), ROW_H), Sense::hover());
                             let (bg, mark, text, color) = match row {
-                                DiffRow::Gap(n) => (None, " ", format!("… {n} oförändrade rader"), p.faint),
+                                DiffRow::Gap(n) => (None, " ", tf!("… {n} oförändrade rader", n = n), p.faint),
                                 DiffRow::Line(l) => match l.kind {
                                     LineKind::Same => (None, " ", l.text.clone(), p.text),
                                     LineKind::Added => (Some(add_bg), "+", l.text.clone(), p.text),
@@ -278,7 +280,17 @@ pub fn format_time(ts_ms: u64) -> String {
     chrono::Local
         .timestamp_millis_opt(ts_ms as i64)
         .single()
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|dt| {
+            use chrono::{Datelike, Timelike};
+            match crate::i18n::lang() {
+                crate::i18n::Lang::Sv => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                crate::i18n::Lang::En => {
+                    let date = crate::i18n::date(dt.year(), dt.month(), dt.day());
+                    let hour = if dt.hour() % 12 == 0 { 12 } else { dt.hour() % 12 };
+                    format!("{date} {hour}:{:02}:{:02} {}", dt.minute(), dt.second(), if dt.hour() < 12 { "AM" } else { "PM" })
+                }
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -286,12 +298,12 @@ pub fn format_time(ts_ms: u64) -> String {
 pub fn format_age(now_ms: u64, ts_ms: u64) -> String {
     let s = now_ms.saturating_sub(ts_ms) / 1000;
     match s {
-        0..=59 => "nu".to_owned(),
-        60..=3599 => format!("{} min sedan", s / 60),
-        3600..=86_399 => format!("{} tim sedan", s / 3600),
+        0..=59 => t("nu").to_owned(),
+        60..=3599 => tf!("{n} min sedan", n = s / 60),
+        3600..=86_399 => tf!("{n} tim sedan", n = s / 3600),
         _ => {
             let d = s / 86_400;
-            format!("{d} {} sedan", if d == 1 { "dag" } else { "dagar" })
+            if d == 1 { t("1 dag sedan").to_owned() } else { tf!("{n} dagar sedan", n = d) }
         }
     }
 }

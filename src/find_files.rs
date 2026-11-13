@@ -12,6 +12,8 @@ use egui::text_edit::TextEditState;
 use egui::{Align, Align2, Color32, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Panel, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, pos2, vec2};
 
 use crate::app::{KladdApp, byte_to_char, editor_id, quiet_button, text_toggle};
+use crate::i18n::t;
+use crate::tf;
 use crate::search::{self, Spec};
 use crate::theme::{self, Palette};
 
@@ -186,7 +188,7 @@ pub fn replace_in_files(paths: &[PathBuf], spec: &Spec, repl: &str) -> Vec<(Path
         .iter()
         .map(|p| {
             let r = (|| {
-                let text = read_text_file(p).ok_or_else(|| "kunde inte läsas som text".to_owned())?;
+                let text = read_text_file(p).ok_or_else(|| t("kunde inte läsas som text").to_owned())?;
                 match search::replace_text(&text, spec, repl, None) {
                     None => Ok(0),
                     Some(done) => {
@@ -319,7 +321,7 @@ impl KladdApp {
             Scope::Tabs => Source::Tabs(self.plain_tabs()),
             Scope::Folder => {
                 let Some(root) = self.settings.workspace.clone() else {
-                    self.ff.status = "Öppna en mapp först (Arkiv, Öppna mapp…).".into();
+                    self.ff.status = t("Öppna en mapp först (Arkiv, Öppna mapp…).").into();
                     return;
                 };
                 let overrides = self
@@ -340,7 +342,7 @@ impl KladdApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.ff.job = Some(Job { rx, cancel: cancel.clone() });
         self.ff.result_spec = Some(spec.clone());
-        self.ff.status = "Söker…".into();
+        self.ff.status = t("Söker…").into();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let mut last = std::time::Instant::now();
@@ -367,15 +369,15 @@ impl KladdApp {
                     finished = true;
                     let hits = self.ff.total();
                     let mut s = if hits == 0 {
-                        format!("Inga träffar i {files} filer")
+                        tf!("Inga träffar i {files}", files = count_files(files))
                     } else {
-                        format!("{hits} träffar i {} filer (av {files})", self.ff.results.len())
+                        tf!("{hits} i {found} (av {files})", hits = count_hits(hits), found = count_files(self.ff.results.len()), files = files)
                     };
                     if skipped > 0 {
-                        s.push_str(&format!(", {skipped} hoppades över"));
+                        s.push_str(&tf!(", {skipped} hoppades över", skipped = skipped));
                     }
                     if truncated {
-                        s.push_str(". Gränsen för antal träffar nåddes, förfina sökningen");
+                        s.push_str(t(". Gränsen för antal träffar nåddes, förfina sökningen"));
                     }
                     self.ff.status = s;
                 }
@@ -385,7 +387,7 @@ impl KladdApp {
             self.ff.job = None;
         } else if !self.ff.results.is_empty() {
             let hits = self.ff.total();
-            self.ff.status = format!("Söker… {hits} träffar hittills");
+            self.ff.status = tf!("Söker… {hits} hittills", hits = count_hits(hits));
         }
     }
 
@@ -394,7 +396,7 @@ impl KladdApp {
         match target {
             Target::Tab(id) => {
                 let Some(i) = self.index_of(*id) else {
-                    self.notify(ctx, "Fliken är stängd.", true);
+                    self.notify(ctx, t("Fliken är stängd."), true);
                     return;
                 };
                 self.active = i;
@@ -410,7 +412,7 @@ impl KladdApp {
         }
         let doc = &self.docs[self.active];
         if end > doc.text.len() || !doc.text.is_char_boundary(start) || !doc.text.is_char_boundary(end) {
-            self.notify(ctx, "Filen har ändrats sedan sökningen. Sök igen.", false);
+            self.notify(ctx, t("Filen har ändrats sedan sökningen. Sök igen."), false);
             return;
         }
         let id = editor_id(doc.id);
@@ -432,15 +434,15 @@ impl KladdApp {
         let mut errors: Vec<String> = Vec::new();
         let mut disk: Vec<PathBuf> = Vec::new();
         let targets: Vec<Target> = self.ff.results.iter().map(|f| f.target.clone()).collect();
-        for t in targets {
-            let idx = match &t {
+        for tg in targets {
+            let idx = match &tg {
                 Target::Tab(id) => self.index_of(*id),
                 Target::File(p) => {
                     let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
                     self.docs.iter().position(|d| d.path.as_deref() == Some(canon.as_path()) && !d.docx && !d.pdf && !d.word_view && d.pdfv.is_none())
                 }
             };
-            match (idx, &t) {
+            match (idx, &tg) {
                 (Some(i), _) => {
                     let doc = &mut self.docs[i];
                     let Some(done) = search::replace_text(&doc.text, &spec, &repl, None) else { continue };
@@ -472,9 +474,9 @@ impl KladdApp {
             }
         }
         self.find.current = None;
-        let mut msg = format!("Ersatte {count} träffar i {files} filer");
+        let mut msg = tf!("Ersatte {hits} i {files}", hits = count_hits(count), files = count_files(files));
         if !errors.is_empty() {
-            msg.push_str(&format!(". Fel: {}", errors.join("; ")));
+            msg.push_str(&tf!(". Fel: {errors}", errors = errors.join("; ")));
         }
         self.notify(ctx, msg, !errors.is_empty());
         self.start_find_files(ctx);
@@ -503,16 +505,16 @@ impl KladdApp {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("SÖK I FILER").font(FontId::new(11.5, theme::semibold())).color(p.muted));
+                    ui.label(RichText::new(t("SÖK I FILER")).font(FontId::new(11.5, theme::semibold())).color(p.muted));
                     ui.add_space(8.0);
-                    if crate::workspace::chip(ui, p, "Mapp", self.ff.scope == Scope::Folder, if has_root { "Sök i hela arbetsmappen" } else { "Öppna en mapp först" }).clicked() {
+                    if crate::workspace::chip(ui, p, t("Mapp"), self.ff.scope == Scope::Folder, if has_root { t("Sök i hela arbetsmappen") } else { t("Öppna en mapp först") }).clicked() {
                         self.ff.scope = Scope::Folder;
                     }
-                    if crate::workspace::chip(ui, p, "Flikar", self.ff.scope == Scope::Tabs, "Sök i alla öppna flikar").clicked() {
+                    if crate::workspace::chip(ui, p, t("Flikar"), self.ff.scope == Scope::Tabs, t("Sök i alla öppna flikar")).clicked() {
                         self.ff.scope = Scope::Tabs;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if crate::icons::button(ui, p, crate::icons::Icon::Close, 24.0, false, "Stäng (Esc)", p.editor).clicked() {
+                        if crate::icons::button(ui, p, crate::icons::Icon::Close, 24.0, false, t("Stäng (Esc)"), p.editor).clicked() {
                             close = true;
                         }
                     });
@@ -522,13 +524,13 @@ impl KladdApp {
                     let q = ui.add(
                         TextEdit::singleline(&mut self.ff.query)
                             .id(Id::unique("kladd-ff-query"))
-                            .hint_text("Sök")
+                            .hint_text(t("Sök"))
                             .desired_width(field_w)
                             .margin(Margin::symmetric(8, 5)),
                     );
                     if let Some(e) = &self.ff.error {
                         ui.painter().rect_stroke(q.rect, 4.0, Stroke::new(1.5, p.error), egui::StrokeKind::Inside);
-                        q.clone().on_hover_text(format!("Ogiltigt reguljärt uttryck: {e}"));
+                        q.clone().on_hover_text(tf!("Ogiltigt reguljärt uttryck: {e}", e = e));
                     }
                     if self.ff.focus {
                         q.request_focus();
@@ -538,23 +540,23 @@ impl KladdApp {
                         run = true;
                         q.request_focus();
                     }
-                    if crate::icons::button(ui, p, crate::icons::Icon::CaseSensitive, 26.0, self.ff.case_sensitive, "Skilj på stora och små bokstäver", p.editor).clicked() {
+                    if crate::icons::button(ui, p, crate::icons::Icon::CaseSensitive, 26.0, self.ff.case_sensitive, t("Skilj på stora och små bokstäver"), p.editor).clicked() {
                         self.ff.case_sensitive = !self.ff.case_sensitive;
                     }
-                    if text_toggle(ui, p, "ab", self.ff.whole_word, "Hela ord").clicked() {
+                    if text_toggle(ui, p, "ab", self.ff.whole_word, t("Hela ord")).clicked() {
                         self.ff.whole_word = !self.ff.whole_word;
                     }
-                    if text_toggle(ui, p, ".*", self.ff.regex, "Reguljära uttryck (ersättning kan använda $1 och ${namn})").clicked() {
+                    if text_toggle(ui, p, ".*", self.ff.regex, t("Reguljära uttryck (ersättning kan använda $1 och ${namn})")).clicked() {
                         self.ff.regex = !self.ff.regex;
                     }
                     if running {
-                        if ui.add(quiet_button("Avbryt", p).min_size(vec2(84.0, 28.0))).clicked() {
+                        if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(84.0, 28.0))).clicked() {
                             cancel = true;
                         }
-                    } else if ui.add(quiet_button("Sök", p).min_size(vec2(84.0, 28.0))).clicked() {
+                    } else if ui.add(quiet_button(t("Sök"), p).min_size(vec2(84.0, 28.0))).clicked() {
                         run = true;
                     }
-                    let label = if self.ff.show_replace { "Dölj ersätt" } else { "Ersätt…" };
+                    let label = if self.ff.show_replace { t("Dölj ersätt") } else { t("Ersätt…") };
                     if ui.add(quiet_button(label, p).min_size(vec2(0.0, 28.0))).clicked() {
                         self.ff.show_replace = !self.ff.show_replace;
                     }
@@ -564,12 +566,12 @@ impl KladdApp {
                         ui.add(
                             TextEdit::singleline(&mut self.ff.replacement)
                                 .id(Id::unique("kladd-ff-replace"))
-                                .hint_text("Ersätt med")
+                                .hint_text(t("Ersätt med"))
                                 .desired_width(ui.available_width().clamp(120.0, 420.0) - 120.0)
                                 .margin(Margin::symmetric(8, 5)),
                         );
                         let ok = self.ff.total() > 0 && !running && self.ff.result_spec.is_some();
-                        if ui.add_enabled(ok, quiet_button("Ersätt alla", p).min_size(vec2(104.0, 28.0))).clicked() {
+                        if ui.add_enabled(ok, quiet_button(t("Ersätt alla"), p).min_size(vec2(104.0, 28.0))).clicked() {
                             self.ff.confirm_replace = true;
                         }
                     });
@@ -644,7 +646,7 @@ impl KladdApp {
         }
         if cancel {
             self.cancel_find_files();
-            self.ff.status = format!("Avbröts. {} träffar hittills", self.ff.total());
+            self.ff.status = tf!("Avbröts. {hits} hittills", hits = count_hits(self.ff.total()));
         }
         if run {
             self.start_find_files(&ctx);
@@ -677,12 +679,12 @@ impl KladdApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(400.0);
-                ui.label(RichText::new(format!("Ersätt {hits} träffar i {files} filer?")).font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.label(RichText::new(tf!("Ersätt {hits} i {files}?", hits = count_hits(hits), files = count_files(files))).font(FontId::new(17.0, theme::semibold())).color(p.text));
                 ui.add_space(6.0);
-                let what = if to.is_empty() { "Träffarna tas bort".to_owned() } else { format!("Träffarna ersätts med \"{}\"", crate::app::truncate(&to, 40)) };
+                let what = if to.is_empty() { t("Träffarna tas bort").to_owned() } else { tf!("Träffarna ersätts med \"{text}\"", text = crate::app::truncate(&to, 40)) };
                 let how = match self.ff.scope {
-                    Scope::Folder => "Filer på disk skrivs över och kan inte ångras här. Öppna flikar ändras i stället i redigeraren (och sparas om de inte hade osparade ändringar).",
-                    Scope::Tabs => "Flikarna ändras i redigeraren och kan ångras där; spara dem själv.",
+                    Scope::Folder => t("Filer på disk skrivs över och kan inte ångras här. Öppna flikar ändras i stället i redigeraren (och sparas om de inte hade osparade ändringar)."),
+                    Scope::Tabs => t("Flikarna ändras i redigeraren och kan ångras där; spara dem själv."),
                 };
                 ui.label(RichText::new(what).color(p.muted));
                 ui.add_space(4.0);
@@ -690,14 +692,14 @@ impl KladdApp {
                 ui.add_space(20.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let go = egui::Button::new(RichText::new("Ersätt alla").font(FontId::new(13.5, theme::medium())).color(p.on_accent))
+                    let go = egui::Button::new(RichText::new(t("Ersätt alla")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
                         .fill(p.accent)
                         .stroke(Stroke::NONE)
                         .min_size(vec2(104.0, 32.0));
                     if ui.add(go).clicked() {
                         choice = Some(true);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         choice = Some(false);
                     }
                 });
@@ -714,6 +716,15 @@ impl KladdApp {
             None => {}
         }
     }
+}
+
+/// "1 träff" / "{n} träffar" (och engelska motsvarigheter).
+fn count_hits(n: usize) -> String {
+    if n == 1 { t("1 träff").to_owned() } else { tf!("{count} träffar", count = n) }
+}
+
+fn count_files(n: usize) -> String {
+    if n == 1 { t("1 fil").to_owned() } else { tf!("{count} filer", count = n) }
 }
 
 fn file_label(label: &str, p: &Palette) -> LayoutJob {
