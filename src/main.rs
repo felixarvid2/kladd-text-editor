@@ -23,6 +23,7 @@ mod icons;
 mod keys;
 mod macopen;
 mod paste;
+mod panes;
 mod platform;
 mod single;
 mod spell;

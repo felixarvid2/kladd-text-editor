@@ -15,6 +15,7 @@ use egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::{Deserialize, Serialize};
 
+use crate::panes::{self, Orient};
 use crate::doc::{Document, LineEnding, LoadError, TEXT_EXTENSIONS, TextEncoding, join_sv};
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
@@ -42,6 +43,15 @@ const DEFAULT_FONT_SIZE: f32 = 15.0;
 const MAX_RECENT: usize = 8;
 const WINDOW_CONTROLS_W: f32 = 3.0 * 38.0 + 14.0;
 const RESIZE_EDGE: f32 = 6.0;
+const PANE_HEAD_H: f32 = 24.0;
+
+/// Vad en ruta i delad vy rapporterar tillbaka.
+#[derive(Default)]
+struct PaneOut {
+    clicked: bool,
+    pick: Option<usize>,
+    close: bool,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -72,6 +82,8 @@ pub struct Settings {
     pub update_skip: Option<String>,
     /// Spara ändrade flikar med sökväg automatiskt när skrivandet stannat (av som standard).
     pub autosave: bool,
+    /// Första rutans andel av ytan i delad vy.
+    pub split_ratio: f32,
 }
 
 impl Default for Settings {
@@ -93,6 +105,7 @@ impl Default for Settings {
             update_last_check: 0,
             update_skip: None,
             autosave: false,
+            split_ratio: 0.5,
         }
     }
 }
@@ -209,10 +222,12 @@ pub struct KladdApp {
     /// Fönstret är i helskärm för presentationsläget i en PDF-flik.
     pdf_fullscreen: bool,
     update: crate::update::State,
+    /// Delad vy: vilka flikar som visas i de två rutorna.
+    pub(crate) panes: crate::panes::Panes,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
-    Id::unique(("kladd-editor", doc_id))
+    Id::unique(("kladd-editor", doc_id, crate::panes::salt()))
 }
 
 pub(crate) fn char_to_byte(text: &str, ci: usize) -> usize {
@@ -318,6 +333,7 @@ impl KladdApp {
             nav: Default::default(),
             pdf_fullscreen: false,
             update: Default::default(),
+            panes: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -414,7 +430,9 @@ impl KladdApp {
         if replace {
             let old = self.docs[self.active].id;
             self.hl.forget(old);
+            self.hl.forget(old | (1 << 62));
             self.word.forget(old);
+            self.panes.forget_doc(old, Some(doc.id));
             self.docs[self.active] = doc;
         } else {
             self.docs.push(doc);
@@ -741,6 +759,7 @@ impl KladdApp {
         self.autosave.forget(doc.id);
         self.recovery.forget(doc.id);
         self.hl.forget(doc.id);
+        self.hl.forget(doc.id | (1 << 62));
         self.word.forget(doc.id);
         if self.docs.is_empty() {
             self.active = 0;
@@ -749,6 +768,8 @@ impl KladdApp {
         } else if self.active > idx || self.active >= self.docs.len() {
             self.active = self.active.saturating_sub(1);
         }
+        // Rutor som visade fliken faller tillbaka på den aktiva fliken.
+        self.panes.forget_doc(doc.id, self.docs.get(self.active).map(|d| d.id));
         self.focus_editor = true;
     }
 
@@ -1073,6 +1094,15 @@ impl KladdApp {
 
         if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
             self.new_tab();
+        }
+        // Ctrl+Skift+\ före Ctrl+\: `consume_shortcut` bryr sig inte om extra Skift.
+        if hit(ctrl_shift, Key::Backslash) || hit(ctrl_shift, Key::Pipe) {
+            self.toggle_split(Orient::Horizontal);
+        } else if hit(ctrl, Key::Backslash) {
+            self.toggle_split(Orient::Vertical);
+        }
+        if hit(Modifiers::NONE, Key::F6) && self.panes.is_split() {
+            self.focus_pane(1 - self.panes.active);
         }
         if hit(ctrl, Key::P) {
             self.open_print(ctx);
@@ -1440,6 +1470,14 @@ impl KladdApp {
             self.open_find(ctx, true);
         }
         menu_divider(ui, p);
+        let split = self.panes.orient;
+        if menu_item(ui, p, "Dela vyn", "Ctrl+\\", Some(split == Some(Orient::Vertical)), has_doc) {
+            self.toggle_split(Orient::Vertical);
+        }
+        if menu_item(ui, p, "Dela vågrätt", "Ctrl+Shift+\\", Some(split == Some(Orient::Horizontal)), has_doc) {
+            self.toggle_split(Orient::Horizontal);
+        }
+        menu_divider(ui, p);
         if menu_item(ui, p, "Radbrytning", "Alt+Z", Some(self.settings.wrap), true) {
             self.settings.wrap = !self.settings.wrap;
         }
@@ -1587,7 +1625,8 @@ impl KladdApp {
 
     fn preview(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(doc) = self.docs.get(self.active) else { return };
-        if !(self.settings.preview && doc.is_markdown()) || self.word_mode() {
+        // I delad vy ryms ingen förhandsvisning bredvid två rutor.
+        if self.panes.is_split() || !(self.settings.preview && doc.is_markdown()) || self.word_mode() {
             return;
         }
         let width = ui.available_width();
@@ -1668,16 +1707,18 @@ impl KladdApp {
                 let hint = doc.syntax_hint();
                 let doc_id = doc.id;
                 let id = editor_id(doc_id);
+                // Egen färgläggningscache per ruta, så att två vyer av samma text inte slår ut varandras.
+                let hl_id = doc_id | ((crate::panes::salt() as u64) << 62);
 
                 let mut edited = false;
                 let scroll = if wrap { ScrollArea::vertical() } else { ScrollArea::both() };
                 let result = scroll
-                    .id_salt(("kladd-scroll", doc_id))
+                    .id_salt(("kladd-scroll", doc_id, crate::panes::salt()))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let viewport_h = ui.clip_rect().height();
                         let num_font = FontId::new((font_size * 0.82).round(), FontFamily::Monospace);
-                        let line_params = Params { doc_id, syntax_hint: &hint, palette: p, font_size, matches: &matches };
+                        let line_params = Params { doc_id: hl_id, syntax_hint: &hint, palette: p, font_size, matches: &matches };
                         let lines = hl.newlines(&doc.text, &line_params) + 1;
                         let digits = lines.to_string().len().max(2) as f32;
                         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&num_font, '0'));
@@ -1690,7 +1731,7 @@ impl KladdApp {
                             let bg_idx = ui.painter().add(Shape::Noop);
 
                             let params = Params {
-                                doc_id,
+                                doc_id: hl_id,
                                 syntax_hint: &hint,
                                 palette: p,
                                 font_size,
@@ -1784,6 +1825,165 @@ impl KladdApp {
                     self.find.current = None;
                 }
             });
+    }
+
+    // ---------------------------------------------------------------- delad vy
+
+    /// Delar vyn i den givna riktningen, byter riktning eller tar bort delningen.
+    fn toggle_split(&mut self, orient: Orient) {
+        let doc = self.docs.get(self.active).map(|d| d.id);
+        self.panes.toggle(orient, doc);
+        panes::set_salt(self.panes.active as u8);
+    }
+
+    /// Håller den aktiva rutan i takt med den aktiva fliken (flikklick, öppna, stäng m.m. ändrar bara `active`).
+    fn sync_panes(&mut self) {
+        let active = self.docs.get(self.active).map(|d| d.id);
+        let ids: Vec<u64> = self.docs.iter().map(|d| d.id).collect();
+        self.panes.follow_active(active, |id| ids.contains(&id));
+        panes::set_salt(self.panes.active as u8);
+    }
+
+    /// Gör en ruta aktiv: dess flik blir den aktiva fliken.
+    fn focus_pane(&mut self, pane: usize) {
+        if let Some(id) = self.panes.focus(pane) {
+            if let Some(i) = self.index_of(id) {
+                self.active = i;
+            }
+            self.wv.pane_switched();
+            self.focus_editor = true;
+        }
+        panes::set_salt(self.panes.active as u8);
+    }
+
+    /// Mittytan: en ruta, eller två med en skiljelinje när vyn är delad. Varje ruta ritas av samma
+    /// `editor` som en enda ruta (text, dokumentläge eller PDF) med den rutans flik som aktiv.
+    fn central(&mut self, ui: &mut Ui, p: &Palette) {
+        let Some(orient) = self.panes.orient else {
+            self.editor(ui, p);
+            return;
+        };
+        CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
+            let area = ui.max_rect();
+            self.settings.split_ratio = panes::clamp_ratio(self.settings.split_ratio);
+            let (r0, r1, divider) = panes::split_rects(area, orient, self.settings.split_ratio);
+
+            let resp = ui.interact(divider, Id::unique("kladd-split-divider"), Sense::click_and_drag());
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(match orient {
+                    Orient::Vertical => egui::CursorIcon::ResizeHorizontal,
+                    Orient::Horizontal => egui::CursorIcon::ResizeVertical,
+                });
+            }
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    self.settings.split_ratio = panes::ratio_at(area, orient, pos);
+                }
+            }
+            if resp.double_clicked() {
+                self.settings.split_ratio = 0.5;
+            }
+            let color = if resp.hovered() || resp.dragged() { p.accent } else { p.line };
+            let line = divider.shrink2(match orient {
+                Orient::Vertical => vec2(2.5, 0.0),
+                Orient::Horizontal => vec2(0.0, 2.5),
+            });
+            ui.painter().rect_filled(line, 0.0, color);
+
+            // Den inaktiva rutan först: den aktiva ritas sist och sätter markörläge, sökyta m.m. för resten av bildrutan.
+            let rects = [r0, r1];
+            let active = self.panes.active;
+            let mut pick = None;
+            let mut clicked = None;
+            let mut close = false;
+            for pane in [1 - active, active] {
+                let out = self.pane(ui, p, pane, rects[pane], pane == active);
+                if out.clicked && pane != active {
+                    clicked = Some(pane);
+                }
+                if out.pick.is_some() {
+                    pick = out.pick.map(|i| (pane, i));
+                }
+                close |= out.close;
+            }
+            if let Some((pane, i)) = pick {
+                self.panes.docs[pane] = self.docs[i].id;
+                self.focus_pane(pane);
+            } else if let Some(pane) = clicked {
+                self.focus_pane(pane);
+            }
+            if close {
+                self.panes.close();
+                panes::set_salt(0);
+            }
+        });
+    }
+
+    /// Ritar en ruta: liten flikväljare överst och sedan innehållet.
+    fn pane(&mut self, ui: &mut Ui, p: &Palette, pane: usize, rect: Rect, active: bool) -> PaneOut {
+        let mut out = PaneOut::default();
+        let Some(idx) = self.index_of(self.panes.docs[pane]) else { return out };
+        let saved_active = self.active;
+        self.active = idx;
+        panes::set_salt(pane as u8);
+        // Rullning till träff och fokus gäller bara den aktiva rutan.
+        let held = if active { None } else { Some((self.scroll_to_char.take(), std::mem::take(&mut self.focus_editor))) };
+
+        let pointer_down = ui.input(|i| i.pointer.any_pressed());
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        // Klick i rutans flikväljare hanteras av väljaren själv.
+        let below_head = Rect::from_min_max(pos2(rect.left(), rect.top() + PANE_HEAD_H), rect.max);
+        out.clicked = pointer_down && pointer.is_some_and(|pos| below_head.contains(pos));
+
+        let titles: Vec<(String, bool)> = self.docs.iter().map(|d| (d.title(), d.id == self.docs[idx].id)).collect();
+        let same_pdf = pane == 1 && self.panes.same_doc() && self.docs[idx].pdfv.is_some();
+        let head = Rect::from_min_size(rect.min, vec2(rect.width(), PANE_HEAD_H));
+        let body = Rect::from_min_max(pos2(rect.left(), head.bottom() + 1.0), rect.max);
+        ui.scope_builder(UiBuilder::new().max_rect(head).layout(Layout::left_to_right(Align::Center)), |ui| {
+            ui.set_clip_rect(head.intersect(ui.clip_rect()));
+            ui.painter().rect_filled(head, 0.0, p.chrome);
+            ui.painter().hline(head.x_range(), head.bottom(), Stroke::new(1.0, p.line));
+            if active {
+                ui.painter().rect_filled(Rect::from_min_size(head.min, vec2(head.width(), 2.0)), 0.0, p.accent);
+            }
+            ui.add_space(8.0);
+            let title = titles.iter().find(|t| t.1).map(|t| truncate(&t.0, 32)).unwrap_or_default();
+            let btn = status_button(ui, p, &format!("{title} ▾"), "Välj flik för den här rutan");
+            Popup::menu(&btn).align(RectAlign::BOTTOM_START).gap(4.0).width(240.0).show(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (i, (t, current)) in titles.iter().enumerate() {
+                    if menu_item(ui, p, &truncate(t, 36), "", Some(*current), true) {
+                        out.pick = Some(i);
+                    }
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(4.0);
+                if icons::button(ui, p, Icon::Close, 22.0, false, "Stäng delad vy", p.chrome).clicked() {
+                    out.close = true;
+                }
+            });
+        });
+        ui.scope_builder(UiBuilder::new().max_rect(body).layout(Layout::top_down(Align::Min)), |ui| {
+            ui.set_clip_rect(body.intersect(ui.clip_rect()));
+            if same_pdf {
+                CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("PDF:en visas redan i den andra rutan").color(p.muted));
+                    });
+                });
+            } else {
+                self.editor(ui, p);
+            }
+        });
+
+        if let Some((s, f)) = held {
+            self.scroll_to_char = s;
+            self.focus_editor = f;
+        }
+        self.active = saved_active;
+        panes::set_salt(self.panes.active as u8);
+        out
     }
 
     fn welcome(&mut self, ui: &mut Ui, p: &Palette) {
@@ -2904,6 +3104,7 @@ impl eframe::App for KladdApp {
         let ctx = ui.ctx().clone();
         let p = self.palette();
 
+        self.sync_panes();
         self.handle_dialogs(&ctx);
         self.handle_drops(&ctx);
         self.handle_shortcuts(&ctx);
@@ -2924,7 +3125,7 @@ impl eframe::App for KladdApp {
         self.pdf_sidebar(ui, &p);
         self.nav_pane(ui, &p);
         self.preview(ui, &p);
-        self.editor(ui, &p);
+        self.central(ui, &p);
         self.find_bar(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
         self.close_dialog(&ctx, &p);

@@ -33,6 +33,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Syntaxfärgning** och radnummer.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`, med alternativ för versaler, hela ord och reguljära uttryck (`$1` och `${namn}` fungerar i ersättningen). I dokumentläget söker Kladd i den synliga texten, så "fet text" hittar `**fet** text`. Du kan också söka på formatering (fetstil, kursiv, färg, markering, rubrik) och låta *Ersätt* lägga på eller ta bort formatering på träffarna.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
+- **Delad vy** – `Ctrl+\` delar fönstret i två rutor bredvid varandra, `Ctrl+Shift+\` över varandra (eller *Dela vyn* / *Dela vågrätt* i menyn). Välj flik per ruta i rutans egen väljare, eller visa samma dokument två gånger med egen rullning. Dra skiljelinjen för att ändra storleken; `F6` byter aktiv ruta.
 - **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
 - **Två teman** – *Gryning* och *Skymning*.
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
@@ -232,6 +233,9 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Ctrl+Shift+>` / `Ctrl+Shift+<` (eller `Ctrl+]` / `Ctrl+[`) | Större / mindre text, ett steg (endast dokumentläge) |
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Markdownförhandsvisning |
+| `Ctrl+\` | Dela vyn i två rutor |
+| `Ctrl+Shift+\` | Dela vyn vågrätt |
+| `F6` | Byt aktiv ruta i delad vy |
 | `Ctrl+Shift+O` | Navigeringsfönster (rubrikträd) på/av |
 | `Ctrl+Shift+L` | Byt tema |
 | `Ctrl+Q` | Avsluta |

@@ -108,6 +108,13 @@ pub struct State {
     fn_pending: Option<usize>,
 }
 
+impl State {
+    /// Aktiv ruta byts i delad vy: en vald bild hör till den förra rutan.
+    pub(crate) fn pane_switched(&mut self) {
+        self.img.deselect();
+    }
+}
+
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
 
 enum BarAct {
@@ -928,7 +935,7 @@ impl KladdApp {
             let mut fn_jump: Option<usize> = None;
             let mut fn_pending = self.wv.fn_pending.take();
 
-            ScrollArea::both().id_salt(("kladd-wscroll", doc_id)).auto_shrink(false).show(ui, |ui| {
+            ScrollArea::both().id_salt(("kladd-wscroll", doc_id, crate::panes::salt())).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let origin = ui.cursor().min;
                 let page_left = origin.x + (area_w - page_w) / 2.0;
