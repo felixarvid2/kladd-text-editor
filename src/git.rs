@@ -583,6 +583,8 @@ mod tests {
         run_text(&d, &["config", "user.name", "Test Person"]).unwrap();
         run_text(&d, &["config", "user.email", "test@example.com"]).unwrap();
         run_text(&d, &["config", "commit.gpgsign", "false"]).unwrap();
+        // Git för Windows har core.autocrlf=true globalt; testerna jämför radslut byte för byte.
+        run_text(&d, &["config", "core.autocrlf", "false"]).unwrap();
         Some(d.canonicalize().unwrap())
     }
 
