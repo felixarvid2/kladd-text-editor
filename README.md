@@ -117,7 +117,7 @@ Kladd öppnar `.docx` och `.odt` (LibreOffice) i dokumentläge, som liknar ett W
 
 Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och marginaler från dokumentet och typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Listor dras in med hängande indrag, tabeller ritas som rutnät med celler som bryter långa rader, `Enter` för radbrytning i cellen, sammanfogade celler och kolumnbredder som du ändrar genom att dra i kanten, och bilder visas i texten. Markdown-koden är dold; den visas nedtonad bara på raden där markören står. Fotnoter visas som små upphöjda siffror med texten under en skiljelinje sist i dokumentet: *Infoga fotnot* i verktygsraden (`Ctrl+Alt+F`) lägger till en och numrerar om, Ctrl+klick på ett nummer hoppar mellan referensen och fotnoten, och fotnoterna följer med som riktiga fotnoter när du sparar som `.docx` eller `.odt` och hamnar längst ned på sidan i PDF. Spårade ändringar och kommentarer i `.docx` visas också: infogad text är understruken och raderad text struken i författarens färg, kommentarerna ligger i ett fält till höger om sidan, och menyn *Granska* (spåra ändringar `Ctrl+Skift+E`, godkänn och avvisa, nästa och föregående ändring, ny kommentar `Ctrl+Alt+M`, svara, ta bort, visa/dölj och *Ditt namn…*) redigerar dem. De sparas som riktiga Word-ändringar och kommentarer; i `.odt` godkänns ändringarna och kommentarerna utelämnas, och PDF och HTML får den godkända texten.
 
-Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, menyn *Infoga* (bild, tabell, fotnot och innehållsförteckning), ångra och gör om, sidinställningar samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
+Formateringsfältet ovanför texten har stilval (Brödtext, Rubrik 1–3, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, menyn *Infoga* (bild, tabell, fotnot, innehållsförteckning, avsnittsbrytning, liggande sidor och spalter), ångra och gör om, sidinställningar samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
 
 ### Förlustfri sparning
 
@@ -146,6 +146,23 @@ Knappen *Sidinställningar* (eller dubbelklick på sidhuvud eller sidfot) öppna
 ```
 
 Word-dokumentets Normal, Rubrik 1–6 och Citat läses in, och när du ändrar en formatmall skrivs ändringen tillbaka till formatmallen i `.docx`-filen (oförändrade dokument sparas som förut). `.odt` fungerar likadant, och PDF, HTML och EPUB följer formatmallarna (PDF har alltid sina inbäddade typsnitt).
+
+### Avsnitt: liggande sidor och spalter
+
+Som i Word kan en del av dokumentet ha egna sidor eller flera spalter. Öppna *Infoga* i formateringsfältet:
+
+- **Avsnittsbrytning (ny sida)** börjar ett nytt avsnitt på en ny sida. Avsnittet börjar som det förra.
+- **Liggande sidor härifrån** (och *Stående sidor härifrån*) vänder sidorna från markören och framåt. Står markören först i dokumentet gäller det hela första avsnittet.
+- **Spalter…** ger avsnittet som markören står i 1, 2 eller 3 spalter med valfritt mellanrum. Texten flyter uppifrån och ned i första spalten, sedan i nästa och sedan på nästa sida.
+- **Spaltbrytning** flyttar texten efter markören till nästa spalt.
+
+Avsnittet börjar vid en egen rad som visas bara när markören står på den. Egenskaper som saknas ärver dokumentets grundformat (inte föregående avsnitt):
+
+```
+<!-- kladd: avsnitt; page: A4 landscape; page-margin: 20mm; columns: 2; column-gap: 12mm -->
+```
+
+Med `type: continuous` börjar avsnittet på samma sida (för att byta antal spalter mitt på en sida; spalterna i avsnittet före jämnas ut). Bilder och tabeller anpassas till spaltens bredd, sidnumren löper över avsnitten och sidhuvud och sidfot är gemensamma. Avsnitten följer med till `.docx` (`w:sectPr`: sidstorlek, orientering, marginaler, spalter och typ), `.odt` (sidmallar, och `text:section` för spalter) och PDF.
 
 ### Tabeller, bilder och inklistring
 
@@ -186,6 +203,7 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 | Fotnoter, fält, textrutor m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
 | Spårad infogning och radering | `<ins data-k="3">text</ins>`, `<del data-k="4">text</del>` (författare och datum i en postrad sist) |
 | Kommentar | `<!--k:c:1-->text<!--k:/c:1-->` och en postrad `<!--k:c id="1" …-->` sist |
+| Liggande sidor, andra marginaler, spalter | `<!-- kladd: avsnitt; page: A4 landscape; columns: 2 -->` på en egen rad (börjar ett avsnitt), `<!-- kladd: spaltbrytning -->` |
 | Punktlistor och numrerade listor | `-` och `1.` |
 | Citat | `>` |
 | Tabeller | `\| kolumn \| kolumn \|` |

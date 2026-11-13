@@ -120,6 +120,8 @@ struct DocState {
     tick: u64,
     /// Flytande bilder i senaste utläggningen: bildens byteläge och sida.
     float_starts: Vec<(usize, Float, usize)>,
+    /// Arken i senaste utläggningen (läge, mått och spalter), se `secpages`.
+    page_boxes: Arc<Vec<super::secpages::PageBox>>,
 }
 
 #[derive(Default)]
@@ -157,6 +159,7 @@ impl Cache {
             geoms: Arc::default(),
             tick: 0,
             float_starts: Vec::new(),
+            page_boxes: Arc::default(),
         });
         if st.text != text {
             st.text.clear();
@@ -174,6 +177,11 @@ impl Cache {
     /// Revisionsnummer: ändras exakt när texten ändrats sedan förra anropet.
     pub fn rev(&mut self, doc_id: u64, text: &str) -> u64 {
         self.state(doc_id, text).rev
+    }
+
+    /// Arken från senaste omläggningen av `text` (tom om den inte gjorts med sidbrytning).
+    pub fn page_boxes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::secpages::PageBox>> {
+        self.state(doc_id, text).page_boxes.clone()
     }
 
     pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
@@ -435,8 +443,20 @@ fn relayout(
     let mut starts: Vec<(usize, Float, usize)> = Vec::new();
     let mut all: Vec<Arc<Galley>> = Vec::new();
     let mut geoms: Vec<TableGeom> = Vec::new();
+    let mut geom_rows: Vec<usize> = Vec::new();
     let mut row_groups: Vec<Range<usize>> = Vec::new();
+    // Avsnitt och spaltbrytningar per rad (för dokument med avsnitt).
+    let multi = pages.is_some_and(|g| g.multi());
+    let mut row_sec: Vec<u32> = Vec::new();
+    let mut col_breaks: Vec<usize> = Vec::new();
+    let page_wrap = wrap_width;
     for (pr, w, tbl) in groups.iter() {
+        // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
+        let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
+        let wrap_width = match pages {
+            Some(g) if multi => g.wrap_for(sec),
+            _ => page_wrap,
+        };
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
@@ -470,6 +490,7 @@ fn relayout(
         };
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
+            wrap_width.to_bits().hash(&mut h);
             for f in &rel {
                 (f.0, f.1.to_bits(), f.2.to_bits()).hash(&mut h);
             }
@@ -499,8 +520,20 @@ fn relayout(
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
             (gs, geom)
         };
+        if multi {
+            let n: usize = galleys.iter().map(|g| g.rows.len()).sum();
+            row_sec.extend(std::iter::repeat(sec as u32).take(n));
+            let mut r = row_no;
+            for (q, lg) in gp.iter().zip(galleys.iter()) {
+                if q.col_break {
+                    col_breaks.push(r);
+                }
+                r += lg.rows.len();
+            }
+        }
         if let Some(g) = &tgeom {
             geoms.push(g.abs(w.start));
+            geom_rows.push(row_no);
             for lg in galleys.iter().filter(|lg| lg.rows.len() > 1) {
                 let _ = lg;
             }
@@ -526,7 +559,6 @@ fn relayout(
     st.units.retain(|_, u| u.used == tick);
     st.float_starts = starts;
 
-    st.geoms = Arc::new(geoms);
     let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
     job.wrap.max_width = wrap_width;
     job.sections.push(LayoutSection {
@@ -535,9 +567,23 @@ fn relayout(
         format: TextFormat::default(),
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
-    if let Some(geom) = pages {
-        super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+    match pages {
+        Some(geom) if multi => {
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks);
+            // Tabellernas kolumnkanter följer med raderna i sidled.
+            for (t, r) in geoms.iter_mut().zip(&geom_rows) {
+                let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
+                t.col_x.iter_mut().for_each(|x| *x += dx);
+            }
+            st.page_boxes = Arc::new(paged.boxes);
+        }
+        Some(geom) => {
+            super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+            st.page_boxes = Arc::new(geom.uniform_boxes(super::pages::page_count(&g, geom)));
+        }
+        None => st.page_boxes = Arc::default(),
     }
+    st.geoms = Arc::new(geoms);
     g
 }
 
@@ -1226,6 +1272,8 @@ struct Para {
     space_before: f32,
     /// Formatmallens indrag av styckets första rad (px).
     first_indent: f32,
+    /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
+    col_break: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1332,6 +1380,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         } else {
             None
         };
+        let col_break = super::sections::is_column_break(t);
         out.push(Para {
             range,
             align,
@@ -1343,6 +1392,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             reserve: None,
             space_before,
             first_indent,
+            col_break,
         });
         if e >= text.len() {
             break;

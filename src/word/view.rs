@@ -20,6 +20,8 @@ use super::grid;
 use super::images;
 use super::layout::{self, px};
 use super::pages;
+use super::secpages;
+use super::sections;
 use super::markup::{self, Block, Inline, SpanProp};
 use super::nav;
 use super::tables::{self, TableOp};
@@ -117,6 +119,8 @@ pub struct State {
     pub(crate) hf_dlg: Option<super::headers::HfDialog>,
     /// Öppen dialog "Ändra formatmall".
     pub(crate) styles_dlg: Option<super::stylesdlg::StylesDialog>,
+    /// Öppen dialog "Spalter" (avsnitt).
+    pub(crate) cols_dlg: Option<super::sectionui::ColumnsDialog>,
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
@@ -142,6 +146,10 @@ enum BarAct {
     Table,
     Footnote,
     Toc,
+    SectionBreak,
+    Landscape(bool),
+    ColumnBreak,
+    Columns,
     TableOp(TableOp),
     PageSetup,
     EditStyles,
@@ -489,6 +497,7 @@ impl KladdApp {
             self.speller = Some(crate::spell::Speller::new(self.settings.spell_lang.as_deref()));
         }
         let sel = self.word_selection(&ctx);
+        let sel_start = sel.start;
         let doc = &self.docs[self.active];
         let in_table = markup::table_at(&doc.text, sel.start).is_some();
         let analysis = self.word.analysis(doc.id, &doc.text);
@@ -497,6 +506,7 @@ impl KladdApp {
         let tracking = self.review_tracking();
         let review_changes = self.review_changes();
         let comments_shown = self.settings.word_comments;
+        let cur_landscape = analysis.sections[sections::index_at(&analysis.sections, sel_start)].landscape();
 
         let mut acts: Vec<BarAct> = Vec::new();
         // Typsnitt i dokumentet (grundtypsnittet först), och de som är installerade.
@@ -680,8 +690,8 @@ impl KladdApp {
                     }
                     divider(ui, p);
                     // Infoga: bild, tabell, fotnot och innehållsförteckning i en meny, som i Word.
-                    let insert = crate::app::status_button(ui, p, "Infoga \u{25BE}", "Infoga bild, tabell, fotnot eller innehållsförteckning");
-                    Popup::menu(&insert).gap(4.0).width(230.0).show(|ui| {
+                    let insert = crate::app::status_button(ui, p, "Infoga \u{25BE}", "Infoga bild, tabell, fotnot, innehållsförteckning, avsnittsbrytning eller spalter");
+                    Popup::menu(&insert).gap(4.0).width(250.0).show(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         if crate::app::menu_item(ui, p, "Bild…", "Ctrl+Shift+I", None, true) {
                             acts.push(BarAct::Image);
@@ -694,6 +704,21 @@ impl KladdApp {
                         }
                         if crate::app::menu_item(ui, p, "Innehållsförteckning", "", None, true) {
                             acts.push(BarAct::Toc);
+                        }
+                        menu_divider(ui, p);
+                        if crate::app::menu_item(ui, p, "Avsnittsbrytning (ny sida)", "", None, true) {
+                            acts.push(BarAct::SectionBreak);
+                        }
+                        let (label, to_landscape) =
+                            if cur_landscape { ("Stående sidor härifrån", false) } else { ("Liggande sidor härifrån", true) };
+                        if crate::app::menu_item(ui, p, label, "", None, true) {
+                            acts.push(BarAct::Landscape(to_landscape));
+                        }
+                        if crate::app::menu_item(ui, p, "Spalter\u{2026}", "", None, true) {
+                            acts.push(BarAct::Columns);
+                        }
+                        if crate::app::menu_item(ui, p, "Spaltbrytning", "", None, true) {
+                            acts.push(BarAct::ColumnBreak);
                         }
                     });
                     // Granska: spåra ändringar och kommentarer.
@@ -751,6 +776,10 @@ impl KladdApp {
                 BarAct::Block(b) => self.word_block(&ctx, b),
                 BarAct::Image => self.request_insert_image(&ctx),
                 BarAct::Toc => self.insert_toc(&ctx),
+                BarAct::SectionBreak => self.section_break(&ctx),
+                BarAct::Landscape(l) => self.section_landscape(&ctx, l),
+                BarAct::ColumnBreak => self.column_break(&ctx),
+                BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
                 BarAct::Footnote => self.word_footnote(&ctx),
@@ -780,6 +809,7 @@ impl KladdApp {
                 }
             }
         }
+        self.columns_dialog(&ctx, p);
     }
 
     /// Läser in en bild (en gång per dokument och källa) och registrerar bytes för ritning.
@@ -866,24 +896,31 @@ impl KladdApp {
             // Sidans mått kommer från dokumentets grundformat; zoomen anpassas så att sidan ryms.
             let avail_w = ui.available_width();
             let mut z = self.settings.word_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-            let geom1 = pages::Geom::new(1.0, &analysis.defaults);
-            if avail_w < geom1.page_w * z + 2.0 * GAP + rv.side {
-                z = ((avail_w - 2.0 * GAP - rv.side) / geom1.page_w).max(0.4);
+            let geom1 = pages::Geom::for_sections(1.0, &analysis.defaults, &analysis.sections);
+            if avail_w < geom1.max_page_w() * z + 2.0 * GAP + rv.side {
+                z = ((avail_w - 2.0 * GAP - rv.side) / geom1.max_page_w()).max(0.4);
             }
-            let geom = pages::Geom::new(z, &analysis.defaults);
-            let page_w = geom.page_w;
-            let text_w = geom.text_w();
+            let geom = pages::Geom::for_sections(z, &analysis.defaults, &analysis.sections);
+            let page_w = geom.max_page_w();
+            // Textytans bredd för TextEdit (med avsnitt: från den vänstraste till den högraste textkanten).
+            let text_w = geom.edit_w();
             let area_w = avail_w.max(page_w + 2.0 * GAP + rv.side);
 
             // Bilder: läs in och räkna ut visningsstorlek vid aktuell zoom.
             let refs = self.word.images(doc_id, &self.docs[self.active].text);
             let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
-            for img in refs.iter().cloned() {
+            // Bilderna i dokumentordning och var de står (för spaltbredden i avsnitt).
+            let img_starts: Vec<usize> =
+                analysis.pieces.iter().filter(|pc| pc.image.is_some()).map(|pc| pc.range.start).collect();
+            for (k, img) in refs.iter().cloned().enumerate() {
                 self.word_image(&ctx, &img.src);
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
-                    let max_w = geom1.text_w();
-                    sizes.insert(images::size_key(&img), images::display_size(info.size, &img, max_w, z));
+                    // Bilder är aldrig bredare än spalten de står i.
+                    let sec = img_starts.get(k).map_or(0, |b| sections::index_at(&analysis.sections, *b));
+                    let max_w = geom1.wrap_for(sec);
+                    let size = images::display_size(info.size, &img, max_w, z);
+                    sizes.entry(images::size_key(&img)).and_modify(|s| if size.x < s.x { *s = size }).or_insert(size);
                 }
             }
             let image_size = |src: &str| sizes.get(src).copied();
@@ -1030,13 +1067,14 @@ impl KladdApp {
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id, crate::panes::salt())).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let origin = ui.cursor().min;
+                // Skrivbordsytans vänsterkant för arken (de centreras om de är olika breda).
                 let page_left = origin.x + (area_w - page_w - rv.side) / 2.0;
                 let page_top = origin.y + GAP;
                 let shadow_slot = ui.painter().add(Shape::Noop);
                 let page_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
-                    pos2(page_left + geom.left, page_top + geom.top),
+                    pos2(page_left + geom.origin_x(), page_top + geom.top),
                     vec2(text_w, f32::INFINITY),
                 );
                 let params = layout::Params {
@@ -1084,6 +1122,17 @@ impl KladdApp {
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
                 let text = doc.text.as_str();
+                // Arken (med avsnitt olika stora, med spalter) från omläggningen som TextEdit just gjorde.
+                let origin_y = page_top + geom.top;
+                let mut boxes = word.page_boxes(doc_id, text);
+                if boxes.is_empty() {
+                    boxes = Arc::new(geom.uniform_boxes(pages::page_count(&galley, &geom)));
+                }
+                let total = boxes.len();
+                // Spalten (vänsterkant relativt galleriet, bredd) vid en punkt i galleriet.
+                let col_at = |x: f32, y: f32| -> (f32, f32) {
+                    if geom.multi() { secpages::column_at(&boxes, geom.origin_x(), x, y) } else { (0.0, text_w) }
+                };
                 // Tabeller: kolumnkanter att dra i, pekarens träffyta och markören i cellens innehåll.
                 let tview = if edited { None } else { word.table_view(doc_id, text) };
                 let mut vtabs: Vec<VisTable> = Vec::new();
@@ -1144,6 +1193,9 @@ impl KladdApp {
                     }
                     tables::pointer_fix(ui.ctx(), id, text, &galley, gpos, geoms, &out.response, on_edge);
                 }
+                if geom.multi() && !on_edge {
+                    secpages::pointer_fix(ui.ctx(), id, text, &galley, gpos, &boxes, geom.origin_x(), &out.response);
+                }
                 // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
                 tables::fix_caret(ui.ctx(), id, text);
 
@@ -1152,7 +1204,8 @@ impl KladdApp {
                     if let Some(start) = markup::footnote_area_start(text, &analysis) {
                         let r = galley.pos_from_cursor(CCursor::new(byte_to_char(text, start))).translate(gpos.to_vec2());
                         let y = (r.top() - px(z, 5.0)).round() + 0.5;
-                        painter_line(ui, p, gpos.x, y, text_w / 3.0, z);
+                        let (cl, cw) = col_at(r.left() - gpos.x, r.top() - gpos.y);
+                        painter_line(ui, p, gpos.x + cl, y, cw / 3.0, z);
                     }
                     let hover = ui.input(|i| i.pointer.hover_pos()).filter(|q| te_rect.contains(*q));
                     if let Some(q) = hover {
@@ -1190,12 +1243,11 @@ impl KladdApp {
                 }
 
                 // Ett ark per sida, med luft emellan.
-                let total = pages::page_count(&galley, &geom);
                 let clip = ui.clip_rect();
-                let (shadows, sheets) = pages::sheet_shapes(p, &geom, page_left, page_top, total, clip);
+                let (shadows, sheets) = pages::sheet_shapes(p, &boxes, page_left, origin_y, clip);
                 ui.painter().set(shadow_slot, shadows);
                 ui.painter().set(page_slot, sheets);
-                let last_bottom = pages::sheet_rect(&geom, page_left, page_top, total - 1).bottom();
+                let last_bottom = boxes[total - 1].rect(page_left, origin_y).bottom();
                 ui.allocate_rect(
                     Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),
                     Sense::hover(),
@@ -1207,12 +1259,13 @@ impl KladdApp {
                     font_family(Some(analysis.defaults.font()), false, false),
                 );
                 let hf_fields = crate::style::Fields::new(1, total, &doc.title());
-                for k in 0..total {
-                    let sheet = pages::sheet_rect(&geom, page_left, page_top, k);
+                for (k, b) in boxes.iter().enumerate() {
+                    let sheet = b.rect(page_left, origin_y);
                     if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
                         continue;
                     }
-                    if let Some(footer) = super::headers::header_footer(ui, p, &geom, sheet, k, total, &analysis.defaults, &hf_fields, hf_font.clone(), doc_id) {
+                    // Varje ark har sin egen storlek: sidhuvudet och sidfoten följer arkets mått.
+                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, total, &analysis.defaults, &hf_fields, hf_font.clone(), doc_id) {
                         open_hf_dlg = Some((footer, k));
                     }
                 }
@@ -1222,10 +1275,10 @@ impl KladdApp {
                 let mut conv = ByteToChar::new(text);
 
                 // Punkter för dolda listmarkörer, citatstreck och bilder.
-                let mut bar: Option<(f32, f32)> = None;
-                let flush_bar = |bar: &mut Option<(f32, f32)>| {
-                    if let Some((y0, y1)) = bar.take() {
-                        let x = gpos.x - px(z, 5.0);
+                let mut bar: Option<(f32, f32, f32)> = None;
+                let flush_bar = |bar: &mut Option<(f32, f32, f32)>| {
+                    if let Some((y0, y1, left)) = bar.take() {
+                        let x = gpos.x + left - px(z, 5.0);
                         painter.rect_filled(
                             Rect::from_min_max(pos2(x - 3.0, y0), pos2(x, y1)),
                             0.0,
@@ -1278,11 +1331,12 @@ impl KladdApp {
                         let ra = galley.pos_from_cursor(CCursor::new(a)).translate(gpos.to_vec2());
                         let rb = galley.pos_from_cursor(CCursor::new(b)).translate(gpos.to_vec2());
                         let (y0, y1) = (ra.top(), rb.bottom());
+                        let left = col_at(ra.left() - gpos.x, ra.top() - gpos.y).0;
                         bar = match bar {
-                            Some((c0, c1)) if y0 <= c1 + 1.0 => Some((c0, c1.max(y1))),
+                            Some((c0, c1, l)) if y0 <= c1 + 1.0 && l == left => Some((c0, c1.max(y1), l)),
                             other => {
                                 flush_bar(&mut { other });
-                                Some((y0, y1))
+                                Some((y0, y1, left))
                             }
                         };
                     }
@@ -1298,9 +1352,10 @@ impl KladdApp {
                             {
                                 let uri = image_uri(&img.src, doc_id);
                                 let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
+                                let (cl, cw) = col_at(r.left() - gpos.x, top - gpos.y);
                                 let min = match side {
-                                    Some((markup::Float::Left, _)) => pos2(gpos.x, top),
-                                    Some((markup::Float::Right, _)) => pos2(gpos.x + text_w - sz.x, top),
+                                    Some((markup::Float::Left, _)) => pos2(gpos.x + cl, top),
+                                    Some((markup::Float::Right, _)) => pos2(gpos.x + cl + cw - sz.x, top),
                                     None => r.min,
                                 };
                                 let rect = Rect::from_min_size(min, *sz);
@@ -1337,7 +1392,8 @@ impl KladdApp {
                             .pos_from_cursor(CCursor::new(text[..line.start].chars().count()))
                             .translate(gpos.to_vec2())
                             .min;
-                        let rect = Rect::from_min_size(pos2(gpos.x, top.y), vec2(text_w, toc_h));
+                        let (cl, cw) = col_at(top.x - gpos.x, top.y - gpos.y);
+                        let rect = Rect::from_min_size(pos2(gpos.x + cl, top.y), vec2(cw, toc_h));
                         if rect.bottom() < clip.top() || rect.top() > clip.bottom() {
                             continue;
                         }
@@ -1345,7 +1401,7 @@ impl KladdApp {
                         let page_nums: Vec<usize> = entries
                             .iter()
                             .take(shown)
-                            .map(|h| geom.page_of(galley.pos_from_cursor(CCursor::new(c2.at(h.start))).min.y) + 1)
+                            .map(|h| secpages::page_index(&boxes, galley.pos_from_cursor(CCursor::new(c2.at(h.start))).min.y) + 1)
                             .collect();
                         let fam = |bold: bool| font_family(Some(analysis.defaults.font()), bold, false);
                         if let Some(b) = super::navui::paint_toc(
@@ -1366,11 +1422,11 @@ impl KladdApp {
                 }
 
                 // Markering, handtag och verktygsrad för bilder; ligger ovanpå texten.
-                let max_w = text_w;
+                let max_w = (0..geom.secs.len().max(1)).map(|i| geom.wrap_for(i)).fold(0.0, f32::max);
                 // Var en dragen bild skulle hamna: raden under pekaren, före eller efter beroende på
                 // om pekaren står över eller under radens mitt. Bara över ett ark.
                 let drop_at = |pos: egui::Pos2| -> Option<images::Drop> {
-                    if !(0..total).any(|k| pages::sheet_rect(&geom, page_left, page_top, k).contains(pos)) {
+                    if !boxes.iter().any(|b| b.rect(page_left, origin_y).contains(pos)) {
                         return None;
                     }
                     let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
@@ -1388,8 +1444,8 @@ impl KladdApp {
                         target: if after { line.end } else { line.start },
                         after,
                         y: if after { bottom } else { top },
-                        x0: gpos.x,
-                        x1: gpos.x + text_w,
+                        x0: gpos.x + col_at(pos.x - gpos.x, pos.y - gpos.y).0,
+                        x1: gpos.x + col_at(pos.x - gpos.x, pos.y - gpos.y).0 + col_at(pos.x - gpos.x, pos.y - gpos.y).1,
                     })
                 };
                 img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
@@ -1425,7 +1481,7 @@ impl KladdApp {
 
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
-                page_pos = ((geom.page_of(caret_y) + 1).min(total), total);
+                page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
 
                 // Röd våglinje under felstavade ord.
                 if !misspelled.is_empty() {

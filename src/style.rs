@@ -316,6 +316,10 @@ impl DocDefaults {
         let t = line.trim();
         let inner = t.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
         let css = inner.strip_prefix("kladd:")?;
+        // Avsnittsraderna (`crate::word::sections`) är inte grundformat.
+        if crate::word::sections::is_section_keyword(css) {
+            return None;
+        }
         let mut d = DocDefaults::default();
         for (k, v) in declarations(css) {
             match k.as_str() {
@@ -473,7 +477,7 @@ pub fn join_parts(p: &[String; 3]) -> (String, Align) {
 }
 
 /// `namn: värde`-par separerade med `;`, där värden inom citattecken får innehålla `;`.
-fn declarations(css: &str) -> Vec<(String, String)> {
+pub(crate) fn declarations(css: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -507,7 +511,7 @@ fn declarations(css: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn quote(t: &str) -> String {
+pub(crate) fn quote(t: &str) -> String {
     let mut s = String::from('"');
     for c in t.chars() {
         match c {
@@ -563,7 +567,7 @@ pub fn parse_length(v: &str) -> Option<f32> {
     (x >= 0.0 && x < 100_000.0).then_some(x * f)
 }
 
-fn parse_page_size(v: &str) -> Option<(f32, f32)> {
+pub(crate) fn parse_page_size(v: &str) -> Option<(f32, f32)> {
     let words: Vec<String> = v.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
     let landscape = words.iter().any(|w| w == "landscape");
     let named = words.iter().find_map(|w| {
@@ -589,7 +593,7 @@ fn parse_page_size(v: &str) -> Option<(f32, f32)> {
     Some(if landscape && w < h { (h, w) } else { (w, h) })
 }
 
-fn parse_margins(v: &str) -> Option<[f32; 4]> {
+pub(crate) fn parse_margins(v: &str) -> Option<[f32; 4]> {
     let l: Vec<f32> = v.split_whitespace().map(parse_length).collect::<Option<_>>()?;
     Some(match l.as_slice() {
         [a] => [*a; 4],
@@ -600,11 +604,11 @@ fn parse_margins(v: &str) -> Option<[f32; 4]> {
     })
 }
 
-fn same_size(a: (f32, f32), b: (f32, f32)) -> bool {
+pub(crate) fn same_size(a: (f32, f32), b: (f32, f32)) -> bool {
     (a.0 - b.0).abs() < 1.0 && (a.1 - b.1).abs() < 1.0
 }
 
-fn page_size_css(w: f32, h: f32) -> String {
+pub(crate) fn page_size_css(w: f32, h: f32) -> String {
     for (name, p) in [("A3", (841.89, 1190.55)), ("A4", A4), ("A5", (419.53, 595.28)), ("Letter", (612.0, 792.0)), ("Legal", (612.0, 1008.0))] {
         if same_size((w, h), p) {
             return name.to_owned();
@@ -616,7 +620,7 @@ fn page_size_css(w: f32, h: f32) -> String {
     format!("{} {}", mm(w), mm(h))
 }
 
-fn margin_css(m: [f32; 4]) -> String {
+pub(crate) fn margin_css(m: [f32; 4]) -> String {
     if m.iter().all(|v| (v - m[0]).abs() < 0.5) {
         mm(m[0])
     } else {
@@ -625,7 +629,7 @@ fn margin_css(m: [f32; 4]) -> String {
 }
 
 /// pt som mm med högst en decimal.
-fn mm(pt: f32) -> String {
+pub(crate) fn mm(pt: f32) -> String {
     let v = (pt * 25.4 / 72.0 * 10.0).round() / 10.0;
     if v.fract() == 0.0 { format!("{}mm", v as i64) } else { format!("{v}mm") }
 }

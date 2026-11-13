@@ -100,6 +100,8 @@ pub struct Analysis {
     pub pieces: Vec<Piece>,
     /// Dokumentets grundformat från kommentaren `<!-- kladd: … -->` på första raden.
     pub defaults: DocDefaults,
+    /// Avsnitten (sidstorlek, spalter) med egenskaperna uträknade; minst ett.
+    pub sections: Vec<super::sections::Section>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -483,6 +485,9 @@ fn parse(text: &str) -> Parsed {
                     } else if t == super::nav::TOC_LINE {
                         // Innehållsförteckningen: en dold rad som dokumentläget ersätter med rubrikerna.
                         fill(&mut st, tr, |s| s.markup = true);
+                    } else if super::sections::SectionProps::from_comment(t).is_some() || super::sections::is_column_break(t) {
+                        // Avsnittsrad och spaltbrytning: dolda rader (visas bara när markören står på dem).
+                        fill(&mut st, tr, |s| s.markup = true);
                     } else if ls == 0 {
                         if let Some(d) = DocDefaults::from_comment(t) {
                             defaults = d;
@@ -777,7 +782,8 @@ fn mark_table(text: &str, st: &mut [St], r: &Range<usize>) {
 
 pub fn analyze(text: &str) -> Analysis {
     let p = parse(text);
-    Analysis { pieces: p.pieces, defaults: p.defaults }
+    let sections = super::sections::scan(text, &p.defaults);
+    Analysis { pieces: p.pieces, sections, defaults: p.defaults }
 }
 
 // ============================================================== bilder och objektmarkörer (HTML)
@@ -1524,7 +1530,7 @@ pub fn toggle_inline(text: &str, sel: Range<usize>, m: Inline) -> Edit {
         }
     }
     let parsed = parse(text);
-    let a = Analysis { pieces: parsed.pieces.clone(), defaults: parsed.defaults.clone() };
+    let a = Analysis { pieces: parsed.pieces.clone(), sections: Vec::new(), defaults: parsed.defaults.clone() };
     let act = active(text, &a, s..e);
     let on = match m {
         Inline::Bold => act.bold,
@@ -2517,7 +2523,7 @@ pub fn set_span_prop(text: &str, sel: Range<usize>, prop: SpanProp) -> Edit {
         }
     }
     let parsed = parse(text);
-    let a = Analysis { pieces: parsed.pieces.clone(), defaults: parsed.defaults.clone() };
+    let a = Analysis { pieces: parsed.pieces.clone(), sections: Vec::new(), defaults: parsed.defaults.clone() };
     let mut segs: Vec<Range<usize>> = content_segments(text, &a, s, e)
         .into_iter()
         // Rader som bara är markup (div-taggar, kommentarer) får ingen formatering.

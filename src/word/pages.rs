@@ -10,11 +10,12 @@ use std::hash::{Hash, Hasher};
 use egui::epaint::text::Galley;
 use egui::{
     Align, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Rect, RichText, Shape, Stroke,
-    Ui, pos2, vec2,
+    Ui, vec2,
 };
 
 use super::layout::px;
 use super::markup::{self, Align as HAlign, DocDefaults};
+use super::secpages::PageBox;
 use crate::app::{KladdApp, quiet_button};
 use crate::theme::{self, Palette};
 
@@ -22,7 +23,7 @@ use crate::theme::{self, Palette};
 pub const SHEET_GAP: f32 = 24.0;
 
 /// Sidans mått i px vid en given zoom.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Geom {
     pub page_w: f32,
     pub page_h: f32,
@@ -31,6 +32,9 @@ pub struct Geom {
     pub bottom: f32,
     pub left: f32,
     pub gap: f32,
+    /// Avsnittens sidgeometri när dokumentet har avsnitt med egen sida eller spalter
+    /// (`Geom::for_sections`); tom för ett vanligt dokument.
+    pub secs: std::sync::Arc<Vec<super::secpages::SecGeom>>,
 }
 
 impl Geom {
@@ -47,11 +51,26 @@ impl Geom {
             bottom: px(zoom, cap(b, h)),
             left: px(zoom, cap(l, w)),
             gap: SHEET_GAP,
+            secs: Default::default(),
         }
     }
 
     pub fn text_w(&self) -> f32 {
         (self.page_w - self.left - self.right).max(1.0)
+    }
+
+    /// Måtten för ett ark (marginalerna till sidhuvud och sidfot).
+    pub fn for_page(&self, b: &PageBox) -> Geom {
+        Geom {
+            page_w: b.w,
+            page_h: b.h,
+            top: b.margin[0],
+            right: b.margin[1],
+            bottom: b.margin[2],
+            left: b.margin[3],
+            gap: self.gap,
+            secs: Default::default(),
+        }
     }
 
     pub fn text_h(&self) -> f32 {
@@ -67,6 +86,7 @@ impl Geom {
         for v in [self.page_w, self.page_h, self.top, self.right, self.bottom, self.left, self.gap] {
             v.to_bits().hash(h);
         }
+        self.hash_secs(h);
     }
 
     /// Sidan (från 0) som y-värdet (px från galleriets överkant) ligger på.
@@ -143,13 +163,13 @@ pub fn page_count(g: &Galley, geom: &Geom) -> usize {
     g.rows.last().map_or(1, |r| geom.page_of(r.pos.y) + 1)
 }
 
-/// Ritar arken (skugga och vitt papper) för `count` sidor. `first_top` är y för första arkets
-/// överkant. Bara ark som syns inom `clip` ritas.
-pub fn sheet_shapes(p: &Palette, geom: &Geom, left: f32, first_top: f32, count: usize, clip: Rect) -> (Shape, Shape) {
+/// Ritar arken (skugga och vitt papper). `base` är skrivbordsytans vänsterkant och `origin_y` y för
+/// galleriets y = 0 (textytans överkant på första sidan). Bara ark som syns inom `clip` ritas.
+pub fn sheet_shapes(p: &Palette, boxes: &[PageBox], base: f32, origin_y: f32, clip: Rect) -> (Shape, Shape) {
     let mut shadows = Vec::new();
     let mut sheets = Vec::new();
-    for k in 0..count {
-        let r = sheet_rect(geom, left, first_top, k);
+    for b in boxes {
+        let r = b.rect(base, origin_y);
         if r.bottom() + 8.0 < clip.top() || r.top() - 8.0 > clip.bottom() {
             continue;
         }
@@ -157,10 +177,6 @@ pub fn sheet_shapes(p: &Palette, geom: &Geom, left: f32, first_top: f32, count: 
         sheets.push(Shape::rect_filled(r, 1.0, p.page));
     }
     (Shape::Vec(shadows), Shape::Vec(sheets))
-}
-
-pub fn sheet_rect(geom: &Geom, left: f32, first_top: f32, k: usize) -> Rect {
-    Rect::from_min_size(pos2(left, first_top + k as f32 * geom.stride()), vec2(geom.page_w, geom.page_h))
 }
 
 /// Sidhuvudets/sidfotens typsnitt: brödtextens, 0,9 gånger så stort.
@@ -428,7 +444,7 @@ mod tests {
     use std::sync::Arc;
 
     fn geom() -> Geom {
-        Geom { page_w: 300.0, page_h: 400.0, top: 40.0, right: 30.0, bottom: 40.0, left: 30.0, gap: 24.0 }
+        Geom { page_w: 300.0, page_h: 400.0, top: 40.0, right: 30.0, bottom: 40.0, left: 30.0, gap: 24.0, secs: Default::default() }
     }
 
     /// Ett galleri med många rader (en per stycke) som `paginate` sedan bryter.

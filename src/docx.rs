@@ -18,6 +18,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::review::{self, CommentRec, RevKind, RevRec};
+use crate::word::sections;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::word::markup::{self, Float};
 
@@ -123,6 +124,8 @@ pub struct Source {
     styles: style::StyleSet,
     /// Originalets kommentarer (comments.xml), om dokumentet har några.
     comments: Option<review_xml::CmPart>,
+    /// Sidhuvuds- och sidfotsreferenserna i första avsnittets `w:sectPr` (de gäller också senare avsnitt).
+    first_refs: String,
 }
 
 // ============================================================== läsning
@@ -796,6 +799,8 @@ struct BodyInfo {
     head: String,
     tail: String,
     sect_pr: Option<String>,
+    /// `w:sectPr` i stycken (slut på varje avsnitt utom det sista), i dokumentordning.
+    sects: Vec<String>,
     /// XML för varje toppnivåelement utom `w:sectPr`.
     elems: Vec<String>,
     tokens: Vec<Opaque>,
@@ -871,7 +876,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
 
     let mut found: Vec<FoundImage> = Vec::new();
     let mut info = BodyInfo { track: true, ..Default::default() };
-    let blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info)?;
+    let mut blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info)?;
     // Kommentarerna: posterna läggs sist i texten, och bara de som har ett område.
     let comments = match find_part("/comments") {
         Some(name) => {
@@ -887,11 +892,14 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         None => None,
     };
 
-    // Sida, sidhuvud och sidfot ur sista sektionen.
-    let page = match info.sect_pr.as_deref() {
+    // Sida, sidhuvud och sidfot ur första avsnittet (de övriga avsnitten blir avsnittsrader).
+    let page = match info.sects.first().or(info.sect_pr.as_ref()) {
         Some(sect) => read_page(sect, &mut pkg, &rels, dir)?,
         None => DocDefaults::default(),
     };
+    let mut all_sects: Vec<&str> = info.sects.iter().map(String::as_str).collect();
+    all_sects.extend(info.sect_pr.as_deref());
+    fill_section_rows(&mut blocks, &all_sects, &page);
 
     // Packa upp bilderna som dokumentet faktiskt använder.
     let mut images: Vec<(String, Image)> = Vec::new();
@@ -992,7 +1000,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 e.fn_ids.push(r.id.clone());
             }
         }
-        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles, comments })
+        let first_refs = info.sects.first().or(info.sect_pr.as_ref()).map(|x| header_refs(x)).unwrap_or_default();
+        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles, comments, first_refs })
     });
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
@@ -1163,6 +1172,91 @@ fn collect_parts(pkg: &mut Package<'_>) -> Option<Vec<(String, Vec<u8>)>> {
         out.push((name, buf));
     }
     Some(out)
+}
+
+/// Sida, spalter och avsnittstyp ur en `w:sectPr` (utan sidhuvud och sidfot).
+#[derive(Debug, Clone, PartialEq)]
+struct RawSect {
+    size: Option<(f32, f32)>,
+    margin: Option<[f32; 4]>,
+    cols: usize,
+    /// Mellanrum mellan spalter i pt.
+    gap: Option<f32>,
+    continuous: bool,
+}
+
+fn read_sect(sect: &str) -> RawSect {
+    let mut o = RawSect { size: None, margin: None, cols: 1, gap: None, continuous: false };
+    let mut mar = [style::DEFAULT_MARGIN; 4];
+    let mut r = Reader::from_str(sect);
+    let tw = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e) | Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"pgSz" => {
+                    if let (Some(w), Some(h)) = (tw(&e, b"w"), tw(&e, b"h")) {
+                        if w > 0.0 && h > 0.0 {
+                            let (w, h) = (w / 20.0, h / 20.0);
+                            let land = attr(&e, b"orient").as_deref() == Some("landscape");
+                            o.size = Some(if land && w < h { (h, w) } else { (w, h) });
+                        }
+                    }
+                }
+                b"pgMar" => {
+                    for (i, n) in [b"top".as_slice(), b"right", b"bottom", b"left"].into_iter().enumerate() {
+                        if let Some(v) = tw(&e, n) {
+                            mar[i] = (v / 20.0).max(0.0);
+                            o.margin = Some(mar);
+                        }
+                    }
+                }
+                b"cols" => {
+                    o.cols = attr(&e, b"num").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, sections::MAX_COLUMNS);
+                    o.gap = tw(&e, b"space").map(|v| v / 20.0);
+                }
+                // Olika breda spalter: antalet räknas, mellanrummet tas från första spalten.
+                b"col" => {
+                    if o.gap.is_none() {
+                        o.gap = tw(&e, b"space").map(|v| v / 20.0);
+                    }
+                }
+                b"type" => o.continuous = attr(&e, b"val").as_deref() == Some("continuous"),
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    o
+}
+
+/// Avsnittsradens egenskaper för ett avsnitt vars `w:sectPr` är `sect`, mot dokumentets grundformat `d`.
+fn section_props(sect: Option<&str>, d: &DocDefaults) -> sections::SectionProps {
+    let Some(sect) = sect else { return sections::SectionProps::default() };
+    let raw = read_sect(sect);
+    let mut p = sections::SectionProps::default();
+    p.page_size = raw.size.filter(|s| !style::same_size(*s, d.page()));
+    p.page_margin = raw.margin.filter(|m| m.iter().zip(d.margins()).any(|(a, b)| (a - b).abs() > 0.6));
+    if raw.cols > 1 {
+        p.columns = Some(raw.cols);
+        p.column_gap = raw.gap.filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
+    }
+    p.continuous = raw.continuous;
+    p
+}
+
+/// Byter platshållarna i avsnittsraderna mot raderna med respektive avsnitts egenskaper.
+/// `sects[n]` är `w:sectPr` för avsnitt n (0 = första); rad n börjar avsnitt n + 1.
+fn fill_section_rows(blocks: &mut [Block], sects: &[&str], d: &DocDefaults) {
+    for b in blocks {
+        let Block::Para(p) = b else { continue };
+        let [run] = p.runs.as_mut_slice() else { continue };
+        let Some(n) = run.text.strip_prefix('\u{E010}').and_then(|r| r.strip_suffix('\u{E011}')).and_then(|r| r.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        run.text = section_props(sects.get(n + 1).copied(), d).to_comment();
+    }
 }
 
 /// Sidstorlek, marginaler, sidhuvud och sidfot ur en `w:sectPr`.
@@ -1557,6 +1651,19 @@ fn run_span(
 }
 
 /// Slutet (exklusivt) på elementet som börjar vid `from` i `xml`.
+/// Ett stycke med bara en rad råtext (Kladds egna markörer: avsnitt, spaltbrytning).
+fn raw_para(text: String, origin: usize) -> Para {
+    let mut p = Para::new();
+    p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
+    p.origin = origin;
+    p
+}
+
+/// Platshållare för avsnittsraden n; fylls i när alla avsnitts egenskaper lästs.
+fn section_placeholder(n: usize) -> String {
+    format!("\u{E010}{n}\u{E011}")
+}
+
 fn element_end(xml: &str, from: usize) -> Option<usize> {
     let mut r = Reader::from_str(&xml[from..]);
     let mut depth = 0usize;
@@ -1619,6 +1726,9 @@ fn parse_body(
     let mut blocks: Vec<Block> = Vec::new();
 
     let mut para: Option<Para> = None;
+    // Avsnittsslut (`w:sectPr` i `w:pPr`) och spaltbrytning i stycket som läses.
+    let mut para_sect: Option<String> = None;
+    let mut para_col_break = false;
     let mut fmt = Fmt::default();
     // Körningens egna egenskaper (`w:rPr`) och teckenmall (`w:rStyle`).
     let mut direct = RProps::default();
@@ -1889,6 +1999,15 @@ fn parse_body(
                             skip = 1;
                         }
                     }
+                    // Avsnittsslut i ett toppnivåstycke: egenskaperna blir en avsnittsrad efter stycket.
+                    b"sectPr" if in_ppr && tables.is_empty() && para.is_some() && para_sect.is_none() => {
+                        if empty {
+                            para_sect = Some(xml[before..after].to_owned());
+                        } else if let Some(end) = element_end(xml, before) {
+                            para_sect = Some(xml[before..end].to_owned());
+                            skip = 1;
+                        }
+                    }
                     b"sdtPr" | b"sdtEndPr" | b"instrText" | b"sectPr" | b"tblPr" | b"trPr" | b"fldData" => {
                         if !empty {
                             skip = 1;
@@ -1999,6 +2118,9 @@ fn parse_body(
                     b"t" => in_t = !empty,
                     b"tab" if !in_ppr && para.is_some() && !hidden(&field_depth) => {
                         push_text(&mut para, "\t", &fmt, &link.last().cloned().flatten())
+                    }
+                    b"br" if !hidden(&field_depth) && attr(e, b"type").as_deref() == Some("column") && tables.is_empty() => {
+                        para_col_break = true;
                     }
                     b"br" | b"cr" if !hidden(&field_depth) => {
                         push_text(&mut para, "\n", &Fmt::default(), &None);
@@ -2195,8 +2317,20 @@ fn parse_body(
                                 }
                             } else {
                                 p.origin = info.elems.len().wrapping_sub(1);
+                                // Spaltbrytning före stycket (eller ensam), avsnittsrad efter det.
+                                let origin = p.origin;
+                                if std::mem::take(&mut para_col_break) {
+                                    blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
+                                }
                                 blocks.push(Block::Para(p));
+                                if let Some(x) = para_sect.take() {
+                                    info.sects.push(x);
+                                    blocks.push(Block::Para(raw_para(section_placeholder(info.sects.len() - 1), origin)));
+                                }
                             }
+                        } else {
+                            para_sect = None;
+                            para_col_break = false;
                         }
                     }
                     b"tc" => {
@@ -2461,8 +2595,15 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 if without_tokens(&text).trim().is_empty() {
                     continue;
                 }
-                // Kodblock justeras inte.
-                let align = if p.kind == ParaKind::Code { Align::Left } else { p.align };
+                // Kodblock justeras inte; Kladds egna markörrader följer omgivningen.
+                let is_marker = matches!(p.runs.as_slice(), [r] if r.raw && r.text.starts_with("<!-- kladd:"));
+                let align = if p.kind == ParaKind::Code {
+                    Align::Left
+                } else if is_marker {
+                    cur_align
+                } else {
+                    p.align
+                };
                 let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_));
                 let same_list = match &p.list {
                     Some((num, 0)) => top_num.as_deref() == Some(num.as_str()),
@@ -2640,6 +2781,8 @@ struct Ctx<'a> {
     revs: HashMap<u32, RevRec>,
     /// Kommentarer som finns som poster (områden utan post skrivs inte).
     comments: std::collections::HashSet<u32>,
+    /// Första avsnittsraden står före all text och gäller första avsnittet (ingen sektionsbrytning).
+    lead_section: bool,
 }
 
 /// En enhet i den skrivna brödtexten (stycke, listpunkt, tabell …) som kan bytas mot originalet.
@@ -3535,6 +3678,17 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.toc(md);
+                } else if sections::SectionProps::from_comment(&s).is_some() && w.table.is_none() && w.quote == 0 {
+                    // Avsnittsslut: ett tomt stycke med `w:sectPr` (egenskaperna sätts av `fix_sections`).
+                    w.close_para();
+                    if std::mem::take(&mut w.ctx.lead_section) {
+                        // Första avsnittets egenskaper: ingen brytning.
+                    } else {
+                        w.body.push_str(SECT_PARA);
+                    }
+                } else if sections::is_column_break(&s) && w.table.is_none() && w.quote == 0 {
+                    w.close_para();
+                    w.body.push_str("<w:p><w:r><w:br w:type=\"column\"/></w:r></w:p>");
                 } else if s.trim().eq_ignore_ascii_case("<br>") || s.trim().eq_ignore_ascii_case("<br/>") {
                     w.line_break();
                 } else if let Some(style) = style::parse_span_open(&s) {
@@ -3592,7 +3746,9 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         // Ett HTML-block är bara en enhet när det är en ensam bild.
                         let ok = code != EvEnd::Html
                             || (key.to_ascii_lowercase().starts_with("<img") && !key.contains('\n'))
-                            || key == crate::word::nav::TOC_LINE;
+                            || key == crate::word::nav::TOC_LINE
+                            || sections::SectionProps::from_comment(&key).is_some()
+                            || sections::is_column_break(&key);
                         if ok && !key.is_empty() {
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
                         }
@@ -3965,17 +4121,23 @@ fn patch_sect(orig: &str, d: &DocDefaults, page: bool, edit: &SectEdit) -> Strin
     if let Some(on) = edit.title_pg {
         x = remove_title_pg(&x);
         if on {
-            // `w:titlePg` står före textriktning, `w:docGrid` m.fl. i schemat.
-            let at = ["<w:textDirection", "<w:bidi", "<w:rtlGutter", "<w:docGrid", "<w:printerSettings", "</w:sectPr>"]
-                .iter()
-                .filter_map(|m| x.find(m))
-                .min();
-            if let Some(at) = at {
-                x.insert_str(at, "<w:titlePg/>");
-            }
+            x = insert_title_pg(&x);
         }
     }
     x
+}
+
+/// Lägger `<w:titlePg/>` på rätt plats i en sektion.
+fn insert_title_pg(x: &str) -> String {
+    // `w:titlePg` står före textriktning, `w:docGrid` m.fl. i schemat.
+    let at = ["<w:textDirection", "<w:bidi", "<w:rtlGutter", "<w:docGrid", "<w:printerSettings", "</w:sectPr>"]
+        .iter()
+        .filter_map(|m| x.find(m))
+        .min();
+    match at {
+        Some(at) => format!("{}<w:titlePg/>{}", &x[..at], &x[at..]),
+        None => x.to_owned(),
+    }
 }
 
 /// Tar bort `<w:titlePg …/>` ur en sektion.
@@ -4005,6 +4167,190 @@ impl HfRefs {
             ftr_first: one(false, d.footer_first.as_deref()),
         }
     }
+}
+
+/// Tomt stycke som avslutar ett avsnitt; `fix_sections` fyller i egenskaperna.
+const SECT_PARA: &str = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:pPr></w:p>";
+
+fn same_pt(a: f32, b: f32, tol: f32) -> bool {
+    (a - b).abs() <= tol
+}
+
+/// Tar bort första taggen som börjar med `start` (`<w:type`), hela elementet om det har innehåll.
+fn remove_tag(x: &str, start: &str) -> String {
+    let Some(i) = x.find(start) else { return x.to_owned() };
+    let Some(j) = x[i..].find('>') else { return x.to_owned() };
+    let mut end = i + j + 1;
+    if !x[i..end].ends_with("/>") {
+        let close = format!("</{}>", &start[1..]);
+        if let Some(k) = x[end..].find(&close) {
+            end += k + close.len();
+        }
+    }
+    format!("{}{}", &x[..i], &x[end..])
+}
+
+/// Sätter sida, marginaler, spalter och avsnittstyp i en `w:sectPr` efter avsnittet `sec`. Är allt
+/// redan lika lämnas XML:en orörd (förlustfri sparning). `refs` = sidhuvud- och sidfotsreferenser att
+/// lägga först om `x` saknar egna (första avsnittet när brödtextens sectPr bär dem).
+fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> String {
+    let raw = read_sect(orig);
+    let (w, h) = sec.page;
+    let size_ok = raw.size.is_some_and(|(rw, rh)| same_pt(rw, w, 1.0) && same_pt(rh, h, 1.0));
+    let mar_ok = raw.margin.is_some_and(|m| m.iter().zip(sec.margin).all(|(a, b)| same_pt(*a, b, 0.6)));
+    let cols_ok = raw.cols == sec.columns && (sec.columns == 1 || raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)));
+    let type_ok = raw.continuous == sec.continuous;
+    let refs_add = refs.filter(|r| !r.is_empty() && !orig.contains("headerReference") && !orig.contains("footerReference"));
+    if size_ok && mar_ok && cols_ok && type_ok && refs_add.is_none() {
+        return orig.to_owned();
+    }
+    let mut x = orig.to_owned();
+    if x.trim_end().ends_with("/>") && !x.contains("</w:sectPr>") {
+        x = format!("{}></w:sectPr>", x.trim_end().trim_end_matches("/>").trim_end());
+    }
+    if !size_ok {
+        x = edit_tag(&x, "<w:pgSz", |t| {
+            let t = set_xml_attr(t, "w:w", &twips(w).to_string());
+            let t = set_xml_attr(&t, "w:h", &twips(h).to_string());
+            if w > h { set_xml_attr(&t, "w:orient", "landscape") } else { remove_xml_attr(&t, "w:orient") }
+        });
+    }
+    if !mar_ok {
+        x = edit_tag(&x, "<w:pgMar", |t| {
+            let mut t = t.to_owned();
+            for (n, v) in ["top", "right", "bottom", "left"].into_iter().zip(sec.margin) {
+                t = set_xml_attr(&t, &format!("w:{n}"), &twips(v).to_string());
+            }
+            for n in ["header", "footer"] {
+                if !t.contains(&format!("w:{n}=")) {
+                    t = set_xml_attr(&t, &format!("w:{n}"), "708");
+                }
+            }
+            if !t.contains("w:gutter=") {
+                t = set_xml_attr(&t, "w:gutter", "0");
+            }
+            t
+        });
+    }
+    if !cols_ok {
+        x = remove_tag(&x, "<w:cols");
+        let cols = if sec.columns > 1 {
+            format!("<w:cols w:num=\"{}\" w:space=\"{}\"/>", sec.columns, twips(sec.gap))
+        } else {
+            "<w:cols w:space=\"708\"/>".to_owned()
+        };
+        // Schemat: cols kommer efter pgMar och före docGrid.
+        x = if x.contains("<w:docGrid") {
+            insert_before(&x, "<w:docGrid", &cols)
+        } else {
+            insert_before(&x, "</w:sectPr>", &cols)
+        };
+    }
+    if !type_ok {
+        x = remove_tag(&x, "<w:type");
+        if sec.continuous {
+            let tag = "<w:type w:val=\"continuous\"/>";
+            x = if x.contains("<w:pgSz") { insert_before(&x, "<w:pgSz", tag) } else { insert_before(&x, "</w:sectPr>", tag) };
+        }
+    }
+    if let Some(r) = refs_add {
+        if let Some(open_end) = x.find('>') {
+            x.insert_str(open_end + 1, r);
+        }
+        if r.contains("w:type=\"first\"") && !x.contains("<w:titlePg") {
+            x = insert_title_pg(&x);
+        }
+    }
+    x
+}
+
+/// Alla sidhuvuds- och sidfotsreferenser (standard och första sida) i en `w:sectPr`.
+fn header_refs(sect: &str) -> String {
+    let mut out = String::new();
+    for tag in ["<w:headerReference", "<w:footerReference"] {
+        let mut rest = sect;
+        while let Some(i) = rest.find(tag) {
+            let Some(j) = rest[i..].find('>') else { break };
+            let one = &rest[i..i + j + 1];
+            if one.contains("w:type=\"default\"") || one.contains("w:type=\"first\"") {
+                out.push_str(one);
+            }
+            rest = &rest[i + j + 1..];
+        }
+    }
+    out
+}
+
+/// Referenserna för sektionen `sect` med originalets första avsnitt (`base`) som reserv per plats:
+/// en plats som ändrats (`changed`: huvud, huvud första, fot, fot första) tas bara från `sect`.
+fn merge_refs(sect: &str, base: &str, changed: [bool; 4]) -> String {
+    let (own, old) = (header_refs(sect), base);
+    let mut out = String::new();
+    for (k, (tag, ty)) in [("<w:headerReference", "default"), ("<w:headerReference", "first"), ("<w:footerReference", "default"), ("<w:footerReference", "first")].into_iter().enumerate() {
+        let pick = |from: &str| {
+            let mut rest = from;
+            while let Some(i) = rest.find(tag) {
+                let Some(j) = rest[i..].find('>') else { break };
+                let one = &rest[i..i + j + 1];
+                if one.contains(&format!("w:type=\"{ty}\"")) {
+                    return Some(one.to_owned());
+                }
+                rest = &rest[i + j + 1..];
+            }
+            None
+        };
+        if let Some(one) = pick(&own).or_else(|| if changed[k] { None } else { pick(old) }) {
+            out.push_str(&one);
+        }
+    }
+    out
+}
+
+/// Sätter egenskaperna för avsnittens slut (`w:sectPr` i stycken, i ordning) efter avsnitten i texten.
+/// `refs` = sidhuvuds- och sidfotsreferenserna som också ska gälla första avsnittet om det saknar egna.
+fn fix_sections(body: &str, secs: &[sections::Section], refs: &str, replace_refs: bool) -> String {
+    if secs.len() < 2 || !body.contains("<w:sectPr") {
+        return body.to_owned();
+    }
+    let mut out = String::with_capacity(body.len() + 256);
+    let mut rest = body;
+    let mut k = 0;
+    while let Some(i) = rest.find("<w:sectPr") {
+        let Some(j) = rest[i..].find('>') else { break };
+        let open_end = i + j + 1;
+        let end = if rest[i..open_end].ends_with("/>") {
+            open_end
+        } else {
+            match rest[open_end..].find("</w:sectPr>") {
+                Some(e) => open_end + e + "</w:sectPr>".len(),
+                None => break,
+            }
+        };
+        out.push_str(&rest[..i]);
+        let mut one = rest[i..end].to_owned();
+        // Ändrat sidhuvud eller sidfot gäller alla avsnitt som hade egna referenser.
+        if replace_refs && !one.ends_with("/>") && (one.contains("<w:headerReference") || one.contains("<w:footerReference")) {
+            for (tag, ty) in [("<w:headerReference", "default"), ("<w:headerReference", "first"), ("<w:footerReference", "default"), ("<w:footerReference", "first")] {
+                one = remove_default_ref(&one, tag, ty);
+            }
+            if let Some(oe) = one.find('>') {
+                one.insert_str(oe + 1, refs);
+            }
+            one = remove_title_pg(&one);
+            if refs.contains("w:type=\"first\"") {
+                one = insert_title_pg(&one);
+            }
+        }
+        let one = one.as_str();
+        match secs.get(k).filter(|_| k + 1 < secs.len()) {
+            Some(sec) => out.push_str(&apply_section(one, sec, (k == 0).then_some(refs))),
+            None => out.push_str(one),
+        }
+        rest = &rest[end..];
+        k += 1;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Ny `w:sectPr` av DocDefaults.
@@ -4255,11 +4601,13 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     .into_iter()
     .map(str::to_owned)
     .collect();
+    let secs = sections::scan(markdown, &defaults);
     let mut ctx = Ctx {
         num_base: 1,
         doc_pr_start: 1,
         max_width: text_width_emu(&defaults),
         used_ids: ["rId1", "rId2", "rId3"].into_iter().map(str::to_owned).collect(),
+        lead_section: secs[0].marker.is_some(),
         ..Default::default()
     };
     rv.apply(&mut ctx);
@@ -4275,6 +4623,10 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     let fields = style::Fields::for_export(title, "docx");
     let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut w.ids, &mut taken);
     let sect = sect_pr_new(&defaults, &refs);
+    let body = fix_sections(&body, &secs, &header_refs(&sect), false);
+    // Sidhuvud och sidfot hör till första avsnittet (de senare ärver); annorlunda första sida gäller bara det.
+    let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
+    let sect = if secs.len() > 1 { remove_title_pg(&sect) } else { sect };
     let document = format!(
         r#"{XML_DECL}
 <w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}"><w:body>{body}{sect}</w:body></w:document>"#
@@ -4708,8 +5060,10 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         .max()
         .map_or(1, |m| m + 1);
     let mut taken: std::collections::HashSet<String> = src.parts.iter().map(|(n, _)| n.trim_start_matches('/').to_lowercase()).collect();
+    let secs = sections::scan(markdown, &defaults);
     let mut ctx = Ctx {
         tokens: src.tokens.len(),
+        lead_section: secs[0].marker.is_some(),
         num_base,
         doc_pr_start,
         max_width: text_width_emu(&defaults),
@@ -4917,6 +5271,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
     let mut ids = w.ids.clone();
     let fields = style::Fields::for_export(title, "docx");
     // Utan originalets sektionsegenskaper skrivs allt om.
+    let refs_changed = src.sect_pr.is_some() && (hdr_changed || ftr_changed || hdr1_changed || ftr1_changed);
     let sect = match &src.sect_pr {
         None => {
             let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut ids, &mut taken);
@@ -4943,6 +5298,9 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
             if !page_changed && edit.is_empty() { orig.clone() } else { patch_sect(orig, &defaults, page_changed, &edit) }
         }
     };
+    let refs = merge_refs(&sect, &src.first_refs, [hdr_changed, hdr1_changed, ftr_changed, ftr1_changed]);
+    let body = fix_sections(&body, &secs, &refs, refs_changed);
+    let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
     let document = format!("{}{body}{sect}{}", fix_head(&src.head), src.tail);
 
     // ---- formatmallar och numrering: originalen kompletteras bara
@@ -6268,3 +6626,7 @@ mod fn_tests;
 
 #[path = "docx_review.rs"]
 mod review_xml;
+
+#[cfg(test)]
+#[path = "docx_section_tests.rs"]
+mod section_tests;

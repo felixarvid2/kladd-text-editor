@@ -504,3 +504,107 @@ stycke skrivs om och rapporteras som "spårade formateringsändringar".
 **ODT**: `text:tracked-changes` godkänns vid läsning (infogad text stannar, raderad text kommer inte med),
 `office:annotation` tas bort som förut, och `odt::write` godkänner ändringarna och utelämnar kommentarerna.
 Spårade ändringar och kommentarer i .odt är alltså inte stödda fullt ut.
+
+## Avsnitt: liggande sidor och spalter
+
+Som Words sektioner. En del av dokumentet kan ha egen sidstorlek (liggande), egna marginaler och flera
+spalter. Logiken ligger i `word/sections.rs` (modell, rad, redigering), `word/secpages.rs` (sidbrytning med
+spalter) och `word/sectionui.rs` (menyn och dialogen "Spalter"); dessutom `docx.rs`, `odt.rs` och `pdf_write.rs`.
+
+### Formatet
+
+Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som grundformatraden):
+
+```
+<!-- kladd: avsnitt; page: A4 landscape; page-margin: 20mm; columns: 2; column-gap: 12mm; type: continuous -->
+<!-- kladd: spaltbrytning -->
+```
+
+- `page` (även `page-size`) följer `page-size` i grundformatet (`A4`, `Letter`, `210mm 297mm`, `landscape` efter
+  namnet), `page-margin` (även `margin`) följer CSS, `columns` är 1–6, `column-gap` en längd (standard 35,4 pt
+  = 1,25 cm, Words 708 twips) och `type: continuous` låter avsnittet börja på samma sida (annars en ny sida).
+- **Egenskaper som saknas ärver dokumentets grundformat**, inte föregående avsnitt. Ett avsnitt utan egenskaper
+  är alltså "tillbaka till grundformatet".
+- En avsnittsrad som står före all text (bara tomma rader och grundformatraden före) gäller **första avsnittet**
+  och börjar ingen ny sida. Så får hela dokumentet spalter eller liggande sidor.
+- Raden räknas som markup: dold utom när markören står på den (som `<!-- kladd: toc -->`), ingen ordräkning,
+  ingen stavningskontroll. `DocDefaults::from_comment` ger `None` för den (den är aldrig grundformat). Rader i
+  kodstaket räknas inte.
+- `sections::scan(text, &defaults) -> Vec<Section>` ger avsnitten (alltid minst ett) med egenskaperna
+  uträknade; `Analysis::sections` har dem. `SectionProps::{from_comment, to_comment}` läser och skriver raden.
+  Redigering: `insert_break`, `insert_column_break`, `update_current`, `set_landscape_from`.
+
+### Gränssnittet
+
+*Infoga* i formateringsfältet: *Avsnittsbrytning (ny sida)* (det nya avsnittet börjar som det nuvarande),
+*Liggande sidor härifrån* / *Stående sidor härifrån* (ändrar avsnittet om inget står före markören i det,
+annars börjar ett nytt avsnitt där), *Spalter…* (dialog: 1–3 spalter och mellanrum i mm; gäller avsnittet
+som markören står i och skriver om dess rad, eller lägger en rad före all text i första avsnittet) och
+*Spaltbrytning*.
+
+### Utläggning och sidbrytning
+
+Galleriet är fortfarande ett enda `Galley` för TextEdit. `layout::relayout` lägger ut varje stycke med
+**spaltens bredd** i dess avsnitt (`Geom::wrap_for`; bredden är med i styckecachens nyckel) och samlar per rad
+avsnittet (`row_sec`) och spaltbrytningarna. `secpages::paginate_sections` flyttar sedan raderna i x och y:
+
+- en spalt fylls uppifrån och ned, sedan nästa spalt, sedan ett nytt ark (samma regler som `paginate`: rader
+  delas aldrig, en rad högre än spalten står ensam, `groups` flyttas ihop, flytande bilder räknas som en rad);
+- ett nytt avsnitt börjar på ett nytt ark med avsnittets storlek och marginaler. Ett **löpande** avsnitt
+  (`type: continuous`) med samma sidstorlek och marginaler fortsätter på samma ark under det förra
+  (`PageBox::regions`: en del per spaltindelning); spalterna i avsnittet före ett löpande byte **jämnas ut**
+  (`balanced_height`) om det ryms på sidan;
+- ark med olika storlek centreras på skrivbordet (`Geom::sheet_left`). Galleriets x = 0 ligger vid den
+  vänstraste textkanten (`Geom::origin_x`), så alla rader har x ≥ 0 och TextEdits yta (`Geom::edit_w`) täcker allt;
+- resultatet är `Paged { boxes: Vec<PageBox>, dx }`; `Cache::page_boxes` ger arken till vyn (ritning av ark,
+  sidhuvud/sidfot per ark, sidnummer med `secpages::page_index`). Sidnumren löper över avsnitten och
+  sidhuvud/sidfot är gemensamma. Ett vanligt dokument (`Geom::for_sections` ger en `Geom` utan `secs`) går
+  den gamla vägen (`pages::paginate`) och får `uniform_boxes`, så ritningen är gemensam.
+- Tabeller och bilder anpassas till spaltens bredd (tabellplanen och `images::display_size` får spaltbredden;
+  en bild i ett smalare avsnitt kläms mot det avsnittets spalt). Tabellernas kolumnkanter (`TableGeom::col_x`)
+  flyttas med radernas dx.
+- Raderna i olika spalter överlappar i y, som cellerna i en tabell. `secpages::pointer_fix` sätter därför om
+  markören vid klick och drag i flerspaltiga delar (`column_hit`: raden söks bland spaltens egna rader).
+  Upp/Ned går rad för rad i läsordningen (egui räknar radindex), så det går över spaltgränsen utan särskild kod.
+- Citatstreck, fotnotsavskiljare, flytande bilder, innehållsförteckning och bildflytt använder spaltens
+  vänsterkant och bredd (`col_at` i `word_page`).
+
+Begränsningar: en tabell som delas mellan två spalter får bara första radens x för draghandtag och träffyta;
+fotnoterna hamnar sist i dokumentet (som förut).
+
+### Word (`docx.rs`)
+
+Läsning: ett toppnivåstycke med `w:pPr/w:sectPr` slutar ett avsnitt; stycket läses som vanligt och följs av
+en avsnittsrad med **nästa** avsnitts egenskaper (sista avsnittets kommer från brödtextens `w:sectPr`). Egenskaperna
+är `w:pgSz` (w, h, orient), `w:pgMar`, `w:cols` (num, space; olika breda spalter räknas som lika breda) och
+`w:type` (`continuous`; övriga typer blir ny sida) och skrivs bara om de skiljer sig från grundformatet. **Grundformatet
+(sida, sidhuvud, sidfot) läses ur första avsnittets `sectPr`**, inte det sista. `w:br w:type="column"` blir
+`<!-- kladd: spaltbrytning -->`.
+
+Skrivning: en avsnittsrad blir ett tomt stycke med `w:sectPr` (`SECT_PARA`), en spaltbrytning ett stycke med
+`<w:br w:type="column"/>`. `fix_sections` går igenom alla `w:sectPr` i stycken i ordning och `apply_section`
+sätter sida, marginaler, spalter och typ efter avsnitten i texten, och brödtextens `w:sectPr` får sista
+avsnittets. **Är allt redan lika lämnas XML:en orörd**, så orörda dokument sparas byte för byte som förut (en
+avsnittsrad är en enhet, `p|…`, som matchas mot originalets stycke precis som innehållsförteckningen; ett
+ändrat stycke får behålla originalets `w:pPr` med dess `sectPr`). Sidhuvudets/sidfotens referenser läggs i första
+avsnittet om det saknar egna (de ärvs av senare avsnitt), och ändras sidhuvudet byts de i alla avsnitt som hade egna
+(`Source::first_refs`).
+
+### OpenDocument (`odt.rs`)
+
+Skrivning: varje avsnitt som börjar på en ny sida får en sidmall `M1`, `M2` … med eget sidformat, delar sidhuvud
+och sidfot med `Standard`, och stycket efter brytningen får ett automatiskt format med `style:master-page-name`
+(ett tomt bärarstycke före block som inte är stycken, och före ett flerspaltigt avsnitt). **Spalter ligger i ett
+`text:section`** med `style:columns` (LibreOffice jämnar ut dem), som ett löpande byte; spaltbrytning är
+`fo:break-before="column"` (`page` utan spalter). Läsning: ett stycke vars format har `style:master-page-name`
+som skiljer sig från gällande sidmall ger en avsnittsrad med sidmallens mått (och `style:columns` i
+sidformatet), och ett `text:section` med spalter ger en löpande rad före och en som återställer efter.
+ODT sparas inte förlustfritt, så markören följer med bara så långt `render` når.
+
+### PDF och utskrift (`pdf_write.rs`)
+
+`Block::SectionBreak`/`ColumnBreak`; varje sida bär sina mått (`PageOps::geom`) och PDF-sidorna skapas med
+rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_page` går till nästa spalt innan en
+ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
+ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Skillnad mot dokumentläget:
+spalterna före ett löpande byte jämnas **inte** ut i PDF:en.
