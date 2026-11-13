@@ -892,7 +892,7 @@ headings = 2
 skip_idempotent = "blanksteg efter en bild i löpande text tappas"
 
 ["odt/gen-fotnoter-kommentarer.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 1
 
 ["odt/gen-innehall-formler.odt"]
@@ -971,7 +971,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-fdo38244.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-fdo43807.odt"]
@@ -979,7 +979,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-fdo60769.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-fdo66811-1.odt"]
@@ -1067,7 +1067,7 @@ dropped = ["textrutor"]
 headings = 0
 
 ["odt/lo-export-resolved-comment.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-rovas-numbering.odt"]
@@ -1163,7 +1163,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-tdf115815.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-tdf118637.odt"]
@@ -1299,7 +1299,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-whitespace.odt"]
-dropped = ["diagram och former", "textrutor", "kommentarer"]
+dropped = ["diagram och former", "textrutor"]
 headings = 0
 
 ["odt/lo-export-z-index-header.odt"]
@@ -1324,7 +1324,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-annotation-formatting.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 0
 skip_idempotent = "förformaterad text blir kodblock vid omläsning"
 
@@ -1547,7 +1547,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-tdf74524.odt"]
-dropped = ["kommentarer"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-tdf75221.odt"]

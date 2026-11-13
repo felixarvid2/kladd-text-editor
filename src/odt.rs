@@ -1933,7 +1933,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     }
     if !rd.review.revs.is_empty() || !rd.review.comments.is_empty() {
         markdown = attach_replies(&markdown, &rd.review.comments);
-        markdown = review::prune(&review::put_records(&markdown, &rd.review.revs, &rd.review.comments));
+        markdown = review::renumber(&review::prune(&review::merge_adjacent(&review::put_records(&markdown, &rd.review.revs, &rd.review.comments))));
     }
     let comment = defaults.to_comment();
     if !comment.is_empty() {
@@ -2253,6 +2253,14 @@ impl<'a> W<'a> {
             Some(s) => format!("<text:span text:style-name=\"{s}\">{t}</text:span>"),
             None => t,
         };
+        // Länken hör till den raderade texten (annars tappas den när regionen skrivs).
+        let x = match &self.link {
+            Some(url) => format!(
+                "<text:a xlink:type=\"simple\" xlink:href=\"{}\" text:style-name=\"Internet_20_link\" text:visited-style-name=\"Visited_20_Internet_20_Link\">{x}</text:a>",
+                esc(url)
+            ),
+            None => x,
+        };
         match self.review.del_last {
             Some((last, idx)) if last == id => self.review.regions[idx].content.push_str(&x),
             _ => {
@@ -2463,8 +2471,9 @@ impl<'a> W<'a> {
     }
 
     fn close_link(&mut self) {
+        // `text:change-start`/`-end` är tomma punktmarkörer och behöver inte omsluta länken: en ändring
+        // som sträcker sig över en länk förblir en region.
         if self.link_open {
-            self.end_ins();
             self.body.push_str("</text:a>");
             self.link_open = false;
         }

@@ -556,6 +556,67 @@ pub fn prune(text: &str) -> String {
     put_records(&text, &revs, &comments)
 }
 
+/// Slår ihop `<ins data-k="1">a</ins><ins data-k="1">b</ins>` (samma ändring, direkt efter varandra) till en.
+/// Läsare ger en ändring per teckenformat, och det som skrivs och läses om delar upp annorlunda än originalet.
+pub fn merge_adjacent(text: &str) -> String {
+    let sc = scan(text);
+    let mut cuts: Vec<Range<usize>> = Vec::new();
+    for w in sc.revs.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if a.kind == b.kind && a.id == b.id && a.close.end == b.open.start {
+            cuts.push(a.close.clone());
+            cuts.push(b.open.clone());
+        }
+    }
+    if cuts.is_empty() {
+        return text.to_owned();
+    }
+    cut_ranges(text, &mut cuts)
+}
+
+/// Numrerar ändringarna 1, 2, 3 … i den ordning de först förekommer i texten (poster och markörer följer med).
+/// Läsare som tar bort tomma ändringar (`prune`) lämnar luckor; med fast numrering ger "spara oförändrad,
+/// läs om" samma text.
+pub fn renumber(text: &str) -> String {
+    let sc = scan(text);
+    let mut at: Vec<(usize, u32)> = sc.revs.iter().map(|r| (r.open.start, r.id)).chain(sc.pmarks.iter().map(|m| (m.range.start, m.id))).collect();
+    at.sort();
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    for (_, id) in at {
+        let n = map.len() as u32 + 1;
+        map.entry(id).or_insert(n);
+    }
+    if map.iter().all(|(a, b)| a == b) {
+        return text.to_owned();
+    }
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for r in &sc.revs {
+        if let Some(&n) = map.get(&r.id) {
+            edits.push((r.open.clone(), open_tag(r.kind, n)));
+        }
+    }
+    for m in &sc.pmarks {
+        if let Some(&n) = map.get(&m.id) {
+            edits.push((m.range.clone(), pmark_text(m.kind, n, m.n)));
+        }
+    }
+    for (r, range) in &sc.rev_recs {
+        if let Some(&n) = map.get(&r.id) {
+            edits.push((range.clone(), rev_line(&RevRec { id: n, ..r.clone() })));
+        }
+    }
+    edits.sort_by_key(|e| e.0.start);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (range, rep) in edits {
+        out.push_str(&text[last..range.start]);
+        out.push_str(&rep);
+        last = range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 fn cut_ranges(text: &str, cuts: &mut Vec<Range<usize>>) -> String {
     cuts.sort_by_key(|r| r.start);
     let mut out = String::with_capacity(text.len());
@@ -1231,6 +1292,22 @@ mod tests {
 
     fn doc() -> String {
         "Hej <ins data-k=\"1\">snälla </ins>världen<del data-k=\"2\"> idag</del>.\n\n<!--k:r id=\"1\" author=\"Ada\" date=\"2026-05-01T10:00:00Z\"-->\n<!--k:r id=\"2\" author=\"Bo\" date=\"2026-05-02T10:00:00Z\"-->\n".to_owned()
+    }
+
+    #[test]
+    fn renumber_closes_gaps_in_order_of_appearance() {
+        let t = "a <ins data-k=\"3\">b</ins> <del data-k=\"7\">c</del>\n\n<!--k:r id=\"7\" author=\"Bo\" date=\"d\"-->\n<!--k:r id=\"3\" author=\"Ada\" date=\"d\"-->\n";
+        let r = renumber(t);
+        assert!(r.contains("<ins data-k=\"1\">b</ins> <del data-k=\"2\">c</del>"), "{r}");
+        assert!(r.contains("<!--k:r id=\"2\" author=\"Bo\""), "{r}");
+        assert!(r.contains("<!--k:r id=\"1\" author=\"Ada\""), "{r}");
+        assert_eq!(renumber(&r), r);
+    }
+
+    #[test]
+    fn merge_adjacent_joins_same_change_only() {
+        let t = "<ins data-k=\"1\">a</ins><ins data-k=\"1\">b</ins><ins data-k=\"2\">c</ins>";
+        assert_eq!(merge_adjacent(t), "<ins data-k=\"1\">ab</ins><ins data-k=\"2\">c</ins>");
     }
 
     #[test]
