@@ -12,6 +12,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Valfri kodsignering i release-bygget.** Windows (signtool) och macOS (Developer ID, notarisering) signeras om certifikat finns som hemligheter i repot; annars byggs paketen som förut. Beskrivet i `docs/dev/signering.md`. Ett utkast till Flatpak-paket finns i `packaging/flatpak/`.
 - **macOS: öppna filer från Finder.** *Öppna med*, dubbelklick och att dra filer till Dock-ikonen öppnar nu filerna i Kladd (som flikar i det öppna fönstret). Kladd tar emot Apple-händelsen "öppna dokument" och deklarerar `.txt`, `.md`, `.docx`, `.odt` och `.pdf` som dokumenttyper med låg rangordning, så ingen filtyp byter program av sig själv.
+- **Uppdateringskontroll.** Kladd frågar högst en gång per dygn GitHub efter en nyare version och visar ett diskret fält med *Visa nyheter* (utgåvans anteckningar som Markdown), *Hämta och installera*, *Senare* och *Hoppa över*. *Sök efter uppdateringar* i huvudmenyn kontrollerar direkt, och *Sök efter uppdateringar automatiskt* stänger av den dagliga kontrollen. Windows hämtar installationsprogrammet och kör det när Kladd avslutas, macOS öppnar skivavbilden, .deb-installationer öppnar paketet (med kommandot att kopiera) och AppImage byter ut sig själv och startar om. Inget körs utan att du klickar.
 
 ## [1.9.0] – 2026-11-12
 

@@ -64,6 +64,12 @@ pub struct Settings {
     pub nav_pane: bool,
     /// Visningsläget (sida, zoom, rotation) för senast öppnade PDF-filer, nyast först.
     pub pdf_memory: Vec<(String, ViewMemory)>,
+    /// Sök efter nya versioner av Kladd (högst en gång per dygn).
+    pub auto_update_check: bool,
+    /// Senaste lyckade kontroll, sekunder sedan 1970.
+    pub update_last_check: u64,
+    /// Version som användaren valt att hoppa över.
+    pub update_skip: Option<String>,
 }
 
 impl Default for Settings {
@@ -81,6 +87,9 @@ impl Default for Settings {
             autosave_recovery: true,
             nav_pane: false,
             pdf_memory: Vec::new(),
+            auto_update_check: true,
+            update_last_check: 0,
+            update_skip: None,
         }
     }
 }
@@ -194,6 +203,7 @@ pub struct KladdApp {
     pub(crate) nav: crate::word::navui::State,
     /// Fönstret är i helskärm för presentationsläget i en PDF-flik.
     pdf_fullscreen: bool,
+    update: crate::update::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -300,6 +310,7 @@ impl KladdApp {
             print: Default::default(),
             nav: Default::default(),
             pdf_fullscreen: false,
+            update: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -1352,6 +1363,12 @@ impl KladdApp {
         if menu_item(ui, p, "Säkerhetskopiera osparade ändringar", "", Some(self.settings.autosave_recovery), true) {
             self.settings.autosave_recovery = !self.settings.autosave_recovery;
         }
+        if menu_item(ui, p, "Sök efter uppdateringar automatiskt", "", Some(self.settings.auto_update_check), true) {
+            self.settings.auto_update_check = !self.settings.auto_update_check;
+        }
+        if menu_item(ui, p, "Sök efter uppdateringar", "", None, true) {
+            self.update.check_now(ctx);
+        }
         menu_divider(ui, p);
         if menu_item(ui, p, "Avsluta", "Ctrl+Q", None, true) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -2108,8 +2125,21 @@ impl KladdApp {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             }
-            Some(_) => self.pending_close = None,
+            Some(_) => {
+                self.pending_close = None;
+                self.update.cancel_launch();
+            }
             None => {}
+        }
+    }
+
+    /// Uppdateringsdelens meddelanden och önskemål om att avsluta.
+    fn update_outs(&mut self, ctx: &egui::Context) {
+        for out in self.update.take_outs() {
+            match out {
+                crate::update::Out::Notify(text, error) => self.notify(ctx, text, error),
+                crate::update::Out::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+            }
         }
     }
 
@@ -2750,6 +2780,8 @@ impl eframe::App for KladdApp {
         // Körs även när fönstret är minimerat, så att osparade ändringar aldrig tappas.
         self.handle_exit(ctx);
         self.handle_incoming(ctx);
+        self.update.tick(ctx, &mut self.settings);
+        self.update_outs(ctx);
         self.recovery.tick(ctx, &self.docs, self.settings.autosave_recovery);
         if self.docs.get(self.active).map(|d| d.id) != self.last_active_id {
             self.last_active_id = self.docs.get(self.active).map(|d| d.id);
@@ -2777,6 +2809,7 @@ impl eframe::App for KladdApp {
         self.word_bar(ui, &p);
         self.pdf_bar(ui, &p);
         self.status_bar(ui, &p);
+        self.update.banner(ui, &ctx, &p, &mut self.settings);
         self.pdf_sidebar(ui, &p);
         self.nav_pane(ui, &p);
         self.preview(ui, &p);
@@ -2785,6 +2818,8 @@ impl eframe::App for KladdApp {
         self.pdf_overlays(&ctx, &p);
         self.close_dialog(&ctx, &p);
         self.recovery_dialog(&ctx, &p);
+        self.update.dialogs(&ctx, &p, &mut self.settings);
+        self.update_outs(&ctx);
         self.docx_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
@@ -2799,6 +2834,7 @@ impl eframe::App for KladdApp {
         if self.owns_socket {
             single::cleanup();
         }
+        self.update.run_on_exit();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

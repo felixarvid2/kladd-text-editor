@@ -25,6 +25,7 @@ mod single;
 mod spell;
 mod style;
 mod theme;
+mod update;
 mod word;
 
 use std::path::PathBuf;
