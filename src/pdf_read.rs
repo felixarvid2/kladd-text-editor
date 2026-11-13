@@ -1033,6 +1033,8 @@ fn is_page_furniture(item: &Item, page_h: f32) -> bool {
 
 struct PageOut {
     items: Vec<Item>,
+    /// Igenkänd text (OCR) för en sida utan egen text, stycken åtskilda av tom rad.
+    ocr: Option<String>,
 }
 
 fn to_markdown(pages: &[PageOut], body: f32) -> String {
@@ -1134,6 +1136,10 @@ fn to_markdown(pages: &[PageOut], body: f32) -> String {
                 }
             }
         }
+        if let Some(t) = &page.ocr {
+            out.extend(t.split("\n\n").map(|p| escape_line_start(p.trim())).filter(|p| !p.is_empty()));
+            prev_open_para = false;
+        }
     }
     let mut md = out.join("\n\n");
     md.push('\n');
@@ -1142,7 +1148,14 @@ fn to_markdown(pages: &[PageOut], body: f32) -> String {
 
 // ============================================================== in
 
+#[cfg(test)]
 pub fn read(bytes: &[u8], password: Option<&str>) -> Result<Loaded, ReadError> {
+    read_with_ocr(bytes, password, &HashMap::new())
+}
+
+/// Som `read`; `ocr` ger igenkänd text (sidindex från 0 → stycken åtskilda av tom rad) som
+/// infogas för sidor utan egen text.
+pub fn read_with_ocr(bytes: &[u8], password: Option<&str>, ocr: &HashMap<usize, String>) -> Result<Loaded, ReadError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(ReadError::Other("PDF-filen är för stor för att öppnas.".into()));
     }
@@ -1230,8 +1243,12 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> Result<Loaded, ReadError> {
         if runs.iter().any(|r| !r.invisible && !r.text.trim().is_empty()) {
             runs.retain(|r| !r.invisible);
         }
+        let mut page_ocr = None;
         if runs.iter().all(|r| r.text.trim().is_empty()) {
-            pages_without_text += 1;
+            page_ocr = ocr.get(&page_out.len()).filter(|t| !t.trim().is_empty()).cloned();
+            if page_ocr.is_none() {
+                pages_without_text += 1;
+            }
         }
         for r in &runs {
             let bucket = (r.size * 2.0).round() as i32;
@@ -1241,7 +1258,7 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> Result<Loaded, ReadError> {
         let items = build_items(lines, images);
         let mut items = reading_order(items);
         items.retain(|it| !is_page_furniture(it, page_h));
-        page_out.push(PageOut { items });
+        page_out.push(PageOut { items, ocr: page_ocr });
     }
 
     // Brödtextens storlek: den storlek som flest tecken har.

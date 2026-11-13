@@ -198,7 +198,7 @@ fn locale_to_code(tag: &str) -> Option<String> {
 }
 
 /// Språkkod från miljön: `$LANG`, annars operativsystemets språk.
-fn system_locale_code() -> Option<String> {
+pub(crate) fn system_locale_code() -> Option<String> {
     std::env::var("LANG")
         .ok()
         .and_then(|l| locale_to_code(&l))

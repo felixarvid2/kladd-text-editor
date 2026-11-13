@@ -2682,10 +2682,14 @@ impl KladdApp {
     /// Redigera: gör om PDF:en till ett redigerbart dokument i samma flik (som PDF-öppning gjorde förut).
     fn pdf_edit(&mut self, ctx: &egui::Context) {
         let idx = self.active;
-        let Some(doc) = self.docs.get(idx) else { return };
-        let (Some(tab), Some(path)) = (doc.pdfv.as_ref(), doc.path.clone()) else { return };
+        let Some(doc) = self.docs.get_mut(idx) else { return };
+        let (Some(tab), Some(path)) = (doc.pdfv.as_deref_mut(), doc.path.clone()) else { return };
+        if tab.ocr.edit_ocr && tab.ocr.edit_offer() {
+            tab.ocr.edit_ocr = false;
+            return self.pdf_ocr(ctx, true);
+        }
         let (bytes, password, id) = (tab.view.bytes().clone(), tab.password.clone(), doc.id);
-        match Document::from_pdf_text(id, &path, &bytes, password.as_deref()) {
+        match Document::from_pdf_text_ocr(id, &path, &bytes, password.as_deref(), &tab.ocr.page_texts()) {
             Ok(mut new) => {
                 self.store_pdf_memory(idx);
                 let note = new.open_note.take();
@@ -2758,6 +2762,9 @@ impl KladdApp {
                 tab.copy_rx = None;
             }
         }
+        // Textigenkänning: resultat in i visaren, och notiser när den är klar.
+        let pw = tab.password.clone();
+        let polled = tab.ocr.poll(&mut tab.view, pw.as_deref(), ctx);
         // En klickad länk i sidan ska bekräftas innan den öppnas.
         let mut blocked = None;
         if let Some(uri) = tab.view.take_pending_uri() {
@@ -2778,7 +2785,12 @@ impl KladdApp {
         if let Some(uri) = blocked {
             self.notify(ctx, format!("Länken öppnas inte: {}", truncate(&uri, 60)), true);
         }
-        if reload {
+        for (m, err) in polled.notices {
+            self.notify(ctx, m, err);
+        }
+        if polled.edit_now {
+            self.pdf_edit(ctx);
+        } else if reload {
             self.pdf_reload(ctx, false);
         }
     }
@@ -2817,6 +2829,17 @@ impl KladdApp {
                     self.notify(ctx, format!("Kunde inte öppna länken: {e}"), true);
                 }
             }
+            PdfAction::Ocr => self.pdf_ocr(ctx, false),
+        }
+    }
+
+    /// Startar textigenkänning av de skannade sidorna (`edit_after`: gör om PDF:en till text när den är klar).
+    fn pdf_ocr(&mut self, ctx: &egui::Context, edit_after: bool) {
+        let Some(tab) = self.pdf_tab_mut() else { return };
+        let pw = tab.password.clone();
+        match tab.ocr.start(&tab.view, pw.as_deref(), ctx, edit_after) {
+            Ok(()) => self.notify(ctx, "Känner igen text…", false),
+            Err(m) => self.notify(ctx, m, true),
         }
     }
 
@@ -2893,7 +2916,9 @@ impl KladdApp {
         let anchor = self.editor_rect;
         let Some(tab) = self.pdf_tab_mut() else { return };
         pdfui::find_bar(ctx, p, tab, anchor);
-        if let Some(act) = pdfui::dialogs(ctx, p, tab, path.as_deref()) {
+        let ocr_act = crate::pdfview::ocr::notice_bar(ctx, p, tab, anchor);
+        let dlg_act = pdfui::dialogs(ctx, p, tab, path.as_deref());
+        for act in [ocr_act, dlg_act].into_iter().flatten() {
             self.pdf_action(ctx, act);
         }
     }

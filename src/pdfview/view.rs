@@ -11,7 +11,7 @@
 //!   skarp längre ritas den gamla utsträckt tills den nya kommer (zoom och omfärgning).
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -496,6 +496,8 @@ pub struct PdfView {
     thumb_wants: HashMap<usize, (f32, u64)>,
 
     texts: HashMap<usize, Arc<PageText>>,
+    /// Sidor vars textlager kommer från OCR (motorns text får inte skriva över det).
+    ocr_pages: HashSet<usize>,
     want_all_text: bool,
     sel: Option<Sel>,
     drag_anchor: Option<Unit>,
@@ -547,6 +549,7 @@ impl PdfView {
             thumbs: HashMap::new(),
             thumb_wants: HashMap::new(),
             texts: HashMap::new(),
+            ocr_pages: HashSet::new(),
             want_all_text: false,
             sel: None,
             drag_anchor: None,
@@ -684,6 +687,20 @@ impl PdfView {
         &self.bytes
     }
 
+    /// Lägger textigenkänd text som sidans textlager (sök, markering och kopiering).
+    pub fn set_ocr_text(&mut self, page: usize, text: Arc<PageText>) {
+        if page < self.sizes.len() {
+            self.texts.insert(page, text);
+            self.ocr_pages.insert(page);
+            self.sel = None;
+            // En pågående sökning ska också titta i den nya texten.
+            if let Some(f) = &self.find {
+                let (q, c, w) = (f.query.clone(), f.case_sensitive, f.whole_word);
+                self.find_set(&q, c, w);
+            }
+        }
+    }
+
     /// Uri som användaren klickat på; chrome frågar om den ska öppnas. Tas bara en gång.
     pub fn take_pending_uri(&mut self) -> Option<String> {
         self.pending_uri.take()
@@ -706,6 +723,7 @@ impl PdfView {
         self.thumbs.clear();
         self.thumb_wants.clear();
         self.texts.clear();
+        self.ocr_pages.clear();
         self.sel = None;
         self.drag_anchor = None;
         self.space = None;
@@ -1164,7 +1182,9 @@ impl PdfView {
             match ev {
                 EngineEvent::Rendered { req, image } => self.on_rendered(ctx, req, image),
                 EngineEvent::Text { page, text } => {
-                    self.texts.insert(page, text);
+                    if !self.ocr_pages.contains(&page) {
+                        self.texts.insert(page, text);
+                    }
                 }
                 EngineEvent::Failed { page, error } => {
                     if error.starts_with(TEXT_ERROR_PREFIX) {
@@ -2023,6 +2043,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         panic!("tidsgräns");
+    }
+
+    #[test]
+    fn ocr_text_ersatter_textlagret_och_sparas_over_motorn() {
+        let ctx = Context::default();
+        let mut v = open_view(&ctx, 1);
+        let t = Arc::new(PageText::new(vec![super::super::text::Glyph { text: "Å".into(), rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(8.0, 12.0)) }]));
+        v.set_ocr_text(0, t);
+        v.set_ocr_text(99, Arc::new(PageText::default()));
+        v.find_set("å", false, false);
+        run_until(&ctx, &mut v, |v| v.find_status().done_pages > 0);
+        // Motorns text kommer efter och får inte skriva över.
+        for _ in 0..10 {
+            frame(&ctx, &mut v);
+        }
+        assert_eq!(v.texts.get(&0).map(|t| t.text().to_owned()).as_deref(), Some("Å"));
+        assert_eq!(v.find_status().total, 1);
+        assert!(!v.texts.contains_key(&99));
     }
 
     #[test]

@@ -45,6 +45,8 @@ pub enum Action {
     OpenExternal,
     Reload,
     CopyImage,
+    /// Känn igen text (OCR) på skannade sidor.
+    Ocr,
     /// Öppna en bekräftad extern länk.
     OpenUri(String),
     /// Ändra sidor (flytta, ta bort, rotera, extrahera, infoga, ångra).
@@ -91,6 +93,7 @@ pub struct PdfTab {
     /// Sidorna har ändrats (flyttats, tagits bort, roterats, infogats) och är inte sparade.
     pub pages_changed: bool,
     pub org: OrgState,
+    pub ocr: super::ocr::OcrState,
 }
 
 impl PdfTab {
@@ -115,6 +118,7 @@ impl PdfTab {
             copy_rx: None,
             pages_changed: false,
             org: OrgState::default(),
+            ocr: Default::default(),
         }
     }
 
@@ -634,6 +638,9 @@ fn view_menu(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, act: &mut Option<Action
     if menu_item(ui, p, "Kopiera sidan som bild", "", None, true) {
         *act = Some(Action::CopyImage);
     }
+    if menu_item(ui, p, "Känn igen text (OCR)", "", None, !tab.ocr.running()) {
+        *act = Some(Action::Ocr);
+    }
     if menu_item(ui, p, "Dokumentegenskaper…", "", None, true) {
         tab.props = true;
     }
@@ -1104,6 +1111,10 @@ pub fn dialogs(ctx: &egui::Context, p: &Palette, tab: &mut PdfTab, path: Option<
                 )
                 .color(p.muted),
             );
+            if tab.ocr.edit_offer() {
+                ui.add_space(10.0);
+                ui.checkbox(&mut tab.ocr.edit_ocr, "Känn igen texten på skannade sidor först (OCR)");
+            }
             ui.add_space(22.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -1226,6 +1237,9 @@ pub fn status(ui: &mut Ui, p: &Palette, font: &FontId, tab: &PdfTab) {
     };
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 18.0;
+        if let Some(s) = super::ocr::status_text(&tab.ocr) {
+            label(ui, s);
+        }
         label(ui, format!("{} %", (tab.view.zoom() * 100.0).round() as i32));
         let v = &tab.view.meta().info.version;
         if !v.is_empty() {

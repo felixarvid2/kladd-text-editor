@@ -208,7 +208,12 @@ impl Document {
 
     /// Gör om en PDF till redigerbar Markdown-text (dagens väg, används av Redigera i PDF-visaren).
     pub fn from_pdf_text(id: u64, path: &Path, bytes: &[u8], password: Option<&str>) -> Result<Self, LoadError> {
-        let loaded = crate::pdf_read::read(bytes, password).map_err(|e| match e {
+        Self::from_pdf_text_ocr(id, path, bytes, password, &std::collections::HashMap::new())
+    }
+
+    /// Som `from_pdf_text`, med igenkänd text (sida → stycken) för sidor som saknar text.
+    pub fn from_pdf_text_ocr(id: u64, path: &Path, bytes: &[u8], password: Option<&str>, ocr: &std::collections::HashMap<usize, String>) -> Result<Self, LoadError> {
+        let loaded = crate::pdf_read::read_with_ocr(bytes, password, ocr).map_err(|e| match e {
             crate::pdf_read::ReadError::NeedsPassword => LoadError::NeedsPassword,
             crate::pdf_read::ReadError::WrongPassword => LoadError::WrongPassword,
             crate::pdf_read::ReadError::Other(m) => LoadError::Message(m),

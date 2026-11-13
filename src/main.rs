@@ -10,6 +10,7 @@ mod docx;
 mod export;
 mod grammar;
 mod grammar_ui;
+mod ocr;
 mod odt;
 mod pdf_read;
 mod pdf_write;

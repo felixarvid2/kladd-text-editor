@@ -31,6 +31,7 @@ Chrome och PdfCraft (storytold/pdfcraft, Rust + egui + hayro).
 | `view.rs` | `PdfView`: själva visaren (layout, zoom, rendering till texturer, navigering, markering, sök, länkar) |
 | `organize.rs` | Sidoperationer på PDF-bytes med lopdf (ordna, ta bort, rotera, extrahera, infoga) och `History` för Ångra |
 | `pages.rs` | Kopplar `organize` till fliken: `OrgOp`, urval, omladdning av visaren, Ångra/Gör om, `PdfTab::pages_changed` |
+| `ocr.rs` | `OcrState`: letar skannade sidor, renderar i 300 dpi på egen motor, kör Tesseract (`crate::ocr`) och ger `PageText` via `PdfView::set_ocr_text` |
 | `chrome.rs` | Verktygsrad, sidopanel (miniatyrer, innehåll), sökfält, egenskaper, presentationsläge, statusrad |
 
 ## Förbättringar (minst 40)
