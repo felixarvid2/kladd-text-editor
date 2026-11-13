@@ -2,7 +2,7 @@
 //!
 //! Dialogen är ett vanligt fönster (inte modal) så att dokumentet syns bakom: varje ändring
 //! skrivs direkt in i `<!-- kladd: … -->`-raden och gäller hela dokumentet. "Uppdatera från
-//! markering" tar utseendet på texten vid markören, "Återställ" tar bort mallens ändringar.
+//! markering" tar utseendet på texten vid markören, "Återställ mallen" tar bort mallens ändringar.
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Frame, Id, Layout, Margin, RichText, Stroke, Ui, vec2};
@@ -276,7 +276,7 @@ impl KladdApp {
                     if ui.add(quiet_button(t("Uppdatera från markering"), p)).on_hover_text(t("Ta utseendet på texten vid markören")).clicked() {
                         update_from_caret = true;
                     }
-                    if ui.add(quiet_button(t("Återställ"), p)).on_hover_text(t("Ta bort ändringarna i den här formatmallen")).clicked() {
+                    if ui.add(quiet_button(t("Återställ mallen"), p)).on_hover_text(t("Ta bort ändringarna i den här formatmallen")).clicked() {
                         dlg.set.set(dlg.sel, StyleOverride::default());
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

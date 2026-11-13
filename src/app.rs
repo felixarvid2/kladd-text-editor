@@ -1657,7 +1657,7 @@ impl KladdApp {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     if let Some(doc) = self.docs.get(self.active) {
-                        let lang = doc.language();
+                        let lang = doc.language_label();
                         ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
                     let now = Self::now(&ctx);

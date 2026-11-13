@@ -1,6 +1,7 @@
 //! Engelska texter för området word (svensk källtext, engelsk text).
 
 pub const EN: &[(&str, &str)] = &[
+    ("Återställ mallen", "Reset Style"),
     ("(utan text)", "(no text)"),
     ("Annorlunda första sida", "Different first page"),
     ("Antal sidor", "Page Count"),

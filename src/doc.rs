@@ -537,7 +537,6 @@ impl Document {
     }
 
     /// `language()` för visning i statusraden (på aktuellt språk); jämför alltid mot `language()`.
-    #[allow(dead_code)] // tas i bruk av statusraden i app.rs (se rapport)
     pub fn language_label(&self) -> String {
         let l = self.language();
         match l.as_str() {
