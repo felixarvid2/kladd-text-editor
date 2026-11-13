@@ -31,6 +31,11 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - **Tabellvy för csv och tsv.** `.csv` och `.tsv` (och annan avgränsad text via *Tabell | Text* i statusraden) visas som ett rutnät med fast rubrikrad och radnummer, virtuell rullning för stora filer, automatiska och justerbara kolumnbredder. Avgränsare, citattecken och rubrikrad gissas och kan ändras per fil. Cellredigering (dubbelklick, F2, skriv; Enter, Tab, piltangenter), markering med Skift/Ctrl, kopiera och klistra in som TSV, infoga och ta bort rader och kolumner, sortering (tal, naturlig ordning, text med svensk ordning), radfilter, sök med markerade celler och statistik för markeringen i statusraden (antal, summa, medel, min, max, även `1 234,5`). Ändringarna är textändringar i dokumentet med ångra och gör om, och orörda rader, avgränsare, citat, radslut och avslutande radbrytning bevaras.
 - **Automatiska gränssnittstester.** Hela appen körs i `egui_kittest` (utan fönster och GPU) med simulerade tangenter och klick: öppna, skriva, ångra och spara, Markdown-förhandsvisning, sök och ersätt med regex, flikar, delad vy, Word (fetstil, formatmall, sidhuvud, spårade ändringar), PDF (sidor, zoom, sök, Redigera, markering som sparas), filträd, snabböppna, språkbyte, flera markörer och versionshistorik. De ingår i `cargo test` i CI på Linux, Windows och macOS. Se `docs/dev/gransnittstester.md`.
 
+- **Korpus av riktiga dokument i testerna.** `tests/corpus/` har 440 `.docx`, `.odt` och `.pdf` från python-docx, mammoth.js, docx4j, Apache POI, odfpy, LibreOffice och pypdf (källor och licenser i `SOURCES.md`) samt egna LibreOffice-dokument med sammanslagna celler, fotnoter, kommentarer, spårade ändringar, sidhuvuden, avsnitt, bilder, listor, innehållsförteckning och formler. Varje fil öppnas, sparas oförändrad och efter en liten ändring, och i en extra Linux-körning med LibreOffice kontrolleras att de sparade filerna går att öppna där.
+
+
+- Ett stycke i ett Word-dokument som börjar med en tabb blev ett kodblock vid sparning; tabben skrivs nu som `&#9;`.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

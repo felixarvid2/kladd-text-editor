@@ -2477,6 +2477,12 @@ pub(crate) fn escape_line_start(line: &str) -> String {
         // Fyra mellanslag blir annars ett kodblock.
         return format!("&#32;{}", &line[1..]);
     }
+    // En tabb först (tabbstopp i början av stycket) blir annars också ett kodblock.
+    let lead = line.trim_start_matches([' ', '\t']);
+    if line[..line.len() - lead.len()].contains('\t') {
+        let at = line.find('\t').unwrap_or(0);
+        return format!("{}&#9;{}", &line[..at], &line[at + 1..]);
+    }
     line.to_owned()
 }
 
@@ -6008,6 +6014,8 @@ Marginal
         assert_eq!(escape_line_start("1. inte lista"), "1\\. inte lista");
         assert_eq!(escape_line_start("- inte punkt"), "\\- inte punkt");
         assert_eq!(escape_line_start("vanlig text"), "vanlig text");
+        assert_eq!(escape_line_start("\ttabb först"), "&#9;tabb först");
+        assert_eq!(escape_line_start("  \ttabb"), "  &#9;tabb");
     }
 
     // ---------------------------------------------------------- förlustfri sparning

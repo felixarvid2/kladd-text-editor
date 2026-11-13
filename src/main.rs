@@ -50,6 +50,8 @@ mod workspace;
 mod find_files;
 mod git;
 mod git_ui;
+#[cfg(test)]
+mod corpus_tests;
 
 use std::path::PathBuf;
 
