@@ -3,12 +3,13 @@
 //! `app.rs` äger fliken i `Document::pdfv` och utför de `Action` som raden och dialogerna ger.
 //! Visaren själv (`PdfView`) används bara via API-kontraktet i `docs/dev/pdfvisare.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant, SystemTime};
 
+use egui::style::ScrollAnimation;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
@@ -18,6 +19,7 @@ use egui::{
 
 use super::engine::{OpenError, PdfEngine, Recolor, RenderRequest};
 use super::meta::{Dest, OutlineItem};
+use super::pages::{self, OrgOp, OrgState};
 use super::view::{FindStatus, PdfView, Spread, Tool, ZoomMode};
 use crate::app::{menu_divider, menu_item, quiet_button, text_toggle};
 use crate::icons::{self, Icon};
@@ -45,6 +47,8 @@ pub enum Action {
     CopyImage,
     /// Öppna en bekräftad extern länk.
     OpenUri(String),
+    /// Ändra sidor (flytta, ta bort, rotera, extrahera, infoga, ångra).
+    Organize(OrgOp),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,6 +88,9 @@ pub struct PdfTab {
     pub confirm_edit: bool,
     pub confirm_uri: Option<String>,
     pub copy_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    /// Sidorna har ändrats (flyttats, tagits bort, roterats, infogats) och är inte sparade.
+    pub pages_changed: bool,
+    pub org: OrgState,
 }
 
 impl PdfTab {
@@ -106,6 +113,8 @@ impl PdfTab {
             confirm_edit: false,
             confirm_uri: None,
             copy_rx: None,
+            pages_changed: false,
+            org: OrgState::default(),
         }
     }
 
@@ -605,10 +614,21 @@ fn view_menu(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, act: &mut Option<Action
         tab.present();
     }
     menu_divider(ui, p);
+    menu_heading(ui, p, "Sidor");
+    if menu_item(ui, p, "Slå ihop med PDF…", "", None, true) {
+        *act = Some(Action::Organize(OrgOp::InsertAt(tab.view.page_count())));
+    }
+    if menu_item(ui, p, "Ångra sidändring", "Ctrl+Z", None, tab.org.history.can_undo()) {
+        *act = Some(Action::Organize(OrgOp::Undo));
+    }
+    if menu_item(ui, p, "Gör om sidändring", "Ctrl+Shift+Z", None, tab.org.history.can_redo()) {
+        *act = Some(Action::Organize(OrgOp::Redo));
+    }
+    menu_divider(ui, p);
     if menu_item(ui, p, "Läs om", "", None, true) {
         *act = Some(Action::Reload);
     }
-    if menu_item(ui, p, "Spara kopia…", "Ctrl+S", None, true) {
+    if menu_item(ui, p, "Spara kopia…", if tab.pages_changed { "" } else { "Ctrl+S" }, None, true) {
         *act = Some(Action::SaveCopy);
     }
     if menu_item(ui, p, "Kopiera sidan som bild", "", None, true) {
@@ -629,9 +649,10 @@ const THUMB_GAP: f32 = 10.0;
 const OUTLINE_ROW_H: f32 = 26.0;
 
 /// Panelen till vänster med miniatyrer och innehållsförteckning (F4).
-pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) {
+pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
+    let mut act = None;
     if !tab.sidebar {
-        return;
+        return act;
     }
     let ctx = ui.ctx().clone();
     let has_outline = !tab.view.meta().outline.is_empty();
@@ -656,10 +677,11 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) {
             });
             ui.add_space(8.0);
             match tab.side_tab {
-                SideTab::Thumbs => thumbnails(ui, p, tab, &ctx),
+                SideTab::Thumbs => act = thumbnails(ui, p, tab, &ctx).map(Action::Organize),
                 SideTab::Outline => outline(ui, p, tab),
             }
         });
+    act
 }
 
 fn side_tab_button(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> Response {
@@ -677,7 +699,7 @@ fn side_tab_button(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> Respon
     resp
 }
 
-fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
+fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) -> Option<OrgOp> {
     let n = tab.view.page_count();
     let cur = tab.view.current_page();
     let w = ui.available_width();
@@ -701,6 +723,15 @@ fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
     tab.last_page = Some(cur);
     let ppp = ctx.pixels_per_point();
     let mut jump = None;
+    let mut op = None;
+    let panel = ui.max_rect();
+    // Ett tryck utanför panelen (inte i en meny) släpper urvalet, så att Delete inte träffar sidor man glömt.
+    if !tab.org.sel.is_empty() && !Popup::is_any_open(ctx) {
+        let outside = ctx.input(|i| i.pointer.primary_pressed() && i.pointer.press_origin().is_some_and(|o| !panel.contains(o)));
+        if outside {
+            tab.org.sel.clear();
+        }
+    }
     ScrollArea::vertical().id_salt("kladd-pdf-thumbs").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         ui.allocate_space(vec2(w, y));
         let origin = ui.min_rect().min;
@@ -712,9 +743,12 @@ fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
         let hi = tops.partition_point(|t| *t < viewport.bottom() + 300.0).min(n);
         for i in lo..hi {
             let item = Rect::from_min_size(origin + vec2(0.0, tops[i]), vec2(w, item_h(i)));
-            let resp = ui.interact(item, Id::unique(("kladd-pdf-thumb", i)), Sense::click());
+            let resp = ui.interact(item, Id::unique(("kladd-pdf-thumb", i)), Sense::click_and_drag());
             let is_cur = i == cur;
-            if is_cur {
+            let chosen = tab.org.sel.contains(&i);
+            if chosen {
+                ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), 8.0, p.accent.gamma_multiply(if is_cur { 0.30 } else { 0.22 }));
+            } else if is_cur {
                 ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), 8.0, p.accent.gamma_multiply(0.16));
             } else if resp.hovered() {
                 ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), 8.0, p.surface_hover);
@@ -747,15 +781,108 @@ fn thumbnails(ui: &mut Ui, p: &Palette, tab: &mut PdfTab, ctx: &egui::Context) {
                 if is_cur { p.accent } else { p.muted },
             );
             if resp.clicked() {
-                jump = Some(i);
+                let m = ui.input(|i| i.modifiers);
+                let (sel, anchor) = pages::click_selection(&tab.org.sel, tab.org.anchor, i, m.shift, m.command, cur);
+                tab.org.sel = sel;
+                tab.org.anchor = anchor;
+                if !m.shift && !m.command {
+                    jump = Some(i);
+                }
+            }
+            if resp.secondary_clicked() && !tab.org.sel.contains(&i) {
+                tab.org.sel = BTreeSet::from([i]);
+                tab.org.anchor = Some(i);
+            }
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                if !tab.org.sel.contains(&i) {
+                    tab.org.sel = BTreeSet::from([i]);
+                    tab.org.anchor = Some(i);
+                }
+                tab.org.drag_active = true;
+            }
+            Popup::context_menu(&resp).width(230.0).show(|ui| {
+                if let Some(o) = page_menu(ui, p, tab, n, i) {
+                    op = Some(o);
+                }
+            });
+        }
+        // Drag av miniatyrer: markera var de hamnar (före vilken sida) och flytta när musen släpps.
+        if tab.org.drag_active {
+            let pointer = ctx.pointer_latest_pos();
+            let clip = ui.clip_rect();
+            tab.org.drop = pointer.filter(|pos| clip.contains(*pos)).map(|pos| {
+                let y = pos.y - origin.y;
+                (0..n).find(|&k| y < tops[k] + item_h(k) / 2.0).unwrap_or(n)
+            });
+            if let (Some(before), true) = (tab.org.drop, n > 0) {
+                let ly = origin.y + tops[before] - THUMB_GAP / 2.0 + 2.0;
+                ui.painter().line_segment([pos2(origin.x + 6.0, ly), pos2(origin.x + w - 6.0, ly)], Stroke::new(3.0, p.accent));
+            }
+            if let Some(pos) = pointer {
+                let edge = if pos.y < clip.top() + 24.0 { 14.0 } else if pos.y > clip.bottom() - 24.0 { -14.0 } else { 0.0 };
+                if edge != 0.0 && pos.x >= clip.left() && pos.x <= clip.right() {
+                    ui.scroll_with_delta_animation(vec2(0.0, edge), ScrollAnimation::none());
+                    ctx.request_repaint();
+                }
+                let label = if tab.org.sel.len() == 1 { "1 sida".to_owned() } else { format!("{} sidor", tab.org.sel.len()) };
+                let font = FontId::new(12.0, theme::medium());
+                let galley = ui.painter().layout_no_wrap(label, font, p.on_accent);
+                let r = Rect::from_min_size(pos + vec2(12.0, 8.0), galley.size() + vec2(14.0, 8.0));
+                ui.painter().rect_filled(r, 6.0, p.accent);
+                ui.painter().galley(r.min + vec2(7.0, 4.0), galley, p.on_accent);
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                tab.org.drag_active = false;
+                if let Some(before) = tab.org.drop.take() {
+                    op = Some(OrgOp::Move { pages: tab.org.sel.clone(), before });
+                }
             }
         }
     });
+    if op.is_some() {
+        return op;
+    }
     if let Some(i) = jump {
         tab.view.go_to_page(i);
         // Miniaturen man klickade på syns redan; panelen ska inte hoppa.
         tab.last_page = Some(i);
     }
+    None
+}
+
+/// Högerklicksmenyn på en miniatyr. `page` är den klickade sidan, som alltid ingår i urvalet.
+fn page_menu(ui: &mut Ui, p: &Palette, tab: &PdfTab, count: usize, page: usize) -> Option<OrgOp> {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let mut pages: Vec<usize> = tab.org.sel.iter().copied().collect();
+    if pages.is_empty() {
+        pages.push(page);
+    }
+    let all = pages.len() >= count;
+    let first = pages[0];
+    let last = pages[pages.len() - 1];
+    let mut op = None;
+    if menu_item(ui, p, "Rotera åt höger", "", None, true) {
+        op = Some(OrgOp::Rotate { pages: pages.clone(), clockwise: true });
+    }
+    if menu_item(ui, p, "Rotera åt vänster", "", None, true) {
+        op = Some(OrgOp::Rotate { pages: pages.clone(), clockwise: false });
+    }
+    menu_divider(ui, p);
+    if menu_item(ui, p, "Ta bort", "Delete", None, !all) {
+        op = Some(OrgOp::Delete(pages.clone()));
+    }
+    if menu_item(ui, p, "Extrahera till ny PDF…", "", None, true) {
+        op = Some(OrgOp::Extract(pages.clone()));
+    }
+    menu_divider(ui, p);
+    if menu_item(ui, p, "Infoga PDF före…", "", None, true) {
+        op = Some(OrgOp::InsertAt(first));
+    }
+    if menu_item(ui, p, "Infoga PDF efter…", "", None, true) {
+        op = Some(OrgOp::InsertAt(last + 1));
+    }
+    op
 }
 
 struct OutRow {

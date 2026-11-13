@@ -29,6 +29,8 @@ Chrome och PdfCraft (storytold/pdfcraft, Rust + egui + hayro).
 | `text.rs` | `PageText`: glyfer, rader, ord, sökning, träffrektanglar, markering |
 | `meta.rs` | `PdfMeta`: innehållsförteckning, länkar, sidetiketter, dokumentinfo (lopdf) |
 | `view.rs` | `PdfView`: själva visaren (layout, zoom, rendering till texturer, navigering, markering, sök, länkar) |
+| `organize.rs` | Sidoperationer på PDF-bytes med lopdf (ordna, ta bort, rotera, extrahera, infoga) och `History` för Ångra |
+| `pages.rs` | Kopplar `organize` till fliken: `OrgOp`, urval, omladdning av visaren, Ångra/Gör om, `PdfTab::pages_changed` |
 | `chrome.rs` | Verktygsrad, sidopanel (miniatyrer, innehåll), sökfält, egenskaper, presentationsläge, statusrad |
 
 ## Förbättringar (minst 40)
@@ -93,7 +95,7 @@ Fil och verktyg
 45. Statusrad: sidetikett, "Sida x av y", zoom i procent.
 46. Kopiera sidan som bild.
 47. Trasiga sidor visar ett felmeddelande på sidan i stället för att krascha.
-48. PDF-flikar räknas inte som ändrade och frågar aldrig om att spara.
+48. PDF-flikar är bara ändrade efter sidändringar (`pages_changed`, se punkt 51) och frågar annars aldrig om att spara.
 49. ⌘ i stället för Ctrl på Mac i alla kortkommandon.
 50. Formulärfält och anteckningar visas (hayro ritar deras utseende).
 
@@ -213,3 +215,10 @@ impl PdfView {
     pub fn reload(&mut self, engine: PdfEngine, meta: PdfMeta, bytes: Arc<Vec<u8>>);
 }
 ```
+
+## Ordna sidor
+
+- `organize.rs` arbetar på bytes: `reorder`, `delete`, `rotate`, `extract`, `insert`. Sidträdet plattas ut först (ärvda `Resources`/`MediaBox`/`CropBox`/`Rotate` skrivs in på sidorna). Vid borttagning blir referenser till borttagna sidor `null` och `prune_objects` rensar oanvänt. `insert` numrerar om den infogade filens objekt (`renumber_objects_with`) och flyttar in dem; dess bokmärken och formulär tas inte med.
+- Krypterade filer avkrypteras (som `print::decrypted_pdf`) vid första ändringen. Resultatet är okrypterat, och sparas det över originalet försvinner lösenordsskyddet.
+- `pages::run` gör ändringen, läser om visaren (`PdfView::reload`) och lägger föregående bytes i `History` (högst 30 versioner och 256 MB). `PdfTab::pages_changed` sätter `Document::dirty`; Ctrl+S skriver bytes över originalet med `write_atomic`. Ändrad fil på disk läses inte om automatiskt medan sidändringar är osparade.
+51. Miniatyrer: flerval, drag för att flytta, högerklicksmeny, Delete, Ångra/Gör om, Slå ihop med PDF.

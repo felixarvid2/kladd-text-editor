@@ -244,7 +244,7 @@ impl Recovery {
             .written
             .keys()
             .copied()
-            .filter(|id| !docs.iter().any(|d| d.id == *id && d.dirty))
+            .filter(|id| !docs.iter().any(|d| d.id == *id && d.dirty && d.pdfv.is_none()))
             .collect();
         for id in stale {
             self.forget(id);
@@ -253,7 +253,8 @@ impl Recovery {
             return false;
         }
         let saved_at = unix_now();
-        for doc in docs.iter().filter(|d| d.dirty) {
+        // PDF-flikar (sidändringar) har ingen text att återställa.
+        for doc in docs.iter().filter(|d| d.dirty && d.pdfv.is_none()) {
             let hash = content_hash(doc);
             if self.written.get(&doc.id) == Some(&hash) {
                 continue;

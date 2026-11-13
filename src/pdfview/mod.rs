@@ -4,5 +4,7 @@
 pub mod chrome;
 pub mod engine;
 pub mod meta;
+pub mod organize;
+pub mod pages;
 pub mod text;
 pub mod view;

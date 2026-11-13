@@ -499,6 +499,12 @@ pub struct PdfView {
     want_all_text: bool,
     sel: Option<Sel>,
     drag_anchor: Option<Unit>,
+    /// Dragsteg: tecken, eller ord/rad när draget började med dubbel-/trippelklick.
+    drag_mode: UnitMode,
+    /// Senaste knapptryckningen (tid, plats, antal i följd) för att känna igen dubbel- och trippelklick vid drag.
+    press_hist: Option<(f64, Pos2, u8)>,
+    /// Blanksteg hålls nere; `true` när det använts för att dra (då ska det inte bläddra).
+    space: Option<SpaceHold>,
     find: Option<Find>,
     pending_uri: Option<String>,
 }
@@ -544,6 +550,9 @@ impl PdfView {
             want_all_text: false,
             sel: None,
             drag_anchor: None,
+            drag_mode: UnitMode::Char,
+            press_hist: None,
+            space: None,
             find: None,
             pending_uri: None,
         };
@@ -699,6 +708,7 @@ impl PdfView {
         self.texts.clear();
         self.sel = None;
         self.drag_anchor = None;
+        self.space = None;
         self.layout = None;
         self.history = History::default();
         let page = page.min(n.saturating_sub(1));
@@ -855,6 +865,7 @@ impl PdfView {
             self.set_zoom_mode(ZoomMode::PageFit);
         }
         if typing {
+            self.space = None;
             return;
         }
         // Historik (23).
@@ -887,8 +898,23 @@ impl PdfView {
         }
         // Sid- och skärmsteg (20).
         let screen = (self.vp.y * 0.9).max(100.0);
-        let page_down = key(Modifiers::NONE, Key::PageDown) || key(Modifiers::NONE, Key::Space);
-        let page_up = key(Modifiers::NONE, Key::PageUp) || key(Modifiers::SHIFT, Key::Space);
+        // Blanksteg: dra med musen panorerar (som handverktyget); bara ett tryck utan drag bläddrar,
+        // och då först när tangenten släpps.
+        let (space_down, space_up) = (key(Modifiers::NONE, Key::Space), key(Modifiers::SHIFT, Key::Space));
+        if (space_down || space_up) && self.space.is_none() {
+            self.space = Some(SpaceHold { back: space_up, dragged: false });
+        }
+        let mut space_page = None;
+        if let Some(hold) = self.space {
+            if !ctx.input(|i| i.key_down(Key::Space)) {
+                self.space = None;
+                if !hold.dragged {
+                    space_page = Some(hold.back);
+                }
+            }
+        }
+        let page_down = key(Modifiers::NONE, Key::PageDown) || space_page == Some(false);
+        let page_up = key(Modifiers::NONE, Key::PageUp) || space_page == Some(true);
         if page_down {
             if self.fits_height() { self.step_row(1) } else { self.scroll_by(vec2(0.0, screen)) }
         }
@@ -1229,6 +1255,22 @@ enum UnitMode {
     Line,
 }
 
+/// Blanksteg som hålls nere.
+#[derive(Clone, Copy, Debug)]
+struct SpaceHold {
+    /// Trycktes med Skift (bläddra bakåt).
+    back: bool,
+    dragged: bool,
+}
+
+/// Antal tryck i följd: ett nytt tryck nära förra i tid och rum räknas vidare, annars börjar det om på 1.
+fn next_press_count(prev: Option<(f64, Pos2, u8)>, now: f64, pos: Pos2) -> u8 {
+    match prev {
+        Some((t, p, n)) if now - t <= 0.5 && p.distance(pos) <= 6.0 => (n % 3) + 1,
+        _ => 1,
+    }
+}
+
 fn close(a: f32, b: f32) -> bool {
     (a / b - 1.0).abs() < 0.02
 }
@@ -1480,7 +1522,13 @@ impl PdfView {
     fn interact(&mut self, ui: &Ui, ctx: &Context, resp: &egui::Response, origin: Pos2) {
         // Panorera: handverktyget eller mittenknappen (26).
         let middle = resp.dragged_by(PointerButton::Middle);
-        let hand = self.tool == Tool::Hand && resp.dragged_by(PointerButton::Primary);
+        let space_pan = self.space.is_some() && resp.dragged_by(PointerButton::Primary);
+        if space_pan {
+            if let Some(hold) = &mut self.space {
+                hold.dragged = true;
+            }
+        }
+        let hand = (self.tool == Tool::Hand || space_pan) && resp.dragged_by(PointerButton::Primary);
         if middle || hand {
             ui.scroll_with_delta_animation(resp.drag_delta(), ScrollAnimation::none());
             ctx.set_cursor_icon(CursorIcon::Grabbing);
@@ -1498,7 +1546,7 @@ impl PdfView {
                     LinkTarget::Page(d) => format!("Gå till sidan {}", d.page + 1),
                 };
                 resp.clone().on_hover_text(tip);
-            } else if self.tool == Tool::Hand {
+            } else if self.tool == Tool::Hand || self.space.is_some() {
                 ctx.set_cursor_icon(CursorIcon::Grab);
             } else if let Some((page, pt)) = self.hit(h, origin, false) {
                 let on_text = self
@@ -1541,17 +1589,30 @@ impl PdfView {
         } else if resp.clicked_by(PointerButton::Primary) {
             self.sel = None;
         }
+        // Antal tryck i följd, räknat vid trycket så att ett drag efter dubbel-/trippelklick känns igen.
+        if resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
+                let now = ctx.input(|i| i.time);
+                let n = next_press_count(self.press_hist, now, pos);
+                self.press_hist = Some((now, pos, n));
+            }
+        }
         if resp.drag_started_by(PointerButton::Primary) {
+            self.drag_mode = match self.press_hist.map_or(1, |h| h.2) {
+                2 => UnitMode::Word,
+                n if n >= 3 => UnitMode::Line,
+                _ => UnitMode::Char,
+            };
             self.drag_anchor = ctx
                 .input(|i| i.pointer.press_origin())
                 .and_then(|o| self.hit(o, origin, false))
-                .and_then(|(page, pt)| self.unit_at(page, pt, UnitMode::Char));
-            self.sel = None;
+                .and_then(|(page, pt)| self.unit_at(page, pt, self.drag_mode));
+            self.sel = self.drag_anchor.filter(|_| self.drag_mode != UnitMode::Char).map(|(a, b)| Sel { start: a, end: b });
         }
         if resp.dragged_by(PointerButton::Primary) {
             if let (Some(anchor), Some(pos)) = (self.drag_anchor, ctx.pointer_latest_pos()) {
                 if let Some((page, pt)) = self.hit(pos, origin, true) {
-                    if let Some(head) = self.unit_at(page, pt, UnitMode::Char) {
+                    if let Some(head) = self.unit_at(page, pt, self.drag_mode) {
                         self.sel = Some(union_units(anchor, head));
                     }
                 }
@@ -1572,6 +1633,7 @@ impl PdfView {
         }
         if resp.drag_stopped() {
             self.drag_anchor = None;
+            self.drag_mode = UnitMode::Char;
         }
     }
 
@@ -1885,6 +1947,21 @@ mod tests {
         let b = anchor_at(&new, (off2 + vp_pos).to_pos2()).unwrap();
         assert_eq!(a.page, b.page);
         assert!(approx(a.fx, b.fx) && approx(a.fy, b.fy), "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn tryck_i_följd_räknas() {
+        let p = Pos2::new(10.0, 10.0);
+        let one = next_press_count(None, 1.0, p);
+        assert_eq!(one, 1);
+        let two = next_press_count(Some((1.0, p, one)), 1.3, Pos2::new(12.0, 10.0));
+        assert_eq!(two, 2);
+        let three = next_press_count(Some((1.3, p, two)), 1.6, p);
+        assert_eq!(three, 3);
+        // Fjärde trycket börjar om; för långsamt eller för långt bort också.
+        assert_eq!(next_press_count(Some((1.6, p, three)), 1.8, p), 1);
+        assert_eq!(next_press_count(Some((1.0, p, 1)), 2.0, p), 1);
+        assert_eq!(next_press_count(Some((1.0, p, 1)), 1.2, Pos2::new(40.0, 10.0)), 1);
     }
 
     #[test]

@@ -202,6 +202,8 @@ En PDF öppnas i en PDF-visare som visar sidorna som de ser ut. Sidorna renderas
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Verklig storlek / sidbredd / hel sida |
 | `Alt+Vänster` / `Alt+Höger` | Bakåt / framåt i historiken efter länkar och hopp |
 
+**Ordna sidor.** Klicka, Ctrl+klicka eller Skift+klicka på miniatyrerna för att markera sidor och dra dem för att flytta (en linje visar var de hamnar). Högerklicka för *Rotera åt höger/vänster*, *Ta bort* (eller Delete), *Extrahera till ny PDF…* och *Infoga PDF före/efter…*; *Slå ihop med PDF…* i Visa-menyn lägger till en fil sist. Ändringarna görs direkt i minnet och kan ångras med `Ctrl+Z` och göras om med `Ctrl+Shift+Z`. Fliken blir ändrad; `Ctrl+S` sparar över originalet (atomiskt) och *Spara kopia…* sparar under nytt namn. Typsnitt och bilder följer med sidorna, men bokmärken i en infogad fil tas inte med och en lösenordsskyddad PDF sparas utan lösenord. Mellanslag+dra panorerar som handverktyget.
+
 **Redigera** gör om PDF:en till ett redigerbart dokument, som öppnas i dokumentläget. Kladd läser texten och visar den med rubriker, stycken, punkt- och numrerade listor, tabeller, fetstil, kursiv och bilder. Läsordningen följer spalterna, avstavning vid radslut tas bort, sidnummer i sidhuvud och sidfot hoppas över och stycken som fortsätter på nästa sida fogas ihop. Lösenordsskyddade PDF:er öppnas efter att du skrivit lösenordet. Originalet ändras inte förrän du sparar.
 
 Spara som `.pdf` för att få en A4-PDF med inbäddade typsnitt (IBM Plex), sökbar text, klickbara länkar, bokmärken från rubrikerna, bilder och sidnummer.

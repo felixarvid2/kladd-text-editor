@@ -28,6 +28,7 @@ fn is_image_path(p: &Path) -> bool {
 use crate::highlight::{Highlighter, Params};
 use crate::pdfview::chrome::{self as pdfui, Action as PdfAction};
 use crate::pdfview::engine::{OpenError, PdfEngine};
+use crate::pdfview::pages::{self as pdfpages, OrgOp as PdfOrgOp};
 use crate::pdfview::view::{PdfView, ViewMemory};
 use crate::search::{self, Apply, DocReplace, FormatFilter, Match, Results};
 use crate::word::markup;
@@ -125,6 +126,10 @@ enum DialogResult {
     SaveAs { doc_id: u64, path: Option<PathBuf>, then_close: bool, exit: bool },
     /// "Spara kopia" av en PDF som visas i PDF-visaren.
     SaveCopy { doc_id: u64, path: Option<PathBuf> },
+    /// "Extrahera till ny PDF" av valda sidor.
+    PdfExtract { doc_id: u64, path: Option<PathBuf>, pages: Vec<usize> },
+    /// "Infoga PDF" / "Slå ihop med PDF": vald fil och plats.
+    PdfInsert { doc_id: u64, path: Option<PathBuf>, at: usize },
 }
 
 struct PendingPassword {
@@ -603,6 +608,10 @@ impl KladdApp {
     /// Sparar dokumentet. Öppnar "Spara som" om det saknar sökväg.
     fn save_doc(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
         let Some(doc) = self.docs.get(idx) else { return };
+        if doc.pdfv.is_some() {
+            self.save_pdf_pages(ctx, idx, then_close, exit);
+            return;
+        }
         let Some(path) = doc.path.clone().filter(|_| !doc.needs_save_as()) else {
             self.request_save_as(ctx, idx, then_close, exit);
             return;
@@ -1039,6 +1048,16 @@ impl KladdApp {
                     self.write_pdf_copy(ctx, doc_id, &path);
                 }
             }
+            DialogResult::PdfExtract { doc_id, path, pages } => {
+                if let Some(path) = path {
+                    self.write_pdf_extract(ctx, doc_id, &path, &pages);
+                }
+            }
+            DialogResult::PdfInsert { doc_id, path, at } => {
+                if let Some(path) = path {
+                    self.insert_pdf_file(ctx, doc_id, &path, at);
+                }
+            }
             DialogResult::SaveAs { doc_id, path, then_close, exit } => {
                 if let (Some(path), Some(idx)) = (path, self.index_of(doc_id)) {
                     let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -1136,9 +1155,13 @@ impl KladdApp {
                 self.request_save_as(ctx, self.active, false, false);
             }
         } else if hit(ctrl, Key::S) && !self.docs.is_empty() {
-            // En PDF i visaren sparas aldrig över: Ctrl+S ger en kopia av originalet.
+            // En PDF i visaren sparas bara över när sidor ändrats; annars ger Ctrl+S en kopia av originalet.
             if pdf {
-                self.request_save_copy(ctx, self.active);
+                if self.pdf_pages_changed() {
+                    self.save_pdf_pages(ctx, self.active, false, false);
+                } else {
+                    self.request_save_copy(ctx, self.active);
+                }
             } else {
                 self.save_doc(ctx, self.active, false, false);
             }
@@ -1453,8 +1476,11 @@ impl KladdApp {
         if menu_item(ui, p, "Öppna…", "Ctrl+O", None, true) {
             self.request_open(ctx);
         }
-        if menu_item(ui, p, if pdf { "Spara kopia…" } else { "Spara" }, "Ctrl+S", None, has_doc) {
-            if pdf {
+        let pdf_changed = self.pdf_pages_changed();
+        if menu_item(ui, p, if pdf && !pdf_changed { "Spara kopia…" } else { "Spara" }, "Ctrl+S", None, has_doc) {
+            if pdf && pdf_changed {
+                self.save_pdf_pages(ctx, self.active, false, false);
+            } else if pdf {
                 self.request_save_copy(ctx, self.active);
             } else {
                 self.save_doc(ctx, self.active, false, false);
@@ -2693,6 +2719,8 @@ impl KladdApp {
             })?;
             let meta = crate::pdfview::meta::read_meta(&bytes, tab.password.as_deref());
             tab.view.reload(engine, meta, bytes);
+            tab.pages_changed = false;
+            tab.org.reset();
             Ok(true)
         })();
         match result {
@@ -2714,7 +2742,8 @@ impl KladdApp {
         if now >= tab.next_check {
             tab.next_check = now + pdfui::CHECK_EVERY;
             if let Some(stamp) = path.as_deref().and_then(pdfui::file_stamp) {
-                reload = tab.stamp.is_some() && tab.stamp != Some(stamp);
+                // Osparade sidändringar skrivs inte över av en ändring på disk.
+                reload = tab.stamp.is_some() && tab.stamp != Some(stamp) && !tab.pages_changed;
             }
         }
         // Sidan som bild är färdig.
@@ -2758,6 +2787,7 @@ impl KladdApp {
     fn pdf_action(&mut self, ctx: &egui::Context, act: PdfAction) {
         match act {
             PdfAction::Edit => self.pdf_edit(ctx),
+            PdfAction::Organize(op) => self.pdf_organize(ctx, op),
             PdfAction::SaveCopy => self.request_save_copy(ctx, self.active),
             PdfAction::Print => self.open_print(ctx),
             PdfAction::Reload => self.pdf_reload(ctx, true),
@@ -2842,8 +2872,9 @@ impl KladdApp {
     }
 
     fn pdf_sidebar(&mut self, ui: &mut Ui, p: &Palette) {
-        if let Some(tab) = self.pdf_tab_mut() {
-            pdfui::sidebar(ui, p, tab);
+        let act = self.pdf_tab_mut().and_then(|tab| pdfui::sidebar(ui, p, tab));
+        if let Some(act) = act {
+            self.pdf_action(&ui.ctx().clone(), act);
         }
     }
 
@@ -2897,8 +2928,132 @@ impl KladdApp {
             tab.present();
         }
         // Skriver man i sök- eller sidfältet ska bokstäverna inte vara visarens kommandon.
+        let mut org = None;
         if !ctx.egui_wants_keyboard_input() {
+            // Sidändringar: Ångra/Gör om, och Delete tar bort de valda miniatyrerna.
+            if hit(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || hit(Modifiers::COMMAND, Key::Y) {
+                org = Some(PdfOrgOp::Redo);
+            } else if hit(Modifiers::COMMAND, Key::Z) {
+                org = Some(PdfOrgOp::Undo);
+            } else if tab.sidebar && tab.org.sel.len() < tab.view.page_count() && !tab.org.sel.is_empty() && hit(Modifiers::NONE, Key::Delete) {
+                org = Some(PdfOrgOp::Delete(tab.org.sel.iter().copied().collect()));
+            }
             tab.view.handle_keys(ctx);
+        }
+        if let Some(op) = org {
+            self.pdf_organize(ctx, op);
+        }
+    }
+
+    /// Sant om den aktiva PDF-fliken har osparade sidändringar.
+    fn pdf_pages_changed(&self) -> bool {
+        self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.pages_changed)
+    }
+
+    /// Utför en sidändring i den aktiva PDF-fliken.
+    fn pdf_organize(&mut self, ctx: &egui::Context, op: PdfOrgOp) {
+        let idx = self.active;
+        let Some(doc) = self.docs.get_mut(idx) else { return };
+        let doc_id = doc.id;
+        let Some(tab) = doc.pdfv.as_deref_mut() else { return };
+        let (kind, pages) = match &op {
+            PdfOrgOp::Extract(pages) => (0, pages.clone()),
+            PdfOrgOp::InsertAt(at) => (1, vec![*at]),
+            _ => {
+                match pdfpages::run(ctx, tab, &op) {
+                    Ok(msg) => {
+                        doc.dirty = true;
+                        if !msg.is_empty() {
+                            self.notify(ctx, msg, false);
+                        }
+                    }
+                    Err(e) => self.notify(ctx, e, true),
+                }
+                return;
+            }
+        };
+        if self.dialog.is_some() {
+            self.notify(ctx, "Stäng den öppna fildialogen först.", true);
+            return;
+        }
+        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "dokument".into());
+        let dir = doc.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).or_else(|| self.start_dir());
+        let (tx, rx) = channel();
+        self.dialog = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().add_filter("PDF", &["pdf"]);
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let res = if kind == 0 {
+                dlg = dlg.set_title("Extrahera till ny PDF").set_file_name(format!("{stem} (utdrag).pdf"));
+                DialogResult::PdfExtract { doc_id, path: dlg.save_file(), pages }
+            } else {
+                dlg = dlg.set_title("Välj PDF att infoga");
+                DialogResult::PdfInsert { doc_id, path: dlg.pick_file(), at: pages[0] }
+            };
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    }
+
+    fn write_pdf_extract(&mut self, ctx: &egui::Context, doc_id: u64, path: &Path, pages: &[usize]) {
+        let Some(idx) = self.index_of(doc_id) else { return };
+        let Some(tab) = self.docs[idx].pdfv.as_ref() else { return };
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if self.docs[idx].path.as_deref() == Some(canon.as_path()) {
+            self.notify(ctx, "Välj ett annat namn än originalfilens.", true);
+            return;
+        }
+        match pdfpages::extract_bytes(tab, pages).and_then(|b| crate::doc::write_atomic(path, &b).map_err(|e| crate::doc::describe_io_error(&e, path))) {
+            Ok(()) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.notify(ctx, format!("Sparade {name}"), false);
+            }
+            Err(e) => self.notify(ctx, e, true),
+        }
+    }
+
+    fn insert_pdf_file(&mut self, ctx: &egui::Context, doc_id: u64, path: &Path, at: usize) {
+        let Some(idx) = self.index_of(doc_id) else { return };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.notify(ctx, crate::doc::describe_io_error(&e, path), true);
+                return;
+            }
+        };
+        let doc = &mut self.docs[idx];
+        let Some(tab) = doc.pdfv.as_deref_mut() else { return };
+        match pdfpages::insert_bytes(ctx, tab, &bytes, at) {
+            Ok(msg) => {
+                doc.dirty = true;
+                self.notify(ctx, msg, false);
+            }
+            Err(e) => self.notify(ctx, e, true),
+        }
+    }
+
+    /// Spar flikens PDF (med sidändringar) över originalfilen, atomiskt. Filen blir okrypterad.
+    fn save_pdf_pages(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
+        let Some(doc) = self.docs.get_mut(idx) else { return };
+        let (Some(tab), Some(path)) = (doc.pdfv.as_deref_mut(), doc.path.clone()) else { return };
+        match crate::doc::write_atomic(&path, tab.view.bytes()) {
+            Ok(()) => {
+                tab.pages_changed = false;
+                tab.stamp = pdfui::file_stamp(&path);
+                doc.dirty = false;
+                let title = doc.title();
+                self.notify(ctx, format!("Sparade {title}"), false);
+                if then_close {
+                    self.close_tab_now(idx);
+                }
+                if exit {
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+            Err(e) => self.notify(ctx, crate::doc::describe_io_error(&e, &path), true),
         }
     }
 }
