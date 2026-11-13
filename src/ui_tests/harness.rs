@@ -63,7 +63,12 @@ fn isolate_user_dirs() {
 pub struct Ui {
     pub h: Harness<'static, KladdApp>,
     pub dir: TempDir,
+    /// Gränssnittstesterna delar processglobalt tillstånd (testkatalogen, inställningsfilen,
+    /// bakgrundstrådar som väcker appen) och körs därför en i taget; övriga tester körs parallellt.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
+
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Ui {
     /// Tom app (startskärmen visas) på svenska.
@@ -74,6 +79,8 @@ impl Ui {
     /// App med filerna öppnade, som `kladd fil ...` men utan enkelinstanssocket.
     pub fn with_files(files: &[PathBuf]) -> Self {
         isolate_user_dirs();
+        // Ett test som fallerar förgiftar låset; nästa test ska ändå få köra.
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new();
         let files = files.to_vec();
         let mut h = Harness::builder()
@@ -105,7 +112,7 @@ impl Ui {
         // belastning hinner de inte alltid bli klara inom `max_steps`, så starten får inte paniken.
         h.run_ok();
         h.run_steps(2);
-        Self { h, dir }
+        Self { h, dir, _serial: serial }
     }
 
     pub fn app(&self) -> &KladdApp {
