@@ -792,6 +792,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         match r.kind {
             crate::review::RevKind::Ins => f.underline = st,
             crate::review::RevKind::Del => f.strikethrough = st,
+            crate::review::RevKind::Fmt => {}
         }
     }
     // Kommentarens område markeras som med en överstrykningspenna.

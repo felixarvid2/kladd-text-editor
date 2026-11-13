@@ -906,7 +906,7 @@ impl<'s, 'b> Rd<'s, 'b> {
         let rev_id = self.review.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
         match kind {
             RevKind::Ins if e.name == "text:change-start" => {
-                self.review.revs.push(RevRec { id: rev_id, author, date });
+                self.review.revs.push(RevRec { id: rev_id, author, date, old: None });
                 self.review.cur = Some((RevKind::Ins, rev_id));
                 self.review.open_ins = Some(rev_id);
             }
@@ -916,7 +916,7 @@ impl<'s, 'b> Rd<'s, 'b> {
                 if paras.is_empty() || self.in_note {
                     return;
                 }
-                self.review.revs.push(RevRec { id: rev_id, author, date });
+                self.review.revs.push(RevRec { id: rev_id, author, date, old: None });
                 let saved = self.review.cur;
                 self.review.cur = Some((RevKind::Del, rev_id));
                 for (i, p) in paras.iter().enumerate() {
@@ -928,6 +928,8 @@ impl<'s, 'b> Rd<'s, 'b> {
                 self.review.cur = saved;
             }
             RevKind::Del => {}
+            // ODT-läsaren ger inga formateringsändringar (de rapporteras som tappade).
+            RevKind::Fmt => {}
         }
     }
 

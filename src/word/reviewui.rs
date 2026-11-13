@@ -201,6 +201,30 @@ impl KladdApp {
         Prep { threads, authors, side: if show { PANE_W + PANE_GAP } else { 0.0 }, author, date, before }
     }
 
+    /// Som `word_edit` för formatering (fet, färg, rubrik, justering, listor …): med spårning på blir
+    /// formateringen en spårad ändring med det gamla formatet sparat (`review::fmt::track_format`).
+    pub(crate) fn word_format(&mut self, ctx: &egui::Context, f: impl FnOnce(&str, Range<usize>) -> crate::word::markup::Edit) {
+        if !self.review_tracking() {
+            return self.word_edit(ctx, f);
+        }
+        let author = self.review_author();
+        let date = crate::docx::now_w3cdtf();
+        self.word_edit(ctx, |t, s| {
+            let e = f(t, s);
+            if e.text == t {
+                return e;
+            }
+            match review::fmt::track_format(t, &e.text, &author, &date) {
+                Some(tg) => {
+                    let start = tg.map(e.sel.start, false);
+                    let end = tg.map(e.sel.end, true).max(start);
+                    crate::word::markup::Edit { sel: start..end, text: tg.text }
+                }
+                None => e,
+            }
+        });
+    }
+
     /// Ersätter texten med den spårade redigeringen och flyttar markören.
     pub(crate) fn review_apply_tracked(&mut self, ctx: &egui::Context, t: Tracked) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
@@ -395,6 +419,153 @@ impl KladdApp {
             self.focus_editor = true;
         }
     }
+}
+
+/// Författarfärg ur färgindex (ljusare i mörkt tema).
+fn mark_color(idx: u8, dark: bool) -> Color32 {
+    let c = review::AUTHOR_COLORS[usize::from(idx) % review::AUTHOR_COLORS.len()];
+    if dark {
+        let m = |v: u8| (f32::from(v) * 0.55 + 255.0 * 0.45) as u8;
+        Color32::from_rgb(m(c[0]), m(c[1]), m(c[2]))
+    } else {
+        Color32::from_rgb(c[0], c[1], c[2])
+    }
+}
+
+/// Delsegment (vänster, höger, underkant) per rad för tecknen i `range`.
+fn row_segments(galley: &Galley, gpos: Pos2, text: &str, range: Range<usize>) -> Vec<(f32, f32, f32)> {
+    let mut out: Vec<(f32, f32, f32)> = Vec::new();
+    let mut cur: Option<(f32, f32, f32)> = None;
+    let at = |b: usize| galley.pos_from_cursor(CCursor::new(byte_to_char(text, b))).translate(gpos.to_vec2());
+    let mut it = text[range.clone()].char_indices().map(|(i, _)| range.start + i).peekable();
+    while let Some(b) = it.next() {
+        let next = it.peek().copied().unwrap_or(range.end);
+        let (r0, r1) = (at(b), at(next));
+        if (r1.top() - r0.top()).abs() < 1.0 {
+            match cur.as_mut() {
+                Some(c) if (c.2 - r0.bottom()).abs() < 1.0 => c.1 = r1.left(),
+                _ => {
+                    out.extend(cur.take());
+                    cur = Some((r0.left(), r1.left(), r0.bottom()));
+                }
+            }
+        } else {
+            out.extend(cur.take());
+        }
+    }
+    out.extend(cur);
+    out
+}
+
+/// Spårade stycketecken (¶ i författarens färg, struket när det är raderat) och formateringsändringar
+/// (ändringsstreck i vänstermarginalen, prickad understrykning och verktygstips "Formaterat: Fet").
+pub(crate) fn paint_marks(
+    ui: &mut Ui,
+    p: &Palette,
+    a: &crate::word::markup::Analysis,
+    text: &str,
+    galley: &Galley,
+    gpos: Pos2,
+    reveal: &Range<usize>,
+    bar_x: f32,
+    resp: &egui::Response,
+) {
+    use crate::word::markup::RevMark;
+    if !a.pieces.iter().any(|pc| pc.pmark.is_some() || pc.fmt.is_some()) {
+        return;
+    }
+    let clip = ui.clip_rect();
+    let painter = ui.painter().clone();
+    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|q| resp.rect.contains(*q) && clip.contains(*q));
+    let at = |b: usize| galley.pos_from_cursor(CCursor::new(byte_to_char(text, b.min(text.len())))).translate(gpos.to_vec2());
+    // (rad, färg) som redan fått ett streck.
+    let mut barred: Vec<(i32, u8)> = Vec::new();
+    let mut bar = |top: f32, bottom: f32, color: u8| {
+        let key = (top.round() as i32, color);
+        if barred.contains(&key) {
+            return;
+        }
+        barred.push(key);
+        painter.line_segment([pos2(bar_x, top), pos2(bar_x, bottom)], Stroke::new(2.0, mark_color(color, p.dark)));
+    };
+    let mut tip: Option<(String, Rect)> = None;
+    let mut sc: Option<review::Scan> = None;
+    for pc in a.pieces.iter().filter(|pc| pc.pmark.is_some() || pc.fmt.is_some()) {
+        if let Some(RevMark { kind, id, color }) = pc.pmark {
+            let r = at(pc.range.start);
+            if r.bottom() < clip.top() || r.top() > clip.bottom() || overlaps_range(&pc.range, reveal) {
+                continue;
+            }
+            let c = mark_color(color, p.dark);
+            // Styckeformatering syns bara som streck; stycketecken som ¶.
+            let line_top = at(text[..pc.range.start].rfind('\n').map_or(0, |i| i + 1)).top();
+            bar(line_top, r.bottom(), color);
+            if kind == review::RevKind::Fmt {
+                if hover.is_some_and(|q| q.y >= line_top && q.y <= r.bottom() && q.x >= gpos.x) && tip.is_none() {
+                    let sc = sc.get_or_insert_with(|| review::scan(text));
+                    if let Some(old) = sc.rev_rec(id).and_then(|x| x.old.as_deref()) {
+                        let cur = a.pieces.iter().find(|q| q.range.end > text[..pc.range.start].rfind('\n').map_or(0, |i| i + 1) && !q.markup && !q.list_marker);
+                        if let Some(cur) = cur {
+                            let what = review::fmt::describe_para(&review::fmt::ParaFmt::decode(old), &review::fmt::ParaFmt { block: cur.block, align: cur.align });
+                            if !what.is_empty() {
+                                let who = sc.rev_rec(id).map(|x| x.author.clone()).unwrap_or_default();
+                                tip = Some((crate::tf!("Formaterat: {what} ({author})", what = what, author = who), Rect::from_min_max(pos2(gpos.x, line_top), pos2(f32::MAX, r.bottom()))));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let font = FontId::new((r.height() * 0.85).max(8.0), FontFamily::Proportional);
+            let g = painter.layout_no_wrap("\u{b6}".to_owned(), font, c);
+            let pos = pos2(r.left() + 1.0, r.top() + (r.height() - g.size().y) / 2.0);
+            let rect = Rect::from_min_size(pos, g.size());
+            painter.galley(pos, g, c);
+            if kind == review::RevKind::Del {
+                painter.line_segment([pos2(rect.left(), rect.center().y), pos2(rect.right(), rect.center().y)], Stroke::new(1.0, c));
+            }
+            if hover.is_some_and(|q| rect.expand(3.0).contains(q)) {
+                let sc = sc.get_or_insert_with(|| review::scan(text));
+                let who = sc.rev_rec(id).map(|x| x.author.clone()).unwrap_or_default();
+                let msg = if kind == review::RevKind::Ins { crate::tf!("Infogat stycketecken ({author})", author = who) } else { crate::tf!("Borttaget stycketecken ({author})", author = who) };
+                tip = Some((msg, rect.expand(3.0)));
+            }
+            continue;
+        }
+        let Some(RevMark { id, color, .. }) = pc.fmt else { continue };
+        if pc.markup {
+            continue;
+        }
+        let first = at(pc.range.start);
+        let last = at(pc.range.end);
+        if last.bottom() < clip.top() || first.top() > clip.bottom() {
+            continue;
+        }
+        bar(first.top(), last.bottom(), color);
+        let c = mark_color(color, p.dark);
+        for (x0, x1, y) in row_segments(galley, gpos, text, pc.range.clone()) {
+            for sh in egui::Shape::dotted_line(&[pos2(x0, y - 1.0), pos2(x1, y - 1.0)], c, 3.0, 0.8) {
+                painter.add(sh);
+            }
+            if hover.is_some_and(|q| q.x >= x0 && q.x <= x1 && q.y >= y - first.height() && q.y <= y + 2.0) && tip.is_none() {
+                let sc = sc.get_or_insert_with(|| review::scan(text));
+                if let Some(old) = sc.rev_rec(id).and_then(|x| x.old.as_deref()) {
+                    let what = review::fmt::describe_char(&review::fmt::CharFmt::decode(old), &review::fmt::CharFmt::of(pc));
+                    if !what.is_empty() {
+                        let who = sc.rev_rec(id).map(|x| x.author.clone()).unwrap_or_default();
+                        tip = Some((crate::tf!("Formaterat: {what} ({author})", what = what, author = who), Rect::from_min_max(pos2(x0, y - first.height()), pos2(x1, y + 2.0))));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((msg, _)) = tip {
+        egui::Tooltip::always_open(ui.ctx().clone(), resp.layer_id, resp.id.with("granska-format"), egui::PopupAnchor::Pointer).show(|ui| ui.label(msg));
+    }
+}
+
+fn overlaps_range(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end || (a.start == a.end && b.start <= a.start && a.start < b.end)
 }
 
 /// Ritar kommentarskorten i fältet till höger om sidan. Korten ligger vid sin kommenterade text

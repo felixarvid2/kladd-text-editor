@@ -445,6 +445,16 @@ Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad
   körning, och godkänn/avvisa tar alla med samma nummer). Taggarna ligger utanför `**`/`<u>`/`<span>` och
   inom ett stycke; en ändring går aldrig över en radbrytning. Författare och datum står inte i taggen utan i
   en postrad `<!--k:r id="3" author="Ada" date="2026-05-01T10:00:00Z"-->`.
+- Stycketecken och radbrytningar: `<!--k:pm ins 5-->` eller `<!--k:pm del 5-->` sist på raden, direkt före
+  radbrytningen (en eller flera `\n`), betyder att brytningen är infogad respektive struken (Words `w:ins`/`w:del`
+  i styckets `w:rPr`). Siffran är ändringens nummer (postrad som för `<ins>`). Kladd skriver `n=1` efter numret
+  (`<!--k:pm ins 5 n=1-->`) för antalet brytningar den själv infogade, så att *Avvisa* tar bort just dem och
+  lämnar en redan befintlig styckegräns; en markör från Word saknar `n` och gäller hela brytningen.
+- Formateringsändringar: `<fmt data-k="6">text</fmt>` runt text vars teckenformat ändrats (Words `w:rPrChange`)
+  och `<!--k:pm fmt 7-->` sist på ett stycke vars typ eller justering ändrats (`w:pPrChange`). Det gamla
+  formatet står i postradens `old` (`<!--k:r id="6" … old="b;color: #C00000"-->`): flaggor `b i u s` (fet, kursiv,
+  understruken, struken), semikolon och CSS för typsnitt, storlek, färg och markering; för styckeformat
+  `h2|center`, `bullet|left`, `numbered|left`, `quote|left`, `normal|right` (slag och justering).
 - Kommentarens område `<!--k:c:ID-->…<!--k:/c:ID-->` i texten (dold markup som `<!--k:N-->`). Börjar
   området först på raden skyddas det av `&#8203;` framför (annars blir raden ett HTML-block, som för
   objektmarkörerna), och `&#8203;` döljs. Kommentaren själv är en postrad
@@ -475,9 +485,28 @@ bildrutan jämförs texten före och efter (gemensamt prefix/suffix) och rediger
 - infogning inne i en tagg, i en radering eller i någon annans infogning flyttas till efter den;
 - ersättning av en markering ger `<del>` följt av `<ins>`; kodblock spåras inte;
 - ögonblicksbilden tas bara när tangenter som kan redigera trycktes (inte vid Ctrl+Z/Y), så texten klonas inte
-  varje bildruta. Radbrytningar (Enter) och formateringsknappar spåras inte (formatering skrivs direkt).
+  varje bildruta. 
+- **Enter, Backsteg och Delete över en radbrytning** (`review::para::track_newlines`): en infogad brytning får
+  `<!--k:pm ins N n=K-->` före sig (intill en egen markör räknas `n` upp, och mitt i en egen infogning delas
+  `<ins>` så att den aldrig går över en brytning); Backsteg direkt efter egen Enter tar bort brytningen på
+  riktigt; annars får brytningen `<!--k:pm del N-->` och markören hamnar före (Backsteg) eller efter (Delete) den.
+  Inklistrad text med flera rader och borttagning av en markering över en brytning ger markörer på samma sätt.
+  Brytningar i tabeller och kodblock spåras inte.
+- **Formatering** (`review::fmt::track_format`): formateringsknapparna, Ctrl+B/I/U, justering, listor, rubriker,
+  färg, markering, typsnitt och storlek går via `word_format`, som med spårning på jämför texten före och efter
+  operationen (bara markup ändras): tecken med nytt format får `<fmt>` (ett nummer per gammalt format) och
+  stycken med ny typ/justering `<!--k:pm fmt N-->`. Redan spårat format behåller sitt första gamla format, och
+  text i egen infogning, struken text, kod, tabeller och rubriker i kodstaket spåras inte.
+- **Godkänn och avvisa**: `fmt::restore` sätter tillbaka det gamla formatet med samma operationer som knapparna
+  (`toggle_inline`, `set_span_prop`, `set_block`, `set_align`); `para::join_marks` slår ihop stycken när en infogad
+  brytning avvisas eller en struken godkänns (nästa rads radprefix tas bort, och en tabell, ett kodstaket eller en
+  avsnittsrad efter stycket slås inte ihop: då försvinner bara markören). Byten, `change_count` och
+  föregående/nästa ändring räknar markörerna som egna ändringar.
 
 **Dokumentläget**: infogat understruket och raderat genomstruket i författarens färg (`layout::piece_format`),
+stycketecken som ¶ (struket när det är raderat) och ett streck i vänstermarginalen vid stycketecken och
+formateringsändringar, prickad understrykning under omformaterad text och verktygstipset *Formaterat: Fet
+(Ada)* (`reviewui::paint_marks`, ritat ovanpå texten; visas inte på raden där markupen visas),
 kommentarsområdet med gul bakgrund (`review::comments_visible`, inställningen "Visa kommentarer"), och ett fält
 till höger om sidan (`reviewui::paint_pane`, 250 px + 16 px luft; sidan flyttas åt vänster och zoomen anpassas så
 att båda ryms). Korten ligger vid sin text och skjuts ned så att de inte överlappar; ett klick på ett kort
@@ -498,8 +527,15 @@ får `w:ins`/`w:del` (`w:id` från 5 000 000, författare och datum ur posterna)
 `w:commentRangeStart`/`End` + referens. `comments.xml` följer med orörd om alla poster är oförändrade;
 annars byggs den av posterna (oförändrade kommentarer ordagrant, nya med `w14:paraId`) och
 `commentsExtended.xml` skrivs om (eller skapas, med relation och innehållstyp). Kommentarer utan område i
-brödtexten tas bort. Spårade formateringsändringar (`rPrChange`, `pPrChange`) tas fortfarande bort när ett
-stycke skrivs om och rapporteras som "spårade formateringsändringar".
+brödtexten tas bort. Stycketecken (`w:pPr/w:rPr/w:ins|w:del`) blir `<!--k:pm ins|del N-->` sist i stycket, och en infogad eller
+struken `w:br` får samma markör före sin `\n`; `w:rPrChange` ger `<fmt>` runt körningen och `w:pPrChange` ger
+`<!--k:pm fmt N-->`, med det gamla formatet (typsnitt, storlek, färg, markering, fet, kursiv, understruken,
+struken respektive formatmall, lista och justering) som `old` i posten; samma författare, datum och gamla format
+delar nummer. Vid skrivning läggs de tillbaka som `w:rPr/w:ins|del` i `w:pPr`, `w:ins`/`w:del` runt en
+`w:br`, `w:rPrChange` sist i körningens `w:rPr` och `w:pPrChange` sist i `w:pPr` (det gamla stycket
+får punktlistans numId, eller första numrerade listans om den finns). Orörda stycken behåller sin XML.
+Bara formatändringar på själva stycketecknet (`w:rPrChange` i `w:pPr/w:rPr`) tas fortfarande bort när ett stycke
+skrivs om och rapporteras som "spårade formateringsändringar".
 
 **ODT** (`odt.rs`, tester i `odt_review_tests.rs`, LibreOffice-fixtur i `tests/data/odt_review_lo.odt`): samma
 modell som Word. `odt::read` förbereder regionerna ur `text:tracked-changes` (`read_regions`: slag, `dc:creator`,

@@ -91,6 +91,10 @@ pub struct Piece {
     pub align: Align,
     /// Spårad ändring (`<ins>`/`<del>`) som biten ligger i.
     pub rev: Option<RevMark>,
+    /// Spårad teckenformatering (`<fmt>`) som biten ligger i (slaget är `Fmt`).
+    pub fmt: Option<RevMark>,
+    /// Biten är en stycke- eller radbrytningsmarkör `<!--k:pm …-->` (dold, `markup: true`).
+    pub pmark: Option<RevMark>,
     /// Kommentarstråden (rotkommentarens nummer) vars område biten ligger i.
     pub comment: Option<u32>,
 }
@@ -165,6 +169,8 @@ struct St {
     span: Option<u32>,
     align: Align,
     rev: Option<RevMark>,
+    fmt: Option<RevMark>,
+    pmark: Option<RevMark>,
     comment: Option<u32>,
 }
 
@@ -187,6 +193,8 @@ impl Default for St {
             span: None,
             align: Align::Left,
             rev: None,
+            fmt: None,
+            pmark: None,
             comment: None,
         }
     }
@@ -573,7 +581,19 @@ fn mark_review(text: &str, st: &mut [St]) {
         let color = sc.rev_rec(r.id).map_or(0, |x| crate::review::author_color_index(&authors, &x.author));
         fill(st, r.open.clone(), |s| s.markup = true);
         fill(st, r.close.clone(), |s| s.markup = true);
-        fill(st, r.inner(), |s| s.rev = Some(RevMark { kind: r.kind, id: r.id, color }));
+        let mark = Some(RevMark { kind: r.kind, id: r.id, color });
+        if r.kind == crate::review::RevKind::Fmt {
+            fill(st, r.inner(), |s| s.fmt = mark);
+        } else {
+            fill(st, r.inner(), |s| s.rev = mark);
+        }
+    }
+    for m in &sc.pmarks {
+        let color = sc.rev_rec(m.id).map_or(0, |x| crate::review::author_color_index(&authors, &x.author));
+        fill(st, m.range.clone(), |s| {
+            s.markup = true;
+            s.pmark = Some(RevMark { kind: m.kind, id: m.id, color });
+        });
     }
     for c in &sc.comments {
         let thread = sc.comment_rec(c.id).map_or(c.id, |x| x.parent.unwrap_or(x.id));
@@ -610,6 +630,8 @@ fn make_piece(range: Range<usize>, s: &St, images: &[ImageRef], styles: &[Arc<Sp
         span: s.span.and_then(|i| styles.get(i as usize).cloned()),
         align: s.align,
         rev: s.rev,
+        fmt: s.fmt,
+        pmark: s.pmark,
         comment: s.comment,
     }
 }

@@ -723,6 +723,8 @@ struct Fmt {
     span: SpanStyle,
     /// Spårad ändring (`w:ins`/`w:del`) som körningen ligger i: slag och ändringens nummer.
     rev: Option<(RevKind, u32)>,
+    /// Spårad teckenformatering (`w:rPrChange`): ändringens nummer (det gamla formatet står i posten).
+    fchange: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -774,8 +776,8 @@ struct Tbl {
     span: usize,
 }
 
-/// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade formateringsändringar
-/// godtas när ett stycke skrivs om (infogningar, raderingar och kommentarer bevaras).
+/// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade formateringsändringar på
+/// stycketecknet (och när spårning inte läses) godtas när ett stycke skrivs om.
 #[derive(Default)]
 struct Dropped {
     tracked: bool,
@@ -939,6 +941,10 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         part.items.retain(|i| info.comment_ids.contains(&i.id));
     }
     if !info.revs.is_empty() || !comment_recs.is_empty() {
+        // Poster utan tagg eller markör (t.ex. ett tomt stycke med spårat stycketecken) skrivs inte.
+        let sc = review::scan(&markdown);
+        let used: std::collections::HashSet<u32> = sc.revs.iter().map(|r| r.id).chain(sc.pmarks.iter().map(|m| m.id)).collect();
+        info.revs.retain(|r| used.contains(&r.id));
         markdown = review::put_records(&markdown, &info.revs, &comment_recs);
     }
     let comments = comments.map(|(p, _)| p);
@@ -1763,6 +1769,9 @@ fn parse_body(
     let mut cur_rev: Option<(RevKind, u32)> = None;
     // Körningen är bara en kommentarsreferens: den ersätts av områdets slutmarkör.
     let mut run_drop = false;
+    // Spårade stycketecken (`w:ins`/`w:del` i styckets `w:rPr`) och styckeformatering (`w:pPrChange`).
+    let mut para_marks: Vec<(RevKind, u32)> = Vec::new();
+    let mut para_fchange: Option<u32> = None;
     // Bara dokument som nämner en innehållsförteckning behöver sökas igenom efter en.
     let toc_hint = xml.contains("Table of Contents") || xml.contains("TOC");
 
@@ -1979,11 +1988,18 @@ fn parse_body(
                         push_token(&mut para, info, &begin);
                         simple_fields.push(());
                     }
+                    // Spårat stycketecken: `w:ins`/`w:del` i styckets egna `w:rPr`.
+                    b"ins" | b"del" | b"moveTo" | b"moveFrom" if info.track && in_ppr && para.is_some() && tables.is_empty() => {
+                        let kind = if matches!(name.as_slice(), b"ins" | b"moveTo") { RevKind::Ins } else { RevKind::Del };
+                        let id = info.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+                        info.revs.push(RevRec { id, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default(), old: None });
+                        para_marks.push((kind, id));
+                    }
                     // Spårade ändringar runt körningar (inte styckemarkeringens `w:ins`/`w:del` i `w:rPr`).
                     b"ins" | b"del" | b"moveTo" | b"moveFrom" if info.track && !empty && !in_rpr && !in_ppr => {
                         let kind = if matches!(name.as_slice(), b"ins" | b"moveTo") { RevKind::Ins } else { RevKind::Del };
                         let id = info.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-                        info.revs.push(RevRec { id, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default() });
+                        info.revs.push(RevRec { id, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default(), old: None });
                         cur_rev = Some((kind, id));
                         rev_stack.push(cur_rev);
                     }
@@ -1993,6 +2009,23 @@ fn parse_body(
                         }
                     }
                     b"ins" | b"moveTo" => {}
+                    // Spårad teckenformatering: det gamla formatet blir en post, körningen får en `<fmt>`.
+                    b"rPrChange" if info.track && in_rpr && !in_ppr && !empty && element_end(xml, before).is_some() => {
+                        let end = element_end(xml, before).unwrap_or(after);
+                        let linked = link.last().is_some_and(Option::is_some);
+                        let old = review_xml::parse_old_rpr(&xml[before..end], styles, &base, para.as_ref(), theme, linked);
+                        let rec = RevRec { id: 0, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default(), old: Some(old.encode()) };
+                        fmt.fchange = Some(review_xml::fmt_rev_id(info, rec));
+                        skip = 1;
+                    }
+                    // Spårad styckeformatering: samma sak med en markör sist i stycket.
+                    b"pPrChange" if info.track && in_ppr && !empty && para.is_some() && tables.is_empty() && element_end(xml, before).is_some() => {
+                        let end = element_end(xml, before).unwrap_or(after);
+                        let old = review_xml::parse_old_ppr(&xml[before..end], styles, numbering);
+                        let rec = RevRec { id: 0, author: attr(e, b"author").unwrap_or_default(), date: attr(e, b"date").unwrap_or_default(), old: Some(old.encode()) };
+                        para_fchange = Some(review_xml::fmt_rev_id(info, rec));
+                        skip = 1;
+                    }
                     b"pPrChange" | b"rPrChange" => {
                         dropped.tracked = true;
                         if !empty {
@@ -2039,6 +2072,8 @@ fn parse_body(
                     }
                     b"p" => {
                         para = Some(Para::new());
+                        para_marks.clear();
+                        para_fchange = None;
                     }
                     b"pPr" => in_ppr = !empty,
                     b"pStyle" if in_ppr => {
@@ -2123,6 +2158,11 @@ fn parse_body(
                         para_col_break = true;
                     }
                     b"br" | b"cr" if !hidden(&field_depth) => {
+                        // En infogad eller struken radbrytning får en markör före sig.
+                        if let Some((kind @ (RevKind::Ins | RevKind::Del), id)) = cur_rev {
+                            let p = para.get_or_insert_with(Para::new);
+                            p.runs.push(Run { text: review::pmark_text(kind, id, None), fmt: Fmt::default(), link: None, raw: true });
+                        }
                         push_text(&mut para, "\n", &Fmt::default(), &None);
                     }
                     b"noBreakHyphen" if !hidden(&field_depth) => {
@@ -2295,6 +2335,15 @@ fn parse_body(
                     }
                     b"p" => {
                         if let Some(mut p) = para.take() {
+                            // Spårade stycketecken och styckeformatering: markörer sist i stycket.
+                            if tables.is_empty() {
+                                if let Some(id) = para_fchange.take() {
+                                    p.runs.push(Run { text: review::pmark_text(RevKind::Fmt, id, None), fmt: Fmt::default(), link: None, raw: true });
+                                }
+                                for (kind, id) in para_marks.drain(..) {
+                                    p.runs.push(Run { text: review::pmark_text(kind, id, None), fmt: Fmt::default(), link: None, raw: true });
+                                }
+                            }
                             p.align = p.direct_align.or_else(|| styles.jc(p.style.as_deref())).unwrap_or(Align::Left);
                             if p.list.is_none() {
                                 p.list = p.style.as_deref().and_then(|s| list_for_style(&styles.map, s));
@@ -2489,6 +2538,9 @@ fn inline_md(run: &Run) -> String {
         }
         if let Some(url) = &run.link {
             s = format!("[{s}]({})", url.replace(' ', "%20").replace(')', "%29"));
+        }
+        if let Some(id) = run.fmt.fchange {
+            s = format!("{}{s}{}", review::open_tag(RevKind::Fmt, id), review::close_tag(RevKind::Fmt));
         }
         if let Some((kind, id)) = run.fmt.rev {
             s = format!("{}{s}{}", review::open_tag(kind, id), review::close_tag(kind));
@@ -2833,6 +2885,14 @@ struct Writer<'a> {
     toc_n: u32,
     /// Öppen `<ins>`/`<del>`.
     rev: Option<(RevKind, u32)>,
+    /// Öppen `<fmt>` (spårad teckenformatering).
+    fchange: Option<u32>,
+    /// Styckeformatering (`<!--k:pm fmt-->`) som väntar på styckets slut.
+    fchange_para: Option<u32>,
+    /// Stycke- och radbrytningsmarkörer (`<!--k:pm …-->`) som väntar på brytningen eller styckets slut.
+    pending_pm: Vec<(RevKind, u32)>,
+    /// Var det öppna stycket börjar i `body`.
+    para_at: usize,
     /// Nästa `w:id` för en skriven ändring.
     rev_next: u32,
     /// Kommentarsområden som redan skrivits (ett område får bara finnas en gång).
@@ -2895,6 +2955,10 @@ impl<'a> Writer<'a> {
             in_footnote: false,
             toc_n: 0,
             rev: None,
+            fchange: None,
+            fchange_para: None,
+            pending_pm: Vec::new(),
+            para_at: 0,
             rev_next: 5_000_000,
             c_started: Default::default(),
             c_ended: Default::default(),
@@ -3048,6 +3112,7 @@ impl<'a> Writer<'a> {
             return;
         }
         let ppr = self.para_props();
+        self.para_at = self.body.len();
         self.body.push_str("<w:p>");
         if !ppr.is_empty() {
             self.body.push_str(&format!("<w:pPr>{ppr}</w:pPr>"));
@@ -3059,8 +3124,68 @@ impl<'a> Writer<'a> {
 
     fn close_para(&mut self) {
         if self.para_open {
+            self.apply_para_marks();
             self.body.push_str("</w:p>");
             self.para_open = false;
+        }
+        self.pending_pm.clear();
+        self.fchange_para = None;
+    }
+
+    /// Ett `w:id`, författare och datum för en skriven ändring ur posten `id`.
+    fn rev_attrs(&mut self, id: u32) -> String {
+        let rec = self.ctx.revs.get(&id).cloned().unwrap_or_else(|| RevRec { id, author: "Okänd".into(), date: String::new(), old: None });
+        let (mut a, mut d) = (String::new(), String::new());
+        xml_escape(&rec.author, &mut a);
+        xml_escape(&rec.date, &mut d);
+        let date = if d.is_empty() { String::new() } else { format!(" w:date=\"{d}\"") };
+        self.rev_next += 1;
+        format!("w:id=\"{}\" w:author=\"{a}\"{date}", self.rev_next)
+    }
+
+    /// Spårade stycketecken (`w:rPr/w:ins|w:del`) och styckeformatering (`w:pPrChange`) läggs i styckets
+    /// `w:pPr` när stycket stängs (markörerna står sist i stycket).
+    fn apply_para_marks(&mut self) {
+        let fmt_id = self.fchange_para.take();
+        if self.pending_pm.is_empty() && fmt_id.is_none() {
+            return;
+        }
+        let marks = std::mem::take(&mut self.pending_pm);
+        let mut inner = String::new();
+        let mut rpr = String::new();
+        for (kind, id) in marks {
+            let attrs = self.rev_attrs(id);
+            match kind {
+                RevKind::Ins => rpr.push_str(&format!("<w:ins {attrs}/>")),
+                RevKind::Del => rpr.push_str(&format!("<w:del {attrs}/>")),
+                RevKind::Fmt => {}
+            }
+        }
+        if !rpr.is_empty() {
+            inner.push_str(&format!("<w:rPr>{rpr}</w:rPr>"));
+        }
+        if let Some(id) = fmt_id {
+            let old = self.ctx.revs.get(&id).and_then(|r| r.old.clone());
+            if let Some(old) = old {
+                let attrs = self.rev_attrs(id);
+                let old_ppr = review_xml::old_ppr_xml(&review::fmt::ParaFmt::decode(&old), self.ctx.num_base, !self.ordered_nums.is_empty());
+                inner.push_str(&format!("<w:pPrChange {attrs}><w:pPr>{old_ppr}</w:pPr></w:pPrChange>"));
+            }
+        }
+        if inner.is_empty() {
+            return;
+        }
+        let head = self.para_at;
+        if !self.body[head..].starts_with("<w:p>") {
+            return;
+        }
+        if self.ppr.is_empty() {
+            self.body.insert_str(head + 5, &format!("<w:pPr>{inner}</w:pPr>"));
+        } else {
+            let at = head + 5 + 7 + self.ppr.len();
+            if self.body[head..].starts_with("<w:p><w:pPr>") && self.body.is_char_boundary(at) {
+                self.body.insert_str(at, &inner);
+            }
         }
     }
 
@@ -3112,6 +3237,14 @@ impl<'a> Writer<'a> {
         if let Some(c) = shading {
             rpr.push_str(&format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
         }
+        // Spårad teckenformatering: det gamla formatet sist i `w:rPr`.
+        if let Some(fid) = self.fchange {
+            if let Some(old) = self.ctx.revs.get(&fid).and_then(|r| r.old.clone()) {
+                let attrs = self.rev_attrs(fid);
+                let old_rpr = review_xml::old_rpr_xml(&review::fmt::CharFmt::decode(&old));
+                rpr.push_str(&format!("<w:rPrChange {attrs}><w:rPr>{old_rpr}</w:rPr></w:rPrChange>"));
+            }
+        }
         let mut xml = String::from("<w:r>");
         if !rpr.is_empty() {
             xml.push_str(&format!("<w:rPr>{rpr}</w:rPr>"));
@@ -3135,20 +3268,15 @@ impl<'a> Writer<'a> {
         }
         xml.push_str("</w:r>");
         if let Some((kind, id)) = self.rev {
-            let rec = self.ctx.revs.get(&id).cloned().unwrap_or_else(|| RevRec { id, author: "Okänd".into(), date: String::new() });
             let (tag, ins) = match kind {
                 RevKind::Ins => ("w:ins", true),
-                RevKind::Del => ("w:del", false),
+                RevKind::Del | RevKind::Fmt => ("w:del", false),
             };
             if !ins {
                 xml = xml.replace("<w:t ", "<w:delText ").replace("</w:t>", "</w:delText>");
             }
-            let (mut a, mut d) = (String::new(), String::new());
-            xml_escape(&rec.author, &mut a);
-            xml_escape(&rec.date, &mut d);
-            let date = if d.is_empty() { String::new() } else { format!(" w:date=\"{d}\"") };
-            self.rev_next += 1;
-            xml = format!("<{tag} w:id=\"{}\" w:author=\"{a}\"{date}>{xml}</{tag}>", self.rev_next);
+            let attrs = self.rev_attrs(id);
+            xml = format!("<{tag} {attrs}>{xml}</{tag}>");
         }
         if let Some(url) = self.fmt.link.clone() {
             let id = self.link_rel(&url);
@@ -3219,7 +3347,14 @@ impl<'a> Writer<'a> {
 
     fn line_break(&mut self) {
         self.open_para();
-        self.body.push_str("<w:r><w:br/></w:r>");
+        let mut xml = String::from("<w:r><w:br/></w:r>");
+        // Spårad radbrytning: `w:ins`/`w:del` runt körningen.
+        if let Some((kind, id)) = std::mem::take(&mut self.pending_pm).into_iter().find(|(k, _)| *k != RevKind::Fmt) {
+            let attrs = self.rev_attrs(id);
+            let tag = if kind == RevKind::Ins { "w:ins" } else { "w:del" };
+            xml = format!("<{tag} {attrs}>{xml}</{tag}>");
+        }
+        self.body.push_str(&xml);
     }
 }
 
@@ -3669,10 +3804,24 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     }
                 } else if let Some((start, id)) = review::parse_marker(s.trim()) {
                     w.comment_marker(start, id);
-                } else if let Some(open) = review::parse_open_tag(s.trim()) {
-                    w.rev = Some(open);
+                } else if let Some((kind, id)) = review::parse_pmark_exact(s.trim()) {
+                    if kind == RevKind::Fmt {
+                        w.fchange_para = Some(id);
+                    } else {
+                        w.pending_pm.push((kind, id));
+                    }
+                } else if let Some((kind, id)) = review::parse_open_tag(s.trim()) {
+                    if kind == RevKind::Fmt {
+                        w.fchange = Some(id);
+                    } else {
+                        w.rev = Some((kind, id));
+                    }
                 } else if review::is_close_tag(s.trim()) {
-                    w.rev = None;
+                    if s.trim() == "</fmt>" {
+                        w.fchange = None;
+                    } else {
+                        w.rev = None;
+                    }
                 } else if let Some(img) = parse_img(&s) {
                     w.image_ref(&img.src, &img.alt, (img.width, img.height), img.align, resolve);
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
@@ -6630,3 +6779,7 @@ mod review_xml;
 #[cfg(test)]
 #[path = "docx_section_tests.rs"]
 mod section_tests;
+
+#[cfg(test)]
+#[path = "docx_track2_tests.rs"]
+mod track2_tests;

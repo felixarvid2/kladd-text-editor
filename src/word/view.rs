@@ -320,12 +320,12 @@ impl KladdApp {
     }
 
     pub(crate) fn word_toggle(&mut self, ctx: &egui::Context, m: Inline) {
-        self.word_edit(ctx, |t, s| markup::toggle_inline(t, s, m));
+        self.word_format(ctx, |t, s| markup::toggle_inline(t, s, m));
     }
 
     /// Större/mindre text ett steg i storlekslistan.
     pub(crate) fn word_font_step(&mut self, ctx: &egui::Context, dir: i32) {
-        self.word_edit(ctx, |t, s| {
+        self.word_format(ctx, |t, s| {
             let a = markup::analyze(t);
             let act = markup::active(t, &a, s.clone());
             let cur = act.span.font_size.unwrap_or(a.defaults.size());
@@ -391,7 +391,7 @@ impl KladdApp {
     }
 
     pub(crate) fn word_block(&mut self, ctx: &egui::Context, b: Block) {
-        self.word_edit(ctx, |t, s| markup::set_block(t, s, b));
+        self.word_format(ctx, |t, s| markup::set_block(t, s, b));
     }
 
     pub(crate) fn word_zoom_step(&mut self, dir: f32) {
@@ -463,7 +463,7 @@ impl KladdApp {
             (Key::J, markup::Align::Justify),
         ] {
             if hit(ctrl, k) {
-                self.word_edit(ctx, |t, s| markup::set_align(t, s, a));
+                self.word_format(ctx, |t, s| markup::set_align(t, s, a));
             }
         }
         // Teckenstorlek ett steg: Words Ctrl+Shift+> / < (på svenskt tangentbord Ctrl+Shift+<
@@ -792,11 +792,11 @@ impl KladdApp {
                 }
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
-                BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
+                BarAct::Span(prop) => self.word_format(&ctx, |t, s| markup::set_span_prop(t, s, prop)),
                 BarAct::Align(al) => {
                     // En vald bild justeras som sitt stycke, oavsett var markören står.
                     let img = self.wv.img.range.clone();
-                    self.word_edit(&ctx, |t, s| markup::set_align(t, img.unwrap_or(s), al))
+                    self.word_format(&ctx, |t, s| markup::set_align(t, img.unwrap_or(s), al))
                 }
                 BarAct::TextColor(c) => self.wv.text_color = c.or(self.wv.text_color),
                 BarAct::Highlight(c) => self.wv.highlight = c.or(self.wv.highlight),
@@ -1249,6 +1249,11 @@ impl KladdApp {
                 if rv.side > 0.0 && !edited {
                     let pane_x = page_left + page_w + super::reviewui::PANE_GAP;
                     pane_act = super::reviewui::paint_pane(ui, p, &rv, &mut rstate, &galley, gpos, text, pane_x);
+                }
+
+                // Spårade stycketecken och formateringsändringar: ¶, ändringsstreck, prickad understrykning.
+                if !edited {
+                    super::reviewui::paint_marks(ui, p, &analysis, text, &galley, gpos, &reveal, page_left + geom.origin_x() - px(z, 12.0), &out.response);
                 }
 
                 // Ett ark per sida, med luft emellan.
