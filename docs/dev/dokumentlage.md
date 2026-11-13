@@ -224,6 +224,16 @@ Gemensamma format (alla moduler ska använda dessa):
   varianter (`Some("")` = tom första sida; `DocDefaults::header_template(sida)`). Dialogen för
   redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
   fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
+- **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
+  grundformatskommentaren, `h1`–`h6`, `body`, `quote`, med ord i valfri ordning: `"Typsnitt"`,
+  `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
+  `space-before L`, `space-after L`, `line-spacing N` (gånger enkelt, `LINE_SINGLE` = 1,25 i
+  layouten), `indent L` (första raden). Layouten läser dem i `piece_format` (typsnitt, storlek,
+  färg, radhöjd) och `paragraphs` (justering, luft, indrag). Luft efter ett stycke läggs som luft
+  före nästa, eftersom `Galley::concat` staplar efter radernas höjd. Docx: `docx_styles.rs`
+  läser Normal/Heading1–6/Quote ur `styles.xml` (bara det mallen själv anger, minus det Kladds
+  egna mallar anger) och skriver tillbaka bara de egenskaper som ändrats. Odt: `Styles::style_set`
+  och `apply_style_overrides`. Dialogen: `word/stylesdlg.rs`.
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.

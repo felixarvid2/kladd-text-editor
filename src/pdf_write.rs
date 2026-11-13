@@ -31,6 +31,8 @@ const BODY_SIZE: f32 = 10.5;
 const LINE: f32 = 1.5;
 const PARA_GAP: f32 = 7.5;
 const INDENT: f32 = 16.0;
+/// Radhöjd för enkelt radavstånd i formatmallarnas `line-spacing`, gånger teckenstorleken.
+const LINE_SINGLE: f32 = 1.3;
 
 // --- färger --------------------------------------------------------------------
 const INK: (u8, u8, u8) = (0x1E, 0x28, 0x36);
@@ -536,6 +538,12 @@ struct Layout<'a> {
     /// som rubriker, tabeller och kod skalas med.
     body: f32,
     scale: f32,
+    /// Dokumentets formatmallar (`h1: …`, `body: …`, `quote: …`).
+    styles: style::StyleSet,
+    /// Radhöjd som faktor av teckenstorleken (`LINE` om formatmallen inte anger något).
+    line: f32,
+    /// Indrag av nästa blocks första rad (formatmallens `indent`).
+    first_indent: f32,
     /// Grundtypsnitt för brödtext (Mono om dokumentets typsnitt är ett monospace).
     base: Face,
     /// Justering för blocket som läggs ut just nu.
@@ -688,6 +696,9 @@ impl<'a> Layout<'a> {
             missing: Vec::new(),
             body,
             scale: body / BODY_SIZE,
+            styles: defaults.styles.clone(),
+            line: LINE,
+            first_indent: 0.0,
             base,
             align: Align::Left,
             pw,
@@ -1025,7 +1036,8 @@ impl<'a> Layout<'a> {
         loop {
             // Flytande bilder gör raden smalare (och förskjuter den vid vänsterbilder).
             let (mut fx, mut fw) = self.float_room();
-            let (mut line, mut after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0)).max(1.0));
+            let ind0 = if i == 0 { self.first_indent } else { 0.0 };
+            let (mut line, mut after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0) - ind0).max(1.0));
             let page_before = self.pages.len();
             // Fotnoterna på raden ska ha plats längst ned på samma sida som raden.
             let refs_of = |this: &Self, line: &Line| -> Vec<usize> {
@@ -1036,7 +1048,7 @@ impl<'a> Layout<'a> {
                 }
             };
             let mut refs = refs_of(self, &line);
-            let line_h0 = line_size(&line, size) * LINE;
+            let line_h0 = line_size(&line, size) * self.line;
             let need0 = self.note_cost(&refs);
             if need0 > 0.0 && self.y + line_h0 + self.reserved + need0 > self.ph - self.mb && self.y > self.mt + 0.5 {
                 self.new_page();
@@ -1044,16 +1056,16 @@ impl<'a> Layout<'a> {
             self.ensure(line_h0);
             if self.pages.len() != page_before {
                 (fx, fw) = self.float_room();
-                (line, after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0)).max(1.0));
+                (line, after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0) - ind0).max(1.0));
                 refs = refs_of(self, &line);
             }
             let need = self.note_cost(&refs);
             self.reserved += need;
             self.page_notes.extend(refs);
-            let (x, width) = (x + fx, width - fw.min(width - 24.0));
+            let (x, width) = (x + fx + ind0, width - fw.min(width - 24.0) - ind0);
             let last = after >= pieces.len() && !line.hard;
             let msz = line_size(&line, size);
-            let line_h = msz * LINE;
+            let line_h = msz * self.line;
             let baseline = self.y + msz * 1.08;
             if i == 0 {
                 if let Some((marker, mface)) = &first_line_extra {
@@ -1379,6 +1391,17 @@ impl<'a> Layout<'a> {
                         _ => (11.5, Face::SansSemi, 8.0),
                     };
                     let size = size * self.scale;
+                    // Formatmallens utseende (typsnittet är alltid det inbäddade).
+                    let st = self.styles.get(style::StyleId::Heading((*level).clamp(1, 6))).clone();
+                    let size = st.size.unwrap_or(size);
+                    let face = if st.bold == Some(false) { Face::Sans } else { face };
+                    let ink = st.color.map_or(INK, |c| (c[0], c[1], c[2]));
+                    if *align == Align::Left {
+                        self.align = st.align.unwrap_or(Align::Left);
+                    }
+                    self.line = st.line_spacing.map_or(LINE, |m| m * LINE_SINGLE);
+                    self.first_indent = st.first_indent.unwrap_or(0.0);
+                    let before = before + st.space_before.unwrap_or(0.0);
                     if bi > 0 && self.y > self.mt + 0.5 {
                         self.y += before;
                     }
@@ -1387,7 +1410,10 @@ impl<'a> Layout<'a> {
                     let text: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
                     self.headings.push(Heading { level: *level, text: text.trim().to_owned(), page: self.pages.len() - 1, y: self.y });
                     let spans: Vec<Span> = spans.iter().map(|s| Span { text: s.text.replace('\n', " "), style: s.style.clone() }).collect();
-                    self.text_block(&spans, self.ml, self.cw, face, size, INK, false, None);
+                    self.text_block(&spans, self.ml, self.cw, face, size, ink, st.italic == Some(true), None);
+                    self.line = LINE;
+                    self.first_indent = 0.0;
+                    self.y += st.space_after.unwrap_or(0.0);
                     if *level == 1 {
                         let y = self.y + 2.0;
                         let ml = self.ml;
@@ -1399,10 +1425,23 @@ impl<'a> Layout<'a> {
                 }
                 Block::Para { spans, indent, quote, align } => {
                     self.align = *align;
-                    let top = self.y;
                     let page_before = self.pages.len();
                     let (color, italic) = if *quote > 0 { (MUTED, true) } else { (INK, false) };
-                    self.text_block(spans, self.ml + indent, self.cw - indent, self.base, self.body, color, italic, None);
+                    let st = self.styles.get(if *quote > 0 { style::StyleId::Quote } else { style::StyleId::Body }).clone();
+                    let (color, italic) = (st.color.map_or(color, |c| (c[0], c[1], c[2])), st.italic.unwrap_or(italic));
+                    let size = st.size.unwrap_or(self.body);
+                    let face = if st.bold == Some(true) && self.base == Face::Sans { Face::SansSemi } else { self.base };
+                    if *align == Align::Left {
+                        self.align = st.align.unwrap_or(Align::Left);
+                    }
+                    self.line = st.line_spacing.map_or(LINE, |m| m * LINE_SINGLE);
+                    self.first_indent = st.first_indent.unwrap_or(0.0);
+                    self.y += st.space_before.unwrap_or(0.0);
+                    let top = self.y;
+                    self.text_block(spans, self.ml + indent, self.cw - indent, face, size, color, italic, None);
+                    self.line = LINE;
+                    self.first_indent = 0.0;
+                    self.y += st.space_after.unwrap_or(0.0);
                     if *quote > 0 {
                         let x = self.ml + indent - 9.0;
                         let start = if self.pages.len() == page_before { top } else { self.mt };
@@ -1881,6 +1920,29 @@ mod tests {
         let lines = lay.break_lines(&spans, Face::Sans, BODY_SIZE, 400.0);
         assert_eq!(lines.len(), 1);
         assert_eq!(line_size(&lines[0], BODY_SIZE), 24.0);
+    }
+
+    #[test]
+    fn style_overrides_change_pdf_layout() {
+        let resolve = |_: &str| None;
+        let ys = |md: &str| {
+            let (lay, _) = laid_out(md, &resolve);
+            (lay.headings[0].y, lay.y)
+        };
+        let doc = "Före\n\n# Rubrik\n\nEfter\n";
+        let (h0, end0) = ys(doc);
+        // Luft före rubriken flyttar den, luft efter flyttar texten under.
+        let (h1, end1) = ys(&format!("<!-- kladd: h1: space-before 20pt space-after 10pt -->\n\n{doc}"));
+        assert!((h1 - h0 - 20.0).abs() < 0.01, "{h0} {h1}");
+        assert!((end1 - end0 - 30.0).abs() < 0.01, "{end0} {end1}");
+        // Radavstånd i brödtexten och större rubrikstorlek ger en högre sida.
+        let (_, end2) = ys(&format!("<!-- kladd: body: line-spacing 2 -->\n\n{doc}"));
+        assert!(end2 > end0, "{end0} {end2}");
+        let big = ys(&format!("<!-- kladd: h1: 40pt -->\n\n{doc}")).1;
+        assert!(big > end0);
+        // Hela dokumentet blir ändå en PDF.
+        let w = write("<!-- kladd: h1: 30pt bold #112233 center indent 10pt; body: italic justify indent 12pt; quote: 9pt -->\n\n# R\n\nText\n\n> citat\n", "x", &|_| None).unwrap();
+        assert!(w.bytes.starts_with(b"%PDF"));
     }
 
     #[test]

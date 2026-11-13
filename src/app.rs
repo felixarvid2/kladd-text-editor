@@ -3447,6 +3447,7 @@ impl eframe::App for KladdApp {
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);
         self.header_dialog(&ctx, &p);
+        self.styles_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);

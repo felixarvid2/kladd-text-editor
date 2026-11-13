@@ -7,6 +7,7 @@ mod app;
 mod autosave;
 mod doc;
 mod docx;
+mod docx_styles;
 mod export;
 mod grammar;
 mod grammar_ui;

@@ -137,6 +137,16 @@ Knappen *Sidinställningar* (eller dubbelklick på sidhuvud eller sidfot) öppna
 <!-- kladd: page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"; footer-align: center -->
 ```
 
+### Formatmallar
+
+*Ändra formatmall…* bredvid stilvalet (eller högerklick på stilvalet) öppnar en dialog där du ändrar utseendet på Brödtext, Rubrik 1–6 och Citat: typsnitt, storlek, fet, kursiv, färg, justering, luft före och efter, radavstånd och indrag av första raden. Dialogen har en förhandsvisning, och ändringarna gäller hela dokumentet direkt. *Uppdatera från markering* tar utseendet på texten vid markören och *Återställ* tar bort ändringarna i den valda formatmallen. De sparas i grundformatskommentaren, en rad per formatmall, och dokument utan sådana rader ser ut som förut:
+
+```
+<!-- kladd: h1: "Calibri Light" 16pt bold #2F5496 space-before 12pt space-after 6pt; body: justify line-spacing 1.15 -->
+```
+
+Word-dokumentets Normal, Rubrik 1–6 och Citat läses in, och när du ändrar en formatmall skrivs ändringen tillbaka till formatmallen i `.docx`-filen (oförändrade dokument sparas som förut). `.odt` fungerar likadant, och PDF, HTML och EPUB följer formatmallarna (PDF har alltid sina inbäddade typsnitt).
+
 ### Tabeller, bilder och inklistring
 
 Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.
@@ -172,6 +182,7 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 | Centrerat, högerjusterat, marginaljusterat | `<div align="center">` … `</div>` |
 | Dokumentets grundtypsnitt | `<!-- kladd: font-family: "Times New Roman"; font-size: 12pt -->` på första raden |
 | Sidstorlek, marginaler, sidhuvud och sidfot | Samma kommentar: `page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"` |
+| Formatmallar (Brödtext, Rubrik 1–6, Citat) | Samma kommentar: `h1: "Calibri Light" 16pt bold #2F5496 space-before 12pt; body: justify line-spacing 1.15; quote: italic` |
 | Fotnoter, kommentarer, fält, textrutor m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
 | Punktlistor och numrerade listor | `-` och `1.` |
 | Citat | `>` |

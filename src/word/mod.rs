@@ -8,6 +8,7 @@ pub mod nav;
 pub mod navui;
 pub mod tables;
 pub mod pages;
+pub mod stylesdlg;
 pub mod view;
 #[cfg(test)]
 pub mod bench;

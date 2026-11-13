@@ -255,6 +255,16 @@ impl TProps {
     }
 }
 
+/// Styckeegenskaper som formatmallarna (`style::StyleSet`) använder.
+#[derive(Clone, Default, Debug)]
+struct PProps {
+    before: Option<f32>,
+    after: Option<f32>,
+    /// `fo:line-height="115%"` som 1,15.
+    line: Option<f32>,
+    indent: Option<f32>,
+}
+
 #[derive(Clone, Default)]
 struct StyleDef {
     name: String,
@@ -263,6 +273,8 @@ struct StyleDef {
     auto: bool,
     tp: TProps,
     align: Option<Align>,
+    /// Luft, radavstånd och indrag i `style:paragraph-properties` (för formatmallarna).
+    pp: PProps,
     /// `style:wrap` och `style:horizontal-pos` i `style:graphic-properties`.
     wrap: Option<String>,
     hpos: Option<String>,
@@ -357,6 +369,14 @@ impl Styles {
                     if let Some(a) = c.attr("fo:text-align") {
                         d.align = Some(parse_align(a));
                     }
+                    d.pp.before = c.attr("fo:margin-top").and_then(style::parse_length);
+                    d.pp.after = c.attr("fo:margin-bottom").and_then(style::parse_length);
+                    d.pp.indent = c.attr("fo:text-indent").and_then(style::parse_length);
+                    d.pp.line = c
+                        .attr("fo:line-height")
+                        .and_then(|v| v.trim().strip_suffix('%')?.trim().parse::<f32>().ok())
+                        .filter(|p| *p > 0.0)
+                        .map(|p| p / 100.0);
                 }
                 "style:graphic-properties" => {
                     d.wrap = c.attr("style:wrap").map(str::to_owned);
@@ -475,6 +495,46 @@ impl Styles {
             chain.pop();
         }
         chain.iter().fold(self.default_props(family), |acc, d| acc.over(&d.tp))
+    }
+
+    /// Brödtext, Rubrik 1-6 och Citat så som formatmallarna själva anger dem (utan standardformat).
+    fn style_set(&self) -> style::StyleSet {
+        use style::{STYLE_IDS, StyleId};
+        let mut set = style::StyleSet::default();
+        for id in STYLE_IDS {
+            let name = match id {
+                StyleId::Body => "Text_20_body".to_owned(),
+                StyleId::Heading(n) => format!("Heading_20_{n}"),
+                StyleId::Quote => "Quotations".to_owned(),
+            };
+            if !self.defs.contains_key(&("paragraph".to_owned(), name.clone())) {
+                continue;
+            }
+            let chain = self.chain("paragraph", &name);
+            let tp = chain.iter().fold(TProps::default(), |acc, d| acc.over(&d.tp));
+            let mut o = style::StyleOverride {
+                font_family: tp.font,
+                size: tp.size,
+                bold: tp.bold,
+                italic: tp.italic,
+                color: tp.color,
+                ..Default::default()
+            };
+            for d in &chain {
+                o.align = d.align.or(o.align);
+                o.space_before = d.pp.before.or(o.space_before);
+                o.space_after = d.pp.after.or(o.space_after);
+                o.line_spacing = d.pp.line.or(o.line_spacing);
+                o.first_indent = d.pp.indent.or(o.first_indent);
+            }
+            if id == StyleId::Body {
+                // Brödtextens typsnitt och storlek är dokumentets grundformat.
+                o.font_family = None;
+                o.size = None;
+            }
+            set.set(id, o);
+        }
+        set
     }
 
     fn align(&self, name: Option<&str>) -> Align {
@@ -1511,6 +1571,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         rd.walk(c);
     }
     let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
+    // Formatmallar som avviker från Kladds egna (de Kladd själv skriver ger inga ändringar).
+    defaults.styles = st.style_set().minus(&kladd_style_set());
     if let Some(s) = &sroot {
         read_page(&st, s, &mut defaults);
     }
@@ -2455,6 +2517,7 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields) -> String {
     let mut fonts = BTreeSet::new();
     fonts.insert(font.clone());
     fonts.insert("Liberation Mono".to_owned());
+    fonts.extend(style::STYLE_IDS.iter().filter_map(|&id| d.styles.get(id).font_family.clone()));
     let (pw, ph) = d.page();
     let m = d.margins();
     let orient = if pw > ph { "landscape" } else { "portrait" };
@@ -2544,12 +2607,112 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields) -> String {
     named.push_str("<style:style style:name=\"Internet_20_link\" style:display-name=\"Internet link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
     named.push_str("<style:style style:name=\"Visited_20_Internet_20_Link\" style:display-name=\"Visited Internet Link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
 
+    apply_style_overrides(&mut named, &d.styles);
     named.push_str("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"1\" text:start-value=\"0\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>");
 
     format!(
         "{XML_DECL}<office:document-styles {NS} office:version=\"1.2\">{}<office:styles>{named}</office:styles><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>",
         font_decls(&fonts)
     )
+}
+
+/// Formatmallarna Kladd själv skriver (utan ändringar), som `StyleSet` att jämföra med vid läsning.
+fn kladd_style_set() -> style::StyleSet {
+    let xml = styles_xml(&DocDefaults::default(), &style::Fields::for_export("", "odt"));
+    let mut st = Styles::default();
+    if let Ok(root) = parse_xml(&xml) {
+        st.read_fonts(&root);
+        st.read_styles(&root);
+    }
+    st.style_set()
+}
+
+/// Sätter `key="value"` i elementet `tag` i formatmallens XML (`el`), och skapar elementet om det saknas.
+fn set_style_attrs(el: &mut String, tag: &str, attrs: &[(&str, String)]) {
+    if attrs.is_empty() {
+        return;
+    }
+    let open = format!("<{tag}");
+    let at = match el.find(&open) {
+        Some(at) => at,
+        None => {
+            // Egenskapselementet saknas: stycke före text, båda före slutet.
+            let end = el.rfind("</style:style>").unwrap_or(el.len());
+            let at = if tag == "style:paragraph-properties" { el.find("<style:text-properties").unwrap_or(end) } else { end };
+            el.insert_str(at, &format!("<{tag}/>"));
+            at
+        }
+    };
+    let tag_end = el[at..].find('>').map_or(el.len(), |i| at + i);
+    let self_closing = el[at..tag_end].ends_with('/');
+    let mut head = el[at..tag_end].trim_end_matches('/').to_owned();
+    for (k, v) in attrs {
+        // Befintligt värde byts ut.
+        if let Some(p) = head.find(&format!(" {k}=\"")) {
+            let q = head[p + k.len() + 3..].find('"').map_or(head.len(), |i| p + k.len() + 3 + i + 1);
+            head.replace_range(p..q, "");
+        }
+        head.push_str(&format!(" {k}=\"{}\"", esc(v)));
+    }
+    el.replace_range(at..tag_end, &format!("{head}{}", if self_closing { "/" } else { "" }));
+}
+
+/// Lägger dokumentets formatmallsändringar på Brödtext, Rubrik 1-6 och Citat i `named`.
+fn apply_style_overrides(named: &mut String, set: &style::StyleSet) {
+    for id in style::STYLE_IDS {
+        let o = set.get(id);
+        if o.is_empty() {
+            continue;
+        }
+        let name = match id {
+            style::StyleId::Body => "Text_20_body".to_owned(),
+            style::StyleId::Heading(n) => format!("Heading_20_{n}"),
+            style::StyleId::Quote => "Quotations".to_owned(),
+        };
+        let start_tag = format!("<style:style style:name=\"{name}\"");
+        let Some(a) = named.find(&start_tag) else { continue };
+        let Some(len) = named[a..].find("</style:style>") else { continue };
+        let b = a + len + "</style:style>".len();
+        let mut el = named[a..b].to_owned();
+        let mut pp: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = o.align {
+            pp.push(("fo:text-align", align_attr(v).to_owned()));
+        }
+        if let Some(v) = o.space_before {
+            pp.push(("fo:margin-top", cm(v)));
+        }
+        if let Some(v) = o.space_after {
+            pp.push(("fo:margin-bottom", cm(v)));
+        }
+        if let Some(v) = o.line_spacing {
+            pp.push(("fo:line-height", format!("{}%", fmt_num(v * 100.0, 0))));
+        }
+        if let Some(v) = o.first_indent {
+            pp.push(("fo:text-indent", cm(v)));
+        }
+        let mut tp: Vec<(&str, String)> = Vec::new();
+        if let Some(f) = &o.font_family {
+            tp.push(("style:font-name", f.clone()));
+        }
+        if let Some(v) = o.size {
+            tp.push(("fo:font-size", pt_str(v)));
+        }
+        if let Some(v) = o.bold {
+            let w = if v { "bold" } else { "normal" };
+            tp.push(("fo:font-weight", w.into()));
+            tp.push(("style:font-weight-asian", w.into()));
+            tp.push(("style:font-weight-complex", w.into()));
+        }
+        if let Some(v) = o.italic {
+            tp.push(("fo:font-style", if v { "italic" } else { "normal" }.into()));
+        }
+        if let Some(c) = o.color {
+            tp.push(("fo:color", style::hex(c)));
+        }
+        set_style_attrs(&mut el, "style:paragraph-properties", &pp);
+        set_style_attrs(&mut el, "style:text-properties", &tp);
+        named.replace_range(a..b, &el);
+    }
 }
 
 fn meta_xml(title: &str) -> String {
@@ -2587,6 +2750,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     let text_w = (pw - m[1] - m[3]).max(36.0);
     let mut w = build_body(markdown, resolve, text_w);
     w.fonts.insert(defaults.font().to_owned());
+    w.fonts.extend(style::STYLE_IDS.iter().filter_map(|&id| defaults.styles.get(id).font_family.clone()));
     let content = format!(
         "{XML_DECL}<office:document-content {NS} office:version=\"1.2\">{}<office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{}</office:text></office:body></office:document-content>",
         font_decls(&w.fonts),
@@ -2770,6 +2934,29 @@ Slut.
     }
 
     #[test]
+    fn style_overrides_roundtrip_through_styles_xml() {
+        let md = "<!-- kladd: h1: \"Georgia\" 22pt nobold #112233 center space-before 18pt space-after 6pt line-spacing 1.5 indent 12pt; body: justify line-spacing 1.2; quote: italic 11pt -->\n\n# Rubrik\n\nText\n\n> citat\n";
+        let w = write(md, "T", &|_| None).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&w.bytes)).unwrap();
+        let mut styles = String::new();
+        z.by_name("styles.xml").unwrap().read_to_string(&mut styles).unwrap();
+        let h1 = &styles[styles.find("style:name=\"Heading_20_1\"").unwrap()..];
+        let h1 = &h1[..h1.find("</style:style>").unwrap()];
+        assert!(h1.contains("fo:text-align=\"center\"") && h1.contains("fo:margin-top=\"0.635cm\""), "{h1}");
+        assert!(h1.contains("fo:line-height=\"150%\"") && h1.contains("fo:font-size=\"22pt\"") && h1.contains("fo:color=\"#112233\""), "{h1}");
+        // Attributet finns bara en gång även om standardvärdet fanns.
+        assert_eq!(h1.matches("fo:font-size=").count(), 1);
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        let first = back.markdown.lines().next().unwrap();
+        assert!(first.contains("h1: \"Georgia\" 22pt nobold #112233 center space-before 18pt space-after 6pt line-spacing 1.5 indent 12pt"), "{first}");
+        assert!(first.contains("body: justify line-spacing 1.2"), "{first}");
+        // Dokument utan ändringar får ingen formatmallsrad.
+        let plain = read(&write("# Rubrik\n\nText\n", "T", &|_| None).unwrap().bytes).unwrap();
+        assert_eq!(plain.markdown, "# Rubrik\n\nText\n");
+    }
+
+    #[test]
     fn floating_image_roundtrip() {
         let md = "<img src=\"bild:image1.png\" alt=\"Sol\" width=\"200\" align=\"left\">Text bredvid.\n\n<img src=\"bild:image1.png\" width=\"100\" align=\"right\">\n\nSlut\n";
         let w = write(md, "T", &resolver()).unwrap();
@@ -2947,7 +3134,7 @@ Slut.
         assert!(l.dropped.is_empty(), "{:?}", l.dropped);
         let md = &l.markdown;
         assert!(
-            md.starts_with("<!-- kladd: font-family: \"Liberation Serif\"; font-size: 12pt; page-size: Letter; page-margin: 20mm 25mm 20mm 25mm; footer: \"Sida {sida} av {sidor}\"; footer-align: center -->\n\n"),
+            md.starts_with("<!-- kladd: font-family: \"Liberation Serif\"; font-size: 12pt; page-size: Letter; page-margin: 20mm 25mm 20mm 25mm; footer: \"Sida {sida} av {sidor}\"; footer-align: center; h1: \"Liberation Sans\" 18.2pt -->\n\n"),
             "{md}"
         );
         assert!(md.contains("\n# Rubrik ett\n"), "fetstil i rubriken kommer från formatmallen: {md}");

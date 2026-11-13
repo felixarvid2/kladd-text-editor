@@ -118,6 +118,8 @@ pub struct Source {
     footnotes: Option<FnPart>,
     /// Sida, sidhuvud och sidfot så som de lästes (övriga fält i DocDefaults är tomma).
     page: DocDefaults,
+    /// Formatmallarna så som de lästes ur `styles.xml` (se `docx_styles`).
+    styles: style::StyleSet,
 }
 
 // ============================================================== läsning
@@ -838,8 +840,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     // Temats typsnitt behövs för `w:asciiTheme` i formatmallarna och texten.
     let theme_part = find_part("/theme").unwrap_or_else(|| "word/theme/theme1.xml".to_owned());
     let theme = pkg.part(&theme_part)?.map(|x| parse_theme(&x)).unwrap_or_default();
+    let mut style_set = style::StyleSet::default();
     let styles = match find_part("/styles") {
-        Some(p) => pkg.part(&p)?.map(|x| parse_styles(&x, &theme)).unwrap_or_default(),
+        Some(p) => pkg
+            .part(&p)?
+            .map(|x| {
+                let kladd = format!("<w:styles>{}</w:styles>", kladd_styles());
+                style_set = crate::docx_styles::read_relative(&x, &|t| theme.font(t), &kladd);
+                parse_styles(&x, &theme)
+            })
+            .unwrap_or_default(),
         None => Styles::default(),
     };
     let numbering = match find_part("/numbering") {
@@ -884,6 +894,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     base.footer_align = page.footer_align;
     base.header_first = page.header_first.clone();
     base.footer_first = page.footer_first.clone();
+    base.styles = style_set;
     if !info.fn_refs.is_empty() {
         markdown.push('\n');
         for (i, r) in info.fn_refs.iter().enumerate() {
@@ -895,6 +906,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         }
     }
     let comment = base.to_comment();
+    // Formatmallarna som `write` får tillbaka ur kommentarraden (avrundade som i texten).
+    let read_styles = DocDefaults::from_comment(&comment).map(|d| d.styles).unwrap_or_default();
     if !comment.is_empty() {
         markdown = format!("{comment}\n\n{markdown}");
     }
@@ -950,7 +963,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 e.fn_ids.push(r.id.clone());
             }
         }
-        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page })
+        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles })
     });
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
@@ -4126,7 +4139,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
         ("docProps/core.xml".into(), core_xml(title, "").into_bytes()),
         ("docProps/app.xml".into(), APP_XML.as_bytes().to_vec()),
-        ("word/styles.xml".into(), styles_xml(&defaults).into_bytes()),
+        ("word/styles.xml".into(), crate::docx_styles::patch_styles(&styles_xml(&defaults), &style::StyleSet::default(), &defaults.styles).into_bytes()),
         ("word/numbering.xml".into(), numbering_xml(&w.ordered_nums).into_bytes()),
         (
             "word/settings.xml".into(),
@@ -4796,14 +4809,19 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
                 .filter(|(id, _)| !xml.contains(&format!("w:styleId=\"{id}\"")))
                 .map(|(_, x)| x)
                 .collect();
-            if !missing.is_empty() {
-                let patched = insert_before(&xml, "</w:styles>", &missing);
+            let mut patched = if missing.is_empty() { xml.clone() } else { insert_before(&xml, "</w:styles>", &missing) };
+            // Formatmallar som ändrats i Kladd skrivs in; oförändrade lämnas som de var.
+            if defaults.styles != src.styles {
+                patched = crate::docx_styles::patch_styles(&patched, &src.styles, &defaults.styles);
+            }
+            if patched != xml {
                 replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
             }
         }
         Some(_) => {}
         None => {
-            let (part, xml) = fresh_part("word/styles.xml", "styles", "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml", styles_xml(&defaults), &mut doc_rel_add, &mut type_add);
+            let styles = crate::docx_styles::patch_styles(&styles_xml(&defaults), &style::StyleSet::default(), &defaults.styles);
+            let (part, xml) = fresh_part("word/styles.xml", "styles", "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml", styles, &mut doc_rel_add, &mut type_add);
             new_parts.push((part, xml.into_bytes()));
         }
     }
@@ -5218,7 +5236,7 @@ Sist vänster.
             format!("{}{}{}", &x[..start], body, &x[end..])
         });
         let back = read(&bytes).unwrap();
-        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt -->
+        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt; h1: \"Georgia\" 20pt #2F5496 -->
 
 # Titel
 

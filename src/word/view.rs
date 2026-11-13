@@ -115,6 +115,8 @@ pub struct State {
     pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Öppen dialog "Sidhuvud och sidfot".
     pub(crate) hf_dlg: Option<super::headers::HfDialog>,
+    /// Öppen dialog "Ändra formatmall".
+    pub(crate) styles_dlg: Option<super::stylesdlg::StylesDialog>,
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
@@ -140,6 +142,7 @@ enum BarAct {
     Toc,
     TableOp(TableOp),
     PageSetup,
+    EditStyles,
     Undo,
     Redo,
     Zoom(f32),
@@ -520,7 +523,7 @@ impl KladdApp {
                 ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
                     ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
                     // Stil
-                    egui::ComboBox::from_id_salt("kladd-word-style")
+                    let style_combo = egui::ComboBox::from_id_salt("kladd-word-style")
                         .width(98.0)
                         .selected_text(block_label(act.block))
                         .show_ui(ui, |ui| {
@@ -536,6 +539,12 @@ impl KladdApp {
                                 }
                             }
                         });
+                    if style_combo.response.secondary_clicked() {
+                        acts.push(BarAct::EditStyles);
+                    }
+                    if status_button(ui, p, "Ändra formatmall…", "Ändra utseendet på Brödtext, rubriker och citat (högerklicka på stilvalet)").clicked() {
+                        acts.push(BarAct::EditStyles);
+                    }
                     // Typsnitt och storlek
                     egui::ComboBox::from_id_salt("kladd-word-font")
                         .width(112.0)
@@ -728,6 +737,10 @@ impl KladdApp {
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
                 BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
+                BarAct::EditStyles => {
+                    let sel = crate::style::StyleId::for_block(act.block);
+                    self.open_styles_dialog(sel)
+                }
                 BarAct::Undo => self.word_undo(&ctx, false),
                 BarAct::Redo => self.word_undo(&ctx, true),
                 BarAct::Span(prop) => self.word_edit(&ctx, |t, s| markup::set_span_prop(t, s, prop)),

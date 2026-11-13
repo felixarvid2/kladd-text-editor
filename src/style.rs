@@ -11,6 +11,9 @@
 //!   Saknas raden gäller Calibri 11 pt.
 #![allow(dead_code)]
 
+mod formatmall;
+pub use formatmall::{STYLE_IDS, StyleId, StyleOverride, StyleSet};
+
 /// Grundtypsnittet när dokumentet inte anger något (samma som `docx::write` skriver).
 pub const DEFAULT_FONT: &str = "Calibri";
 pub const DEFAULT_SIZE: f32 = 11.0;
@@ -221,6 +224,8 @@ pub struct DocDefaults {
     pub header_first: Option<String>,
     /// Annorlunda sidfot på första sidan (`Some("")` = tomt).
     pub footer_first: Option<String>,
+    /// Formatmallarnas ändringar (`h1: …`, `body: …`, `quote: …`), se `formatmall`.
+    pub styles: StyleSet,
 }
 
 /// A4 i pt.
@@ -299,6 +304,7 @@ impl DocDefaults {
                 parts.push(format!("{name}: {}", quote(t)));
             }
         }
+        parts.extend(self.styles.to_parts());
         if parts.is_empty() {
             return String::new();
         }
@@ -323,7 +329,9 @@ impl DocDefaults {
                 "footer-first" => d.footer_first = Some(unquote(&v)),
                 "header-align" => d.header_align = Align::from_attr(&v),
                 "footer-align" => d.footer_align = Align::from_attr(&v),
-                _ => {}
+                k => {
+                    d.styles.read_decl(k, &v);
+                }
             }
         }
         Some(d)

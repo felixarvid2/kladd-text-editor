@@ -1225,6 +1225,58 @@ fn css(d: &DocDefaults, mode: Mode) -> String {
          nav.toc ul { list-style: none; padding-left: 1.2em; margin: .2em 0; }\n\
          nav.toc > ul { padding-left: 0; }\n",
     );
+    s.push_str(&style_css(d));
+    s
+}
+
+/// Dokumentets formatmallar (`h1: …`, `body: …`, `quote: …`) som CSS-regler efter standardreglerna.
+fn style_css(d: &DocDefaults) -> String {
+    let mut s = String::new();
+    for id in crate::style::STYLE_IDS {
+        let o = d.styles.get(id);
+        if o.is_empty() {
+            continue;
+        }
+        let sel = match id {
+            crate::style::StyleId::Body => "p, li".to_owned(),
+            crate::style::StyleId::Heading(n) => format!("h{n}"),
+            crate::style::StyleId::Quote => "blockquote".to_owned(),
+        };
+        let mut decl: Vec<String> = Vec::new();
+        if let Some(f) = o.font_family.as_deref() {
+            decl.push(format!("font-family: {}", font_stack(f)));
+        }
+        if let Some(v) = o.size {
+            decl.push(format!("font-size: {}pt", num(v)));
+        }
+        if let Some(b) = o.bold {
+            decl.push(format!("font-weight: {}", if b { "bold" } else { "normal" }));
+        }
+        if let Some(i) = o.italic {
+            decl.push(format!("font-style: {}", if i { "italic" } else { "normal" }));
+        }
+        if let Some(c) = o.color {
+            decl.push(format!("color: {}", crate::style::hex(c)));
+        }
+        if let Some(a) = o.align {
+            decl.push(format!("text-align: {}", a.as_attr()));
+        }
+        if let Some(v) = o.space_before {
+            decl.push(format!("margin-top: {}pt", num(v)));
+        }
+        if let Some(v) = o.space_after {
+            decl.push(format!("margin-bottom: {}pt", num(v)));
+        }
+        if let Some(v) = o.line_spacing {
+            decl.push(format!("line-height: {}", num(v * 1.2)));
+        }
+        if let Some(v) = o.first_indent {
+            decl.push(format!("text-indent: {}pt", num(v)));
+        }
+        if !decl.is_empty() {
+            s.push_str(&format!("{sel} {{ {}; }}\n", decl.join("; ")));
+        }
+    }
     s
 }
 
@@ -1264,6 +1316,20 @@ mod tests {
 
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn style_overrides_become_css_rules() {
+        let md = "<!-- kladd: h1: \"Georgia\" 24pt nobold #112233 center space-before 18pt space-after 6pt; body: justify line-spacing 1.5 indent 12pt; quote: italic -->\n\n# Rubrik\n\nText\n";
+        let w = html(md, "T", &|_| None).unwrap();
+        let h = String::from_utf8(w.bytes).unwrap();
+        assert!(h.contains("h1 { font-family: \"Georgia\""), "{h}");
+        assert!(h.contains("font-size: 24pt; font-weight: normal; color: #112233; text-align: center; margin-top: 18pt; margin-bottom: 6pt;"), "{h}");
+        assert!(h.contains("p, li { text-align: justify; line-height: 1.8; text-indent: 12pt; }"), "{h}");
+        assert!(h.contains("blockquote { font-style: italic; }"), "{h}");
+        // Utan formatmallar finns inga extra regler.
+        let plain = String::from_utf8(html("# R\n", "T", &|_| None).unwrap().bytes).unwrap();
+        assert!(!plain.contains("p, li {"));
+    }
 
     // 1x1 PNG.
     const PNG: &[u8] = &[
