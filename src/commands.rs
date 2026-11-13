@@ -398,6 +398,10 @@ pub static ALL: &[Command] = &[
     Command::new("insert.toc", "Infoga innehållsförteckning", Insert, "", |e| e.markdown && !e.pdf, |a, c| a.insert_toc(c)),
     Command::new("insert.table", "Infoga tabell", Insert, "", |e| e.word, |a, c| a.word_edit(c, |t, s| markup::insert_table(t, s.end))).scope(Scope::Word),
     Command::new("insert.footnote", "Infoga fotnot", Insert, "Ctrl+Alt+F", |e| e.word, |a, c| a.word_footnote(c)).scope(Scope::Word),
+    Command::new("insert.equation", "Ekvation", Insert, "", |e| e.word, |a, c| a.word_edit(c, |t, s| {
+        let e = crate::math::insert::insert_equation(t, s.end);
+        markup::Edit { text: e.text, sel: e.sel }
+    })).scope(Scope::Word),
     Command::new("insert.header", "Sidhuvud…", Insert, "", |e| e.word, |a, _| a.open_header_dialog(false, 1)).scope(Scope::Word).sep(),
     Command::new("insert.footer", "Sidfot…", Insert, "", |e| e.word, |a, _| a.open_header_dialog(true, 1)).scope(Scope::Word),
     Command::new("insert.section_break", "Avsnittsbrytning (ny sida)", Insert, "", |e| e.word, |a, c| a.section_break(c)).scope(Scope::Word),

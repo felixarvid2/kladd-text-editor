@@ -53,6 +53,7 @@ modules:
       - install -Dm644 packaging/flatpak/se.kladd.Kladd.metainfo.xml /app/share/metainfo/se.kladd.Kladd.metainfo.xml
       - install -Dm644 assets/fonts/OFL.txt /app/share/doc/kladd/FONT-LICENSE
       - install -Dm644 assets/fonts/Carlito-OFL.txt /app/share/doc/kladd/CARLITO-FONT-LICENSE
+      - install -Dm644 assets/fonts/STIXTwo-OFL.txt /app/share/doc/kladd/STIXTWO-FONT-LICENSE
       - install -Dm644 LICENSE /app/share/licenses/se.kladd.Kladd/LICENSE
     sources:
       # Byt mot { type: git, url: ..., tag: v<version>, commit: ... } vid inlämning.
