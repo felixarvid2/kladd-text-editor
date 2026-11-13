@@ -723,7 +723,8 @@ mod tests {
 
         // Ett arkiv utan incheckningar: allt är ospårat.
         let snap = snapshot(&root).unwrap();
-        assert_eq!(snap.root, root);
+        // Git skriver "C:/…" på Windows; jämför kanoniskt.
+        assert_eq!(snap.root.canonicalize().unwrap(), root.canonicalize().unwrap());
         assert_eq!(snap.prefix, "");
         assert_eq!(snap.status.branch.as_deref(), Some("main"));
         assert!(snap.status.files.iter().all(|f| f.work == Some(Change::Untracked) && !f.staged()));
@@ -833,7 +834,7 @@ mod tests {
         std::fs::write(root.join("sub").join("x.txt"), "x").unwrap();
         let s = snapshot(&root.join("sub")).unwrap();
         assert_eq!(s.prefix, "sub/");
-        assert_eq!(s.root, root);
+        assert_eq!(s.root.canonicalize().unwrap(), root.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

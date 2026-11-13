@@ -131,6 +131,8 @@ impl Ui {
 
     /// Klickar på elementet med exakt den här etiketten (knappars verktygstips är deras etikett).
     pub fn click(&mut self, label: &str) {
+        // Etiketter med kortkommandon skrivs med ⌘ på Mac, precis som i appen.
+        let label = &*crate::keys::shortcut(label);
         // Långa menyer rullar: se till att knappen är synlig innan det klickas.
         self.h.get_by_label(label).scroll_to_me();
         self.settle();
@@ -154,7 +156,7 @@ impl Ui {
 
     /// Finns ett element med exakt den här etiketten eller texten?
     pub fn has(&self, label: &str) -> bool {
-        self.h.query_by_label(label).is_some()
+        self.h.query_by_label(&crate::keys::shortcut(label)).is_some()
     }
 
     /// Finns ett element vars etikett eller text innehåller `part`?
@@ -212,6 +214,7 @@ impl Ui {
 
     /// Klickar på det sista elementet med etiketten (t.ex. dialogknappen när en knapp med samma namn finns bakom).
     pub fn click_last(&mut self, label: &str) {
+        let label = &*crate::keys::shortcut(label);
         self.h.get_all_by_label(label).last().unwrap_or_else(|| panic!("hittar inte '{label}'")).click();
         self.settle();
     }
