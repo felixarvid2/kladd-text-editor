@@ -26,6 +26,10 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Säkerhetskopia och återställning** – osparade flikar sparas undan var 30:e sekund; efter en krasch erbjuder Kladd att återställa dem vid nästa start. Kan stängas av i *Inställningar → Allmänt*.
 - **Spara automatiskt** – slå på i *Inställningar → Allmänt*: ändrade filer sparas två sekunder efter att du slutat skriva och när fönstret tappar fokus. Rör aldrig namnlösa flikar, PDF:er eller filer där sparning skulle tappa innehåll, och skriver inte över en fil som ändrats på disk.
 - **Versionshistorik** – varje sparning lagrar en version (gallras automatiskt). *Arkiv → Versionshistorik…* jämför med aktuell text och kan återställa en version eller öppna den i en ny flik.
+- **Mallar** – *Ny från mall…* (`Ctrl+Shift+N`) visar ett galleri med brev, rapport, mötesprotokoll, dagordning, CV, faktura, uppsats, anteckningar, README och tomma sidor, på svenska eller engelska. `{{platshållare}}` som namn och datum fylls i i ett formulär. *Spara som mall…* gör det aktuella dokumentet till en egen mall (under *Mina mallar*, i datakatalogens `mallar/`), och en .docx eller .odt kan importeras som mall. De inbyggda ligger som filer i `assets/templates/`.
+- **Säkerhetskopia och återställning** – osparade flikar sparas undan var 30:e sekund; efter en krasch erbjuder Kladd att återställa dem vid nästa start. Kan stängas av i huvudmenyn.
+- **Spara automatiskt** – slå på i huvudmenyn: ändrade filer sparas två sekunder efter att du slutat skriva och när fönstret tappar fokus. Rör aldrig namnlösa flikar, PDF:er eller filer där sparning skulle tappa innehåll, och skriver inte över en fil som ändrats på disk.
+- **Versionshistorik** – varje sparning lagrar en version (gallras automatiskt). *Versionshistorik…* i huvudmenyn jämför med aktuell text och kan återställa en version eller öppna den i en ny flik.
 - **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), många kodformat och PDF. PDF:er visas i en PDF-visare, se [PDF](#pdf).
 - **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
@@ -276,6 +280,7 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | Kommando | Funktion |
 |---|---|
 | `Ctrl+T` / `Ctrl+N` | Ny flik |
+| `Ctrl+Shift+N` | Ny från mall… |
 | `Ctrl+O` | Öppna fil |
 | `Ctrl+S` | Spara |
 | `Ctrl+Shift+S` | Spara som |

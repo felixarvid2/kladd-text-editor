@@ -160,6 +160,8 @@ enum DialogResult {
     PdfExtract { doc_id: u64, path: Option<PathBuf>, pages: Vec<usize> },
     /// "Infoga PDF" / "Slå ihop med PDF": vald fil och plats.
     PdfInsert { doc_id: u64, path: Option<PathBuf>, at: usize },
+    /// "Importera .docx/.odt…" i mallgalleriet.
+    TemplateImport(Option<PathBuf>),
 }
 
 struct PendingPassword {
@@ -244,6 +246,7 @@ pub struct KladdApp {
     pending_docx: Option<PendingDocx>,
     autosave: crate::autosave::Autosave,
     history: Option<crate::history_ui::Dialog>,
+    templates: Option<crate::templates_ui::Dialog>,
     pending_password: Option<PendingPassword>,
     allow_exit: bool,
     toast: Option<Toast>,
@@ -378,6 +381,7 @@ impl KladdApp {
             pending_docx: None,
             autosave: Default::default(),
             history: None,
+            templates: None,
             pending_password: None,
             allow_exit: false,
             toast: None,
@@ -445,6 +449,103 @@ impl KladdApp {
         self.docs.push(doc);
         self.active = self.docs.len() - 1;
         self.focus_editor = true;
+    }
+
+    /// Öppnar en ny namnlös flik med mallens text: dokumentläget för Word-lika mallar, annars textvyn.
+    fn new_from_template(&mut self, text: String, doc: bool) {
+        self.new_tab();
+        let d = &mut self.docs[self.active];
+        d.text = text;
+        d.docx = doc;
+        d.word_view = doc;
+        d.on_edited();
+    }
+
+    fn open_templates(&mut self) {
+        self.templates = Some(crate::templates_ui::Dialog::gallery(&self.settings.author_name));
+    }
+
+    fn open_save_template(&mut self) {
+        let Some(d) = self.docs.get(self.active) else { return };
+        let stem = d.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = if stem.is_empty() && d.path.is_none() { String::new() } else { stem };
+        let doc = d.docx || d.word_view;
+        self.templates = Some(crate::templates_ui::Dialog::save_as(d.text.clone(), doc, &name, &self.settings.author_name));
+    }
+
+    fn templates_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        use crate::templates_ui::Action;
+        let Some(mut dlg) = self.templates.take() else { return };
+        match dlg.show(ctx, p) {
+            Action::None => self.templates = Some(dlg),
+            Action::Close => {}
+            Action::Create { text, doc } => self.new_from_template(text, doc),
+            Action::Done { message, error, close } => {
+                self.notify(ctx, message, error);
+                if !close {
+                    self.templates = Some(dlg);
+                }
+            }
+            Action::Import => {
+                self.templates = Some(dlg);
+                self.request_template_import(ctx);
+            }
+        }
+    }
+
+    fn request_template_import(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() {
+            self.notify(ctx, t("Stäng den öppna fildialogen först."), true);
+            return;
+        }
+        let (tx, rx) = channel();
+        self.dialog = Some(rx);
+        let ctx = ctx.clone();
+        let dir = self.start_dir();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title(t("Importera som mall"))
+                .add_filter(t("Word- och OpenDocument-filer"), &["docx", "dotx", "odt", "ott"]);
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let _ = tx.send(DialogResult::TemplateImport(dlg.pick_file()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Läser en vald .docx/.odt som egen mall och markerar den i galleriet.
+    fn import_template(&mut self, ctx: &egui::Context, path: &Path) {
+        let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = crate::templates::name_from_path(path);
+        let dir = crate::templates::user_dir();
+        let result = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| crate::templates::import_bytes(&b, &ext))
+            .and_then(|(text, images)| {
+                // Finns namnet redan får importen ett löpnummer så att ingen mall skrivs över.
+                let mut unique = name.clone();
+                let mut n = 1;
+                while crate::templates::sanitize_name(&unique).is_some_and(|id| dir.join(format!("{id}.md")).exists()) {
+                    n += 1;
+                    unique = format!("{name} {n}");
+                }
+                crate::templates::save_user(&dir, &unique, &text, true, false).map(|id| (id, images))
+            });
+        match result {
+            Ok((id, images)) => {
+                if let Some(dlg) = self.templates.as_mut() {
+                    dlg.select_user(&id);
+                }
+                let msg = if images > 0 {
+                    tf!("Importerade {name} som mall (bilderna följde inte med)", name = id)
+                } else {
+                    tf!("Importerade {name} som mall", name = id)
+                };
+                self.notify(ctx, msg, false);
+            }
+            Err(e) => self.notify(ctx, e, true),
+        }
     }
 
     fn remember(&mut self, path: &Path) {
@@ -569,6 +670,9 @@ impl KladdApp {
             format!("{}.{ext}", stem.unwrap_or_else(|| doc.title()))
         } else if doc.path.is_some() {
             doc.title()
+        } else if doc.docx {
+            // Ett namnlöst dokument i dokumentläget (t.ex. från en mall) sparas som Word.
+            format!("{}.docx", doc.title())
         } else {
             format!("{}.txt", doc.title())
         };
@@ -1087,6 +1191,11 @@ impl KladdApp {
                     self.open_path(ctx, &f);
                 }
             }
+            DialogResult::TemplateImport(path) => {
+                if let Some(path) = path {
+                    self.import_template(ctx, &path);
+                }
+            }
             DialogResult::InsertImage { doc_id, path } => {
                 if let (Some(path), Some(idx)) = (path, self.index_of(doc_id)) {
                     self.active = idx;
@@ -1163,7 +1272,7 @@ impl KladdApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.history.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.wv.hf_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
+        if self.pending_close.is_some() || self.history.is_some() || self.templates.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.wv.hf_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
             return;
         }
         // COMMAND = ⌘ på Mac, Ctrl annars.
@@ -1191,7 +1300,10 @@ impl KladdApp {
         // Före Ctrl+F: Skift-varianterna måste tas först.
         self.workspace_shortcuts(ctx);
 
-        if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
+        // Ctrl+Skift+N före Ctrl+N: `consume_shortcut` bryr sig inte om extra Skift.
+        if hit(ctrl_shift, Key::N) {
+            self.open_templates();
+        } else if hit(ctrl, Key::T) || hit(ctrl, Key::N) {
             self.new_tab();
         }
         // Ctrl+Skift+\ före Ctrl+\: `consume_shortcut` bryr sig inte om extra Skift.
@@ -3405,6 +3517,7 @@ impl eframe::App for KladdApp {
         self.update_outs(&ctx);
         self.docx_dialog(&ctx, &p);
         self.history_dialog(&ctx, &p);
+        self.templates_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);

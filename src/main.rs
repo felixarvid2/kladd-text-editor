@@ -40,6 +40,8 @@ mod platform;
 mod single;
 mod spell;
 mod style;
+mod templates;
+mod templates_ui;
 mod theme;
 mod update;
 mod word;

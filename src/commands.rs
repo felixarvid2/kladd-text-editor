@@ -322,9 +322,11 @@ use Category::{Edit, File, Format, Help, Insert, Tools, View};
 pub static ALL: &[Command] = &[
     // ---------------------------------------------------------------- Arkiv
     Command::new("file.new", "Ny flik", File, "Ctrl+T", always, |a, _| a.new_tab()),
+    Command::new("file.new_template", "Ny från mall…", File, "Ctrl+Shift+N", always, |a, _| a.open_templates()),
     Command::new("file.open", "Öppna…", File, "Ctrl+O", always, |a, c| a.request_open(c)),
     Command::new("file.save", "Spara", File, "Ctrl+S", |e| e.has_doc, |a, c| a.cmd_save(c)),
     Command::new("file.save_as", "Spara som…", File, "Ctrl+Shift+S", |e| e.has_doc && !e.pdf, |a, c| a.request_save_as(c, a.active, false, false)),
+    Command::new("file.save_template", "Spara som mall…", File, "", |e| e.has_doc && !e.pdf, |a, _| a.open_save_template()),
     Command::new("file.save_copy", "Spara kopia…", File, "Ctrl+Shift+S", |e| e.pdf, |a, c| a.request_save_copy(c, a.active)),
     Command::new("file.export_html", "Exportera som webbsida…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "html")),
     Command::new("file.export_epub", "Exportera som e-bok…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "epub")),

@@ -1,0 +1,52 @@
+//! Engelska texter för området templates (svensk källtext, engelsk text).
+//! Mallarna själva (innehåll och namn) ligger som filer i `assets/templates/{sv,en}/`.
+
+pub const EN: &[(&str, &str)] = &[
+    // Kategorier (templates.rs)
+    ("Brev", "Letters"),
+    ("Rapport", "Reports"),
+    ("Mötesprotokoll", "Meeting minutes"),
+    ("Dagordning", "Agendas"),
+    ("Faktura", "Invoices"),
+    ("Uppsats och PM", "Essays and memos"),
+    ("Anteckningar", "Notes"),
+    ("Tom", "Blank"),
+    ("Mina mallar", "My templates"),
+    // Egna mallar och import (templates.rs)
+    ("Ge mallen ett namn.", "Give the template a name."),
+    ("Det finns redan en mall som heter {name}.", "A template named {name} already exists."),
+    ("Mallen kunde inte sparas: {e}", "The template could not be saved: {e}"),
+    ("Mallen kunde inte läsas: {e}", "The template could not be read: {e}"),
+    ("Mallen kunde inte tas bort: {e}", "The template could not be deleted: {e}"),
+    ("Bara .docx och .odt kan importeras som mall.", "Only .docx and .odt files can be imported as a template."),
+    // Dialogen (templates_ui.rs)
+    ("Ny från mall", "New from template"),
+    ("Inga egna mallar än. Använd Arkiv, Spara som mall… eller importera en fil.", "No templates of your own yet. Use Save as template… or import a file."),
+    ("Skapa dokument", "Create document"),
+    ("Importera .docx/.odt…", "Import .docx/.odt…"),
+    ("Läs en Word- eller OpenDocument-fil som egen mall", "Read a Word or OpenDocument file as a template of your own"),
+    ("Byt namn…", "Rename…"),
+    ("Ta bort på riktigt", "Delete for good"),
+    ("Mallen togs bort", "Template deleted"),
+    ("Fyll i {name}", "Fill in {name}"),
+    ("Tomma fält blir gulmarkerade platshållare i dokumentet som du fyller i senare.", "Empty fields become yellow placeholders in the document that you can fill in later."),
+    ("Tomma fält lämnas som platshållare i texten.", "Empty fields are left as placeholders in the text."),
+    ("Tillbaka", "Back"),
+    ("Spara som mall", "Save as template"),
+    ("Byt namn på mallen", "Rename template"),
+    ("Dokumentets text sparas som en egen mall. Du hittar den under Mina mallar.", "The text of the document is saved as a template of your own. You will find it under My templates."),
+    ("Mallens namn", "Template name"),
+    ("Mallen fick nytt namn", "Template renamed"),
+    ("Sparade mallen {name}", "Saved the template {name}"),
+    ("Ersätta mallen?", "Replace the template?"),
+    ("Det finns redan en mall som heter {name}. Vill du ersätta den?", "A template named {name} already exists. Do you want to replace it?"),
+    ("Ändra namn", "Change name"),
+    ("Dokument", "Document"),
+    // Menyn och importen (app.rs)
+    ("Ny från mall…", "New from Template…"),
+    ("Spara som mall…", "Save as Template…"),
+    ("Importerade {name} som mall", "Imported {name} as a template"),
+    ("Importerade {name} som mall (bilderna följde inte med)", "Imported {name} as a template (images were left out)"),
+    ("Importera som mall", "Import as template"),
+    ("Word- och OpenDocument-filer", "Word and OpenDocument files"),
+];
