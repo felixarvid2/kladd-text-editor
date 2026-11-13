@@ -18,6 +18,7 @@ mod recovery;
 mod highlight;
 mod icons;
 mod keys;
+mod macopen;
 mod paste;
 mod platform;
 mod single;

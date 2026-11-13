@@ -301,12 +301,13 @@ impl KladdApp {
             nav: Default::default(),
             pdf_fullscreen: false,
         };
-        if single_instance {
-            let (tx, rx) = channel();
-            if single::listen(tx, ctx.clone()) {
-                app.incoming = Some(rx);
-                app.owns_socket = true;
-            }
+        let (tx, rx) = channel();
+        app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
+        // macOS levererar filer från Finder som Apple-händelser till den här processen.
+        #[cfg(target_os = "macos")]
+        crate::macopen::install(tx, ctx.clone());
+        if app.owns_socket || cfg!(target_os = "macos") {
+            app.incoming = Some(rx);
         }
         for f in files {
             app.open_path(ctx, &f);

@@ -66,7 +66,7 @@ chmod +x Kladd-*-x86_64.AppImage
 xattr -dr com.apple.quarantine /Applications/Kladd.app
 ```
 
-På macOS går det ännu inte att öppna filer från Finder med *Öppna med* eller genom att dra dem till ikonen i Dock. Öppna dem i stället med *Öppna…* i menyn (`⌘O`) eller genom att dra dem till Kladd-fönstret.
+På macOS öppnas filer från Finder i Kladd: *Öppna med*, dubbelklick (efter *Hämta info* → *Öppna med* → *Ändra alla…*) och att dra filer till ikonen i Dock. De läggs som nya flikar i det öppna fönstret. Kladd är bara ett alternativ i *Öppna med* och tar inte över någon filtyp av sig själv.
 
 **Signering:** just nu är varken Windows- eller macOS-paketen signerade (därav varningarna ovan) och AppImagen är osignerad. Release-workflowen kan signera och notarisera så fort certifikat finns, se [docs/dev/signering.md](docs/dev/signering.md).
 
