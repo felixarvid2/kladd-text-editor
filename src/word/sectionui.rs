@@ -5,6 +5,7 @@ use egui::{Align, Color32, FontId, Frame, Id, Layout, Margin, RichText, Stroke, 
 
 use super::sections::{self, Section};
 use crate::app::{KladdApp, quiet_button};
+use crate::i18n::t;
 use crate::theme::{self, Palette};
 
 /// 1 mm i pt.
@@ -73,18 +74,18 @@ impl KladdApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                ui.label(RichText::new("Spalter").font(FontId::new(17.0, theme::semibold())).color(p.text));
-                ui.label(RichText::new("Gäller avsnittet som markören står i").color(p.muted).size(12.5));
+                ui.label(RichText::new(t("Spalter")).font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.label(RichText::new(t("Gäller avsnittet som markören står i")).color(p.muted).size(12.5));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    for (n, name) in [(1, "En"), (2, "Två"), (3, "Tre")] {
+                    for (n, name) in [(1, t("En")), (2, t("Två")), (3, t("Tre"))] {
                         ui.selectable_value(&mut d.cols, n, name);
                     }
                 });
                 ui.add_space(8.0);
                 ui.add_enabled_ui(d.cols > 1, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Mellanrum").color(p.muted));
+                        ui.label(RichText::new(t("Mellanrum")).color(p.muted));
                         ui.add(egui::DragValue::new(&mut d.gap_mm).range(2.0..=60.0).speed(0.5).suffix(" mm").max_decimals(1));
                     });
                 });
@@ -98,7 +99,7 @@ impl KladdApp {
                     if ui.add(b).clicked() {
                         ok = Some(true);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         ok = Some(false);
                     }
                 });

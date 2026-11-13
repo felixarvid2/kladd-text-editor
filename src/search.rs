@@ -10,6 +10,8 @@ use std::ops::Range;
 use regex::{Regex, RegexBuilder};
 
 use crate::highlight::find_all;
+use crate::i18n::t;
+use crate::tf;
 use crate::word::markup::{self, Analysis, Block, Inline, SpanProp};
 
 /// Formatfilter för dokumentläget: en träff räknas bara om varje synligt tecken i den har
@@ -36,27 +38,27 @@ impl FormatFilter {
     pub fn label(&self) -> String {
         let mut v = Vec::new();
         if self.bold {
-            v.push("Fetstil".to_owned());
+            v.push(t("Fetstil").to_owned());
         }
         if self.italic {
-            v.push("Kursiv".to_owned());
+            v.push(t("Kursiv").to_owned());
         }
         if self.underline {
-            v.push("Understruken".to_owned());
+            v.push(t("Understruken").to_owned());
         }
         if self.strike {
-            v.push("Genomstruken".to_owned());
+            v.push(t("Genomstruken").to_owned());
         }
         if self.highlight {
-            v.push("Markerad".to_owned());
+            v.push(t("Markerad").to_owned());
         }
         if self.color.is_some() {
-            v.push("Textfärg".to_owned());
+            v.push(t("Textfärg").to_owned());
         }
         if let Some(n) = self.heading {
-            v.push(format!("Rubrik {n}"));
+            v.push(tf!("Rubrik {n}", n = n));
         }
-        if v.is_empty() { "Format".to_owned() } else { v.join(", ") }
+        if v.is_empty() { t("Format").to_owned() } else { v.join(", ") }
     }
 
     fn accepts(&self, s: &Sty) -> bool {

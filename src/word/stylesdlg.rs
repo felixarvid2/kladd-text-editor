@@ -11,7 +11,9 @@ use super::layout::{LINE_SINGLE, px};
 use super::markup::{self, Align as HAlign, DocDefaults};
 use super::pages::set_defaults_line;
 use crate::app::{KladdApp, quiet_button};
+use crate::i18n::t;
 use crate::style::{STYLE_IDS, StyleId, StyleOverride, StyleSet};
+use crate::tf;
 use crate::theme::Palette;
 
 /// Dialogens tillstånd medan den är öppen.
@@ -36,7 +38,7 @@ fn toggled<T: Clone>(ui: &mut Ui, slot: &mut Option<T>, init: T, add: impl FnOnc
         match slot {
             Some(v) => add(ui, v),
             None => {
-                ui.label(RichText::new("Standard").weak());
+                ui.label(RichText::new(t("Standard")).weak());
             }
         }
     });
@@ -123,7 +125,7 @@ impl KladdApp {
         let mut open = true;
         let mut update_from_caret = false;
         let mut done = false;
-        egui::Window::new("Ändra formatmall")
+        egui::Window::new(t("Ändra formatmall"))
             .id(Id::unique("kladd-styles-dialog"))
             .open(&mut open)
             .collapsible(false)
@@ -157,7 +159,7 @@ impl KladdApp {
                         let heading = matches!(sel, StyleId::Heading(_));
                         let mut o = dlg.set.get(sel).clone();
                         egui::Grid::new("kladd-styles-grid").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                            ui.label(RichText::new("Typsnitt").color(p.muted));
+                            ui.label(RichText::new(t("Typsnitt")).color(p.muted));
                             toggled(ui, &mut o.font_family, doc_font.clone(), |ui, v| {
                                 egui::ComboBox::from_id_salt("kladd-styles-font").selected_text(v.clone()).width(170.0).show_ui(
                                     ui,
@@ -169,55 +171,55 @@ impl KladdApp {
                                 );
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Storlek").color(p.muted));
+                            ui.label(RichText::new(t("Storlek")).color(p.muted));
                             toggled(ui, &mut o.size, sel.default_size(body_size), |ui, v| {
                                 ui.add(egui::DragValue::new(v).range(4.0..=96.0).speed(0.25).suffix(" pt").max_decimals(1));
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Fet").color(p.muted));
+                            ui.label(RichText::new(t("Fet")).color(p.muted));
                             toggled(ui, &mut o.bold, heading, |ui, v| {
                                 ui.checkbox(v, "");
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Kursiv").color(p.muted));
+                            ui.label(RichText::new(t("Kursiv")).color(p.muted));
                             toggled(ui, &mut o.italic, sel == StyleId::Quote, |ui, v| {
                                 ui.checkbox(v, "");
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Färg").color(p.muted));
+                            ui.label(RichText::new(t("Färg")).color(p.muted));
                             toggled(ui, &mut o.color, [0, 0, 0], |ui, v| {
                                 ui.color_edit_button_srgb(v);
                                 ui.label(crate::style::hex(*v));
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Justering").color(p.muted));
+                            ui.label(RichText::new(t("Justering")).color(p.muted));
                             toggled(ui, &mut o.align, HAlign::Left, |ui, v| {
                                 for (a, name) in [
-                                    (HAlign::Left, "Vänster"),
-                                    (HAlign::Center, "Mitten"),
-                                    (HAlign::Right, "Höger"),
-                                    (HAlign::Justify, "Block"),
+                                    (HAlign::Left, t("Vänster")),
+                                    (HAlign::Center, t("Mitten")),
+                                    (HAlign::Right, t("Höger")),
+                                    (HAlign::Justify, t("Block")),
                                 ] {
                                     ui.selectable_value(v, a, name);
                                 }
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Luft före").color(p.muted));
+                            ui.label(RichText::new(t("Luft före")).color(p.muted));
                             toggled(ui, &mut o.space_before, 0.0, |ui, v| {
                                 ui.add(egui::DragValue::new(v).range(0.0..=200.0).speed(0.5).suffix(" pt").max_decimals(1));
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Luft efter").color(p.muted));
+                            ui.label(RichText::new(t("Luft efter")).color(p.muted));
                             toggled(ui, &mut o.space_after, 0.0, |ui, v| {
                                 ui.add(egui::DragValue::new(v).range(0.0..=200.0).speed(0.5).suffix(" pt").max_decimals(1));
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Radavstånd").color(p.muted));
+                            ui.label(RichText::new(t("Radavstånd")).color(p.muted));
                             toggled(ui, &mut o.line_spacing, 1.15, |ui, v| {
                                 ui.add(egui::DragValue::new(v).range(0.5..=5.0).speed(0.01).max_decimals(2).suffix(" ×"));
                             });
                             ui.end_row();
-                            ui.label(RichText::new("Indrag, första raden").color(p.muted));
+                            ui.label(RichText::new(t("Indrag, första raden")).color(p.muted));
                             toggled(ui, &mut o.first_indent, 18.0, |ui, v| {
                                 ui.add(egui::DragValue::new(v).range(0.0..=200.0).speed(0.5).suffix(" pt").max_decimals(1));
                             });
@@ -240,9 +242,9 @@ impl KladdApp {
                     (None, StyleId::Body) => p.page_text,
                 };
                 let sample = if heading {
-                    format!("{} – exempeltext", sel.label())
+                    tf!("{style} – exempeltext", style = sel.label())
                 } else {
-                    "Så här ser stycket ut. Ändringarna gäller hela dokumentet direkt.".to_owned()
+                    t("Så här ser stycket ut. Ändringarna gäller hela dokumentet direkt.").to_owned()
                 };
                 Frame::NONE.fill(p.page).stroke(Stroke::new(1.0, p.line)).inner_margin(Margin::same(12)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -271,14 +273,14 @@ impl KladdApp {
                 });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.add(quiet_button("Uppdatera från markering", p)).on_hover_text("Ta utseendet på texten vid markören").clicked() {
+                    if ui.add(quiet_button(t("Uppdatera från markering"), p)).on_hover_text(t("Ta utseendet på texten vid markören")).clicked() {
                         update_from_caret = true;
                     }
-                    if ui.add(quiet_button("Återställ", p)).on_hover_text("Ta bort ändringarna i den här formatmallen").clicked() {
+                    if ui.add(quiet_button(t("Återställ"), p)).on_hover_text(t("Ta bort ändringarna i den här formatmallen")).clicked() {
                         dlg.set.set(dlg.sel, StyleOverride::default());
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(quiet_button("Klar", p)).clicked() {
+                        if ui.add(quiet_button(t("Klar"), p)).clicked() {
                             done = true;
                         }
                     });

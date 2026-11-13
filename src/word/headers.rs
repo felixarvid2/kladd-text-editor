@@ -13,7 +13,9 @@ use egui::{
 use super::markup::{self, DocDefaults};
 use super::pages::{Geom, set_defaults_line};
 use crate::app::{KladdApp, quiet_button};
+use crate::i18n::t;
 use crate::style::{self, Fields};
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Ritar sidhuvud och sidfot på ett ark och ger `Some(true)` vid dubbelklick på sidfoten och
@@ -43,7 +45,7 @@ pub fn header_footer(
         if resp.double_clicked() {
             open = Some(footer);
         }
-        resp.on_hover_text("Dubbelklicka för att ändra sidhuvud och sidfot");
+        resp.on_hover_text(t("Dubbelklicka för att ändra sidhuvud och sidfot"));
         let Some(t) = text else { continue };
         let y = zone.center().y;
         for (i, part) in style::parts_of(t, align).iter().enumerate() {
@@ -174,15 +176,15 @@ impl KladdApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(480.0);
-                ui.label(RichText::new("Sidhuvud och sidfot").font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.label(RichText::new(t("Sidhuvud och sidfot")).font(FontId::new(17.0, theme::semibold())).color(p.text));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut d.footer, false, "Sidhuvud");
-                    ui.selectable_value(&mut d.footer, true, "Sidfot");
+                    ui.selectable_value(&mut d.footer, false, t("Sidhuvud"));
+                    ui.selectable_value(&mut d.footer, true, t("Sidfot"));
                     if d.different_first {
                         ui.add_space(14.0);
-                        ui.selectable_value(&mut d.first, false, "Övriga sidor");
-                        ui.selectable_value(&mut d.first, true, "Första sidan");
+                        ui.selectable_value(&mut d.first, false, t("Övriga sidor"));
+                        ui.selectable_value(&mut d.first, true, t("Första sidan"));
                     }
                 });
                 ui.add_space(10.0);
@@ -190,7 +192,7 @@ impl KladdApp {
                 let want_focus = std::mem::take(&mut d.want_focus);
                 let mut new_focus = None;
                 egui::Grid::new("kladd-hf-grid").num_columns(2).spacing(vec2(14.0, 8.0)).show(ui, |ui| {
-                    for (i, label) in ["Vänster", "Mitten", "Höger"].into_iter().enumerate() {
+                    for (i, label) in [t("Vänster"), t("Mitten"), t("Höger")].into_iter().enumerate() {
                         ui.label(RichText::new(label).color(p.muted));
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut d.row_mut()[i]).desired_width(340.0).margin(Margin::symmetric(8, 5)),
@@ -208,10 +210,10 @@ impl KladdApp {
                     d.focus = i;
                 }
                 ui.add_space(8.0);
-                ui.label(RichText::new("Infoga i det markerade fältet").color(p.muted).size(12.5));
+                ui.label(RichText::new(t("Infoga i det markerade fältet")).color(p.muted).size(12.5));
                 ui.horizontal_wrapped(|ui| {
                     for (code, label) in style::FIELD_NAMES {
-                        if ui.add(quiet_button(label, p)).clicked() {
+                        if ui.add(quiet_button(t(label), p)).clicked() {
                             let f = d.focus;
                             d.row_mut()[f].push_str(code);
                             d.want_focus = true;
@@ -219,25 +221,25 @@ impl KladdApp {
                     }
                 });
                 ui.add_space(8.0);
-                if ui.checkbox(&mut d.different_first, "Annorlunda första sida").changed() && !d.different_first {
+                if ui.checkbox(&mut d.different_first, t("Annorlunda första sida")).changed() && !d.different_first {
                     d.first = false;
                 }
                 // Förhandsvisning av raden som den ser ut på sida 1 av 3.
                 let f = Fields::new(1, 3, &d.name);
                 let [l, c, r] = d.row_mut().clone().map(|t| style::fill_fields(&t, &f));
                 ui.add_space(6.0);
-                ui.label(RichText::new(format!("Förhandsvisning:  {l}   |   {c}   |   {r}")).color(p.muted).size(12.5));
+                ui.label(RichText::new(tf!("Förhandsvisning:  {l}   |   {c}   |   {r}", l = l, c = c, r = r)).color(p.muted).size(12.5));
                 ui.add_space(20.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let ok = egui::Button::new(RichText::new("OK").font(FontId::new(13.5, theme::medium())).color(p.on_accent))
+                    let ok = egui::Button::new(RichText::new(t("OK")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
                         .fill(p.accent)
                         .stroke(Stroke::NONE)
                         .min_size(vec2(84.0, 32.0));
                     if ui.add(ok).clicked() {
                         act = Some(Act::Ok);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         act = Some(Act::Cancel);
                     }
                 });

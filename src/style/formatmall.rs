@@ -13,6 +13,8 @@
 //! raden). Det som inte anges ärvs från Kladds standardutseende, så ett dokument utan
 //! formatmallar ser ut som förut.
 use super::{Align, hex, parse_color, parse_length, quote, unquote};
+use crate::i18n::t;
+use crate::tf;
 use crate::word::markup::Block;
 
 /// En formatmall som går att ändra.
@@ -57,9 +59,9 @@ impl StyleId {
     /// Namnet i gränssnittet.
     pub fn label(self) -> String {
         match self {
-            StyleId::Body => "Brödtext".into(),
-            StyleId::Heading(n) => format!("Rubrik {n}"),
-            StyleId::Quote => "Citat".into(),
+            StyleId::Body => t("Brödtext").into(),
+            StyleId::Heading(n) => tf!("Rubrik {n}", n = n),
+            StyleId::Quote => t("Citat").into(),
         }
     }
 

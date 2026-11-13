@@ -17,6 +17,8 @@ use super::layout::px;
 use super::markup::{self, Align as HAlign, DocDefaults};
 use super::secpages::PageBox;
 use crate::app::{KladdApp, quiet_button};
+use crate::i18n::t;
+use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Luft (px, ozoomad) mellan två ark på skrivbordet.
@@ -284,7 +286,7 @@ impl PageDialog {
     fn paper_label(&self) -> String {
         if self.paper == CUSTOM {
             let (w, h) = self.custom;
-            format!("Eget ({:.0} × {:.0} mm)", w / MM, h / MM)
+            tf!("Eget ({w} × {h} mm)", w = format!("{:.0}", w / MM), h = format!("{:.0}", h / MM))
         } else {
             PAPERS[self.paper].0.to_owned()
         }
@@ -294,7 +296,7 @@ impl PageDialog {
 fn align_row(ui: &mut Ui, id: &str, value: &mut HAlign) {
     ui.horizontal(|ui| {
         let _ = id;
-        for (a, name) in [(HAlign::Left, "Vänster"), (HAlign::Center, "Centrerad"), (HAlign::Right, "Höger")] {
+        for (a, name) in [(HAlign::Left, t("Vänster")), (HAlign::Center, t("Centrerad")), (HAlign::Right, t("Höger"))] {
             ui.selectable_value(value, a, name);
         }
     });
@@ -328,10 +330,10 @@ impl KladdApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(460.0);
-                ui.label(RichText::new("Sidinställningar").font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.label(RichText::new(t("Sidinställningar")).font(FontId::new(17.0, theme::semibold())).color(p.text));
                 ui.add_space(14.0);
                 egui::Grid::new("kladd-page-grid").num_columns(2).spacing(vec2(14.0, 10.0)).show(ui, |ui| {
-                    ui.label(RichText::new("Pappersstorlek").color(p.muted));
+                    ui.label(RichText::new(t("Pappersstorlek")).color(p.muted));
                     egui::ComboBox::from_id_salt("kladd-page-paper").selected_text(d.paper_label()).width(220.0).show_ui(
                         ui,
                         |ui| {
@@ -346,17 +348,17 @@ impl KladdApp {
                     );
                     ui.end_row();
 
-                    ui.label(RichText::new("Orientering").color(p.muted));
+                    ui.label(RichText::new(t("Orientering")).color(p.muted));
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut d.landscape, false, "Stående");
-                        ui.selectable_value(&mut d.landscape, true, "Liggande");
+                        ui.selectable_value(&mut d.landscape, false, t("Stående"));
+                        ui.selectable_value(&mut d.landscape, true, t("Liggande"));
                     });
                     ui.end_row();
 
-                    ui.label(RichText::new("Marginaler").color(p.muted));
+                    ui.label(RichText::new(t("Marginaler")).color(p.muted));
                     ui.horizontal(|ui| {
                         for (label, m) in [("Normala (25,4 mm)", 25.4), ("Smala (12,7 mm)", 12.7), ("Breda (50,8 mm)", 50.8)] {
-                            if ui.add(quiet_button(label, p)).clicked() {
+                            if ui.add(quiet_button(t(label), p)).clicked() {
                                 d.margins = [m; 4];
                             }
                         }
@@ -367,7 +369,7 @@ impl KladdApp {
                     ui.horizontal(|ui| {
                         for (label, i) in [("Överkant", 0), ("Höger", 1), ("Nederkant", 2), ("Vänster", 3)] {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(label).color(p.muted).size(12.0));
+                                ui.label(RichText::new(t(label)).color(p.muted).size(12.0));
                                 ui.add(
                                     egui::DragValue::new(&mut d.margins[i]).range(0.0..=120.0).speed(0.5).suffix(" mm").max_decimals(1),
                                 );
@@ -376,7 +378,7 @@ impl KladdApp {
                     });
                     ui.end_row();
 
-                    ui.label(RichText::new("Sidhuvud").color(p.muted));
+                    ui.label(RichText::new(t("Sidhuvud")).color(p.muted));
                     ui.add(
                         egui::TextEdit::singleline(&mut d.header).desired_width(300.0).margin(Margin::symmetric(8, 5)),
                     );
@@ -385,7 +387,7 @@ impl KladdApp {
                     align_row(ui, "kladd-page-halign", &mut d.header_align);
                     ui.end_row();
 
-                    ui.label(RichText::new("Sidfot").color(p.muted));
+                    ui.label(RichText::new(t("Sidfot")).color(p.muted));
                     ui.add(
                         egui::TextEdit::singleline(&mut d.footer).desired_width(300.0).margin(Margin::symmetric(8, 5)),
                     );
@@ -396,26 +398,26 @@ impl KladdApp {
                 });
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("Fält: {sida} {sidor} {datum} {titel} {fil}. Med | delas texten i vänster, mitten och höger. Dubbelklicka på sidhuvudet i dokumentet för fler val.")
+                    RichText::new(t("Fält: {sida} {sidor} {datum} {titel} {fil}. Med | delas texten i vänster, mitten och höger. Dubbelklicka på sidhuvudet i dokumentet för fler val."))
                         .color(p.muted)
                         .size(12.5),
                 );
                 ui.add_space(6.0);
-                if ui.add(quiet_button("Sidnummer i sidfoten", p)).clicked() {
+                if ui.add(quiet_button(t("Sidnummer i sidfoten"), p)).clicked() {
                     d.footer = "{sida}".to_owned();
                     d.footer_align = HAlign::Center;
                 }
                 ui.add_space(20.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let ok = egui::Button::new(RichText::new("OK").font(FontId::new(13.5, theme::medium())).color(p.on_accent))
+                    let ok = egui::Button::new(RichText::new(t("OK")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
                         .fill(p.accent)
                         .stroke(Stroke::NONE)
                         .min_size(vec2(84.0, 32.0));
                     if ui.add(ok).clicked() {
                         act = Some(Act::Ok);
                     }
-                    if ui.add(quiet_button("Avbryt", p).min_size(vec2(0.0, 32.0))).clicked() {
+                    if ui.add(quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
                         act = Some(Act::Cancel);
                     }
                 });

@@ -18,6 +18,7 @@ use egui::{Context, Event, Galley, Id, Key, Pos2, Response, Ui};
 use super::grid::{self, TableGeom};
 use super::markup::{self, Edit, TableInfo};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item};
+use crate::i18n::t;
 use crate::icons::{self, Icon};
 use crate::theme::Palette;
 
@@ -52,15 +53,15 @@ impl TableOp {
 
     pub fn label(self) -> &'static str {
         match self {
-            TableOp::RowAbove => "Rad ovanför",
-            TableOp::RowBelow => "Rad nedanför",
-            TableOp::ColLeft => "Kolumn till vänster",
-            TableOp::ColRight => "Kolumn till höger",
-            TableOp::DelRow => "Ta bort rad",
-            TableOp::DelCol => "Ta bort kolumn",
-            TableOp::DelTable => "Ta bort tabell",
-            TableOp::Merge => "Sammanfoga celler",
-            TableOp::Split => "Dela cell",
+            TableOp::RowAbove => t("Rad ovanför"),
+            TableOp::RowBelow => t("Rad nedanför"),
+            TableOp::ColLeft => t("Kolumn till vänster"),
+            TableOp::ColRight => t("Kolumn till höger"),
+            TableOp::DelRow => t("Ta bort rad"),
+            TableOp::DelCol => t("Ta bort kolumn"),
+            TableOp::DelTable => t("Ta bort tabell"),
+            TableOp::Merge => t("Sammanfoga celler"),
+            TableOp::Split => t("Dela cell"),
         }
     }
 
