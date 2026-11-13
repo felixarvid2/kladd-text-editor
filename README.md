@@ -35,6 +35,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
 - **Förlustfri Word-sparning** – Word-filer sparas med alla sina delar kvar, se [Word-dokument](#word-dokument).
 - **Syntaxfärgning** och radnummer.
+- **Språkservrar (LSP)** för kodfiler i textläget: felmarkeringar med krumelurer, ikon i marginalen och hovertext, panelen *Problem* (klicka för att hoppa dit), komplettering (efter `.`, `::` m.fl. eller `Ctrl+Space`; pilar, `Enter`/`Tab`), hover, gå till definition (`F12` eller `Ctrl+klick`), referenser (`Skift+F12`), byt namn (`F2`), formatera dokumentet (`Skift+Alt+F`) och signaturhjälp. Kladd startar rust-analyzer, pyright-langserver (eller pylsp), typescript-language-server, gopls och clangd när de finns på PATH, första gången en fil av språket öppnas, med projektets rot (arbetsmappen eller närmaste `Cargo.toml`, `pyproject.toml`, `package.json`, `go.mod`, `.git`). Statusraden visar serverns läge, t.ex. *rust-analyzer: indexerar…*. Egna kommandon och av/på ställs in under *Språkservrar…* i menyn.
 - **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`, med alternativ för versaler, hela ord och reguljära uttryck (`$1` och `${namn}` fungerar i ersättningen). I dokumentläget söker Kladd i den synliga texten, så "fet text" hittar `**fet** text`. Du kan också söka på formatering (fetstil, kursiv, färg, markering, rubrik) och låta *Ersätt* lägga på eller ta bort formatering på träffarna.
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
 - **Tabellvy för csv och tsv** – `.csv`, `.tsv` (och annan avgränsad text, via *Tabell | Text* i statusraden) visas som ett rutnät med rubrikrad och radnummer som ligger kvar vid rullning, och klarar hundratusentals rader. Kladd gissar avgränsare (`,` `;` tabb `|`), citattecken och om första raden är rubrik; båda går att ändra i verktygsraden. Dubbelklicka, `F2` eller skriv för att redigera en cell (Enter, Tab och piltangenter flyttar), markera med Skift/Ctrl, kopiera och klistra in rektanglar som TSV (Excel och LibreOffice), infoga och ta bort rader och kolumner i högerklicksmenyn, sortera på en kolumn (tal, naturlig ordning eller text med svensk ordning), filtrera rader och sök med `Ctrl+F` (träffarna markeras i cellerna). Statusraden visar antal, summa, medel, min och max för markeringen, även för `1 234,5`. Allt är ändringar i dokumentets text (`Ctrl+Z` och `Ctrl+Y` ångrar), och orörda rader, avgränsare, citat, radslut och avslutande radbrytning bevaras byte för byte.
@@ -322,6 +323,9 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Alt+klick` | Lägg till en markör (textläge) |
 | `Alt+Shift+drag` eller mittenknappen | Kolumnmarkering: en markering per rad (textläge) |
 | `Esc` | Tillbaka till en markör (textläge, med flera markörer) |
+| `Ctrl+Space` / `Ctrl+Shift+Space` | Komplettering / signaturhjälp från språkservern (kodfiler) |
+| `F12` / `Ctrl+klick` / `Shift+F12` | Gå till definition / sök referenser (kodfiler) |
+| `F2` / `Shift+Alt+F` | Byt namn på symbol / formatera dokumentet (kodfiler) |
 | `Ctrl+Shift+K` | Byt tema |
 | `Ctrl+Shift+P` | Kommandopalett: sök och kör valfritt kommando |
 | `Ctrl+,` | Inställningar |

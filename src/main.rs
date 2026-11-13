@@ -31,6 +31,7 @@ mod history_ui;
 mod i18n;
 mod icons;
 mod keys;
+mod lsp;
 mod macopen;
 mod menubar;
 mod multicursor;

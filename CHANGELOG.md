@@ -36,6 +36,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - Ett stycke i ett Word-dokument som börjar med en tabb blev ett kodblock vid sparning; tabben skrivs nu som `&#9;`.
 
+- **Språkservrar (LSP) för kodfiler.** Kladd startar rust-analyzer, pyright-langserver/pylsp, typescript-language-server, gopls eller clangd (de som finns på PATH) när en kodfil öppnas och visar fel och varningar som krumelurer, ikoner i marginalen och hovertext, med en *Problem*-panel där ett klick hoppar till platsen. Komplettering (efter utlösartecken eller `Ctrl+Space`), hover, gå till definition (`F12`, `Ctrl+klick`, även till andra filer), referenser (`Skift+F12`), byt namn (`F2`), formatera (`Skift+Alt+F`) och signaturhjälp. Ändringar skickas inkrementellt med rätt UTF-16-positioner, och statusraden visar serverns förlopp (*rust-analyzer: indexerar…*). *Språkservrar…* i menyn ställer in kommandon per språk.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

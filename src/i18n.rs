@@ -23,6 +23,7 @@ mod en_doc;
 mod en_incr;
 mod en_menus;
 mod en_git;
+mod en_lsp;
 mod en_misc;
 mod en_odtrev;
 mod en_pdf;
@@ -113,7 +114,7 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
 });
 
 fn tables() -> &'static [&'static [(&'static str, &'static str)]] {
-    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN, en_menus::EN, en_git::EN, en_templates::EN, en_track2::EN, en_csv::EN]
+    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN, en_menus::EN, en_git::EN, en_templates::EN, en_track2::EN, en_csv::EN, en_lsp::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.

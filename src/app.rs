@@ -113,6 +113,10 @@ pub struct Settings {
     pub autocorrect: crate::autocorrect::Config,
     /// Senast körda kommandon (id ur kommandoregistret), nyast först; paletten visar dem överst.
     pub recent_commands: Vec<String>,
+    /// Språkservrar (LSP) för kodfiler: fel, förslag, hover m.m.
+    pub lsp: bool,
+    /// Egna serverkommandon per språk (nyckel i `lsp::config`, kommandorad); saknas ett används standardvalet.
+    pub lsp_commands: Vec<(String, String)>,
 }
 
 impl Default for Settings {
@@ -146,6 +150,8 @@ impl Default for Settings {
             lang: Default::default(),
             autocorrect: Default::default(),
             recent_commands: Vec::new(),
+            lsp: true,
+            lsp_commands: Vec::new(),
         }
     }
 }
@@ -286,6 +292,8 @@ pub struct KladdApp {
     pub(crate) git: crate::git_ui::State,
     /// Tabellvyn för csv/tsv (`csv/`): vyinställningar per flik.
     pub(crate) csv: crate::csv::view::State,
+    /// Språkserverklienten (`lsp/`).
+    pub(crate) lsp: crate::lsp::Lsp,
 }
 
 /// Gränssnittstester som kör hela appen utan fönster (se `docs/dev/gransnittstester.md`).
@@ -419,6 +427,7 @@ impl KladdApp {
             cmd: Default::default(),
             git: Default::default(),
             csv: Default::default(),
+            lsp: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -1699,6 +1708,7 @@ impl KladdApp {
                         pdfui::status(ui, p, &font, tab);
                         return;
                     }
+                    self.lsp_status(ui, p, &font);
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1886,6 +1896,12 @@ impl KladdApp {
                     edited = true;
                 }
                 scroll_to = scroll_to.or(pre.scroll_to);
+                let lpre = self.lsp.pre(ui.ctx(), id, doc, had_focus, mc.multi());
+                if lpre.edited {
+                    edited = true;
+                }
+                scroll_to = scroll_to.or(lpre.scroll_to);
+                let lsp = &mut self.lsp;
                 let scroll = if wrap { ScrollArea::vertical() } else { ScrollArea::both() };
                 let result = scroll
                     .id_salt(("kladd-scroll", doc_id, crate::panes::salt()))
@@ -1938,6 +1954,7 @@ impl KladdApp {
                                 edited = true;
                             }
                             mc.post(ui, id, &doc.text, &out, font_size);
+                            lsp.post(ui, p, id, doc, &out, gutter);
                             if focus {
                                 ui.memory_mut(|m| m.request_focus(id));
                             }
@@ -3502,6 +3519,7 @@ impl eframe::App for KladdApp {
         self.update_outs(ctx);
         self.recovery.tick(ctx, &self.docs, self.settings.autosave_recovery);
         self.autosave_tick(ctx);
+        self.lsp_tick(ctx);
         if self.docs.get(self.active).map(|d| d.id) != self.last_active_id {
             self.last_active_id = self.docs.get(self.active).map(|d| d.id);
             self.find.current = None;
@@ -3531,6 +3549,7 @@ impl eframe::App for KladdApp {
         self.pdf_bar(ui, &p);
         self.git_tick(&ctx);
         self.status_bar(ui, &p);
+        self.lsp_panel(ui, &p);
         self.update.banner(ui, &ctx, &p, &mut self.settings);
         self.find_files_panel(ui, &p);
         self.pdf_sidebar(ui, &p);
@@ -3544,6 +3563,7 @@ impl eframe::App for KladdApp {
         self.settings_window(&ctx, &p);
         self.workspace_dialogs(&ctx, &p);
         self.git_dialogs(&ctx, &p);
+        self.lsp_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
         self.autocorrect_dialog(&ctx);
         self.close_dialog(&ctx, &p);
@@ -3564,6 +3584,7 @@ impl eframe::App for KladdApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.lsp.shutdown();
         self.recovery.shutdown(&self.docs);
         if self.owns_socket {
             single::cleanup();

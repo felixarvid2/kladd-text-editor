@@ -82,6 +82,7 @@ pub struct Env<'a> {
     pub git_repo: bool,
     pub blame_on: bool,
     pub scm_open: bool,
+    pub lsp_panel: bool,
 }
 
 impl<'a> Env<'a> {
@@ -104,6 +105,7 @@ impl<'a> Env<'a> {
             git_repo: app.git.repo().is_some(),
             blame_on: app.git.blame_on,
             scm_open: app.git.scm && app.settings.workspace_panel,
+            lsp_panel: app.lsp.ui.panel,
         }
     }
 
@@ -127,6 +129,7 @@ impl<'a> Env<'a> {
             git_repo: false,
             blame_on: false,
             scm_open: false,
+            lsp_panel: false,
         }
     }
 }
@@ -428,6 +431,8 @@ pub static ALL: &[Command] = &[
     Command::new("tools.grammar", "Grammatikkontroll", Tools, "", always, |a, _| a.grammar_toggle()).checked(|e| e.settings.grammar),
     Command::new("tools.grammar_settings", "Grammatik och stil…", Tools, "", always, |a, _| a.open_grammar_dialog(false)),
     Command::new("tools.autocorrect", "Autokorrigering…", Tools, "", always, |a, _| a.open_autocorrect_dialog()),
+    Command::new("tools.lsp_panel", "Problem och referenser", Tools, "", |e| e.has_doc && !e.pdf, |a, _| a.lsp.ui.panel = !a.lsp.ui.panel).checked(|e| e.lsp_panel).sep(),
+    Command::new("tools.lsp_settings", "Språkservrar…", Tools, "", always, |a, _| a.lsp.ui.settings_open = true),
     Command::new("git.compare", "Jämför med HEAD…", Tools, "", |e| e.git_doc, |a, c| a.git_compare_active(c)).sep(),
     Command::new("git.blame", "Visa blame", Tools, "", |e| e.git_doc, |a, _| a.git.blame_on = !a.git.blame_on).checked(|e| e.blame_on),
     Command::new("git.scm", "Källkontroll", Tools, "Ctrl+Shift+G", |e| e.git_repo, |a, _| a.git_toggle_scm_open()).checked(|e| e.scm_open),

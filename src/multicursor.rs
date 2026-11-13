@@ -543,6 +543,11 @@ impl State {
         self.cur.is_some()
     }
 
+    /// Finns extra markörer just nu? (Samma som `is_multi`.)
+    pub fn multi(&self) -> bool {
+        self.is_multi()
+    }
+
     /// Kör före `TextEdit::show`. `focused`: editorn har tangentbordsfokus. `rect`: editorns yta.
     pub fn pre(&mut self, ctx: &Context, id: Id, doc_id: u64, text: &mut String, focused: bool, rect: Rect) -> Outcome {
         let mut out = Outcome::default();
