@@ -15,6 +15,13 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Redigera och ta bort befintliga PDF-anteckningar.** Anteckningar som redan finns i filen (markering, understruken, genomstruken, vågig, lapp, textruta, penna, rektangel, ellips, linje) kan väljas med ett klick i *Anteckna*-läget: en ruta visar författare och datum och låter dig ändra kommentaren och färgen eller *Ta bort*. Pekaren över en anteckning visar författare och text, också utanför Anteckna-läget. Ändringarna är osparade tills du sparar (Ctrl+S, *Spara kopia*) och kan ångras (*Ångra*, Ctrl+Z). Utseendet ritas om för det Kladd kan rita; övriga typer behåller sitt utseende och får bara ny text. Fliken *Kommentarer* i sidopanelen listar alla anteckningar med sida, författare och text, och ett klick hoppar dit.
 
+- **Kommandopalett** (`Ctrl+Skift+P`): suddig sökning bland alla kommandon, på svenska och engelska, med kategori och kortkommando. Senast använda kommandon ligger överst, kommandon som inte går att köra nu är nedtonade, och Enter kör.
+- **Inställningar** (`Ctrl+,`): ett eget fönster med Allmänt (språk, tema, textstorlek, uppdateringar, spara automatiskt, säkerhetskopior), Redigerare, Dokument (författarnamn, stavning, grammatik och server), PDF och Avancerat (med *Återställ alla inställningar*).
+- Nya kommandon i menyerna: *Exportera som webbsida…* och *Exportera som e-bok…*, *Nästa/Föregående träff*, *Visa som dokument*, sidhuvud och sidfot, formatering och granskning samt PDF-åtgärder (rotera sidan, lägg till PDF, OCR, öppna i extern visare) finns nu som menyval.
+
+
+- **Menyrad i stället för en lång hamburgermeny.** *Arkiv · Redigera · Visa · Infoga · Verktyg · Hjälp* (och *Format* i dokumentläget) ligger i övre raden och byggs ur ett gemensamt kommandoregister (`src/commands.rs`, se `docs/dev/kommandon.md`). Menyerna visar bara det som hör till läget. I smala fönster samlas de under hamburgerknappen som undermenyer. Inställningarna som låg i menyn (språk, säkerhetskopiering, uppdateringar, spara automatiskt) ligger i *Inställningar*.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

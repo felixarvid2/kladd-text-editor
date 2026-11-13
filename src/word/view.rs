@@ -109,7 +109,7 @@ pub struct State {
     images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
     /// Vald bild, pågående storleksändring.
-    img: images::State,
+    pub(crate) img: images::State,
     target: Option<SpellTarget>,
     /// Grammatikträffen som högerklickats.
     gtarget: Option<crate::grammar::Match>,
@@ -295,7 +295,7 @@ impl KladdApp {
         self.find.current = None;
     }
 
-    fn word_undo(&mut self, ctx: &egui::Context, redo: bool) {
+    pub(crate) fn word_undo(&mut self, ctx: &egui::Context, redo: bool) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let id = editor_id(doc.id);
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
@@ -319,12 +319,12 @@ impl KladdApp {
         self.focus_editor = true;
     }
 
-    fn word_toggle(&mut self, ctx: &egui::Context, m: Inline) {
+    pub(crate) fn word_toggle(&mut self, ctx: &egui::Context, m: Inline) {
         self.word_edit(ctx, |t, s| markup::toggle_inline(t, s, m));
     }
 
     /// Större/mindre text ett steg i storlekslistan.
-    fn word_font_step(&mut self, ctx: &egui::Context, dir: i32) {
+    pub(crate) fn word_font_step(&mut self, ctx: &egui::Context, dir: i32) {
         self.word_edit(ctx, |t, s| {
             let a = markup::analyze(t);
             let act = markup::active(t, &a, s.clone());
@@ -390,7 +390,7 @@ impl KladdApp {
         });
     }
 
-    fn word_block(&mut self, ctx: &egui::Context, b: Block) {
+    pub(crate) fn word_block(&mut self, ctx: &egui::Context, b: Block) {
         self.word_edit(ctx, |t, s| markup::set_block(t, s, b));
     }
 

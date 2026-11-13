@@ -20,6 +20,7 @@ mod en_app;
 mod en_autocorrect;
 mod en_doc;
 mod en_incr;
+mod en_menus;
 mod en_misc;
 mod en_odtrev;
 mod en_pdf;
@@ -92,7 +93,7 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
 });
 
 fn tables() -> &'static [&'static [(&'static str, &'static str)]] {
-    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN]
+    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN, en_menus::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.
@@ -101,6 +102,20 @@ pub fn t(sv: &'static str) -> &'static str {
         Lang::Sv => sv,
         Lang::En => EN.get(sv).copied().unwrap_or(sv),
     }
+}
+
+/// Texten på ett bestämt språk, oavsett aktuellt språk (kommandopaletten söker i båda).
+pub fn translate(sv: &'static str, lang: Lang) -> &'static str {
+    match lang {
+        Lang::Sv => sv,
+        Lang::En => EN.get(sv).copied().unwrap_or(sv),
+    }
+}
+
+/// Finns en engelsk översättning av den svenska texten?
+#[allow(dead_code)]
+pub fn has_en(sv: &str) -> bool {
+    EN.contains_key(sv)
 }
 
 /// Översätter mallen och byter ut `{namn}` mot värdena. Se `tf!`.

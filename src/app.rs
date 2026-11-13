@@ -38,11 +38,15 @@ use crate::icons::{self, Icon};
 use crate::single::{self, Incoming};
 use crate::theme::{self, Palette};
 
+// Kommandoregistret är en undermodul till `app` så att det når appens privata funktioner.
+#[path = "commands.rs"]
+pub(crate) mod commands;
+
 const SETTINGS_KEY: &str = "kladd-settings";
 const TOPBAR_H: f32 = 46.0;
 const TOPBAR_PAD_TOP: f32 = 8.0;
 const STATUS_H: f32 = 28.0;
-const DEFAULT_FONT_SIZE: f32 = 15.0;
+pub(crate) const DEFAULT_FONT_SIZE: f32 = 15.0;
 const MAX_RECENT: usize = 8;
 const WINDOW_CONTROLS_W: f32 = 3.0 * 38.0 + 14.0;
 const RESIZE_EDGE: f32 = 6.0;
@@ -107,6 +111,8 @@ pub struct Settings {
     pub lang: crate::i18n::LangSetting,
     /// Autokorrigering medan man skriver (dialogen Autokorrigering…).
     pub autocorrect: crate::autocorrect::Config,
+    /// Senast körda kommandon (id ur kommandoregistret), nyast först; paletten visar dem överst.
+    pub recent_commands: Vec<String>,
 }
 
 impl Default for Settings {
@@ -139,6 +145,7 @@ impl Default for Settings {
             workspace_hidden: false,
             lang: Default::default(),
             autocorrect: Default::default(),
+            recent_commands: Vec::new(),
         }
     }
 }
@@ -261,7 +268,7 @@ pub struct KladdApp {
     pub(crate) nav: crate::word::navui::State,
     /// Fönstret är i helskärm för presentationsläget i en PDF-flik.
     pdf_fullscreen: bool,
-    update: crate::update::State,
+    pub(crate) update: crate::update::State,
     /// Delad vy: vilka flikar som visas i de två rutorna.
     pub(crate) panes: crate::panes::Panes,
     /// Extra markörer och kolumnmarkering i textläget.
@@ -270,6 +277,8 @@ pub struct KladdApp {
     pub(crate) ws: crate::workspace::State,
     /// Sök i filer (`find_files.rs`).
     pub(crate) ff: crate::find_files::State,
+    /// Kommandopalett och inställningsfönster (`commands.rs`).
+    pub(crate) cmd: commands::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -394,6 +403,7 @@ impl KladdApp {
             panes: Default::default(),
             ws: Default::default(),
             ff: Default::default(),
+            cmd: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -1166,6 +1176,13 @@ impl KladdApp {
             self.pdf_shortcuts(ctx);
             return;
         }
+        // Ctrl+Skift+P före Ctrl+P (skriv ut): `consume_shortcut` bryr sig inte om extra Skift.
+        if hit(ctrl_shift, Key::P) {
+            self.open_palette();
+        }
+        if hit(ctrl, Key::Comma) {
+            self.open_settings(None);
+        }
         let pdf = self.pdf_mode();
         // Före Ctrl+F: Skift-varianterna måste tas först.
         self.workspace_shortcuts(ctx);
@@ -1280,11 +1297,11 @@ impl KladdApp {
         }
     }
 
-    fn zoom(&mut self, delta: f32) {
+    pub(crate) fn zoom(&mut self, delta: f32) {
         self.settings.font_size = (self.settings.font_size + delta).clamp(9.0, 32.0);
     }
 
-    fn toggle_theme(&mut self, ctx: &egui::Context) {
+    pub(crate) fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.settings.dark = !self.settings.dark;
         theme::set_dark(ctx, self.settings.dark);
     }
@@ -1343,7 +1360,12 @@ impl KladdApp {
                 }
                 let show_preview_btn = self.docs.get(self.active).is_some_and(Document::is_markdown) && !self.word_mode();
                 let show_nav_btn = self.docs.get(self.active).is_some_and(Document::is_markdown);
-                let buttons = 2 + usize::from(show_preview_btn) + usize::from(show_nav_btn);
+                // Menyraden ligger bredvid flikarna när det finns plats; annars samlas menyerna i hamburgermenyn.
+                let cats = self.menu_categories();
+                let bar_w = crate::menubar::bar_width(ui, &cats);
+                let side_btns = 1 + usize::from(show_preview_btn) + usize::from(show_nav_btn);
+                let wide = full.width() - side_btns as f32 * 34.0 - WINDOW_CONTROLS_W - 8.0 - 90.0 - bar_w > crate::menubar::MIN_TABS_W;
+                let buttons = side_btns + usize::from(!wide);
                 let right_w = buttons as f32 * 34.0 + WINDOW_CONTROLS_W;
                 let left = Rect::from_min_max(full.min, pos2(full.right() - right_w - 8.0, full.bottom()));
                 let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
@@ -1353,6 +1375,10 @@ impl KladdApp {
                     |ui| {
                         self.wordmark(ui, p);
                         ui.add_space(14.0);
+                        if wide {
+                            self.menu_bar(ui, &ctx, p, &cats);
+                            ui.add_space(8.0);
+                        }
                         ScrollArea::horizontal()
                             .id_salt("kladd-tabs")
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1392,16 +1418,10 @@ impl KladdApp {
                         let (sep, _) = ui.allocate_exact_size(vec2(14.0, 30.0), Sense::hover());
                         ui.painter().vline(sep.center().x, sep.y_range().shrink(7.0), Stroke::new(1.0, p.line));
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let menu = icons::button(ui, p, Icon::Menu, 30.0, false, t("Meny"), p.chrome);
-                        Popup::menu(&menu)
-                            .width(312.0)
-                            .align(RectAlign::BOTTOM_END)
-                            .gap(6.0)
-                            .show(|ui| {
-                                // Menyn är längre än ett litet fönster: rulla i stället för att klippa.
-                                let max_h = (ctx.content_rect().height() - TOPBAR_H - 24.0).max(200.0);
-                                ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).auto_shrink([false, true]).show(ui, |ui| self.menu(ui, &ctx, p));
-                            });
+                        if !wide {
+                            let menu = icons::button(ui, p, Icon::Menu, 30.0, false, t("Meny"), p.chrome);
+                            Popup::menu(&menu).width(312.0).align(RectAlign::BOTTOM_END).gap(6.0).show(|ui| self.hamburger_menu(ui, &ctx, p));
+                        }
 
                         let (icon, tip) = if self.settings.dark {
                             (Icon::Sun, t("Byt till ljust tema (Ctrl+Shift+K)"))
@@ -1510,140 +1530,6 @@ impl KladdApp {
         }
         if let Some(i) = close {
             self.request_close_tab(i);
-        }
-    }
-
-    fn menu(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Palette) {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        let has_doc = !self.docs.is_empty();
-        let pdf = self.pdf_mode();
-        if menu_item(ui, p, t("Ny flik"), "Ctrl+T", None, true) {
-            self.new_tab();
-        }
-        if menu_item(ui, p, t("Öppna…"), "Ctrl+O", None, true) {
-            self.request_open(ctx);
-        }
-        let pdf_changed = self.pdf_unsaved();
-        if menu_item(ui, p, if pdf && !pdf_changed { t("Spara kopia…") } else { t("Spara") }, "Ctrl+S", None, has_doc) {
-            if pdf && pdf_changed {
-                self.pdf_save(ctx, self.active, false, false);
-            } else if pdf {
-                self.request_save_copy(ctx, self.active);
-            } else {
-                self.save_doc(ctx, self.active, false, false);
-            }
-        }
-        if pdf && pdf_changed && menu_item(ui, p, t("Spara kopia…"), "Ctrl+Shift+S", None, true) {
-            self.request_save_copy(ctx, self.active);
-        }
-        if menu_item(ui, p, t("Spara som…"), "Ctrl+Shift+S", None, has_doc && !pdf) {
-            self.request_save_as(ctx, self.active, false, false);
-        }
-        if menu_item(ui, p, t("Skriv ut…"), "Ctrl+P", None, has_doc) {
-            self.open_print(ctx);
-        }
-        let hist = self.docs.get(self.active).is_some_and(|d| d.path.is_some() && d.pdfv.is_none());
-        if menu_item(ui, p, t("Versionshistorik…"), "", None, hist) {
-            self.open_history(ctx);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Öppna mapp…"), "", None, true) {
-            self.request_folder(ctx);
-        }
-        if menu_item(ui, p, t("Mappträd"), "Ctrl+Shift+E", Some(self.settings.workspace_panel), true) {
-            self.toggle_workspace_panel(ctx);
-        }
-        if menu_item(ui, p, t("Stäng mapp"), "", None, self.settings.workspace.is_some()) {
-            self.close_workspace();
-        }
-        if menu_item(ui, p, t("Snabböppna…"), "Ctrl+E", None, true) {
-            self.open_quick(ctx);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Stäng flik"), "Ctrl+W", None, has_doc) {
-            self.request_close_tab(self.active);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Infoga bild…"), "Ctrl+Shift+I", None, has_doc && !pdf) {
-            self.request_insert_image(ctx);
-        }
-        if menu_item(ui, p, t("Infoga innehållsförteckning"), "", None, self.docs.get(self.active).is_some_and(Document::is_markdown)) {
-            self.insert_toc(ctx);
-        }
-        if menu_item(ui, p, t("Sök"), "Ctrl+F", None, has_doc) {
-            self.open_find(ctx, false);
-        }
-        if menu_item(ui, p, t("Sök och ersätt"), "Ctrl+H", None, has_doc && !pdf) {
-            self.open_find(ctx, true);
-        }
-        if menu_item(ui, p, t("Sök i filer…"), "Ctrl+Shift+F", None, true) {
-            self.open_find_files(ctx);
-        }
-        menu_divider(ui, p);
-        let split = self.panes.orient;
-        if menu_item(ui, p, t("Dela vyn"), "Ctrl+\\", Some(split == Some(Orient::Vertical)), has_doc) {
-            self.toggle_split(Orient::Vertical);
-        }
-        if menu_item(ui, p, t("Dela vågrätt"), "Ctrl+Shift+\\", Some(split == Some(Orient::Horizontal)), has_doc) {
-            self.toggle_split(Orient::Horizontal);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Radbrytning"), "Alt+Z", Some(self.settings.wrap), true) {
-            self.settings.wrap = !self.settings.wrap;
-        }
-        if menu_item(ui, p, t("Radnummer"), "", Some(self.settings.line_numbers), true) {
-            self.settings.line_numbers = !self.settings.line_numbers;
-        }
-        let md = self.docs.get(self.active).is_some_and(Document::is_markdown);
-        if menu_item(ui, p, t("Navigeringsfönster"), "Ctrl+Shift+O", Some(self.settings.nav_pane), md) {
-            self.settings.nav_pane = !self.settings.nav_pane;
-        }
-        if menu_item(ui, p, t("Förhandsvisa Markdown"), "Ctrl+Shift+M", Some(self.settings.preview), true) {
-            self.settings.preview = !self.settings.preview;
-        }
-        if menu_item(ui, p, t("Mörkt tema"), "Ctrl+Shift+K", Some(self.settings.dark), true) {
-            self.toggle_theme(ctx);
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Större text"), "Ctrl++", None, true) {
-            self.zoom(1.0);
-        }
-        if menu_item(ui, p, t("Mindre text"), "Ctrl+−", None, true) {
-            self.zoom(-1.0);
-        }
-        if menu_item(ui, p, t("Normal textstorlek"), "Ctrl+0", None, true) {
-            self.settings.font_size = DEFAULT_FONT_SIZE;
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Säkerhetskopiera osparade ändringar"), "", Some(self.settings.autosave_recovery), true) {
-            self.settings.autosave_recovery = !self.settings.autosave_recovery;
-        }
-        if menu_item(ui, p, t("Sök efter uppdateringar automatiskt"), "", Some(self.settings.auto_update_check), true) {
-            self.settings.auto_update_check = !self.settings.auto_update_check;
-        }
-        if menu_item(ui, p, t("Sök efter uppdateringar"), "", None, true) {
-            self.update.check_now(ctx);
-        }
-        if menu_item(ui, p, t("Spara automatiskt"), "", Some(self.settings.autosave), true) {
-            self.settings.autosave = !self.settings.autosave;
-        }
-        if menu_item(ui, p, t("Autokorrigering…"), "", None, true) {
-            self.open_autocorrect_dialog();
-        }
-        menu_divider(ui, p);
-        // Ett klick byter till nästa språkval (Automatiskt, Svenska, English).
-        let cur = self.settings.lang;
-        let label = format!("Språk / Language: {}", cur.label());
-        if menu_item(ui, p, &label, "", None, true) {
-            let all = crate::i18n::LangSetting::ALL;
-            self.settings.lang = all[(all.iter().position(|l| *l == cur).unwrap_or(0) + 1) % all.len()];
-            // Gäller från nästa bild utan omstart.
-            crate::i18n::set_lang(self.settings.lang.resolve());
-            ctx.request_repaint();
-        }
-        menu_divider(ui, p);
-        if menu_item(ui, p, t("Avsluta"), "Ctrl+Q", None, true) {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
 
@@ -3491,6 +3377,8 @@ impl eframe::App for KladdApp {
         self.central(ui, &p);
         self.find_bar(&ctx, &p);
         self.quick_open_popup(&ctx, &p);
+        self.command_palette(&ctx, &p);
+        self.settings_window(&ctx, &p);
         self.workspace_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
         self.autocorrect_dialog(&ctx);
