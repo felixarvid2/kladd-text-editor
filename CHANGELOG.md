@@ -16,6 +16,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - **Spara automatiskt** (huvudmenyn, av som standard). Ändrade flikar med sökväg sparas till sin egen fil två sekunder efter att skrivandet stannat och när fönstret tappar fokus eller fliken byts. Namnlösa flikar, filer som kräver Spara som, PDF-flikar och format som skulle tappa innehåll (Word/ODT med varning, omvandlade PDF:er) sparas aldrig automatiskt. Har filen ändrats på disk sparas inget, och en notis visas.
 - **Versionshistorik.** Varje sparning lagrar en version i Kladds datamapp (högst 50 per fil, gallras till en per timme efter en timme och en per dygn efter ett dygn, äldre än 30 dagar tas bort). *Versionshistorik…* i huvudmenyn visar versionerna med en radvis jämförelse mot aktuell text (för textformat), *Återställ* (går att ångra) och *Öppna som ny flik*.
 - **Delad vy.** *Dela vyn* (Ctrl+\) i huvudmenyn visar två rutor bredvid varandra och *Dela vågrätt* (Ctrl+Skift+\) över varandra. Varje ruta har en egen flikväljare, så den kan visa en annan flik eller samma dokument en gång till med egen markör och rullning (ändringar delas). Dra i skiljelinjen för att ändra storleken (dubbelklick återställer; storleken kommer ihåg). Klicka i en ruta, eller tryck F6, för att göra den aktiv: verktygsrad, sök, kortkommandon och statusrad gäller den aktiva rutan. Fungerar för text, dokumentläge och PDF (samma PDF visas bara i en ruta). Markdownförhandsvisningen döljs i delad vy.
+- **Flera markörer och kolumnmarkering i textläget.** Ctrl+D lägger till nästa förekomst av markeringen, Ctrl+Shift+L markerar alla, Alt+klick lägger till en markör och Alt+Shift+drag (eller mittenknappen) markerar en kolumn. Skrivning, Backsteg/Delete, Enter, Tab, piltangenter (även Home/End och ordhopp), klipp ut/kopiera/klistra in (en rad per markör när antalet stämmer) fungerar på alla markörer, och Ångra tar tillbaka hela steget. Esc återgår till en markör.
+
+
+- Byt tema har flyttats från Ctrl+Shift+L till Ctrl+Shift+K (Ctrl+Shift+L är nu "markera alla förekomster" i textläget).
 
 ## [1.9.0] – 2026-11-12
 

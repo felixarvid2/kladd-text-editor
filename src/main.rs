@@ -22,6 +22,7 @@ mod history_ui;
 mod icons;
 mod keys;
 mod macopen;
+mod multicursor;
 mod paste;
 mod panes;
 mod platform;

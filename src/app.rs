@@ -224,6 +224,8 @@ pub struct KladdApp {
     update: crate::update::State,
     /// Delad vy: vilka flikar som visas i de två rutorna.
     pub(crate) panes: crate::panes::Panes,
+    /// Extra markörer och kolumnmarkering i textläget.
+    mc: crate::multicursor::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -320,6 +322,7 @@ impl KladdApp {
             scroll_to_char: None,
             focus_editor: false,
             editor_rect: Rect::NOTHING,
+            mc: Default::default(),
             last_title: String::new(),
             last_active_id: None,
             incoming: None,
@@ -1166,7 +1169,7 @@ impl KladdApp {
         }
         // Zoom, radbrytning och förhandsvisning hör till redigeraren; i PDF-visaren sköter vyn zoomen.
         if pdf {
-            if hit(ctrl_shift, Key::L) {
+            if hit(ctrl_shift, Key::K) || hit(ctrl_shift, Key::L) {
                 self.toggle_theme(ctx);
             }
             if hit(ctrl, Key::Q) {
@@ -1189,7 +1192,8 @@ impl KladdApp {
         if hit(ctrl_shift, Key::M) {
             if !word { self.settings.preview = !self.settings.preview; }
         }
-        if hit(ctrl_shift, Key::L) {
+        // Ctrl+Skift+L är "markera alla förekomster" i textläget; temat byts där med Ctrl+Skift+K.
+        if hit(ctrl_shift, Key::K) || (word && hit(ctrl_shift, Key::L)) {
             self.toggle_theme(ctx);
         }
         if hit(ctrl, Key::Q) {
@@ -1317,9 +1321,9 @@ impl KladdApp {
                             .show(|ui| self.menu(ui, &ctx, p));
 
                         let (icon, tip) = if self.settings.dark {
-                            (Icon::Sun, "Byt till ljust tema (Ctrl+Shift+L)")
+                            (Icon::Sun, "Byt till ljust tema (Ctrl+Shift+K)")
                         } else {
-                            (Icon::Moon, "Byt till mörkt tema (Ctrl+Shift+L)")
+                            (Icon::Moon, "Byt till mörkt tema (Ctrl+Shift+K)")
                         };
                         if icons::button(ui, p, icon, 30.0, false, tip, p.chrome).clicked() {
                             self.toggle_theme(&ctx);
@@ -1491,7 +1495,7 @@ impl KladdApp {
         if menu_item(ui, p, "Förhandsvisa Markdown", "Ctrl+Shift+M", Some(self.settings.preview), true) {
             self.settings.preview = !self.settings.preview;
         }
-        if menu_item(ui, p, "Mörkt tema", "Ctrl+Shift+L", Some(self.settings.dark), true) {
+        if menu_item(ui, p, "Mörkt tema", "Ctrl+Shift+K", Some(self.settings.dark), true) {
             self.toggle_theme(ctx);
         }
         menu_divider(ui, p);
@@ -1704,6 +1708,7 @@ impl KladdApp {
 
                 let doc = &mut self.docs[self.active];
                 let hl = &mut self.hl;
+                let mc = &mut self.mc;
                 let hint = doc.syntax_hint();
                 let doc_id = doc.id;
                 let id = editor_id(doc_id);
@@ -1711,6 +1716,14 @@ impl KladdApp {
                 let hl_id = doc_id | ((crate::panes::salt() as u64) << 62);
 
                 let mut edited = false;
+                let mut scroll_to = scroll_to;
+                let had_focus = ui.memory(|m| m.has_focus(id));
+                let pre = mc.pre(ui.ctx(), id, doc_id, &mut doc.text, had_focus, self.editor_rect);
+                if pre.edited {
+                    doc.on_edited();
+                    edited = true;
+                }
+                scroll_to = scroll_to.or(pre.scroll_to);
                 let scroll = if wrap { ScrollArea::vertical() } else { ScrollArea::both() };
                 let result = scroll
                     .id_salt(("kladd-scroll", doc_id, crate::panes::salt()))
@@ -1756,6 +1769,7 @@ impl KladdApp {
                                 doc.on_edited();
                                 edited = true;
                             }
+                            mc.post(ui, id, &doc.text, &out, font_size);
                             if focus {
                                 ui.memory_mut(|m| m.request_focus(id));
                             }

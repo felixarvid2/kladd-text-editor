@@ -237,7 +237,12 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Ctrl+Shift+\` | Dela vyn vågrätt |
 | `F6` | Byt aktiv ruta i delad vy |
 | `Ctrl+Shift+O` | Navigeringsfönster (rubrikträd) på/av |
-| `Ctrl+Shift+L` | Byt tema |
+| `Ctrl+D` | Lägg till nästa förekomst av markeringen (eller ordet vid markören) som egen markör (textläge) |
+| `Ctrl+Shift+L` | Markera alla förekomster (textläge) |
+| `Alt+klick` | Lägg till en markör (textläge) |
+| `Alt+Shift+drag` eller mittenknappen | Kolumnmarkering: en markering per rad (textläge) |
+| `Esc` | Tillbaka till en markör (textläge, med flera markörer) |
+| `Ctrl+Shift+K` | Byt tema |
 | `Ctrl+Q` | Avsluta |
 
 ## Licens
