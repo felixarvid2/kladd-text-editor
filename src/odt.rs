@@ -11,11 +11,13 @@
 //!
 //! Beslut om saker Kladd inte kan visa:
 //! - Fotnoter och slutnoter (`text:note`) blir `[^N]` och en definition `[^N]: text` sist i dokumentet
-//!   (slutnoter blir fotnoter). Kommentarer (`office:annotation`) tas bort ur texten och rapporteras
-//!   som borttagna ("kommentarer"), på samma sätt som för .docx.
-//! - Spårade ändringar (`text:tracked-changes`, `text:change-start`) godkänns: infogad text blir vanlig text
-//!   och raderad text (som ligger i `text:changed-region`) kommer inte med. Kommentarer och ändringar
-//!   skrivs inte till .odt (se `review::clean_for_export`).
+//!   (slutnoter blir fotnoter).
+//! - Spårade ändringar och kommentarer läses som i .docx (`crate::review`): `text:insertion` (mellan
+//!   `text:change-start` och `text:change-end`) blir `<ins>`, `text:deletion` (platsen markeras av
+//!   `text:change`, den raderade texten ligger i `text:changed-region`) blir `<del>`, och
+//!   `office:annotation` blir ett kommentarsområde (`office:annotation-end` ger slutet, `loext:parent-name`
+//!   ett svar, `loext:resolved` löst). Författare och datum hamnar i postraderna. Formatändringar
+//!   (`text:format-change`) rapporteras som borttagna.
 //! - Diagram, former och inbäddade objekt (`draw:*` utom bilder) rapporteras som borttagna.
 //! - Länkade bilder (utanför paketet) och bildformat som Kladd inte kan visa (svg, wmf …) likaså.
 //! - Fält i sidhuvud/sidfot blir `{sida}`, `{sidor}`, `{datum}`, `{titel}` och `{fil}`, flikar delar i
@@ -34,6 +36,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::docx::{escape_inline, escape_line_start, image_ext, is_supported_image, wrap, Image, Loaded, Written, IMAGE_SCHEME};
+use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::word::markup::{self, Float};
@@ -47,12 +50,14 @@ const MAX_DEPTH: usize = 256;
 
 // ============================================================== XML-träd
 
+#[derive(Clone)]
 struct Node {
     name: String,
     attrs: Vec<(String, String)>,
     kids: Vec<Kid>,
 }
 
+#[derive(Clone)]
 enum Kid {
     El(Node),
     Text(String),
@@ -601,6 +606,8 @@ struct Fmt {
     underline: bool,
     code: bool,
     span: SpanStyle,
+    /// Spårad ändring som texten ligger i: slag och ändringens nummer.
+    rev: Option<(RevKind, u32)>,
 }
 
 #[derive(Clone)]
@@ -647,6 +654,8 @@ struct Dropped {
     linked: bool,
     textboxes: bool,
     comments: bool,
+    /// Spårade formatändringar (`text:format-change`) som inte kan visas.
+    format_changes: bool,
 }
 
 impl Dropped {
@@ -663,6 +672,9 @@ impl Dropped {
         }
         if self.comments {
             v.push(crate::i18n::t("kommentarer"));
+        }
+        if self.format_changes {
+            v.push(crate::i18n::t("spårade formatändringar"));
         }
         v
     }
@@ -702,6 +714,33 @@ struct Rd<'s, 'b> {
     masters: HashMap<String, sections::SectionProps>,
     cur_master: Option<String>,
     cur_page: sections::SectionProps,
+    review: ReviewRd,
+}
+
+/// En ändringsregion ur `text:tracked-changes`: slag, författare, datum och det raderade innehållet.
+struct Region {
+    kind: RevKind,
+    author: String,
+    date: String,
+    paras: Vec<Node>,
+}
+
+/// Granskningsläget vid läsning: regionerna, posterna och pågående infogning.
+#[derive(Default)]
+struct ReviewRd {
+    regions: HashMap<String, Region>,
+    revs: Vec<RevRec>,
+    comments: Vec<CommentRec>,
+    /// `office:name` per kommentar (index = kommentarens nummer).
+    names: Vec<String>,
+    /// Namn som har en `office:annotation-end` i dokumentet.
+    ends: std::collections::HashSet<String>,
+    /// Kommentarer som väntar på sin slutmarkör.
+    pending_end: Vec<u32>,
+    /// Ändringen som gäller för texten just nu (infogning mellan start och slut, eller raderad text).
+    cur: Option<(RevKind, u32)>,
+    /// Den öppna infogningen (kan sträcka sig över flera stycken).
+    open_ins: Option<u32>,
 }
 
 fn kind_of(st: &Styles, style: Option<&str>) -> Kind {
@@ -769,6 +808,7 @@ impl<'s, 'b> Rd<'s, 'b> {
                 color: e.color.filter(|c| Some(*c) != sr.color),
                 background: e.bg().filter(|c| Some(*c) != sr.bg()),
             },
+            rev: self.review.cur,
         }
     }
 
@@ -835,13 +875,131 @@ impl<'s, 'b> Rd<'s, 'b> {
             }
             "draw:frame" => self.frame(e, st, pc, runs),
             "text:note" => self.note(e, runs),
-            "office:annotation" => self.dropped.comments = true,
+            "office:annotation" => self.annotation(e, runs),
+            "office:annotation-end" => self.annotation_end(e, runs),
+            "text:change-start" | "text:change" => self.change_mark(e, st, pc, runs),
+            "text:change-end" => {
+                if e.attr("text:change-id").and_then(|id| self.review.regions.get(id)).is_some_and(|r| r.kind == RevKind::Ins) {
+                    self.review.cur = None;
+                    self.review.open_ins = None;
+                }
+            }
             "text:soft-page-break" | "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:reference-mark"
-            | "text:reference-mark-start" | "text:reference-mark-end" | "office:annotation-end" | "text:index-mark"
-            | "text:index-mark-start" | "text:index-mark-end" | "text:changed-region" | "text:change" | "text:change-start"
-            | "text:change-end" | "text:toc-mark" | "text:toc-mark-start" | "text:toc-mark-end" => {}
+            | "text:reference-mark-start" | "text:reference-mark-end" | "text:index-mark"
+            | "text:index-mark-start" | "text:index-mark-end" | "text:changed-region" | "text:toc-mark"
+            | "text:toc-mark-start" | "text:toc-mark-end" => {}
             n if n.starts_with("draw:") => self.dropped.shapes = true,
             _ => self.inline(e, st, pc, runs),
+        }
+    }
+
+    fn marker_run(text: String) -> Run {
+        Run { text, fmt: Fmt::default(), link: None, raw: true }
+    }
+
+    /// `text:change-start` (infogning: text som följer är infogad, borttagning: den raderade texten
+    /// läggs här) och `text:change` (raderad text på platsen).
+    fn change_mark(&mut self, e: &Node, st: &St, pc: &mut Pc, runs: &mut Vec<Run>) {
+        let Some(id) = e.attr("text:change-id") else { return };
+        let Some(reg) = self.review.regions.get(id) else { return };
+        let (kind, author, date) = (reg.kind, reg.author.clone(), reg.date.clone());
+        let rev_id = self.review.revs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+        match kind {
+            RevKind::Ins if e.name == "text:change-start" => {
+                self.review.revs.push(RevRec { id: rev_id, author, date });
+                self.review.cur = Some((RevKind::Ins, rev_id));
+                self.review.open_ins = Some(rev_id);
+            }
+            RevKind::Ins => {}
+            RevKind::Del if e.name == "text:change-start" || e.name == "text:change" => {
+                let paras = self.review.regions.get(id).map(|r| r.paras.clone()).unwrap_or_default();
+                if paras.is_empty() || self.in_note {
+                    return;
+                }
+                self.review.revs.push(RevRec { id: rev_id, author, date });
+                let saved = self.review.cur;
+                self.review.cur = Some((RevKind::Del, rev_id));
+                for (i, p) in paras.iter().enumerate() {
+                    if i > 0 {
+                        self.add_text(runs, " ".into(), st, pc);
+                    }
+                    self.inline(p, st, pc, runs);
+                }
+                self.review.cur = saved;
+            }
+            RevKind::Del => {}
+        }
+    }
+
+    /// Texten i en kommentars stycken (`text:p`), ett stycke per rad.
+    fn annotation_text(n: &Node) -> String {
+        fn plain(n: &Node, out: &mut String) {
+            for k in &n.kids {
+                match k {
+                    Kid::Text(t) => out.push_str(t),
+                    Kid::El(e) => match e.name.as_str() {
+                        "text:s" => out.push_str(&" ".repeat(e.attr("text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).min(10_000))),
+                        "text:tab" => out.push('\t'),
+                        "text:line-break" => out.push('\n'),
+                        _ => plain(e, out),
+                    },
+                }
+            }
+        }
+        let mut paras: Vec<String> = Vec::new();
+        for c in n.els().filter(|c| matches!(c.name.as_str(), "text:p" | "text:h")) {
+            let mut s = String::new();
+            plain(c, &mut s);
+            paras.push(s);
+        }
+        paras.join("\n")
+    }
+
+    /// `office:annotation`: startmarkören i texten och en post. Saknar kommentaren slutmarkör
+    /// (`office:annotation-end`) blir området tomt.
+    fn annotation(&mut self, e: &Node, runs: &mut Vec<Run>) {
+        if self.in_note {
+            self.dropped.comments = true;
+            return;
+        }
+        let name = e.attr("office:name").unwrap_or("").to_owned();
+        let id = self.review.comments.len() as u32;
+        // Svar: `loext:parent-name` pekar på kommentaren (trådens rot) de svarar på.
+        let parent = e.attr("loext:parent-name").and_then(|p| self.review.names.iter().position(|n| !n.is_empty() && n == p)).map(|i| {
+            let i = i as u32;
+            self.review.comments[i as usize].parent.unwrap_or(i)
+        });
+        let child_text = |k: &str| e.child(k).map(|c| c.deep_text().trim().to_owned()).unwrap_or_default();
+        self.review.comments.push(CommentRec {
+            id,
+            parent,
+            author: child_text("dc:creator"),
+            date: child_text("dc:date"),
+            done: e.attr("loext:resolved") == Some("true"),
+            text: Self::annotation_text(e),
+        });
+        self.review.names.push(name.clone());
+        // Ett svar delar trådens område: dess markörer sätts intill förälderns efter läsningen (`attach_replies`),
+        // eftersom LibreOffice skriver svaret efter områdets slut.
+        if parent.is_some() {
+            return;
+        }
+        runs.push(Self::marker_run(review::marker_start(id)));
+        if !name.is_empty() && self.review.ends.contains(&name) {
+            self.review.pending_end.push(id);
+        } else {
+            runs.push(Self::marker_run(review::marker_end(id)));
+        }
+    }
+
+    /// Slutet på ett kommentarsområde.
+    fn annotation_end(&mut self, e: &Node, runs: &mut Vec<Run>) {
+        let Some(name) = e.attr("office:name") else { return };
+        let Some(id) = self.review.names.iter().position(|n| n == name) else { return };
+        let id = id as u32;
+        if self.review.pending_end.contains(&id) {
+            self.review.pending_end.retain(|&c| c != id);
+            runs.push(Self::marker_run(review::marker_end(id)));
         }
     }
 
@@ -993,9 +1151,17 @@ impl<'s, 'b> Rd<'s, 'b> {
             return;
         }
         if p.kind == Kind::Code && p.list.is_none() {
+            // Kommentarsmarkörer och raderad text hör inte hemma i ett kodblock.
+            let code_text = |p: &Para| -> String {
+                p.runs
+                    .iter()
+                    .filter(|r| !(r.raw && review::parse_marker(&r.text).is_some()) && !matches!(r.fmt.rev, Some((RevKind::Del, _))))
+                    .map(|r| r.text.as_str())
+                    .collect()
+            };
             if let Some(Block::Para(last)) = self.blocks.last_mut() {
                 if last.kind == Kind::Code && last.list.is_none() {
-                    let raw: String = p.runs.iter().map(|r| r.text.as_str()).collect();
+                    let raw = code_text(&p);
                     let first = &mut last.runs[0];
                     first.text.push('\n');
                     first.text.push_str(&raw);
@@ -1003,7 +1169,7 @@ impl<'s, 'b> Rd<'s, 'b> {
                 }
             }
             // Ett kodblock samlas i en enda körning.
-            let raw: String = p.runs.iter().map(|r| r.text.as_str()).collect();
+            let raw = code_text(&p);
             self.blocks.push(Block::Para(Para {
                 kind: Kind::Code,
                 runs: vec![Run { text: raw, fmt: Fmt::default(), link: None, raw: true }],
@@ -1284,6 +1450,9 @@ fn inline_md(run: &Run) -> String {
         if !run.fmt.span.is_empty() {
             s = wrap_tag(&s, &run.fmt.span.open_tag(), "</span>");
         }
+        if let Some((kind, id)) = run.fmt.rev {
+            s = format!("{}{s}{}", review::open_tag(kind, id), review::close_tag(kind));
+        }
         parts.push(s);
     }
     parts.concat()
@@ -1321,6 +1490,9 @@ fn para_md(p: &Para) -> String {
             let t = l.trim_start_matches('\t');
             if t.len() != l.len() {
                 format!("{}{t}", "    ".repeat(l.len() - t.len()))
+            } else if l.starts_with("<!--k:") {
+                // En rad som börjar med en markör vore annars ett HTML-block; `write` tar bort tecknet igen.
+                format!("&#8203;{l}")
             } else {
                 l.to_owned()
             }
@@ -1617,6 +1789,61 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults) {
 }
 
 /// Läser ett OpenDocument-textdokument som Markdown.
+/// Sätter svarens markörer intill trådens egna (`<!--k:c:0--><!--k:c:1-->…<!--k:/c:0--><!--k:/c:1-->`).
+fn attach_replies(md: &str, comments: &[CommentRec]) -> String {
+    let mut out = md.to_owned();
+    for root in comments.iter().filter(|c| c.parent.is_none()) {
+        let replies: Vec<u32> = comments.iter().filter(|c| c.parent == Some(root.id)).map(|c| c.id).collect();
+        if replies.is_empty() {
+            continue;
+        }
+        let (start, end) = (review::marker_start(root.id), review::marker_end(root.id));
+        let starts: String = replies.iter().map(|&r| review::marker_start(r)).collect();
+        let ends: String = replies.iter().map(|&r| review::marker_end(r)).collect();
+        out = out.replacen(&start, &format!("{start}{starts}"), 1).replacen(&end, &format!("{end}{ends}"), 1);
+    }
+    out
+}
+
+/// Förarbete: ändringsregionerna (`text:tracked-changes`) och namnen på kommentarsområdenas slut.
+fn read_regions(body: &Node, rv: &mut ReviewRd, dropped: &mut Dropped) {
+    fn ends(n: &Node, out: &mut std::collections::HashSet<String>) {
+        for c in n.els() {
+            if c.name == "office:annotation-end" {
+                if let Some(name) = c.attr("office:name") {
+                    out.insert(name.to_owned());
+                }
+            }
+            ends(c, out);
+        }
+    }
+    ends(body, &mut rv.ends);
+    for tc in body.els().filter(|c| c.name == "text:tracked-changes") {
+        for reg in tc.els().filter(|c| c.name == "text:changed-region") {
+            let Some(id) = reg.attr("text:id").or_else(|| reg.attr("xml:id")) else { continue };
+            for k in reg.els() {
+                let kind = match k.name.as_str() {
+                    "text:insertion" => RevKind::Ins,
+                    "text:deletion" => RevKind::Del,
+                    "text:format-change" => {
+                        dropped.format_changes = true;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let info = k.child("office:change-info");
+                let field = |n: &str| info.and_then(|i| i.child(n)).map(|c| c.deep_text().trim().to_owned()).unwrap_or_default();
+                let paras = if kind == RevKind::Del {
+                    k.els().filter(|c| matches!(c.name.as_str(), "text:p" | "text:h")).cloned().collect()
+                } else {
+                    Vec::new()
+                };
+                rv.regions.insert(id.to_owned(), Region { kind, author: field("dc:creator"), date: field("dc:date"), paras });
+            }
+        }
+    }
+}
+
 pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if !bytes.starts_with(b"PK") {
         return Err(crate::i18n::t("Filen är inte ett OpenDocument-textdokument (.odt).").into());
@@ -1684,7 +1911,9 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         cur_page: start_master.as_ref().and_then(|m| masters.get(m)).cloned().unwrap_or_default(),
         cur_master: start_master,
         masters,
+        review: ReviewRd::default(),
     };
+    read_regions(body, &mut rd.review, &mut rd.dropped);
     for c in body.els() {
         rd.walk(c);
     }
@@ -1699,6 +1928,10 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         for (i, n) in rd.notes.iter().enumerate() {
             markdown.push_str(&format!("[^{}]: {n}\n", i + 1));
         }
+    }
+    if !rd.review.revs.is_empty() || !rd.review.comments.is_empty() {
+        markdown = attach_replies(&markdown, &rd.review.comments);
+        markdown = review::prune(&review::put_records(&markdown, &rd.review.revs, &rd.review.comments));
     }
     let comment = defaults.to_comment();
     if !comment.is_empty() {
@@ -1874,6 +2107,32 @@ struct W<'a> {
     section_open: bool,
     n_sect: usize,
     pending_break: Option<String>,
+    review: ReviewWr,
+}
+
+/// En ändringsregion som skrivs: slag, post och (för raderingar) det raderade innehållet som XML.
+struct WRegion {
+    id: String,
+    kind: RevKind,
+    rec: RevRec,
+    content: String,
+}
+
+/// Granskningsläget vid skrivning: posterna, ändringen som gäller just nu, regionerna och kommentarerna.
+#[derive(Default)]
+struct ReviewWr {
+    revs: HashMap<u32, RevRec>,
+    comments: HashMap<u32, CommentRec>,
+    /// Ändringen som texten ligger i (`<ins>`/`<del>`).
+    cur: Option<(RevKind, u32)>,
+    regions: Vec<WRegion>,
+    /// Den öppna infogningen (ändringens nummer, regionens plats) och den senaste raderingen.
+    ins_open: Option<(u32, usize)>,
+    del_last: Option<(u32, usize)>,
+    started: std::collections::HashSet<u32>,
+    ended: std::collections::HashSet<u32>,
+    /// Svar (delar förälderns område och får ingen egen slutmarkör).
+    replies: std::collections::HashSet<u32>,
 }
 
 fn heading_num(level: HeadingLevel) -> u8 {
@@ -1954,7 +2213,118 @@ impl<'a> W<'a> {
             section_open: false,
             n_sect: 0,
             pending_break: None,
+            review: ReviewWr::default(),
         }
+    }
+
+    fn region(&mut self, kind: RevKind, id: u32) -> usize {
+        let rec = self.review.revs.get(&id).cloned().unwrap_or(RevRec { id, ..Default::default() });
+        let n = self.review.regions.len() + 1;
+        self.review.regions.push(WRegion { id: format!("ct{n}"), kind, rec, content: String::new() });
+        self.review.regions.len() - 1
+    }
+
+    /// Öppnar en infogning för ändring `want` (och stänger en annan som är öppen); `None` stänger.
+    fn sync_ins(&mut self, want: Option<u32>) {
+        if self.review.ins_open.map(|(id, _)| id) == want {
+            return;
+        }
+        self.end_ins();
+        if let Some(id) = want {
+            let idx = self.region(RevKind::Ins, id);
+            self.body.push_str(&format!("<text:change-start text:change-id=\"{}\"/>", self.review.regions[idx].id));
+            self.review.ins_open = Some((id, idx));
+        }
+    }
+
+    fn end_ins(&mut self) {
+        if let Some((_, idx)) = self.review.ins_open.take() {
+            self.body.push_str(&format!("<text:change-end text:change-id=\"{}\"/>", self.review.regions[idx].id));
+        }
+    }
+
+    /// Raderad text: den ligger i ändringsregionen, och `text:change` markerar platsen.
+    fn run_deleted(&mut self, id: u32, text: &str, code: bool) {
+        let style = if self.code { None } else { self.text_style(code) };
+        let t = self.odt_text(text);
+        let x = match style {
+            Some(s) => format!("<text:span text:style-name=\"{s}\">{t}</text:span>"),
+            None => t,
+        };
+        match self.review.del_last {
+            Some((last, idx)) if last == id => self.review.regions[idx].content.push_str(&x),
+            _ => {
+                self.end_ins();
+                let idx = self.region(RevKind::Del, id);
+                self.review.regions[idx].content = x;
+                self.body.push_str(&format!("<text:change text:change-id=\"{}\"/>", self.review.regions[idx].id));
+                self.review.del_last = Some((id, idx));
+            }
+        }
+    }
+
+    /// Kommentarsområdets början (`office:annotation`) eller slut (`office:annotation-end`).
+    fn comment_marker(&mut self, start: bool, id: u32) {
+        let Some(rec) = self.review.comments.get(&id).cloned() else { return };
+        if self.in_note {
+            return;
+        }
+        if start {
+            if !self.review.started.insert(id) {
+                return;
+            }
+            self.open_para();
+            self.review.del_last = None;
+            let mut attrs = format!(" office:name=\"kladd-{id}\"");
+            if let Some(p) = rec.parent.filter(|p| self.review.started.contains(p)) {
+                self.review.replies.insert(id);
+                attrs.push_str(&format!(" loext:parent-name=\"kladd-{p}\""));
+            }
+            if rec.done {
+                attrs.push_str(" loext:resolved=\"true\"");
+            }
+            let mut x = format!("<office:annotation{attrs}>");
+            if !rec.author.is_empty() {
+                x.push_str(&format!("<dc:creator>{}</dc:creator>", esc(&rec.author)));
+            }
+            if !rec.date.is_empty() {
+                x.push_str(&format!("<dc:date>{}</dc:date>", esc(&rec.date)));
+            }
+            for line in rec.text.split('\n') {
+                x.push_str(&format!("<text:p>{}</text:p>", annotation_line(line)));
+            }
+            x.push_str("</office:annotation>");
+            self.body.push_str(&x);
+        } else if self.review.started.contains(&id) && !self.review.replies.contains(&id) && self.review.ended.insert(id) {
+            self.open_para();
+            self.body.push_str(&format!("<office:annotation-end office:name=\"kladd-{id}\"/>"));
+        }
+    }
+
+    /// `text:tracked-changes` med alla regioner (tom sträng utan ändringar).
+    fn tracked_changes(&self) -> String {
+        if self.review.regions.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("<text:tracked-changes text:track-changes=\"false\">");
+        for r in &self.review.regions {
+            s.push_str(&format!("<text:changed-region xml:id=\"{0}\" text:id=\"{0}\">", r.id));
+            let tag = if r.kind == RevKind::Ins { "text:insertion" } else { "text:deletion" };
+            s.push_str(&format!("<{tag}><office:change-info>"));
+            if !r.rec.author.is_empty() {
+                s.push_str(&format!("<dc:creator>{}</dc:creator>", esc(&r.rec.author)));
+            }
+            if !r.rec.date.is_empty() {
+                s.push_str(&format!("<dc:date>{}</dc:date>", esc(&r.rec.date)));
+            }
+            s.push_str("</office:change-info>");
+            if r.kind == RevKind::Del {
+                s.push_str(&format!("<text:p text:style-name=\"Standard\">{}</text:p>", r.content));
+            }
+            s.push_str(&format!("</{tag}></text:changed-region>"));
+        }
+        s.push_str("</text:tracked-changes>");
+        s
     }
 
     /// Ett automatiskt styckeformat som börjar en ny sida med sidmallen `brk`, eller en ny spalt (`column`)
@@ -2092,6 +2462,7 @@ impl<'a> W<'a> {
 
     fn close_link(&mut self) {
         if self.link_open {
+            self.end_ins();
             self.body.push_str("</text:a>");
             self.link_open = false;
         }
@@ -2099,6 +2470,8 @@ impl<'a> W<'a> {
 
     fn close_para(&mut self) {
         if let Some(t) = self.open.take() {
+            self.end_ins();
+            self.review.del_last = None;
             self.close_link();
             self.body.push_str(t);
         }
@@ -2212,10 +2585,25 @@ impl<'a> W<'a> {
     }
 
     fn run(&mut self, text: &str, code: bool) {
+        // Den osynliga tecknet-referensen framför en markör i radens början (se `read`).
+        let cleaned;
+        let text = if text.contains('\u{200B}') {
+            cleaned = text.replace('\u{200B}', "");
+            cleaned.as_str()
+        } else {
+            text
+        };
         if text.is_empty() {
             return;
         }
         self.open_para();
+        let cur = self.review.cur.filter(|_| !self.in_note);
+        if let Some((RevKind::Del, id)) = cur {
+            self.run_deleted(id, text, code);
+            return;
+        }
+        self.review.del_last = None;
+        self.sync_ins(cur.map(|(_, id)| id));
         self.open_link_if_needed();
         let style = if self.code { None } else { self.text_style(code) };
         let t = self.odt_text(text);
@@ -2329,7 +2717,13 @@ impl<'a> W<'a> {
     fn html(&mut self, s: &str) {
         let t = s.trim();
         let single_line = t.lines().count() == 1;
-        if t == crate::word::nav::TOC_LINE {
+        if let Some((start, id)) = review::parse_marker(t) {
+            self.comment_marker(start, id);
+        } else if let Some(open) = review::parse_open_tag(t) {
+            self.review.cur = Some(open).filter(|_| !self.in_note);
+        } else if review::is_close_tag(t) {
+            self.review.cur = None;
+        } else if t == crate::word::nav::TOC_LINE {
             self.close_para();
             self.toc();
         } else if let Some(props) = sections::SectionProps::from_comment(t).filter(|_| self.table.is_none()) {
@@ -2424,8 +2818,10 @@ impl<'a> W<'a> {
     }
 }
 
-fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: f32, defaults: &DocDefaults) -> W<'a> {
+fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: f32, defaults: &DocDefaults, revs: Vec<RevRec>, comments: Vec<CommentRec>) -> W<'a> {
     let mut w = W::new(resolve, text_w);
+    w.review.revs = revs.into_iter().map(|r| (r.id, r)).collect();
+    w.review.comments = comments.into_iter().map(|c| (c.id, c)).collect();
     w.defaults = defaults.clone();
     w.first = sections::Section::resolve(&sections::SectionProps::default(), defaults);
     w.cur = w.first.clone();
@@ -2657,7 +3053,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
     w
 }
 
-const NS: &str = "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\" xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"";
+const NS: &str = "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" xmlns:loext=\"urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\" xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"";
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
 
 fn now_w3cdtf() -> String {
@@ -2678,6 +3074,30 @@ fn now_w3cdtf() -> String {
 }
 
 /// Sidhuvudets eller sidfotens innehåll: text och fälten (`{sida}` …) som ODF-fält.
+/// En rad i en kommentar som `text:p`-innehåll (flera mellanslag och flikar bevaras).
+fn annotation_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = true;
+    for c in line.chars() {
+        match c {
+            ' ' => {
+                out.push_str(if prev_space { "<text:s/>" } else { " " });
+                prev_space = true;
+            }
+            '\t' => {
+                out.push_str("<text:tab/>");
+                prev_space = true;
+            }
+            '\r' => {}
+            c => {
+                out.push_str(&esc(&c.to_string()));
+                prev_space = false;
+            }
+        }
+    }
+    out
+}
+
 fn hf_inline(text: &str, f: &style::Fields) -> String {
     let fields: [(&str, String); 5] = [
         ("{sida}", format!("<text:page-number text:select-page=\"current\">{}</text:page-number>", f.page)),
@@ -2993,9 +3413,10 @@ fn manifest_xml(media: &[(String, Vec<u8>, &'static str)]) -> String {
 /// Bygger ett komplett .odt-paket av Markdown-text.
 /// `resolve` hämtar bilddata för en bildkälla (`bild:namn`, en sökväg …).
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
-    // Spårade ändringar och kommentarer kan inte skrivas i .odt: ändringarna godkänns, kommentarerna utelämnas.
-    let cleaned = crate::review::clean_for_export(markdown);
-    let markdown = cleaned.as_str();
+    // Spårade ändringar och kommentarer: posterna lyfts ur texten och skrivs som `text:tracked-changes`
+    // och `office:annotation`.
+    let (stripped, revs, comments) = review::split_records(markdown);
+    let markdown = stripped.as_str();
     let first = markdown.lines().next().unwrap_or("");
     let (defaults, markdown) = match DocDefaults::from_comment(first) {
         Some(d) => (d, markdown[first.len()..].trim_start_matches(['\n', '\r'])),
@@ -3004,13 +3425,14 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     let (pw, _) = defaults.page();
     let m = defaults.margins();
     let text_w = (pw - m[1] - m[3]).max(36.0);
-    let mut w = build_body(markdown, resolve, text_w, &defaults);
+    let mut w = build_body(markdown, resolve, text_w, &defaults, revs, comments);
     w.fonts.insert(defaults.font().to_owned());
     w.fonts.extend(style::STYLE_IDS.iter().filter_map(|&id| defaults.styles.get(id).font_family.clone()));
     let content = format!(
-        "{XML_DECL}<office:document-content {NS} office:version=\"1.2\">{}<office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{}</office:text></office:body></office:document-content>",
+        "{XML_DECL}<office:document-content {NS} office:version=\"1.2\">{}<office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{}{}</office:text></office:body></office:document-content>",
         font_decls(&w.fonts),
         w.auto,
+        w.tracked_changes(),
         w.body
     );
 
@@ -3384,12 +3806,13 @@ Slut.
 </office:text></office:body></office:document-content>"##;
 
     #[test]
-    fn tracked_changes_are_accepted_and_deleted_text_stays_out() {
+    fn tracked_changes_become_review_markup() {
         let c = r##"<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.3"><office:body><office:text><text:tracked-changes text:track-changes="true"><text:changed-region text:id="ct1"><text:insertion><office:change-info><dc:creator>Ada</dc:creator><dc:date>2026-05-01T10:00:00</dc:date></office:change-info></text:insertion></text:changed-region><text:changed-region text:id="ct2"><text:deletion><office:change-info><dc:creator>Bo</dc:creator><dc:date>2026-05-02T10:00:00</dc:date></office:change-info><text:p text:style-name="Standard">Borttagen</text:p></text:deletion></text:changed-region></text:tracked-changes><text:p text:style-name="Standard">Hej <text:change-start text:change-id="ct1"/>nya<text:change-end text:change-id="ct1"/> värld<text:change text:change-id="ct2"/>.</text:p></office:text></office:body></office:document-content>"##;
         let l = read(&make_odt(c, LO_STYLES, &[])).unwrap();
-        assert!(l.markdown.contains("Hej nya värld."), "{}", l.markdown);
-        assert!(!l.markdown.contains("Borttagen"), "{}", l.markdown);
+        assert!(l.markdown.contains("Hej <ins data-k=\"1\">nya</ins> värld<del data-k=\"2\">Borttagen</del>."), "{}", l.markdown);
+        assert!(crate::review::accept_all(&l.markdown).trim().ends_with("Hej nya värld."));
+        assert!(l.markdown.contains("author=\"Ada\"") && l.markdown.contains("author=\"Bo\""), "{}", l.markdown);
     }
 
     #[test]
@@ -3562,6 +3985,10 @@ Slut.
 #[cfg(test)]
 #[path = "odt_fn_tests.rs"]
 mod fn_tests;
+
+#[cfg(test)]
+#[path = "odt_review_tests.rs"]
+mod review_tests;
 
 #[cfg(test)]
 #[path = "odt_section_tests.rs"]

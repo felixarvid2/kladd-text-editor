@@ -269,7 +269,7 @@ lägger dit.
 `.docx`: `odt::read(bytes) -> docx::Loaded` och `odt::write(markdown, titel, resolve) -> docx::Written`.
 Formatmallar (`office:styles` och `office:automatic-styles` i `styles.xml`/`content.xml`) löses längs
 `style:parent-style-name`; bara det som skiljer sig från grundformatet (standardstycket + Standard)
-blir `<span style>`. Fotnoter, kommentarer, former/diagram och länkade bilder tas bort och rapporteras
+blir `<span style>`. Spårade ändringar och kommentarer läses och skrivs (se *Granska* nedan). Fotnoter, former/diagram och länkade bilder tas bort och rapporteras
 som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/sidfot (`text:page-number`
 → `{sida}`, `text:page-count` → `{sidor}`, `text:date`, `text:title`, `text:file-name`, flikar och `style:header-first`) hamnar i grundformatskommentaren. Vid skrivning ligger
 `mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
@@ -501,9 +501,25 @@ annars byggs den av posterna (oförändrade kommentarer ordagrant, nya med `w14:
 brödtexten tas bort. Spårade formateringsändringar (`rPrChange`, `pPrChange`) tas fortfarande bort när ett
 stycke skrivs om och rapporteras som "spårade formateringsändringar".
 
-**ODT**: `text:tracked-changes` godkänns vid läsning (infogad text stannar, raderad text kommer inte med),
-`office:annotation` tas bort som förut, och `odt::write` godkänner ändringarna och utelämnar kommentarerna.
-Spårade ändringar och kommentarer i .odt är alltså inte stödda fullt ut.
+**ODT** (`odt.rs`, tester i `odt_review_tests.rs`, LibreOffice-fixtur i `tests/data/odt_review_lo.odt`): samma
+modell som Word. `odt::read` förbereder regionerna ur `text:tracked-changes` (`read_regions`: slag, `dc:creator`,
+`dc:date` och det raderade innehållet). `text:change-start`/`text:change-end` runt en `text:insertion` blir
+`<ins>` (kan gå över flera stycken, ett nummer och en post), och en `text:deletion` blir `<del>` med det raderade
+stycket inlagt där `text:change` (eller `text:change-start`) står; flera raderade stycken skarvas med mellanslag.
+`office:annotation` ger en post (`dc:creator`, `dc:date`, `text:p` som rader, `loext:resolved` = löst) och
+startmarkören; slutet kommer från `office:annotation-end` med samma `office:name` (saknas den blir området
+tomt). Ett svar (`loext:parent-name`) skrivs av LibreOffice efter förälderns slut, så svarets markörer sätts
+intill förälderns efter läsningen (`attach_replies`). Markörer och raderad text tas bort ur kodblock och
+`text:format-change` rapporteras som "spårade formatändringar". Orörda dokument skrivs om från Markdown som förut
+(ingen originalkopia, som i `.docx`), så allt som läses skrivs också.
+`odt::write` lyfter posterna ur texten (`review::split_records`) och skriver `text:tracked-changes` först i
+`office:text` med en region per infogning (`text:change-start`/`-end`, en ny region om infogningen bryts av en
+länk eller ett stycke) och per radering (`text:change` på platsen, texten i regionens `text:p`, intilliggande
+körningar i samma ändring delar region), samt `office:annotation` med `office:name="kladd-N"`,
+`loext:parent-name` och `loext:resolved` och `office:annotation-end` (inte för svar). Kommentarer utan område i
+texten och poster utan markörer utelämnas. Kontrollerat mot LibreOffice: det skrivna paketet konverteras till
+`.docx` och `.odt` utan fel och ändringarna och kommentarerna läses tillbaka (LibreOffices `.docx`-export
+skriver inga områden för svar och punktkommentarer, så de syns bara i `.odt`).
 
 ## Avsnitt: liggande sidor och spalter
 

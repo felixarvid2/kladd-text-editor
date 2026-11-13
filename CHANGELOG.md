@@ -7,6 +7,9 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Ändrat
 
 - **PDF sparas som inkrementell uppdatering.** Anteckningar och ifyllda formulärfält läggs sist i den ursprungliga filen (nya objekt, nytt xref-avsnitt och trailer med `/Prev`) i stället för att hela filen skrivs om, så digitala signaturer fortsätter gälla och filen struktureras inte om. Krypterade PDF:er skrivs som förut om avkrypterade. Egenskapsdialogen visar *Signerad: ja (n signaturer)*, och att ordna sidor i en signerad PDF frågar först (*Att ordna sidor tar bort signaturerna*).
+### Nytt
+
+- **Spårade ändringar och kommentarer i `.odt`.** Ändringar (`text:tracked-changes`: infogningar och raderingar med författare och datum) och kommentarer (`office:annotation`, med svar och löst-markering från LibreOffice) visas nu i dokumentläget som i `.docx` och sparas tillbaka som riktiga LibreOffice-ändringar och kommentarer, i stället för att godkännas respektive tas bort. Formatändringar (`text:format-change`) kan inte visas och rapporteras som borttagna.
 
 ## [2.0.0] – 2026-11-13
 
