@@ -153,7 +153,7 @@ impl Geo {
 
     /// Rektangel i användarrymd (x0, y0, x1, y1) → normaliserad rektangel i visningspunkter,
     /// begränsad till sidan.
-    fn rect(&self, a: (f32, f32, f32, f32)) -> egui::Rect {
+    pub(crate) fn rect(&self, a: (f32, f32, f32, f32)) -> egui::Rect {
         let (ax, ay) = self.point(a.0, a.1);
         let (bx, by) = self.point(a.2, a.3);
         let (w, h) = self.size();
@@ -189,13 +189,13 @@ fn inherited(doc: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
     None
 }
 
-fn num(doc: &Document, o: &Object) -> Option<f32> {
+pub(crate) fn num(doc: &Document, o: &Object) -> Option<f32> {
     let v = doc.dereference(o).ok()?.1.as_float().ok()?;
     v.is_finite().then_some(v)
 }
 
 /// `[x0 y0 x1 y1]` normaliserad (min/max); `None` om tom eller ogiltig.
-fn rect_of(doc: &Document, o: &Object) -> Option<(f32, f32, f32, f32)> {
+pub(crate) fn rect_of(doc: &Document, o: &Object) -> Option<(f32, f32, f32, f32)> {
     let a = o.as_array().ok()?;
     let v: Vec<f32> = a.iter().filter_map(|x| num(doc, x)).collect();
     if v.len() < 4 {
@@ -215,7 +215,7 @@ const PDFDOC_80: [char; 33] = [
 const PDFDOC_18: [char; 8] = ['\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}', '\u{02DC}'];
 
 /// PDF-textsträng: UTF-16BE/LE med BOM, UTF-8 med BOM eller PDFDocEncoding.
-fn decode_text(b: &[u8]) -> String {
+pub(crate) fn decode_text(b: &[u8]) -> String {
     let s: String = if b.starts_with(&[0xFE, 0xFF]) || b.starts_with(&[0xFF, 0xFE]) {
         let le = b[0] == 0xFF;
         let u: Vec<u16> = b[2..]

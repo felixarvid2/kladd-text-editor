@@ -72,9 +72,10 @@ fn open_error(e: OpenError) -> String {
 
 /// Flikens bytes utan kryptering (lösenordet används om det finns).
 fn plain(tab: &PdfTab) -> Result<Vec<u8>, String> {
-    // Osparade anteckningar bakas in först, så att de följer med sina sidor (commit tömmer listan).
+    // Osparade anteckningar och formulärvärden bakas in först, så att de följer med sina sidor
+    // (commit tömmer listan och läser om fälten).
     let edited;
-    let bytes: &[u8] = if tab.view.annot.has_pending() {
+    let bytes: &[u8] = if tab.view.annot.has_pending() || tab.view.forms.dirty() {
         edited = tab.edited_bytes()?;
         &edited
     } else {
@@ -101,6 +102,7 @@ fn commit(ctx: &egui::Context, tab: &mut PdfTab, new: Vec<u8>, sel: BTreeSet<usi
     tab.org.history.push(prev);
     tab.pages_changed = true;
     tab.view.annot.clear();
+    tab.reload_forms();
     if let Some(&first) = sel.iter().next() {
         tab.view.go_to_page(first);
     }
@@ -137,11 +139,16 @@ pub fn run(ctx: &egui::Context, tab: &mut PdfTab, op: &OrgOp) -> Result<String, 
             Ok(String::new())
         }
         OrgOp::Undo | OrgOp::Redo => {
+            // Äldre versioner saknar de osparade anteckningarna och fältvärdena, som annars skulle försvinna.
+            if tab.view.annot.has_pending() || tab.view.forms.dirty() {
+                return Err("Spara först: det finns osparade anteckningar eller formulärvärden.".to_owned());
+            }
             let cur = tab.view.bytes().clone();
             let (next, what) = if *op == OrgOp::Undo { (tab.org.history.undo(cur), "Ångrade") } else { (tab.org.history.redo(cur), "Gjorde om") };
             let Some(bytes) = next else { return Ok(String::new()) };
             install(ctx, tab, bytes)?;
             tab.pages_changed = true;
+            tab.reload_forms();
             tab.org.sel.clear();
             Ok(format!("{what} sidändringen"))
         }

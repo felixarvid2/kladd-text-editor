@@ -4,6 +4,7 @@
 pub mod annot;
 pub mod chrome;
 pub mod engine;
+pub mod forms;
 pub mod meta;
 pub mod organize;
 pub mod pages;

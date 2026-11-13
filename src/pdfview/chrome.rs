@@ -99,15 +99,19 @@ pub struct PdfTab {
 }
 
 impl PdfTab {
-    /// Osparade ändringar i fliken: sidordning eller nya anteckningar.
+    /// Osparade ändringar i fliken: sidordning, nya anteckningar eller ifyllda formulärfält.
     pub fn unsaved(&self) -> bool {
-        self.pages_changed || self.view.annot.has_pending()
+        self.pages_changed || self.view.annot.has_pending() || self.view.forms.dirty()
     }
 
     /// PDF:en med alla osparade ändringar: sidändringarna finns redan i visarens bytes,
-    /// anteckningarna läggs på här.
+    /// formulärvärden och anteckningar läggs på här (objektnumren behålls, så ordningen spelar ingen roll).
     pub fn edited_bytes(&self) -> Result<Vec<u8>, String> {
         let mut out = self.view.bytes().as_ref().clone();
+        if self.view.forms.dirty() {
+            // Formulär visas bara för okrypterade PDF:er.
+            out = crate::pdfview::forms::apply(&out, None, &self.view.forms.changes())?;
+        }
         if self.view.annot.has_pending() {
             // Efter sidändringar är bytes redan avkrypterade och lösenordet behövs inte.
             let pw = if self.pages_changed { None } else { self.password.as_deref() };
@@ -120,9 +124,11 @@ impl PdfTab {
     pub fn mark_saved(&mut self) {
         self.pages_changed = false;
         self.view.annot.clear();
+        self.reload_forms();
     }
 
-    pub fn new(view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
+    pub fn new(mut view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
+        view.forms = super::forms::FormState::load(view.bytes(), password.as_deref());
         let has_outline = !view.meta().outline.is_empty();
         Self {
             view,
@@ -146,6 +152,11 @@ impl PdfTab {
             ocr: Default::default(),
             annotate: false,
         }
+    }
+
+    /// Läser formulärfälten på nytt ur visarens bytes (efter sparning eller omläsning).
+    pub fn reload_forms(&mut self) {
+        self.view.forms = super::forms::FormState::load(self.view.bytes(), self.password.as_deref());
     }
 
     /// Är någon dialog öppen (då ska kortkommandon vänta)?

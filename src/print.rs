@@ -205,11 +205,15 @@ fn render_pdf(doc: &Document) -> Result<PathBuf, String> {
     let title = doc.title();
     // En PDF i visaren skrivs ut som originalfilen, inte som en omrendering av texten.
     let bytes = match &doc.pdfv {
-        Some(tab) => match tab.password.as_deref() {
-            // Skrivaren kan inte lösenordet: skriv ut en avkrypterad kopia.
-            Some(pw) => decrypted_pdf(tab.view.bytes(), pw).unwrap_or_else(|| tab.view.bytes().as_ref().clone()),
-            None => tab.view.bytes().as_ref().clone(),
-        },
+        Some(tab) => {
+            // Osparade ändringar (sidor, anteckningar, formulärvärden) ska med på pappret.
+            let base = if tab.unsaved() { tab.edited_bytes().unwrap_or_else(|_| tab.view.bytes().as_ref().clone()) } else { tab.view.bytes().as_ref().clone() };
+            match tab.password.as_deref() {
+                // Skrivaren kan inte lösenordet: skriv ut en avkrypterad kopia.
+                Some(pw) => decrypted_pdf(&base, pw).unwrap_or(base),
+                None => base,
+            }
+        }
         None => {
             let base = doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
             let images = &doc.images;

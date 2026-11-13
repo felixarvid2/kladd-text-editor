@@ -1486,6 +1486,9 @@ impl KladdApp {
                 self.save_doc(ctx, self.active, false, false);
             }
         }
+        if pdf && pdf_changed && menu_item(ui, p, "Spara kopia…", "Ctrl+Shift+S", None, true) {
+            self.request_save_copy(ctx, self.active);
+        }
         if menu_item(ui, p, "Spara som…", "Ctrl+Shift+S", None, has_doc && !pdf) {
             self.request_save_as(ctx, self.active, false, false);
         }
@@ -2725,6 +2728,7 @@ impl KladdApp {
             tab.view.reload(engine, meta, bytes);
             tab.pages_changed = false;
             tab.org.reset();
+            tab.reload_forms();
             Ok(true)
         })();
         match result {
@@ -2740,7 +2744,7 @@ impl KladdApp {
         let now = Self::now(ctx);
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let path = doc.path.clone();
-        // Osparade sidändringar och anteckningar gör fliken "ändrad" (fråga vid stängning).
+        // Osparade sidändringar, anteckningar och formulärvärden gör fliken "ändrad" (fråga vid stängning).
         if let Some(t) = doc.pdfv.as_deref() {
             doc.dirty = t.unsaved();
         }
@@ -2750,8 +2754,8 @@ impl KladdApp {
         if now >= tab.next_check {
             tab.next_check = now + pdfui::CHECK_EVERY;
             if let Some(stamp) = path.as_deref().and_then(pdfui::file_stamp) {
-                // Osparade sidändringar skrivs inte över av en ändring på disk.
-                reload = tab.stamp.is_some() && tab.stamp != Some(stamp) && !tab.pages_changed;
+                // Osparade ändringar skrivs inte över av en ändring på disk.
+                reload = tab.stamp.is_some() && tab.stamp != Some(stamp) && !tab.unsaved();
             }
         }
         // Sidan som bild är färdig.
@@ -2875,7 +2879,19 @@ impl KladdApp {
 
     fn write_pdf_copy(&mut self, ctx: &egui::Context, doc_id: u64, path: &Path) {
         let Some(idx) = self.index_of(doc_id) else { return };
-        let Some(bytes) = self.docs[idx].pdfv.as_ref().map(|t| t.view.bytes().clone()) else { return };
+        let Some(tab) = self.docs[idx].pdfv.as_ref() else { return };
+        // Ifyllda formulärvärden följer med i kopian.
+        let bytes = if tab.view.forms.dirty() {
+            match crate::pdfview::forms::apply(tab.view.bytes(), tab.password.as_deref(), &tab.view.forms.changes()) {
+                Ok(b) => Arc::new(b),
+                Err(e) => {
+                    self.notify(ctx, e, true);
+                    return;
+                }
+            }
+        } else {
+            tab.view.bytes().clone()
+        };
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if self.docs[idx].path.as_deref() == Some(canon.as_path()) {
             self.notify(ctx, "Välj ett annat namn än originalfilens.", true);
@@ -2946,6 +2962,10 @@ impl KladdApp {
         if let Some(act) = pdfui::toolbar(ui, p, tab) {
             self.pdf_action(&ui.ctx().clone(), act);
         }
+        let Some(tab) = self.pdf_tab_mut() else { return };
+        if let Some(crate::pdfview::forms::FormAction::Save) = crate::pdfview::forms::bar(ui, p, &mut tab.view.forms) {
+            self.save_doc(&ui.ctx().clone(), self.active, false, false);
+        }
     }
 
     fn pdf_sidebar(&mut self, ui: &mut Ui, p: &Palette) {
@@ -3005,6 +3025,13 @@ impl KladdApp {
         }
         if hit(Modifiers::NONE, Key::F5) {
             tab.present();
+        }
+        // Formulärfält: Tab, Esc och mellanslag hör till fältet som är öppet.
+        tab.view.forms.pre_keys(ctx);
+        if let Some((page, r)) = tab.view.forms.take_goto() {
+            if page != tab.view.current_page() {
+                tab.view.go_to(&crate::pdfview::meta::Dest { page, y: Some((r.top() - 40.0).max(0.0)) });
+            }
         }
         // Skriver man i sök- eller sidfältet ska bokstäverna inte vara visarens kommandon.
         let mut org = None;

@@ -511,6 +511,8 @@ pub struct PdfView {
     pending_uri: Option<String>,
     /// Nya anteckningar som inte sparats än (annot.rs).
     pub annot: super::annot::AnnotState,
+    /// Formulärfält (AcroForm): värden och redigering; se `forms.rs`.
+    pub forms: super::forms::FormState,
 }
 
 impl PdfView {
@@ -561,6 +563,7 @@ impl PdfView {
             space: None,
             find: None,
             pending_uri: None,
+            forms: Default::default(),
         };
         if let Some(m) = memory {
             v.zoom_mode = m.zoom_mode;
@@ -1475,6 +1478,7 @@ impl PdfView {
                 self.paint_page(ui, ctx, p, r, pal, dark, true);
                 let xf = self.xf(layout, p, origin);
                 self.paint_overlays(ui, p, &xf);
+                self.forms.page_ui(ui, p, &xf);
             }
         }
         self.interact(ui, ctx, &resp, origin);
