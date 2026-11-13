@@ -22,6 +22,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Menyrad i stället för en lång hamburgermeny.** *Arkiv · Redigera · Visa · Infoga · Verktyg · Hjälp* (och *Format* i dokumentläget) ligger i övre raden och byggs ur ett gemensamt kommandoregister (`src/commands.rs`, se `docs/dev/kommandon.md`). Menyerna visar bara det som hör till läget. I smala fönster samlas de under hamburgerknappen som undermenyer. Inställningarna som låg i menyn (språk, säkerhetskopiering, uppdateringar, spara automatiskt) ligger i *Inställningar*.
 
+- **Git i arbetsmappen.** Är den öppna mappen ett git-arkiv visar filträdet status per fil (M, A, U, D, konflikt; mappar med ändringar markeras) och statusraden grenen med ↑/↓ mot fjärrgrenen, uppdaterat när fönstret får fokus och efter sparning. Marginalen i textläget markerar tillagda, ändrade och borttagna rader mot HEAD; ett klick på en markör visar de gamla raderna med *Återställ ändringen*. *Jämför med HEAD…* öppnar en diff och *Visa blame* visar författare, ålder och meddelande per rad. Källkontrollpanelen (`Ctrl+Shift+G`) har köa/ta ur kön, förkasta, incheckningsmeddelande med *Checka in* (`Ctrl+Enter`) och *Checka in och pusha*, hämta/pulla/pusha, byte och skapande av gren och de 50 senaste incheckningarna; fel visas som notiser med git:s meddelande. Använder programmet `git` i bakgrunden (inga nya beroenden); saknas det döljs allt Git-relaterat.
+
 ## [2.0.0] – 2026-11-13
 
 ### Nytt

@@ -77,6 +77,11 @@ pub struct Env<'a> {
     pub find_open: bool,
     pub tracking: bool,
     pub changes: usize,
+    /// Git finns, och den aktiva fliken är en textfil med sökväg (jämförelse och blame).
+    pub git_doc: bool,
+    pub git_repo: bool,
+    pub blame_on: bool,
+    pub scm_open: bool,
 }
 
 impl<'a> Env<'a> {
@@ -95,6 +100,10 @@ impl<'a> Env<'a> {
             find_open: app.find.open,
             tracking: app.review_tracking(),
             changes: app.review_changes(),
+            git_doc: app.git.available() && doc.is_some_and(|d| d.path.is_some() && d.pdfv.is_none() && !d.docx && !d.pdf),
+            git_repo: app.git.repo().is_some(),
+            blame_on: app.git.blame_on,
+            scm_open: app.git.scm && app.settings.workspace_panel,
         }
     }
 
@@ -114,6 +123,10 @@ impl<'a> Env<'a> {
             find_open: false,
             tracking: false,
             changes: 0,
+            git_doc: false,
+            git_repo: false,
+            blame_on: false,
+            scm_open: false,
         }
     }
 }
@@ -413,6 +426,9 @@ pub static ALL: &[Command] = &[
     Command::new("tools.grammar", "Grammatikkontroll", Tools, "", always, |a, _| a.grammar_toggle()).checked(|e| e.settings.grammar),
     Command::new("tools.grammar_settings", "Grammatik och stil…", Tools, "", always, |a, _| a.open_grammar_dialog(false)),
     Command::new("tools.autocorrect", "Autokorrigering…", Tools, "", always, |a, _| a.open_autocorrect_dialog()),
+    Command::new("git.compare", "Jämför med HEAD…", Tools, "", |e| e.git_doc, |a, c| a.git_compare_active(c)).sep(),
+    Command::new("git.blame", "Visa blame", Tools, "", |e| e.git_doc, |a, _| a.git.blame_on = !a.git.blame_on).checked(|e| e.blame_on),
+    Command::new("git.scm", "Källkontroll", Tools, "Ctrl+Shift+G", |e| e.git_repo, |a, _| a.git_toggle_scm_open()).checked(|e| e.scm_open),
     Command::new("review.track", "Spåra ändringar", Tools, "Ctrl+Shift+E", |e| e.word, |a, c| a.review_act(c, ReviewAct::ToggleTrack)).scope(Scope::Word).checked(|e| e.tracking).sep(),
     Command::new("review.accept", "Godkänn ändring", Tools, "", |e| e.changes > 0, |a, c| a.review_act(c, ReviewAct::Accept)).scope(Scope::Word),
     Command::new("review.reject", "Avvisa ändring", Tools, "", |e| e.changes > 0, |a, c| a.review_act(c, ReviewAct::Reject)).scope(Scope::Word),

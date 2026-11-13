@@ -279,6 +279,8 @@ pub struct KladdApp {
     pub(crate) ff: crate::find_files::State,
     /// Kommandopalett och inställningsfönster (`commands.rs`).
     pub(crate) cmd: commands::State,
+    /// Git: status, marginal, källkontroll (`git_ui.rs`).
+    pub(crate) git: crate::git_ui::State,
 }
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
@@ -404,6 +406,7 @@ impl KladdApp {
             ws: Default::default(),
             ff: Default::default(),
             cmd: Default::default(),
+            git: Default::default(),
         };
         let (tx, rx) = channel();
         app.owns_socket = single_instance && single::listen(tx.clone(), ctx.clone());
@@ -677,6 +680,7 @@ impl KladdApp {
     fn after_save(&mut self, idx: usize, path: &Path) {
         let Some(doc) = self.docs.get(idx) else { return };
         self.autosave.record_stamp(doc.id, path);
+        self.git.bump();
         if let Ok(bytes) = std::fs::read(path) {
             let _ = crate::history::record(&crate::history::root(), path, &bytes, crate::history::now_ms(), &Default::default());
         }
@@ -1554,6 +1558,7 @@ impl KladdApp {
                         let lang = doc.language_label();
                         ui.label(RichText::new(lang).font(font.clone()).color(p.muted));
                     }
+                    self.git_status_chip(ui, p);
                     let now = Self::now(&ctx);
                     if let Some(t) = &self.toast {
                         if t.until > now {
@@ -1712,6 +1717,8 @@ impl KladdApp {
                 let scroll_to = self.scroll_to_char.take();
                 let focus = std::mem::take(&mut self.focus_editor);
 
+                let git_gutter = self.git_gutter(ui.ctx());
+                let mut git_hunk: Option<(usize, egui::Pos2)> = None;
                 let ac_on = self.autocorrect_active(false);
                 let ac_lang = self.autocorrect_lang();
                 let ac_cfg = &self.settings.autocorrect;
@@ -1746,7 +1753,7 @@ impl KladdApp {
                         let lines = hl.newlines(&doc.text, &line_params) + 1;
                         let digits = lines.to_string().len().max(2) as f32;
                         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&num_font, '0'));
-                        let gutter_w = if line_numbers { digits * char_w + 40.0 } else { 22.0 };
+                        let gutter_w = if line_numbers { digits * char_w + 40.0 } else { 22.0 } + git_gutter.as_ref().map_or(0.0, |g| g.extra_width());
 
                         ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1836,6 +1843,11 @@ impl KladdApp {
                                         color,
                                     );
                                 }
+                                if let Some(g) = &git_gutter {
+                                    if let Some(h) = g.row(ui, p, gutter, r, this - 1, is_start) {
+                                        git_hunk = Some(h);
+                                    }
+                                }
                             }
                             if let Some(c) = cur {
                                 if sel == 0 {
@@ -1852,6 +1864,9 @@ impl KladdApp {
                         .inner
                     });
                 self.cursor = result.inner;
+                if let (Some(g), Some((idx, anchor))) = (&git_gutter, git_hunk) {
+                    self.git_open_hunk(g, idx, anchor);
+                }
                 if edited {
                     self.find.current = None;
                 }
@@ -3367,6 +3382,7 @@ impl eframe::App for KladdApp {
         self.top_bar(ui, &p);
         self.word_bar(ui, &p);
         self.pdf_bar(ui, &p);
+        self.git_tick(&ctx);
         self.status_bar(ui, &p);
         self.update.banner(ui, &ctx, &p, &mut self.settings);
         self.find_files_panel(ui, &p);
@@ -3380,6 +3396,7 @@ impl eframe::App for KladdApp {
         self.command_palette(&ctx, &p);
         self.settings_window(&ctx, &p);
         self.workspace_dialogs(&ctx, &p);
+        self.git_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
         self.autocorrect_dialog(&ctx);
         self.close_dialog(&ctx, &p);

@@ -45,6 +45,8 @@ mod update;
 mod word;
 mod workspace;
 mod find_files;
+mod git;
+mod git_ui;
 
 use std::path::PathBuf;
 

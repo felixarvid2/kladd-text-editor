@@ -35,6 +35,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Markdownförhandsvisning** med `Ctrl+Shift+M`.
 - **Delad vy** – `Ctrl+\` delar fönstret i två rutor bredvid varandra, `Ctrl+Shift+\` över varandra (eller *Dela vyn* / *Dela vågrätt* i menyn). Välj flik per ruta i rutans egen väljare, eller visa samma dokument två gånger med egen rullning. Dra skiljelinjen för att ändra storleken; `F6` byter aktiv ruta.
 - **Arbetsmapp** (`Ctrl+Shift+E`): filträd i en sidopanel med nytt, byt namn och ta bort (till papperskorgen), **snabböppna** (`Ctrl+E`) med suddig filnamnssökning och **sök i filer** (`Ctrl+Shift+F`) i mappen eller alla flikar, med ersättning över flera filer.
+- **Git** – är arbetsmappen ett git-arkiv (och finns `git` på datorn) visar filträdet status per fil (`M` ändrad, `A` ny och köad, `U` ospårad, `D` borttagen, `!` konflikt; mappar med ändringar får en punkt) och statusraden grenen med `↑`/`↓` för skillnad mot fjärrgrenen. I textläget visar marginalen tillagda (grön), ändrade (blå) och borttagna rader (röd triangel) mot HEAD; ett klick på en markör visar de gamla raderna med *Återställ ändringen*. *Arkiv → Jämför med HEAD…* visar en diff, *Visa blame* skriver författare, ålder och incheckningsmeddelande per rad i marginalen. **Källkontroll** (`Ctrl+Shift+G`, eller *Källkontroll* i panelen) listar köade och ändrade filer med köa, ta ur kön, förkasta (med bekräftelse) och jämför, en ruta för incheckningsmeddelande med *Checka in* (`Ctrl+Enter`) och *Checka in och pusha*, hämta, pulla och pusha, byte och skapande av gren samt de 50 senaste incheckningarna. Fel från git visas som notiser med git:s eget meddelande. Allt körs med programmet `git` i bakgrunden; saknas det döljs alla Git-funktioner.
 - **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
 - **Två teman** – *Gryning* och *Skymning*.
 - **Svenska och engelska** – välj *Språk / Language* i *Inställningar → Allmänt*; Automatiskt följer systemets språk. Hela gränssnittet finns på båda språken.
@@ -289,6 +290,8 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Ctrl+Shift+F` | Sök i filer (arbetsmappen eller alla flikar) |
 | `Ctrl+E` | Snabböppna fil i arbetsmappen (inte i dokumentläget, där är det centrera) |
 | `Ctrl+Shift+E` | Mappträd (arbetsmapp) på/av; i dokumentläget Spåra ändringar |
+| `Ctrl+Shift+G` | Källkontroll (Git) i sidopanelen |
+| `Ctrl+Enter` | Checka in (i meddelanderutan i källkontrollen) |
 | `F3` / `Shift+F3` | Nästa / föregående träff |
 | `Esc` | Stäng sökning |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Textstorlek (i dokumentläge: zoom av sidan) |

@@ -174,55 +174,59 @@ impl Dialog {
             Some(View::Message(m)) => {
                 ui.label(RichText::new(m).color(p.muted));
             }
-            Some(View::Diff(rows)) => {
-                ui.label(
-                    RichText::new(t("Röd: finns i versionen men inte nu. Grön: finns nu men inte i versionen."))
-                        .font(FontId::new(12.0, FontFamily::Proportional))
-                        .color(p.muted),
-                );
-                ui.add_space(4.0);
-                if rows.iter().all(|r| matches!(r, DiffRow::Gap(_))) {
-                    ui.label(RichText::new(t("Versionen är identisk med den aktuella texten.")).color(p.muted));
-                    return;
-                }
-                let (add_bg, del_bg) = if p.dark {
-                    (Color32::from_rgba_unmultiplied(70, 170, 90, 55), Color32::from_rgba_unmultiplied(210, 80, 80, 60))
-                } else {
-                    (Color32::from_rgba_unmultiplied(70, 170, 90, 60), Color32::from_rgba_unmultiplied(210, 80, 80, 55))
-                };
-                let font = FontId::new(12.5, FontFamily::Monospace);
-                ScrollArea::both().id_salt("hist-diff").max_height(h - 26.0).auto_shrink([false, false]).show_rows(
-                    ui,
-                    ROW_H,
-                    rows.len(),
-                    |ui, range| {
-                        for row in &rows[range] {
-                            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), ROW_H), Sense::hover());
-                            let (bg, mark, text, color) = match row {
-                                DiffRow::Gap(n) => (None, " ", tf!("… {n} oförändrade rader", n = n), p.faint),
-                                DiffRow::Line(l) => match l.kind {
-                                    LineKind::Same => (None, " ", l.text.clone(), p.text),
-                                    LineKind::Added => (Some(add_bg), "+", l.text.clone(), p.text),
-                                    LineKind::Removed => (Some(del_bg), "−", l.text.clone(), p.text),
-                                },
-                            };
-                            if let Some(bg) = bg {
-                                ui.painter().rect_filled(rect, 2, bg);
-                            }
-                            let shown = text.replace('\t', "    ");
-                            ui.painter().with_clip_rect(rect).text(
-                                rect.left_center() + vec2(6.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                format!("{mark} {shown}"),
-                                font.clone(),
-                                color,
-                            );
-                        }
-                    },
-                );
-            }
+            Some(View::Diff(rows)) => diff_view(ui, p, rows, h, "hist-diff", t("Röd: finns i versionen men inte nu. Grön: finns nu men inte i versionen."), t("Versionen är identisk med den aktuella texten.")),
         }
     }
+}
+
+/// Ritar en diff (raderna från `history::collapse`) med röda och gröna rader. Delas av versionshistoriken
+/// och jämförelsen med HEAD i Git. `legend` förklarar färgerna, `same` visas när inget skiljer.
+pub fn diff_view(ui: &mut Ui, p: &Palette, rows: &[DiffRow], h: f32, id_salt: &str, legend: &str, same: &str) {
+    ui.label(
+        RichText::new(legend)
+            .font(FontId::new(12.0, FontFamily::Proportional))
+            .color(p.muted),
+    );
+    ui.add_space(4.0);
+    if rows.iter().all(|r| matches!(r, DiffRow::Gap(_))) {
+        ui.label(RichText::new(same).color(p.muted));
+        return;
+    }
+    let (add_bg, del_bg) = if p.dark {
+        (Color32::from_rgba_unmultiplied(70, 170, 90, 55), Color32::from_rgba_unmultiplied(210, 80, 80, 60))
+    } else {
+        (Color32::from_rgba_unmultiplied(70, 170, 90, 60), Color32::from_rgba_unmultiplied(210, 80, 80, 55))
+    };
+    let font = FontId::new(12.5, FontFamily::Monospace);
+    ScrollArea::both().id_salt(id_salt).max_height(h - 26.0).auto_shrink([false, false]).show_rows(
+        ui,
+        ROW_H,
+        rows.len(),
+        |ui, range| {
+            for row in &rows[range] {
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), ROW_H), Sense::hover());
+                let (bg, mark, text, color) = match row {
+                    DiffRow::Gap(n) => (None, " ", tf!("… {n} oförändrade rader", n = n), p.faint),
+                    DiffRow::Line(l) => match l.kind {
+                        LineKind::Same => (None, " ", l.text.clone(), p.text),
+                        LineKind::Added => (Some(add_bg), "+", l.text.clone(), p.text),
+                        LineKind::Removed => (Some(del_bg), "−", l.text.clone(), p.text),
+                    },
+                };
+                if let Some(bg) = bg {
+                    ui.painter().rect_filled(rect, 2, bg);
+                }
+                let shown = text.replace('\t', "    ");
+                ui.painter().with_clip_rect(rect).text(
+                    rect.left_center() + vec2(6.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{mark} {shown}"),
+                    font.clone(),
+                    color,
+                );
+            }
+        },
+    );
 }
 
 fn version_row(ui: &mut Ui, p: &Palette, v: &Version, now_ms: u64, selected: bool) -> bool {
