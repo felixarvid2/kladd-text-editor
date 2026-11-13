@@ -68,6 +68,12 @@ pub struct Settings {
     pub spell: bool,
     /// Vald ordlista (t.ex. "sv_SE"); `None` = automatiskt.
     pub spell_lang: Option<String>,
+    /// Grammatik- och stilkontroll (LanguageTool) i dokumentläget. Av som standard.
+    pub grammar: bool,
+    /// "public" (api.languagetool.org) eller adressen till en egen server.
+    pub grammar_server: String,
+    /// Att texten skickas till publika servern är godkänt (förklaringen visad en gång).
+    pub grammar_ack: bool,
     /// Säkerhetskopiera osparade flikar regelbundet så att de kan återställas efter en krasch.
     pub autosave_recovery: bool,
     /// Navigeringsfönstret (rubrikträd) för Markdown-baserade flikar.
@@ -98,6 +104,9 @@ impl Default for Settings {
             word_zoom: 1.0,
             spell: true,
             spell_lang: None,
+            grammar: false,
+            grammar_server: crate::grammar::PUBLIC_SETTING.to_owned(),
+            grammar_ack: false,
             autosave_recovery: true,
             nav_pane: false,
             pdf_memory: Vec::new(),
@@ -216,6 +225,8 @@ pub struct KladdApp {
     /// Typsnitt som Word-dokumenten använder, hämtade från systemet.
     pub(crate) doc_fonts: crate::word::fonts::DocFonts,
     pub(crate) speller: Option<crate::spell::Speller>,
+    pub(crate) grammar: crate::grammar::Checker,
+    pub(crate) grammar_dlg: Option<crate::grammar_ui::Dialog>,
     pub(crate) wv: crate::word::view::State,
     pub(crate) print: crate::print::PrintState,
     pub(crate) nav: crate::word::navui::State,
@@ -331,6 +342,8 @@ impl KladdApp {
             word: Default::default(),
             doc_fonts: crate::word::fonts::DocFonts::new(),
             speller: None,
+            grammar: Default::default(),
+            grammar_dlg: None,
             wv: Default::default(),
             print: Default::default(),
             nav: Default::default(),

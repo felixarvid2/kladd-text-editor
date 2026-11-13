@@ -8,6 +8,8 @@ mod autosave;
 mod doc;
 mod docx;
 mod export;
+mod grammar;
+mod grammar_ui;
 mod odt;
 mod pdf_read;
 mod pdf_write;

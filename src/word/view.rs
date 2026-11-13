@@ -84,6 +84,16 @@ struct SpellTarget {
     suggestions: Vec<String>,
 }
 
+/// Blå (grammatik) och bärnstensgul (stil) våglinje, för att skilja dem från röd stavning.
+const GRAMMAR_COLOR: Color32 = Color32::from_rgb(70, 130, 230);
+const STYLE_COLOR: Color32 = Color32::from_rgb(225, 150, 20);
+
+enum GramAct {
+    Replace(Range<usize>, String),
+    Ignore(crate::grammar::Match),
+    IgnoreRule(String),
+}
+
 enum SpellAct {
     Replace(Range<usize>, String),
     Ignore(String),
@@ -97,6 +107,8 @@ pub struct State {
     /// Vald bild, pågående storleksändring.
     img: images::State,
     target: Option<SpellTarget>,
+    /// Grammatikträffen som högerklickats.
+    gtarget: Option<crate::grammar::Match>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
     /// Öppen dialog "Sidinställningar".
@@ -891,6 +903,41 @@ impl KladdApp {
                 }
             }
 
+            // Grammatik och stil: bara i bakgrunden och bara för ändrade stycken (se grammar.rs).
+            self.grammar_dialog(&ctx);
+            let mut gmatches: Arc<Vec<crate::grammar::Match>> = Arc::default();
+            if let Some(cfg) = self.grammar_config() {
+                if !self.grammar.has_wake() {
+                    let c = ctx.clone();
+                    self.grammar.set_wake(Arc::new(move || c.request_repaint()));
+                }
+                gmatches = self.grammar.update(
+                    &cfg,
+                    doc_id,
+                    rev,
+                    &self.docs[self.active].text,
+                    || {
+                        analysis
+                            .pieces
+                            .iter()
+                            .map(|pc| {
+                                let skip = pc.markup
+                                    || pc.code
+                                    || pc.link
+                                    || pc.list_marker
+                                    || pc.object.is_some()
+                                    || pc.footnote_ref.is_some()
+                                    || pc.footnote_def.is_some()
+                                    || pc.image.is_some()
+                                    || matches!(pc.block, Block::Code | Block::Table);
+                                (pc.range.clone(), !skip)
+                            })
+                            .collect()
+                    },
+                    &mut |d| ctx.request_repaint_after(d),
+                );
+            }
+
             // Markupen visas bara på markörens rader när editorn har fokus.
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
@@ -907,6 +954,9 @@ impl KladdApp {
             let mut painted: Vec<images::Painted> = Vec::new();
             let mut img_index = 0usize;
             let secondary_target = self.wv.target.clone();
+            let secondary_gtarget = self.wv.gtarget.clone();
+            let mut new_gtarget: Option<Option<crate::grammar::Match>> = None;
+            let mut gram_act: Option<GramAct> = None;
 
             // Typsnitten som dokumentet använder registreras hos egui före layouten, som sedan
             // bara slår upp dem (en okänd familj kraschar egui).
@@ -1364,8 +1414,68 @@ impl KladdApp {
                     }
                 }
 
+                // Blå/bärnstensgul våglinje under grammatik- och stilträffar (inte där ordet är felstavat).
+                if !gmatches.is_empty() {
+                    let mut conv = ByteToChar::new(text);
+                    let amp = 1.2 * z.max(0.8);
+                    let half = 2.0 * z.max(0.8);
+                    let g0 = gmatches.partition_point(|r| r.range.end < vis.start);
+                    for m in gmatches[g0..].iter().take_while(|m| m.range.start <= vis.end) {
+                        if misspelled.iter().any(|r| r.start < m.range.end && m.range.start < r.end) {
+                            continue;
+                        }
+                        let (a, b) = (conv.at(m.range.start), conv.at(m.range.end));
+                        let ra = galley.pos_from_cursor(CCursor::new(a)).translate(gpos.to_vec2());
+                        if ra.bottom() < clip.top() || ra.top() > clip.bottom() {
+                            continue;
+                        }
+                        let rb = galley.pos_from_cursor(CCursor::new(b)).translate(gpos.to_vec2());
+                        if (ra.top() - rb.top()).abs() > 1.0 {
+                            continue; // träffen bryts över två rader
+                        }
+                        let y = ra.bottom() - 1.0 + amp;
+                        let mut pts = Vec::new();
+                        let mut x = ra.left();
+                        let mut up = false;
+                        while x < rb.left() {
+                            pts.push(pos2(x, if up { y - amp } else { y + amp }));
+                            x += half;
+                            up = !up;
+                        }
+                        pts.push(pos2(rb.left(), if up { y - amp } else { y + amp }));
+                        if pts.len() >= 2 {
+                            let col = if m.style { STYLE_COLOR } else { GRAMMAR_COLOR };
+                            painter.add(Shape::line(pts, Stroke::new(1.0, col)));
+                        }
+                    }
+                }
+                // Håll muspekaren över en träff: meddelandet som verktygstips.
+                if !gmatches.is_empty() && !out.response.secondary_clicked() {
+                    if let Some(pos) = out.response.hover_pos() {
+                        let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
+                        let hit = gmatches.iter().find(|m| m.range.start <= b && b < m.range.end);
+                        if let Some(m) = hit.filter(|_| !misspelled.iter().any(|r| r.start <= b && b < r.end)) {
+                            egui::Response::clone(&out.response).on_hover_ui_at_pointer(|ui| {
+                                ui.set_max_width(320.0);
+                                ui.label(&m.message);
+                                if !m.replacements.is_empty() {
+                                    ui.label(egui::RichText::new(m.replacements.join(" · ")).color(p.muted));
+                                }
+                            });
+                        }
+                    }
+                }
+
                 // Högerklick på ett felstavat ord.
                 if out.response.secondary_clicked() {
+                    let mut gfound = None;
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        let b = char_to_byte(text, galley.cursor_from_pos(pos - gpos).index.0);
+                        if !misspelled.iter().any(|r| r.start <= b && b < r.end) {
+                            gfound = gmatches.iter().find(|m| m.range.start <= b && b < m.range.end).cloned();
+                        }
+                    }
+                    new_gtarget = Some(gfound);
                     let mut found = None;
                     if let Some(pos) = ui.ctx().pointer_interact_pos() {
                         let ci = galley.cursor_from_pos(pos - gpos).index.0;
@@ -1384,8 +1494,12 @@ impl KladdApp {
                     Some(t) => t.clone(),
                     None => secondary_target.clone(),
                 };
+                let gtarget = match &new_gtarget {
+                    Some(t) => t.clone(),
+                    None => secondary_gtarget.clone(),
+                };
                 let in_table_menu = table_menu.unwrap_or_else(|| tables::menu_open(ui.ctx()));
-                if target.is_some() || in_table_menu {
+                if target.is_some() || in_table_menu || gtarget.is_some() {
                     out.response.context_menu(|ui| {
                         ui.set_min_width(210.0);
                         ui.set_max_width(260.0);
@@ -1405,6 +1519,25 @@ impl KladdApp {
                             }
                             if menu_item(ui, p, "Lägg till i ordlistan", "", None, true) {
                                 spell_act = Some(SpellAct::Add(t.word.clone()));
+                            }
+                            if in_table_menu {
+                                menu_divider(ui, p);
+                            }
+                        }
+                        if let (Some(m), None) = (&gtarget, &target) {
+                            ui.add(egui::Label::new(egui::RichText::new(&m.message).color(p.text)).wrap());
+                            ui.add_space(4.0);
+                            for s in m.replacements.iter().take(5) {
+                                if menu_item(ui, p, s, "", None, true) {
+                                    gram_act = Some(GramAct::Replace(m.range.clone(), s.clone()));
+                                }
+                            }
+                            menu_divider(ui, p);
+                            if menu_item(ui, p, "Ignorera", "", None, true) {
+                                gram_act = Some(GramAct::Ignore(m.clone()));
+                            }
+                            if menu_item(ui, p, "Ignorera regeln", "", None, true) {
+                                gram_act = Some(GramAct::IgnoreRule(m.rule_id.clone()));
                             }
                             if in_table_menu {
                                 menu_divider(ui, p);
@@ -1437,6 +1570,24 @@ impl KladdApp {
             }
             if let Some(t) = new_target {
                 self.wv.target = t;
+            }
+            if let Some(t) = new_gtarget {
+                self.wv.gtarget = t;
+            }
+            match gram_act {
+                Some(GramAct::Replace(r, s)) => {
+                    self.word_edit(&ctx, |t, _| {
+                        let mut text = String::with_capacity(t.len() + s.len());
+                        text.push_str(&t[..r.start]);
+                        text.push_str(&s);
+                        text.push_str(&t[r.end..]);
+                        let end = r.start + s.len();
+                        markup::Edit { text, sel: end..end }
+                    });
+                }
+                Some(GramAct::Ignore(m)) => self.grammar.ignore_match(&m),
+                Some(GramAct::IgnoreRule(id)) => self.grammar.ignore_rule(&id),
+                None => {}
             }
             if edited {
                 self.find.current = None;
@@ -1490,6 +1641,7 @@ impl KladdApp {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
             label(ui, format!("{zoom_pct} %"));
+            let mut gram_toggle = false;
             if let Some(sp) = self.speller.as_mut() {
                 let finished = sp.poll_download();
                 let busy = sp.downloading().map(str::to_owned);
@@ -1513,6 +1665,7 @@ impl KladdApp {
                 let mut pick: Option<String> = None;
                 let mut fetch: Option<String> = None;
                 let mut spell = self.settings.spell;
+                let gram_on = self.settings.grammar;
                 Popup::menu(&btn).align(RectAlign::TOP_END).gap(6.0).width(260.0).show(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     if !langs.is_empty() {
@@ -1543,6 +1696,10 @@ impl KladdApp {
                             }
                         }
                     }
+                    menu_divider(ui, p);
+                    if menu_item(ui, p, "Grammatik", "", Some(gram_on), true) {
+                        gram_toggle = true;
+                    }
                     ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(egui::RichText::new(crate::spell::LICENSE_NOTE).font(font.clone()).color(p.muted))
@@ -1571,7 +1728,25 @@ impl KladdApp {
                     }
                 }
             }
+            if gram_toggle {
+                self.grammar_toggle();
+            }
             label(ui, if words == 1 { "1 ord".to_owned() } else { format!("{words} ord") });
+            {
+                let st = self.grammar.status().clone();
+                let (text, hint) = if !self.settings.grammar {
+                    ("Grammatik: av".to_owned(), "Slå på grammatik- och stilkontroll (LanguageTool)".to_owned())
+                } else if let Some(e) = &st.error {
+                    ("Grammatik: fel".to_owned(), format!("Grammatikkontrollen misslyckades: {e}"))
+                } else if st.pending && st.count == 0 {
+                    ("Grammatik: kontrollerar…".to_owned(), "Grammatik och stil".to_owned())
+                } else {
+                    (format!("Grammatik: {}", st.count), "Grammatik och stil: inställningar".to_owned())
+                };
+                if status_button(ui, p, &text, &hint).clicked() {
+                    self.open_grammar_dialog(false);
+                }
+            }
             label(ui, format!("Sida {cur} av {total}"));
         });
     }
