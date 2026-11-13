@@ -1395,7 +1395,7 @@ impl KladdApp {
                             .show(|ui| {
                                 // Menyn är längre än ett litet fönster: rulla i stället för att klippa.
                                 let max_h = (ctx.content_rect().height() - TOPBAR_H - 24.0).max(200.0);
-                                ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| self.menu(ui, &ctx, p));
+                                ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).auto_shrink([false, true]).show(ui, |ui| self.menu(ui, &ctx, p));
                             });
 
                         let (icon, tip) = if self.settings.dark {

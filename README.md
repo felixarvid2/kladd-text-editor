@@ -37,7 +37,7 @@ Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ers�
 - **Arbetsmapp** (`Ctrl+Shift+E`): filträd i en sidopanel med nytt, byt namn och ta bort (till papperskorgen), **snabböppna** (`Ctrl+E`) med suddig filnamnssökning och **sök i filer** (`Ctrl+Shift+F`) i mappen eller alla flikar, med ersättning över flera filer.
 - **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
 - **Två teman** – *Gryning* och *Skymning*.
-- **Svenska och engelska** – välj *Språk / Language* längst ned i huvudmenyn; Automatiskt följer systemets språk. Översättningen pågår, texter som saknas visas på svenska.
+- **Svenska och engelska** – välj *Språk / Language* längst ned i huvudmenyn; Automatiskt följer systemets språk. Hela gränssnittet finns på båda språken.
 - **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
 - **Dra och släpp** filer direkt i fönstret.
 - **Ett fönster** – filer som öppnas från filhanteraren eller terminalen läggs som nya flikar i det Kladd-fönster som redan är öppet. Använd `kladd --new-window` för ett separat fönster.
