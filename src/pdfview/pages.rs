@@ -72,10 +72,17 @@ fn open_error(e: OpenError) -> String {
 
 /// Flikens bytes utan kryptering (lösenordet används om det finns).
 fn plain(tab: &PdfTab) -> Result<Vec<u8>, String> {
-    let bytes = tab.view.bytes();
+    // Osparade anteckningar bakas in först, så att de följer med sina sidor (commit tömmer listan).
+    let edited;
+    let bytes: &[u8] = if tab.view.annot.has_pending() {
+        edited = tab.edited_bytes()?;
+        &edited
+    } else {
+        tab.view.bytes()
+    };
     match tab.password.as_deref() {
         Some(pw) => crate::print::decrypted_pdf(bytes, pw).ok_or_else(|| "PDF:en kunde inte avkrypteras".to_owned()),
-        None => Ok(bytes.as_ref().clone()),
+        None => Ok(bytes.to_vec()),
     }
 }
 
@@ -93,6 +100,7 @@ fn commit(ctx: &egui::Context, tab: &mut PdfTab, new: Vec<u8>, sel: BTreeSet<usi
     install(ctx, tab, Arc::new(new))?;
     tab.org.history.push(prev);
     tab.pages_changed = true;
+    tab.view.annot.clear();
     if let Some(&first) = sel.iter().next() {
         tab.view.go_to_page(first);
     }

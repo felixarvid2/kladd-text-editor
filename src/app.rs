@@ -609,7 +609,7 @@ impl KladdApp {
     fn save_doc(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
         let Some(doc) = self.docs.get(idx) else { return };
         if doc.pdfv.is_some() {
-            self.save_pdf_pages(ctx, idx, then_close, exit);
+            self.pdf_save(ctx, idx, then_close, exit);
             return;
         }
         let Some(path) = doc.path.clone().filter(|_| !doc.needs_save_as()) else {
@@ -1157,8 +1157,8 @@ impl KladdApp {
         } else if hit(ctrl, Key::S) && !self.docs.is_empty() {
             // En PDF i visaren sparas bara över när sidor ändrats; annars ger Ctrl+S en kopia av originalet.
             if pdf {
-                if self.pdf_pages_changed() {
-                    self.save_pdf_pages(ctx, self.active, false, false);
+                if self.pdf_unsaved() {
+                    self.pdf_save(ctx, self.active, false, false);
                 } else {
                     self.request_save_copy(ctx, self.active);
                 }
@@ -1476,10 +1476,10 @@ impl KladdApp {
         if menu_item(ui, p, "Öppna…", "Ctrl+O", None, true) {
             self.request_open(ctx);
         }
-        let pdf_changed = self.pdf_pages_changed();
+        let pdf_changed = self.pdf_unsaved();
         if menu_item(ui, p, if pdf && !pdf_changed { "Spara kopia…" } else { "Spara" }, "Ctrl+S", None, has_doc) {
             if pdf && pdf_changed {
-                self.save_pdf_pages(ctx, self.active, false, false);
+                self.pdf_save(ctx, self.active, false, false);
             } else if pdf {
                 self.request_save_copy(ctx, self.active);
             } else {
@@ -2740,6 +2740,10 @@ impl KladdApp {
         let now = Self::now(ctx);
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let path = doc.path.clone();
+        // Osparade sidändringar och anteckningar gör fliken "ändrad" (fråga vid stängning).
+        if let Some(t) = doc.pdfv.as_deref() {
+            doc.dirty = t.unsaved();
+        }
         let Some(tab) = doc.pdfv.as_deref_mut() else { return };
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(pdfui::CHECK_EVERY));
         let mut reload = false;
@@ -2877,12 +2881,62 @@ impl KladdApp {
             self.notify(ctx, "Välj ett annat namn än originalfilens.", true);
             return;
         }
+        // Osparade ändringar (sidor, anteckningar) följer med i kopian; originalfilen och fliken är oförändrade.
+        let (bytes, decrypted) = match self.docs[idx].pdfv.as_ref().filter(|t| t.unsaved()) {
+            Some(t) => match t.edited_bytes() {
+                Ok(out) => (Arc::new(out), t.password.is_some()),
+                Err(e) => {
+                    self.notify(ctx, e, true);
+                    return;
+                }
+            },
+            None => (bytes, false),
+        };
         match crate::doc::write_atomic(path, &bytes) {
             Ok(()) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.notify(ctx, format!("Sparade kopian {name}"), false);
+                let note = if decrypted { " (utan lösenordsskydd)" } else { "" };
+                self.notify(ctx, format!("Sparade kopian {name}{note}"), false);
             }
             Err(e) => self.notify(ctx, crate::doc::describe_io_error(&e, path), true),
+        }
+    }
+
+    /// Sparar PDF-flikens ändringar (sidordning, anteckningar) över originalfilen, atomiskt.
+    fn pdf_save(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
+        let Some(doc) = self.docs.get_mut(idx) else { return };
+        let (Some(tab), Some(path)) = (doc.pdfv.as_deref_mut(), doc.path.clone()) else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !tab.unsaved() {
+            if then_close {
+                self.close_tab_now(idx);
+            }
+            if exit {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            return;
+        }
+        let decrypted = tab.password.is_some();
+        let result = tab
+            .edited_bytes()
+            .and_then(|out| crate::doc::write_atomic(&path, &out).map_err(|e| crate::doc::describe_io_error(&e, &path)));
+        if let Err(e) = result {
+            self.notify(ctx, e, true);
+            return;
+        }
+        tab.mark_saved();
+        tab.password = None;
+        tab.stamp = pdfui::file_stamp(&path);
+        doc.dirty = false;
+        if then_close {
+            self.close_tab_now(idx);
+        } else if idx == self.active {
+            self.pdf_reload(ctx, true);
+        }
+        let note = if decrypted { " PDF:en sparades utan lösenordsskydd." } else { "" };
+        self.notify(ctx, format!("Sparade {name}.{note}"), false);
+        if exit {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
 
@@ -2970,9 +3024,9 @@ impl KladdApp {
         }
     }
 
-    /// Sant om den aktiva PDF-fliken har osparade sidändringar.
-    fn pdf_pages_changed(&self) -> bool {
-        self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.pages_changed)
+    /// Sant om den aktiva PDF-fliken har osparade ändringar (sidor, anteckningar).
+    fn pdf_unsaved(&self) -> bool {
+        self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.unsaved())
     }
 
     /// Utför en sidändring i den aktiva PDF-fliken.
@@ -3057,28 +3111,6 @@ impl KladdApp {
                 self.notify(ctx, msg, false);
             }
             Err(e) => self.notify(ctx, e, true),
-        }
-    }
-
-    /// Spar flikens PDF (med sidändringar) över originalfilen, atomiskt. Filen blir okrypterad.
-    fn save_pdf_pages(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
-        let Some(doc) = self.docs.get_mut(idx) else { return };
-        let (Some(tab), Some(path)) = (doc.pdfv.as_deref_mut(), doc.path.clone()) else { return };
-        match crate::doc::write_atomic(&path, tab.view.bytes()) {
-            Ok(()) => {
-                tab.pages_changed = false;
-                tab.stamp = pdfui::file_stamp(&path);
-                doc.dirty = false;
-                let title = doc.title();
-                self.notify(ctx, format!("Sparade {title}"), false);
-                if then_close {
-                    self.close_tab_now(idx);
-                }
-                if exit {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
-            }
-            Err(e) => self.notify(ctx, crate::doc::describe_io_error(&e, &path), true),
         }
     }
 }

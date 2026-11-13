@@ -509,6 +509,8 @@ pub struct PdfView {
     space: Option<SpaceHold>,
     find: Option<Find>,
     pending_uri: Option<String>,
+    /// Nya anteckningar som inte sparats än (annot.rs).
+    pub annot: super::annot::AnnotState,
 }
 
 impl PdfView {
@@ -552,6 +554,7 @@ impl PdfView {
             ocr_pages: HashSet::new(),
             want_all_text: false,
             sel: None,
+            annot: Default::default(),
             drag_anchor: None,
             drag_mode: UnitMode::Char,
             press_hist: None,
@@ -1330,6 +1333,8 @@ impl PdfView {
         } else {
             self.show_scroll(ui, &ctx, palette, dark);
         }
+        let sizes = &self.sizes;
+        self.annot.show_editor(&ctx, &|p| sizes.get(p).map_or((0.0, 0.0), |s| (s.width, s.height)));
         self.after_frame(&ctx);
     }
 
@@ -1511,6 +1516,7 @@ impl PdfView {
 
     /// Sökträffar (gult, aktuell orange) och markering (blått) ovanpå sidan.
     fn paint_overlays(&self, ui: &Ui, p: usize, xf: &PageXf) {
+        self.annot.paint(ui.painter(), p, xf);
         let Some(t) = self.texts.get(&p) else { return };
         let painter = ui.painter();
         if let Some(f) = &self.find {
@@ -1552,6 +1558,11 @@ impl PdfView {
         if middle || hand {
             ui.scroll_with_delta_animation(resp.drag_delta(), ScrollAnimation::none());
             ctx.set_cursor_icon(CursorIcon::Grabbing);
+            return;
+        }
+
+        // Anteckningsverktygen (lapp, textruta, penna) tar hand om musen själva.
+        if self.annot.tool.is_some() && self.annot_pointer(ctx, resp, origin) {
             return;
         }
 
@@ -1655,6 +1666,32 @@ impl PdfView {
             self.drag_anchor = None;
             self.drag_mode = UnitMode::Char;
         }
+        self.annot_from_selection(resp);
+    }
+
+    fn annot_pointer(&mut self, ctx: &Context, resp: &egui::Response, origin: Pos2) -> bool {
+        let mut a = std::mem::take(&mut self.annot);
+        let hit = |s: Pos2, nearest: bool| self.hit(s, origin, nearest);
+        let size = |p: usize| (self.sizes[p].width, self.sizes[p].height);
+        let took = a.pointer(ctx, resp, &hit, &size);
+        self.annot = a;
+        took
+    }
+
+    /// Markera/understruken/genomstruken: musen släpps efter en markering → ny anteckning på texten.
+    fn annot_from_selection(&mut self, resp: &egui::Response) {
+        let Some(tool) = self.annot.tool.filter(|t| t.is_markup()) else { return };
+        let done = resp.drag_stopped_by(PointerButton::Primary) || resp.double_clicked() || resp.triple_clicked();
+        let Some(sel) = self.sel.filter(|_| done) else { return };
+        let mut per_page = Vec::new();
+        for p in sel.start.0..=sel.end.0.min(self.sizes.len().saturating_sub(1)) {
+            let Some(t) = self.texts.get(&p) else { continue };
+            if let Some(r) = sel_range_on_page(&sel, p, t.glyphs.len()) {
+                per_page.push((p, t.rects(r)));
+            }
+        }
+        self.annot.add_markup(tool, per_page);
+        self.sel = None;
     }
 
     /// Presentationsläge (43): svart bakgrund, en sida anpassad till skärmen.

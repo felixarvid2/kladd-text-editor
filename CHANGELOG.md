@@ -27,6 +27,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - I PDF-visaren panorerar Mellanslag+dra som handverktyget, och Mellanslag bläddrar bara när man inte dragit. Dra efter dubbel- eller trippelklick utvidgar markeringen med hela ord respektive rader.
 - **Textigenkänning (OCR) för skannade PDF-sidor.** Har datorn Tesseract installerat känner Kladd igen skannade sidor: *Visa → Känn igen text (OCR)* (och ett engångsmeddelande när dokumentet har skannade sidor) renderar sidorna i 300 dpi i bakgrunden, visar förloppet i statusraden och gör texten sökbar, markerbar och kopierbar. *Redigera* kan känna igen texten först och lägger den som stycken i dokumentet. Saknas Tesseract förklarar menyvalet hur det installeras.
+- **Anteckningar i PDF-visaren.** *Anteckna* i verktygsraden visar Markera (gul, grön, blå, rosa), Understruken, Genomstruken, Anteckning (lapp med text), Textruta och Penna (färg och bredd). Markera text med musen så läggs anteckningen på när du släpper knappen; högerklick tar bort en ny anteckning och *Ångra* tar bort den senaste. Fliken blir ändrad tills du sparar: Ctrl+S skriver anteckningarna som riktiga PDF-anteckningar med utseende (alla läsare visar dem) i filen, *Spara kopia* tar med dem i kopian. Krypterade PDF:er sparas utan lösenordsskydd, och Kladd säger till.
 
 ## [1.9.0] – 2026-11-12
 

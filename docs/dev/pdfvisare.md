@@ -32,6 +32,7 @@ Chrome och PdfCraft (storytold/pdfcraft, Rust + egui + hayro).
 | `organize.rs` | Sidoperationer på PDF-bytes med lopdf (ordna, ta bort, rotera, extrahera, infoga) och `History` för Ångra |
 | `pages.rs` | Kopplar `organize` till fliken: `OrgOp`, urval, omladdning av visaren, Ångra/Gör om, `PdfTab::pages_changed` |
 | `ocr.rs` | `OcrState`: letar skannade sidor, renderar i 300 dpi på egen motor, kör Tesseract (`crate::ocr`) och ger `PageText` via `PdfView::set_ocr_text` |
+| `annot.rs` | Nya anteckningar (markering, understruken, genomstruken, lapp, textruta, penna): minneslista i visningspunkter, verktygsrad, överlägg, `apply` skriver `/Annots` med `/AP` via lopdf |
 | `chrome.rs` | Verktygsrad, sidopanel (miniatyrer, innehåll), sökfält, egenskaper, presentationsläge, statusrad |
 
 ## Förbättringar (minst 40)
@@ -223,3 +224,10 @@ impl PdfView {
 - Krypterade filer avkrypteras (som `print::decrypted_pdf`) vid första ändringen. Resultatet är okrypterat, och sparas det över originalet försvinner lösenordsskyddet.
 - `pages::run` gör ändringen, läser om visaren (`PdfView::reload`) och lägger föregående bytes i `History` (högst 30 versioner och 256 MB). `PdfTab::pages_changed` sätter `Document::dirty`; Ctrl+S skriver bytes över originalet med `write_atomic`. Ändrad fil på disk läses inte om automatiskt medan sidändringar är osparade.
 51. Miniatyrer: flerval, drag för att flytta, högerklicksmeny, Delete, Ångra/Gör om, Slå ihop med PDF.
+
+## Anteckningar (`annot.rs`)
+
+- `PdfView.annot` (`AnnotState`) håller verktyg, färg och väntande `NewAnnot` per sida i visningspunkter. view.rs har några krokar: `annot.paint` i `paint_overlays`, `annot_pointer` (lapp/textruta/penna tar över musen), `annot_from_selection` (markering → markup vid musknapp upp) och `annot.show_editor` i `show`.
+- Fliken är ändrad (`Document::dirty`) så länge `annot.has_pending()`; Ctrl+S → `KladdApp::pdf_save` skriver `annot::apply` atomiskt och läser om visaren. Krypterade PDF:er skrivs avkrypterade.
+- Koordinater tillbaka till användarrymd: `to_user` (invers av `Geo::point`, med /Rotate och CropBox). Lapp och textruta får `/Matrix` så att de står upprätt på roterade sidor.
+- Utanför omfånget: ändra eller ta bort anteckningar som redan sparats i filen (hayro ritar dem); inkrementell uppdatering som bevarar signaturer.

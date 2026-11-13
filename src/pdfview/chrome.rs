@@ -94,9 +94,34 @@ pub struct PdfTab {
     pub pages_changed: bool,
     pub org: OrgState,
     pub ocr: super::ocr::OcrState,
+    /// Anteckningsverktygen (annot.rs) visas under verktygsraden.
+    pub annotate: bool,
 }
 
 impl PdfTab {
+    /// Osparade ändringar i fliken: sidordning eller nya anteckningar.
+    pub fn unsaved(&self) -> bool {
+        self.pages_changed || self.view.annot.has_pending()
+    }
+
+    /// PDF:en med alla osparade ändringar: sidändringarna finns redan i visarens bytes,
+    /// anteckningarna läggs på här.
+    pub fn edited_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut out = self.view.bytes().as_ref().clone();
+        if self.view.annot.has_pending() {
+            // Efter sidändringar är bytes redan avkrypterade och lösenordet behövs inte.
+            let pw = if self.pages_changed { None } else { self.password.as_deref() };
+            out = crate::pdfview::annot::apply(&out, pw, self.view.annot.pending())?;
+        }
+        Ok(out)
+    }
+
+    /// Efter en lyckad sparning: inga ändringar kvar.
+    pub fn mark_saved(&mut self) {
+        self.pages_changed = false;
+        self.view.annot.clear();
+    }
+
     pub fn new(view: PdfView, password: Option<String>, stamp: Option<FileStamp>) -> Self {
         let has_outline = !view.meta().outline.is_empty();
         Self {
@@ -119,6 +144,7 @@ impl PdfTab {
             pages_changed: false,
             org: OrgState::default(),
             ocr: Default::default(),
+            annotate: false,
         }
     }
 
@@ -572,6 +598,16 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 if tool_btn(ui, p, G::Print, false, true, "Skriv ut (Ctrl+P)").clicked() {
                     act = Some(Action::Print);
                 }
+                bar_divider(ui, p);
+                let on = tab.annotate;
+                let label = RichText::new("Anteckna").color(if on { p.accent } else { p.text });
+                let btn = egui::Button::new(label).fill(if on { p.accent.gamma_multiply(0.16) } else { Color32::TRANSPARENT }).stroke(Stroke::NONE);
+                if ui.add(btn).on_hover_text("Överstryk, understryk, skriv anteckningar och rita i PDF:en").clicked() {
+                    tab.annotate = !on;
+                    if on {
+                        tab.view.annot.tool = None;
+                    }
+                }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -588,6 +624,18 @@ pub fn toolbar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
                 });
             });
         });
+    if tab.annotate {
+        Panel::top("kladd-pdf-annot-bar")
+            .exact_size(BAR_H)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(Frame::NONE.fill(p.chrome).inner_margin(Margin::symmetric(12, 5)))
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().hline((r.left() - 12.0)..=(r.right() + 12.0), r.bottom() + 5.0, Stroke::new(1.0, p.line));
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| crate::pdfview::annot::tool_row(ui, p, &mut tab.view.annot));
+            });
+    }
     act
 }
 

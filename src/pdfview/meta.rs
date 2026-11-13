@@ -115,17 +115,17 @@ fn build(doc: &Document, bytes: &[u8]) -> PdfMeta {
 
 /// Sidans beskärningsruta (användarrymd) och rotation.
 #[derive(Clone, Copy, Debug)]
-struct Geo {
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
+pub(crate) struct Geo {
+    pub(crate) x0: f32,
+    pub(crate) y0: f32,
+    pub(crate) x1: f32,
+    pub(crate) y1: f32,
     /// 0, 90, 180 eller 270 (medurs).
-    rot: u16,
+    pub(crate) rot: u16,
 }
 
 impl Geo {
-    fn of(doc: &Document, page: ObjectId) -> Geo {
+    pub(crate) fn of(doc: &Document, page: ObjectId) -> Geo {
         let rect = |key: &[u8]| inherited(doc, page, key).and_then(|o| rect_of(doc, &o));
         let (x0, y0, x1, y1) = rect(b"CropBox").or_else(|| rect(b"MediaBox")).unwrap_or((0.0, 0.0, 612.0, 792.0));
         let rot = inherited(doc, page, b"Rotate").and_then(|o| o.as_i64().ok()).unwrap_or(0);
@@ -140,7 +140,7 @@ impl Geo {
     }
 
     /// Användarrymd (x, y uppåt) → visningspunkter (origo uppe till vänster, y nedåt).
-    fn point(&self, x: f32, y: f32) -> (f32, f32) {
+    pub(crate) fn point(&self, x: f32, y: f32) -> (f32, f32) {
         let (w, h) = (self.x1 - self.x0, self.y1 - self.y0);
         let (u, v) = (x - self.x0, self.y1 - y); // oroterat, y nedåt
         match self.rot {
