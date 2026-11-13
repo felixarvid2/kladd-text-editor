@@ -15,7 +15,8 @@
 //!   som borttagna ("kommentarer"), på samma sätt som för .docx.
 //! - Diagram, former och inbäddade objekt (`draw:*` utom bilder) rapporteras som borttagna.
 //! - Länkade bilder (utanför paketet) och bildformat som Kladd inte kan visa (svg, wmf …) likaså.
-//! - Sidnummer och antal sidor i sidhuvud/sidfot blir `{sida}` och `{sidor}`; bara standardsidans
+//! - Fält i sidhuvud/sidfot blir `{sida}`, `{sidor}`, `{datum}`, `{titel}` och `{fil}`, flikar delar i
+//!   vänster|mitten|höger och `style:header-first`/`footer-first` blir första sidans variant; bara standardsidans
 //!   (första huvudsidans) vanliga sidhuvud och sidfot läses.
 //!
 //! Skrivning: ett nytt, giltigt paket med `mimetype` först och okomprimerad, manifest, innehåll,
@@ -1320,11 +1321,13 @@ fn render(blocks: &[Block], text_w: Option<f64>) -> String {
     out
 }
 
-/// Text i ett sidhuvud eller en sidfot med fält som `{sida}` och `{sidor}`.
-fn hf_collect(n: &Node, out: &mut String) {
+/// Text i ett sidhuvud eller en sidfot med fält som `{sida}`, `{sidor}`, `{datum}`, `{titel}` och
+/// `{fil}`. Flikar delar texten i `segs` (den sista delen är den pågående).
+fn hf_collect(n: &Node, segs: &mut Vec<String>) {
     for k in &n.kids {
         match k {
             Kid::Text(t) => {
+                let out = segs.last_mut().expect("minst en del");
                 for c in t.chars() {
                     if c.is_whitespace() {
                         if !out.ends_with(' ') && !out.is_empty() {
@@ -1335,33 +1338,60 @@ fn hf_collect(n: &Node, out: &mut String) {
                     }
                 }
             }
-            Kid::El(e) => match e.name.as_str() {
-                "text:page-number" => out.push_str("{sida}"),
-                "text:page-count" => out.push_str("{sidor}"),
-                "text:s" => {
-                    let c = e.attr("text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).min(100);
-                    out.push_str(&" ".repeat(c));
+            Kid::El(e) => {
+                let field = match e.name.as_str() {
+                    "text:page-number" => Some("{sida}"),
+                    "text:page-count" => Some("{sidor}"),
+                    "text:date" => Some("{datum}"),
+                    "text:title" => Some("{titel}"),
+                    "text:file-name" => Some("{fil}"),
+                    _ => None,
+                };
+                if let Some(f) = field {
+                    segs.last_mut().expect("minst en del").push_str(f);
+                    continue;
                 }
-                "text:tab" | "text:line-break" => out.push(' '),
-                "text:note" | "office:annotation" => {}
-                _ => hf_collect(e, out),
-            },
+                match e.name.as_str() {
+                    "text:s" => {
+                        let c = e.attr("text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).min(100);
+                        segs.last_mut().expect("minst en del").push_str(&" ".repeat(c));
+                    }
+                    "text:tab" => segs.push(String::new()),
+                    "text:line-break" => segs.last_mut().expect("minst en del").push(' '),
+                    "text:note" | "office:annotation" => {}
+                    _ => hf_collect(e, segs),
+                }
+            }
         }
     }
 }
 
+/// Sidhuvudets/sidfotens mall och justering. Ett enda stycke med en eller två flikar blir
+/// vänster|mitten|höger (`a|b|c`), annars sammanfogas styckena med mellanslag.
 fn header_footer(st: &Styles, n: &Node) -> Option<(String, Align)> {
     let mut parts = Vec::new();
+    let mut layout: Vec<Vec<String>> = Vec::new();
     let mut align = None;
     for p in n.els().filter(|p| matches!(p.name.as_str(), "text:p" | "text:h")) {
-        let mut s = String::new();
-        hf_collect(p, &mut s);
-        let s = s.trim().to_owned();
+        let mut segs = vec![String::new()];
+        hf_collect(p, &mut segs);
+        let segs: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
+        let s = segs.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
         if !s.is_empty() {
             if align.is_none() {
                 align = Some(st.align(p.attr("text:style-name")));
             }
             parts.push(s);
+            layout.push(match segs.len() {
+                // Standardsidhuvudets fliksstopp är mitten och höger.
+                2 => vec![segs[0].clone(), segs[1].clone(), String::new()],
+                _ => segs,
+            });
+        }
+    }
+    if let [l] = layout.as_slice() {
+        if l.len() == 3 {
+            return Some((l.join("|"), Align::Left));
         }
     }
     (!parts.is_empty()).then(|| (parts.join(" "), align.unwrap_or(Align::Left)))
@@ -1400,6 +1430,21 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults) {
     if let Some((t, a)) = master.child("style:footer").and_then(|h| header_footer(st, h)) {
         d.footer = Some(t);
         d.footer_align = a;
+    }
+    // Egen första sida (`style:header-first`/`style:footer-first`); en tom del blir en tom första sida.
+    let (h1, f1) = (master.child("style:header-first"), master.child("style:footer-first"));
+    if h1.is_some() || f1.is_some() {
+        for (node, header) in [(h1, true), (f1, false)] {
+            let found = node.and_then(|n| header_footer(st, n));
+            let text = found.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
+            let (slot, align) = if header { (&mut d.header_first, &mut d.header_align) } else { (&mut d.footer_first, &mut d.footer_align) };
+            *slot = Some(text);
+            if let Some((_, a)) = found {
+                if (header && d.header.is_none()) || (!header && d.footer.is_none()) {
+                    *align = a;
+                }
+            }
+        }
     }
 }
 
@@ -2345,26 +2390,43 @@ fn now_w3cdtf() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// Sidhuvudets eller sidfotens stycke med fälten `{sida}` och `{sidor}`.
-fn hf_paragraph(text: &str, style: &str) -> String {
+/// Sidhuvudets eller sidfotens innehåll: text och fälten (`{sida}` …) som ODF-fält.
+fn hf_inline(text: &str, f: &style::Fields) -> String {
+    let fields: [(&str, String); 5] = [
+        ("{sida}", format!("<text:page-number text:select-page=\"current\">{}</text:page-number>", f.page)),
+        ("{sidor}", format!("<text:page-count>{}</text:page-count>", f.pages)),
+        ("{datum}", format!("<text:date text:date-value=\"{d}\">{d}</text:date>", d = f.date)),
+        ("{titel}", format!("<text:title>{}</text:title>", esc(&f.title))),
+        ("{fil}", format!("<text:file-name text:display=\"name-and-extension\">{}</text:file-name>", esc(&f.file))),
+    ];
     let mut inner = String::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let s = rest.find("{sida}");
-        let n = rest.find("{sidor}");
-        let (at, len, field) = match (s, n) {
-            (Some(a), Some(b)) if b < a => (b, 7, "<text:page-count>1</text:page-count>"),
-            (Some(a), _) => (a, 6, "<text:page-number text:select-page=\"current\">1</text:page-number>"),
-            (None, Some(b)) => (b, 7, "<text:page-count>1</text:page-count>"),
-            (None, None) => {
+        match fields.iter().filter_map(|(p, x)| rest.find(p).map(|at| (at, p.len(), x))).min_by_key(|(at, ..)| *at) {
+            Some((at, len, x)) => {
+                inner.push_str(&hf_text(&rest[..at]));
+                inner.push_str(x);
+                rest = &rest[at + len..];
+            }
+            None => {
                 inner.push_str(&hf_text(rest));
                 break;
             }
-        };
-        inner.push_str(&hf_text(&rest[..at]));
-        inner.push_str(field);
-        rest = &rest[at + len..];
+        }
     }
+    inner
+}
+
+/// Sidhuvudets eller sidfotens stycke. En mall med `|` blir vänster, mitten och höger skilda av
+/// flikar (stycketypen har tabbstopp mitt och längst till höger).
+fn hf_paragraph(template: &str, style: &str, align: Align, f: &style::Fields) -> String {
+    let inner = if style::split_parts(template).is_some() {
+        let p = style::parts_of(template, align);
+        format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f), hf_inline(&p[1], f), hf_inline(&p[2], f))
+    } else {
+        let text = style::parts_of(template, align).into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+        hf_inline(&text, f)
+    };
     format!("<text:p text:style-name=\"{style}\">{inner}</text:p>")
 }
 
@@ -2387,7 +2449,7 @@ fn hf_text(t: &str) -> String {
     out
 }
 
-fn styles_xml(d: &DocDefaults) -> String {
+fn styles_xml(d: &DocDefaults, fields: &style::Fields) -> String {
     let font = d.font().to_owned();
     let size = pt_str(d.size());
     let mut fonts = BTreeSet::new();
@@ -2396,8 +2458,8 @@ fn styles_xml(d: &DocDefaults) -> String {
     let (pw, ph) = d.page();
     let m = d.margins();
     let orient = if pw > ph { "landscape" } else { "portrait" };
-    let header = d.header.as_deref().filter(|t| !t.is_empty());
-    let footer = d.footer.as_deref().filter(|t| !t.is_empty());
+    let text_w = cm((pw - m[1] - m[3]).max(36.0));
+    let half_w = cm((pw - m[1] - m[3]).max(36.0) / 2.0);
     let hf_style = |tag: &str| {
         format!(
             "<style:{tag}-style><style:header-footer-properties fo:min-height=\"0.6cm\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:margin-{side}=\"0.3cm\"/></style:{tag}-style>",
@@ -2417,17 +2479,29 @@ fn styles_xml(d: &DocDefaults) -> String {
     auto.push_str(&hf_style("footer"));
     auto.push_str("</style:page-layout>");
     let mut master = String::from("<style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\">");
+    // Sidhuvud och sidfot, och första sidans varianter som `style:header-first`/`style:footer-first`.
     for (tag, text, align, auto_name, parent) in [
-        ("header", header, d.header_align, "MP1", "Header"),
-        ("footer", footer, d.footer_align, "MP2", "Footer"),
+        ("header", d.header_template(1), d.header_align, "MP1", "Header"),
+        ("footer", d.footer_template(1), d.footer_align, "MP2", "Footer"),
+        ("header-first", d.header_first.as_deref(), d.header_align, "MP3", "Header"),
+        ("footer-first", d.footer_first.as_deref(), d.footer_align, "MP4", "Footer"),
     ] {
-        if let Some(t) = text {
-            auto.push_str(&format!(
-                "<style:style style:name=\"{auto_name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{}\" style:justify-single-word=\"false\"/></style:style>",
-                align_attr(align)
-            ));
-            master.push_str(&format!("<style:{tag}>{}</style:{tag}>", hf_paragraph(t, auto_name)));
+        // Utan egen första sida visas varken `header-first` eller `footer-first`.
+        let first = tag.ends_with("-first");
+        if first && !d.different_first() {
+            continue;
         }
+        let Some(t) = text.or(if first { Some("") } else { None }) else { continue };
+        let tabs = if style::split_parts(t).is_some() {
+            format!("<style:tab-stops><style:tab-stop style:position=\"{half_w}\" style:type=\"center\"/><style:tab-stop style:position=\"{text_w}\" style:type=\"right\"/></style:tab-stops>")
+        } else {
+            String::new()
+        };
+        let al = if style::split_parts(t).is_some() { "start" } else { align_attr(align) };
+        auto.push_str(&format!(
+            "<style:style style:name=\"{auto_name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\">{tabs}</style:paragraph-properties></style:style>"
+        ));
+        master.push_str(&format!("<style:{tag}>{}</style:{tag}>", hf_paragraph(t, auto_name, align, fields)));
     }
     master.push_str("</style:master-page>");
 
@@ -2533,7 +2607,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         for (name, text) in [
             ("META-INF/manifest.xml", manifest_xml(&w.media)),
             ("content.xml", content),
-            ("styles.xml", styles_xml(&defaults)),
+            ("styles.xml", styles_xml(&defaults, &style::Fields::for_export(title, "odt"))),
             ("meta.xml", meta_xml(title)),
         ] {
             zip.start_file(name, deflated).map_err(|e| e.to_string())?;
@@ -2894,6 +2968,33 @@ Slut.
         assert!(md.contains("[länk](https://example.com)[^1]."), "{md}");
         assert!(md.ends_with("Sista\n\n[^1]: Fotnot\n"), "{md}");
         assert_eq!(l.images.len(), 1);
+    }
+
+    fn odt_part(bytes: &[u8], name: &str) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut z.by_name(name).unwrap(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn header_fields_parts_and_first_page_roundtrip() {
+        let md = "<!-- kladd: header: \"Rapport|{titel}|{datum}\"; footer: \"Sida {sida} av {sidor}\"; footer-align: center; header-first: \"\"; footer-first: \"{fil}\" -->\n\nText\n";
+        let bytes = write(md, "Min rapport", &|_| None).unwrap().bytes;
+        let styles = odt_part(&bytes, "styles.xml");
+        assert!(styles.contains("<text:title>Min rapport</text:title>"), "{styles}");
+        assert!(styles.contains("<text:date text:date-value=\""), "{styles}");
+        assert!(styles.contains("<text:file-name text:display=\"name-and-extension\">Min rapport.odt</text:file-name>"), "{styles}");
+        assert!(styles.contains("<text:tab/>") && styles.contains("style:type=\"right\""), "{styles}");
+        assert!(styles.contains("<style:header-first>") && styles.contains("<style:footer-first>"), "{styles}");
+        assert!(styles.contains("<text:page-count>"), "{styles}");
+        let back = read(&bytes).unwrap();
+        let got = DocDefaults::from_comment(back.markdown.lines().next().unwrap()).unwrap();
+        assert_eq!(got, DocDefaults::from_comment(md.lines().next().unwrap()).unwrap());
+        // Utan första sida skrivs inga `-first`-delar.
+        let plain = write("<!-- kladd: footer: \"{sida}\" -->\n\nText\n", "x", &|_| None).unwrap().bytes;
+        let s = odt_part(&plain, "styles.xml");
+        assert!(!s.contains("header-first") && !s.contains("footer-first"), "{s}");
     }
 
     #[test]

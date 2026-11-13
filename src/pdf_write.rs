@@ -763,33 +763,39 @@ impl<'a> Layout<'a> {
         self.y += PARA_GAP;
     }
 
-    /// Sidhuvud och sidfot för sida `page` (1-baserad) av `total`, som ritinstruktioner.
-    /// Baslinjen ligger halvvägs mellan sidkanten och marginalen.
-    fn header_footer(&mut self, d: &DocDefaults, page: usize, total: usize) -> Vec<Op> {
+    /// Sidhuvud och sidfot för sidan `f.page` (1-baserad) av `f.pages`, som ritinstruktioner.
+    /// Baslinjen ligger halvvägs mellan sidkanten och marginalen. Delarna vänster|mitten|höger
+    /// ritas var för sig.
+    fn header_footer(&mut self, d: &DocDefaults, f: &style::Fields) -> Vec<Op> {
         let size = self.body * 0.9;
         let mut out = Vec::new();
+        let first = f.page == 1 && d.different_first();
         let items = [
-            (d.header.clone(), d.header_align, self.mt / 2.0),
+            (d.header_template(f.page - 1).map(str::to_owned), d.header_align, self.mt / 2.0),
             (
                 // Utan eget sidfotstecken visas ändå "N av M" till höger när dokumentet har flera sidor.
-                d.footer.clone().or_else(|| (total > 1).then(|| "{sida} av {sidor}".to_owned())),
-                if d.footer.is_some() { d.footer_align } else { Align::Right },
+                d.footer_template(f.page - 1)
+                    .map(str::to_owned)
+                    .or_else(|| (d.footer.is_none() && !first && f.pages > 1).then(|| "{sida} av {sidor}".to_owned())),
+                if d.footer.is_some() || first { d.footer_align } else { Align::Right },
                 self.ph - self.mb / 2.0,
             ),
         ];
         for (tpl, align, y) in items {
             let Some(tpl) = tpl else { continue };
-            let text = style::fill_fields(&tpl, page, total).replace('\n', " ");
-            if text.trim().is_empty() {
-                continue;
+            for (i, part) in style::parts_of(&tpl, align).iter().enumerate() {
+                let text = style::fill_fields(part, f).replace('\n', " ");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let w = self.m.width(self.base, size, &text);
+                let x = match i {
+                    1 => self.ml + ((self.cw - w) / 2.0).max(0.0),
+                    2 => self.ml + (self.cw - w).max(0.0),
+                    _ => self.ml,
+                };
+                out.push(Op::Text { x, y, face: self.base, size, text, color: MUTED, italic: false });
             }
-            let w = self.m.width(self.base, size, &text);
-            let x = match align {
-                Align::Center => self.ml + ((self.cw - w) / 2.0).max(0.0),
-                Align::Right => self.ml + (self.cw - w).max(0.0),
-                _ => self.ml,
-            };
-            out.push(Op::Text { x, y, face: self.base, size, text, color: MUTED, italic: false });
         }
         out
     }
@@ -1515,7 +1521,8 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let total = lay.pages.len();
     let images = std::mem::take(&mut lay.images);
     // Sidhuvud och sidfot ritas sist, när sidantalet är känt.
-    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer(&defaults, pi + 1, total)).collect();
+    let fields = style::Fields::for_export(title, "pdf");
+    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer(&defaults, &fields.at(pi + 1, total))).collect();
     for (pi, page_ops) in lay.pages.iter().enumerate() {
         let mut page = doc.start_page_with(PageSettings::from_wh(lay.pw, lay.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
@@ -1950,7 +1957,7 @@ mod tests {
         let total = lay.pages.len();
         assert!(total >= 3, "{total} sidor");
         for p in 1..=total {
-            let ops = lay.header_footer(&d, p, total);
+            let ops = lay.header_footer(&d, &style::Fields::new(p, total, "x"));
             let t = texts(&ops);
             assert_eq!(t.len(), 2);
             assert_eq!(t[0].2, "Rapport");
@@ -1968,9 +1975,32 @@ mod tests {
     }
 
     #[test]
+    fn header_parts_fields_and_first_page_in_pdf() {
+        let md = "<!-- kladd: header: \"Rapport|{titel}|{datum}\"; footer: \"{sida}/{sidor}\"; footer-align: right; header-first: \"\"; footer-first: \"Omslag\" -->\n\n".to_owned()
+            + &(0..150).map(|i| format!("Stycke {i} med lite text som fyller sidan.\n\n")).collect::<String>();
+        let (mut lay, d) = laid_out(&md, &|_| None);
+        let total = lay.pages.len();
+        assert!(total >= 3);
+        let f = |p: usize| style::Fields { page: p, pages: total, title: "Min rapport".into(), file: "Min rapport.pdf".into(), date: "2026-11-13".into() };
+        // Första sidan: tomt sidhuvud och egen sidfot.
+        let t1 = texts(&lay.header_footer(&d, &f(1)));
+        assert_eq!(t1.iter().map(|t| t.2.as_str()).collect::<Vec<_>>(), ["Omslag"]);
+        // Övriga sidor: tre delar i sidhuvudet (vänster, mitten, höger) och sidfot med fält.
+        let t2 = texts(&lay.header_footer(&d, &f(2)));
+        assert_eq!(t2.iter().map(|t| t.2.as_str()).collect::<Vec<_>>(), ["Rapport", "Min rapport", "2026-11-13", format!("2/{total}").as_str()]);
+        let (l, c, r) = (&t2[0], &t2[1], &t2[2]);
+        assert!((l.0 - lay.ml).abs() < 0.01);
+        let cw = lay.m.width(lay.base, lay.body * 0.9, "Min rapport");
+        assert!((c.0 + cw / 2.0 - (lay.ml + lay.cw / 2.0)).abs() < 0.01);
+        let rw = lay.m.width(lay.base, lay.body * 0.9, "2026-11-13");
+        assert!((r.0 + rw - (lay.ml + lay.cw)).abs() < 0.01);
+        assert!(write(&md, "Min rapport", &|_| None).unwrap().bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
     fn no_header_means_no_header_text() {
         let (mut lay, d) = laid_out("Hej\n", &|_| None);
-        assert!(texts(&lay.header_footer(&d, 1, 1)).is_empty());
+        assert!(texts(&lay.header_footer(&d, &style::Fields::new(1, 1, "x"))).is_empty());
     }
 
     #[test]

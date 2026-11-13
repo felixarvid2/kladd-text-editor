@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 
 use egui::epaint::text::Galley;
 use egui::{
-    Align, Align2, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Painter, Rect, RichText, Sense, Shape, Stroke,
+    Align, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Rect, RichText, Shape, Stroke,
     Ui, pos2, vec2,
 };
 
@@ -161,44 +161,6 @@ pub fn sheet_shapes(p: &Palette, geom: &Geom, left: f32, first_top: f32, count: 
 
 pub fn sheet_rect(geom: &Geom, left: f32, first_top: f32, k: usize) -> Rect {
     Rect::from_min_size(pos2(left, first_top + k as f32 * geom.stride()), vec2(geom.page_w, geom.page_h))
-}
-
-/// Ritar sidhuvud och sidfot på ett ark och ger `true` vid dubbelklick på någon av dem.
-#[allow(clippy::too_many_arguments)]
-pub fn header_footer(
-    ui: &mut Ui,
-    p: &Palette,
-    geom: &Geom,
-    sheet: Rect,
-    k: usize,
-    total: usize,
-    d: &DocDefaults,
-    font: FontId,
-    doc_id: u64,
-) -> bool {
-    let mut open = false;
-    let painter: Painter = ui.painter().clone();
-    let zones = [
-        (false, Rect::from_min_max(sheet.min, pos2(sheet.right(), sheet.top() + geom.top)), &d.header, d.header_align),
-        (true, Rect::from_min_max(pos2(sheet.left(), sheet.bottom() - geom.bottom), sheet.max), &d.footer, d.footer_align),
-    ];
-    for (footer, zone, text, align) in zones {
-        let resp = ui.interact(zone, ui.make_persistent_id(("kladd-hf", doc_id, k, footer)), Sense::click());
-        if resp.double_clicked() {
-            open = true;
-        }
-        let Some(t) = text.as_deref().filter(|t| !t.is_empty()) else { continue };
-        let t = crate::style::fill_fields(t, k + 1, total);
-        let y = zone.center().y;
-        let (x, anchor) = match align {
-            HAlign::Center => (sheet.center().x, Align2::CENTER_CENTER),
-            HAlign::Right => (sheet.right() - geom.right, Align2::RIGHT_CENTER),
-            _ => (sheet.left() + geom.left, Align2::LEFT_CENTER),
-        };
-        painter.text(pos2(x, y), anchor, t, font.clone(), p.page_muted);
-        resp.on_hover_text("Dubbelklicka för att ändra sidhuvud och sidfot");
-    }
-    open
 }
 
 /// Sidhuvudets/sidfotens typsnitt: brödtextens, 0,9 gånger så stort.
@@ -417,7 +379,11 @@ impl KladdApp {
                     ui.end_row();
                 });
                 ui.add_space(6.0);
-                ui.label(RichText::new("Använd {sida} och {sidor} för sidnummer").color(p.muted).size(12.5));
+                ui.label(
+                    RichText::new("Fält: {sida} {sidor} {datum} {titel} {fil}. Med | delas texten i vänster, mitten och höger. Dubbelklicka på sidhuvudet i dokumentet för fler val.")
+                        .color(p.muted)
+                        .size(12.5),
+                );
                 ui.add_space(6.0);
                 if ui.add(quiet_button("Sidnummer i sidfoten", p)).clicked() {
                     d.footer = "{sida}".to_owned();

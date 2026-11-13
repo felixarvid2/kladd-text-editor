@@ -101,6 +101,8 @@ pub struct State {
     pages: (usize, usize),
     /// Öppen dialog "Sidinställningar".
     pub(crate) page_dlg: Option<pages::PageDialog>,
+    /// Öppen dialog "Sidhuvud och sidfot".
+    pub(crate) hf_dlg: Option<super::headers::HfDialog>,
     /// Senast valda text- och markeringsfärg (knapparna tillämpar dem direkt).
     text_color: Option<[u8; 3]>,
     highlight: Option<[u8; 3]>,
@@ -931,7 +933,7 @@ impl KladdApp {
             let mut table_act: Option<TableOp> = None;
             let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
-            let mut open_page_dlg = false;
+            let mut open_hf_dlg: Option<(bool, usize)> = None;
             let mut fn_jump: Option<usize> = None;
             let mut fn_pending = self.wv.fn_pending.take();
 
@@ -1098,19 +1100,20 @@ impl KladdApp {
                     Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),
                     Sense::hover(),
                 );
-                // Sidhuvud och sidfot (skrivskyddade här; dubbelklick öppnar sidinställningarna).
+                // Sidhuvud och sidfot (skrivskyddade här; dubbelklick öppnar redigeringsdialogen).
                 let hf_font = pages::header_font(
                     z,
                     &analysis.defaults,
                     font_family(Some(analysis.defaults.font()), false, false),
                 );
+                let hf_fields = crate::style::Fields::new(1, total, &doc.title());
                 for k in 0..total {
                     let sheet = pages::sheet_rect(&geom, page_left, page_top, k);
                     if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
                         continue;
                     }
-                    if pages::header_footer(ui, p, &geom, sheet, k, total, &analysis.defaults, hf_font.clone(), doc_id) {
-                        open_page_dlg = true;
+                    if let Some(footer) = super::headers::header_footer(ui, p, &geom, sheet, k, total, &analysis.defaults, &hf_fields, hf_font.clone(), doc_id) {
+                        open_hf_dlg = Some((footer, k));
                     }
                 }
                 let painter = ui.painter().clone();
@@ -1429,8 +1432,8 @@ impl KladdApp {
             if let (Some(act), Some(r)) = (img_act, img_range) {
                 self.word_image_act(&ctx, act, r);
             }
-            if open_page_dlg {
-                self.open_page_dialog();
+            if let Some((footer, page)) = open_hf_dlg {
+                self.open_header_dialog(footer, page);
             }
             if let Some(t) = new_target {
                 self.wv.target = t;

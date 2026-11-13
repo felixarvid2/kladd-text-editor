@@ -197,7 +197,14 @@ pub fn div_open(align: Align) -> String {
 /// Allt står på en rad. `page-size` är `A4`, `A5`, `A3`, `Letter`, `Legal` eller bredd och höjd
 /// (`mm`, `cm`, `in`, `pt`); `landscape` efter namnet vänder sidan. `page-margin` följer CSS:
 /// ett värde för alla, eller topp höger botten vänster. I `header`/`footer` står `{sida}` för
-/// sidnumret och `{sidor}` för antalet sidor.
+/// sidnumret, `{sidor}` för antalet sidor, `{datum}` för dagens datum (ÅÅÅÅ-MM-DD), `{titel}` för
+/// filens namn utan ändelse och `{fil}` för hela filnamnet.
+///
+/// Med `|` delas texten i vänster, mitten och höger (`header: "Rapport|{titel}|{sida}"`; med två
+/// delar blir det vänster och höger). Utan `|` är det ett enda värde som placeras enligt
+/// `-align`. Ett litet `\|` är ett riktigt lodrätt streck. `header-first`/`footer-first` är
+/// sidhuvudet och sidfoten på första sidan: saknas de är första sidan som de andra, och med
+/// `""` är första sidan tom.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocDefaults {
     pub font_family: Option<String>,
@@ -210,6 +217,10 @@ pub struct DocDefaults {
     pub header_align: Align,
     pub footer: Option<String>,
     pub footer_align: Align,
+    /// Annorlunda sidhuvud på första sidan (`Some("")` = tomt).
+    pub header_first: Option<String>,
+    /// Annorlunda sidfot på första sidan (`Some("")` = tomt).
+    pub footer_first: Option<String>,
 }
 
 /// A4 i pt.
@@ -240,6 +251,23 @@ impl DocDefaults {
         self.page_margin.unwrap_or([DEFAULT_MARGIN; 4])
     }
 
+    /// Har första sidan eget sidhuvud eller egen sidfot?
+    pub fn different_first(&self) -> bool {
+        self.header_first.is_some() || self.footer_first.is_some()
+    }
+
+    /// Mallen för sidhuvudet på sida `page` (0-baserad); `None` om sidan saknar sidhuvud.
+    pub fn header_template(&self, page: usize) -> Option<&str> {
+        let t = if page == 0 && self.different_first() { self.header_first.as_deref() } else { self.header.as_deref() };
+        t.filter(|t| !t.is_empty())
+    }
+
+    /// Mallen för sidfoten på sida `page` (0-baserad); `None` om sidan saknar sidfot.
+    pub fn footer_template(&self, page: usize) -> Option<&str> {
+        let t = if page == 0 && self.different_first() { self.footer_first.as_deref() } else { self.footer.as_deref() };
+        t.filter(|t| !t.is_empty())
+    }
+
     /// Raden som skrivs först i texten, utan radslut. Tom sträng om inget avviker från standard.
     pub fn to_comment(&self) -> String {
         let mut parts = Vec::new();
@@ -266,6 +294,11 @@ impl DocDefaults {
                 }
             }
         }
+        for (name, text) in [("header-first", &self.header_first), ("footer-first", &self.footer_first)] {
+            if let Some(t) = text {
+                parts.push(format!("{name}: {}", quote(t)));
+            }
+        }
         if parts.is_empty() {
             return String::new();
         }
@@ -286,6 +319,8 @@ impl DocDefaults {
                 "page-margin" => d.page_margin = parse_margins(&v),
                 "header" => d.header = Some(unquote(&v)),
                 "footer" => d.footer = Some(unquote(&v)),
+                "header-first" => d.header_first = Some(unquote(&v)),
+                "footer-first" => d.footer_first = Some(unquote(&v)),
                 "header-align" => d.header_align = Align::from_attr(&v),
                 "footer-align" => d.footer_align = Align::from_attr(&v),
                 _ => {}
@@ -295,9 +330,138 @@ impl DocDefaults {
     }
 }
 
-/// Text i sidhuvud eller sidfot med fälten ifyllda.
-pub fn fill_fields(template: &str, page: usize, pages: usize) -> String {
-    template.replace("{sida}", &page.to_string()).replace("{sidor}", &pages.to_string())
+/// Fältens värden för en sida: sidnummer, antal sidor, filens namn och dagens datum.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fields {
+    pub page: usize,
+    pub pages: usize,
+    /// `{titel}`: filnamnet utan ändelse.
+    pub title: String,
+    /// `{fil}`: hela filnamnet.
+    pub file: String,
+    /// `{datum}`: ÅÅÅÅ-MM-DD.
+    pub date: String,
+}
+
+/// Dagens datum som ÅÅÅÅ-MM-DD (svenskt format).
+pub fn today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+impl Fields {
+    /// Fält för sida `page` av `pages` i filen `name` (med eller utan ändelse; en tom `name` ger tomma fält).
+    pub fn new(page: usize, pages: usize, name: &str) -> Self {
+        let (title, file) = split_name(name);
+        Fields { page, pages, title, file, date: today() }
+    }
+
+    /// Fält för en fil som skrivs som `title` + `ext` (utan punkt); `title` kan redan ha ändelsen.
+    pub fn for_export(title: &str, ext: &str) -> Self {
+        let (t, f) = split_name(title);
+        let has_ext = f != t;
+        let file = if has_ext || title.is_empty() { f } else { format!("{t}.{ext}") };
+        Fields { page: 1, pages: 1, title: t, file, date: today() }
+    }
+
+    pub fn at(&self, page: usize, pages: usize) -> Self {
+        Fields { page, pages, ..self.clone() }
+    }
+}
+
+/// (titel, filnamn): en kort alfanumerisk ändelse räknas som filändelse.
+fn split_name(name: &str) -> (String, String) {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && (1..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            (stem.to_owned(), name.to_owned())
+        }
+        _ => (name.to_owned(), name.to_owned()),
+    }
+}
+
+/// Fälten och deras namn i gränssnittet.
+pub const FIELD_NAMES: [(&str, &str); 5] = [
+    ("{sida}", "Sidnummer"),
+    ("{sidor}", "Antal sidor"),
+    ("{datum}", "Datum"),
+    ("{titel}", "Titel"),
+    ("{fil}", "Filnamn"),
+];
+
+/// Text i sidhuvud eller sidfot med fälten ifyllda. `\|` blir ett vanligt `|`.
+pub fn fill_fields(template: &str, f: &Fields) -> String {
+    let out = template
+        .replace("{sida}", &f.page.to_string())
+        .replace("{sidor}", &f.pages.to_string())
+        .replace("{datum}", &f.date)
+        .replace("{titel}", &f.title)
+        .replace("{fil}", &f.file);
+    out.replace("\\|", "|")
+}
+
+/// Delar mallen vid `|` (ej föregånget av `\`): `None` för ett enda värde. Två delar blir vänster och
+/// höger, fler än tre slås ihop i den sista. Delarna behåller `\|`.
+pub fn split_parts(t: &str) -> Option<[String; 3]> {
+    let mut parts = vec![String::new()];
+    let mut esc = false;
+    for c in t.chars() {
+        let cur = parts.last_mut().expect("minst en del");
+        if esc {
+            esc = false;
+            cur.push(c);
+            continue;
+        }
+        match c {
+            '\\' => {
+                esc = true;
+                cur.push(c);
+            }
+            '|' => parts.push(String::new()),
+            c => cur.push(c),
+        }
+    }
+    match parts.len() {
+        1 => None,
+        2 => {
+            let r = parts.pop().unwrap_or_default();
+            let l = parts.pop().unwrap_or_default();
+            Some([l, String::new(), r])
+        }
+        _ => {
+            let rest = parts.split_off(2).join("|");
+            let mut it = parts.into_iter();
+            Some([it.next().unwrap_or_default(), it.next().unwrap_or_default(), rest])
+        }
+    }
+}
+
+/// Mallens tre delar (vänster, mitten, höger) med `\|` som vanligt `|`; ett enda värde hamnar där
+/// `align` säger.
+pub fn parts_of(t: &str, align: Align) -> [String; 3] {
+    let un = |s: String| s.replace("\\|", "|");
+    match split_parts(t) {
+        Some(p) => p.map(un),
+        None => {
+            let mut p = [String::new(), String::new(), String::new()];
+            p[match align {
+                Align::Center => 1,
+                Align::Right => 2,
+                _ => 0,
+            }] = un(t.to_owned());
+            p
+        }
+    }
+}
+
+/// Tvärtom: mall och justering av (vänster, mitten, höger). Bara en del ifylld ger det gamla
+/// enkla värdet med justering; annars `v|m|h`.
+pub fn join_parts(p: &[String; 3]) -> (String, Align) {
+    let esc = |s: &str| s.replace('|', "\\|");
+    let filled: Vec<usize> = (0..3).filter(|&i| !p[i].is_empty()).collect();
+    match filled.as_slice() {
+        [] => (String::new(), Align::Left),
+        [i] => (esc(&p[*i]), [Align::Left, Align::Center, Align::Right][*i]),
+        _ => (format!("{}|{}|{}", esc(&p[0]), esc(&p[1]), esc(&p[2])), Align::Left),
+    }
 }
 
 /// `namn: värde`-par separerade med `;`, där värden inom citattecken får innehålla `;`.
@@ -675,7 +839,71 @@ mod tests {
         assert_eq!(back.page_size, Some((612.0, 792.0)));
         let m = back.page_margin.unwrap();
         assert!((m[1] - 56.69).abs() < 0.2 && (m[0] - 72.0).abs() < 0.2);
-        assert_eq!(fill_fields("Sida {sida} av {sidor}", 2, 5), "Sida 2 av 5");
+        assert_eq!(fill_fields("Sida {sida} av {sidor}", &Fields::new(2, 5, "")), "Sida 2 av 5");
+    }
+
+    #[test]
+    fn header_parts_and_first_page_roundtrip() {
+        let d = DocDefaults {
+            header: Some("Rapport|{titel}|{datum}".into()),
+            footer: Some("Sida {sida} av {sidor}".into()),
+            footer_align: Align::Center,
+            header_first: Some(String::new()),
+            footer_first: Some("Omslag".into()),
+            ..Default::default()
+        };
+        let c = d.to_comment();
+        assert!(c.contains("header: \"Rapport|{titel}|{datum}\""), "{c}");
+        assert!(c.contains("header-first: \"\""), "{c}");
+        assert_eq!(DocDefaults::from_comment(&c), Some(d.clone()));
+        assert!(d.different_first());
+        assert_eq!(d.header_template(0), None);
+        assert_eq!(d.header_template(1), Some("Rapport|{titel}|{datum}"));
+        assert_eq!(d.footer_template(0), Some("Omslag"));
+        assert_eq!(d.footer_template(2), Some("Sida {sida} av {sidor}"));
+        // Utan första-sidan-varianter gäller samma för alla sidor.
+        let plain = DocDefaults { header: Some("H".into()), ..Default::default() };
+        assert!(!plain.different_first());
+        assert_eq!(plain.header_template(0), Some("H"));
+    }
+
+    #[test]
+    fn parts_split_and_join() {
+        assert_eq!(split_parts("Bara en text"), None);
+        assert_eq!(parts_of("Mitt", Align::Center), ["", "Mitt", ""].map(String::from));
+        assert_eq!(parts_of("Höger", Align::Right), ["", "", "Höger"].map(String::from));
+        assert_eq!(parts_of("a|b|c", Align::Left), ["a", "b", "c"].map(String::from));
+        assert_eq!(parts_of("v||h", Align::Left), ["v", "", "h"].map(String::from));
+        assert_eq!(parts_of("v|h", Align::Left), ["v", "", "h"].map(String::from));
+        assert_eq!(parts_of("a\\|b|c", Align::Left), ["a|b", "", "c"].map(String::from));
+        assert_eq!(parts_of("a\\|b", Align::Left), ["a|b", "", ""].map(String::from));
+        // Ett enda värde ger det gamla formatet med justering.
+        assert_eq!(join_parts(&["".into(), "{sida}".into(), "".into()]), ("{sida}".to_owned(), Align::Center));
+        assert_eq!(join_parts(&["".into(), "".into(), "x".into()]), ("x".to_owned(), Align::Right));
+        assert_eq!(join_parts(&["a".into(), "".into(), "b".into()]), ("a||b".to_owned(), Align::Left));
+        assert_eq!(join_parts(&["".into(), "".into(), "".into()]), (String::new(), Align::Left));
+        // Ett riktigt streck överlever en tur genom join och parts_of.
+        let (t, a) = join_parts(&["a|b".into(), "".into(), "c".into()]);
+        assert_eq!(parts_of(&t, a), ["a|b", "", "c"].map(String::from));
+        let (t, a) = join_parts(&["".into(), "x|y".into(), "".into()]);
+        assert_eq!(parts_of(&t, a), ["", "x|y", ""].map(String::from));
+    }
+
+    #[test]
+    fn field_expansion() {
+        let f = Fields { page: 2, pages: 7, title: "Rapport".into(), file: "Rapport.docx".into(), date: "2026-11-13".into() };
+        assert_eq!(fill_fields("{titel} ({fil}) {datum}: {sida}/{sidor}", &f), "Rapport (Rapport.docx) 2026-11-13: 2/7");
+        assert_eq!(fill_fields("a\\|b", &f), "a|b");
+        let n = Fields::new(1, 1, "anteckning.md");
+        assert_eq!((n.title.as_str(), n.file.as_str()), ("anteckning", "anteckning.md"));
+        assert_eq!(n.date.len(), 10);
+        let e = Fields::for_export("anteckning", "pdf");
+        assert_eq!((e.title.as_str(), e.file.as_str()), ("anteckning", "anteckning.pdf"));
+        let e = Fields::for_export("anteckning.md", "pdf");
+        assert_eq!((e.title.as_str(), e.file.as_str()), ("anteckning", "anteckning.md"));
+        let e = Fields::for_export("v1.2 utkast", "pdf");
+        assert_eq!(e.title, "v1.2 utkast");
+        assert_eq!(f.at(3, 7).page, 3);
     }
 
     #[test]

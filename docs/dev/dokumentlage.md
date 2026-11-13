@@ -218,7 +218,12 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Sida, sidhuvud och sidfot** står i grundformatskommentaren (`style::DocDefaults`):
   `<!-- kladd: page-size: A4; page-margin: 25mm 20mm; header: "Rapport"; header-align: right;
   footer: "Sida {sida} av {sidor}"; footer-align: center -->`. Standard är A4 med en tums
-  marginaler och inget sidhuvud eller sidfot. `style::fill_fields` fyller i `{sida}`/`{sidor}`.
+  marginaler och inget sidhuvud eller sidfot. `style::fill_fields` fyller i `{sida}`, `{sidor}`, `{datum}`,
+  `{titel}` och `{fil}` (`style::Fields`). `|` delar i vänster|mitten|höger (`style::parts_of`,
+  `join_parts`; `\|` är ett riktigt streck) och `header-first`/`footer-first` är första sidans
+  varianter (`Some("")` = tom första sida; `DocDefaults::header_template(sida)`). Dialogen för
+  redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
+  fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
@@ -256,7 +261,7 @@ Formatmallar (`office:styles` och `office:automatic-styles` i `styles.xml`/`cont
 `style:parent-style-name`; bara det som skiljer sig från grundformatet (standardstycket + Standard)
 blir `<span style>`. Fotnoter, kommentarer, former/diagram och länkade bilder tas bort och rapporteras
 som borttagna (som för .docx). Sida, marginaler samt standardsidans sidhuvud/sidfot (`text:page-number`
-→ `{sida}`, `text:page-count` → `{sidor}`) hamnar i grundformatskommentaren. Vid skrivning ligger
+→ `{sida}`, `text:page-count` → `{sidor}`, `text:date`, `text:title`, `text:file-name`, flikar och `style:header-first`) hamnar i grundformatskommentaren. Vid skrivning ligger
 `mimetype` först och okomprimerad. `Document.docx` är sant även för `.odt` (dokumentläget);
 `language()` visar "OpenDocument".
 

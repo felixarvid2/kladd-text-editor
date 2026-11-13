@@ -1,5 +1,6 @@
 pub mod fonts;
 pub mod grid;
+pub mod headers;
 pub mod images;
 pub mod layout;
 pub mod markup;

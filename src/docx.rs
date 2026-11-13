@@ -882,6 +882,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     base.header_align = page.header_align;
     base.footer = page.footer.clone();
     base.footer_align = page.footer_align;
+    base.header_first = page.header_first.clone();
+    base.footer_first = page.footer_first.clone();
     if !info.fn_refs.is_empty() {
         markdown.push('\n');
         for (i, r) in info.fn_refs.iter().enumerate() {
@@ -1129,6 +1131,9 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
     let mut has_mar = false;
     let mut hdr: Option<String> = None;
     let mut ftr: Option<String> = None;
+    let mut hdr_first: Option<String> = None;
+    let mut ftr_first: Option<String> = None;
+    let mut title_pg = false;
     let mut r = Reader::from_str(sect);
     let twips = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
     loop {
@@ -1152,14 +1157,17 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
                         }
                     }
                 }
-                b"headerReference" | b"footerReference" if attr(&e, b"type").as_deref() == Some("default") => {
+                b"headerReference" | b"footerReference" if matches!(attr(&e, b"type").as_deref(), Some("default" | "first")) => {
                     let id = attr(&e, b"id");
-                    if local(e.name().as_ref()) == b"headerReference" {
-                        hdr = id;
-                    } else {
-                        ftr = id;
+                    let (header, first) = (local(e.name().as_ref()) == b"headerReference", attr(&e, b"type").as_deref() == Some("first"));
+                    match (header, first) {
+                        (true, false) => hdr = id,
+                        (true, true) => hdr_first = id,
+                        (false, false) => ftr = id,
+                        (false, true) => ftr_first = id,
                     }
                 }
+                b"titlePg" => title_pg = !matches!(attr(&e, b"val").as_deref(), Some("0" | "false" | "off")),
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
@@ -1181,23 +1189,55 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
             }
         }
     }
+    // Annorlunda första sida (`w:titlePg`): en saknad eller oläslig del blir en tom första sida.
+    if title_pg {
+        for (id, header) in [(hdr_first, true), (ftr_first, false)] {
+            let mut found = None;
+            if let Some((target, _, false)) = id.and_then(|i| rels.get(&i)) {
+                if let Some(xml) = pkg.part(&resolve_target(dir, target))? {
+                    found = hf_text(&xml);
+                }
+            }
+            let text = found.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
+            if header {
+                d.header_first = Some(text);
+                if d.header.is_none() {
+                    d.header_align = found.map_or(Align::Left, |(_, a)| a);
+                }
+            } else {
+                d.footer_first = Some(text);
+                if d.footer.is_none() {
+                    d.footer_align = found.map_or(Align::Left, |(_, a)| a);
+                }
+            }
+        }
+    }
     Ok(d)
 }
 
-/// `{sida}` för PAGE och `{sidor}` för NUMPAGES/SECTIONPAGES.
+/// `{sida}` för PAGE, `{sidor}` för NUMPAGES/SECTIONPAGES, `{datum}` för DATE/TIME, `{titel}` för
+/// TITLE och `{fil}` för FILENAME.
 fn field_placeholder(instr: &str) -> Option<&'static str> {
     match instr.split_whitespace().next().map(str::to_ascii_uppercase).as_deref() {
         Some("PAGE") => Some("{sida}"),
         Some("NUMPAGES" | "SECTIONPAGES") => Some("{sidor}"),
+        Some("DATE" | "TIME") => Some("{datum}"),
+        Some("TITLE") => Some("{titel}"),
+        Some("FILENAME") => Some("{fil}"),
         _ => None,
     }
 }
 
-/// Texten i ett sidhuvud eller en sidfot: styckenas text sammanfogad med mellanslag, sidnummerfält
-/// som `{sida}`/`{sidor}`, och det första styckets justering.
+/// Texten i ett sidhuvud eller en sidfot: styckenas text sammanfogad med mellanslag, fält som
+/// `{sida}`/`{sidor}`/`{datum}`/`{titel}`/`{fil}`, och det första styckets justering. Ett enda
+/// stycke med en eller två flikar blir vänster|mitten|höger (`a|b|c`); `|` i texten skrivs `\|`.
 fn hf_text(xml: &str) -> Option<(String, Align)> {
     let mut r = Reader::from_str(xml);
     let mut paras: Vec<String> = Vec::new();
+    // Styckenas delar uppdelade vid flikar, och det senaste styckets egna tabbstopp.
+    let mut para_segs: Vec<Vec<String>> = Vec::new();
+    let mut segs: Vec<String> = Vec::new();
+    let mut tab_stops: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut align: Option<Align> = None;
     let mut seen_p = false;
@@ -1218,6 +1258,8 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
                     b"p" if !empty => {
                         in_p = true;
                         cur.clear();
+                        segs.clear();
+                        tab_stops.clear();
                         if !seen_p {
                             seen_p = true;
                         }
@@ -1226,7 +1268,12 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
                     b"jc" if in_ppr && align.is_none() && paras.is_empty() => align = attr(e, b"val").map(|v| Align::from_jc(&v)),
                     b"t" => in_t = !empty,
                     b"instrText" => in_instr = !empty,
-                    b"tab" if in_p && !in_ppr => cur.push(' '),
+                    b"tab" if in_p && !in_ppr => segs.push(std::mem::take(&mut cur)),
+                    b"tab" if in_ppr => {
+                        if let Some(v) = attr(e, b"val").filter(|v| v != "clear") {
+                            tab_stops.push(v);
+                        }
+                    }
                     b"fldChar" => match attr(e, b"fldCharType").as_deref() {
                         Some("begin") => fields.push((String::new(), false, None)),
                         Some("separate") => {
@@ -1258,9 +1305,18 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
             Event::End(e) => match local(e.name().as_ref()) {
                 b"p" => {
                     if in_p {
-                        let t = cur.trim();
+                        segs.push(std::mem::take(&mut cur));
+                        let parts: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
+                        let t = parts.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
                         if !t.is_empty() {
-                            paras.push(t.to_owned());
+                            paras.push(t);
+                            // Två delar utan egna tabbstopp: Words standard är mitt och höger.
+                            let mut p = parts;
+                            if p.len() == 2 {
+                                let right = tab_stops.len() == 1 && tab_stops[0] == "right";
+                                p = if right { vec![p[0].clone(), String::new(), p[1].clone()] } else { vec![p[0].clone(), p[1].clone(), String::new()] };
+                            }
+                            para_segs.push(p);
                         } else if paras.is_empty() {
                             // Ett tomt första stycke ger ingen justering.
                             align = None;
@@ -1290,6 +1346,11 @@ fn hf_text(xml: &str) -> Option<(String, Align)> {
                 }
             }
             _ => {}
+        }
+    }
+    if let [p] = para_segs.as_slice() {
+        if p.len() == 3 {
+            return Some((p.join("|"), Align::Left));
         }
     }
     let text = paras.join(" ");
@@ -3678,14 +3739,14 @@ fn edit_tag(x: &str, start: &str, f: impl Fn(&str) -> String) -> String {
 }
 
 /// Tar bort `w:headerReference`/`w:footerReference` av typen "default".
-fn remove_default_ref(x: &str, tag: &str) -> String {
+fn remove_default_ref(x: &str, tag: &str, ty: &str) -> String {
     let mut out = String::new();
     let mut rest = x;
     while let Some(i) = rest.find(tag) {
         let Some(j) = rest[i..].find('>') else { break };
         let one = &rest[i..i + j + 1];
         out.push_str(&rest[..i]);
-        if !one.contains("w:type=\"default\"") {
+        if !one.contains(&format!("w:type=\"{ty}\"")) {
             out.push_str(one);
         }
         rest = &rest[i + j + 1..];
@@ -3694,9 +3755,25 @@ fn remove_default_ref(x: &str, tag: &str) -> String {
     out
 }
 
-/// Anpassar originalets `w:sectPr` efter ändrad sida (`page`) eller ändrat sidhuvud/sidfot
-/// (`Some(None)` tar bort standardreferensen, `Some(Some(id))` byter den).
-fn patch_sect(orig: &str, d: &DocDefaults, page: bool, hdr: Option<Option<&str>>, ftr: Option<Option<&str>>) -> String {
+/// Ändringar av sidhuvud och sidfot i en sektion: `Some(None)` tar bort referensen, `Some(Some(id))`
+/// byter den. `title_pg` slår på eller av annorlunda första sida.
+#[derive(Default)]
+struct SectEdit {
+    hdr: Option<Option<String>>,
+    hdr_first: Option<Option<String>>,
+    ftr: Option<Option<String>>,
+    ftr_first: Option<Option<String>>,
+    title_pg: Option<bool>,
+}
+
+impl SectEdit {
+    fn is_empty(&self) -> bool {
+        self.hdr.is_none() && self.hdr_first.is_none() && self.ftr.is_none() && self.ftr_first.is_none() && self.title_pg.is_none()
+    }
+}
+
+/// Anpassar originalets `w:sectPr` efter ändrad sida (`page`) eller ändrat sidhuvud/sidfot.
+fn patch_sect(orig: &str, d: &DocDefaults, page: bool, edit: &SectEdit) -> String {
     let mut x = orig.to_owned();
     if x.trim_end().ends_with("/>") && !x.contains("</w:sectPr>") {
         x = format!("{}></w:sectPr>", x.trim_end().trim_end_matches("/>").trim_end());
@@ -3717,38 +3794,90 @@ fn patch_sect(orig: &str, d: &DocDefaults, page: bool, hdr: Option<Option<&str>>
             t
         });
     }
-    for (tag, change) in [("<w:footerReference", ftr), ("<w:headerReference", hdr)] {
-        let Some(new) = change else { continue };
-        x = remove_default_ref(&x, tag);
+    for (tag, ty, change) in [
+        ("<w:footerReference", "first", &edit.ftr_first),
+        ("<w:headerReference", "first", &edit.hdr_first),
+        ("<w:footerReference", "default", &edit.ftr),
+        ("<w:headerReference", "default", &edit.hdr),
+    ] {
+        let Some(new) = change.as_ref() else { continue };
+        x = remove_default_ref(&x, tag, ty);
         if let Some(rid) = new {
             if let Some(open_end) = x.find('>') {
-                x.insert_str(open_end + 1, &format!("{tag} w:type=\"default\" r:id=\"{rid}\"/>"));
+                x.insert_str(open_end + 1, &format!("{tag} w:type=\"{ty}\" r:id=\"{rid}\"/>"));
+            }
+        }
+    }
+    if let Some(on) = edit.title_pg {
+        x = remove_title_pg(&x);
+        if on {
+            // `w:titlePg` står före textriktning, `w:docGrid` m.fl. i schemat.
+            let at = ["<w:textDirection", "<w:bidi", "<w:rtlGutter", "<w:docGrid", "<w:printerSettings", "</w:sectPr>"]
+                .iter()
+                .filter_map(|m| x.find(m))
+                .min();
+            if let Some(at) = at {
+                x.insert_str(at, "<w:titlePg/>");
             }
         }
     }
     x
 }
 
+/// Tar bort `<w:titlePg …/>` ur en sektion.
+fn remove_title_pg(x: &str) -> String {
+    let Some(i) = x.find("<w:titlePg") else { return x.to_owned() };
+    let Some(j) = x[i..].find('>') else { return x.to_owned() };
+    format!("{}{}", &x[..i], &x[i + j + 1..])
+}
+
+/// Relations-id:n för sidhuvuden och sidfötter som ska refereras.
+#[derive(Default)]
+struct HfRefs {
+    hdr: Option<String>,
+    hdr_first: Option<String>,
+    ftr: Option<String>,
+    ftr_first: Option<String>,
+}
+
+impl HfRefs {
+    /// Skriver de delar av `d` som har text och ger deras id:n.
+    fn make(extras: &mut Extras, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> HfRefs {
+        let mut one = |header: bool, text: Option<&str>| text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, d, f, ids, taken));
+        HfRefs {
+            hdr: one(true, d.header.as_deref()),
+            hdr_first: one(true, d.header_first.as_deref()),
+            ftr: one(false, d.footer.as_deref()),
+            ftr_first: one(false, d.footer_first.as_deref()),
+        }
+    }
+}
+
 /// Ny `w:sectPr` av DocDefaults.
-fn sect_pr_new(d: &DocDefaults, hdr: Option<&str>, ftr: Option<&str>) -> String {
+fn sect_pr_new(d: &DocDefaults, refs: &HfRefs) -> String {
     let (w, h) = d.page();
     let m = d.margins();
     let mut s = String::from("<w:sectPr>");
-    if let Some(id) = hdr {
-        s.push_str(&format!("<w:headerReference w:type=\"default\" r:id=\"{id}\"/>"));
-    }
-    if let Some(id) = ftr {
-        s.push_str(&format!("<w:footerReference w:type=\"default\" r:id=\"{id}\"/>"));
+    for (tag, ty, id) in [
+        ("header", "default", &refs.hdr),
+        ("header", "first", &refs.hdr_first),
+        ("footer", "default", &refs.ftr),
+        ("footer", "first", &refs.ftr_first),
+    ] {
+        if let Some(id) = id {
+            s.push_str(&format!("<w:{tag}Reference w:type=\"{ty}\" r:id=\"{id}\"/>"));
+        }
     }
     let orient = if w > h { " w:orient=\"landscape\"" } else { "" };
     s.push_str(&format!(
-        "<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/><w:cols w:space=\"708\"/></w:sectPr>",
+        "<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/><w:cols w:space=\"708\"/>{title_pg}</w:sectPr>",
         twips(w),
         twips(h),
         twips(m[0]),
         twips(m[1]),
         twips(m[2]),
-        twips(m[3])
+        twips(m[3]),
+        title_pg = if d.different_first() { "<w:titlePg/>" } else { "" }
     ));
     s
 }
@@ -3760,17 +3889,21 @@ fn field_runs(instr: &str, shown: &str) -> String {
     )
 }
 
-/// Ett sidhuvud (`hdr`) eller en sidfot (`ftr`) med ett stycke; `{sida}`/`{sidor}` blir fält.
-fn hf_part(root: &str, text: &str, align: Align) -> String {
+/// Körningar för en text där fälten (`{sida}` …) blir Word-fält med värdena i `f` som förhandsvisning.
+fn hf_runs(text: &str, f: &style::Fields) -> String {
+    let fields: [(&str, &str, String); 5] = [
+        ("{sida}", "PAGE", f.page.to_string()),
+        ("{sidor}", "NUMPAGES", f.pages.to_string()),
+        ("{datum}", "DATE \\@ \"yyyy-MM-dd\"", f.date.clone()),
+        ("{titel}", "TITLE", f.title.clone()),
+        ("{fil}", "FILENAME", f.file.clone()),
+    ];
     let mut runs = String::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let next = [("{sida}", "PAGE", "1"), ("{sidor}", "NUMPAGES", "1")]
-            .into_iter()
-            .filter_map(|(p, i, sh)| rest.find(p).map(|at| (at, p, i, sh)))
-            .min_by_key(|(at, ..)| *at);
+        let next = fields.iter().filter_map(|(p, i, sh)| rest.find(p).map(|at| (at, p.len(), i, sh))).min_by_key(|(at, ..)| *at);
         let (plain, field) = match next {
-            Some((at, p, i, sh)) => (&rest[..at], Some((p.len(), i, sh))),
+            Some((at, len, i, sh)) => (&rest[..at], Some((len, i, sh))),
             None => (rest, None),
         };
         if !plain.is_empty() {
@@ -3780,14 +3913,33 @@ fn hf_part(root: &str, text: &str, align: Align) -> String {
         }
         match field {
             Some((len, i, sh)) => {
-                runs.push_str(&field_runs(i, sh));
+                let mut shown = String::new();
+                xml_escape(sh, &mut shown);
+                runs.push_str(&field_runs(i, &shown));
                 rest = &rest[plain.len() + len..];
             }
             None => rest = "",
         }
     }
-    let jc = if align == Align::Left { String::new() } else { format!("<w:pPr><w:jc w:val=\"{}\"/></w:pPr>", align.as_jc()) };
-    format!("{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p>{jc}{runs}</w:p></w:{root}>")
+    runs
+}
+
+/// Ett sidhuvud (`hdr`) eller en sidfot (`ftr`) med ett stycke. Fälten blir Word-fält; en mall med
+/// `|` blir vänster, mitten och höger med flikar (mitt och höger tabbstopp över textbredden
+/// `text_w` i twips).
+fn hf_part(root: &str, template: &str, align: Align, text_w: i64, f: &style::Fields) -> String {
+    let (ppr, runs) = if style::split_parts(template).is_some() {
+        let p = style::parts_of(template, align);
+        let tab = "<w:r><w:tab/></w:r>";
+        let ppr = format!("<w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\"{}\"/><w:tab w:val=\"right\" w:pos=\"{text_w}\"/></w:tabs></w:pPr>", text_w / 2);
+        (ppr, format!("{}{tab}{}{tab}{}", hf_runs(&p[0], f), hf_runs(&p[1], f), hf_runs(&p[2], f)))
+    } else {
+        let [l, c, r] = style::parts_of(template, align);
+        let text = [l, c, r].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+        let ppr = if align == Align::Left { String::new() } else { format!("<w:pPr><w:jc w:val=\"{}\"/></w:pPr>", align.as_jc()) };
+        (ppr, hf_runs(&text, f))
+    };
+    format!("{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p>{ppr}{runs}</w:p></w:{root}>")
 }
 
 /// Delar som läggs till i ett paket: relationer, innehållstyper och nya filer.
@@ -3800,7 +3952,9 @@ struct Extras {
 
 impl Extras {
     /// Lägger till sidhuvud/sidfot och ger dess relations-id.
-    fn header_footer(&mut self, header: bool, text: &str, align: Align, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> String {
+    fn header_footer(&mut self, header: bool, text: &str, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> String {
+        let align = if header { d.header_align } else { d.footer_align };
+        let text_w = twips(((d.page().0 - d.margins()[1] - d.margins()[3]).max(36.0)) as f32) as i64;
         let (stem, root, kind, mime) = if header {
             ("header", "hdr", "header", "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml")
         } else {
@@ -3824,7 +3978,7 @@ impl Extras {
         };
         self.rels.push_str(&format!(r#"<Relationship Id="{rid}" Type="{REL_NS}/{kind}" Target="{stem}{n}.xml"/>"#));
         self.types.push_str(&format!(r#"<Override PartName="/{name}" ContentType="{mime}"/>"#));
-        self.parts.push((name, hf_part(root, text, align).into_bytes()));
+        self.parts.push((name, hf_part(root, text, align, text_w, f).into_bytes()));
         rid
     }
 }
@@ -3911,7 +4065,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         None => (DocDefaults::default(), markdown),
     };
     match source {
-        Some(src) => write_patched(src, defaults, markdown, resolve),
+        Some(src) => write_patched(src, defaults, markdown, title, resolve),
         None => write_fresh(defaults, markdown, title, resolve),
     }
 }
@@ -3946,9 +4100,9 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     }
     let (body, footnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None);
     let mut extras = Extras::default();
-    let hdr = defaults.header.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(true, t, defaults.header_align, &mut w.ids, &mut taken));
-    let ftr = defaults.footer.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(false, t, defaults.footer_align, &mut w.ids, &mut taken));
-    let sect = sect_pr_new(&defaults, hdr.as_deref(), ftr.as_deref());
+    let fields = style::Fields::for_export(title, "docx");
+    let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut w.ids, &mut taken);
+    let sect = sect_pr_new(&defaults, &refs);
     let document = format!(
         r#"{XML_DECL}
 <w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}"><w:body>{body}{sect}</w:body></w:document>"#
@@ -3998,6 +4152,15 @@ fn same_page(a: &DocDefaults, b: &DocDefaults) -> bool {
     let (pa, pb) = (a.page(), b.page());
     let (ma, mb) = (a.margins(), b.margins());
     (pa.0 - pb.0).abs() < 1.0 && (pa.1 - pb.1).abs() < 1.0 && ma.iter().zip(mb).all(|(x, y)| (x - y).abs() < 0.6)
+}
+
+/// Har första sidans sidhuvud/sidfot ändrats? `None` = ingen egen första sida, `Some("")` = tom.
+fn first_changed(new: Option<&str>, new_align: Align, old: Option<&str>, old_align: Align) -> bool {
+    match (new, old) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a != b || (!a.is_empty() && new_align != old_align),
+        _ => true,
+    }
 }
 
 /// Har sidhuvudets/sidfotens text eller justering ändrats?
@@ -4334,7 +4497,7 @@ fn fix_head(head: &str) -> String {
     h
 }
 
-fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
+fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>) -> Result<Written, String> {
     let main_dir = src.main.rsplit_once('/').map_or("", |(d, _)| d);
     let main_file = src.main.rsplit('/').next().unwrap_or("document.xml");
     let rels_name = if main_dir.is_empty() { format!("_rels/{main_file}.rels") } else { format!("{main_dir}/_rels/{main_file}.rels") };
@@ -4559,22 +4722,37 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, resolve: &
     let page_changed = !same_page(&defaults, &src.page);
     let hdr_changed = hf_changed(defaults.header.as_deref(), defaults.header_align, src.page.header.as_deref(), src.page.header_align);
     let ftr_changed = hf_changed(defaults.footer.as_deref(), defaults.footer_align, src.page.footer.as_deref(), src.page.footer_align);
+    let hdr1_changed = first_changed(defaults.header_first.as_deref(), defaults.header_align, src.page.header_first.as_deref(), src.page.header_align);
+    let ftr1_changed = first_changed(defaults.footer_first.as_deref(), defaults.footer_align, src.page.footer_first.as_deref(), src.page.footer_align);
     let mut extras = Extras::default();
     let mut ids = w.ids.clone();
-    let mut new_hdr: Option<Option<String>> = None;
-    let mut new_ftr: Option<Option<String>> = None;
+    let fields = style::Fields::for_export(title, "docx");
     // Utan originalets sektionsegenskaper skrivs allt om.
-    let (hdr_changed, ftr_changed) = if src.sect_pr.is_none() { (true, true) } else { (hdr_changed, ftr_changed) };
-    if hdr_changed {
-        new_hdr = Some(defaults.header.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(true, t, defaults.header_align, &mut ids, &mut taken)));
-    }
-    if ftr_changed {
-        new_ftr = Some(defaults.footer.as_deref().filter(|t| !t.is_empty()).map(|t| extras.header_footer(false, t, defaults.footer_align, &mut ids, &mut taken)));
-    }
     let sect = match &src.sect_pr {
-        Some(orig) if !page_changed && new_hdr.is_none() && new_ftr.is_none() => orig.clone(),
-        Some(orig) => patch_sect(orig, &defaults, page_changed, new_hdr.as_ref().map(|o| o.as_deref()), new_ftr.as_ref().map(|o| o.as_deref())),
-        None => sect_pr_new(&defaults, new_hdr.flatten().as_deref(), new_ftr.flatten().as_deref()),
+        None => {
+            let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut ids, &mut taken);
+            sect_pr_new(&defaults, &refs)
+        }
+        Some(orig) => {
+            let mut edit = SectEdit::default();
+            let mut make = |header: bool, text: Option<&str>| text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, &defaults, &fields, &mut ids, &mut taken));
+            if hdr_changed {
+                edit.hdr = Some(make(true, defaults.header.as_deref()));
+            }
+            if ftr_changed {
+                edit.ftr = Some(make(false, defaults.footer.as_deref()));
+            }
+            if hdr1_changed {
+                edit.hdr_first = Some(make(true, defaults.header_first.as_deref()));
+            }
+            if ftr1_changed {
+                edit.ftr_first = Some(make(false, defaults.footer_first.as_deref()));
+            }
+            if defaults.different_first() != src.page.different_first() {
+                edit.title_pg = Some(defaults.different_first());
+            }
+            if !page_changed && edit.is_empty() { orig.clone() } else { patch_sect(orig, &defaults, page_changed, &edit) }
+        }
     };
     let document = format!("{}{body}{sect}{}", fix_head(&src.head), src.tail);
 
@@ -5224,6 +5402,108 @@ Marginal
         assert_eq!(part_text(&out, "word/styles.xml").contains("Brodtext2"), true);
         // Ingen ny sektion eller sidhuvud skapas.
         assert!(zip::ZipArchive::new(Cursor::new(&out)).unwrap().file_names().all(|n| n != "word/header2.xml"));
+    }
+
+    // ---------------------------------------------------------- sidhuvud och sidfot: fält, delar, första sidan
+
+    const WNS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+    /// `rich_docx` med Words sidhuvud (vänster, titel och datum med flikar), en sidfot med bara ett
+    /// högerställt sidnummer och en egen första sida (tomt sidhuvud, sidfot "Omslag").
+    fn word_hf_docx() -> (Vec<u8>, String, String) {
+        let hdr = format!(
+            r#"<w:hdr xmlns:w="{WNS}"><w:p><w:pPr><w:tabs><w:tab w:val="center" w:pos="4680"/><w:tab w:val="right" w:pos="9360"/></w:tabs></w:pPr><w:r><w:t>Rapport</w:t></w:r><w:r><w:tab/></w:r><w:fldSimple w:instr=" TITLE "><w:r><w:t>Min titel</w:t></w:r></w:fldSimple><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> DATE \@ "d MMMM yyyy" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1 januari 2020</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:hdr>"#
+        );
+        let ftr = format!(
+            r#"<w:ftr xmlns:w="{WNS}"><w:p><w:pPr><w:tabs><w:tab w:val="right" w:pos="9360"/></w:tabs></w:pPr><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:ftr>"#
+        );
+        let ftr1 = format!(r#"<w:ftr xmlns:w="{WNS}"><w:p><w:r><w:t>Omslag</w:t></w:r></w:p></w:ftr>"#);
+        let hdr1 = format!(r#"<w:hdr xmlns:w="{WNS}"><w:p/></w:hdr>"#);
+        let sect = SECT
+            .replace(
+                r#"<w:footerReference w:type="default" r:id="rId11"/>"#,
+                r#"<w:footerReference w:type="default" r:id="rId11"/><w:headerReference w:type="first" r:id="rId13"/><w:footerReference w:type="first" r:id="rId14"/>"#,
+            )
+            .replace("</w:sectPr>", "<w:titlePg/></w:sectPr>");
+        let mut b = patch_part(&rich_docx(), "word/header1.xml", |_| hdr.clone());
+        b = patch_part(&b, "word/footer1.xml", |_| ftr.clone());
+        b = patch_part(&b, "word/header2.xml", |_| hdr1.clone());
+        b = patch_part(&b, "word/footer2.xml", |_| ftr1.clone());
+        b = patch_part(&b, "word/document.xml", |x| x.replace(SECT, &sect));
+        b = patch_part(&b, "word/_rels/document.xml.rels", |x| {
+            x.replace(
+                "</Relationships>",
+                &format!(
+                    r#"<Relationship Id="rId13" Type="{REL_NS}/header" Target="header2.xml"/><Relationship Id="rId14" Type="{REL_NS}/footer" Target="footer2.xml"/></Relationships>"#
+                ),
+            )
+        });
+        (b, hdr, ftr)
+    }
+
+    #[test]
+    fn word_header_with_tabs_fields_and_first_page_imports() {
+        let (docx, ..) = word_hf_docx();
+        let l = read(&docx).unwrap();
+        let d = DocDefaults::from_comment(l.markdown.lines().next().unwrap()).expect("grundformat");
+        assert_eq!(d.header.as_deref(), Some("Rapport|{titel}|{datum}"));
+        assert_eq!(d.footer.as_deref(), Some("||{sida}"));
+        assert_eq!(d.header_first.as_deref(), Some(""));
+        assert_eq!(d.footer_first.as_deref(), Some("Omslag"));
+        assert!(d.different_first());
+        // Utan `w:titlePg` ignoreras första sidans delar.
+        let no_first = patch_part(&docx, "word/document.xml", |x| x.replace("<w:titlePg/>", ""));
+        let d2 = DocDefaults::from_comment(read(&no_first).unwrap().markdown.lines().next().unwrap()).unwrap();
+        assert!(!d2.different_first());
+    }
+
+    #[test]
+    fn word_header_unchanged_keeps_original_parts_and_changes_are_patched() {
+        let (docx, hdr, ftr) = word_hf_docx();
+        let l = read(&docx).unwrap();
+        let src = l.source.as_ref();
+        // Oförändrat: dokument, sidhuvud och sidfot är orörda.
+        let out = write(&l.markdown, "x", &|_| None, src).unwrap().bytes;
+        assert_eq!(part_text(&out, "word/header1.xml"), hdr);
+        assert_eq!(part_text(&out, "word/footer1.xml"), ftr);
+        assert!(part_text(&out, "word/document.xml").contains("<w:titlePg/>"));
+        // Nytt sidhuvud: en ny del ersätter standardreferensen, första sidan och `titlePg` består.
+        let md = l.markdown.replacen("header: \"Rapport|{titel}|{datum}\"", "header: \"Ny|{titel}|{sida}\"", 1);
+        assert_ne!(md, l.markdown);
+        let out = write(&md, "x", &|_| None, src).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert!(doc.contains("<w:titlePg/>") && doc.contains(r#"w:type="first""#), "{doc}");
+        assert!(doc.contains(r#"<w:headerReference w:type="default" r:id="rIdKladdHdr1"/>"#), "{doc}");
+        assert_eq!(part_text(&out, "word/footer1.xml"), ftr);
+        let back = read(&out).unwrap();
+        assert!(back.markdown.contains("header: \"Ny|{titel}|{sida}\""), "{}", back.markdown);
+        // Utan första sida: referenserna och `titlePg` tas bort.
+        let md = l.markdown.replace("; header-first: \"\"", "").replace("; footer-first: \"Omslag\"", "");
+        assert!(!md.contains("-first"), "{md}");
+        let out = write(&md, "x", &|_| None, src).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert!(!doc.contains("titlePg") && !doc.contains(r#"w:type="first""#), "{doc}");
+        assert!(!read(&out).unwrap().markdown.contains("-first"));
+    }
+
+    #[test]
+    fn written_header_has_fields_tabs_and_first_page_variant() {
+        let md = "<!-- kladd: header: \"Rapport|{titel}|{datum}\"; footer: \"Sida {sida} av {sidor}\"; footer-align: center; header-first: \"\"; footer-first: \"Omslag\" -->\n\nText\n";
+        let out = write(md, "Min rapport", &|_| None, None).unwrap().bytes;
+        let hdr = part_text(&out, "word/header1.xml");
+        assert!(hdr.contains(" TITLE ") && hdr.contains("DATE ") && hdr.contains("<w:tab/>"), "{hdr}");
+        assert!(hdr.contains("w:val=\"center\"") && hdr.contains("w:val=\"right\""), "{hdr}");
+        assert!(hdr.contains("<w:t>Min rapport</w:t>"), "förhandsvisning av titeln: {hdr}");
+        let ftr = part_text(&out, "word/footer1.xml");
+        assert!(ftr.contains(" PAGE ") && ftr.contains(" NUMPAGES ") && !ftr.contains("<w:tab/>"), "{ftr}");
+        assert!(part_text(&out, "word/footer2.xml").contains("Omslag"));
+        let doc = part_text(&out, "word/document.xml");
+        assert!(doc.contains("<w:titlePg/>") && doc.contains(r#"<w:footerReference w:type="first""#), "{doc}");
+        // Tomt första sidhuvud ger ingen del, och allt läses tillbaka.
+        assert!(!doc.contains(r#"<w:headerReference w:type="first""#), "{doc}");
+        let want = DocDefaults::from_comment(md.lines().next().unwrap()).unwrap();
+        let back = read(&out).unwrap();
+        assert_eq!(DocDefaults::from_comment(back.markdown.lines().next().unwrap()), Some(want));
     }
 
     #[test]

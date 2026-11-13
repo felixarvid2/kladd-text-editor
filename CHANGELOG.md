@@ -20,6 +20,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 
 - Byt tema har flyttats från Ctrl+Shift+L till Ctrl+Shift+K (Ctrl+Shift+L är nu "markera alla förekomster" i textläget).
+- **Redigerbara sidhuvuden och sidfötter.** Dubbelklicka på sidhuvudet eller sidfoten på en sida i dokumentläget för att redigera dem i tre fält (vänster, mitten, höger) med knappar för Sidnummer, Antal sidor, Datum, Titel och Filnamn, och rutan *Annorlunda första sida*. Nya fält `{datum}`, `{titel}` och `{fil}`, delning med `|` (`header: "Rapport|{titel}|{sida}"`) och `header-first`/`footer-first` fungerar i dokumentläget, PDF, utskrift, `.docx` och `.odt`. Sidhuvud och sidfot med fält, flikar och annorlunda första sida läses också från Word- och LibreOffice-dokument.
 
 ## [1.9.0] – 2026-11-12
 

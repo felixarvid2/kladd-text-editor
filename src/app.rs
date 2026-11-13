@@ -1076,7 +1076,7 @@ impl KladdApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending_close.is_some() || self.history.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
+        if self.pending_close.is_some() || self.history.is_some() || self.pending_docx.is_some() || self.pending_password.is_some() || self.print.is_open() || self.wv.page_dlg.is_some() || self.wv.hf_dlg.is_some() || self.docs.get(self.active).and_then(|d| d.pdfv.as_ref()).is_some_and(|t| t.dialog_open()) {
             return;
         }
         // COMMAND = ⌘ på Mac, Ctrl annars.
@@ -3151,6 +3151,7 @@ impl eframe::App for KladdApp {
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);
+        self.header_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);
