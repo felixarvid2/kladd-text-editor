@@ -594,6 +594,8 @@ struct PageGeom {
 struct PageOps {
     ops: Vec<Op>,
     geom: PageGeom,
+    /// Avsnittet sidan börjar i (för sidhuvud, sidfot och sidnummer).
+    sec: usize,
 }
 
 struct Heading {
@@ -650,6 +652,11 @@ struct Layout<'a> {
     page_ymax: f32,
     /// Räknas upp vid varje spalt- eller sidbyte.
     breaks: usize,
+    /// Avsnittet vi står i och om en avsnittsrad redan setts (en rad före all text gäller första avsnittet).
+    cur_sec: usize,
+    sec_row_seen: bool,
+    /// Minsta marginal uppifrån och nedifrån per avsnitt för sidhuvud och sidfot (`hf::Plan::reserve`).
+    hf_reserve: Vec<[f32; 2]>,
     /// Fotnoternas text (nummer − 1), och de som hör till sidan som läggs ut just nu.
     notes: Vec<Vec<Span>>,
     page_notes: Vec<usize>,
@@ -781,7 +788,7 @@ impl<'a> Layout<'a> {
             _ => Face::Sans,
         };
         let (pw, ph) = defaults.page();
-        let [mt, mr, mb, ml] = defaults.margins();
+        let [mt, mr, mb, ml] = defaults.layout_margins();
         // Orimliga marginaler (större än sidan) ger ändå en användbar textyta.
         let cw = (pw - ml - mr).max(36.0);
         Layout {
@@ -817,6 +824,9 @@ impl<'a> Layout<'a> {
             rt: mt,
             page_ymax: 0.0,
             breaks: 0,
+            cur_sec: 0,
+            sec_row_seen: false,
+            hf_reserve: Vec::new(),
             notes: Vec::new(),
             page_notes: Vec::new(),
             reserved: 0.0,
@@ -884,42 +894,78 @@ impl<'a> Layout<'a> {
         self.y += PARA_GAP;
     }
 
-    /// Sidhuvud och sidfot för sidan `f.page` (1-baserad) av `f.pages`, som ritinstruktioner.
-    /// Baslinjen ligger halvvägs mellan sidkanten och marginalen på sidans egen storlek (avsnitt kan ha
-    /// olika). Delarna vänster|mitten|höger ritas var för sig.
+    /// Sidhuvud och sidfot för sidan `f.page` (1-baserad) av `f.pages` i ett dokument utan avsnitt.
+    #[cfg(test)]
     fn header_footer(&mut self, d: &DocDefaults, f: &style::Fields) -> Vec<Op> {
-        let size = self.body * 0.9;
-        let g = self.pages.get(f.page.wrapping_sub(1)).map_or(
+        let plan = crate::hf::Plan::new(d, &[]);
+        let pp = plan.pages(&vec![0; f.pages]);
+        self.header_footer_page(d, &plan, &pp, f, f.page.wrapping_sub(1))
+    }
+
+    /// Sidhuvud och sidfot för ark `k` (0-baserat) som ritinstruktioner. Raden ställs upp av
+    /// `hf::layout_zone` på sidans egen storlek (avsnitt kan ha olika): avstånd från sidkanten,
+    /// delar vänster|mitten|höger, bilder och linjen mot brödtexten. `base` har sidantalet.
+    fn header_footer_page(&mut self, d: &DocDefaults, plan: &crate::hf::Plan, pp: &crate::hf::PagePlan, base: &style::Fields, k: usize) -> Vec<Op> {
+        use crate::hf::{self, Placed};
+        let g = self.pages.get(k).map_or(
             PageGeom { pw: self.pw, ph: self.ph, mt: self.mt, mb: self.mb, ml: self.text_l, cw: self.text_w },
             |p| p.geom,
         );
-        let mut out = Vec::new();
-        let first = f.page == 1 && d.different_first();
+        let hf_page = plan.page(pp, k, base);
+        let f = &hf_page.fields;
+        // Utan eget sidfotstecken visas ändå "N av M" till höger när dokumentet har flera sidor.
+        let first = d.different_first() && k == 0;
+        let auto_footer = (d.footer.is_none() && d.footer_even.is_none() && plan.secs.len() == 1 && !first && f.pages > 1).then(|| "{sida} av {sidor}".to_owned());
         let items = [
-            (d.header_template(f.page - 1).map(str::to_owned), d.header_align, g.mt / 2.0),
+            (false, hf_page.header.map(str::to_owned), hf_page.header_align, &d.header_style, d.header_dist),
             (
-                // Utan eget sidfotstecken visas ändå "N av M" till höger när dokumentet har flera sidor.
-                d.footer_template(f.page - 1)
-                    .map(str::to_owned)
-                    .or_else(|| (d.footer.is_none() && !first && f.pages > 1).then(|| "{sida} av {sidor}".to_owned())),
-                if d.footer.is_some() || first { d.footer_align } else { Align::Right },
-                g.ph - g.mb / 2.0,
+                true,
+                hf_page.footer.map(str::to_owned).or(auto_footer.clone()),
+                if auto_footer.is_some() { Align::Right } else { hf_page.footer_align },
+                &d.footer_style,
+                d.footer_dist,
             ),
         ];
-        for (tpl, align, y) in items {
+        let mut out = Vec::new();
+        for (footer, tpl, align, st, dist) in items {
             let Some(tpl) = tpl else { continue };
-            for (i, part) in style::parts_of(&tpl, align).iter().enumerate() {
-                let text = style::fill_fields(part, f).replace('\n', " ");
-                if text.trim().is_empty() {
+            let parts = hf::filled_parts(&tpl, align, f);
+            let size = st.size.unwrap_or(self.body * 0.9);
+            let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
+            // Bilderna först: de behöver sin egen storlek för uppställningen.
+            let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
+            for src in parts.iter().flat_map(|p| hf::image_srcs(p)) {
+                if loaded.contains_key(&src) {
                     continue;
                 }
-                let w = self.m.width(self.base, size, &text);
-                let x = match i {
-                    1 => g.ml + ((g.cw - w) / 2.0).max(0.0),
-                    2 => g.ml + (g.cw - w).max(0.0),
-                    _ => g.ml,
-                };
-                out.push(Op::Text { x, y, face: self.base, size, text, color: MUTED, italic: false });
+                if let Some(img) = (self.resolve)(&src).and_then(|i| make_image(&i.bytes)) {
+                    let (pw, ph) = img.size();
+                    self.images.push(img);
+                    loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
+                }
+            }
+            let base_face = self.base;
+            let m = std::cell::RefCell::new(&mut self.m);
+            let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
+            let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
+            let zn = hf::layout_zone(&parts, size, 1.0, g.cw, &measure, &natural);
+            let edge = dist.unwrap_or(hf::DEFAULT_DIST);
+            let top = if footer { g.ph - edge - zn.height } else { edge };
+            for it in &zn.items {
+                match it {
+                    Placed::Text { x, y, text, size } => {
+                        out.push(Op::Text { x: g.ml + x, y: top + y + size * 0.95, face: self.base, size: *size, text: text.clone(), color, italic: st.italic });
+                    }
+                    Placed::Image { x, y, w, h, src, anchored } => {
+                        let Some((index, ..)) = loaded.get(src) else { continue };
+                        let (ox, oy) = if *anchored { (0.0, 0.0) } else { (g.ml, top) };
+                        out.push(Op::Image { x: ox + x, y: oy + y, w: *w, h: *h, index: *index, crop: None });
+                    }
+                }
+            }
+            if let Some((c, w)) = st.line {
+                let y = if footer { top - 3.0 } else { top + zn.height + 3.0 };
+                out.push(Op::Line { x1: g.ml, y1: y, x2: g.ml + g.cw, y2: y, width: w, color: (c[0], c[1], c[2]) });
             }
         }
         out
@@ -1008,7 +1054,8 @@ impl<'a> Layout<'a> {
     fn start_page(&mut self) {
         self.flush_notes();
         let geom = self.page_geom();
-        self.pages.push(PageOps { ops: Vec::new(), geom });
+        let sec = self.cur_sec;
+        self.pages.push(PageOps { ops: Vec::new(), geom, sec });
         self.y = self.mt;
         self.rt = self.mt;
         self.page_ymax = 0.0;
@@ -1021,6 +1068,8 @@ impl<'a> Layout<'a> {
     /// Tar avsnittets sidstorlek, marginaler och spalter i bruk (sidan eller spalten byts av anroparen).
     fn set_section(&mut self, sec: &Section) {
         let [mt, mr, mb, ml] = sec.margin;
+        let res = self.hf_reserve.get(self.cur_sec).copied().unwrap_or([0.0; 2]);
+        let (mt, mb) = (mt.max(res[0]), mb.max(res[1]));
         self.pw = sec.page.0;
         self.ph = sec.page.1;
         self.mt = mt;
@@ -1054,12 +1103,18 @@ impl<'a> Layout<'a> {
         if !page_empty {
             self.flush_rules();
         }
+        if !(self.pages.len() <= 1 && page_empty && !self.sec_row_seen) {
+            self.cur_sec += 1;
+        }
+        self.sec_row_seen = true;
         if page_empty {
             // Början av dokumentet (eller två rader i rad): sidan görs om i stället för att lämnas tom.
             self.set_section(&sec);
             let geom = self.page_geom();
+            let cur = self.cur_sec;
             if let Some(p) = self.pages.last_mut() {
                 p.geom = geom;
+                p.sec = cur;
             }
             self.y = self.mt;
             self.rt = self.mt;
@@ -1971,6 +2026,21 @@ fn doc_defaults(md: &str) -> DocDefaults {
 
 /// Lägger ut alla block. Med en innehållsförteckning görs två passager: förteckningens höjd beror
 /// bara på antalet rubriker, så sidnumren från första passet stämmer i det andra.
+/// Sidhuvudets och sidfotens utrymme per avsnitt (se `hf::Plan::reserve`); avsnittsraderna räknas som i
+/// `Layout::section_break` (en rad före all text gäller första avsnittet).
+fn hf_reserve(blocks: &[Block], defaults: &DocDefaults) -> Vec<[f32; 2]> {
+    let mut secs: Vec<Section> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::SectionBreak(p) => secs.push(Section::resolve(p, defaults)),
+            _ if secs.is_empty() => secs.push(Section::resolve(&SectionProps::default(), defaults)),
+            _ => {}
+        }
+    }
+    let plan = crate::hf::Plan::new(defaults, &secs);
+    (0..secs.len().max(1)).map(|i| plan.reserve(defaults, i)).collect()
+}
+
 fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
     // Rubrikerna H1–H3 till en eventuell innehållsförteckning (samma urval som bokmärkena).
     let toc_entries: Vec<(u8, String)> = blocks
@@ -1983,7 +2053,9 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
             _ => None,
         })
         .collect();
+    let reserve = hf_reserve(blocks, defaults);
     let mut lay = Layout::new(resolve, defaults);
+    lay.hf_reserve = reserve.clone();
     lay.toc_entries = toc_entries.clone();
     lay.notes = notes.to_vec();
     lay.new_page();
@@ -1994,6 +2066,7 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
         let pos: Vec<(usize, f32)> =
             lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
         let mut second = Layout::new(resolve, defaults);
+        second.hf_reserve = reserve;
         second.toc_entries = toc_entries;
         second.toc_pos = pos;
         second.notes = notes.to_vec();
@@ -2022,10 +2095,13 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
 
     let mut doc = Document::new();
     let total = lay.pages.len();
-    let images = std::mem::take(&mut lay.images);
     // Sidhuvud och sidfot ritas sist, när sidantalet är känt.
-    let fields = style::Fields::for_export(title, "pdf");
-    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer(&defaults, &fields.at(pi + 1, total))).collect();
+    let fields = style::Fields::for_export(title, "pdf").at(1, total);
+    let secs = sections::scan(markdown, &defaults);
+    let hf_plan = crate::hf::Plan::new(&defaults, &secs);
+    let hf_pages = hf_plan.pages(&lay.pages.iter().map(|p| p.sec).collect::<Vec<_>>());
+    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer_page(&defaults, &hf_plan, &hf_pages, &fields, pi)).collect();
+    let images = std::mem::take(&mut lay.images);
     for (pi, page_ops) in lay.pages.iter().enumerate() {
         let mut page = doc.start_page_with(PageSettings::from_wh(page_ops.geom.pw, page_ops.geom.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
@@ -2540,9 +2616,10 @@ mod tests {
             assert_eq!(t.len(), 2);
             assert_eq!(t[0].2, "Rapport");
             assert_eq!(t[1].2, format!("Sida {p} av {total}"));
-            // Baslinjer halvvägs i topp- och bottenmarginalen.
-            assert!((t[0].1 - lay.mt / 2.0).abs() < 0.01);
-            assert!((t[1].1 - (lay.ph - lay.mb / 2.0)).abs() < 0.01);
+            // Sidhuvudet börjar `DEFAULT_DIST` från överkanten och sidfoten slutar lika långt från nederkanten.
+            let size = lay.body * 0.9;
+            assert!((t[0].1 - (crate::hf::DEFAULT_DIST + size * 0.95)).abs() < 0.01);
+            assert!(t[1].1 < lay.ph - crate::hf::DEFAULT_DIST + 0.01 && t[1].1 > lay.ph - lay.mb);
             // Sidfoten är centrerad, sidhuvudet högerställt.
             let fw = lay.m.width(lay.base, lay.body * 0.9, &t[1].2);
             assert!((t[1].0 + fw / 2.0 - (lay.ml + lay.cw / 2.0)).abs() < 0.01);
@@ -2559,7 +2636,7 @@ mod tests {
         let (mut lay, d) = laid_out(&md, &|_| None);
         let total = lay.pages.len();
         assert!(total >= 3);
-        let f = |p: usize| style::Fields { page: p, pages: total, title: "Min rapport".into(), file: "Min rapport.pdf".into(), date: "2026-11-13".into() };
+        let f = |p: usize| style::Fields { page: p, pages: total, title: "Min rapport".into(), file: "Min rapport.pdf".into(), date: "2026-11-13".into(), sec_pages: total, fmt: Default::default() };
         // Första sidan: tomt sidhuvud och egen sidfot.
         let t1 = texts(&lay.header_footer(&d, &f(1)));
         assert_eq!(t1.iter().map(|t| t.2.as_str()).collect::<Vec<_>>(), ["Omslag"]);
@@ -2747,3 +2824,7 @@ mod fn_tests;
 #[cfg(test)]
 #[path = "pdf_section_tests.rs"]
 mod section_tests;
+
+#[cfg(test)]
+#[path = "pdf_hf_tests.rs"]
+mod hf_tests;

@@ -1001,6 +1001,14 @@ impl KladdApp {
                     sizes.entry(images::size_key(&img)).and_modify(|s| if size.x < s.x { *s = size }).or_insert(size);
                 }
             }
+            // Bilderna i sidhuvud och sidfot (mallens `{bild:…}`).
+            let mut hf_imgs: super::headers::HfImages = HashMap::new();
+            for src in crate::hf::all_image_srcs(&analysis.defaults, &analysis.sections) {
+                self.word_image(&ctx, &src);
+                if let Some(Some(info)) = self.wv.images.get(&(doc_id, src.clone())) {
+                    hf_imgs.insert(src.clone(), (image_uri(&src, doc_id), info.size));
+                }
+            }
             let image_size = |src: &str| sizes.get(src).copied();
             // Textbredd för tabellkolumner och listindrag. Mäts före och utanför layout_job, så
             // ingen fonts-lås hålls när det anropas.
@@ -1389,13 +1397,16 @@ impl KladdApp {
                     font_family(Some(analysis.defaults.font()), false, false),
                 );
                 let hf_fields = crate::style::Fields::new(1, total, &doc.title());
+                let hf_plan = crate::hf::Plan::new(&analysis.defaults, &analysis.sections);
+                let hf_pages = hf_plan.pages(&boxes.iter().map(|b| b.sec).collect::<Vec<_>>());
                 for (k, b) in boxes.iter().enumerate() {
                     let sheet = b.rect(page_left, origin_y);
                     if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
                         continue;
                     }
                     // Varje ark har sin egen storlek: sidhuvudet och sidfoten följer arkets mått.
-                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, total, &analysis.defaults, &hf_fields, hf_font.clone(), doc_id) {
+                    let page_hf = hf_plan.page(&hf_pages, k, &hf_fields);
+                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, &page_hf, &analysis.defaults, hf_font.clone(), doc_id, z, &hf_imgs) {
                         open_hf_dlg = Some((footer, k));
                     }
                 }

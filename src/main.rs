@@ -19,6 +19,7 @@ mod docx_tbox;
 mod export;
 mod grammar;
 mod grammar_ui;
+mod hf;
 mod ocr;
 mod odt;
 mod pdf_read;

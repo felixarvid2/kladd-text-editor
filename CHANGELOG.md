@@ -8,6 +8,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Fler testdokument.** Testkorpusen har ett nyhetsbrev (spalter, textruta, bild) och en skolrapport (sidhuvud med logga, sidfot, fotnoter, innehållsförteckning), både i Word 365-stil och som LibreOffice skapar dem.
 - **Olika breda spalter och skiljelinje.** Spalter med olika bredd (`w:equalWidth="0"` i Word, `style:column` i LibreOffice) och linjen mellan spalterna visas som i Word och LibreOffice, och följer med till `.docx`, `.odt` och PDF (`column-widths` och `column-rule` i avsnittsraden).
+- **Sidhuvud och sidfot som i Word.** Loggor i sidhuvud och sidfot (inline och förankrade, från Word och LibreOffice) ritas i dokumentläget och i PDF-exporten och följer med vid sparning. Sidnummerfält läses med format (`\* roman`, `\* ROMAN`, `\* Arabic`), `SECTIONPAGES` och sidnumrering som börjar om per avsnitt, och "Sida X av Y" räknas från den faktiska sidindelningen. Tabbstopp, en tabell utan ramar (logga | titel | datum), textstorlek, färg och linjen under sidhuvudet läses, och annorlunda första sida, olika udda/jämna sidor, egna sidhuvuden per avsnitt (med arv från föregående avsnitt) och avståndet från sidkanten (`w:pgMar w:header/w:footer`) visas som i originalet. Brödtexten skjuts ned om sidhuvudet med logga behöver mer plats. Orörda dokument sparas som förut, och ett sidhuvud som ändras i dialogen skrivs om med loggan och fälten kvar.
 
 ### Rättat
 

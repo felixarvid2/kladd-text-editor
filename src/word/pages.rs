@@ -42,7 +42,7 @@ pub struct Geom {
 impl Geom {
     pub fn new(zoom: f32, d: &DocDefaults) -> Self {
         let (w, h) = d.page();
-        let [t, r, b, l] = d.margins();
+        let [t, r, b, l] = d.layout_margins();
         // Marginalerna får aldrig äta upp hela sidan.
         let cap = |m: f32, dim: f32| m.clamp(0.0, dim * 0.4);
         Self {

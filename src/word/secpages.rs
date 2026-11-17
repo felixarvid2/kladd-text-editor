@@ -118,7 +118,19 @@ impl Geom {
         if plain {
             return base;
         }
-        let secs: Vec<SecGeom> = sections.iter().map(|s| SecGeom::new(zoom, s)).collect();
+        let plan = crate::hf::Plan::new(d, sections);
+        let secs: Vec<SecGeom> = sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut g = SecGeom::new(zoom, s);
+                // Sidhuvud och sidfot skjuter ned texten om marginalen inte räcker.
+                let r = plan.reserve(d, i);
+                g.top = g.top.max(px(zoom, r[0]).min(g.page_h * 0.4));
+                g.bottom = g.bottom.max(px(zoom, r[1]).min(g.page_h * 0.4));
+                g
+            })
+            .collect();
         let f = &secs[0];
         Geom {
             page_w: f.page_w,

@@ -224,6 +224,27 @@ Gemensamma format (alla moduler ska använda dessa):
   varianter (`Some("")` = tom första sida; `DocDefaults::header_template(sida)`). Dialogen för
   redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
   fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
+- **Sidhuvud och sidfot, rik mall** (`src/hf.rs`, läsning i `docx_hf.rs` och `odt_hf.rs`). Mallen har fler märken:
+  `{sida:roman}`/`{sida:ROMAN}`/`{sida:abc}`/`{sida:ABC}`/`{sida:1}` (och samma för `{sidor}`), `{avsnittssidor}` och
+  `{bild:namn 80x30}` (bredd x höjd i pt) eller `{bild:namn 80x30 @12,20}` för en bild förankrad 12 pt från sidans
+  vänsterkant och 20 pt från överkanten (förankrade bilder i docx räknas om med `word/anchor.rs`). Bilden är en av
+  dokumentets vanliga bilder (`bild:namn`, relationen ligger i `header*.xml.rels`). Grundformatet har dessutom
+  `header-even`/`footer-even` (udda/jämna sidor, `w:evenAndOddHeaders`), `header-style: "9pt #666666 bold line=#999999/0.5pt"`
+  (storlek, färg och linjen under sidhuvudet via `w:pBdr`), `header-dist`/`footer-dist` (`w:pgMar w:header/w:footer`),
+  `page-start` och `page-format: roman` (`w:pgNumType`). En avsnittsrad kan ha egna `header`, `footer`, `header-first`,
+  `footer-first`, `header-even`, `footer-even`, `title-page: yes`, `page-start` och `page-format`; en del som saknas
+  ärvs från föregående avsnitt (som i Word), `""` är uttryckligen tom. `hf::Plan::new(defaults, sections)` utreder arvet,
+  `Plan::pages(arkens avsnitt)` ger visade sidnummer (med omstart), antal sidor i avsnittet och första sidan i avsnittet,
+  och `Plan::page` väljer rätt del (första, jämn, vanlig). `hf::layout_zone` ställer upp en rad (delar, bilder, anpassat
+  avstånd) i både dokumentläget (`word/headers.rs`) och PDF-exporten (`Layout::header_footer_page`). `Plan::reserve`
+  ger den marginal sidhuvudet och sidfoten behöver (avstånd + höjd + linje); `DocDefaults::layout_margins`, `SecGeom` och
+  PDF-layouten skjuter ned brödtexten med den, medan `margins()` (det som skrivs till filen) är orörd.
+  docx-skrivning: oförändrade delar och `w:sectPr` skrivs tillbaka orörda; ändras en del skrivs bara den (och sektionens
+  referens) om, med fält, bilder och linje. Sektioner som skrivs om från grunden får originalets referenser (`seed_hf`).
+  odt: `style:header-left` är jämna sidor, tabbstoppens typer avgör vänster/höger, `text:page-number` följer
+  `style:num-format`, och sidmallens övre/nedre marginal är avståndet till sidhuvudet (marginalen i Kladd är avståndet plus
+  sidhuvudets minsta höjd och mellanrum). Begränsningar: ett sidhuvud med flera rader slås ihop till en rad, text i
+  tabellceller placeras efter kolumnens ordning (inte dess bredd) och odt-sidnumrering som börjar om per avsnitt läses inte.
 - **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
   grundformatskommentaren, `h1`–`h6`, `body`, `quote`, `title`, `subtitle`, med ord i valfri ordning: `"Typsnitt"`,
   `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
@@ -690,8 +711,8 @@ avsnittet (`row_sec`) och spaltbrytningarna. `secpages::paginate_sections` flytt
 - ark med olika storlek centreras på skrivbordet (`Geom::sheet_left`). Galleriets x = 0 ligger vid den
   vänstraste textkanten (`Geom::origin_x`), så alla rader har x ≥ 0 och TextEdits yta (`Geom::edit_w`) täcker allt;
 - resultatet är `Paged { boxes: Vec<PageBox>, dx }`; `Cache::page_boxes` ger arken till vyn (ritning av ark,
-  sidhuvud/sidfot per ark, sidnummer med `secpages::page_index`). Sidnumren löper över avsnitten och
-  sidhuvud/sidfot är gemensamma. Ett vanligt dokument (`Geom::for_sections` ger en `Geom` utan `secs`) går
+  sidhuvud/sidfot per ark, sidnummer med `secpages::page_index`). Sidnumren löper över avsnitten (om inte avsnittet börjar om,
+  `page-start`) och sidhuvud/sidfot ärvs från föregående avsnitt tills ett avsnitt anger egna (`hf::Plan`). Ett vanligt dokument (`Geom::for_sections` ger en `Geom` utan `secs`) går
   den gamla vägen (`pages::paginate`) och får `uniform_boxes`, så ritningen är gemensam.
 - Tabeller och bilder anpassas till spaltens bredd (tabellplanen och `images::display_size` får spaltbredden;
   en bild i ett smalare avsnitt kläms mot det avsnittets spalt). Tabellernas kolumnkanter (`TableGeom::col_x`)

@@ -318,6 +318,10 @@ struct StyleDef {
     /// `fo:break-before` och `fo:break-after` (`page` = true, `auto` = false) i styckeformatet.
     break_before: Option<bool>,
     break_after: Option<bool>,
+    /// Tabbstoppens typer (`left`, `center`, `right`) och ramlinjerna över/under stycket (för sidhuvud och sidfot).
+    tabs: Option<Vec<String>>,
+    border_top: Option<String>,
+    border_bottom: Option<String>,
 }
 
 #[derive(Default)]
@@ -487,6 +491,11 @@ impl Styles {
                     };
                     d.break_before = c.attr("fo:break-before").and_then(brk);
                     d.break_after = c.attr("fo:break-after").and_then(brk);
+                    d.tabs = c
+                        .child("style:tab-stops")
+                        .map(|t| t.els().filter(|k| k.name == "style:tab-stop").map(|k| k.attr("style:type").unwrap_or("left").to_owned()).collect());
+                    d.border_top = c.attr("fo:border-top").map(str::to_owned);
+                    d.border_bottom = c.attr("fo:border-bottom").map(str::to_owned);
                     d.pp.before = c.attr("fo:margin-top").and_then(style::parse_length);
                     d.pp.after = c.attr("fo:margin-bottom").and_then(style::parse_length);
                     d.pp.indent = c.attr("fo:text-indent").and_then(style::parse_length);
@@ -1846,98 +1855,18 @@ fn render(blocks: &[Block], text_w: Option<f64>) -> String {
     out
 }
 
-/// Text i ett sidhuvud eller en sidfot med fält som `{sida}`, `{sidor}`, `{datum}`, `{titel}` och
-/// `{fil}`. Flikar delar texten i `segs` (den sista delen är den pågående).
-fn hf_collect(n: &Node, segs: &mut Vec<String>) {
-    for k in &n.kids {
-        match k {
-            Kid::Text(t) => {
-                let out = segs.last_mut().expect("minst en del");
-                for c in t.chars() {
-                    if c.is_whitespace() {
-                        if !out.ends_with(' ') && !out.is_empty() {
-                            out.push(' ');
-                        }
-                    } else {
-                        out.push(c);
-                    }
-                }
-            }
-            Kid::El(e) => {
-                let field = match e.name.as_str() {
-                    "text:page-number" => Some("{sida}"),
-                    "text:page-count" => Some("{sidor}"),
-                    "text:date" => Some("{datum}"),
-                    "text:title" => Some("{titel}"),
-                    "text:file-name" => Some("{fil}"),
-                    _ => None,
-                };
-                if let Some(f) = field {
-                    segs.last_mut().expect("minst en del").push_str(f);
-                    continue;
-                }
-                match e.name.as_str() {
-                    "text:s" => {
-                        let c = e.attr("text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).min(100);
-                        segs.last_mut().expect("minst en del").push_str(&" ".repeat(c));
-                    }
-                    "text:tab" => segs.push(String::new()),
-                    "text:line-break" => segs.last_mut().expect("minst en del").push(' '),
-                    "text:note" | "office:annotation" => {}
-                    _ => hf_collect(e, segs),
-                }
-            }
-        }
-    }
-}
-
-/// Sidhuvudets/sidfotens mall och justering. Ett enda stycke med en eller två flikar blir
-/// vänster|mitten|höger (`a|b|c`), annars sammanfogas styckena med mellanslag.
-fn header_footer(st: &Styles, n: &Node) -> Option<(String, Align)> {
-    let mut parts = Vec::new();
-    let mut layout: Vec<Vec<String>> = Vec::new();
-    let mut align = None;
-    for p in n.els().filter(|p| matches!(p.name.as_str(), "text:p" | "text:h")) {
-        let mut segs = vec![String::new()];
-        hf_collect(p, &mut segs);
-        let segs: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
-        let s = segs.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
-        if !s.is_empty() {
-            if align.is_none() {
-                align = Some(st.align(p.attr("text:style-name")));
-            }
-            parts.push(s);
-            layout.push(match segs.len() {
-                // Standardsidhuvudets fliksstopp är mitten och höger.
-                2 => vec![segs[0].clone(), segs[1].clone(), String::new()],
-                _ => segs,
-            });
-        }
-    }
-    if let [l] = layout.as_slice() {
-        if l.len() == 3 {
-            return Some((l.join("|"), Align::Left));
-        }
-    }
-    (!parts.is_empty()).then(|| (parts.join(" "), align.unwrap_or(Align::Left)))
-}
-
 /// Sidmallarnas sida och spalter som avsnittsegenskaper (mot dokumentets grundformat `d`), per namn.
-fn master_props(styles_root: &Node, d: &DocDefaults) -> (HashMap<String, sections::SectionProps>, Option<String>) {
+fn master_props(st: &Styles, styles_root: &Node, d: &DocDefaults, ctx: &mut hf::HfCtx<'_, '_>) -> (HashMap<String, sections::SectionProps>, Option<String>) {
     let mut out = HashMap::new();
     let Some(masters) = styles_root.child("office:master-styles") else { return (out, None) };
     let all: Vec<&Node> = masters.els().filter(|m| m.name == "style:master-page").collect();
     let start = all.iter().find(|m| m.attr("style:name") == Some("Standard")).or(all.first()).and_then(|m| m.attr("style:name")).map(str::to_owned);
     let Some(auto) = styles_root.child("office:automatic-styles") else { return (out, start) };
-    for m in all {
+    for m_node in all {
+        let m = m_node;
         let (Some(name), Some(layout)) = (m.attr("style:name"), m.attr("style:page-layout-name")) else { continue };
-        let Some(pp) = auto
-            .els()
-            .find(|n| n.name == "style:page-layout" && n.attr("style:name") == Some(layout))
-            .and_then(|pl| pl.child("style:page-layout-properties"))
-        else {
-            continue;
-        };
+        let Some(layout_node) = auto.els().find(|n| n.name == "style:page-layout" && n.attr("style:name") == Some(layout)) else { continue };
+        let Some(pp) = layout_node.child("style:page-layout-properties") else { continue };
         let len = |k: &str| pp.attr(k).and_then(style::parse_length);
         let mut p = sections::SectionProps::default();
         if let (Some(w), Some(h)) = (len("fo:page-width"), len("fo:page-height")) {
@@ -1952,7 +1881,9 @@ fn master_props(styles_root: &Node, d: &DocDefaults) -> (HashMap<String, section
             len("fo:margin-left").or(all_m),
         ];
         if mm.iter().any(Option::is_some) {
-            let m = [mm[0].unwrap_or(def), mm[1].unwrap_or(def), mm[2].unwrap_or(def), mm[3].unwrap_or(def)];
+            let mut m = [mm[0].unwrap_or(def), mm[1].unwrap_or(def), mm[2].unwrap_or(def), mm[3].unwrap_or(def)];
+            // Sidhuvud och sidfot skjuter ned brödtexten (som i grundformatet, se `hf::read_master_hf`).
+            hf::add_hf_extent(st, m_node, layout_node, &mut m, ctx);
             p.page_margin = Some(m).filter(|m| m.iter().zip(d.margins()).any(|(a, b)| (a - b).abs() > 0.6));
         }
         if let Some(def) = pp.child("style:columns").and_then(columns_of) {
@@ -1960,12 +1891,15 @@ fn master_props(styles_root: &Node, d: &DocDefaults) -> (HashMap<String, section
             let m = p.page_margin.unwrap_or_else(|| d.margins());
             def.apply(&mut p, (pw - m[1] - m[3]).max(1.0));
         }
+        if start.as_deref() != Some(name) {
+            p.hf = hf::master_hf(st, m, d, ctx);
+        }
         out.insert(name.to_owned(), p);
     }
     (out, start)
 }
 
-fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults) {
+fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults, ctx: &mut hf::HfCtx<'_, '_>) {
     let Some(masters) = styles_root.child("office:master-styles") else { return };
     let mut it = masters.els().filter(|m| m.name == "style:master-page");
     let all: Vec<&Node> = it.by_ref().collect();
@@ -1977,6 +1911,7 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults) {
                 if let (Some(w), Some(h)) = (len("fo:page-width"), len("fo:page-height")) {
                     d.page_size = Some((w, h));
                 }
+                d.page_format = pp.attr("style:num-format").and_then(crate::hf::NumFmt::from_name).filter(|f| *f != crate::hf::NumFmt::Decimal);
                 let all_m = len("fo:margin");
                 let m = [
                     len("fo:margin-top").or(all_m),
@@ -1991,29 +1926,8 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults) {
             }
         }
     }
-    if let Some((t, a)) = master.child("style:header").and_then(|h| header_footer(st, h)) {
-        d.header = Some(t);
-        d.header_align = a;
-    }
-    if let Some((t, a)) = master.child("style:footer").and_then(|h| header_footer(st, h)) {
-        d.footer = Some(t);
-        d.footer_align = a;
-    }
-    // Egen första sida (`style:header-first`/`style:footer-first`); en tom del blir en tom första sida.
-    let (h1, f1) = (master.child("style:header-first"), master.child("style:footer-first"));
-    if h1.is_some() || f1.is_some() {
-        for (node, header) in [(h1, true), (f1, false)] {
-            let found = node.and_then(|n| header_footer(st, n));
-            let text = found.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
-            let (slot, align) = if header { (&mut d.header_first, &mut d.header_align) } else { (&mut d.footer_first, &mut d.footer_align) };
-            *slot = Some(text);
-            if let Some((_, a)) = found {
-                if (header && d.header.is_none()) || (!header && d.footer.is_none()) {
-                    *align = a;
-                }
-            }
-        }
-    }
+    let layout = master.attr("style:page-layout-name").zip(styles_root.child("office:automatic-styles")).and_then(|(l, auto)| auto.els().find(|n| n.name == "style:page-layout" && n.attr("style:name") == Some(l)));
+    hf::read_master_hf(st, master, layout, d, ctx);
 }
 
 /// Läser ett OpenDocument-textdokument som Markdown.
@@ -2121,17 +2035,22 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let mut defaults = DocDefaults { font_family: base.font.clone(), font_size: base.size, ..Default::default() };
     // Formatmallar som avviker från Kladds egna (de Kladd själv skriver ger inga ändringar).
     defaults.styles = st.style_set().minus(&kladd_style_set());
-    if let Some(s) = &sroot {
-        read_page(&st, s, &mut defaults);
-    }
-    let (masters, start_master) = sroot.as_ref().map(|s| master_props(s, &defaults)).unwrap_or_default();
+    let mut hf_images: Vec<(String, Image)> = Vec::new();
+    let mut hf_by_target: HashMap<String, String> = HashMap::new();
+    let (masters, start_master) = {
+        let mut ctx = hf::HfCtx { pkg: &mut pkg, images: &mut hf_images, by_target: &mut hf_by_target };
+        if let Some(s) = &sroot {
+            read_page(&st, s, &mut defaults, &mut ctx);
+        }
+        sroot.as_ref().map(|s| master_props(&st, s, &defaults, &mut ctx)).unwrap_or_default()
+    };
     let mut rd = Rd {
         st: &st,
         base: base.clone(),
         pkg,
         dropped: Dropped::default(),
-        images: Vec::new(),
-        by_target: HashMap::new(),
+        images: hf_images,
+        by_target: hf_by_target,
         blocks: Vec::new(),
         list_id: 0,
         notes: Vec::new(),
@@ -3618,41 +3537,19 @@ fn annotation_line(line: &str) -> String {
     out
 }
 
-fn hf_inline(text: &str, f: &style::Fields) -> String {
-    let fields: [(&str, String); 5] = [
-        ("{sida}", format!("<text:page-number text:select-page=\"current\">{}</text:page-number>", f.page)),
-        ("{sidor}", format!("<text:page-count>{}</text:page-count>", f.pages)),
-        ("{datum}", format!("<text:date text:date-value=\"{d}\">{d}</text:date>", d = f.date)),
-        ("{titel}", format!("<text:title>{}</text:title>", esc(&f.title))),
-        ("{fil}", format!("<text:file-name text:display=\"name-and-extension\">{}</text:file-name>", esc(&f.file))),
-    ];
-    let mut inner = String::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        match fields.iter().filter_map(|(p, x)| rest.find(p).map(|at| (at, p.len(), x))).min_by_key(|(at, ..)| *at) {
-            Some((at, len, x)) => {
-                inner.push_str(&hf_text(&rest[..at]));
-                inner.push_str(x);
-                rest = &rest[at + len..];
-            }
-            None => {
-                inner.push_str(&hf_text(rest));
-                break;
-            }
-        }
-    }
-    inner
+fn hf_inline(text: &str, f: &style::Fields, out: &mut hf::HfOut<'_>) -> String {
+    out.inline(text, f)
 }
 
 /// Sidhuvudets eller sidfotens stycke. En mall med `|` blir vänster, mitten och höger skilda av
 /// flikar (stycketypen har tabbstopp mitt och längst till höger).
-fn hf_paragraph(template: &str, style: &str, align: Align, f: &style::Fields) -> String {
+fn hf_paragraph(template: &str, style: &str, align: Align, f: &style::Fields, out: &mut hf::HfOut<'_>) -> String {
     let inner = if style::split_parts(template).is_some() {
         let p = style::parts_of(template, align);
-        format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f), hf_inline(&p[1], f), hf_inline(&p[2], f))
+        format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f, out), hf_inline(&p[1], f, out), hf_inline(&p[2], f, out))
     } else {
         let text = style::parts_of(template, align).into_iter().find(|t| !t.is_empty()).unwrap_or_default();
-        hf_inline(&text, f)
+        hf_inline(&text, f, out)
     };
     format!("<text:p text:style-name=\"{style}\">{inner}</text:p>")
 }
@@ -3676,7 +3573,7 @@ fn hf_text(t: &str) -> String {
     out
 }
 
-fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section, masters: &[sections::Section]) -> String {
+fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section, masters: &[sections::Section], env: &mut hf::HfEnv<'_>) -> String {
     let font = d.font().to_owned();
     let size = pt_str(d.size());
     let mut fonts = BTreeSet::new();
@@ -3686,76 +3583,125 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
     let (pw, ph) = first.page;
     let m = first.margin;
     let orient = if pw > ph { "landscape" } else { "portrait" };
-    let hf_style = |tag: &str| {
-        format!(
-            "<style:{tag}-style><style:header-footer-properties fo:min-height=\"0.6cm\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:margin-{side}=\"0.3cm\"/></style:{tag}-style>",
-            side = if tag == "header" { "bottom" } else { "top" }
+    // Sidhuvudets och sidfotens utrymme: sidmallens övre/nedre marginal är avståndet till kanten, och
+    // sidhuvudet/sidfoten får så hög minsta höjd att brödtexten börjar vid Kladds marginal.
+    let hf_style = |tag: &str, body_margin: f32, present: bool| -> (f32, String) {
+        let dist = if tag == "header" { d.header_dist } else { d.footer_dist }.unwrap_or(crate::hf::DEFAULT_DIST);
+        let (edge, min_h) = if present { (dist, (body_margin - dist - 8.5).max(0.0)) } else { (body_margin, 0.0) };
+        (
+            edge,
+            format!(
+                "<style:{tag}-style><style:header-footer-properties fo:min-height=\"{}\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:margin-{side}=\"0.3cm\"/></style:{tag}-style>",
+                cm(min_h),
+                side = if tag == "header" { "bottom" } else { "top" }
+            ),
         )
     };
-    // Sidhuvud och sidfot, och första sidans varianter som `style:header-first`/`style:footer-first`.
-    // Flikarna för tre delar följer sidmallens textbredd, så varje sidmall får egna styckeformat (`sfx`).
-    let hf_parts = |text_pt: f32, sfx: &str, auto: &mut String| -> String {
+    // Sidhuvud och sidfot, och första sidans och jämna sidors varianter som `style:header-first`/
+    // `style:header-left` m.fl. Flikarna för tre delar följer sidmallens textbredd, så varje sidmall
+    // får egna styckeformat (`sfx`). `si` är avsnittet sidmallen hör till; ger (xml, finns huvud, finns fot).
+    let hf_parts = |text_pt: f32, sfx: &str, si: usize, auto: &mut String, env: &mut hf::HfEnv<'_>| -> (String, bool, bool) {
         let text_w = cm(text_pt.max(36.0));
         let half_w = cm(text_pt.max(36.0) / 2.0);
+        let r = env.plan.secs.get(si.min(env.plan.secs.len().saturating_sub(1))).cloned().unwrap_or_default();
+        let even = env.plan.even_odd;
+        let some = |t: &Option<String>| t.clone().filter(|t| !t.is_empty());
         let mut out = String::new();
+        let (mut has_h, mut has_f) = (false, false);
         for (tag, text, align, auto_name, parent) in [
-            ("header", d.header_template(1), d.header_align, "MP1", "Header"),
-            ("footer", d.footer_template(1), d.footer_align, "MP2", "Footer"),
-            ("header-first", d.header_first.as_deref(), d.header_align, "MP3", "Header"),
-            ("footer-first", d.footer_first.as_deref(), d.footer_align, "MP4", "Footer"),
+            ("header", some(&r.header), d.header_align, "MP1", "Header"),
+            ("footer", some(&r.footer), d.footer_align, "MP2", "Footer"),
+            ("header-first", r.title_pg.then(|| r.header_first.clone().unwrap_or_default()), d.header_align, "MP3", "Header"),
+            ("footer-first", r.title_pg.then(|| r.footer_first.clone().unwrap_or_default()), d.footer_align, "MP4", "Footer"),
+            ("header-left", even.then(|| r.header_even.clone().unwrap_or_default()), d.header_align, "MP5", "Header"),
+            ("footer-left", even.then(|| r.footer_even.clone().unwrap_or_default()), d.footer_align, "MP6", "Footer"),
         ] {
-            // Utan egen första sida visas varken `header-first` eller `footer-first`.
-            let first = tag.ends_with("-first");
-            if first && !d.different_first() {
-                continue;
+            let Some(t) = text else { continue };
+            let header = tag.starts_with("header");
+            if !t.is_empty() {
+                if header {
+                    has_h = true;
+                } else {
+                    has_f = true;
+                }
             }
-            let Some(t) = text.or(if first { Some("") } else { None }) else { continue };
-            let tabs = if style::split_parts(t).is_some() {
+            let tabs = if style::split_parts(&t).is_some() {
                 format!("<style:tab-stops><style:tab-stop style:position=\"{half_w}\" style:type=\"center\"/><style:tab-stop style:position=\"{text_w}\" style:type=\"right\"/></style:tab-stops>")
             } else {
                 String::new()
             };
-            let al = if style::split_parts(t).is_some() { "start" } else { align_attr(align) };
+            let al = if style::split_parts(&t).is_some() { "start" } else { align_attr(align) };
             let name = format!("{auto_name}{sfx}");
+            let st = if header { &d.header_style } else { &d.footer_style };
+            let border = st.line.map_or(String::new(), |(c, w)| {
+                let side = if header { "bottom" } else { "top" };
+                format!(" fo:border-{side}=\"{}pt solid {}\" fo:padding-{side}=\"0.1cm\"", fmt_num(w, 2), style::hex(c))
+            });
+            let mut tp = String::new();
+            if let Some(sz) = st.size {
+                tp.push_str(&format!(" fo:font-size=\"{}\"", pt_str(sz)));
+            }
+            if let Some(c) = st.color {
+                tp.push_str(&format!(" fo:color=\"{}\"", style::hex(c)));
+            }
+            if st.bold {
+                tp.push_str(" fo:font-weight=\"bold\"");
+            }
+            if st.italic {
+                tp.push_str(" fo:font-style=\"italic\"");
+            }
+            let tp = if tp.is_empty() { String::new() } else { format!("<style:text-properties{tp}/>") };
             auto.push_str(&format!(
-                "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\">{tabs}</style:paragraph-properties></style:style>"
+                "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\"{border}>{tabs}</style:paragraph-properties>{tp}</style:style>"
             ));
-            out.push_str(&format!("<style:{tag}>{}</style:{tag}>", hf_paragraph(t, &name, align, fields)));
+            out.push_str(&format!("<style:{tag}>{}</style:{tag}>", hf_paragraph(&t, &name, align, fields, &mut env.out)));
         }
-        out
+        (out, has_h, has_f)
     };
+    // Sidmallens sidformat: `style:num-format` är sidnumrets format (`page-format`).
+    let num_fmt = d.page_format.map_or("1", |f| f.odf());
+    let mut hf_auto = String::new();
+    let (master_inner, has_h, has_f) = hf_parts(pw - m[1] - m[3], "", 0, &mut hf_auto, env);
+    let (top0, hs) = hf_style("header", m[0], has_h);
+    let (bot0, fs) = hf_style("footer", m[2], has_f);
     let mut auto = format!(
-        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"1\" style:print-orientation=\"{orient}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>",
+        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"{num_fmt}\" style:print-orientation=\"{orient}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>",
         cm(pw),
         cm(ph),
-        cm(m[0]),
-        cm(m[2]),
+        cm(top0),
+        cm(bot0),
         cm(m[3]),
         cm(m[1])
     );
-    auto.push_str(&hf_style("header"));
-    auto.push_str(&hf_style("footer"));
+    auto.push_str(&hs);
+    auto.push_str(&fs);
     auto.push_str("</style:page-layout>");
-    let mut master = format!("<style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\">{}</style:master-page>", hf_parts(pw - m[1] - m[3], "", &mut auto));
-    // Avsnitten med egen sida: en sidmall (M1, M2 …) med eget sidformat och samma sidhuvud och sidfot.
+    auto.push_str(&hf_auto);
+    let mut master = format!("<style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\">{}</style:master-page>", master_inner);
+    // Avsnitten med egen sida: en sidmall (M1, M2 …) med eget sidformat och avsnittets sidhuvud och sidfot.
     for (i, sec) in masters.iter().enumerate() {
         let n = i + 1;
         let (w, h) = sec.page;
         let mm = sec.margin;
+        let si = env.master_idx.get(i).copied().unwrap_or(0);
+        let mut ma = String::new();
+        let (hf_xml, mh, mf) = {
+            let r = hf_parts(w - mm[1] - mm[3], &format!("_{n}"), si, &mut ma, env);
+            (r.0, r.1, r.2)
+        };
+        let (t, hs) = hf_style("header", mm[0], mh);
+        let (b, fs) = hf_style("footer", mm[2], mf);
         auto.push_str(&format!(
-            "<style:page-layout style:name=\"pm{}\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"1\" style:print-orientation=\"{}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>{}{}</style:page-layout>",
+            "<style:page-layout style:name=\"pm{}\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"{num_fmt}\" style:print-orientation=\"{}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>{hs}{fs}</style:page-layout>{ma}",
             n + 1,
             cm(w),
             cm(h),
             if w > h { "landscape" } else { "portrait" },
-            cm(mm[0]),
-            cm(mm[2]),
+            cm(t),
+            cm(b),
             cm(mm[3]),
-            cm(mm[1]),
-            hf_style("header"),
-            hf_style("footer")
+            cm(mm[1])
         ));
-        let hf_xml = hf_parts(w - mm[1] - mm[3], &format!("_{n}"), &mut auto);
         master.push_str(&format!("<style:master-page style:name=\"M{n}\" style:page-layout-name=\"pm{}\">{hf_xml}</style:master-page>", n + 1));
     }
 
@@ -3813,7 +3759,9 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
 fn kladd_style_set() -> style::StyleSet {
     let d = DocDefaults::default();
     let first = sections::Section::resolve(&sections::SectionProps::default(), &d);
-    let xml = styles_xml(&d, &style::Fields::for_export("", "odt"), &first, &[]);
+    let none: &dyn Fn(&str) -> Option<Image> = &|_| None;
+    let mut env = hf::HfEnv::new(none, &d, &[], &[]);
+    let xml = styles_xml(&d, &style::Fields::for_export("", "odt"), &first, &[], &mut env);
     let mut st = Styles::default();
     if let Ok(root) = parse_xml(&xml) {
         st.read_fonts(&root);
@@ -3962,6 +3910,11 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         w.body
     );
 
+    // Sidhuvuden och sidfötter först: deras bilder hör till paketet (och manifestet).
+    let all_secs = sections::scan(markdown, &defaults);
+    let mut env = hf::HfEnv::new(resolve, &defaults, &all_secs, &w.masters);
+    let styles_xml_text = styles_xml(&defaults, &style::Fields::for_export(title, "odt"), &w.first, &w.masters, &mut env);
+    w.media.append(&mut env.out.media);
     let mut buf = Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
@@ -3975,7 +3928,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
         for (name, text) in [
             ("META-INF/manifest.xml", manifest_xml(&w.media)),
             ("content.xml", content),
-            ("styles.xml", styles_xml(&defaults, &style::Fields::for_export(title, "odt"), &w.first, &w.masters)),
+            ("styles.xml", styles_xml_text.clone()),
             ("meta.xml", meta_xml(title)),
         ] {
             zip.start_file(name, deflated).map_err(|e| e.to_string())?;
@@ -4404,7 +4357,7 @@ Slut.
         assert!(l.dropped.is_empty(), "{:?}", l.dropped);
         let md = &l.markdown;
         assert!(
-            md.starts_with("<!-- kladd: font-family: \"Liberation Serif\"; font-size: 12pt; page-size: Letter; page-margin: 20mm 25mm 20mm 25mm; footer: \"Sida {sida} av {sidor}\"; footer-align: center; h1: \"Liberation Sans\" 18.2pt -->\n\n"),
+            md.starts_with("<!-- kladd: font-family: \"Liberation Serif\"; font-size: 12pt; page-size: Letter; page-margin: 20mm 25mm 20mm 25mm; footer: \"Sida {sida} av {sidor}\"; footer-align: center; footer-dist: 20mm; h1: \"Liberation Sans\" 18.2pt -->\n\n"),
             "{md}"
         );
         assert!(md.contains("\n# Rubrik ett\n"), "fetstil i rubriken kommer från formatmallen: {md}");
@@ -4595,3 +4548,6 @@ mod review_tests;
 #[cfg(test)]
 #[path = "odt_section_tests.rs"]
 mod section_tests;
+
+#[path = "odt_hf.rs"]
+mod hf;

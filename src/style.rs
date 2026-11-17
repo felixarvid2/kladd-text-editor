@@ -225,6 +225,18 @@ pub struct DocDefaults {
     pub header_first: Option<String>,
     /// Annorlunda sidfot på första sidan (`Some("")` = tomt).
     pub footer_first: Option<String>,
+    /// Sidhuvud och sidfot på jämna sidor (`w:evenAndOddHeaders`; `Some("")` = tomt). Se `crate::hf`.
+    pub header_even: Option<String>,
+    pub footer_even: Option<String>,
+    /// Textens utseende i sidhuvudet och sidfoten (`header-style: "9pt #666666 line=#999999/0.5pt"`).
+    pub header_style: crate::hf::HfStyle,
+    pub footer_style: crate::hf::HfStyle,
+    /// Avstånd från sidans övre/nedre kant till sidhuvudet/sidfoten i pt (`w:pgMar w:header/w:footer`).
+    pub header_dist: Option<f32>,
+    pub footer_dist: Option<f32>,
+    /// Sidnumret på första sidan (`page-start`) och dess format (`page-format: roman`).
+    pub page_start: Option<u32>,
+    pub page_format: Option<crate::hf::NumFmt>,
     /// Formatmallarnas ändringar (`h1: …`, `body: …`, `quote: …`), se `formatmall`.
     pub styles: StyleSet,
 }
@@ -255,6 +267,16 @@ impl DocDefaults {
     /// Marginaler i pt: topp, höger, botten, vänster (en tum om inget anges).
     pub fn margins(&self) -> [f32; 4] {
         self.page_margin.unwrap_or([DEFAULT_MARGIN; 4])
+    }
+
+    /// Marginalerna som sidorna läggs ut med: som `margins`, men sidhuvudet och sidfoten (med bilder)
+    /// skjuter ned brödtexten om de behöver mer plats än marginalen.
+    pub fn layout_margins(&self) -> [f32; 4] {
+        let mut m = self.margins();
+        let r = crate::hf::Plan::new(self, &[]).reserve(self, 0);
+        m[0] = m[0].max(r[0]);
+        m[2] = m[2].max(r[1]);
+        m
     }
 
     /// Har första sidan eget sidhuvud eller egen sidfot?
@@ -300,10 +322,31 @@ impl DocDefaults {
                 }
             }
         }
-        for (name, text) in [("header-first", &self.header_first), ("footer-first", &self.footer_first)] {
+        for (name, text) in [
+            ("header-first", &self.header_first),
+            ("footer-first", &self.footer_first),
+            ("header-even", &self.header_even),
+            ("footer-even", &self.footer_even),
+        ] {
             if let Some(t) = text {
                 parts.push(format!("{name}: {}", quote(t)));
             }
+        }
+        for (name, st) in [("header-style", &self.header_style), ("footer-style", &self.footer_style)] {
+            if !st.is_default() {
+                parts.push(format!("{name}: {}", quote(&st.to_text())));
+            }
+        }
+        for (name, d) in [("header-dist", self.header_dist), ("footer-dist", self.footer_dist)] {
+            if let Some(d) = d.filter(|d| (d - crate::hf::DEFAULT_DIST).abs() > 0.3) {
+                parts.push(format!("{name}: {}", mm(d)));
+            }
+        }
+        if let Some(n) = self.page_start {
+            parts.push(format!("page-start: {n}"));
+        }
+        if let Some(f) = self.page_format.filter(|f| *f != crate::hf::NumFmt::Decimal) {
+            parts.push(format!("page-format: {}", f.name()));
         }
         parts.extend(self.styles.to_parts());
         if parts.is_empty() {
@@ -332,6 +375,14 @@ impl DocDefaults {
                 "footer" => d.footer = Some(unquote(&v)),
                 "header-first" => d.header_first = Some(unquote(&v)),
                 "footer-first" => d.footer_first = Some(unquote(&v)),
+                "header-even" => d.header_even = Some(unquote(&v)),
+                "footer-even" => d.footer_even = Some(unquote(&v)),
+                "header-style" => d.header_style = crate::hf::HfStyle::from_text(&unquote(&v)),
+                "footer-style" => d.footer_style = crate::hf::HfStyle::from_text(&unquote(&v)),
+                "header-dist" => d.header_dist = parse_length(&v),
+                "footer-dist" => d.footer_dist = parse_length(&v),
+                "page-start" => d.page_start = v.trim().parse().ok(),
+                "page-format" => d.page_format = crate::hf::NumFmt::from_name(&v),
                 "header-align" => d.header_align = Align::from_attr(&v),
                 "footer-align" => d.footer_align = Align::from_attr(&v),
                 k => {
@@ -354,6 +405,10 @@ pub struct Fields {
     pub file: String,
     /// `{datum}`: ÅÅÅÅ-MM-DD.
     pub date: String,
+    /// `{avsnittssidor}`: antalet sidor i avsnittet.
+    pub sec_pages: usize,
+    /// Sidnumrets format i avsnittet (`{sida}`).
+    pub fmt: crate::hf::NumFmt,
 }
 
 /// Dagens datum som ÅÅÅÅ-MM-DD (svenskt format).
@@ -365,7 +420,7 @@ impl Fields {
     /// Fält för sida `page` av `pages` i filen `name` (med eller utan ändelse; en tom `name` ger tomma fält).
     pub fn new(page: usize, pages: usize, name: &str) -> Self {
         let (title, file) = split_name(name);
-        Fields { page, pages, title, file, date: today() }
+        Fields { page, pages, title, file, date: today(), sec_pages: pages, fmt: Default::default() }
     }
 
     /// Fält för en fil som skrivs som `title` + `ext` (utan punkt); `title` kan redan ha ändelsen.
@@ -373,7 +428,7 @@ impl Fields {
         let (t, f) = split_name(title);
         let has_ext = f != t;
         let file = if has_ext || title.is_empty() { f } else { format!("{t}.{ext}") };
-        Fields { page: 1, pages: 1, title: t, file, date: today() }
+        Fields { page: 1, pages: 1, title: t, file, date: today(), sec_pages: 1, fmt: Default::default() }
     }
 
     pub fn at(&self, page: usize, pages: usize) -> Self {
@@ -400,15 +455,9 @@ pub const FIELD_NAMES: [(&str, &str); 5] = [
     ("{fil}", "Filnamn"),
 ];
 
-/// Text i sidhuvud eller sidfot med fälten ifyllda. `\|` blir ett vanligt `|`.
+/// Text i sidhuvud eller sidfot med fälten ifyllda. `\|` blir ett vanligt `|`. Se `crate::hf::fill`.
 pub fn fill_fields(template: &str, f: &Fields) -> String {
-    let out = template
-        .replace("{sida}", &f.page.to_string())
-        .replace("{sidor}", &f.pages.to_string())
-        .replace("{datum}", &f.date)
-        .replace("{titel}", &f.title)
-        .replace("{fil}", &f.file);
-    out.replace("\\|", "|")
+    crate::hf::fill(template, f)
 }
 
 /// Delar mallen vid `|` (ej föregånget av `\`): `None` för ett enda värde. Två delar blir vänster och
@@ -528,7 +577,7 @@ pub(crate) fn quote(t: &str) -> String {
     s
 }
 
-fn unquote(v: &str) -> String {
+pub(crate) fn unquote(v: &str) -> String {
     let v = v.trim();
     let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
         return v.to_owned();
@@ -904,7 +953,7 @@ mod tests {
 
     #[test]
     fn field_expansion() {
-        let f = Fields { page: 2, pages: 7, title: "Rapport".into(), file: "Rapport.docx".into(), date: "2026-11-13".into() };
+        let f = Fields { page: 2, pages: 7, title: "Rapport".into(), file: "Rapport.docx".into(), date: "2026-11-13".into(), sec_pages: 7, fmt: Default::default() };
         assert_eq!(fill_fields("{titel} ({fil}) {datum}: {sida}/{sidor}", &f), "Rapport (Rapport.docx) 2026-11-13: 2/7");
         assert_eq!(fill_fields("a\\|b", &f), "a|b");
         let n = Fields::new(1, 1, "anteckning.md");

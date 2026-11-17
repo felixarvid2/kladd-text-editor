@@ -68,6 +68,8 @@ pub struct SectionProps {
     pub column_rule: bool,
     /// Börjar på samma sida som föregående avsnitt (annars på en ny sida).
     pub continuous: bool,
+    /// Egna sidhuvuden och sidfötter, sidnumrering som börjar om (`crate::hf`).
+    pub hf: crate::hf::SecHf,
 }
 
 impl SectionProps {
@@ -96,6 +98,7 @@ impl SectionProps {
         if self.continuous {
             parts.push("type: continuous".to_owned());
         }
+        parts.extend(self.hf.to_parts());
         format!("<!-- kladd: {} -->", parts.join("; "))
     }
 
@@ -122,7 +125,9 @@ impl SectionProps {
                 }
                 "column-rule" => p.column_rule = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "ja" | "1" | "true" | "solid"),
                 "type" => p.continuous = v.trim().eq_ignore_ascii_case("continuous"),
-                _ => {}
+                k => {
+                    p.hf.read_decl(k, &v);
+                }
             }
         }
         Some(p)
