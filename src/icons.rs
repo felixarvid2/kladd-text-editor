@@ -11,6 +11,8 @@ pub enum Icon {
     Menu,
     Moon,
     Sun,
+    // Förhandsvisningsknappen använder sidikonen sedan läsläget kom; ikonen sparas.
+    #[allow(dead_code)]
     Split,
     ChevronUp,
     ChevronDown,

@@ -12,7 +12,7 @@ use egui::{
     RichText, ScrollArea, Sense, Shape, Stroke, TextBuffer, TextEdit, Ui, UiBuilder,
     ViewportCommand, pos2, vec2,
 };
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark::CommonMarkCache;
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::t;
@@ -66,7 +66,9 @@ pub struct Settings {
     pub dark: bool,
     pub font_size: f32,
     pub wrap: bool,
-    pub preview: bool,
+    /// Förhandsvisning bredvid texten när en Markdown-fil redigeras (av som standard: öppnade
+    /// .md-filer visas i stället färdigritade i hela fönstret, se `mdread`).
+    pub side_preview: bool,
     pub line_numbers: bool,
     pub recent: Vec<PathBuf>,
     /// Zoom för sidan i dokumentläget (1.0 = 100 %).
@@ -129,7 +131,7 @@ impl Default for Settings {
             dark: true,
             font_size: DEFAULT_FONT_SIZE,
             wrap: true,
-            preview: true,
+            side_preview: false,
             line_numbers: true,
             recent: Vec::new(),
             word_zoom: 1.0,
@@ -253,7 +255,7 @@ pub struct KladdApp {
     hl: Highlighter,
     /// Stora textfiler: virtualiserad vy, bakgrundsinläsning, sökning i bitar (`bigfiles`).
     pub(crate) big: crate::bigfiles::State,
-    md_cache: CommonMarkCache,
+    pub(crate) md_cache: CommonMarkCache,
     pub(crate) find: Find,
     dialog: Option<Receiver<DialogResult>>,
     pending_close: Option<PendingClose>,
@@ -271,7 +273,9 @@ pub struct KladdApp {
     last_title: String,
     last_active_id: Option<u64>,
     incoming: Option<Receiver<Incoming>>,
-    preview_images: std::collections::HashSet<String>,
+    pub(crate) preview_images: std::collections::HashSet<String>,
+    /// Markdown-flikar (id) som visas i läsläget: färdigritade i hela fönstret med en Redigera-knapp.
+    pub(crate) md_reading: std::collections::HashSet<u64>,
     owns_socket: bool,
     pub(crate) word: crate::word::layout::Cache,
     /// Typsnitt som Word-dokumenten använder, hämtade från systemet.
@@ -427,6 +431,7 @@ impl KladdApp {
             last_active_id: None,
             incoming: None,
             preview_images: std::collections::HashSet::new(),
+            md_reading: std::collections::HashSet::new(),
             owns_socket: false,
             word: Default::default(),
             doc_fonts: crate::word::fonts::DocFonts::new(),
@@ -640,6 +645,9 @@ impl KladdApp {
     /// Lägger det inlästa dokumentet i en ny flik (eller i en tom, orörd namnlös flik).
     fn install_doc(&mut self, ctx: &egui::Context, doc: Document, canonical: &Path) {
         self.next_id += 1;
+        if crate::mdread::opens_in_reading(&doc) {
+            self.md_reading.insert(doc.id);
+        }
         // Ersätt en tom, orörd namnlös flik i stället för att lägga till en ny.
         let replace = self
             .docs
@@ -1012,6 +1020,7 @@ impl KladdApp {
         self.hl.forget(doc.id | (1 << 62));
         self.big.forget(doc.id);
         self.word.forget(doc.id);
+        self.md_reading.remove(&doc.id);
         if self.docs.is_empty() {
             self.active = 0;
             self.untitled_counter = 0;
@@ -1602,7 +1611,7 @@ impl KladdApp {
             self.settings.wrap = !self.settings.wrap;
         }
         if hit(ctrl_shift, Key::M) {
-            if !word { self.settings.preview = !self.settings.preview; }
+            if !word { self.toggle_md_reading(); }
         }
         // Ctrl+Skift+L är "markera alla förekomster" i textläget; temat byts där med Ctrl+Skift+K.
         if hit(ctrl_shift, Key::K) || (word && hit(ctrl_shift, Key::L)) {
@@ -1758,15 +1767,10 @@ impl KladdApp {
                             }
                         }
                         if show_preview_btn {
-                            let tip = if self.settings.preview {
-                                t("Dölj förhandsvisning (Ctrl+Shift+M)")
-                            } else {
-                                t("Visa förhandsvisning (Ctrl+Shift+M)")
-                            };
-                            if icons::button(ui, p, Icon::Split, 30.0, self.settings.preview, tip, p.chrome)
-                                .clicked()
-                            {
-                                self.settings.preview = !self.settings.preview;
+                            let reading = self.md_read_mode();
+                            let tip = if reading { t("Redigera (Ctrl+Shift+M)") } else { t("Visa förhandsvisning (Ctrl+Shift+M)") };
+                            if icons::button(ui, p, Icon::Page, 30.0, reading, tip, p.chrome).clicked() {
+                                self.toggle_md_reading();
                             }
                         }
                     },
@@ -1982,7 +1986,12 @@ impl KladdApp {
     fn preview(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(doc) = self.docs.get(self.active) else { return };
         // I delad vy ryms ingen förhandsvisning bredvid två rutor.
-        if self.panes.is_split() || !(self.settings.preview && doc.is_markdown()) || self.word_mode() || self.big.has_view(doc.id) {
+        if self.panes.is_split()
+            || !(self.settings.side_preview && doc.is_markdown())
+            || self.word_mode()
+            || self.md_read_mode()
+            || self.big.has_view(doc.id)
+        {
             return;
         }
         let width = ui.available_width();
@@ -1997,39 +2006,8 @@ impl KladdApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(22.0);
-                        let st = ui.style_mut();
-                        st.text_styles.insert(egui::TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
-                        st.text_styles.insert(egui::TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace));
-                        st.text_styles.insert(egui::TextStyle::Heading, FontId::new(26.0, theme::semibold()));
-                        st.spacing.item_spacing.y = 8.0;
-                        st.visuals.override_text_color = Some(p.text);
                         ui.set_max_width(680.0f32.min(ui.available_width()));
-                        // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
-                        // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
-                        let with_math = crate::math::preview::replace(&doc.text, ui.ctx(), 15.0, p.text, ui.available_width());
-                        let mut text: std::borrow::Cow<str> = std::borrow::Cow::Owned(crate::preview::clean(&with_math));
-                        for (name, img) in &doc.images {
-                            let enc = name.replace(' ', "%20");
-                            let uri = format!("bytes://kladd/{}/{enc}", doc.id);
-                            if self.preview_images.insert(uri.clone()) {
-                                ui.ctx().include_bytes(uri.clone(), img.bytes.clone());
-                            }
-                            let from = format!("]({}{enc})", crate::docx::IMAGE_SCHEME);
-                            if text.contains(&from) {
-                                text = std::borrow::Cow::Owned(text.replace(&from, &format!("]({uri})")));
-                            }
-                        }
-                        if let Some(home) = home_dir() {
-                            if text.contains("](~/") {
-                                text = std::borrow::Cow::Owned(text.replace("](~/", &format!("](file://{}/", home.display())));
-                            }
-                        }
-                        let base = doc.base_dir().or_else(home_dir).unwrap_or_default();
-                        let max_w = ui.available_width() as usize;
-                        CommonMarkViewer::new()
-                            .default_implicit_uri_scheme(format!("file://{}/", base.display()))
-                            .max_image_width(Some(max_w))
-                            .show(ui, &mut self.md_cache, &text);
+                        crate::mdread::render(ui, p, doc, &mut self.preview_images, &mut self.md_cache);
                         ui.add_space(40.0);
                     });
             });
@@ -2046,6 +2024,10 @@ impl KladdApp {
         }
         if self.csv_mode() {
             self.csv_page(ui, p);
+            return;
+        }
+        if self.md_read_mode() {
+            self.md_read_page(ui, p);
             return;
         }
         CentralPanel::default()

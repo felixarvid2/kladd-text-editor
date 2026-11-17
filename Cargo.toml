@@ -1,6 +1,6 @@
 [package]
 name = "kladd"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
 description = "Kladd – en lugn och snygg texteditor för txt, Markdown och kod"
 authors = ["Felix"]
@@ -100,3 +100,8 @@ assets = [
     ["assets/fonts/STIXTwo-OFL.txt", "usr/share/doc/kladd/STIXTWO-FONT-LICENSE", "644"],
     ["README.md", "usr/share/doc/kladd/README.md", "644"],
 ]
+
+# Lappad kopia av egui_commonmark_backend: fet text i Markdown-förhandsvisningen ritas med ett
+# fett typsnitt i stället för bara en starkare färg. Se vendor/egui_commonmark_backend/KLADD.md.
+[patch.crates-io]
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
