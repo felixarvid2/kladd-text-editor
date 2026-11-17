@@ -12,7 +12,8 @@
 #![allow(dead_code)]
 
 mod formatmall;
-pub use formatmall::{STYLE_IDS, StyleId, StyleOverride, StyleSet};
+pub mod titles;
+pub use formatmall::{Border, STYLE_IDS, StyleId, StyleOverride, StyleSet};
 
 /// Grundtypsnittet när dokumentet inte anger något (samma som `docx::write` skriver).
 pub const DEFAULT_FONT: &str = "Calibri";

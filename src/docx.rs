@@ -19,6 +19,7 @@ use quick_xml::Reader;
 
 use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
+use crate::style::titles::{self, TitleKind};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::word::markup::{self, Float};
 
@@ -310,6 +311,9 @@ struct RProps {
     highlight: Option<Option<[u8; 3]>>,
     /// `w:shd w:fill`.
     shading: Option<[u8; 3]>,
+    /// Fet och kursiv (`w:b`, `w:i`): används för teckenmallar som Betoning och Stark.
+    bold: Option<bool>,
+    italic: Option<bool>,
 }
 
 impl RProps {
@@ -321,6 +325,8 @@ impl RProps {
             color: inner.color.or(self.color),
             highlight: inner.highlight.or(self.highlight),
             shading: inner.shading.or(self.shading),
+            bold: inner.bold.or(self.bold),
+            italic: inner.italic.or(self.italic),
         }
     }
 
@@ -338,9 +344,25 @@ impl RProps {
 struct Theme {
     major: Option<String>,
     minor: Option<String>,
+    /// `a:clrScheme`: dk1, lt1, dk2, lt2, accent1-6, hlink, folHlink (gemener).
+    colors: HashMap<String, [u8; 3]>,
 }
 
 impl Theme {
+    /// `w:themeColor` (`accent1`, `text2`, `background1` …) → temats färg, utan tint/shade.
+    fn color(&self, name: &str) -> Option<[u8; 3]> {
+        let key = match name {
+            "text1" | "dark1" => "dk1",
+            "background1" | "light1" => "lt1",
+            "text2" | "dark2" => "dk2",
+            "background2" | "light2" => "lt2",
+            "hyperlink" => "hlink",
+            "followedHyperlink" => "folhlink",
+            n => return self.colors.get(&n.to_ascii_lowercase()).copied(),
+        };
+        self.colors.get(key).copied()
+    }
+
     /// `minorHAnsi`, `majorAscii` … → typsnittets namn.
     fn font(&self, theme_name: &str) -> Option<String> {
         let n = theme_name.to_ascii_lowercase();
@@ -359,15 +381,33 @@ fn parse_theme(xml: &str) -> Theme {
     let mut r = Reader::from_str(xml);
     // 0 = utanför, 1 = majorFont, 2 = minorFont
     let mut cur = 0u8;
+    // Färgen i `a:clrScheme` som just läses (dk1, accent1 …).
+    let mut slot: Option<String> = None;
     loop {
         match r.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if matches!(local(e.name().as_ref()), b"srgbClr" | b"sysClr") => {
+                let c = attr(&e, b"val").filter(|_| local(e.name().as_ref()) == b"srgbClr").or_else(|| attr(&e, b"lastClr"));
+                if let (Some(s), Some(c)) = (&slot, c.and_then(|c| style::parse_color(&c))) {
+                    t.colors.entry(s.clone()).or_insert(c);
+                }
+            }
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
                 b"majorFont" => cur = 1,
                 b"minorFont" => cur = 2,
                 b"latin" => theme_latin(&mut t, cur, &e),
+                n @ (b"dk1" | b"lt1" | b"dk2" | b"lt2" | b"accent1" | b"accent2" | b"accent3" | b"accent4" | b"accent5"
+                | b"accent6" | b"hlink" | b"folHlink") => slot = Some(String::from_utf8_lossy(n).to_ascii_lowercase()),
                 _ => {}
             },
             Ok(Event::Empty(e)) if local(e.name().as_ref()) == b"latin" => theme_latin(&mut t, cur, &e),
+            Ok(Event::End(e))
+                if matches!(
+                    local(e.name().as_ref()),
+                    b"dk1" | b"lt1" | b"dk2" | b"lt2" | b"accent1" | b"accent2" | b"accent3" | b"accent4" | b"accent5" | b"accent6" | b"hlink" | b"folHlink"
+                ) =>
+            {
+                slot = None
+            }
             Ok(Event::End(e)) if matches!(local(e.name().as_ref()), b"majorFont" | b"minorFont") => cur = 0,
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -396,7 +436,8 @@ fn apply_rpr_elem(rp: &mut RProps, name: &[u8], e: &BytesStart<'_>, theme: &Them
             }
         }
         b"color" => {
-            if let Some(c) = attr(e, b"val").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| style::parse_color(&v)) {
+            let tc = crate::docx_styles::Theme { font: &|_| None, color: &|n| theme.color(n) };
+            if let Some(c) = crate::docx_styles::color_of(e, &tc) {
                 rp.color = Some(c);
             }
         }
@@ -405,6 +446,8 @@ fn apply_rpr_elem(rp: &mut RProps, name: &[u8], e: &BytesStart<'_>, theme: &Them
                 rp.size = Some(half / 2.0);
             }
         }
+        b"b" => rp.bold = Some(!matches!(attr(e, b"val").as_deref(), Some("0" | "false" | "off" | "none"))),
+        b"i" => rp.italic = Some(!matches!(attr(e, b"val").as_deref(), Some("0" | "false" | "off" | "none"))),
         b"highlight" => match attr(e, b"val").as_deref() {
             Some("none") => rp.highlight = Some(None),
             Some(n) => {
@@ -577,15 +620,24 @@ fn parse_styles(xml: &str, theme: &Theme) -> Styles {
 enum ParaKind {
     Normal,
     Heading(u8),
+    /// Wordstilen Title / Subtitle (Kladds `Block::Title` / `Block::Subtitle`).
+    Title,
+    Subtitle,
     Quote,
     Code,
 }
 
+/// Wordstilarna Title och Subtitle (id eller namn; "Rubrik" är svenska Words Title).
+fn title_from_name(s: &str) -> Option<ParaKind> {
+    match s.to_lowercase().replace([' ', '_', '-'], "").as_str() {
+        "title" | "rubrik" | "titel" => Some(ParaKind::Title),
+        "subtitle" | "underrubrik" | "undertitel" => Some(ParaKind::Subtitle),
+        _ => None,
+    }
+}
+
 fn heading_from_name(s: &str) -> Option<u8> {
     let s = s.to_lowercase().replace([' ', '_', '-'], "");
-    if s == "title" || s == "rubrik" || s == "titel" {
-        return Some(1);
-    }
     for prefix in ["heading", "rubrik", "überschrift", "titre", "kop", "otsikko", "overskrift"] {
         if let Some(n) = s.strip_prefix(prefix) {
             if let Ok(n) = n.parse::<u8>() {
@@ -614,10 +666,16 @@ fn kind_for_style(styles: &HashMap<String, StyleInfo>, id: &str) -> ParaKind {
     let mut cur = Some(id.to_owned());
     for _ in 0..10 {
         let Some(sid) = cur else { break };
+        if let Some(k) = title_from_name(&sid) {
+            return k;
+        }
         if let Some(h) = heading_from_name(&sid) {
             return ParaKind::Heading(h);
         }
         let Some(info) = styles.get(&sid) else { break };
+        if let Some(k) = title_from_name(&info.name) {
+            return k;
+        }
         if let Some(h) = heading_from_name(&info.name) {
             return ParaKind::Heading(h);
         }
@@ -864,7 +922,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
             .part(&p)?
             .map(|x| {
                 let kladd = format!("<w:styles>{}</w:styles>", kladd_styles());
-                style_set = crate::docx_styles::read_relative(&x, &|t| theme.font(t), &kladd);
+                let th = crate::docx_styles::Theme { font: &|t| theme.font(t), color: &|n| theme.color(n) };
+                style_set = crate::docx_styles::read_relative(&x, &th, &kladd);
                 parse_styles(&x, &theme)
             })
             .unwrap_or_default(),
@@ -1633,7 +1692,7 @@ fn run_span(
     }
     let eff = eff.over(direct);
     let mut reference = match para.map_or(ParaKind::Normal, |p| p.kind) {
-        ParaKind::Heading(_) | ParaKind::Quote => para_eff,
+        ParaKind::Heading(_) | ParaKind::Quote | ParaKind::Title | ParaKind::Subtitle => para_eff,
         _ => RProps { font: Some(base.font().to_owned()), size: Some(base.size()), ..Default::default() },
     };
     // Länkar har Words länkfärg; den ska inte bli en span.
@@ -2142,6 +2201,16 @@ fn parse_body(
                         }
                         if s == "emphasis" || s.contains("betoning") {
                             fmt.italic = true;
+                        }
+                        // Andra teckenmallar (Subtil betoning, Bokens titel, egna) med fet/kursiv.
+                        // (Inte i rubriker: deras teckenmallar är bara rubrikens eget utseende.)
+                        let in_head = para.as_ref().is_some_and(|p| matches!(p.kind, ParaKind::Heading(_) | ParaKind::Title | ParaKind::Subtitle));
+                        let rp = styles.rchain(attr(e, b"val").unwrap_or_default().as_str());
+                        if let (Some(b), false) = (rp.bold, in_head) {
+                            fmt.bold = b;
+                        }
+                        if let (Some(i), false) = (rp.italic, in_head) {
+                            fmt.italic = i;
                         }
                     }
                     b"rFonts" if in_rpr => {
@@ -2669,7 +2738,7 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 } else {
                     p.align
                 };
-                let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_));
+                let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_) | ParaKind::Title | ParaKind::Subtitle);
                 let same_list = match &p.list {
                     Some((num, 0)) => top_num.as_deref() == Some(num.as_str()),
                     Some(_) => true,
@@ -2721,6 +2790,13 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                         }
                         let kind = if ordered { 'o' } else { 'u' };
                         units.push(MdUnit { origin: p.origin, desc: format!("l{l}{kind}|{}", align.as_attr()), key: norm(&key) });
+                    }
+                    (k @ (ParaKind::Title | ParaKind::Subtitle), _) => {
+                        let tk = if k == ParaKind::Title { TitleKind::Title } else { TitleKind::Subtitle };
+                        let one_line = text.replace('\n', " ");
+                        let h = format!("{} {} {}", "#".repeat(tk.level() as usize), one_line.trim(), tk.marker());
+                        units.push(MdUnit { origin: p.origin, desc: format!("{}|{}", tk.class(), align.as_attr()), key: norm(&h) });
+                        out.push_str(&h);
                     }
                     (ParaKind::Quote, None) => {
                         let q: Vec<String> = text.lines().map(|l| format!("> {}", escape_line_start(l))).collect();
@@ -2876,6 +2952,8 @@ struct Writer<'a> {
     item_first_para: bool,
     quote: u32,
     heading: Option<u8>,
+    /// Titel/Underrubrik (`{.title}` / `{.subtitle}`): stycket får Wordstilen Title/Subtitle.
+    title: Option<TitleKind>,
     table: Option<TableState>,
     in_code_block: bool,
     /// Bild som håller på att läsas: (källa, alt-text).
@@ -2956,6 +3034,7 @@ impl<'a> Writer<'a> {
             item_first_para: false,
             quote: 0,
             heading: None,
+            title: None,
             table: None,
             in_code_block: false,
             image: None,
@@ -3089,7 +3168,12 @@ impl<'a> Writer<'a> {
 
     fn para_props(&self) -> String {
         let mut ppr = String::new();
-        if let Some(h) = self.heading {
+        if let Some(t) = self.title {
+            ppr.push_str(match t {
+                TitleKind::Title => "<w:pStyle w:val=\"Title\"/>",
+                TitleKind::Subtitle => "<w:pStyle w:val=\"Subtitle\"/>",
+            });
+        } else if let Some(h) = self.heading {
             ppr.push_str(&format!("<w:pStyle w:val=\"Heading{h}\"/>"));
         } else if self.in_code_block {
             ppr.push_str("<w:pStyle w:val=\"Code\"/>");
@@ -3553,6 +3637,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(titles::OPTS);
     let mut next_num: u32 = base + 1; // base = punktlistor
     // Enheter (stycke, listpunkt, tabell …) i brödtexten, för att kunna bytas mot originalet.
     let mut cur: Option<OpenUnit> = None;
@@ -3570,7 +3655,10 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     w.close_para();
                     let kind = match tag {
                         Tag::Paragraph | Tag::HtmlBlock => "p".to_owned(),
-                        Tag::Heading { level, .. } => format!("h{}", heading_num(*level)),
+                        Tag::Heading { level, classes, .. } => match titles::kind(classes) {
+                            Some(k) => k.class().to_owned(),
+                            None => format!("h{}", heading_num(*level)),
+                        },
                         Tag::CodeBlock(_) => "c".to_owned(),
                         Tag::Table(_) => "t".to_owned(),
                         _ => "q".to_owned(),
@@ -3632,8 +3720,9 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     w.close_para();
                     w.open_para();
                 }
-                Tag::Heading { level, .. } => {
+                Tag::Heading { level, classes, .. } => {
                     w.close_para();
+                    w.title = titles::kind(&classes);
                     w.heading = Some(heading_num(level));
                     w.open_para();
                 }
@@ -3743,6 +3832,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 TagEnd::Heading(_) => {
                     w.close_para();
                     w.heading = None;
+                    w.title = None;
                 }
                 TagEnd::BlockQuote(_) => {
                     w.close_para();
@@ -4020,6 +4110,8 @@ fn kladd_styles() -> String {
     for (n, size, color) in heads {
         s.push_str(&heading_style(n, size, color));
     }
+    // Word-lika Title och Subtitle (Calibri Light 28 pt respektive 14 pt).
+    s.push_str(r#"<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="10"/><w:qFormat/><w:pPr><w:spacing w:after="120" w:line="240" w:lineRule="auto"/><w:contextualSpacing/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="1F3864"/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="11"/><w:qFormat/><w:pPr><w:spacing w:after="160"/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="595959"/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr></w:style>"#);
     s.push_str(r#"<w:style w:type="paragraph" w:styleId="TOCHeading"><w:name w:val="TOC Heading"/><w:basedOn w:val="Heading1"/><w:next w:val="Normal"/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:qFormat/><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:style>"#);
     for (n, ind) in [(1, 0), (2, 220), (3, 440)] {
         s.push_str(&format!(
@@ -5522,6 +5614,13 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
             let missing: String = split_styles(&kladd_styles())
                 .into_iter()
                 .filter(|(id, _)| !xml.contains(&format!("w:styleId=\"{id}\"")))
+                // Titel och Underrubrik läggs bara till när de används och dokumentet saknar en mall med namnet.
+                .filter(|(id, _)| match id.as_str() {
+                    "Title" | "Subtitle" => {
+                        w.body.contains(&format!("<w:pStyle w:val=\"{id}\"/>")) && !xml.to_lowercase().contains(&format!("<w:name w:val=\"{}\"/>", id.to_lowercase()))
+                    }
+                    _ => true,
+                })
                 .map(|(_, x)| x)
                 .collect();
             let mut patched = if missing.is_empty() { xml.clone() } else { insert_before(&xml, "</w:styles>", &missing) };
@@ -5993,7 +6092,7 @@ Sist vänster.
             format!("{}{}{}", &x[..start], body, &x[end..])
         });
         let back = read(&bytes).unwrap();
-        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt; h1: \"Georgia\" 20pt #2F5496 -->
+        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt; h1: \"Georgia\" 20pt nobold #2F5496 -->
 
 # Titel
 

@@ -11,7 +11,82 @@ use std::collections::HashMap;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::style::{Align, STYLE_IDS, StyleId, StyleOverride, StyleSet};
+use crate::style::{Align, Border, STYLE_IDS, StyleId, StyleOverride, StyleSet};
+
+/// Temats typsnitt och färger för `w:asciiTheme` / `w:themeColor` (se `docx::Theme`).
+pub struct Theme<'a> {
+    /// `majorHAnsi`, `minorAscii` … → typsnittets namn.
+    pub font: &'a dyn Fn(&str) -> Option<String>,
+    /// `accent1`, `text2` … → temats färg (före tint/shade).
+    pub color: &'a dyn Fn(&str) -> Option<[u8; 3]>,
+}
+
+impl Theme<'_> {
+    /// Ett tema utan typsnitt och färger (Kladds egna mallar läses så).
+    pub const NONE: Theme<'static> = Theme { font: &|_| None, color: &|_| None };
+}
+
+/// Wordtonen `w:themeTint` / `w:themeShade` (hex 00-FF) på en temafärg: tint ljusar mot vitt,
+/// shade mörkar mot svart (samma formler som Word skriver ut sin färg med).
+pub fn tint_shade(c: [u8; 3], tint: Option<&str>, shade: Option<&str>) -> [u8; 3] {
+    let hex = |v: Option<&str>| v.and_then(|v| u8::from_str_radix(v, 16).ok()).map(|v| f32::from(v) / 255.0);
+    let mut out = c.map(f32::from);
+    if let Some(t) = hex(tint) {
+        out = out.map(|v| 255.0 - (255.0 - v) * t);
+    }
+    if let Some(sh) = hex(shade) {
+        out = out.map(|v| v * sh);
+    }
+    // Word avrundar nedåt.
+    out.map(|v| (v + 0.0001).floor().clamp(0.0, 255.0) as u8)
+}
+
+/// Färgen i ett `w:color`-element: `w:val` om den är en färg, annars temafärgen.
+pub fn color_of(e: &BytesStart<'_>, th: &Theme) -> Option<[u8; 3]> {
+    let direct = attr(e, b"val").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| crate::style::parse_color(&v));
+    if direct.is_some() {
+        return direct;
+    }
+    let base = attr(e, b"themeColor").and_then(|n| (th.color)(&n))?;
+    Some(tint_shade(base, attr(e, b"themeTint").as_deref(), attr(e, b"themeShade").as_deref()))
+}
+
+/// Ett barn i en `w:rPr` (typsnitt, storlek, fet, kursiv, färg, teckenavstånd, versaler).
+fn rpr_elem(o: &mut StyleOverride, name: &[u8], e: &BytesStart<'_>, th: &Theme) {
+    match name {
+        b"rFonts" => {
+            let themed = attr(e, b"asciiTheme").or_else(|| attr(e, b"hAnsiTheme")).and_then(|t| (th.font)(&t));
+            let named = || attr(e, b"ascii").or_else(|| attr(e, b"hAnsi")).filter(|f| !f.trim().is_empty());
+            if let Some(f) = themed.or_else(named) {
+                o.font_family = Some(f);
+            }
+        }
+        b"sz" => o.size = attr(e, b"val").and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0).map(|h| h / 2.0),
+        b"b" => o.bold = Some(on_off(e)),
+        b"i" => o.italic = Some(on_off(e)),
+        b"color" => o.color = color_of(e, th),
+        b"spacing" => o.letter_spacing = twips_signed(attr(e, b"val")),
+        b"caps" => o.caps = Some(on_off(e)),
+        b"smallCaps" => o.small_caps = Some(on_off(e)),
+        _ => {}
+    }
+}
+
+/// `w:pBdr/w:bottom` som en linje (tjocklek i åttondels punkt, avstånd i punkter). `nil`/`none` = ingen.
+fn border_of(e: &BytesStart<'_>, th: &Theme) -> Option<Border> {
+    if matches!(attr(e, b"val").as_deref(), None | Some("nil" | "none")) {
+        return None;
+    }
+    let width = attr(e, b"sz").and_then(|v| v.parse::<f32>().ok()).map_or(0.5, |v| (v / 8.0).clamp(0.25, 12.0));
+    let space = attr(e, b"space").and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 31.0);
+    // Automatisk färg är svart i Word; `w:color` är här färgen själv.
+    let direct = attr(e, b"color").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| crate::style::parse_color(&v));
+    let themed = || {
+        let base = attr(e, b"themeColor").and_then(|n| (th.color)(&n))?;
+        Some(tint_shade(base, attr(e, b"themeTint").as_deref(), attr(e, b"themeShade").as_deref()))
+    };
+    Some(Border { width, color: direct.or_else(themed).unwrap_or([0, 0, 0]), space })
+}
 
 fn local(name: &[u8]) -> &[u8] {
     name.iter().rposition(|&b| b == b':').map_or(name, |i| &name[i + 1..])
@@ -49,7 +124,16 @@ impl St {
         p.space_after = inner.space_after.or(p.space_after);
         p.line_spacing = inner.line_spacing.or(p.line_spacing);
         p.first_indent = inner.first_indent.or(p.first_indent);
+        p.letter_spacing = inner.letter_spacing.or(p.letter_spacing);
+        p.caps = inner.caps.or(p.caps);
+        p.small_caps = inner.small_caps.or(p.small_caps);
+        p.border_bottom = inner.border_bottom.or(p.border_bottom);
     }
+}
+
+/// Som `twips` men tillåter negativa värden (sammandraget teckenavstånd).
+fn twips_signed(v: Option<String>) -> Option<f32> {
+    v.and_then(|s| s.parse::<f32>().ok()).map(|t| (t / 20.0 * 100.0).round() / 100.0)
 }
 
 fn twips(v: Option<String>) -> Option<f32> {
@@ -57,12 +141,21 @@ fn twips(v: Option<String>) -> Option<f32> {
 }
 
 /// Läser formatmallarna ur `styles.xml`. `theme` ger typsnittet för ett temanamn (`majorHAnsi`).
-pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
+#[cfg(test)]
+pub fn read(xml: &str, th: &Theme) -> StyleSet {
+    parse(xml, th, None).0
+}
+
+/// Läser formatmallarna och docDefaults; `forced` ersätter docDefaults (för Kladds egna mallar,
+/// som saknar egna men ska jämföras med dokumentets).
+fn parse(xml: &str, th: &Theme, forced: Option<&StyleOverride>) -> (StyleSet, StyleOverride) {
     let mut map: HashMap<String, St> = HashMap::new();
     let mut default_para = String::new();
     let mut r = Reader::from_str(xml);
     let mut cur: Option<(String, St)> = None;
-    let (mut in_ppr, mut in_rpr, mut in_defaults) = (false, false, false);
+    let (mut in_ppr, mut in_rpr, mut in_defaults, mut in_drpr, mut in_pbdr) = (false, false, false, false, false);
+    // docDefaults/rPrDefault: teckenegenskaper som gäller om en formatmall inte anger något.
+    let mut defaults = StyleOverride::default();
     loop {
         let ev = r.read_event();
         let (e, empty) = match &ev {
@@ -79,7 +172,11 @@ pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
                         }
                     }
                     b"pPr" => in_ppr = false,
-                    b"rPr" => in_rpr = false,
+                    b"pBdr" => in_pbdr = false,
+                    b"rPr" => {
+                        in_rpr = false;
+                        in_drpr = false;
+                    }
                     b"docDefaults" => in_defaults = false,
                     _ => {}
                 }
@@ -104,6 +201,14 @@ pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
             cur = Some((attr(e, b"styleId").unwrap_or_default(), st));
             continue;
         }
+        if in_defaults && !empty && name == b"rPr" {
+            in_drpr = true;
+            continue;
+        }
+        if in_drpr {
+            rpr_elem(&mut defaults, name, e, th);
+            continue;
+        }
         let Some((_, st)) = cur.as_mut().filter(|_| !in_defaults) else {
             if name == b"pPr" {
                 in_ppr = !empty;
@@ -114,30 +219,13 @@ pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
         };
         match name {
             b"pPr" => in_ppr = !empty,
+            b"pBdr" if in_ppr => in_pbdr = !empty,
             b"rPr" if !in_ppr => in_rpr = !empty,
             b"name" if !in_rpr && !in_ppr => st.name = attr(e, b"val").unwrap_or_default().to_lowercase(),
             b"basedOn" => st.based_on = attr(e, b"val").map(|v| v.to_lowercase()),
-            _ if in_rpr => match name {
-                b"rFonts" => {
-                    let themed = attr(e, b"asciiTheme").or_else(|| attr(e, b"hAnsiTheme")).and_then(|t| theme(&t));
-                    let named = || attr(e, b"ascii").or_else(|| attr(e, b"hAnsi")).filter(|f| !f.trim().is_empty());
-                    if let Some(f) = themed.or_else(named) {
-                        st.props.font_family = Some(f);
-                    }
-                }
-                b"sz" => {
-                    st.props.size =
-                        attr(e, b"val").and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0).map(|h| h / 2.0);
-                }
-                b"b" => st.props.bold = Some(on_off(e)),
-                b"i" => st.props.italic = Some(on_off(e)),
-                b"color" => {
-                    st.props.color =
-                        attr(e, b"val").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| crate::style::parse_color(&v));
-                }
-                _ => {}
-            },
+            _ if in_rpr => rpr_elem(&mut st.props, name, e, th),
             _ if in_ppr => match name {
+                b"bottom" if in_pbdr => st.props.border_bottom = border_of(e, th),
                 b"jc" => st.props.align = attr(e, b"val").map(|v| Align::from_jc(&v)),
                 b"spacing" => {
                     st.props.space_before = twips(attr(e, b"before"));
@@ -156,6 +244,9 @@ pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
         }
     }
 
+    if let Some(f) = forced {
+        defaults = f.clone();
+    }
     let chain = |id: &str| -> St {
         let mut ids = Vec::new();
         let mut c = Some(id.to_owned());
@@ -182,9 +273,26 @@ pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
             StyleId::Body => Some(if default_para.is_empty() { "normal".to_owned() } else { default_para.clone() }),
             StyleId::Heading(n) => find(&[&format!("heading{n}"), &format!("heading {n}")]),
             StyleId::Quote => find(&["quote"]),
+            StyleId::Title => find(&["title"]),
+            StyleId::Subtitle => find(&["subtitle"]),
         };
         let Some(sid) = sid.filter(|s| map.contains_key(s)) else { continue };
         let mut o = chain(&sid).props;
+        if id != StyleId::Body {
+            // Words docDefaults gäller det formatmallen inte anger (typsnittet undantaget: Kladds
+            // rubriker har sitt eget typsnitt).
+            o = StyleOverride {
+                size: o.size.or(defaults.size),
+                // En mall som inte anger fet/kursiv/färg är vanlig svart text i Word (inte Kladds blå rubrik).
+                bold: o.bold.or(defaults.bold).or(Some(false)),
+                italic: o.italic.or(defaults.italic).or(Some(false)),
+                color: o.color.or(defaults.color).or(Some([0, 0, 0])),
+                letter_spacing: o.letter_spacing.or(defaults.letter_spacing),
+                caps: o.caps.or(defaults.caps),
+                small_caps: o.small_caps.or(defaults.small_caps),
+                ..o
+            };
+        }
         if id == StyleId::Body {
             // Brödtextens typsnitt och storlek är dokumentets grundformat.
             o.font_family = None;
@@ -192,14 +300,15 @@ pub fn read(xml: &str, theme: &dyn Fn(&str) -> Option<String>) -> StyleSet {
         }
         set.set(id, o);
     }
-    set
+    (set, defaults)
 }
 
 /// Som `read`, men utan det som är lika med Kladds egna formatmallar (`kladd_styles`, inpackade i
 /// `w:styles`). Ett dokument skrivet av Kladd, eller ett som aldrig ändrat rubrikerna, får då inga
 /// formatmallsändringar.
-pub fn read_relative(xml: &str, theme: &dyn Fn(&str) -> Option<String>, kladd_xml: &str) -> StyleSet {
-    read(xml, theme).minus(&read(kladd_xml, &|_| None))
+pub fn read_relative(xml: &str, th: &Theme, kladd_xml: &str) -> StyleSet {
+    let (doc, defaults) = parse(xml, th, None);
+    doc.minus(&parse(kladd_xml, &Theme::NONE, Some(&defaults)).0)
 }
 
 // ------------------------------------------------------------------ skrivning
@@ -367,6 +476,34 @@ fn patch_style(style: &str, old: &StyleOverride, new: &StyleOverride, body: bool
         let x = new.color.map(|c| format!("<w:color w:val=\"{}\"/>", crate::style::hex(c).trim_start_matches('#')));
         set_child(&mut rpr, RPR_ORDER, "color", x);
     }
+    if old.letter_spacing != new.letter_spacing {
+        let x = new.letter_spacing.map(|v| format!("<w:spacing w:val=\"{}\"/>", (v * 20.0).round() as i64));
+        set_child(&mut rpr, RPR_ORDER, "spacing", x);
+    }
+    for (o, n, tag) in [(old.caps, new.caps, "caps"), (old.small_caps, new.small_caps, "smallCaps")] {
+        if o != n {
+            let x = n.map(|b| if b { format!("<w:{tag}/>") } else { format!("<w:{tag} w:val=\"0\"/>") });
+            set_child(&mut rpr, RPR_ORDER, tag, x);
+        }
+    }
+    if old.border_bottom != new.border_bottom {
+        // `w:pBdr` kan ha andra kanter; bara `w:bottom` byts.
+        let mut edges = ppr.iter().find(|(n, _)| n == "pBdr").map(|(_, x)| {
+            let o = x.find('>').map_or(0, |i| i + 1);
+            if x[..o].ends_with("/>") { Vec::new() } else { children(&x[o..x.rfind("</").unwrap_or(x.len())]) }
+        }).unwrap_or_default();
+        let b = new.border_bottom.map(|b| {
+            format!(
+                "<w:bottom w:val=\"single\" w:sz=\"{}\" w:space=\"{}\" w:color=\"{}\"/>",
+                ((b.width * 8.0).round() as i64).max(2),
+                b.space.round() as i64,
+                crate::style::hex(b.color).trim_start_matches('#')
+            )
+        });
+        set_child(&mut edges, &["top", "left", "bottom", "right", "between", "bar"], "bottom", b);
+        let x = (!edges.is_empty()).then(|| format!("<w:pBdr>{}</w:pBdr>", edges.iter().map(|(_, x)| x.as_str()).collect::<String>()));
+        set_child(&mut ppr, PPR_ORDER, "pBdr", x);
+    }
     if old.align != new.align {
         let x = new.align.map(|a| format!("<w:jc w:val=\"{}\"/>", a.as_jc()));
         set_child(&mut ppr, PPR_ORDER, "jc", x);
@@ -420,6 +557,8 @@ fn locate(xml: &str, id: StyleId, default_para: bool) -> Option<(usize, usize)> 
         StyleId::Body => vec!["normal".into()],
         StyleId::Heading(n) => vec![format!("heading{n}"), format!("heading {n}")],
         StyleId::Quote => vec!["quote".into()],
+        StyleId::Title => vec!["title".into()],
+        StyleId::Subtitle => vec!["subtitle".into()],
     };
     let mut fallback = None;
     while let Some(i) = xml[at..].find("<w:style ") {
@@ -463,13 +602,23 @@ mod tests {
     const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/><w:pPr><w:jc w:val="both"/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="240" w:after="0"/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="2F5496"/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:pPr><w:ind w:left="864" w:firstLine="360"/></w:pPr><w:rPr><w:i/><w:iCs/></w:rPr></w:style></w:styles>"#;
 
-    fn theme(t: &str) -> Option<String> {
+    fn theme_font(t: &str) -> Option<String> {
         (t == "majorHAnsi").then(|| "Calibri Light".to_owned())
     }
 
+    fn theme_color(n: &str) -> Option<[u8; 3]> {
+        match n {
+            "accent1" => Some([0x4F, 0x81, 0xBD]),
+            "text2" => Some([0x1F, 0x49, 0x7D]),
+            _ => None,
+        }
+    }
+
+    const THEME: Theme<'static> = Theme { font: &theme_font, color: &theme_color };
+
     #[test]
     fn reads_headings_normal_and_quote() {
-        let s = read(STYLES, &theme);
+        let s = read(STYLES, &THEME);
         let h1 = s.get(StyleId::Heading(1));
         assert_eq!(h1.font_family.as_deref(), Some("Calibri Light"));
         assert_eq!(h1.size, Some(16.0));
@@ -489,20 +638,20 @@ mod tests {
     fn relative_read_drops_kladd_defaults() {
         let kladd = r#"<w:styles><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:pPr><w:spacing w:before="360" w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="36"/></w:rPr></w:style></w:styles>"#;
         let xml = kladd.replace("w:val=\"36\"", "w:val=\"40\"");
-        let s = read_relative(&xml, &|_| None, kladd);
+        let s = read_relative(&xml, &Theme::NONE, kladd);
         assert_eq!(s.get(StyleId::Heading(1)), &StyleOverride { size: Some(20.0), ..Default::default() });
-        assert!(read_relative(kladd, &|_| None, kladd).is_empty());
+        assert!(read_relative(kladd, &Theme::NONE, kladd).is_empty());
     }
 
     #[test]
     fn untouched_set_leaves_xml_alone() {
-        let s = read(STYLES, &theme);
+        let s = read(STYLES, &THEME);
         assert_eq!(patch_styles(STYLES, &s, &s), STYLES);
     }
 
     #[test]
     fn changed_properties_are_written_in_schema_order() {
-        let old = read(STYLES, &theme);
+        let old = read(STYLES, &THEME);
         let mut new = old.clone();
         let mut h1 = old.get(StyleId::Heading(1)).clone();
         h1.size = Some(20.0);
@@ -518,14 +667,14 @@ mod tests {
         assert!(h.contains(r#"<w:spacing w:before="240" w:after="120" w:line="360" w:lineRule="auto"/><w:outlineLvl"#), "{h}");
         assert!(h.contains("<w:keepNext/>"));
         // Läser man tillbaka får man det nya.
-        assert_eq!(read(&out, &theme), new);
+        assert_eq!(read(&out, &THEME), new);
         // Andra mallar är orörda.
         assert!(out.contains(r#"<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:pPr><w:ind w:left="864" w:firstLine="360"/></w:pPr><w:rPr><w:i/><w:iCs/></w:rPr></w:style>"#));
     }
 
     #[test]
     fn reset_removes_and_new_blocks_are_created() {
-        let old = read(STYLES, &theme);
+        let old = read(STYLES, &THEME);
         let mut new = old.clone();
         let mut q = old.get(StyleId::Quote).clone();
         q.first_indent = None;
@@ -579,7 +728,7 @@ mod tests {
         let first = l.markdown.lines().next().unwrap();
         assert!(first.contains("h1: \"Calibri Light\" 16pt"), "{first}");
         assert!(first.contains("space-before 12pt space-after 0pt"), "{first}");
-        assert!(first.contains("quote: justify indent 18pt"), "{first}");
+        assert!(first.contains("quote: #000000 justify indent 18pt"), "{first}");
         // Oförändrat dokument: formatmallsdelen är byte för byte lika.
         let same = crate::docx::write(&l.markdown, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
         // (Kladds egna saknade mallar, t.ex. Heading2, läggs till som förut; de som fanns är orörda.)
@@ -611,5 +760,64 @@ mod tests {
         assert!(normal[..normal.find("</w:style>").unwrap()].contains(r#"w:line="360""#));
         let back = crate::docx::read(&bytes).unwrap();
         assert!(back.markdown.lines().next().unwrap().contains("line-spacing 1.5"), "{}", back.markdown);
+    }
+
+    // ---------------------------------------------------------- Titel och Underrubrik
+
+    const TITLE_STYLES: &str = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="8" w:space="4" w:color="4F81BD" w:themeColor="accent1"/></w:pBdr><w:spacing w:after="300"/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi"/><w:color w:themeColor="text2" w:themeShade="BF"/><w:spacing w:val="5"/><w:sz w:val="52"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:rPr><w:i/><w:caps/><w:color w:val="4F81BD"/><w:spacing w:val="15"/><w:sz w:val="24"/></w:rPr></w:style></w:styles>"#;
+
+    #[test]
+    fn title_and_subtitle_are_resolved_with_theme_colors_and_borders() {
+        let s = read(TITLE_STYLES, &THEME);
+        let t = s.get(StyleId::Title);
+        assert_eq!(t.font_family.as_deref(), Some("Calibri Light"));
+        assert_eq!(t.size, Some(26.0));
+        // text2 1F497D med shade BF = 17365D (Words egen utskrivna färg).
+        assert_eq!(t.color, Some([0x17, 0x36, 0x5D]));
+        assert_eq!(t.letter_spacing, Some(0.25));
+        assert_eq!(t.space_after, Some(15.0));
+        assert_eq!(t.border_bottom, Some(Border { width: 1.0, color: [0x4F, 0x81, 0xBD], space: 4.0 }));
+        let st = s.get(StyleId::Subtitle);
+        assert_eq!((st.italic, st.caps, st.letter_spacing, st.size), (Some(true), Some(true), Some(0.75), Some(12.0)));
+        // Rubrik 1 saknas: ingen ändring.
+        assert!(s.get(StyleId::Heading(1)).is_empty());
+    }
+
+    #[test]
+    fn tint_and_shade_follow_word() {
+        assert_eq!(tint_shade([0x1F, 0x49, 0x7D], None, Some("BF")), [0x17, 0x36, 0x5D]);
+        assert_eq!(tint_shade([0x4F, 0x81, 0xBD], Some("99"), None), [0x95, 0xB3, 0xD7]);
+    }
+
+    #[test]
+    fn title_style_round_trips_through_docx_and_back() {
+        let base = crate::docx::write("Hej\n", "x", &|_| None, None).unwrap().bytes;
+        let docx = with_part(&base, "word/styles.xml", &TITLE_STYLES.replace("<w:styles ", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:styles "));
+        // Ett dokument med en Title-rad: pStyle Title.
+        let loaded = crate::docx::read(&docx).unwrap();
+        let head = loaded.markdown.lines().next().unwrap().to_owned();
+        let md = format!("{head}\n\n# Mitt dokument {{.title}}\n\n## Under {{.subtitle}}\n\nText\n");
+        let out = crate::docx::write(&md, "x", &|_| None, loaded.source.as_ref()).unwrap().bytes;
+        let doc = part(&out, "word/document.xml");
+        assert!(doc.contains(r#"<w:pStyle w:val="Title"/>"#) && doc.contains(r#"<w:pStyle w:val="Subtitle"/>"#), "{doc}");
+        let back = crate::docx::read(&out).unwrap();
+        assert!(back.markdown.contains("# Mitt dokument {.title}"), "{}", back.markdown);
+        assert!(back.markdown.contains("## Under {.subtitle}"), "{}", back.markdown);
+        // Dokumentets Title-mall (kantlinje, teckenavstånd) finns kvar i dialektraden.
+        assert!(back.markdown.lines().next().unwrap().contains("border-bottom 1pt #4F81BD 4pt"), "{}", back.markdown);
+        // Ny fil utan källa får Kladds egna Title/Subtitle-mallar.
+        let fresh = crate::docx::write("# Mitt dokument {.title}\n", "x", &|_| None, None).unwrap().bytes;
+        let styles = part(&fresh, "word/styles.xml");
+        assert!(styles.contains(r#"w:styleId="Title""#) && styles.contains(r#"w:styleId="Subtitle""#));
+        assert!(crate::docx::read(&fresh).unwrap().markdown.contains("# Mitt dokument {.title}"));
+    }
+
+    #[test]
+    fn bare_title_style_is_black_not_kladd_blue() {
+        let xml = r#"<w:styles xmlns:w="x"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:rPr><w:sz w:val="56"/></w:rPr></w:style></w:styles>"#;
+        let kladd = r#"<w:styles><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:color w:val="1F3864"/><w:sz w:val="56"/></w:rPr></w:style></w:styles>"#;
+        let s = read_relative(xml, &Theme::NONE, kladd);
+        assert_eq!(s.get(StyleId::Title).color, Some([0, 0, 0]));
+        assert_eq!(s.get(StyleId::Title).size, None);
     }
 }

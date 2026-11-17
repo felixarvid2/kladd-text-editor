@@ -225,9 +225,10 @@ Gemensamma format (alla moduler ska använda dessa):
   redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
   fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
 - **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
-  grundformatskommentaren, `h1`–`h6`, `body`, `quote`, med ord i valfri ordning: `"Typsnitt"`,
+  grundformatskommentaren, `h1`–`h6`, `body`, `quote`, `title`, `subtitle`, med ord i valfri ordning: `"Typsnitt"`,
   `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
-  `space-before L`, `space-after L`, `line-spacing N` (gånger enkelt, `LINE_SINGLE` = 1,25 i
+  `letter-spacing L`, `caps`, `smallcaps`, `border-bottom W #RRGGBB S` (linje under stycket; ritas
+  av `word/view.rs` för titel och underrubrik, av `pdf_write.rs` i PDF), `space-before L`, `space-after L`, `line-spacing N` (gånger enkelt, `LINE_SINGLE` = 1,25 i
   layouten), `indent L` (första raden). Layouten läser dem i `piece_format` (typsnitt, storlek,
   färg, radhöjd) och `paragraphs` (justering, luft, indrag). Luft efter ett stycke läggs som luft
   före nästa, eftersom `Galley::concat` staplar efter radernas höjd. Docx: `docx_styles.rs`
@@ -684,3 +685,19 @@ Export: docx skriver `m:oMath`/`m:oMathPara` med `xmlns:m` på elementet (`omml:
 `math:`-prefix) och `ObjectReplacements/Object N` (PNG). pdf: `Style::math`, en `Piece` per formel, `Op::Math`
 ritas som fyllda glyfkonturer via krilla. html/epub: `export::map_events` byter matematikhändelser mot
 `<math>`; EPUB-posten får `properties="mathml"`.
+
+## Titel och Underrubrik
+
+Wordstilarna Title/Subtitle är egna blockslag (`Block::Title`/`Block::Subtitle`, `ParaKind`, `StyleId::Title`/`Subtitle`).
+I texten är de rubriker med klassmarkör sist på raden, `# Text {.title}` och `## Text {.subtitle}`, via Markdowns
+rubrikattribut (`style::titles::OPTS` läggs till i alla tolkare; `titles::kind` läser klassen). Analysen döljer markören som
+markup, `set_block` lägger på och tar bort den, `nav::headings_scan` hoppar över raderna. docx: `pStyle` Title/Subtitle
+(Kladds egna mallar läggs bara till i en befintlig fil när de används och namnet saknas), odt: `text:p` med mallen
+Title/Subtitle. `docx_styles::read` räknar in docDefaults, `basedOn`, temafärger (`Theme::color` + `tint_shade`) och
+teckenavstånd, versaler och `pBdr/bottom`.
+
+## Vita sidor i mörkt tema
+
+`Settings::white_paper` (på som standard). `Palette::paper()` (`theme.rs`) ger sidans färger från det ljusa temat med svart
+automatisk textfärg och `dark: false`, så att `adapt_text_color`/`adapt_background` inte ändrar dokumentets färger.
+`word_page` byter palett och sätter markeringsfärg och markör för vit botten; skrivbordet och fälten förblir mörka.

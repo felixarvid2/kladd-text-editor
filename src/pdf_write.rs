@@ -205,6 +205,10 @@ fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>)> {
     Some((src, alt, ImgSize { w: px("width"), h: px("height") }, float))
 }
 
+/// Rubriknivåerna som Titel och Underrubrik lagras med (över Markdowns 1-6).
+const TITLE_LEVEL: u8 = 100;
+const SUBTITLE_LEVEL: u8 = 101;
+
 fn heading_num(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -229,6 +233,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(crate::style::titles::OPTS);
     // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
     let mut note_labels: Vec<String> = Vec::new();
     let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
@@ -323,9 +328,13 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 }
             }
             MdEvent::Start(tag) => match tag {
-                Tag::Heading { level, .. } => {
+                Tag::Heading { level, classes, .. } => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
-                    heading = Some(heading_num(level));
+                    heading = Some(match crate::style::titles::kind(&classes) {
+                        Some(crate::style::titles::TitleKind::Title) => TITLE_LEVEL,
+                        Some(crate::style::titles::TitleKind::Subtitle) => SUBTITLE_LEVEL,
+                        None => heading_num(level),
+                    });
                 }
                 Tag::Paragraph => {
                     if pending_marker.is_none() {
@@ -1551,7 +1560,9 @@ impl<'a> Layout<'a> {
             match b {
                 Block::Heading(level, spans, align) => {
                     self.align = *align;
-                    let (size, face, before) = match level {
+                    let (size, face, before) = match *level {
+                        TITLE_LEVEL => (26.0, Face::Sans, 0.0),
+                        SUBTITLE_LEVEL => (14.0, Face::Sans, 0.0),
                         1 => (22.0, Face::SansSemi, 14.0),
                         2 => (16.5, Face::SansSemi, 14.0),
                         3 => (13.5, Face::SansSemi, 10.0),
@@ -1559,10 +1570,19 @@ impl<'a> Layout<'a> {
                     };
                     let size = size * self.scale;
                     // Formatmallens utseende (typsnittet är alltid det inbäddade).
-                    let st = self.styles.get(style::StyleId::Heading((*level).clamp(1, 6))).clone();
+                    let id = match *level {
+                        TITLE_LEVEL => style::StyleId::Title,
+                        SUBTITLE_LEVEL => style::StyleId::Subtitle,
+                        n => style::StyleId::Heading(n.clamp(1, 6)),
+                    };
+                    let st = self.styles.get(id).clone();
                     let size = st.size.unwrap_or(size);
-                    let face = if st.bold == Some(false) { Face::Sans } else { face };
-                    let ink = st.color.map_or(INK, |c| (c[0], c[1], c[2]));
+                    let face = match (st.bold, *level >= TITLE_LEVEL) {
+                        (Some(false), _) | (None, true) => Face::Sans,
+                        (Some(true), true) => Face::SansSemi,
+                        _ => face,
+                    };
+                    let ink = st.color.map_or(if *level == SUBTITLE_LEVEL { MUTED } else { INK }, |c| (c[0], c[1], c[2]));
                     if *align == Align::Left {
                         self.align = st.align.unwrap_or(Align::Left);
                     }
@@ -1581,6 +1601,12 @@ impl<'a> Layout<'a> {
                     self.line = LINE;
                     self.first_indent = 0.0;
                     self.y += st.space_after.unwrap_or(0.0);
+                    // Linje under stycket (Words Titel har en).
+                    if let Some(b) = st.border_bottom {
+                        let (y, ml, cw) = (self.y + b.space * 0.5, self.ml, self.cw);
+                        self.page().ops.push(Op::Rect { x: ml, y, w: cw, h: b.width, color: (b.color[0], b.color[1], b.color[2]) });
+                        self.y += b.space * 0.5 + b.width + 4.0;
+                    }
                     if *level == 1 {
                         let y = self.y + 2.0;
                         let ml = self.ml;

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
+use crate::style::titles::TitleKind;
 use crate::style::{div_open, is_div_close, is_span_close, parse_div_open, parse_span_open};
 pub use crate::style::{Align, DocDefaults, SpanStyle};
 
@@ -19,6 +20,9 @@ pub use crate::style::{Align, DocDefaults, SpanStyle};
 pub enum Block {
     Normal,
     Heading(u8),
+    /// Wordstilen Titel och Underrubrik: `# Text {.title}` / `## Text {.subtitle}` (se `style::titles`).
+    Title,
+    Subtitle,
     Quote,
     Bullet,
     Numbered,
@@ -329,10 +333,16 @@ fn parse(text: &str) -> Parsed {
                     }
                 }
                 match tag {
-                    Tag::Heading { level, .. } => {
+                    Tag::Heading { level, classes, .. } => {
                         let lvl = level as u8;
-                        fill(&mut st, r.clone(), |s| s.block = Block::Heading(lvl));
-                        mark_heading(text, &mut st, &r);
+                        let tk = crate::style::titles::kind(&classes);
+                        let block = match tk {
+                            Some(TitleKind::Title) => Block::Title,
+                            Some(TitleKind::Subtitle) => Block::Subtitle,
+                            None => Block::Heading(lvl),
+                        };
+                        fill(&mut st, r.clone(), |s| s.block = block);
+                        mark_heading(text, &mut st, &r, tk.is_some());
                     }
                     Tag::BlockQuote(_) => {
                         fill(&mut st, r.clone(), |s| s.block = Block::Quote);
@@ -700,7 +710,7 @@ fn finish_link(text: &str, st: &mut [St], r: &Range<usize>, lt: LinkType, last: 
     fill(st, last..r.end, |s| s.markup = true);
 }
 
-fn mark_heading(text: &str, st: &mut [St], r: &Range<usize>) {
+fn mark_heading(text: &str, st: &mut [St], r: &Range<usize>, titled: bool) {
     let s = &text[r.clone()];
     let b = s.as_bytes();
     let indent = ws_run(b, 0);
@@ -708,6 +718,13 @@ fn mark_heading(text: &str, st: &mut [St], r: &Range<usize>) {
         let hashes = b[indent..].iter().take_while(|c| **c == b'#').count();
         let open_end = indent + hashes + ws_run(b, indent + hashes);
         fill(st, r.start..r.start + open_end, |s| s.markup = true);
+        // Klassmarkören `{.title}` är markup.
+        if titled {
+            let line = s.find('\n').map_or(s, |i| &s[..i]);
+            if let Some((at, _)) = crate::style::titles::trailing_marker(line) {
+                fill(st, r.start + at..r.start + line.trim_end().len(), |s| s.markup = true);
+            }
+        }
         // Avslutande ##.
         let line = s.find('\n').map_or(s, |i| &s[..i]).trim_end();
         let core = line.trim_end_matches('#');
@@ -1785,6 +1802,8 @@ pub fn set_block(text: &str, sel: Range<usize>, b: Block) -> Edit {
         let old_list = matches!(pre.kind, Some(Block::Bullet | Block::Numbered));
         let marker = match target {
             Block::Heading(n) => format!("{} ", "#".repeat(n as usize)),
+            Block::Title => "# ".to_string(),
+            Block::Subtitle => "## ".to_string(),
             Block::Quote => "> ".to_string(),
             Block::Bullet => "- ".to_string(),
             Block::Numbered => {
@@ -1800,6 +1819,25 @@ pub fn set_block(text: &str, sel: Range<usize>, b: Block) -> Edit {
             (*ls + pre.indent..*ls + pre.indent, marker)
         };
         edits.push((range, vec![Part::Lit(new)]));
+        // Titel och Underrubrik slutar med klassmarkören; en gammal markör byts eller tas bort.
+        let line = &text[*ls..le];
+        let old_marker = crate::style::titles::trailing_marker(line);
+        let new_marker = match target {
+            Block::Title => Some(TitleKind::Title),
+            Block::Subtitle => Some(TitleKind::Subtitle),
+            _ => None,
+        };
+        match (old_marker, new_marker) {
+            (Some((at, _)), nm) => {
+                let lit = nm.map(|k| format!(" {}", k.marker())).unwrap_or_default();
+                edits.push((*ls + at..*ls + line.trim_end().len(), vec![Part::Lit(lit)]));
+            }
+            (None, Some(k)) => {
+                let end = *ls + line.trim_end().len();
+                edits.push((end..end, vec![Part::Lit(format!(" {}", k.marker()))]));
+            }
+            (None, None) => {}
+        }
     }
     let mut r = apply(text, edits, s, e);
     if s == e {
@@ -3030,7 +3068,8 @@ pub const FOOTNOTE_OPTS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
     .union(Options::ENABLE_FOOTNOTES)
-    .union(Options::ENABLE_MATH);
+    .union(Options::ENABLE_MATH)
+    .union(crate::style::titles::OPTS);
 
 /// Etikettens intervall och slutet på `]:` för definitionen som börjar på `start` (`[^etikett]:`).
 fn def_label(text: &str, start: usize) -> Option<(Range<usize>, usize)> {
@@ -4147,6 +4186,24 @@ mod tests {
 
     fn blk(t: &str, sel: Range<usize>, b: Block) -> Edit {
         set_block(t, sel, b)
+    }
+
+    #[test]
+    fn titel_och_underrubrik_i_analysen_och_set_block() {
+        let t = "# Mitt dokument {.title}\n\n## Under {.subtitle}\n\n## Rubrik\n";
+        assert_eq!(pc(t, "Mitt").block, Block::Title);
+        assert!(pc(t, "{.title}").markup);
+        assert_eq!(pc(t, "Under").block, Block::Subtitle);
+        assert_eq!(pc(t, "Rubrik").block, Block::Heading(2));
+        // Normal -> Titel lägger på markören, Titel -> Normal tar bort den.
+        let e = blk("Hej", 0..0, Block::Title);
+        assert_eq!(e.text, "# Hej {.title}");
+        let e = blk(&e.text, 0..0, Block::Title);
+        assert_eq!(e.text, "Hej");
+        let e = blk("# Hej {.title}", 0..0, Block::Subtitle);
+        assert_eq!(e.text, "## Hej {.subtitle}");
+        let e = blk("# Hej {.title}", 0..0, Block::Heading(1));
+        assert_eq!(e.text, "# Hej");
     }
 
     #[test]

@@ -38,6 +38,7 @@ use quick_xml::Reader;
 use crate::docx::{escape_inline, escape_line_start, image_ext, is_supported_image, wrap, Image, Loaded, Written, IMAGE_SCHEME};
 use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
+use crate::style::titles::{self, TitleKind};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::word::markup::{self, Float};
 
@@ -538,6 +539,8 @@ impl Styles {
                 StyleId::Body => "Text_20_body".to_owned(),
                 StyleId::Heading(n) => format!("Heading_20_{n}"),
                 StyleId::Quote => "Quotations".to_owned(),
+                StyleId::Title => "Title".to_owned(),
+                StyleId::Subtitle => "Subtitle".to_owned(),
             };
             if !self.defs.contains_key(&("paragraph".to_owned(), name.clone())) {
                 continue;
@@ -593,6 +596,9 @@ fn norm(s: &str) -> String {
 enum Kind {
     Normal,
     Heading(u8),
+    /// Wordstilarna Title och Subtitle (`# Text {.title}` / `## Text {.subtitle}`).
+    Title,
+    Subtitle,
     Quote,
     Code,
     Rule,
@@ -753,7 +759,8 @@ fn kind_of(st: &Styles, style: Option<&str>) -> Kind {
                 }
             }
             match x.as_str() {
-                "title" => return Kind::Heading(1),
+                "title" => return Kind::Title,
+                "subtitle" => return Kind::Subtitle,
                 "quotations" | "quote" | "block quote" => return Kind::Quote,
                 "preformatted text" => return Kind::Code,
                 "horizontal line" => return Kind::Rule,
@@ -1550,6 +1557,11 @@ fn render(blocks: &[Block], text_w: Option<f64>) -> String {
                         let one_line = text.replace('\n', " ");
                         out.push_str(&format!("{} {}", "#".repeat(*n as usize), one_line.trim()));
                     }
+                    (k @ (Kind::Title | Kind::Subtitle), _) => {
+                        let tk = if *k == Kind::Title { TitleKind::Title } else { TitleKind::Subtitle };
+                        let one_line = text.replace('\n', " ");
+                        out.push_str(&format!("{} {} {}", "#".repeat(tk.level() as usize), one_line.trim(), tk.marker()));
+                    }
                     (_, Some(l)) => {
                         let indent = "    ".repeat(l.level);
                         let (marker, mlen) = match &l.marker {
@@ -2083,6 +2095,7 @@ struct W<'a> {
     spans: Vec<SpanStyle>,
     aligns: Vec<Align>,
     heading: Option<u8>,
+    title: Option<TitleKind>,
     quote: u32,
     code: bool,
     table: Option<WTable>,
@@ -2195,6 +2208,7 @@ impl<'a> W<'a> {
             spans: Vec::new(),
             aligns: Vec::new(),
             heading: None,
+            title: None,
             quote: 0,
             code: false,
             table: None,
@@ -2419,6 +2433,11 @@ impl<'a> W<'a> {
     fn base_para_style(&self) -> String {
         if self.in_note {
             "Footnote".into()
+        } else if let Some(t) = self.title {
+            match t {
+                TitleKind::Title => "Title".into(),
+                TitleKind::Subtitle => "Subtitle".into(),
+            }
         } else if let Some(h) = self.heading {
             format!("Heading_20_{h}")
         } else if self.code {
@@ -2897,6 +2916,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(titles::OPTS);
     // Pågående fotnotsdefinition: (etikett, brödtexten som lagts åt sidan).
     let mut note_cur: Option<(String, String)> = None;
     for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
@@ -2925,9 +2945,13 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
             }
             MdEvent::Start(tag) => match tag {
                 Tag::Paragraph => w.close_para(),
-                Tag::Heading { level, .. } => {
+                Tag::Heading { level, classes, .. } => {
                     w.close_para();
-                    w.heading = Some(heading_num(level));
+                    // Titel och underrubrik är vanliga stycken med egen mall (inte `text:h`).
+                    match titles::kind(&classes) {
+                        Some(k) => w.title = Some(k),
+                        None => w.heading = Some(heading_num(level)),
+                    }
                 }
                 Tag::BlockQuote(_) => {
                     w.close_para();
@@ -3029,6 +3053,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 TagEnd::Heading(_) => {
                     w.close_para();
                     w.heading = None;
+                    w.title = None;
                 }
                 TagEnd::BlockQuote(_) => {
                     w.close_para();
@@ -3323,6 +3348,8 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
             tw = tab
         ));
     }
+    named.push_str("<style:style style:name=\"Title\" style:display-name=\"Title\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Text_20_body\" style:class=\"chapter\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0.212cm\"/><style:text-properties fo:font-size=\"28pt\" fo:color=\"#1F3864\"/></style:style>");
+    named.push_str("<style:style style:name=\"Subtitle\" style:display-name=\"Subtitle\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Text_20_body\" style:class=\"chapter\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0.212cm\"/><style:text-properties fo:font-size=\"14pt\" fo:color=\"#595959\"/></style:style>");
     named.push_str("<style:style style:name=\"Quotations\" style:display-name=\"Quotations\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-left=\"1cm\" fo:margin-right=\"0cm\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.247cm\" fo:padding-left=\"0.3cm\" fo:border-left=\"1.5pt solid #A6A6A6\" fo:border-top=\"none\" fo:border-bottom=\"none\" fo:border-right=\"none\"/><style:text-properties fo:color=\"#404040\"/></style:style>");
     named.push_str("<style:style style:name=\"Preformatted_20_Text\" style:display-name=\"Preformatted Text\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\"><style:paragraph-properties fo:margin-top=\"0cm\" fo:margin-bottom=\"0cm\"/><style:text-properties style:font-name=\"Liberation Mono\" fo:font-size=\"10pt\"/></style:style>");
     named.push_str("<style:style style:name=\"Source_20_Text\" style:display-name=\"Source Text\" style:family=\"text\"><style:text-properties style:font-name=\"Liberation Mono\"/></style:style>");
@@ -3401,6 +3428,8 @@ fn apply_style_overrides(named: &mut String, set: &style::StyleSet) {
             style::StyleId::Body => "Text_20_body".to_owned(),
             style::StyleId::Heading(n) => format!("Heading_20_{n}"),
             style::StyleId::Quote => "Quotations".to_owned(),
+            style::StyleId::Title => "Title".to_owned(),
+            style::StyleId::Subtitle => "Subtitle".to_owned(),
         };
         let start_tag = format!("<style:style style:name=\"{name}\"");
         let Some(a) = named.find(&start_tag) else { continue };

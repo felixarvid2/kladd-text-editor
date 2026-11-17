@@ -35,7 +35,12 @@ enum Mode {
 }
 
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_FOOTNOTES | Options::ENABLE_MATH
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
+        | crate::style::titles::OPTS
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1256,6 +1261,8 @@ fn style_css(d: &DocDefaults) -> String {
             crate::style::StyleId::Body => "p, li".to_owned(),
             crate::style::StyleId::Heading(n) => format!("h{n}"),
             crate::style::StyleId::Quote => "blockquote".to_owned(),
+            crate::style::StyleId::Title => "h1.title".to_owned(),
+            crate::style::StyleId::Subtitle => "h2.subtitle".to_owned(),
         };
         let mut decl: Vec<String> = Vec::new();
         if let Some(f) = o.font_family.as_deref() {
@@ -1287,6 +1294,15 @@ fn style_css(d: &DocDefaults) -> String {
         }
         if let Some(v) = o.first_indent {
             decl.push(format!("text-indent: {}pt", num(v)));
+        }
+        if let Some(v) = o.letter_spacing {
+            decl.push(format!("letter-spacing: {}pt", num(v)));
+        }
+        if o.caps == Some(true) {
+            decl.push("text-transform: uppercase".to_owned());
+        }
+        if let Some(b) = o.border_bottom {
+            decl.push(format!("border-bottom: {}pt solid {}; padding-bottom: {}pt", num(b.width), crate::style::hex(b.color), num(b.space)));
         }
         if !decl.is_empty() {
             s.push_str(&format!("{sel} {{ {}; }}\n", decl.join("; ")));

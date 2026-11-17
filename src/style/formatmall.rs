@@ -9,8 +9,9 @@
 //!
 //! Värdet är ord i valfri ordning: ett citerat typsnitt, storlek (`16pt`), `bold`/`nobold`,
 //! `italic`/`noitalic`, färg (`#RRGGBB`), `left|center|right|justify`, `space-before L`,
-//! `space-after L`, `line-spacing N` (gånger enkelt radavstånd) och `indent L` (indrag av första
-//! raden). Det som inte anges ärvs från Kladds standardutseende, så ett dokument utan
+//! `space-after L`, `line-spacing N` (gånger enkelt radavstånd), `indent L` (indrag av första
+//! raden), `letter-spacing L` (teckenavstånd), `caps`/`smallcaps` och `border-bottom W #RRGGBB S`
+//! (linje under stycket: tjocklek, färg, avstånd). Det som inte anges ärvs från Kladds standardutseende, så ett dokument utan
 //! formatmallar ser ut som förut.
 use super::{Align, hex, parse_color, parse_length, quote, unquote};
 use crate::i18n::t;
@@ -23,10 +24,17 @@ pub enum StyleId {
     Body,
     Heading(u8),
     Quote,
+    /// Wordstilen Title (`# Text {.title}`).
+    Title,
+    /// Wordstilen Subtitle (`## Text {.subtitle}`).
+    Subtitle,
 }
 
+/// Antal formatmallar.
+pub const STYLE_COUNT: usize = 10;
+
 /// Alla formatmallar i den ordning de visas och skrivs.
-pub const STYLE_IDS: [StyleId; 8] = [
+pub const STYLE_IDS: [StyleId; STYLE_COUNT] = [
     StyleId::Body,
     StyleId::Heading(1),
     StyleId::Heading(2),
@@ -35,6 +43,8 @@ pub const STYLE_IDS: [StyleId; 8] = [
     StyleId::Heading(5),
     StyleId::Heading(6),
     StyleId::Quote,
+    StyleId::Title,
+    StyleId::Subtitle,
 ];
 
 impl StyleId {
@@ -49,6 +59,8 @@ impl StyleId {
             StyleId::Heading(5) => "h5",
             StyleId::Heading(_) => "h6",
             StyleId::Quote => "quote",
+            StyleId::Title => "title",
+            StyleId::Subtitle => "subtitle",
         }
     }
 
@@ -62,6 +74,8 @@ impl StyleId {
             StyleId::Body => t("Brödtext").into(),
             StyleId::Heading(n) => tf!("Rubrik {n}", n = n),
             StyleId::Quote => t("Citat").into(),
+            StyleId::Title => t("Titel").into(),
+            StyleId::Subtitle => t("Underrubrik").into(),
         }
     }
 
@@ -70,6 +84,8 @@ impl StyleId {
             StyleId::Body => 0,
             StyleId::Heading(n) => n.clamp(1, 6) as usize,
             StyleId::Quote => 7,
+            StyleId::Title => 8,
+            StyleId::Subtitle => 9,
         }
     }
 
@@ -79,6 +95,8 @@ impl StyleId {
             Block::Normal | Block::Bullet | Block::Numbered => Some(StyleId::Body),
             Block::Heading(n) => Some(StyleId::Heading(n.clamp(1, 6))),
             Block::Quote => Some(StyleId::Quote),
+            Block::Title => Some(StyleId::Title),
+            Block::Subtitle => Some(StyleId::Subtitle),
             Block::Code | Block::Table | Block::Footnote => None,
         }
     }
@@ -92,6 +110,8 @@ impl StyleId {
             StyleId::Heading(3) => 13.0,
             StyleId::Heading(4) => 12.0,
             StyleId::Heading(_) => 11.0,
+            StyleId::Title => 28.0,
+            StyleId::Subtitle => 14.0,
             _ => body,
         }
     }
@@ -114,6 +134,22 @@ pub struct StyleOverride {
     pub line_spacing: Option<f32>,
     /// Indrag av första raden, punkter.
     pub first_indent: Option<f32>,
+    /// Teckenavstånd (`w:spacing` i `w:rPr`), punkter.
+    pub letter_spacing: Option<f32>,
+    /// Versaler (`w:caps`).
+    pub caps: Option<bool>,
+    /// Kapitäler (`w:smallCaps`).
+    pub small_caps: Option<bool>,
+    /// Linje under stycket (`w:pBdr/w:bottom` i formatmallen), t.ex. under en Word-titel.
+    pub border_bottom: Option<Border>,
+}
+
+/// En linje runt eller under ett stycke: tjocklek och avstånd till texten i punkter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Border {
+    pub width: f32,
+    pub color: [u8; 3],
+    pub space: f32,
 }
 
 impl StyleOverride {
@@ -137,6 +173,10 @@ impl StyleOverride {
             space_after: keep(&self.space_after, &base.space_after),
             line_spacing: keep(&self.line_spacing, &base.line_spacing),
             first_indent: keep(&self.first_indent, &base.first_indent),
+            letter_spacing: keep(&self.letter_spacing, &base.letter_spacing),
+            caps: keep(&self.caps, &base.caps),
+            small_caps: keep(&self.small_caps, &base.small_caps),
+            border_bottom: keep(&self.border_bottom, &base.border_bottom),
         }
     }
 
@@ -177,6 +217,22 @@ impl StyleOverride {
         if let Some(v) = self.first_indent {
             w.push(format!("indent {}pt", fmt_num(v)));
         }
+        if let Some(v) = self.letter_spacing {
+            w.push(format!("letter-spacing {}pt", fmt_num(v)));
+        }
+        match self.caps {
+            Some(true) => w.push("caps".into()),
+            Some(false) => w.push("nocaps".into()),
+            None => {}
+        }
+        match self.small_caps {
+            Some(true) => w.push("smallcaps".into()),
+            Some(false) => w.push("nosmallcaps".into()),
+            None => {}
+        }
+        if let Some(b) = self.border_bottom {
+            w.push(format!("border-bottom {}pt {} {}pt", fmt_num(b.width), hex(b.color), fmt_num(b.space)));
+        }
         w.join(" ")
     }
 
@@ -193,6 +249,23 @@ impl StyleOverride {
                 "nobold" => o.bold = Some(false),
                 "italic" => o.italic = Some(true),
                 "noitalic" => o.italic = Some(false),
+                "caps" => o.caps = Some(true),
+                "nocaps" => o.caps = Some(false),
+                "smallcaps" => o.small_caps = Some(true),
+                "nosmallcaps" => o.small_caps = Some(false),
+                "letter-spacing" => {
+                    i += 1;
+                    o.letter_spacing = toks.get(i).and_then(|a| parse_length(a));
+                }
+                "border-bottom" => {
+                    let width = toks.get(i + 1).and_then(|a| parse_length(a)).filter(|w| *w > 0.0);
+                    let color = toks.get(i + 2).and_then(|a| parse_color(a));
+                    let space = toks.get(i + 3).and_then(|a| parse_length(a));
+                    if let (Some(width), Some(color), Some(space)) = (width, color, space) {
+                        o.border_bottom = Some(Border { width, color, space });
+                        i += 3;
+                    }
+                }
                 "left" | "center" | "right" | "justify" => o.align = Some(Align::from_attr(&lower)),
                 "space-before" | "space-after" | "indent" => {
                     i += 1;
@@ -263,7 +336,7 @@ fn tokens(v: &str) -> Vec<String> {
 /// Dokumentets alla formatmallsändringar.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StyleSet {
-    items: [StyleOverride; 8],
+    items: [StyleOverride; STYLE_COUNT],
 }
 
 impl StyleSet {
@@ -333,11 +406,15 @@ mod tests {
             space_after: Some(6.0),
             line_spacing: Some(1.15),
             first_indent: Some(18.0),
+            letter_spacing: Some(0.75),
+            caps: Some(true),
+            small_caps: Some(false),
+            border_bottom: Some(Border { width: 1.0, color: [0x4F, 0x81, 0xBD], space: 4.0 }),
         };
         let v = o.to_value();
         assert_eq!(
             v,
-            "\"Calibri Light\" 16pt bold noitalic #2F5496 center space-before 12pt space-after 6pt line-spacing 1.15 indent 18pt"
+            "\"Calibri Light\" 16pt bold noitalic #2F5496 center space-before 12pt space-after 6pt line-spacing 1.15 indent 18pt letter-spacing 0.75pt caps nosmallcaps border-bottom 1pt #4F81BD 4pt"
         );
         assert_eq!(StyleOverride::from_value(&v), o);
     }

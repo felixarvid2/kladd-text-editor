@@ -397,6 +397,8 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
             Block::Normal => 0u8,
             Block::Heading(n) => 10 + n,
             Block::Quote => 1,
+            Block::Title => 20,
+            Block::Subtitle => 21,
             Block::Bullet => 2,
             Block::Numbered => 3,
             Block::Code => 4,
@@ -676,6 +678,8 @@ fn block_size_pt(b: Block, mono: bool, body: f32) -> f32 {
         Block::Heading(1) => 18.0,
         Block::Heading(2) => 15.0,
         Block::Heading(3) => 13.0,
+        Block::Title => 28.0,
+        Block::Subtitle => 14.0,
         Block::Heading(4) => 12.0,
         Block::Heading(_) => 11.0,
         Block::Footnote => body * 0.85,
@@ -741,7 +745,9 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     let zoom = p.zoom;
     let table_raw = pc.block == Block::Table && grid.is_none();
     let mono = pc.code || matches!(pc.block, Block::Code) || table_raw;
-    let heading = matches!(pc.block, Block::Heading(_));
+    // Titel och underrubrik delar rubrikernas typsnitt och radhöjd, men är inte feta som standard.
+    let heading = matches!(pc.block, Block::Heading(_) | Block::Title | Block::Subtitle);
+    let bold_default = matches!(pc.block, Block::Heading(_));
     let body_family = |bold: bool, italic: bool| (p.font_family)(Some(d.font()), bold, italic);
     let ov = if mono { None } else { d.styles.for_block(pc.block) };
     let block_pt = ov.and_then(|o| o.size).unwrap_or_else(|| block_size_pt(pc.block, mono, d.size()));
@@ -774,7 +780,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     let span = pc.span.as_deref();
     let size = px(zoom, span.and_then(|s| s.font_size).unwrap_or(block_pt));
     let header = grid == Some(true);
-    let bold = pc.bold || ov.and_then(|o| o.bold).unwrap_or(heading) || header;
+    let bold = pc.bold || ov.and_then(|o| o.bold).unwrap_or(bold_default) || header;
     let italic = pc.italic || ov.and_then(|o| o.italic).unwrap_or(matches!(pc.block, Block::Quote));
     let family = if mono {
         FontFamily::Monospace
@@ -791,9 +797,10 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     };
     let mut color = match pc.block {
         Block::Heading(1) => pal.page_heading1,
+        Block::Title => pal.page_heading1,
         Block::Heading(6) => pal.page_muted,
         Block::Heading(_) => pal.page_heading,
-        Block::Quote => pal.page_muted,
+        Block::Quote | Block::Subtitle => pal.page_muted,
         _ => pal.page_text,
     };
     if let Some(c) = ov.and_then(|o| o.color) {
@@ -809,6 +816,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         font_id: FontId::new(size, family),
         line_height: Some(lh_for(size)),
         color,
+        extra_letter_spacing: ov.and_then(|o| o.letter_spacing).map_or(0.0, |s| px(zoom, s)),
         ..Default::default()
     };
     // Fotnotsnummer (referens och definition): litet, upphöjt och i länkfärg. Med egen radhöjd
@@ -942,7 +950,8 @@ pub fn needed_fonts(a: &Analysis) -> BTreeSet<(String, bool, bool)> {
         if pc.markup || pc.code || matches!(pc.block, Block::Code) {
             continue;
         }
-        let heading = matches!(pc.block, Block::Heading(_));
+        let heading = matches!(pc.block, Block::Heading(_) | Block::Title | Block::Subtitle);
+        let bold_default = matches!(pc.block, Block::Heading(_));
         let ov = d.styles.for_block(pc.block);
         let span_font = pc.span.as_deref().and_then(|s| s.font_family.as_deref());
         let style_font = ov.and_then(|o| o.font_family.as_deref());
@@ -951,7 +960,7 @@ pub fn needed_fonts(a: &Analysis) -> BTreeSet<(String, bool, bool)> {
         }
         let name = span_font.or(style_font).unwrap_or(d.font()).to_owned();
         let italic = pc.italic || ov.and_then(|o| o.italic).unwrap_or(matches!(pc.block, Block::Quote));
-        set.insert((name.clone(), pc.bold || ov.and_then(|o| o.bold).unwrap_or(heading), italic));
+        set.insert((name.clone(), pc.bold || ov.and_then(|o| o.bold).unwrap_or(bold_default), italic));
         if pc.block == Block::Table {
             set.insert((name.clone(), true, false));
             set.insert((name, false, false));
@@ -1413,7 +1422,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         }
         // Luft och indrag gäller vanliga stycken, rubriker och citat (inte listor).
         let (space_before, space_after, first_indent) = match style {
-            Some((Block::Normal | Block::Heading(_) | Block::Quote, o)) => (
+            Some((Block::Normal | Block::Heading(_) | Block::Quote | Block::Title | Block::Subtitle, o)) => (
                 px(p.zoom, o.space_before.unwrap_or(0.0)),
                 px(p.zoom, o.space_after.unwrap_or(0.0)),
                 px(p.zoom, o.first_indent.unwrap_or(0.0)),

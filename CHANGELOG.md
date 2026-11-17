@@ -4,6 +4,15 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **Titel och Underrubrik** som egna stilar i dokumentläget (stilvalet, *Ändra formatmall…*). En Word-titel (Title) är inte längre en liten Rubrik 1: den ritas med sin egen storlek, sitt typsnitt och sin färg, och Underrubrik (Subtitle) med kursiv och teckenavstånd. I Markdown skrivs de `# Text {.title}` och `## Text {.subtitle}` (markören döljs) och följer med som Wordstilarna Title/Subtitle till `.docx`, som `.odt`-stilarna Title/Subtitle, till PDF och som `<h1 class="title">` i HTML. Titel och underrubrik hamnar inte i rubrikträdet. Stilvalet har också Rubrik 4–6.
+- **Vita sidor i mörkt tema** (*Visa → Vita sidor i mörkt tema* och *Inställningar → Dokument*, på som standard): dokumentläget ritar sidan vit med dokumentets riktiga färger och svart text som i Word och LibreOffice, så att mörkblå och lila text går att läsa. Stavningsvågor och markering syns som förut.
+
+### Ändrat
+
+- **Formatmallarna läses som i Word.** `docDefaults` (storlek, fet, kursiv) och temafärger (`w:themeColor` med tint/shade ur temats `clrScheme`) räknas in, teckenavstånd (`w:spacing`), versaler och kapitäler (`w:caps`, `w:smallCaps`) och linjen under stycket (`w:pBdr/w:bottom`, t.ex. under titeln) läses och skrivs tillbaka, och teckenmallar med fet eller kursiv (Subtil betoning m.fl.) syns i texten. En mall som inte anger färg eller fet är vanlig svart text, inte Kladds blå fetstilsrubrik. Grundformatskommentaren får `letter-spacing`, `caps`, `smallcaps` och `border-bottom`.
+
 ## [2.1.0] – 2026-11-13
 
 ### Nytt

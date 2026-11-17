@@ -528,7 +528,7 @@ headings = 0
 
 ["docx/poi-bug65738.docx"]
 dropped = []
-headings = 4
+headings = 5
 
 ["docx/poi-bug66312.docx"]
 dropped = []

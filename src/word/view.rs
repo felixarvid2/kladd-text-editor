@@ -174,6 +174,8 @@ fn block_label(b: Block) -> String {
         Block::Normal => t("Brödtext").into(),
         Block::Heading(n) => tf!("Rubrik {n}", n = n),
         Block::Quote => t("Citat").into(),
+        Block::Title => t("Titel").into(),
+        Block::Subtitle => t("Underrubrik").into(),
         Block::Bullet => t("Punktlista").into(),
         Block::Numbered => t("Numrerad lista").into(),
         Block::Code => t("Kod").into(),
@@ -550,9 +552,14 @@ impl KladdApp {
                         .show_ui(ui, |ui| {
                             for b in [
                                 Block::Normal,
+                                Block::Title,
+                                Block::Subtitle,
                                 Block::Heading(1),
                                 Block::Heading(2),
                                 Block::Heading(3),
+                                Block::Heading(4),
+                                Block::Heading(5),
+                                Block::Heading(6),
                                 Block::Quote,
                             ] {
                                 if ui.selectable_label(act.block == b, block_label(b)).clicked() {
@@ -892,8 +899,15 @@ impl KladdApp {
 
     /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
+        let paper = if self.settings.white_paper { p.paper() } else { *p };
+        let p = &paper;
         CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
             self.editor_rect = ui.max_rect();
+            if self.settings.white_paper && paper_differs(&paper, self.settings.dark) {
+                // Markering och markör på en vit sida (de globala färgerna hör till det mörka temat).
+                ui.visuals_mut().selection.bg_fill = p.selection;
+                ui.visuals_mut().text_cursor.stroke.color = Color32::BLACK;
+            }
             let ctx = ui.ctx().clone();
             if self.speller.is_none() {
                 self.speller = Some(crate::spell::Speller::new(self.settings.spell_lang.as_deref()));
@@ -1387,6 +1401,22 @@ impl KladdApp {
                                 Some((y0, y1, left))
                             }
                         };
+                    }
+                    // Linje under en titel (formatmallens `border-bottom`): ritas vid radens första bit.
+                    if matches!(pc.block, Block::Title | Block::Subtitle)
+                        && pc.markup
+                        && (pc.range.start == 0 || text[..pc.range.start].ends_with('\n'))
+                    {
+                        if let Some(b) = analysis.defaults.styles.for_block(pc.block).and_then(|o| o.border_bottom) {
+                            let end = pc.range.start + text[pc.range.start..].find('\n').unwrap_or(text.len() - pc.range.start);
+                            let rb = galley.pos_from_cursor(CCursor::new(conv.at(end))).translate(gpos.to_vec2());
+                            let (cl, cw) = col_at(rb.left() - gpos.x, rb.top() - gpos.y);
+                            let y = rb.bottom() + px(z, b.space * 0.5);
+                            if y >= clip.top() && y <= clip.bottom() {
+                                let c = Color32::from_rgb(b.color[0], b.color[1], b.color[2]);
+                                painter.hline(gpos.x + cl..=gpos.x + cl + cw, y, Stroke::new((b.width * z).max(1.0), c));
+                            }
+                        }
                     }
                     if pc.image.is_some() {
                         img_index += 1;
@@ -1969,4 +1999,9 @@ mod tests {
         assert_eq!(step_size(72.0, 1), 82.0);
         assert_eq!(step_size(13.0, 1), 14.0);
     }
+}
+
+/// Är sidan vit trots mörkt tema?
+fn paper_differs(p: &Palette, dark_theme: bool) -> bool {
+    dark_theme && !p.dark
 }

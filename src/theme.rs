@@ -177,6 +177,36 @@ pub fn gryning() -> Palette {
     }
 }
 
+impl Palette {
+    /// Dokumentläget med vita sidor ("Vita sidor i mörkt tema"): skrivbordet och fälten behåller det
+    /// mörka temat men sidan, texten och markeringarna på den får det ljusa temats färger, så att
+    /// dokumentets egna färger (mörkblå rubriker, svart text) syns som i Word och LibreOffice.
+    /// Det ljusa temat är redan vitt och lämnas oförändrat.
+    pub fn paper(self) -> Palette {
+        if !self.dark {
+            return self;
+        }
+        let l = gryning();
+        Palette {
+            dark: false,
+            page: l.page,
+            page_shadow: l.page_shadow,
+            // Automatisk textfärg är svart i Word.
+            page_text: Color32::BLACK,
+            page_muted: l.page_muted,
+            page_heading: l.page_heading,
+            page_heading1: l.page_heading1,
+            page_link: l.page_link,
+            page_code_bg: l.page_code_bg,
+            page_markup: l.page_markup,
+            // Stavnings- och grammatikvågor och markeringen ska synas mot vitt.
+            error: l.error,
+            selection: rgba(0x2F7BC4, 80),
+            ..self
+        }
+    }
+}
+
 pub fn palette(dark: bool) -> Palette {
     if dark { skymning() } else { gryning() }
 }

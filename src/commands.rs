@@ -367,6 +367,7 @@ pub static ALL: &[Command] = &[
         a.focus_editor = true;
     })
     .checked(|e| e.word),
+    Command::new("view.white_paper", "Vita sidor i mörkt tema", View, "", |e| e.doc_capable, |a, _| a.settings.white_paper = !a.settings.white_paper).checked(|e| e.settings.white_paper),
     Command::new("view.theme", "Mörkt tema", View, "Ctrl+Shift+K", always, |a, c| a.toggle_theme(c)).checked(|e| e.settings.dark).sep(),
     Command::new("view.zoom_in", "Större text", View, "Ctrl++", always, |a, _| a.cmd_zoom(1.0)).sep(),
     Command::new("view.zoom_out", "Mindre text", View, "Ctrl+−", always, |a, _| a.cmd_zoom(-1.0)),
