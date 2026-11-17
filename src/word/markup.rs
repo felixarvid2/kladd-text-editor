@@ -456,6 +456,14 @@ fn parse(text: &str) -> Parsed {
                     fill(&mut st, r.end - d..r.end, |s| s.markup = true);
                     fill(&mut st, r.start + d..r.end - d, |s| s.code = true);
                 }
+                // I en tabellcell skrivs `|` i kod som `\\|` (GFM, annars delar det cellen); dokumentläget
+                // visar bara `|`. Tabellrader börjar med `|`.
+                let line_start = text[..r.start].rfind('\n').map_or(0, |i| i + 1);
+                if text[line_start..].trim_start().starts_with('|') {
+                    for (i, _) in text[r.clone()].match_indices("\\|") {
+                        fill(&mut st, r.start + i..r.start + i + 1, |s| s.markup = true);
+                    }
+                }
             }
             Event::InlineHtml(h) => {
                 let t = h.trim();
@@ -3855,6 +3863,12 @@ mod tests {
         // Bildtext med formatering ger fortfarande en bit.
         let t = "![**a** b](x.png)";
         assert_eq!(analyze(t).pieces.len(), 1);
+    }
+
+    #[test]
+    fn rör_i_kod_i_tabell_visas_utan_backstreck() {
+        let t = "| a | b |\n|---|---|\n| `x \\| y` | z |\n";
+        assert!(markup_str(t).contains('\\'), "{}", markup_str(t));
     }
 
     #[test]
