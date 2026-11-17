@@ -57,6 +57,11 @@ pub struct ImageRef {
     pub height: Option<f32>,
     /// `<img align="left|right">`: bilden flyter vid vänster/höger textkant.
     pub align: Option<Float>,
+    /// Förankrad bild (`hrel`/`x`/`vrel`/`y`/`wrap`/`dist`): läge och omflöde. Då är `align` bara
+    /// en antydan om sida (bilden är flytande); layouten räknar sidan ur ankaret.
+    pub anchor: Option<super::anchor::Anchor>,
+    /// Beskärning i procent av bilden: vänster, ovan, höger, under (`crop="l t r b"`).
+    pub crop: Option<[f32; 4]>,
 }
 
 /// Spårad ändring som biten ligger i: slag, nummer och författarens färgindex.
@@ -388,7 +393,7 @@ fn parse(text: &str) -> Parsed {
                     }
                     Tag::Link { link_type, .. } => link = Some((r.clone(), link_type, r.start + 1)),
                     Tag::Image { dest_url, .. } => {
-                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None, align: None });
+                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None, align: None, anchor: None, crop: None });
                         let idx = (images.len() - 1) as u32;
                         fill(&mut st, r.clone(), |s| {
                             s.image = Some(idx);
@@ -965,16 +970,25 @@ fn parse_img(tag: &str) -> Option<ImageRef> {
     }
     let attrs = html_attrs(tag);
     let get = |n: &str| attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    let anchor = super::anchor::Anchor::from_attrs(&get);
+    let align = get("align").and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+        "left" => Some(Float::Left),
+        "right" => Some(Float::Right),
+        _ => None,
+    });
+    let crop = get("crop").and_then(|v| {
+        let n: Vec<f32> = v.split_whitespace().filter_map(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite() && (0.0..100.0).contains(x)).collect();
+        (n.len() == 4 && n[0] + n[2] < 100.0 && n[1] + n[3] < 100.0 && n.iter().any(|x| *x > 0.0)).then(|| [n[0], n[1], n[2], n[3]])
+    });
     Some(ImageRef {
         src: get("src")?,
         alt: get("alt").unwrap_or_default(),
         width: get("width").and_then(|v| px_value(&v)),
         height: get("height").and_then(|v| px_value(&v)),
-        align: get("align").and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-            "left" => Some(Float::Left),
-            "right" => Some(Float::Right),
-            _ => None,
-        }),
+        // Förankrad bild är flytande också utan `align`.
+        align: align.or(anchor.map(|a| a.side_hint())),
+        anchor,
+        crop,
     })
 }
 
@@ -1032,7 +1046,11 @@ pub fn image_at(text: &str, a: &Analysis, pos: usize) -> Option<(Range<usize>, I
     piece_at(a, prev).and_then(hit)
 }
 
-/// `<img src alt [width] [height] [align]>` (attributen i den ordningen).
+fn fmt_pct(v: f32) -> String {
+    format!("{}", (v * 100.0).round() / 100.0)
+}
+
+/// `<img src alt [width] [height] [align | hrel x vrel y wrap dist] [crop]>` (attributen i den ordningen).
 fn img_tag(img: &ImageRef) -> String {
     let mut s = format!("<img src=\"{}\" alt=\"{}\"", encode_attr(&img.src), encode_attr(&img.alt));
     if let Some(w) = img.width {
@@ -1041,10 +1059,14 @@ fn img_tag(img: &ImageRef) -> String {
     if let Some(h) = img.height {
         s.push_str(&format!(" height=\"{h}\""));
     }
-    match img.align {
-        Some(Float::Left) => s.push_str(" align=\"left\""),
-        Some(Float::Right) => s.push_str(" align=\"right\""),
-        None => {}
+    match (&img.anchor, img.align) {
+        (Some(a), _) => a.write_attrs(&mut s),
+        (None, Some(Float::Left)) => s.push_str(" align=\"left\""),
+        (None, Some(Float::Right)) => s.push_str(" align=\"right\""),
+        (None, None) => {}
+    }
+    if let Some(c) = img.crop {
+        s.push_str(&format!(" crop=\"{} {} {} {}\"", fmt_pct(c[0]), fmt_pct(c[1]), fmt_pct(c[2]), fmt_pct(c[3])));
     }
     s.push('>');
     s
@@ -1085,7 +1107,7 @@ pub fn set_image_size(text: &str, image_range: Range<usize>, width: Option<f32>)
         None => {
             img.width = None;
             img.height = None;
-            if img.align.is_some() { img_tag(&img) } else { md_image(&img) }
+            if img.align.is_some() || img.crop.is_some() { img_tag(&img) } else { md_image(&img) }
         }
     };
     replace_tag(text, image_range, &new)
@@ -1103,8 +1125,32 @@ pub fn set_image_float(text: &str, image_range: Range<usize>, float: Option<Floa
         return keep();
     }
     img.align = float;
-    let new = if float.is_none() && img.width.is_none() && img.height.is_none() { md_image(&img) } else { img_tag(&img) };
+    img.anchor = None;
+    let new = if float.is_none() && img.width.is_none() && img.height.is_none() && img.crop.is_none() { md_image(&img) } else { img_tag(&img) };
     replace_tag(text, image_range, &new)
+}
+
+/// Flyttar en förankrad bild: nya förskjutningar `x`/`y` (px från ankarets referens, se
+/// `anchor::Anchor`); omflöde, avstånd och referenser behålls. En bild som inte var förankrad blir
+/// förankrad i spalten/stycket med textomflöde på sidan den stod. Texten orörd om `range` inte är en bild.
+pub fn set_image_pos(text: &str, image_range: Range<usize>, x: f32, y: f32) -> Edit {
+    let keep = || Edit { text: text.to_string(), sel: image_range.clone() };
+    let a = analyze(text);
+    let Some(mut img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
+        return keep();
+    };
+    let base = img.anchor.unwrap_or_else(|| {
+        let mut an = super::anchor::Anchor::default();
+        an.dist = if img.align == Some(Float::Right) { [0.0, 0.0, 0.0, 12.0] } else { [0.0, 12.0, 0.0, 0.0] };
+        an
+    });
+    let new_anchor = base.with_offsets((x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0);
+    if img.anchor == Some(new_anchor) {
+        return keep();
+    }
+    img.anchor = Some(new_anchor);
+    img.align = Some(new_anchor.side_hint());
+    replace_tag(text, image_range, &img_tag(&img))
 }
 
 /// Byteintervall (utan radbrytning) för raden som innehåller `pos`.
@@ -3787,7 +3833,7 @@ mod tests {
         let t = "före\n\n![Sol](bild:image1.png)\n\nefter";
         let p = pc(t, "![Sol](bild:image1.png)");
         assert!(p.markup);
-        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None, align: None }));
+        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None, align: None, anchor: None, crop: None }));
         assert_eq!(p.range.len(), "![Sol](bild:image1.png)".len());
         // Två bilder intill varandra blir två bitar.
         let t = "![a](1.png)![b](2.png)";
@@ -5053,7 +5099,7 @@ mod tests {
     // ---- bilder (HTML) och objektmarkörer
 
     fn iref(alt: &str, src: &str, width: Option<f32>, height: Option<f32>) -> ImageRef {
-        ImageRef { alt: alt.into(), src: src.into(), width, height, align: None }
+        ImageRef { alt: alt.into(), src: src.into(), width, height, align: None, anchor: None, crop: None }
     }
 
     fn at(t: &str, needle: &str) -> usize {

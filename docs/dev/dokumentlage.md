@@ -316,6 +316,26 @@ Gemensamma format (alla moduler ska använda dessa):
     `text:anchor-type="paragraph"` och grafikformat med `style:wrap="right|left"` (bilden
     till vänster/höger) och `style:horizontal-pos`. PDF: samma per-rad-flöde (`FloatBox`). HTML/EPUB:
     CSS `float`.
+  - **Förankrade bilder** (`word::anchor`): attribut på `<img>` utöver `align`: `hrel="column|margin|page"`
+    + `x="N|left|center|right"` (px, kan vara negativt), `vrel="paragraph|margin|page"` + `y="N|top|center|bottom"`,
+    `wrap="top|behind|front"` (utelämnat = text runt, `top` = över och under), `dist="ovan höger under vänster"`
+    (px, standard `0 12 0 12`) och `crop="v o h u"` (procent, även för vanliga bilder). `x`/`y` skrivs alltid när
+    ankaret finns; `align="left|right"` är kortformen för en bild vid kanten överst i stycket med normalt avstånd
+    (`Anchor::legacy_side`) och gäller bara utan ankare. `ImageRef.anchor`/`crop`; `set_image_pos` skriver nytt läge
+    (dra en förankrad bild = `Act::Place`), `set_image_float` tar bort ankaret.
+  - Layout: `layout::plan_float` ger sida (`Side::Left/Right/Full`), bredd och lodrät utsträckning relativt
+    stycket. Text runt tar den bredare sidan (`anchor::reserve`; WordCrafts `float.rs` gör likadant), en bild utan
+    plats vid sidan eller `wrap="top"` är `Full` och texten hoppar under den (luft ovanför nästa del), bakom/framför
+    påverkar inte texten. Lägen mot sidan/marginalen räknas om till stycket med `PageSim` (uppskattad sidbrytning som
+    `pages::paginate`); själva ritningen (`view.rs`) använder arkets verkliga läge. Bilder bakom texten ritas i en
+    reserverad plats före texten. `ActiveFloat` har nu övre och nedre kant, så rader ovanför en bild flyter normalt.
+  - Word: `wp:anchor` med `positionH/V` (`relativeFrom` page/margin/column/paragraph m.fl., `align` eller `posOffset`),
+    `simplePos`, `wrapSquare/Tight/Through/TopAndBottom/None` + `behindDoc`, `distT/B/L/R`, `a:srcRect`; VML `v:shape`
+    med `style` (`position:absolute`, `margin-left/top`, `mso-position-*`, `w10:wrap`) och `v:imagedata`. Bilder i en
+    tabellcell blir vanliga bilder. Rotation och spegling, textrutor (`wps:wsp`) med bilder och `layoutInCell` /
+    `allowOverlap` läses inte (textrutor bevaras som förut). ODT: `draw:frame` med `text:anchor-type`
+    (paragraph/page/char), `svg:x/y`, `style:wrap`, `horizontal/vertical-pos/-rel`, `style:run-through`, `fo:margin-*` och
+    `fo:clip` (96 dpi antas). PDF: samma regler (`Layout::anchored_image`), beskärning med klippning.
   - Flytt med musen: dra i bildens mitt (inte ett handtag); `images::Act::Move` utförs via
     `word_edit` (ett ångra-steg). Esc och släpp utanför arken avbryter.
 - **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med

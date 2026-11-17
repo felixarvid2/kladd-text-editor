@@ -40,6 +40,7 @@ use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
 use crate::style::titles::{self, TitleKind};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
+use crate::word::anchor::{Anchor, HRel, Pos, VRel, Wrap};
 use crate::word::markup::{self, Float};
 
 const MIME: &str = "application/vnd.oasis.opendocument.text";
@@ -276,6 +277,25 @@ struct PProps {
 }
 
 #[derive(Clone, Default)]
+struct GfxPlace {
+    hrel: Option<String>,
+    vpos: Option<String>,
+    vrel: Option<String>,
+    run_through: Option<String>,
+    clip: Option<String>,
+    margin: [Option<f32>; 4],
+}
+
+/// Längd med tecken (`svg:x` kan vara negativ) i pt.
+fn signed_length(v: &str) -> Option<f32> {
+    let t = v.trim();
+    match t.strip_prefix('-') {
+        Some(r) => style::parse_length(r).map(|x| -x),
+        None => style::parse_length(t),
+    }
+}
+
+#[derive(Clone, Default)]
 struct StyleDef {
     name: String,
     display: String,
@@ -288,6 +308,9 @@ struct StyleDef {
     /// `style:wrap` och `style:horizontal-pos` i `style:graphic-properties`.
     wrap: Option<String>,
     hpos: Option<String>,
+    /// Resten av ramens placering: `style:horizontal-rel`, `style:vertical-pos`, `style:vertical-rel`,
+    /// `style:run-through`, `fo:clip` och marginalerna (ovan, höger, under, vänster; pt).
+    gfx: GfxPlace,
     /// `style:master-page-name`: stycket börjar en ny sida med den sidmallen (avsnitt).
     master: Option<String>,
     /// Spalter i ett avsnittsformat (`style:columns`): antal och mellanrum i pt.
@@ -404,6 +427,18 @@ impl Styles {
                 "style:graphic-properties" => {
                     d.wrap = c.attr("style:wrap").map(str::to_owned);
                     d.hpos = c.attr("style:horizontal-pos").map(str::to_owned);
+                    let g = &mut d.gfx;
+                    g.hrel = c.attr("style:horizontal-rel").map(str::to_owned);
+                    g.vpos = c.attr("style:vertical-pos").map(str::to_owned);
+                    g.vrel = c.attr("style:vertical-rel").map(str::to_owned);
+                    g.run_through = c.attr("style:run-through").map(str::to_owned);
+                    g.clip = c.attr("fo:clip").map(str::to_owned);
+                    for (i, k) in ["fo:margin-top", "fo:margin-right", "fo:margin-bottom", "fo:margin-left"].iter().enumerate() {
+                        g.margin[i] = c.attr(k).and_then(style::parse_length);
+                    }
+                    if let Some(m) = c.attr("fo:margin").and_then(style::parse_length) {
+                        g.margin = [Some(m); 4];
+                    }
                 }
                 _ => {}
             }
@@ -411,26 +446,95 @@ impl Styles {
         d
     }
 
-    /// Sidan en ram med grafikformatet `name` flyter på. `style:wrap="right"` betyder att texten
-    /// står till höger om bilden (bilden till vänster), `left` tvärtom; vid `parallel`, `dynamic`
-    /// och `biggest` avgör `style:horizontal-pos` (`left`/`right`). Allt annat (`none`, `run-through`,
-    /// ramar som ligger i texten) är ingen flytande bild.
-    fn float_of(&self, name: &str) -> Option<Float> {
-        let (mut wrap, mut hpos) = (None, None);
-        for d in self.chain("graphic", name) {
-            wrap = d.wrap.as_ref().or(wrap);
-            hpos = d.hpos.as_ref().or(hpos);
+    /// Ramens placering ur grafikformatet `name` och ramens egna `svg:x`/`svg:y`. `None` för ramar
+    /// som ligger i texten (`as-char`) eller i en annan ram. `wrap="right"` betyder att texten
+    /// står till höger om bilden, `left` tvärtom; `none` att texten står över och under; `run-through`
+    /// att bilden ligger framför eller (`style:run-through="background"`) bakom texten.
+    fn frame_place(&self, e: &Node, name: Option<&str>) -> Option<Anchor> {
+        let kind = e.attr("text:anchor-type")?;
+        if !matches!(kind, "paragraph" | "page" | "char") {
+            return None;
         }
-        match wrap?.as_str() {
-            "right" => Some(Float::Left),
-            "left" => Some(Float::Right),
-            "parallel" | "dynamic" | "biggest" => match hpos.map(String::as_str) {
-                Some("left") => Some(Float::Left),
-                Some("right") => Some(Float::Right),
-                _ => None,
+        let mut wrap: Option<&String> = None;
+        let mut hpos: Option<&String> = None;
+        let mut g = GfxPlace::default();
+        if let Some(n) = name {
+            for d in self.chain("graphic", n) {
+                wrap = d.wrap.as_ref().or(wrap);
+                hpos = d.hpos.as_ref().or(hpos);
+                g.hrel = d.gfx.hrel.clone().or(g.hrel);
+                g.vpos = d.gfx.vpos.clone().or(g.vpos);
+                g.vrel = d.gfx.vrel.clone().or(g.vrel);
+                g.run_through = d.gfx.run_through.clone().or(g.run_through);
+                for i in 0..4 {
+                    g.margin[i] = d.gfx.margin[i].or(g.margin[i]);
+                }
+            }
+        }
+        let px = |pt: f32| (pt * 96.0 / 72.0 * 10.0).round() / 10.0;
+        let on_page = kind == "page";
+        let hrel = match g.hrel.as_deref() {
+            Some("page" | "page-start-margin" | "page-end-margin") => HRel::Page,
+            Some("page-content") => HRel::Margin,
+            Some(_) => HRel::Column,
+            None if on_page => HRel::Page,
+            None => HRel::Column,
+        };
+        let vrel = match g.vrel.as_deref() {
+            Some("page") => VRel::Page,
+            Some("page-content") => VRel::Margin,
+            Some(_) => VRel::Paragraph,
+            None if on_page => VRel::Page,
+            None => VRel::Paragraph,
+        };
+        let wrap_s = wrap.map(String::as_str).unwrap_or(if on_page { "none" } else { "parallel" });
+        let wrap = match wrap_s {
+            "none" => Wrap::TopBottom,
+            "run-through" => {
+                if g.run_through.as_deref() == Some("background") { Wrap::Behind } else { Wrap::Front }
+            }
+            _ => Wrap::Square,
+        };
+        // Vågrätt: `from-left` använder `svg:x`; utan `horizontal-pos` avgör omflödet sidan.
+        let x = e.attr("svg:x").and_then(signed_length).map(px);
+        let h = match hpos.map(String::as_str) {
+            Some("left" | "inside" | "from-inside") => Pos::Start,
+            Some("center") => Pos::Center,
+            Some("right" | "outside") => Pos::End,
+            Some(_) => Pos::Off(x.unwrap_or(0.0)),
+            None => match wrap_s {
+                "right" => Pos::Start,
+                "left" => Pos::End,
+                _ => Pos::Off(x.unwrap_or(0.0)),
             },
-            _ => None,
+        };
+        let y = e.attr("svg:y").and_then(signed_length).map(px);
+        let v = match g.vpos.as_deref() {
+            Some("top") => Pos::Start,
+            Some("middle") => Pos::Center,
+            Some("bottom") => Pos::End,
+            _ => Pos::Off(y.unwrap_or(0.0)),
+        };
+        let m = |i: usize| g.margin[i].map_or(0.0, px);
+        let a = Anchor { hrel, h, vrel, v, wrap, dist: [m(0), m(1), m(2), m(3)] };
+        // Förankring vid stycket utan eget läge och utan omflöde (`wrap="none"` utan placering) är
+        // en vanlig bild på egen rad, som förut.
+        let plain = wrap_s == "none" && hpos.is_none() && x.is_none() && y.is_none() && !on_page;
+        (!plain).then_some(a)
+    }
+
+    /// Beskärningen (`fo:clip="rect(ovan, höger, under, vänster)"`) som procent av bilden
+    /// (vänster, ovan, höger, under). Bildens eget mått antas vara 96 dpi.
+    fn clip_pct(&self, name: &str, nw: f32, nh: f32) -> Option<[f32; 4]> {
+        let clip = self.chain("graphic", name).iter().rev().find_map(|d| d.gfx.clip.clone())?;
+        let inner = clip.trim().strip_prefix("rect(")?.strip_suffix(')')?;
+        let parts: Vec<&str> = inner.split([',', ' ']).filter(|p| !p.is_empty()).collect();
+        let l: Vec<f32> = parts.iter().filter_map(|p| signed_length(p)).map(|pt| pt * 96.0 / 72.0).collect();
+        if l.len() != 4 || nw < 1.0 || nh < 1.0 {
+            return None;
         }
+        let c = [l[3] / nw * 100.0, l[0] / nh * 100.0, l[1] / nw * 100.0, l[2] / nh * 100.0];
+        (c.iter().all(|v| (0.0..100.0).contains(v)) && c[0] + c[2] < 100.0 && c[1] + c[3] < 100.0 && c.iter().any(|v| *v > 0.1)).then_some(c)
     }
 
     fn list_style(&mut self, s: &Node) {
@@ -1098,26 +1202,37 @@ impl<'s, 'b> Rd<'s, 'b> {
         let fh = e.attr("svg:height").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
         // Ramar som ligger i texten (`as-char`) flyter aldrig.
-        let float = e
-            .attr("draw:style-name")
-            .filter(|_| e.attr("text:anchor-type") != Some("as-char"))
-            .and_then(|n| self.st.float_of(n));
+        let place = self.st.frame_place(e, e.attr("draw:style-name"));
+        let float = place.as_ref().and_then(Anchor::legacy_side);
+        let anchor = place.filter(|_| float.is_none());
+        let crop = natural.zip(e.attr("draw:style-name")).and_then(|((nw, nh), n)| self.st.clip_pct(n, nw, nh));
+        // Beskärning och sträckning ger en egen höjd.
+        let cropped_h = |w: f32| match (crop, natural) {
+            (Some(c), Some((nw, nh))) => nh * (1.0 - (c[1] + c[3]) / 100.0) / (nw * (1.0 - (c[0] + c[2]) / 100.0)) * w,
+            (None, Some((nw, nh))) => w * nh / nw,
+            _ => w,
+        };
         let md = match (natural, fw) {
-            (Some((nw, nh)), Some(w))
-                if float.is_some() || (w - nw).abs() > 1.5 || fh.is_some_and(|h| (h - w * nh / nw).abs() > 1.5) =>
+            (Some((nw, _)), Some(w))
+                if float.is_some() || anchor.is_some() || crop.is_some() || (w - nw).abs() > 1.5 || fh.is_some_and(|h| (h - cropped_h(w)).abs() > 1.5) =>
             {
                 let mut tag = format!("<img src=\"{}\"", html_escape_attr(&src));
                 if !alt.is_empty() {
                     tag.push_str(&format!(" alt=\"{}\"", html_escape_attr(&alt)));
                 }
                 tag.push_str(&format!(" width=\"{}\"", w.round() as i64));
-                if let Some(h) = fh.filter(|h| (h - w * nh / nw).abs() > 1.5) {
+                if let Some(h) = fh.filter(|h| (h - cropped_h(w)).abs() > 1.5 || crop.is_some()) {
                     tag.push_str(&format!(" height=\"{}\"", h.round() as i64));
                 }
-                match float {
-                    Some(Float::Left) => tag.push_str(" align=\"left\""),
-                    Some(Float::Right) => tag.push_str(" align=\"right\""),
-                    None => {}
+                match (anchor, float) {
+                    (Some(a), _) => a.write_attrs(&mut tag),
+                    (None, Some(Float::Left)) => tag.push_str(" align=\"left\""),
+                    (None, Some(Float::Right)) => tag.push_str(" align=\"right\""),
+                    (None, None) => {}
+                }
+                if let Some(c) = crop {
+                    let f = |v: f32| format!("{}", (v * 100.0).round() / 100.0);
+                    tag.push_str(&format!(" crop=\"{} {} {} {}\"", f(c[0]), f(c[1]), f(c[2]), f(c[3])));
                 }
                 tag.push('>');
                 tag
@@ -2101,6 +2216,8 @@ struct W<'a> {
     table: Option<WTable>,
     cell_style: bool,
     frame_style: bool,
+    /// Grafikformat för förankrade/beskurna bilder: egenskaperna och formatets namn.
+    frame_styles: Vec<(String, String)>,
     image: Option<(String, String)>,
     media: Vec<(String, Vec<u8>, &'static str)>,
     missing: Vec<String>,
@@ -2214,6 +2331,7 @@ impl<'a> W<'a> {
             table: None,
             cell_style: false,
             frame_style: false,
+            frame_styles: Vec::new(),
             image: None,
             media: Vec::new(),
             missing: Vec::new(),
@@ -2696,7 +2814,8 @@ impl<'a> W<'a> {
         self.after_space = true;
     }
 
-    fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>, float: Option<Float>) {
+    #[allow(clippy::too_many_arguments)]
+    fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>, float: Option<Float>, anchor: Option<Anchor>, crop: Option<[f32; 4]>) {
         let Some(img) = (self.resolve)(src).filter(|i| is_supported_image(&i.bytes)) else {
             self.missing.push(src.to_owned());
             let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
@@ -2720,6 +2839,11 @@ impl<'a> W<'a> {
         };
         let natural = imagesize::blob_size(&img.bytes).ok().map(|s| (s.width as f32, s.height as f32));
         let ratio = natural.map(|(w, h)| h / w.max(1.0)).unwrap_or(0.66);
+        // Beskuren bild: de synliga proportionerna styr höjden när bara bredden är angiven.
+        let ratio = match (natural, crop) {
+            (Some((nw, nh)), Some(c)) => nh * (1.0 - (c[1] + c[3]) / 100.0) / (nw * (1.0 - (c[0] + c[2]) / 100.0)).max(1.0),
+            _ => ratio,
+        };
         let mut w_pt = width
             .map(|w| w * 0.75)
             .or_else(|| img.extent.map(|(cx, _)| cx as f32 / 12700.0))
@@ -2742,8 +2866,76 @@ impl<'a> W<'a> {
             self.frame_style = true;
             self.auto.push_str("<style:style style:name=\"fr1\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:vertical-pos=\"top\" style:vertical-rel=\"baseline\" style:wrap=\"none\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\"/></style:style>");
         }
+        // Förankrad bild och/eller beskärning: eget grafikformat (namnet följer innehållet) och `svg:x`/`svg:y`.
+        let mut frame_pos = String::new();
+        let custom = if anchor.is_some() || crop.is_some() {
+            let mut props = String::from("style:vertical-pos=\"top\" style:vertical-rel=\"baseline\" style:wrap=\"none\"");
+            if let Some(a) = anchor {
+                let h_rel = match a.hrel {
+                    HRel::Column => "paragraph",
+                    HRel::Margin => "page-content",
+                    HRel::Page => "page",
+                };
+                let v_rel = match a.vrel {
+                    VRel::Paragraph => "paragraph",
+                    VRel::Margin => "page-content",
+                    VRel::Page => "page",
+                };
+                let pt = |px: f32| px * 0.75;
+                let (hp, x) = match a.h {
+                    Pos::Off(o) => ("from-left", Some(o)),
+                    Pos::Start => ("left", None),
+                    Pos::Center => ("center", None),
+                    Pos::End => ("right", None),
+                };
+                let (vp, y) = match a.v {
+                    Pos::Off(o) => ("from-top", Some(o)),
+                    Pos::Start => ("top", None),
+                    Pos::Center => ("middle", None),
+                    Pos::End => ("bottom", None),
+                };
+                let (wrap, run) = match a.wrap {
+                    Wrap::Square => ("parallel", "foreground"),
+                    Wrap::TopBottom => ("none", "foreground"),
+                    Wrap::Behind => ("run-through", "background"),
+                    Wrap::Front => ("run-through", "foreground"),
+                };
+                let cmv = |px: f32| format!("{:.3}cm", pt(px) * 2.54 / 72.0);
+                props = format!(
+                    "style:vertical-pos=\"{vp}\" style:vertical-rel=\"{v_rel}\" style:horizontal-pos=\"{hp}\" style:horizontal-rel=\"{h_rel}\" style:wrap=\"{wrap}\" style:number-wrapped-paragraphs=\"no-limit\" style:run-through=\"{run}\" fo:margin-top=\"{}\" fo:margin-right=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\"",
+                    cmv(a.dist[0]),
+                    cmv(a.dist[1]),
+                    cmv(a.dist[2]),
+                    cmv(a.dist[3])
+                );
+                if let Some(x) = x {
+                    frame_pos.push_str(&format!(" svg:x=\"{}\"", cmv(x)));
+                }
+                if let Some(y) = y {
+                    frame_pos.push_str(&format!(" svg:y=\"{}\"", cmv(y)));
+                }
+            }
+            if let (Some(c), Some((nw, nh))) = (crop, natural) {
+                // `fo:clip` är i bildens egna mått (96 dpi): ovan, höger, under, vänster.
+                let cm = |pct: f32, full: f32| format!("{:.3}cm", pct / 100.0 * full * 2.54 / 96.0);
+                props.push_str(&format!(" fo:clip=\"rect({}, {}, {}, {})\"", cm(c[1], nh), cm(c[2], nw), cm(c[3], nh), cm(c[0], nw)));
+            }
+            let idx = match self.frame_styles.iter().position(|(p, _)| *p == props) {
+                Some(i) => i,
+                None => {
+                    self.frame_styles.push((props.clone(), format!("frA{}", self.frame_styles.len() + 1)));
+                    let (props, name) = self.frame_styles.last().cloned().unwrap_or_default();
+                    self.auto.push_str(&format!("<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties {props}/></style:style>"));
+                    self.frame_styles.len() - 1
+                }
+            };
+            Some((self.frame_styles[idx].1.clone(), if anchor.is_some() { "paragraph" } else { "as-char" }))
+        } else {
+            None
+        };
         // Flytande bild: förankrad vid stycket, vid kanten, text runt med 12 px (0,318 cm) luft.
         let (style_name, anchor) = match float {
+            _ if custom.is_some() => custom.unwrap_or(("fr1".into(), "as-char")),
             Some(side) => {
                 let (name, pos, wrap, ml, mr) = match side {
                     Float::Left => ("frL", "left", "right", "0cm", "0.318cm"),
@@ -2752,9 +2944,9 @@ impl<'a> W<'a> {
                 if !self.auto.contains(&format!("style:name=\"{name}\"")) {
                     self.auto.push_str(&format!("<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\" style:horizontal-pos=\"{pos}\" style:horizontal-rel=\"paragraph\" style:wrap=\"{wrap}\" style:number-wrapped-paragraphs=\"no-limit\" style:run-through=\"foreground\" fo:margin-left=\"{ml}\" fo:margin-right=\"{mr}\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0cm\"/></style:style>"));
                 }
-                (name, "paragraph")
+                (name.to_owned(), "paragraph")
             }
-            None => ("fr1", "as-char"),
+            None => ("fr1".to_owned(), "as-char"),
         };
         self.open_para();
         self.open_link_if_needed();
@@ -2762,7 +2954,7 @@ impl<'a> W<'a> {
         let n = self.n_frame;
         let desc = if alt.is_empty() { String::new() } else { format!("<svg:desc>{}</svg:desc>", esc(alt)) };
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\" svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
+            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\"{frame_pos} svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
             cm(w_pt),
             cm(h_pt),
             n - 1
@@ -2839,7 +3031,12 @@ impl<'a> W<'a> {
                 Some("right") => Some(Float::Right),
                 _ => None,
             };
-            self.image(&src, &alt, num("width"), num("height"), float);
+            let anchor = Anchor::from_attrs(&|k| get(k).map(str::to_owned));
+            let crop = get("crop").and_then(|v| {
+                let n: Vec<f32> = v.split_whitespace().filter_map(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite() && (0.0..100.0).contains(x)).collect();
+                (n.len() == 4 && n[0] + n[2] < 100.0 && n[1] + n[3] < 100.0 && n.iter().any(|x| *x > 0.0)).then(|| [n[0], n[1], n[2], n[3]])
+            });
+            self.image(&src, &alt, num("width"), num("height"), float.filter(|_| anchor.is_none()), anchor, crop);
             // Det som följer på nästa rader i samma HTML-block är vanlig text.
             let rest = t[end + 1..].trim_matches('\n');
             if !rest.trim().is_empty() {
@@ -3099,7 +3296,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                 }
                 TagEnd::Image => {
                     if let Some((src, alt)) = w.image.take() {
-                        w.image(&src, &alt, None, None, None);
+                        w.image(&src, &alt, None, None, None, None, None);
                     }
                 }
                 _ => {}
@@ -3742,6 +3939,35 @@ Slut.
     }
 
     #[test]
+    fn anchored_image_roundtrip() {
+        // Röd 1x1-bild skalas till 200 px; beskärningen räknas mot bildens 96-dpi-mått (1 px), så
+        // en beskärning testas på en större bild nedan.
+        let md = concat!(
+            "<img src=\"bild:image1.png\" alt=\"A\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\" dist=\"0 6 0 6\">Text\n\n",
+            "<img src=\"bild:image1.png\" width=\"100\" x=\"center\" y=\"12\" wrap=\"top\">\n\nMellan\n\n",
+            "<img src=\"bild:image1.png\" width=\"50\" hrel=\"margin\" x=\"right\" vrel=\"margin\" y=\"20\" dist=\"3 4 5 6\">\n\nSlut\n"
+        );
+        let w = write(md, "T", &resolver()).unwrap();
+        let c = content_xml(&w.bytes);
+        assert!(c.contains("style:wrap=\"run-through\"") && c.contains("style:run-through=\"background\""), "{c}");
+        assert!(c.contains("style:horizontal-rel=\"page\"") && c.contains("style:vertical-pos=\"bottom\""), "{c}");
+        assert!(c.contains("svg:x=\"2.540cm\""), "{c}");
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}\n{c}", back.markdown);
+    }
+
+    #[test]
+    fn frame_crop_and_page_anchor_are_read() {
+        let c = LO_CONTENT.replace("svg:width=\"0.0265cm\" svg:height=\"0.0265cm\"", "svg:width=\"6.35cm\" svg:height=\"6.35cm\" svg:x=\"1cm\" svg:y=\"2cm\"");
+        let c = c.replace("<draw:frame draw:name=\"Bild1\" text:anchor-type=\"as-char\"", "<draw:frame draw:style-name=\"fr9\" draw:name=\"Bild1\" text:anchor-type=\"page\"");
+        let style = "<style:style style:name=\"fr9\" style:family=\"graphic\"><style:graphic-properties style:wrap=\"none\" style:horizontal-pos=\"from-left\" style:horizontal-rel=\"page\" style:vertical-pos=\"from-top\" style:vertical-rel=\"page\"/></style:style>";
+        let c = c.replacen("</office:automatic-styles>", &format!("{style}</office:automatic-styles>"), 1);
+        let m = read(&make_odt(&c, LO_STYLES, &[("Pictures/a.png", &png())])).unwrap().markdown;
+        assert!(m.contains("hrel=\"page\" x=\"37.8\" vrel=\"page\" y=\"75.6\" wrap=\"top\""), "{m}");
+    }
+
+    #[test]
     fn wrap_values_are_mapped() {
         let base = |wrap: &str, pos: &str| {
             let c = LO_CONTENT.replace("svg:width=\"0.0265cm\" svg:height=\"0.0265cm\"", "svg:width=\"6.35cm\" svg:height=\"6.35cm\"");
@@ -3754,13 +3980,13 @@ Slut.
             let i = m.find("<img").expect("bildtagg");
             m[i..i + m[i..].find('>').unwrap()].to_owned()
         };
-        assert!(base("right", "center").contains("align=\"left\""));
-        assert!(base("left", "center").contains("align=\"right\""));
-        assert!(base("parallel", "right").contains("align=\"right\""));
-        assert!(base("dynamic", "left").contains("align=\"left\""));
-        assert!(!base("none", "left").contains("align="));
-        assert!(!base("run-through", "left").contains("align="));
-        assert!(!base("parallel", "center").contains("align="));
+        // Utan margin är det ett ankare (kortformen `align` kräver Kladds normala 12 px luft).
+        assert!(base("right", "center").contains("x=\"center\""));
+        assert!(base("parallel", "right").contains("x=\"right\""));
+        assert!(base("dynamic", "left").contains("x=\"left\""));
+        assert!(base("none", "left").contains("wrap=\"top\""));
+        assert!(base("run-through", "left").contains("wrap=\"front\""));
+        assert!(base("parallel", "center").contains("x=\"center\"") && !base("parallel", "center").contains("wrap="));
     }
 
     /// LibreOffice ska rendera den skrivna filen med texten runt bilden. Kräver `soffice` och `pdftotext`.

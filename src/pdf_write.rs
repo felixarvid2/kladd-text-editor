@@ -24,6 +24,7 @@ use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEn
 use crate::docx::Image as DocImage;
 use crate::style::{self, Align, DocDefaults, SpanStyle};
 use crate::theme;
+use crate::word::anchor::{Anchor, PageCtx, Reserve, VAt, Wrap};
 use crate::word::markup::Float;
 use crate::word::sections::{self, Section, SectionProps};
 
@@ -136,7 +137,7 @@ enum Block {
     /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
     Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>> },
     Rule,
-    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float> },
+    Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float>, place: ImgPlace },
     /// Innehållsförteckning (`<!-- kladd: toc -->`).
     Toc,
     /// Nytt avsnitt (`<!-- kladd: avsnitt; … -->`): egen sidstorlek, marginaler och spalter.
@@ -190,7 +191,15 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 }
 
 /// `<img src="…" alt="…" width="W" [height="H"]>` med storlek i CSS-px (1/96 tum) omräknad till pt.
-fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>)> {
+/// Förankring och beskärning av en `<img>` (se `word::anchor`).
+#[derive(Clone, Copy, Default)]
+struct ImgPlace {
+    anchor: Option<Anchor>,
+    /// Beskärning i procent: vänster, ovan, höger, under.
+    crop: Option<[f32; 4]>,
+}
+
+fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>, ImgPlace)> {
     if !tag.get(..4)?.eq_ignore_ascii_case("<img") || !tag.ends_with('>') {
         return None;
     }
@@ -202,7 +211,14 @@ fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>)> {
         Some("right") => Some(Float::Right),
         _ => None,
     };
-    Some((src, alt, ImgSize { w: px("width"), h: px("height") }, float))
+    let anchor = Anchor::from_attrs(&|k| attr(tag, k));
+    let crop = attr(tag, "crop").and_then(|v| {
+        let n: Vec<f32> = v.split_whitespace().filter_map(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite() && (0.0..100.0).contains(x)).collect();
+        (n.len() == 4 && n[0] + n[2] < 100.0 && n[1] + n[3] < 100.0 && n.iter().any(|x| *x > 0.0)).then(|| [n[0], n[1], n[2], n[3]])
+    });
+    // Förankrad bild: `align` är bara en antydan (kortformen gäller bara utan ankare).
+    let float = float.filter(|_| anchor.is_none());
+    Some((src, alt, ImgSize { w: px("width"), h: px("height") }, float, ImgPlace { anchor, crop }))
 }
 
 /// Rubriknivåerna som Titel och Underrubrik lagras med (över Markdowns 1-6).
@@ -430,7 +446,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     if let Some((src, alt)) = image.take() {
                         // En bild i en tabellcell eller mitt i text ritas som eget block efter stycket.
                         flush(&mut spans, &mut blocks, heading, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left, float: None });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Left, float: None, place: ImgPlace::default() });
                     }
                 }
                 _ => {}
@@ -489,10 +505,10 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     } else if style::is_div_close(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         aligns.pop();
-                    } else if let Some((src, alt, size, float)) = parse_img(tag) {
+                    } else if let Some((src, alt, size, float, place)) = parse_img(tag) {
                         // `<img>` med storlek blir ett eget bildblock, justerat av omgivande `<div align>`.
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align, float });
+                        blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align, float, place });
                     } else if tag == crate::word::nav::TOC_LINE {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::Toc);
@@ -550,7 +566,7 @@ enum Op {
     /// Formel med origo på baslinjen (`y`), `em` pt per em.
     Math { x: f32, y: f32, src: String, display: bool, em: f32, color: (u8, u8, u8) },
     Line { x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: (u8, u8, u8) },
-    Image { x: f32, y: f32, w: f32, h: f32, index: usize },
+    Image { x: f32, y: f32, w: f32, h: f32, index: usize, crop: Option<[f32; 4]> },
     Link { x: f32, y: f32, w: f32, h: f32, url: String },
     /// Intern länk till en plats i dokumentet (sida från 0, y).
     Goto { x: f32, y: f32, w: f32, h: f32, page: usize, to_y: f32 },
@@ -641,8 +657,12 @@ struct Layout<'a> {
 /// En flytande bild: sida, upptagen bredd (bild + luft), sidan (0-baserad) och understa kanten (pt).
 struct FloatBox {
     side: Float,
+    /// Bilden tar hela radens bredd (texten hoppar under den).
+    full: bool,
     w: f32,
     page: usize,
+    /// Övre kanten (pt): texten påverkas först från den.
+    top: f32,
     bottom: f32,
 }
 
@@ -910,8 +930,14 @@ impl<'a> Layout<'a> {
     /// Utrymmet vid aktuell rad: (förskjutning från vänster, bredd som tas av flytande bilder).
     fn float_room(&mut self) -> (f32, f32) {
         self.prune_floats();
-        let sum = |side: Float| self.floats.iter().filter(|f| f.side == side).map(|f| f.w).sum::<f32>();
-        (sum(Float::Left), sum(Float::Left) + sum(Float::Right))
+        // Bild över hela bredden: texten hoppar till under den.
+        while let Some(b) = self.floats.iter().filter(|f| f.full && f.top <= self.y + 0.5).map(|f| f.bottom).reduce(f32::max) {
+            self.y = self.y.max(b);
+            self.prune_floats();
+        }
+        let y = self.y;
+        let wide = |side: Float| self.floats.iter().filter(|f| !f.full && f.side == side && f.top <= y + 0.5).map(|f| f.w).fold(0.0, f32::max);
+        (wide(Float::Left), wide(Float::Left) + wide(Float::Right))
     }
 
     fn page(&mut self) -> &mut PageOps {
@@ -1331,10 +1357,11 @@ impl<'a> Layout<'a> {
         }
     }
 
-    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align, float: Option<Float>) {
+    fn image(&mut self, src: &str, alt: &str, indent: f32, size: ImgSize, align: Align, float: Option<Float>, place: ImgPlace) {
         // Bilder som inte flyter, och texten om bilden saknas, kommer under flytande bilder.
         let float = float.filter(|_| indent == 0.0);
-        if float.is_none() {
+        let anchor = place.anchor.filter(|_| indent == 0.0);
+        if float.is_none() && anchor.is_none() {
             self.clear_floats();
         }
         let Some(img) = (self.resolve)(src) else {
@@ -1356,22 +1383,36 @@ impl<'a> Layout<'a> {
         };
         // Angiven storlek (`width`/`height` i CSS-px, redan omräknat till pt); proportionerna bevaras
         // när bara en sida anges.
-        let aspect = if pw > 0 { ph as f32 / pw as f32 } else { 1.0 };
+        let mut aspect = if pw > 0 { ph as f32 / pw as f32 } else { 1.0 };
+        // Beskuren bild: den synliga delen avgör proportionerna.
+        if let Some(c) = place.crop {
+            aspect *= (1.0 - (c[1] + c[3]) / 100.0) / (1.0 - (c[0] + c[2]) / 100.0);
+            if size.w.is_none() && size.h.is_none() && img.extent.is_none() {
+                w *= 1.0 - (c[0] + c[2]) / 100.0;
+                h = w * aspect;
+            }
+        }
         match (size.w, size.h) {
             (Some(sw), Some(sh)) => (w, h) = (sw, sh),
             (Some(sw), None) => (w, h) = (sw, sw * aspect),
             (None, Some(sh)) => (w, h) = (sh / aspect.max(0.0001), sh),
             _ => {}
         }
-        let max_w = self.cw - indent;
+        let max_w = if anchor.is_some() { self.pw } else { self.cw - indent };
         if w > max_w {
             h *= max_w / w;
             w = max_w;
         }
-        let max_h = self.ph - self.mt - self.mb;
+        let max_h = if anchor.is_some() { self.ph } else { self.ph - self.mt - self.mb };
         if h > max_h {
             w *= max_h / h;
             h = max_h;
+        }
+        if let Some(an) = anchor {
+            let index = self.images.len();
+            self.images.push(image);
+            self.anchored_image(an, w, h, index, place.crop);
+            return;
         }
         // Flytande bild: vid vänster/höger textkant, text runt; ryms den inte flyttas den till nästa sida.
         let mut float = float;
@@ -1384,9 +1425,9 @@ impl<'a> Layout<'a> {
         self.images.push(image);
         if let Some(side) = float {
             let (x, y) = (if side == Float::Left { self.ml } else { self.ml + self.cw - w }, self.y);
-            self.page().ops.push(Op::Image { x, y, w, h, index });
+            self.page().ops.push(Op::Image { x, y, w, h, index, crop: place.crop });
             let page = self.pages.len() - 1;
-            self.floats.push(FloatBox { side, w: w + FLOAT_GAP, page, bottom: y + h });
+            self.floats.push(FloatBox { side, full: false, w: w + FLOAT_GAP, page, top: y, bottom: y + h });
             return;
         }
         let free = (self.cw - indent - w).max(0.0);
@@ -1396,8 +1437,58 @@ impl<'a> Layout<'a> {
             _ => 0.0,
         };
         let (x, y) = (self.ml + indent + dx, self.y);
-        self.page().ops.push(Op::Image { x, y, w, h, index });
+        self.page().ops.push(Op::Image { x, y, w, h, index, crop: place.crop });
         self.y += h + PARA_GAP;
+    }
+
+    /// Förankrad bild: läget räknas mot sidan, marginalen, spalten eller stycket (som i
+    /// dokumentläget); text flyter runt den på bredare sidan, hoppar förbi den (över/under), eller
+    /// påverkas inte alls (bakom/framför). Sidan är den där bilden förankras.
+    fn anchored_image(&mut self, an: Anchor, w: f32, h: f32, index: usize, crop: Option<[f32; 4]>) {
+        // CSS-px till pt.
+        let a = an.scaled(0.75);
+        let ctx = PageCtx {
+            page_w: self.pw,
+            page_h: self.ph,
+            margin: [self.mt, (self.pw - self.text_l - self.text_w).max(0.0), self.mb, self.text_l],
+            col_left: self.ml,
+            col_w: self.cw,
+        };
+        let affects = a.wrap.affects_text();
+        let para = matches!(a.y_at(h, &ctx), VAt::Para(_));
+        // En bild vid stycket som inte ryms på sidan flyttas till nästa sida med texten.
+        if affects && para {
+            self.ensure(h);
+        }
+        let x = self.ml + a.x_in_column(w, &ctx);
+        let y = match a.y_at(h, &ctx) {
+            VAt::Para(o) => self.y + o,
+            VAt::Page(py) => py,
+        };
+        let op = Op::Image { x, y, w, h, index, crop };
+        if a.wrap == Wrap::Behind {
+            self.page().ops.insert(0, op);
+        } else {
+            self.page().ops.push(op);
+        }
+        if !affects {
+            return;
+        }
+        let page = self.pages.len() - 1;
+        let (top, bottom) = (y - a.dist[0], y + h + a.dist[2]);
+        let (side, rw, full) = match a.wrap {
+            Wrap::TopBottom => (Float::Left, 0.0, true),
+            _ => match crate::word::anchor::reserve(&a, x - self.ml, w, self.cw) {
+                Reserve::Left(r) => (Float::Left, r, false),
+                Reserve::Right(r) => (Float::Right, r, false),
+                Reserve::Full => (Float::Left, 0.0, true),
+            },
+        };
+        // Utan plats vid sidan hoppar texten förbi bilden.
+        let full = full || self.cw - rw < FLOAT_MIN_ROOM;
+        // En rad som börjar strax ovanför en bild över hela bredden skulle överlappa den.
+        let top = if full { top - self.body * 1.2 } else { top };
+        self.floats.push(FloatBox { side, full, w: rw, page, top, bottom });
     }
 
     fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>) {
@@ -1661,7 +1752,7 @@ impl<'a> Layout<'a> {
                     self.page().ops.push(Op::Line { x1: ml, y1: y, x2: ml + cw, y2: y, width: 0.8, color: RULE });
                     self.y += 16.0;
                 }
-                Block::Image { src, alt, indent, size, align, float } => self.image(src, alt, *indent, *size, *align, *float),
+                Block::Image { src, alt, indent, size, align, float, place } => self.image(src, alt, *indent, *size, *align, *float, *place),
                 Block::Toc => self.toc(),
                 Block::SectionBreak(props) => self.section_break(props),
                 Block::ColumnBreak => self.new_page(),
@@ -1866,11 +1957,30 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                             s.pop();
                         }
                     }
-                    Op::Image { x, y, w, h, index } => {
+                    Op::Image { x, y, w, h, index, crop } => {
                         if let Some(size) = Size::from_wh(*w, *h) {
-                            s.push_transform(&Transform::from_translate(*x, *y));
-                            s.draw_image(images[*index].clone(), size);
-                            s.pop();
+                            match crop {
+                                // Beskärning: hela bilden ritas större och klipps till rutan.
+                                Some(c) => {
+                                    let (fw, fh) = (*w / (1.0 - (c[0] + c[2]) / 100.0), *h / (1.0 - (c[1] + c[3]) / 100.0));
+                                    if let (Some(full), Some(r)) = (Size::from_wh(fw, fh), Rect::from_xywh(*x, *y, *w, *h)) {
+                                        let mut pb = PathBuilder::new();
+                                        pb.push_rect(r);
+                                        if let Some(path) = pb.finish() {
+                                            s.push_clip_path(&path, &FillRule::NonZero);
+                                            s.push_transform(&Transform::from_translate(*x - fw * c[0] / 100.0, *y - fh * c[1] / 100.0));
+                                            s.draw_image(images[*index].clone(), full);
+                                            s.pop();
+                                            s.pop();
+                                        }
+                                    }
+                                }
+                                None => {
+                                    s.push_transform(&Transform::from_translate(*x, *y));
+                                    s.draw_image(images[*index].clone(), size);
+                                    s.pop();
+                                }
+                            }
                         }
                     }
                     Op::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
@@ -2402,6 +2512,42 @@ mod tests {
         // Texten efter bilden står bredvid den på sida 2.
         let t = texts(&lay.pages[1].ops);
         assert!(t.iter().any(|(x, _, _)| *x > lay.ml + 100.0), "{t:?}");
+    }
+
+    #[test]
+    fn anchored_images_are_placed_like_in_the_document_mode() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        // Mot sidan: absolut plats (96 px = 72 pt från sidans kant), text påverkas inte (bakom).
+        let md = format!("<img src=\"a\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\">\n\n{LOREM}\n");
+        let (lay, _) = laid_out(&md, &resolve);
+        let (ix, iy, iw, ih) = images_of(&lay)[0];
+        assert!((ix - 72.0).abs() < 0.01 && (iy + ih - lay.ph).abs() < 0.01 && (iw - 150.0).abs() < 0.01, "{ix} {iy} {iw} {ih}");
+        assert!(texts(&lay.pages[0].ops).iter().all(|(x, _, _)| (*x - lay.ml).abs() < 0.01));
+        // Bakom texten: bilden ritas först.
+        assert!(matches!(lay.pages[0].ops[0], Op::Image { .. }));
+        // Över och under: texten börjar under bilden.
+        let md = format!("<img src=\"a\" width=\"200\" x=\"center\" y=\"0\" wrap=\"top\">\n\n{LOREM}\n");
+        let (lay, _) = laid_out(&md, &resolve);
+        let (ix, iy, iw, ih) = images_of(&lay)[0];
+        assert!((ix - (lay.ml + (lay.cw - iw) / 2.0)).abs() < 0.01);
+        assert!(texts(&lay.pages[0].ops).iter().all(|(_, y, _)| *y > iy + ih - 1.0));
+        // Kvadratiskt vid högerkanten: raderna slutar före bilden.
+        let md = format!("<img src=\"a\" width=\"200\" x=\"right\" y=\"0\" dist=\"0 0 0 12\">\n\n{LOREM}\n");
+        let (lay, _) = laid_out(&md, &resolve);
+        let (ix, _, _, _) = images_of(&lay)[0];
+        assert!((ix - (lay.ml + lay.cw - 150.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn cropped_image_keeps_the_visible_proportions() {
+        let data = png(100, 50);
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let md = "<img src=\"a\" width=\"100\" crop=\"0 0 50 0\">\n";
+        let (lay, _) = laid_out(md, &resolve);
+        let (_, _, w, h) = images_of(&lay)[0];
+        // Halva bredden synlig: visningsrutan 75 x 37,5 pt blir 75 x 75 vid samma höjdförhållande.
+        assert!((w - 75.0).abs() < 0.01 && (h - 75.0 * 50.0 / 50.0).abs() < 0.01, "{w} x {h}");
     }
 
     #[test]

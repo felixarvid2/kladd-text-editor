@@ -13,6 +13,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Formatmallarna läses som i Word.** `docDefaults` (storlek, fet, kursiv) och temafärger (`w:themeColor` med tint/shade ur temats `clrScheme`) räknas in, teckenavstånd (`w:spacing`), versaler och kapitäler (`w:caps`, `w:smallCaps`) och linjen under stycket (`w:pBdr/w:bottom`, t.ex. under titeln) läses och skrivs tillbaka, och teckenmallar med fet eller kursiv (Subtil betoning m.fl.) syns i texten. En mall som inte anger färg eller fet är vanlig svart text, inte Kladds blå fetstilsrubrik. Grundformatskommentaren får `letter-spacing`, `caps`, `smallcaps` och `border-bottom`.
 
+- **Bilder sitter där Word och LibreOffice la dem.** Förankrade bilder (`wp:anchor`, äldre VML-bilder, ODT `draw:frame`) behåller nu sitt läge mot sidan, marginalen, spalten eller stycket (förskjutning eller vänster/mitten/höger respektive topp/mitten/botten), textomflöde (runt, över och under, bakom eller framför texten) och avstånd till texten, och ritas på rätt plats i dokumentläget och i PDF-exporten: texten flyter på den bredare sidan, hoppar förbi bilder över hela bredden, och bilder bakom/framför påverkar inte texten. Beskärning (`a:srcRect`, `fo:clip`) och exakt storlek (också sträckta bilder) bevaras, bilder i tabellceller blir vanliga bilder som inte blir bredare än cellen. Att dra en förankrad bild skriver tillbaka nytt läge till `.docx`/`.odt`. Orörda dokument är oförändrade.
+
 ## [2.1.0] – 2026-11-13
 
 ### Nytt

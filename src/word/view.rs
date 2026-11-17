@@ -3,6 +3,7 @@
 //! Allt här är en vy över samma Markdown-`String` som textvyn redigerar (se
 //! `docs/dev/dokumentlage.md`): `TextEdit` med samma id, så markör och ångra överlever växlingen.
 
+use crate::word::anchor::{PageCtx, VAt, Wrap};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::ops::Range;
@@ -874,6 +875,7 @@ impl KladdApp {
             Act::Resize { w, h: None } => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, Some(w))),
             Act::Resize { w, h: Some(h) } => self.word_edit(ctx, |t, _| images::set_free_size(t, r, w, h)),
             Act::Float(f) => self.word_edit(ctx, |t, _| markup::set_image_float(t, r, f)),
+            Act::Place { x, y } => self.word_edit(ctx, |t, _| markup::set_image_pos(t, r, x, y)),
             Act::Move { target, after } => {
                 // Ett ångra-steg; bilden förblir vald på sin nya plats.
                 let mut at = None;
@@ -943,6 +945,7 @@ impl KladdApp {
             let refs = self.word.images(doc_id, &self.docs[self.active].text);
             let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
+            let prev_tables = self.word.table_view(doc_id, &self.docs[self.active].text).map(|(_, g)| g);
             // Bilderna i dokumentordning och var de står (för spaltbredden i avsnitt).
             let img_starts: Vec<usize> =
                 analysis.pieces.iter().filter(|pc| pc.image.is_some()).map(|pc| pc.range.start).collect();
@@ -951,7 +954,21 @@ impl KladdApp {
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
                     // Bilder är aldrig bredare än spalten de står i.
                     let sec = img_starts.get(k).map_or(0, |b| sections::index_at(&analysis.sections, *b));
-                    let max_w = geom1.wrap_for(sec);
+                    // Förankrade bilder får vara bredare än spalten (upp till arket).
+                    let mut max_w = if img.anchor.is_some() { geom1.max_page_w() } else { geom1.wrap_for(sec) };
+                    // I en tabellcell: högst cellens bredd (från förra utläggningen).
+                    if let (Some(gs), Some(b)) = (&prev_tables, img_starts.get(k)) {
+                        let pad = grid::cell_pad(1.0) * 2.0;
+                        let cell = gs.iter().filter(|t| t.region.contains(b)).find_map(|t| {
+                            t.rows.iter().flat_map(|r| r.cells.iter()).find(|c| c.seg.contains(b)).map(|c| {
+                                let (x0, x1) = t.cell_x(c);
+                                (x1 - x0) / z - pad
+                            })
+                        });
+                        if let Some(w) = cell.filter(|w| *w >= 16.0) {
+                            max_w = max_w.min(w);
+                        }
+                    }
                     let size = images::display_size(info.size, &img, max_w, z);
                     sizes.entry(images::size_key(&img)).and_modify(|s| if size.x < s.x { *s = size }).or_insert(size);
                 }
@@ -1112,6 +1129,9 @@ impl KladdApp {
                 let page_top = origin.y + GAP;
                 let shadow_slot = ui.painter().add(Shape::Noop);
                 let page_slot = ui.painter().add(Shape::Noop);
+                // Bilder bakom texten ritas före texten (platsen fylls när bilderna är placerade).
+                let behind_slot = ui.painter().add(Shape::Noop);
+                let mut behind_shapes: Vec<Shape> = Vec::new();
 
                 let text_rect = Rect::from_min_size(
                     pos2(page_left + geom.origin_x(), page_top + geom.top),
@@ -1431,20 +1451,52 @@ impl KladdApp {
                                 let uri = image_uri(&img.src, doc_id);
                                 let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
                                 let (cl, cw) = col_at(r.left() - gpos.x, top - gpos.y);
-                                let min = match side {
-                                    Some((markup::Float::Left, _)) => pos2(gpos.x + cl, top),
-                                    Some((markup::Float::Right, _)) => pos2(gpos.x + cl + cw - sz.x, top),
-                                    None => r.min,
+                                let mut pos_off = None;
+                                let min = match (side, img.anchor) {
+                                    (Some(_), Some(an)) => {
+                                        // Förankrad bild: läge mot sidan, marginalen, spalten eller stycket.
+                                        let gy = top - gpos.y;
+                                        let ctx = match boxes.get(secpages::page_index(&boxes, gy)) {
+                                            Some(b) => {
+                                                let sheet = b.rect(page_left, origin_y);
+                                                PageCtx { page_w: b.w, page_h: b.h, margin: b.margin, col_left: gpos.x + cl - sheet.left(), col_w: cw }
+                                            }
+                                            None => PageCtx::column_only(cw),
+                                        };
+                                        let sheet_top = boxes.get(secpages::page_index(&boxes, gy)).map_or(top, |b| b.rect(page_left, origin_y).top());
+                                        let a = an.scaled(z);
+                                        let x = gpos.x + cl + a.x_in_column(sz.x, &ctx);
+                                        let y = match a.y_at(sz.y, &ctx) {
+                                            VAt::Para(o) => top + o,
+                                            VAt::Page(py) => sheet_top + py,
+                                        };
+                                        // Förskjutningar (CSS-px) som ger dagens läge: för flytt med musen.
+                                        let (ref_x, ref_y) = (gpos.x + cl + a.h_ref_left(&ctx), a.v_ref_top(&ctx).map_or(top, |t| sheet_top + t));
+                                        pos_off = Some(((x - ref_x) / z, (y - ref_y) / z));
+                                        pos2(x, y)
+                                    }
+                                    (Some((markup::Float::Left, _)), _) => pos2(gpos.x + cl, top),
+                                    (Some((markup::Float::Right, _)), _) => pos2(gpos.x + cl + cw - sz.x, top),
+                                    (None, _) => r.min,
                                 };
                                 let rect = Rect::from_min_size(min, *sz);
                                 if rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
-                                    egui::Image::new(uri.clone()).paint_at(ui, rect);
+                                    let uv = images::crop_uv(img.crop);
+                                    if img.anchor.is_some_and(|a| a.wrap == Wrap::Behind) && side.is_some() {
+                                        if let Some(sh) = images::image_shape(ui.ctx(), &uri, rect, uv) {
+                                            behind_shapes.push(sh);
+                                        }
+                                    } else {
+                                        egui::Image::new(uri.clone()).uv(uv).paint_at(ui, rect);
+                                    }
                                     painted.push(images::Painted {
                                         rect,
                                         align: img.align,
                                         range: pc.range.clone(),
                                         index: img_index - 1,
                                         uri,
+                                        pos_off: pos_off.filter(|_| img.anchor.is_some()),
+                                        crop: img.crop,
                                     });
                                 }
                             }
@@ -1452,6 +1504,7 @@ impl KladdApp {
                     }
                 }
                 flush_bar(&mut bar);
+                ui.painter().set(behind_slot, Shape::Vec(std::mem::take(&mut behind_shapes)));
 
                 // Innehållsförteckningar: raden är dold och har reserverat höjden; posterna
                 // ritas här med sidnumren från galleriet (sidbrytningen är redan gjord, så en

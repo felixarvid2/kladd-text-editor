@@ -14,6 +14,7 @@ use egui::epaint::text::FontsView;
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
+use super::anchor::{self, Anchor, PageCtx, VAt, Wrap};
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use crate::highlight;
@@ -412,6 +413,9 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         pc.footnote_ref.is_some().hash(&mut h);
         pc.footnote_def.is_some().hash(&mut h);
         pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
+        if let Some(i) = pc.image.as_ref().filter(|i| i.anchor.is_some() || i.crop.is_some()) {
+            format!("{:?}{:?}", i.anchor, i.crop).hash(&mut h);
+        }
         if let Some(s) = &pc.span {
             s.font_family.hash(&mut h);
             s.font_size.map(f32::to_bits).hash(&mut h);
@@ -453,10 +457,10 @@ fn relayout(
 
     // Grupperna läggs ut i ordning: en flytande bild påverkar bredden på stycken efter den, och
     // hur högt dessa är avgör var bilden slutar.
-    let gap = FLOAT_GAP * p.zoom;
     struct FloatBox {
-        side: Float,
+        side: Side,
         w: f32,
+        top: f32,
         bottom: f32,
     }
     let mut active: Vec<FloatBox> = Vec::new();
@@ -473,6 +477,9 @@ fn relayout(
     let mut row_sec: Vec<u32> = Vec::new();
     let mut col_breaks: Vec<usize> = Vec::new();
     let page_wrap = wrap_width;
+    // Uppskattad sidbrytning (som `pages::paginate`) så att bilder som placeras mot sidan eller
+    // marginalen vet var på arket stycket ligger.
+    let mut sim = pages.filter(|_| !multi).map(PageSim::new);
     for (pr, w, tbl) in groups.iter() {
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
@@ -483,11 +490,18 @@ fn relayout(
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
-        let mut anchor = None;
+        let mut anchor: Option<(FloatSpec, FloatPlan)> = None;
         if let (Some(f), false) = (gp[0].float, table) {
-            let used: f32 = active.iter().map(|f| f.w).sum();
-            let same = active.iter().any(|a| a.side == f.side);
-            if same || wrap_width - used - f.size.x - gap < FLOAT_MIN_ROOM * p.zoom {
+            let ctx = match pages {
+                Some(g) => PageCtx { page_w: g.page_w, page_h: g.page_h, margin: [g.top, g.right, g.bottom, g.left], col_left: g.left, col_w: wrap_width },
+                None => PageCtx::column_only(wrap_width),
+            };
+            let page_y = sim.as_ref().map(|s| s.sheet_y(y));
+            let mut plan = plan_float(&f, p.zoom, wrap_width, &ctx, page_y, min_h);
+            let used: f32 = active.iter().filter(|a| a.side != Side::Full).map(|f| f.w).fold(0.0, f32::max);
+            let same = active.iter().any(|a| Some(a.side) == plan.side && f.anchor.is_none());
+            let room = |pl: &FloatPlan| pl.side.is_some_and(|s| s != Side::Full) && wrap_width - used.max(pl.w) < FLOAT_MIN_ROOM * p.zoom;
+            if f.anchor.is_none() && (same || room(&plan)) {
                 // Ryms inte bredvid texten: en ensam bild får en egen rad, annars ritas den på texten.
                 gp[0].float = None;
                 if f.alone {
@@ -495,27 +509,34 @@ fn relayout(
                     gp[0].reserve = Some(f.size.y);
                 }
             } else {
-                anchor = Some(f);
+                if room(&plan) {
+                    // Förankrad bild utan plats vid sidan: texten fortsätter under den.
+                    plan.side = Some(Side::Full);
+                }
+                anchor = Some((f, plan));
             }
         } else if gp[0].float.is_some() {
             gp[0].float = None;
         }
         // Stycket flyter också runt sin egen bild (om det har text).
-        let own = anchor.filter(|f| !f.alone).map(|f| FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+        let own = anchor
+            .filter(|(f, _)| !f.alone || f.anchor.is_some())
+            .and_then(|(_, pl)| pl.side.map(|side| FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom }));
         let rel: Vec<ActiveFloat> = if table {
             Vec::new()
         } else {
+            let half = |v: f32| (v * 2.0).round() / 2.0;
             active
                 .iter()
                 .chain(own.iter())
-                .map(|f| (f.side, f.w, ((f.bottom - y) * 2.0).round() / 2.0))
+                .map(|f| ActiveFloat { side: f.side, w: f.w, top: half(f.top - y), bottom: half(f.bottom - y) })
                 .collect()
         };
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
             wrap_width.to_bits().hash(&mut h);
             for f in &rel {
-                (f.0, f.1.to_bits(), f.2.to_bits()).hash(&mut h);
+                (f.side, f.w.to_bits(), f.top.to_bits(), f.bottom.to_bits()).hash(&mut h);
             }
             h.finish()
         };
@@ -568,14 +589,28 @@ fn relayout(
                 r += lg.rows.len();
             }
         }
-        if let Some(f) = anchor {
-            anchors.push((row_no, f.size.y));
+        if let Some((f, pl)) = anchor {
+            // Sidbrytningen räknar bilden som en rad av dess höjd (om den ligger vid stycket).
+            if pl.side.is_some() && (f.anchor.is_none() || (pl.para_rel && pl.top > -0.5)) {
+                anchors.push((row_no, f.size.y + pl.top.max(0.0)));
+            }
             if let Some(pc) = pieces_in(&a, &gp[0].range).iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some())) {
                 starts.push((pc.range.start, f.side, row_no));
             }
-            active.push(FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+            if let Some(side) = pl.side {
+                active.push(FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom });
+            }
         }
         row_no += galleys.iter().map(|g| g.rows.len()).sum::<usize>();
+        if let Some(sm) = sim.as_mut() {
+            let mut gy = y;
+            for g in galleys.iter() {
+                for r in &g.rows {
+                    sm.place(gy + r.pos.y, r.row.size.y);
+                }
+                gy += g.rect.height();
+            }
+        }
         y += galleys.iter().map(|g| g.rect.height()).sum::<f32>();
         all.extend(galleys.iter().cloned());
     }
@@ -1357,6 +1392,8 @@ struct Para {
 #[derive(Debug, Clone, Copy)]
 struct FloatSpec {
     side: Float,
+    /// Dialektens ankare (`<img x= y= …>`); `None` för den äldre kortformen `align`.
+    anchor: Option<Anchor>,
     size: Vec2,
     /// Raden innehåller bara bilden (då kollapsar den).
     alone: bool,
@@ -1451,6 +1488,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             if let Some((pc, img)) = first.and_then(|pc| pc.image.as_ref().map(|i| (*pc, i))) {
                 float = (p.image_size)(&super::images::size_key(img)).zip(img.align).map(|(size, side)| FloatSpec {
                     side,
+                    anchor: img.anchor,
                     size,
                     alone: is_float_line(text, pc),
                 });
@@ -1625,7 +1663,103 @@ fn justify_row(
 
 /// En flytande bild som är aktiv vid ett stycke: sida, upptagen bredd (bild + luft) och
 /// understa kanten i px under styckets överkant.
-pub(crate) type ActiveFloat = (Float, f32, f32);
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ActiveFloat {
+    pub side: Side,
+    /// Bredd från den egna kanten (bild + luft, och förskjutning från kanten).
+    pub w: f32,
+    /// Övre och understa kanten i px under styckets överkant (kan vara negativ).
+    pub top: f32,
+    pub bottom: f32,
+}
+
+/// Vilken del av raden en flytande bild tar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Side {
+    Left,
+    Right,
+    /// Hela radens bredd: texten hoppar förbi bilden.
+    Full,
+}
+
+/// Var en flytande bild tar plats relativt stycket den är förankrad vid.
+#[derive(Clone, Copy, Debug)]
+struct FloatPlan {
+    /// `None` om bilden inte påverkar texten (bakom/framför).
+    side: Option<Side>,
+    w: f32,
+    top: f32,
+    bottom: f32,
+    /// Bilden är placerad relativt stycket (inte sidan).
+    para_rel: bool,
+}
+
+/// Planen för en flytande bild: den äldre kortformen sitter vid textkanten överst i stycket;
+/// ett ankare räknas mot spalten/sidan (se `anchor`) och ger sida, bredd och lodrät utsträckning.
+/// Idén med att texten tar den bredare sidan och att en bild utan plats trycker texten under den
+/// motsvarar hur WordCraft (crates/layout) hanterar omflöde.
+fn plan_float(f: &FloatSpec, zoom: f32, col_w: f32, ctx: &PageCtx, page_y: Option<f32>, line_h: f32) -> FloatPlan {
+    let Some(a) = f.anchor.map(|a| a.scaled(zoom)) else {
+        let side = if f.side == Float::Left { Side::Left } else { Side::Right };
+        return FloatPlan { side: Some(side), w: f.size.x + FLOAT_GAP * zoom, top: 0.0, bottom: f.size.y, para_rel: true };
+    };
+    let (w, h) = (f.size.x, f.size.y);
+    let x = a.x_in_column(w, ctx);
+    let (top, para_rel) = match a.y_at(h, ctx) {
+        VAt::Para(o) => (o, true),
+        VAt::Page(py) => (page_y.map_or(0.0, |s| py - s), false),
+    };
+    let (t, b) = (top - a.dist[0], top + h + a.dist[2]);
+    let (side, rw) = match a.wrap {
+        Wrap::Behind | Wrap::Front => (None, 0.0),
+        Wrap::TopBottom => (Some(Side::Full), 0.0),
+        Wrap::Square => match anchor::reserve(&a, x, w, col_w) {
+            anchor::Reserve::Left(r) => (Some(Side::Left), r),
+            anchor::Reserve::Right(r) => (Some(Side::Right), r),
+            anchor::Reserve::Full => (Some(Side::Full), 0.0),
+        },
+    };
+    // En rad som börjar strax ovanför en bild över hela bredden skulle överlappa den: den hoppar också.
+    let t = if side == Some(Side::Full) { t - line_h } else { t };
+    FloatPlan { side, w: rw, top: t, bottom: b, para_rel }
+}
+
+/// Uppskattning av var på arket en rad hamnar: samma regel som `pages::paginate` (en rad som inte
+/// ryms flyttas till nästa sida), utan tabellgrupper och bildhöjder.
+struct PageSim {
+    text_h: f32,
+    stride: f32,
+    top: f32,
+    page: usize,
+    shift: f32,
+}
+
+impl PageSim {
+    fn new(g: &super::pages::Geom) -> Self {
+        PageSim { text_h: g.text_h(), stride: g.stride(), top: g.top, page: 0, shift: 0.0 }
+    }
+
+    /// Radens läge på arket (från arkets överkant) för galleriets y före sidbrytning.
+    fn sheet_y(&self, y: f32) -> f32 {
+        let mut page = self.page;
+        let mut shift = self.shift;
+        // En rad som inte längre ryms går till nästa sida: håll fast vid sidans början.
+        if y + shift > page as f32 * self.stride + self.text_h {
+            page += 1;
+            shift = page as f32 * self.stride - y;
+        }
+        y + shift - page as f32 * self.stride + self.top
+    }
+
+    fn place(&mut self, y0: f32, h: f32) {
+        let top = y0 + self.shift;
+        let page_top = self.page as f32 * self.stride;
+        if top + h > page_top + self.text_h + 0.5 && top > page_top + 0.5 {
+            self.page += 1;
+            self.shift = self.page as f32 * self.stride - y0;
+        }
+    }
+}
 
 /// Lägger ut ett stycke och placerar dess rader: hängande indrag, centrering, högerjustering
 /// och marginaljustering.
@@ -1652,13 +1786,28 @@ fn layout_para_floats(
     let mut cur = para.clone();
     let mut y = 0.0f32;
     loop {
-        let act: Vec<&ActiveFloat> = floats.iter().filter(|f| f.2 > y + 0.25).collect();
-        let sum = |side: Float| act.iter().filter(|f| f.0 == side).map(|f| f.1).sum::<f32>();
-        let (lw, rw) = (sum(Float::Left), sum(Float::Right));
-        let cut = act.iter().map(|f| f.2).fold(f32::NEG_INFINITY, f32::max) - y;
+        let act: Vec<&ActiveFloat> = floats.iter().filter(|f| f.bottom > y + 0.25 && f.top <= y + 0.25).collect();
+        // Bild över hela bredden: texten hoppar till under bilden (luft ovanför nästa del).
+        let skip = act.iter().filter(|f| f.side == Side::Full).map(|f| f.bottom).fold(f32::NEG_INFINITY, f32::max);
+        let gap = if skip.is_finite() { skip - y } else { 0.0 };
+        let y_text = y + gap;
+        let act: Vec<&ActiveFloat> = if gap > 0.0 {
+            floats.iter().filter(|f| f.bottom > y_text + 0.25 && f.top <= y_text + 0.25).collect()
+        } else {
+            act
+        };
+        let wide = |side: Side| act.iter().filter(|f| f.side == side).map(|f| f.w).fold(0.0, f32::max);
+        let (lw, rw) = (wide(Side::Left), wide(Side::Right));
+        // Nästa gräns där bredden ändras: en bild slutar eller börjar.
+        let next = floats
+            .iter()
+            .flat_map(|f| [f.top, f.bottom])
+            .filter(|t| *t > y_text + 0.25)
+            .fold(f32::INFINITY, f32::min);
+        let cut = next.is_finite().then(|| next - y_text);
         let eff = (avail - lw - rw).max(24.0);
-        let (g, consumed) =
-            layout_piece(fonts, full, &cur, eff, lw, ppp, act.first().map(|_| cut), !pieces.is_empty(), true);
+        let (g, consumed) = layout_piece(fonts, full, &cur, eff, lw, ppp, cut, !pieces.is_empty(), true);
+        let g = add_space(g, gap);
         y += g.rect.height();
         pieces.push(g);
         let Some(n) = consumed else { break };

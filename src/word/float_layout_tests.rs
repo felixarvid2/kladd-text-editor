@@ -185,3 +185,78 @@ fn andrad_align_andrar_layouten() {
     assert!(a.rect.height() < b.rect.height() + 0.1);
     assert!(b.rows.iter().all(|r| r.pos.x < 1.0));
 }
+
+// --- Förankrade bilder (x/y/wrap/dist) ---
+
+fn img(attrs: &str) -> String {
+    format!("<img src=\"a.png\" alt=\"\" width=\"100\" {attrs}>")
+}
+
+#[test]
+fn forankrad_bild_med_forskjutning_tar_den_storre_sidan() {
+    // Bilden ligger 250 px in i en 600 px bred spalt: texten tar den bredare högra sidan.
+    let t = format!("{}\n\n{LONG}\n\n{LONG}\n\n{LONG}\n\nSlut", img("x=\"250\" y=\"0\""));
+    let (g, sides) = lay(&t, 600.0, Vec2::new(100.0, 90.0), None);
+    assert_eq!(sides.len(), 1);
+    assert_eq!(chars(&g), t.chars().count());
+    let beside: Vec<usize> = text_rows(&g).into_iter().filter(|&i| g.rows[i].pos.y < 89.0).collect();
+    assert!(!beside.is_empty());
+    for i in beside {
+        // Vänsterkant = bildens högerkant (350) + 12 px luft.
+        assert!(g.rows[i].pos.x >= 362.0 - 0.6, "rad {i} börjar vid {}", g.rows[i].pos.x);
+    }
+}
+
+#[test]
+fn topp_och_botten_hoppar_texten_under_bilden() {
+    let t = format!("{}\n\n{LONG}\n\n{LONG}\n\nSlut", img("x=\"center\" y=\"0\" wrap=\"top\""));
+    let (g, _) = lay(&t, 600.0, Vec2::new(100.0, 90.0), None);
+    assert_eq!(chars(&g), t.chars().count());
+    // Ingen text ovanför bildens underkant, och alla rader har full bredd.
+    for &i in &text_rows(&g) {
+        assert!(g.rows[i].pos.y >= 89.0, "rad {i} på y {}", g.rows[i].pos.y);
+        assert!(g.rows[i].pos.x < 1.0);
+    }
+}
+
+#[test]
+fn bakom_och_framfor_paverkar_inte_texten() {
+    let plain = format!("{LONG}\n\n{LONG}\n\nSlut");
+    let (a, _) = lay(&plain, 600.0, Vec2::new(100.0, 90.0), None);
+    for w in ["behind", "front"] {
+        let t = format!("{}\n\n{LONG}\n\n{LONG}\n\nSlut", img(&format!("hrel=\"page\" x=\"20\" vrel=\"page\" y=\"30\" wrap=\"{w}\"")));
+        let (g, sides) = lay(&t, 600.0, Vec2::new(100.0, 90.0), None);
+        assert_eq!(sides.len(), 1);
+        assert_eq!(text_rows(&g).len(), text_rows(&a).len(), "{w}");
+        assert!(text_rows(&g).iter().all(|&i| g.rows[i].pos.x < 1.0), "{w}");
+        // Bilden tar ingen plats: första textraden ligger överst.
+        assert!(g.rows[text_rows(&g)[0]].pos.y < 12.0, "{w}");
+    }
+}
+
+#[test]
+fn bild_i_helbredd_med_forskjutning_ger_text_ovanfor_och_under() {
+    // En bild i full textbredd 100 px under stycket (som i en LibreOffice-fil): raderna ovanför
+    // flyter normalt, resten hoppar under bilden.
+    let t = format!("{}\n\n{LONG}\n\n{LONG}\n\n{LONG}\n\nSlut", img("x=\"0\" y=\"100\"").replace("width=\"100\"", "width=\"600\""));
+    let (g, _) = lay(&t, 600.0, Vec2::new(600.0, 120.0), None);
+    assert_eq!(chars(&g), t.chars().count());
+    let ys: Vec<f32> = text_rows(&g).iter().map(|&i| g.rows[i].pos.y).collect();
+    // Bildens ruta: y 100..220 relativt styckets överkant (här 0).
+    assert!(ys.iter().any(|&y| y < 100.0), "ingen text ovanför bilden: {ys:?}");
+    assert!(ys.iter().all(|&y| y < 100.0 || y >= 219.0), "text över bilden: {ys:?}");
+    assert!(ys.iter().any(|&y| y >= 219.0), "{ys:?}");
+}
+
+#[test]
+fn sidrelativ_bild_flyttar_texten_efter_arkets_lage() {
+    // Bild i arkets övre vänstra hörn (0,0 på arket, i marginalen): den når 150 px in, så texten
+    // överst på sidan börjar efter bildens högerkant (räknat från textspaltens vänsterkant).
+    let geom = pages::Geom::new(1.0, &markup::analyze("").defaults);
+    let t = format!("{}\n\n{LONG}\n\n{LONG}\n\nSlut", img("hrel=\"page\" x=\"0\" vrel=\"page\" y=\"0\""));
+    let (g, _) = lay(&t, geom.text_w(), Vec2::new(150.0, 300.0), Some(&geom));
+    assert_eq!(chars(&g), t.chars().count());
+    let rows = text_rows(&g);
+    let first = &g.rows[rows[0]];
+    assert!(first.pos.x >= 150.0 + 12.0 - geom.left - 0.6, "x = {}", first.pos.x);
+}

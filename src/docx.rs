@@ -21,6 +21,7 @@ use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
 use crate::style::titles::{self, TitleKind};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
+use crate::word::anchor::{Anchor, HRel, Pos, VRel, Wrap};
 use crate::word::markup::{self, Float};
 
 /// Högsta antal poster i ett paket (WordCraft: zip_guard).
@@ -1036,8 +1037,13 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let repl = match name {
             Some(name) => {
                 let img = images.iter().find(|(n, _)| *n == name).map(|(_, i)| i);
-                let float = f.anchor.as_ref().and_then(|a| anchor_float(a, f.extent, &page));
-                image_md(&name, &f.alt, f.extent, img, float)
+                // Bilder i en tabellcell flyter inte (cellen har sin egen bredd): vanlig bild.
+                let in_cell = markdown.find(&f.placeholder).is_some_and(|at| {
+                    let ls = markdown[..at].rfind('\n').map_or(0, |i| i + 1);
+                    markdown[ls..].trim_start().starts_with('|')
+                });
+                let anchor = f.anchor.as_ref().filter(|_| !in_cell).map(|a| anchor_of(a, &page));
+                image_md(&name, &f.alt, f.extent, img, anchor, f.crop)
             }
             // Bilden går inte att visa: originalkörningen bevaras som markör.
             None => f.fallback.map(token_text).unwrap_or_default(),
@@ -1183,16 +1189,24 @@ fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Th
 
 /// Hur en bild skrivs i texten: `![alt](bild:namn)`, eller `<img … width>` när storleken avviker
 /// från bildens egen (96 dpi) eller från den som redan lagrats för bilden.
-fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Image>, float: Option<Float>) -> String {
+fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Image>, anchor: Option<Anchor>, crop: Option<[i64; 4]>) -> String {
+    let float = anchor.as_ref().and_then(Anchor::legacy_side);
+    let anchor = anchor.filter(|_| float.is_none());
+    // Beskärning i procent (`a:srcRect` är i tusendels procent).
+    let crop = crop
+        .map(|c| c.map(|v| v as f32 / 1000.0))
+        .filter(|c| c.iter().all(|v| (0.0..100.0).contains(v)) && c[0] + c[2] < 100.0 && c[1] + c[3] < 100.0);
+    let floating = float.is_some() || anchor.is_some();
     let differs = |a: f64, b: f64| b > 0.0 && (a - b).abs() / b > 0.02;
     let want = extent.map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
-    let natural = img.and_then(|i| imagesize::blob_size(&i.bytes).ok()).map(|s| s.width as f64);
+    let nat = img.and_then(|i| imagesize::blob_size(&i.bytes).ok()).map(|s| (s.width as f64, s.height as f64));
+    let natural = nat.map(|n| n.0);
     let stored = img.and_then(|i| i.extent).map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
     let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
-    // En flytande bild skrivs alltid som `<img … width align>`.
-    let want = if float.is_some() { want.or(natural) } else { want };
+    // En flytande eller beskuren bild skrivs alltid som `<img … width …>`.
+    let want = if floating || crop.is_some() { want.or(natural) } else { want };
     match want {
-        Some(w) if float.is_some() || natural.is_some_and(|n| differs(w, n)) || stored.is_some_and(|st| differs(w, st)) => {
+        Some(w) if floating || crop.is_some() || natural.is_some_and(|n| differs(w, n)) || stored.is_some_and(|st| differs(w, st)) => {
             let mut a = String::new();
             for c in alt.chars() {
                 match c {
@@ -1204,12 +1218,34 @@ fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Imag
                     c => a.push(c),
                 }
             }
-            let al = match float {
-                Some(Float::Left) => " align=\"left\"",
-                Some(Float::Right) => " align=\"right\"",
-                None => "",
-            };
-            format!("<img src=\"{src}\" alt=\"{a}\" width=\"{}\"{al}>", w.round().max(1.0) as i64)
+            // Höjden skrivs när den inte följer av bredden (beskuren eller sträckt bild).
+            let h = extent.map(|(_, cy)| cy as f64 / EMU_PER_PIXEL as f64).filter(|h| {
+                let ratio = match (nat, crop) {
+                    (Some((nw, nh)), Some(c)) => Some(nh * (1.0 - (c[1] + c[3]) as f64 / 100.0) / (nw * (1.0 - (c[0] + c[2]) as f64 / 100.0))),
+                    (Some((nw, nh)), None) => Some(nh / nw),
+                    _ => None,
+                };
+                match ratio {
+                    Some(r) => differs(*h, w * r),
+                    None => crop.is_some(),
+                }
+            });
+            let mut tag = format!("<img src=\"{src}\" alt=\"{a}\" width=\"{}\"", w.round().max(1.0) as i64);
+            if let Some(h) = h {
+                tag.push_str(&format!(" height=\"{}\"", h.round().max(1.0) as i64));
+            }
+            match (anchor, float) {
+                (Some(an), _) => an.write_attrs(&mut tag),
+                (None, Some(Float::Left)) => tag.push_str(" align=\"left\""),
+                (None, Some(Float::Right)) => tag.push_str(" align=\"right\""),
+                (None, None) => {}
+            }
+            if let Some(c) = crop {
+                let f = |v: f32| format!("{}", (v * 100.0).round() / 100.0);
+                tag.push_str(&format!(" crop=\"{} {} {} {}\"", f(c[0]), f(c[1]), f(c[2]), f(c[3])));
+            }
+            tag.push('>');
+            tag
         }
         _ => format!("![{}]({src})", escape_alt(alt)),
     }
@@ -1564,51 +1600,76 @@ struct FoundImage {
     target: String,
     alt: String,
     extent: Option<(i64, i64)>,
-    /// Förankrad bild med omflöde (`wp:anchor` + `wrapSquare/Tight/Through`): läget i sidled.
+    /// Förankrad bild (`wp:anchor`): läge, omflöde och avstånd.
     anchor: Option<AnchorPos>,
+    /// Beskärning (`a:srcRect`): vänster, ovan, höger, under i tusendels procent.
+    crop: Option<[i64; 4]>,
     /// Markör för hela körningen, om bilden inte går att visa.
     fallback: Option<usize>,
 }
 
-/// `wp:positionH` för en förankrad bild med textomflöde.
+/// Placeringen i en `wp:anchor`: `positionH`/`positionV`, omflöde och avstånd.
 #[derive(Default, Clone)]
 struct AnchorPos {
-    /// `relativeFrom` ("column", "margin", "page" …).
+    /// `relativeFrom` ("column", "margin", "page" …) i sidled.
     rel: String,
     /// `wp:align`: left, right, center, inside, outside.
     align: Option<String>,
     /// `wp:posOffset` i EMU.
     off: Option<i64>,
+    /// Samma i höjdled.
+    rel_v: String,
+    align_v: Option<String>,
+    off_v: Option<i64>,
+    /// Omflöde; `None` om ingen `wrap*`-tagg fanns (då ligger bilden framför texten).
+    wrap: Option<Wrap>,
+    /// `behindDoc="1"`.
+    behind: bool,
+    /// Avstånd till texten (ovan, under, vänster, höger) i EMU.
+    dist: [i64; 4],
+    /// `simplePos="1"`: läget i `wp:simplePos` (EMU från sidans hörn).
+    simple: Option<(i64, i64)>,
 }
 
-/// Sidan en förankrad bild flyter på: `align` left/right, eller en förskjutning nära vänster
-/// respektive höger marginal. Mitt på raden, "inside/outside" och okända lägen ger `None`
-/// (bilden blir en egen rad).
-fn anchor_float(a: &AnchorPos, extent: Option<(i64, i64)>, page: &DocDefaults) -> Option<Float> {
-    match a.align.as_deref() {
-        Some("left") => return Some(Float::Left),
-        Some("right") => return Some(Float::Right),
-        Some(_) => return None,
-        None => {}
-    }
-    let off = a.off? as f64;
-    let (pw, _) = page.page();
-    let [_, r, _, l] = page.margins();
-    let (l, text_w) = (l as f64 * 12700.0, (pw - l - r) as f64 * 12700.0);
-    let w = extent.map_or(0.0, |e| e.0 as f64);
-    // Bildens vänsterkant räknad från textspaltens vänsterkant.
-    let left = match a.rel.as_str() {
-        "page" => off - l,
-        "column" | "margin" | "leftMargin" | "character" | "" => off,
-        _ => return None,
+/// Dialektens ankare för en förankrad bild. Lägen relativt kanter som Kladd inte har egna
+/// (`leftMargin`, `bottomMargin` …) räknas om till sidan eller marginalen.
+fn anchor_of(a: &AnchorPos, page: &DocDefaults) -> Anchor {
+    let emu = |v: i64| (v as f64 / EMU_PER_PIXEL as f64) as f32;
+    let (pw, ph) = page.page();
+    let [_, mr, mb, _] = page.margins();
+    let half = |v: Option<&str>| match v {
+        Some("left" | "top" | "inside") => Some(Pos::Start),
+        Some("center") => Some(Pos::Center),
+        Some("right" | "bottom" | "outside") => Some(Pos::End),
+        _ => None,
     };
-    if left <= 0.25 * text_w {
-        Some(Float::Left)
-    } else if left + w >= 0.75 * text_w {
-        Some(Float::Right)
-    } else {
-        None
+    let (mut hrel, hbase) = match a.rel.as_str() {
+        "page" => (HRel::Page, None),
+        "margin" | "insideMargin" | "outsideMargin" => (HRel::Margin, None),
+        "leftMargin" => (HRel::Page, None),
+        "rightMargin" => (HRel::Page, Some(pw - mr)),
+        _ => (HRel::Column, None),
+    };
+    let mut hpos = half(a.align.as_deref()).unwrap_or_else(|| Pos::Off(emu(a.off.unwrap_or(0)) + hbase.unwrap_or(0.0)));
+    let (mut vrel, vbase) = match a.rel_v.as_str() {
+        "page" | "topMargin" => (VRel::Page, None),
+        "margin" | "insideMargin" | "outsideMargin" => (VRel::Margin, None),
+        "bottomMargin" => (VRel::Page, Some(ph - mb)),
+        _ => (VRel::Paragraph, None),
+    };
+    let mut vpos = half(a.align_v.as_deref()).unwrap_or_else(|| Pos::Off(emu(a.off_v.unwrap_or(0)) + vbase.unwrap_or(0.0)));
+    if vrel == VRel::Paragraph && !matches!(vpos, Pos::Off(_)) {
+        vpos = Pos::Off(0.0);
     }
+    if let Some((x, y)) = a.simple {
+        (hrel, hpos, vrel, vpos) = (HRel::Page, Pos::Off(emu(x)), VRel::Page, Pos::Off(emu(y)));
+    }
+    let wrap = match a.wrap {
+        Some(w) => w,
+        None if a.behind => Wrap::Behind,
+        None => Wrap::Front,
+    };
+    Anchor { hrel, h: hpos, vrel, v: vpos, wrap, dist: [emu(a.dist[0]), emu(a.dist[3]), emu(a.dist[1]), emu(a.dist[2])] }
 }
 
 /// Lägger originalets XML i listan över okända objekt och ger dess nummer.
@@ -1641,12 +1702,80 @@ struct Drawing {
     extent: Option<(i64, i64)>,
     /// `wp:anchor` (inte `wp:inline`).
     anchored: bool,
-    /// `wrapSquare`, `wrapTight` eller `wrapThrough`: texten flyter runt bilden.
-    wraps: bool,
     pos: AnchorPos,
-    in_pos_h: bool,
+    /// Inuti `positionH` (1) eller `positionV` (2).
+    in_pos: u8,
     /// Vad nästa text är: 1 = `wp:align`, 2 = `wp:posOffset`.
     text_of: u8,
+    /// `a:srcRect` (vänster, ovan, höger, under; tusendels procent).
+    crop: Option<[i64; 4]>,
+    /// Läget kommer från en VML-form (`v:shape`).
+    vml: bool,
+}
+
+/// Läser storlek och läge ur `style` på en VML-form (`width:72pt;margin-left:10pt;position:absolute …`).
+fn vml_style(style: &str, d: &mut Drawing) {
+    let get = |k: &str| {
+        style.split(';').find_map(|kv| {
+            let (a, b) = kv.split_once(':')?;
+            (a.trim().eq_ignore_ascii_case(k)).then(|| b.trim().to_owned())
+        })
+    };
+    // Längd i EMU.
+    let emu = |v: &str| -> Option<i64> {
+        let v = v.trim().to_ascii_lowercase();
+        let (n, f) = if let Some(n) = v.strip_suffix("pt") {
+            (n, 12700.0)
+        } else if let Some(n) = v.strip_suffix("in") {
+            (n, 914_400.0)
+        } else if let Some(n) = v.strip_suffix("cm") {
+            (n, 360_000.0)
+        } else if let Some(n) = v.strip_suffix("mm") {
+            (n, 36_000.0)
+        } else if let Some(n) = v.strip_suffix("px") {
+            (n, 9525.0)
+        } else {
+            (v.as_str(), 9525.0)
+        };
+        n.trim().parse::<f64>().ok().filter(|x| x.is_finite() && x.abs() < 1.0e5).map(|x| (x * f) as i64)
+    };
+    let (w, h) = (get("width").and_then(|v| emu(&v)), get("height").and_then(|v| emu(&v)));
+    if let (Some(w), Some(h)) = (w, h) {
+        if w > 0 && h > 0 {
+            d.extent = Some((w, h));
+        }
+    }
+    d.vml = true;
+    if get("position").as_deref() == Some("absolute") {
+        d.anchored = true;
+        d.pos.off = get("margin-left").or_else(|| get("left")).and_then(|v| emu(&v)).or(Some(0));
+        d.pos.off_v = get("margin-top").or_else(|| get("top")).and_then(|v| emu(&v)).or(Some(0));
+        d.pos.rel = match get("mso-position-horizontal-relative").as_deref() {
+            Some("page") => "page",
+            Some("margin") => "margin",
+            _ => "column",
+        }
+        .to_owned();
+        d.pos.rel_v = match get("mso-position-vertical-relative").as_deref() {
+            Some("page") => "page",
+            Some("margin") => "margin",
+            _ => "paragraph",
+        }
+        .to_owned();
+        if let Some(a) = get("mso-position-horizontal") {
+            if matches!(a.as_str(), "left" | "center" | "right" | "inside" | "outside") {
+                d.pos.align = Some(a);
+            }
+        }
+        if let Some(a) = get("mso-position-vertical") {
+            if matches!(a.as_str(), "top" | "center" | "bottom" | "inside" | "outside") {
+                d.pos.align_v = Some(a);
+            }
+        }
+        d.pos.behind = get("z-index").and_then(|z| z.parse::<i64>().ok()).is_some_and(|z| z < 0);
+        d.pos.dist = [0, 0, 114_300, 114_300];
+        // Utan `w10:wrap` ligger formen framför texten.
+    }
 }
 
 fn escape_alt(s: &str) -> String {
@@ -1961,14 +2090,58 @@ fn parse_body(
                                 skip = 1;
                             }
                         }
-                        b"anchor" => d.anchored = true,
-                        b"wrapSquare" | b"wrapTight" | b"wrapThrough" => d.wraps = true,
+                        b"anchor" => {
+                            d.anchored = true;
+                            let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0).max(0);
+                            d.pos.dist = [n(b"distT"), n(b"distB"), n(b"distL"), n(b"distR")];
+                            d.pos.behind = matches!(attr(e, b"behindDoc").as_deref(), Some("1" | "true"));
+                            if matches!(attr(e, b"simplePos").as_deref(), Some("1" | "true")) {
+                                d.pos.simple = Some((0, 0));
+                            }
+                        }
+                        b"simplePos" if d.pos.simple.is_some() => {
+                            let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                            d.pos.simple = Some((n(b"x"), n(b"y")));
+                        }
+                        b"wrapSquare" | b"wrapTight" | b"wrapThrough" | b"wrapTopAndBottom" => {
+                            d.pos.wrap = Some(if name == b"wrapTopAndBottom" { Wrap::TopBottom } else { Wrap::Square });
+                            // Avstånd på wrap-taggen går före anchorns.
+                            for (i, k) in [&b"distT"[..], b"distB", b"distL", b"distR"].iter().enumerate() {
+                                if let Some(v) = attr(e, k).and_then(|v| v.parse::<i64>().ok()) {
+                                    d.pos.dist[i] = v.max(0);
+                                }
+                            }
+                        }
+                        // Äldre VML-bild (`v:shape` med `v:imagedata`): storlek och läge ur `style`.
+                        b"shape" if d.extent.is_none() => {
+                            if let Some(st) = attr(e, b"style") {
+                                vml_style(&st, d);
+                            }
+                        }
+                        b"wrap" if d.vml => {
+                            d.pos.wrap = match attr(e, b"type").as_deref() {
+                                Some("square" | "tight" | "through") => Some(Wrap::Square),
+                                Some("topAndBottom") => Some(Wrap::TopBottom),
+                                _ => None,
+                            };
+                        }
+                        b"srcRect" => {
+                            let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                            let c = [n(b"l"), n(b"t"), n(b"r"), n(b"b")];
+                            if d.crop.is_none() && c.iter().any(|v| *v != 0) {
+                                d.crop = Some(c);
+                            }
+                        }
                         b"positionH" => {
                             d.pos.rel = attr(e, b"relativeFrom").unwrap_or_default();
-                            d.in_pos_h = !empty;
+                            d.in_pos = if empty { 0 } else { 1 };
                         }
-                        b"align" if d.in_pos_h && !empty => d.text_of = 1,
-                        b"posOffset" if d.in_pos_h && !empty => d.text_of = 2,
+                        b"positionV" => {
+                            d.pos.rel_v = attr(e, b"relativeFrom").unwrap_or_default();
+                            d.in_pos = if empty { 0 } else { 2 };
+                        }
+                        b"align" if d.in_pos != 0 && !empty => d.text_of = 1,
+                        b"posOffset" if d.in_pos != 0 && !empty => d.text_of = 2,
                         _ => {}
                     }
                     continue;
@@ -2310,7 +2483,7 @@ fn parse_body(
                 if let Some(d) = drawing.as_mut() {
                     d.depth -= 1;
                     match local(e.name().as_ref()) {
-                        b"positionH" => d.in_pos_h = false,
+                        b"positionH" | b"positionV" => d.in_pos = 0,
                         b"align" | b"posOffset" => d.text_of = 0,
                         _ => {}
                     }
@@ -2329,7 +2502,8 @@ fn parse_body(
                                 target: resolve_target(dir, &target),
                                 alt: alt.trim().to_owned(),
                                 extent: d.extent,
-                                anchor: (d.anchored && d.wraps).then_some(d.pos),
+                                anchor: d.anchored.then_some(d.pos),
+                                crop: d.crop,
                                 fallback: None,
                             });
                         }
@@ -2500,9 +2674,12 @@ fn parse_body(
             Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => {
                 if let Some(d) = drawing.as_mut().filter(|d| d.text_of != 0) {
                     let t = text_of(&ev);
-                    match d.text_of {
-                        1 => d.pos.align = Some(t.trim().to_ascii_lowercase()),
-                        _ => d.pos.off = t.trim().parse().ok(),
+                    let v = d.in_pos == 2;
+                    match (d.text_of, v) {
+                        (1, false) => d.pos.align = Some(t.trim().to_ascii_lowercase()),
+                        (1, true) => d.pos.align_v = Some(t.trim().to_ascii_lowercase()),
+                        (_, false) => d.pos.off = t.trim().parse().ok(),
+                        (_, true) => d.pos.off_v = t.trim().parse().ok(),
                     }
                 } else if skip == 0 && in_t && !hidden(&field_depth) {
                     let t = text_of(&ev).replace(['\n', '\r'], " ");
@@ -3108,7 +3285,7 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str, float: Option<Float>) {
+    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str, place: Option<(Option<Float>, Option<Anchor>)>, crop: Option<[f64; 4]>) {
         let Some(ext) = image_ext(&bytes) else { return };
         // Samma bild flera gånger bäddas bara in en gång; en bild som redan finns i
         // originalpaketet återanvänds.
@@ -3143,19 +3320,55 @@ impl<'a> Writer<'a> {
         const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
         // Gemensam del efter placeringen: storlek, beskrivning och själva bilden.
         let tail = format!(
-            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
+            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/>{{SRC_RECT}}<a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
         );
-        let drawing = match float {
-            // Flytande bild: förankrad vid stycket, vid vänster/höger textkant, text runt (12 px luft).
-            Some(side) => {
-                let (al, dist_l, dist_r) = match side {
-                    Float::Left => ("left", 0, 114300),
-                    Float::Right => ("right", 114300, 0),
+        let src_rect = crop
+            .map(|c| format!(r#"<a:srcRect l="{}" t="{}" r="{}" b="{}"/>"#, (c[0] * 1000.0).round() as i64, (c[1] * 1000.0).round() as i64, (c[2] * 1000.0).round() as i64, (c[3] * 1000.0).round() as i64))
+            .unwrap_or_default();
+        let tail = tail.replace("{SRC_RECT}", &src_rect);
+        // Dialektens ankare, eller kortformen `align` (vid vänster/höger textkant, 12 px luft).
+        let anchor = match place {
+            Some((_, Some(a))) => Some(a),
+            Some((Some(side), None)) => Some(Anchor {
+                h: if side == Float::Left { Pos::Start } else { Pos::End },
+                dist: if side == Float::Left { [0.0, 12.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0, 12.0] },
+                ..Anchor::default()
+            }),
+            _ => None,
+        };
+        let drawing = match anchor {
+            Some(a) => {
+                let emu = |v: f32| ((v as f64) * EMU_PER_PIXEL as f64).round() as i64;
+                let pos = |p: Pos, names: [&str; 3]| match p {
+                    Pos::Off(o) => format!("<wp:posOffset>{}</wp:posOffset>", emu(o)),
+                    Pos::Start => format!("<wp:align>{}</wp:align>", names[0]),
+                    Pos::Center => format!("<wp:align>{}</wp:align>", names[1]),
+                    Pos::End => format!("<wp:align>{}</wp:align>", names[2]),
                 };
+                let hrel = match a.hrel {
+                    HRel::Column => "column",
+                    HRel::Margin => "margin",
+                    HRel::Page => "page",
+                };
+                let vrel = match a.vrel {
+                    VRel::Paragraph => "paragraph",
+                    VRel::Margin => "margin",
+                    VRel::Page => "page",
+                };
+                let wrap = match a.wrap {
+                    Wrap::Square => r#"<wp:wrapSquare wrapText="bothSides"/>"#,
+                    Wrap::TopBottom => "<wp:wrapTopAndBottom/>",
+                    Wrap::Behind | Wrap::Front => "<wp:wrapNone/>",
+                };
+                let [dt, dr, db, dl] = a.dist.map(emu);
                 format!(
-                    r#"<wp:anchor xmlns:wp="{WP}" xmlns:r="{R_NS}" distT="0" distB="0" distL="{dist_l}" distR="{dist_r}" simplePos="0" relativeHeight="{}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>{al}</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>{}</wp:anchor>"#,
+                    r#"<wp:anchor xmlns:wp="{WP}" xmlns:r="{R_NS}" distT="{dt}" distB="{db}" distL="{dl}" distR="{dr}" simplePos="0" relativeHeight="{}" behindDoc="{}" locked="0" layoutInCell="1" allowOverlap="{}"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="{hrel}">{}</wp:positionH><wp:positionV relativeFrom="{vrel}">{}</wp:positionV>{}</wp:anchor>"#,
                     251_658_240 + doc_pr,
-                    tail.replace("{WRAP}", r#"<wp:wrapSquare wrapText="bothSides"/>"#)
+                    u8::from(a.wrap == Wrap::Behind),
+                    u8::from(!a.wrap.affects_text()),
+                    pos(a.h, ["left", "center", "right"]),
+                    pos(a.v, ["top", "center", "bottom"]),
+                    tail.replace("{WRAP}", wrap)
                 )
             }
             None => format!(
@@ -3438,15 +3651,18 @@ impl<'a> Writer<'a> {
     }
 
     /// Bäddar in en bild från en `![](…)` eller `<img>`; saknas bilden stannar texten.
-    fn image_ref(&mut self, src: &str, alt: &str, size: (Option<f64>, Option<f64>), float: Option<Float>, resolve: &dyn Fn(&str) -> Option<Image>) {
+    fn image_ref(&mut self, tag: &ImgTag, resolve: &dyn Fn(&str) -> Option<Image>) {
+        let (src, alt) = (tag.src.as_str(), tag.alt.as_str());
         if self.in_footnote {
             self.run(alt, false);
             return;
         }
         match resolve(src) {
             Some(img) if is_supported_image(&img.bytes) => {
-                let extent = sized_extent(&img, size);
-                self.picture(img.bytes, extent, alt, float);
+                let extent = sized_extent(&img, (tag.width, tag.height), tag.crop);
+                // En bild i en tabellcell eller i en lista flyter inte.
+                let place = if self.table.is_some() { None } else { Some((tag.align, tag.anchor)) };
+                self.picture(img.bytes, extent, alt, place, tag.crop);
             }
             _ => {
                 self.missing.push(src.to_owned());
@@ -3525,6 +3741,9 @@ struct ImgTag {
     width: Option<f64>,
     height: Option<f64>,
     align: Option<Float>,
+    anchor: Option<Anchor>,
+    /// Beskärning i procent: vänster, ovan, höger, under.
+    crop: Option<[f64; 4]>,
 }
 
 fn parse_img(s: &str) -> Option<ImgTag> {
@@ -3538,6 +3757,7 @@ fn parse_img(s: &str) -> Option<ImgTag> {
     }
     let decode = |v: &str| v.replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
     let (mut src, mut alt, mut width, mut height, mut align) = (None, String::new(), None, None, None);
+    let mut extra: Vec<(String, String)> = Vec::new();
     let mut chars = inner.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
         if c.is_whitespace() {
@@ -3598,16 +3818,26 @@ fn parse_img(s: &str) -> Option<ImgTag> {
                     _ => None,
                 }
             }
-            _ => {}
+            _ => extra.push((name, value.clone())),
         }
     }
-    Some(ImgTag { src: src.filter(|s| !s.is_empty())?, alt, width, height, align })
+    let anchor = Anchor::from_attrs(&|k| extra.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()));
+    let crop = extra.iter().find(|(n, _)| n == "crop").and_then(|(_, v)| {
+        let n: Vec<f64> = v.split_whitespace().filter_map(|s| s.parse::<f64>().ok()).filter(|x| x.is_finite() && (0.0..100.0).contains(x)).collect();
+        (n.len() == 4 && n[0] + n[2] < 100.0 && n[1] + n[3] < 100.0 && n.iter().any(|x| *x > 0.0)).then(|| [n[0], n[1], n[2], n[3]])
+    });
+    Some(ImgTag { src: src.filter(|s| !s.is_empty())?, alt, width, height, align, anchor, crop })
 }
 
 /// Bildens storlek i EMU när taggen anger bredd och/eller höjd i CSS-pixlar (bevarar proportionerna).
-fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>)) -> Option<(i64, i64)> {
+fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>), crop: Option<[f64; 4]>) -> Option<(i64, i64)> {
     let px = EMU_PER_PIXEL as f64;
     let natural = imagesize::blob_size(&img.bytes).ok().map(|s| (s.width as f64, s.height as f64)).or(img.extent.map(|(x, y)| (x as f64, y as f64)));
+    // Den synliga delen av en beskuren bild bestämmer proportionerna och grundstorleken.
+    let natural = natural.map(|(w, h)| match crop {
+        Some(c) => (w * (1.0 - (c[0] + c[2]) / 100.0), h * (1.0 - (c[1] + c[3]) / 100.0)),
+        None => (w, h),
+    });
     match (size, natural) {
         ((None, None), _) => img.extent,
         ((Some(w), Some(h)), _) => Some(((w * px) as i64, (h * px) as i64)),
@@ -3888,7 +4118,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 TagEnd::Link => w.fmt.link = None,
                 TagEnd::Image => {
                     if let Some((src, alt)) = w.image.take() {
-                        w.image_ref(&src, &alt, (None, None), None, resolve);
+                        w.image_ref(&ImgTag { src, alt, width: None, height: None, align: None, anchor: None, crop: None }, resolve);
                     }
                 }
                 _ => {}
@@ -3944,7 +4174,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         w.rev = None;
                     }
                 } else if let Some(img) = parse_img(&s) {
-                    w.image_ref(&img.src, &img.alt, (img.width, img.height), img.align, resolve);
+                    w.image_ref(&img, resolve);
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.toc(md);
@@ -6578,7 +6808,7 @@ Marginal
         let back = read(&out.bytes).unwrap();
         let name = &back.images[0].0;
         let want = format!(
-            "<img src=\"bild:{name}\" alt=\"Sol &amp; måne\" width=\"240\">\n\nText med <img src=\"bild:{name}\" alt=\"\" width=\"100\"> inne.\n\n<img src=\"bild:{name}\" alt=\"Ren\" width=\"1\">\n"
+            "<img src=\"bild:{name}\" alt=\"Sol &amp; måne\" width=\"240\">\n\nText med <img src=\"bild:{name}\" alt=\"\" width=\"100\" height=\"50\"> inne.\n\n<img src=\"bild:{name}\" alt=\"Ren\" width=\"1\">\n"
         );
         assert_eq!(back.markdown, want);
         // Och tillbaka igen, nu med Source, med bilderna från dokumentet.
@@ -6634,39 +6864,104 @@ Marginal
         let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
         let md = "<img src=\"bild:a.png\" alt=\"\" width=\"200\" align=\"left\">\n";
         let w = write(md, "x", &resolve, None).unwrap().bytes;
-        // Byter `from` mot `to` i document.xml och ger sidan bilden får vid inläsning.
+        // Byter `from` mot `to` i document.xml och ger bildtaggens attribut vid inläsning.
         let read_with = |from: &str, to: &str| {
             let b = patch_document(&w, |x| x.replace(from, to));
             let m = read(&b).unwrap().markdown;
-            if m.contains("align=\"left\"") {
-                "left"
-            } else if m.contains("align=\"right\"") {
-                "right"
-            } else {
-                "none"
-            }
+            let t = m.split("<img ").nth(1).and_then(|t| t.split('>').next()).unwrap_or("").to_owned();
+            t.split("alt=\"\" ").nth(1).unwrap_or("").to_owned()
         };
         let al = |a: &str| read_with("<wp:align>left</wp:align>", &format!("<wp:align>{a}</wp:align>"));
-        assert_eq!(al("left"), "left");
-        assert_eq!(al("right"), "right");
-        assert_eq!(al("center"), "none");
-        // wrapTight och wrapThrough flyter också; wrapTopAndBottom och wrapNone gör det inte.
+        assert_eq!(al("left"), "width=\"200\" align=\"left\"");
+        // (Avståndet 12 px ligger på höger sida i den skrivna bilden, så detta är inte "align".)
+        assert_eq!(al("right"), "width=\"200\" x=\"right\" y=\"0\" dist=\"0 12 0 0\"");
+        assert_eq!(al("center"), "width=\"200\" x=\"center\" y=\"0\" dist=\"0 12 0 0\"");
+        // wrapTight och wrapThrough flyter också; wrapTopAndBottom och wrapNone får egna lägen.
         let sq = r#"<wp:wrapSquare wrapText="bothSides"/>"#;
         let poly = r#"<wp:wrapPolygon edited="0"><wp:start x="0" y="0"/></wp:wrapPolygon>"#;
-        assert_eq!(read_with(sq, &format!(r#"<wp:wrapTight wrapText="bothSides">{poly}</wp:wrapTight>"#)), "left");
-        assert_eq!(read_with(sq, &format!(r#"<wp:wrapThrough wrapText="bothSides">{poly}</wp:wrapThrough>"#)), "left");
-        assert_eq!(read_with(sq, "<wp:wrapTopAndBottom/>"), "none");
-        assert_eq!(read_with(sq, "<wp:wrapNone/>"), "none");
-        // Förskjutning nära vänster/höger marginal i stället för align (A4: textbredd 5731510 EMU).
+        assert_eq!(read_with(sq, &format!(r#"<wp:wrapTight wrapText="bothSides">{poly}</wp:wrapTight>"#)), "width=\"200\" align=\"left\"");
+        assert_eq!(read_with(sq, &format!(r#"<wp:wrapThrough wrapText="bothSides">{poly}</wp:wrapThrough>"#)), "width=\"200\" align=\"left\"");
+        assert_eq!(read_with(sq, "<wp:wrapTopAndBottom/>"), "width=\"200\" x=\"left\" y=\"0\" wrap=\"top\" dist=\"0 12 0 0\"");
+        assert_eq!(read_with(sq, "<wp:wrapNone/>"), "width=\"200\" x=\"left\" y=\"0\" wrap=\"front\" dist=\"0 12 0 0\"");
+        let behind = patch_document(&w, |x| x.replace(sq, "<wp:wrapNone/>").replace("behindDoc=\"0\"", "behindDoc=\"1\""));
+        assert!(read(&behind).unwrap().markdown.contains("wrap=\"behind\""));
+        // Förskjutning i stället för align, med referens.
         let h = r#"<wp:positionH relativeFrom="column"><wp:align>left</wp:align></wp:positionH>"#;
         let off = |rel: &str, o: i64| read_with(h, &format!(r#"<wp:positionH relativeFrom="{rel}"><wp:posOffset>{o}</wp:posOffset></wp:positionH>"#));
-        assert_eq!(off("column", 0), "left");
-        assert_eq!(off("column", 3_800_000), "right");
-        assert_eq!(off("column", 2_000_000), "none");
-        assert_eq!(off("page", 720_000), "left");
+        assert_eq!(off("column", 0), "width=\"200\" x=\"0\" y=\"0\" dist=\"0 12 0 0\"");
+        assert_eq!(off("column", 1_905_000), "width=\"200\" x=\"200\" y=\"0\" dist=\"0 12 0 0\"");
+        assert_eq!(off("page", 720_000), "width=\"200\" hrel=\"page\" x=\"75.6\" y=\"0\" dist=\"0 12 0 0\"");
+        // Lodrät placering mot sidan, avstånd och beskärning.
+        let v = r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#;
+        assert_eq!(
+            read_with(v, r#"<wp:positionV relativeFrom="page"><wp:align>bottom</wp:align></wp:positionV>"#),
+            "width=\"200\" x=\"left\" vrel=\"page\" y=\"bottom\" dist=\"0 12 0 0\""
+        );
+        assert_eq!(read_with("distT=\"0\" distB=\"0\"", "distT=\"95250\" distB=\"190500\""), "width=\"200\" x=\"left\" y=\"0\" dist=\"10 12 20 0\"");
+        let cropped = read_with("<a:stretch>", "<a:srcRect l=\"10000\" t=\"0\" r=\"5500\" b=\"0\"/><a:stretch>");
+        assert_eq!(cropped, "width=\"200\" height=\"200\" align=\"left\" crop=\"10 0 5.5 0\"");
         // Inline-bilder blir aldrig flytande.
         let inl = w_inline();
         assert!(!read(&inl).unwrap().markdown.contains("align="));
+    }
+
+    #[test]
+    fn anchored_image_roundtrip() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let md = concat!(
+            "<img src=\"bild:a.png\" alt=\"A\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\" dist=\"0 6 0 6\"> Text\n\n",
+            "<img src=\"bild:a.png\" alt=\"\" width=\"100\" height=\"60\" x=\"center\" y=\"12\" wrap=\"top\" crop=\"10 0 5.5 0\">\n\n",
+            "<img src=\"bild:a.png\" alt=\"\" width=\"50\" hrel=\"margin\" x=\"right\" vrel=\"margin\" y=\"20\" dist=\"3 4 5 6\">\n\nSlut\n"
+        );
+        let out = write(md, "x", &resolve, None).unwrap();
+        let doc = part_text(&out.bytes, "word/document.xml");
+        assert_eq!(doc.matches("<wp:anchor ").count(), 3, "{doc}");
+        assert!(doc.contains(r#"behindDoc="1""#) && doc.contains("<wp:wrapNone/>") && doc.contains("<wp:wrapTopAndBottom/>"));
+        assert!(doc.contains(r#"<wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset></wp:positionH><wp:positionV relativeFrom="page"><wp:align>bottom</wp:align></wp:positionV>"#), "{doc}");
+        assert!(doc.contains(r#"<wp:positionH relativeFrom="column"><wp:align>center</wp:align></wp:positionH>"#));
+        assert!(doc.contains(r#"<a:srcRect l="10000" t="0" r="5500" b="0"/>"#));
+        assert!(doc.contains(r#"distT="28575" distB="47625" distL="57150" distR="38100""#), "{doc}");
+        // Tillbaka: samma dialekt.
+        let back = read(&out.bytes).unwrap();
+        let name = &back.images[0].0;
+        assert_eq!(back.markdown, md.replace("bild:a.png", &format!("bild:{name}")), "{}", back.markdown);
+        // Och igen med Source: oförändrat.
+        let imgs = back.images.clone();
+        let again = write(&back.markdown, "x", &move |s| imgs.iter().find(|(n, _)| Some(n.as_str()) == s.strip_prefix(IMAGE_SCHEME)).map(|(_, i)| i.clone()), back.source.as_ref()).unwrap();
+        assert_eq!(read(&again.bytes).unwrap().markdown, back.markdown);
+    }
+
+    #[test]
+    fn anchored_image_in_table_cell_is_inline() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let w = write("<img src=\"bild:a.png\" alt=\"\" width=\"60\" align=\"left\">\n", "x", &resolve, None).unwrap().bytes;
+        // Flytta in anchor-elementet i en tabellcell.
+        let b = patch_document(&w, |x| {
+            let i = x.find("<w:p>").unwrap();
+            let j = x.find("</w:p>").unwrap() + 6;
+            let p = x[i..j].to_owned();
+            let tbl = format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"4000\"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w=\"4000\" w:type=\"dxa\"/></w:tcPr>{p}</w:tc></w:tr></w:tbl><w:p/>");
+            format!("{}{}{}", &x[..i], tbl, &x[j..])
+        });
+        let m = read(&b).unwrap().markdown;
+        assert!(m.contains("<img") && !m.contains("align=") && !m.contains(" x="), "{m}");
+    }
+
+    #[test]
+    fn vml_picture_position_is_read() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let w = write("<img src=\"bild:a.png\" alt=\"\" width=\"60\" align=\"left\">\n", "x", &resolve, None).unwrap().bytes;
+        let b = patch_document(&w, |x| {
+            let id = x.split("r:embed=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_owned();
+            let i = x.find("<w:drawing>").unwrap();
+            let j = x.find("</w:drawing>").unwrap() + "</w:drawing>".len();
+            let pict = format!(
+                "<w:pict><v:shape id=\"s1\" type=\"#_x0000_t75\" style=\"position:absolute;margin-left:72pt;margin-top:36pt;width:144pt;height:72pt;z-index:-1;mso-position-horizontal-relative:page;mso-position-vertical-relative:page\"><v:imagedata r:id=\"{id}\"/><w10:wrap type=\"square\"/></v:shape></w:pict>"
+            );
+            format!("{}{}{}", &x[..i], pict, &x[j..])
+        });
+        let m = read(&b).unwrap().markdown;
+        assert!(m.contains("width=\"192\" height=\"96\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"48\">"), "{m}");
     }
 
     fn w_inline() -> Vec<u8> {
