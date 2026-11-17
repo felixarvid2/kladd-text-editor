@@ -850,6 +850,11 @@ struct BoxRead {
     token: usize,
     shape: docx_tbox::Shape,
     blocks: Vec<Block>,
+    /// Bredd (pt) och vågrätt läge ur ankaret (`wp:anchor`), annars rutan i flödet.
+    width: f32,
+    x: crate::word::pbox::FrameX,
+    /// `x` är ett avstånd från sidans vänsterkant (räknas om till spalten när sidan är känd).
+    page_rel: bool,
 }
 
 impl Para {
@@ -1052,6 +1057,18 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         Some(((w - m[1] - m[3]) * 20.0) as f64)
     };
     fill_para_looks(&mut blocks, &info.elems, &para_styles);
+    // Rutor placerade från sidans kant: räknas om till spaltens vänsterkant.
+    let left_margin = page.margins()[3];
+    for b in blocks.iter_mut() {
+        if let Block::Para(p) = b {
+            for bx in p.boxes.iter_mut().filter(|b| b.page_rel) {
+                if let crate::word::pbox::FrameX::Off(v) = bx.x {
+                    bx.x = crate::word::pbox::FrameX::Off((v - left_margin).max(0.0));
+                }
+                bx.page_rel = false;
+            }
+        }
+    }
     let mut tboxes: HashMap<usize, (String, String)> = HashMap::new();
     for b in &blocks {
         if let Block::Para(p) = b {
@@ -1852,6 +1869,7 @@ fn is_toc_xml(xml: &str) -> bool {
 fn read_box(
     inner: &str,
     shape_xml: &str,
+    d: &Drawing,
     (styles, theme, numbering, rels): (&Styles, &Theme, &Numbering, &HashMap<String, (String, String, bool)>),
     dropped: &mut Dropped,
     dir: &str,
@@ -1867,7 +1885,22 @@ fn read_box(
         return None;
     }
     let shape = docx_tbox::read_shape(shape_xml, &|n| theme.color(n));
-    Some(BoxRead { token: 0, shape, blocks })
+    use crate::word::pbox::FrameX;
+    let width = d.extent.map_or(0.0, |(cx, _)| cx as f32 / 12700.0);
+    // Läget i spalten: justering eller förskjutning från kolumn/marginal. Sidrelativa lägen är inte kända här.
+    let x = match (d.anchored, d.pos.align.as_deref()) {
+        (true, Some("center")) => FrameX::Center,
+        (true, Some("right" | "outside")) => FrameX::End,
+        (true, Some(_)) => FrameX::Start,
+        (true, None) if matches!(d.pos.rel.as_str(), "" | "column" | "margin" | "character") => FrameX::Off(d.pos.off.unwrap_or(0) as f32 / 12700.0),
+        _ => FrameX::Start,
+    };
+    let page_rel = d.anchored && d.pos.align.is_none() && matches!(d.pos.rel.as_str(), "page" | "leftMargin");
+    let x = match (page_rel, x) {
+        (true, _) => FrameX::Off(d.pos.off.unwrap_or(0) as f32 / 12700.0),
+        (_, x) => x,
+    };
+    Some(BoxRead { token: 0, shape, blocks, width, x, page_rel })
 }
 
 fn parse_body(
@@ -2508,7 +2541,7 @@ fn parse_body(
                             // Textrutan visas som stycken före ankarstycket (`docx_tbox`).
                             if let Some((s, e)) = d.tx.filter(|_| !info.in_box && tables.is_empty() && !hidden(&field_depth)) {
                                 let shape_xml = format!("{}{}", &xml[d.start..s], &xml[e..after]);
-                                run_box = read_box(&xml[s..e], &shape_xml, (styles, theme, numbering, rels), dropped, dir, info);
+                                run_box = read_box(&xml[s..e], &shape_xml, &d, (styles, theme, numbering, rels), dropped, dir, info);
                             }
                         }
                     }
@@ -2957,9 +2990,9 @@ fn box_shown(p: &Para) -> bool {
 
 /// Rutans styckemarkör (ram, fyllning och bredd) och innehåll som Markdown.
 fn box_md(b: &BoxRead, numbering: &Numbering, text_w: Option<f64>) -> (String, String) {
-    // Rutan fyller spalten: dess läge och bredd i dokumentet räknas inte om (spaltbredden är inte känd här).
-    let tw = text_w.map_or(451.0, |t| (t / 20.0) as f32);
-    let pp = docx_tbox::frame(&b.shape, 0.0, tw, tw);
+    // Rutans bredd och läge räknas mot spaltens bredd först när dokumentet ritas (`pbox::Frame`).
+    let _ = text_w;
+    let pp = docx_tbox::frame(&b.shape, b.x, b.width);
     let mut blocks = b.blocks.clone();
     for bl in blocks.iter_mut() {
         if let Block::Para(p) = bl {
@@ -5374,13 +5407,13 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     let rv = Review { revs, comments };
     // Textrutornas block hör inte till brödtexten: med original byts deras innehåll in i rutan,
     // utan original blir stycknen vanliga stycken.
-    let (markdown, boxes) = match source {
-        Some(_) => docx_tbox::extract(&markdown),
-        None => (docx_tbox::strip_tags(&markdown), Vec::new()),
+    let (markdown, boxes, new_boxes) = match source {
+        Some(src) => docx_tbox::extract(&markdown, &|n| src.tboxes.contains_key(&n), src.tokens.len()),
+        None => docx_tbox::extract(&markdown, &|_| false, 0),
     };
     match source {
-        Some(src) => write_patched(src, defaults, &markdown, &boxes, title, resolve, &rv),
-        None => write_fresh(defaults, &markdown, title, resolve, &rv),
+        Some(src) => write_patched(src, defaults, &markdown, (&boxes, &new_boxes), title, resolve, &rv),
+        None => write_fresh(defaults, &markdown, &new_boxes, title, resolve, &rv),
     }
 }
 
@@ -5397,7 +5430,7 @@ impl Review {
     }
 }
 
-fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
+fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Found], title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let mut taken: std::collections::HashSet<String> = [
         "[content_types].xml",
         "_rels/.rels",
@@ -5413,9 +5446,13 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     .map(str::to_owned)
     .collect();
     let secs = sections::scan(markdown, &defaults);
+    let mut tokens: Vec<Opaque> = Vec::new();
+    let mut doc_pr = 1u32;
+    add_new_boxes(new_boxes, &mut tokens, resolve, 1, &mut doc_pr, (text_width_emu(&defaults) / 12700) as f32);
     let mut ctx = Ctx {
+        tokens: tokens.len(),
         num_base: 1,
-        doc_pr_start: 1,
+        doc_pr_start: doc_pr,
         max_width: text_width_emu(&defaults),
         used_ids: ["rId1", "rId2", "rId3"].into_iter().map(str::to_owned).collect(),
         lead_section: secs[0].marker.is_some(),
@@ -5424,6 +5461,9 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     let mut body = std::mem::take(&mut w.body);
+    if !tokens.is_empty() {
+        body = resolve_markers(&[(false, body)], &tokens, &mut std::collections::HashSet::new()).0;
+    }
     // Ett dokument som slutar med en tabell måste ha ett stycke efter den.
     if body.is_empty() || body.ends_with("</w:tbl>") {
         body.push_str("<w:p/>");
@@ -5955,7 +5995,22 @@ fn fix_head(head: &str) -> String {
     h
 }
 
-fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, boxes: &[docx_tbox::Found], title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
+/// Originalkörningar för nya textrutor (Infoga → Textruta): token för token, i samma ordning som
+/// `docx_tbox::extract` numrerade dem (de börjar där `tokens` slutar).
+fn add_new_boxes(new: &[docx_tbox::Found], tokens: &mut Vec<Opaque>, resolve: &dyn Fn(&str) -> Option<Image>, num_base: u32, doc_pr: &mut u32, text_w_pt: f32) {
+    for f in new {
+        let (pp, md) = docx_tbox::split_frame(&f.inner);
+        let ctx = Ctx { tokens: tokens.len(), num_base, doc_pr_start: *doc_pr, ..Default::default() };
+        let bw = body_from_markdown(&md, resolve, ctx);
+        let (inner, _) = resolve_markers(&[(false, bw.body)], tokens, &mut std::collections::HashSet::new());
+        let inner = if inner.is_empty() { "<w:p/>".to_owned() } else { inner };
+        let lines = md.lines().filter(|l| !l.trim().is_empty()).count().max(1);
+        tokens.push(Opaque { xml: docx_tbox::new_box_run(&inner, &pp, *doc_pr, text_w_pt, lines), fld: 0 });
+        *doc_pr += 1;
+    }
+}
+
+fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, new_boxes): (&[docx_tbox::Found], &[docx_tbox::Found]), title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let main_dir = src.main.rsplit_once('/').map_or("", |(d, _)| d);
     let main_file = src.main.rsplit('/').next().unwrap_or("document.xml");
     let rels_name = if main_dir.is_empty() { format!("_rels/{main_file}.rels") } else { format!("{main_dir}/_rels/{main_file}.rels") };
@@ -5971,7 +6026,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, boxes: &[d
         Some(x) => (max_id(x, "<w:num w:numId=\"").map_or(1, |m| m + 1), max_id(x, "w:abstractNumId=\"").map_or(0, |m| m + 1)),
         None => (1, 0),
     };
-    let doc_pr_start = src
+    let mut doc_pr_start = src
         .elems
         .iter()
         .map(|e| e.xml.as_str())
@@ -5981,8 +6036,10 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, boxes: &[d
         .map_or(1, |m| m + 1);
     let mut taken: std::collections::HashSet<String> = src.parts.iter().map(|(n, _)| n.trim_start_matches('/').to_lowercase()).collect();
     let secs = sections::scan(markdown, &defaults);
+    let mut tokens = src.tokens.clone();
+    add_new_boxes(new_boxes, &mut tokens, resolve, num_base, &mut doc_pr_start, (text_width_emu(&defaults) / 12700) as f32);
     let mut ctx = Ctx {
-        tokens: src.tokens.len(),
+        tokens: tokens.len(),
         lead_section: secs[0].marker.is_some(),
         num_base,
         doc_pr_start,
@@ -6001,7 +6058,6 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, boxes: &[d
     let mut w = body_from_markdown(markdown, resolve, ctx);
     w.units.sort_by_key(|u| u.range.start);
     // Ändrade textrutor: originalkörningen med nytt `w:txbxContent`.
-    let mut tokens = src.tokens.clone();
     let mut swaps: Vec<(String, String)> = Vec::new();
     for f in boxes {
         let Some((marker, orig)) = src.tboxes.get(&f.token) else { continue };

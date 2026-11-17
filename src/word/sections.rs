@@ -267,6 +267,16 @@ fn insert_line(text: &str, at: usize, line: &str) -> Edit {
     Edit { text: t, sel: caret..caret }
 }
 
+/// Sätter in ett block (flera rader) som ett eget stycke vid `at` och markerar första `select` i det.
+pub fn insert_block(text: &str, at: usize, block: &str, select: &str) -> Edit {
+    let mut e = insert_line(text, at, block);
+    let from = at.min(text.len());
+    if let Some(i) = e.text[from..].find(select) {
+        e.sel = from + i..from + i + select.len();
+    }
+    e
+}
+
 /// Börjar ett nytt avsnitt med egenskaperna `props` vid `at`.
 pub fn insert_break(text: &str, at: usize, props: &SectionProps) -> Edit {
     insert_line(text, at, &props.to_comment())

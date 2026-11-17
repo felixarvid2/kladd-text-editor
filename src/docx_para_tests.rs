@@ -98,6 +98,7 @@ fn new_paragraphs_with_a_marker_write_ppr_in_schema_order() {
         left: Some(36.0),
         right: Some(0.0),
         first: Some(-18.0),
+        frame: None,
     };
     let md = format!("# Rubrik{}\n\nNytt stycke{}\n", crate::word::pbox::PPr { shd: Some([1, 2, 3]), ..Default::default() }.marker(), pp.marker());
     let w = write(&md, "t", &|_| None, None).unwrap();

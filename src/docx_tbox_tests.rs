@@ -70,3 +70,26 @@ fn box_without_source_becomes_plain_paragraphs() {
     let x = part_text(&out, "word/document.xml");
     assert!(x.contains("Faktaruta") && x.contains("Text i rutan") && !x.contains("k:tb"), "{x}");
 }
+
+#[test]
+fn inserted_box_is_written_as_a_real_text_box() {
+    let block = docx_tbox::new_block();
+    let md = format!("Före\n\n{}\n\nEfter\n", block.replace("Text<!--k:pp", "Ny **ruta**<!--k:pp"));
+    // Utan original.
+    let out = write(&md, "x", &|_| None, None).unwrap().bytes;
+    let x = part_text(&out, "word/document.xml");
+    assert!(x.contains("<wps:txbx><w:txbxContent>") && x.contains("Ny ") && x.contains("<wp:wrapTopAndBottom/>"), "{x}");
+    assert!(x.contains("w:pBdr") == false && !x.contains("k:tb"), "{x}");
+    let back = read(&out).unwrap();
+    assert!(back.markdown.contains("<!--k:tb ") && back.markdown.contains("**ruta**"), "{}", back.markdown);
+    // Med original: den nya rutan hamnar mellan styckena och den gamla rutan är orörd.
+    let l = read(&doc()).unwrap();
+    let md = l.markdown.replace("Slut", &format!("Slut\n\n{}", block));
+    let out = write(&md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    let x = part_text(&out, "word/document.xml");
+    assert!(x.contains(BOX_RUN), "den gamla rutan ska vara orörd");
+    assert_eq!(x.matches("<wps:txbx>").count(), 2, "{x}"); // gamla (Choice) + nya
+    let back = read(&out).unwrap();
+    assert_eq!(back.markdown.matches("<!--k:tb ").count(), 2, "{}", back.markdown);
+    assert!(back.markdown.find("Slut").unwrap() < back.markdown.rfind("k:tb").unwrap());
+}

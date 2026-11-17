@@ -131,7 +131,8 @@ struct Span {
 
 enum Block {
     Heading(u8, Vec<Span>, Align),
-    Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align },
+    /// `look`: ram, fyllning och bredd ur `<!--k:pp …-->` (`word::pbox`).
+    Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align, look: Option<crate::word::pbox::PPr> },
     Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
     Code { text: String, indent: f32 },
     /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
@@ -276,6 +277,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     let mut table: Option<Vec<Vec<Vec<Span>>>> = None;
     let mut row: Vec<Vec<Span>> = Vec::new();
 
+    // Styckeutseendet (`k:pp`) som hör till stycket som läses; `flush` lägger det på stycket.
+    let look_cell: std::cell::RefCell<Option<crate::word::pbox::PPr>> = std::cell::RefCell::new(None);
     let indent_now = |lists: &Vec<Option<u64>>, quote: u8| lists.len() as f32 * INDENT + quote as f32 * 14.0;
 
     let flush = |spans: &mut Vec<Span>,
@@ -285,6 +288,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                  lists: &Vec<Option<u64>>,
                  quote: u8,
                  align: Align| {
+        let look = look_cell.borrow_mut().take();
         if spans.iter().all(|s| s.text.trim().is_empty()) && pending_marker.is_none() {
             spans.clear();
             return;
@@ -300,7 +304,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         } else if let Some(m) = pending_marker.take() {
             blocks.push(Block::Item { spans: taken, indent, marker: m, quote, align });
         } else {
-            blocks.push(Block::Para { spans: taken, indent, quote, align });
+            blocks.push(Block::Para { spans: taken, indent, quote, align, look: look.filter(|l| l.has_box() || l.frame.is_some()) });
         }
     };
 
@@ -484,6 +488,11 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 // Ett HTML-block kan ha flera rader; varje rad som är en känd tagg tolkas för sig.
                 let mut first = true;
+                for line in t.split('\n') {
+                    if let Some(pp) = crate::word::pbox::PPr::parse_marker(line.trim()) {
+                        *look_cell.borrow_mut() = Some(pp);
+                    }
+                }
                 let t = strip_markers(&t);
                 for line in t.split('\n') {
                     let tag = line.trim();
@@ -1810,6 +1819,47 @@ impl<'a> Layout<'a> {
         self.y += PARA_GAP;
     }
 
+    /// Ritar fyllning (bakom texten, på `ops_at`) och kanter för ett stycke i en ram. Bara delen på
+    /// sidan där stycket slutar ritas när det bryts över en sida.
+    fn paint_box(&mut self, l: &crate::word::pbox::PPr, x: f32, w: f32, ops_at: Option<usize>, top: f32, first: bool, last: bool, same_page: bool) {
+        // Luften under sista stycket, och avståndet fram till nästa stycke i samma ruta fylls också.
+        let bottom = self.y + if last { l.pad_bottom() } else { PARA_GAP };
+        let start = if same_page { top - if first { l.pad_top() } else { 0.0 } } else { self.rt };
+        let h = (bottom - start).max(1.0);
+        let col = |c: Option<[u8; 3]>| c.map_or(INK, |c| (c[0], c[1], c[2]));
+        let mut ops: Vec<Op> = Vec::new();
+        let bd = &l.borders;
+        if let Some(c) = l.shd {
+            ops.push(Op::Rect { x, y: start, w, h, color: (c[0], c[1], c[2]) });
+        }
+        let draw_top = first && same_page;
+        if let (Some(b), true) = (bd.top, draw_top) {
+            ops.push(Op::Rect { x, y: start, w, h: b.width_pt(), color: col(b.color) });
+        }
+        if let (Some(b), true) = (bd.bottom, last) {
+            ops.push(Op::Rect { x, y: bottom - b.width_pt(), w, h: b.width_pt(), color: col(b.color) });
+        }
+        if let Some(b) = bd.left {
+            ops.push(Op::Rect { x, y: start, w: b.width_pt(), h, color: col(b.color) });
+        }
+        if let Some(b) = bd.right {
+            ops.push(Op::Rect { x: x + w - b.width_pt(), y: start, w: b.width_pt(), h, color: col(b.color) });
+        }
+        // Fyllningen först (bakom texten), kanterna ovanpå.
+        let mut at = ops_at.unwrap_or(0);
+        let fill = l.shd.is_some();
+        for (i, op) in ops.into_iter().enumerate() {
+            if i == 0 && fill {
+                let pg = self.page();
+                let n = pg.ops.len();
+                pg.ops.insert(at.min(n), op);
+                at += 1;
+            } else {
+                self.page().ops.push(op);
+            }
+        }
+    }
+
     fn run(&mut self, blocks: &[Block]) {
         for (bi, b) in blocks.iter().enumerate() {
             self.align = Align::Left;
@@ -1872,7 +1922,7 @@ impl<'a> Layout<'a> {
                         self.y += 3.0;
                     }
                 }
-                Block::Para { spans, indent, quote, align } => {
+                Block::Para { spans, indent, quote, align, look } => {
                     self.align = *align;
                     let page_before = self.breaks;
                     let (color, italic) = if *quote > 0 { (MUTED, true) } else { (INK, false) };
@@ -1886,11 +1936,41 @@ impl<'a> Layout<'a> {
                     self.line = st.line_spacing.map_or(LINE, |m| m * LINE_SINGLE);
                     self.first_indent = st.first_indent.unwrap_or(0.0);
                     self.y += st.space_before.unwrap_or(0.0);
+                    // Ram och fyllning (textruta eller stycke med ram): text inne i rutan, ramen ritas under och runt.
+                    let look_of = |b: Option<&Block>| match b {
+                        Some(Block::Para { look: Some(l), .. }) => Some(l.clone()),
+                        _ => None,
+                    };
+                    let boxed = look.as_ref().filter(|l| l.has_box());
+                    let first_in_box = boxed.is_some_and(|l| bi == 0 || !look_of(blocks.get(bi.wrapping_sub(1)).filter(|_| bi > 0)).is_some_and(|p| p.same_box(l)));
+                    let last_in_box = boxed.is_some_and(|l| !look_of(blocks.get(bi + 1)).is_some_and(|n| n.same_box(l)));
+                    let (mut tx, mut tw) = (self.ml + indent, self.cw - indent);
+                    let mut frame_x: Option<(f32, f32)> = None;
+                    if let Some(l) = boxed {
+                        if let Some((tl, tr, fl, fw)) = l.frame_geom(self.cw - indent) {
+                            tx += tl;
+                            tw -= tl + tr;
+                            frame_x = Some((self.ml + indent + fl, fw));
+                        } else {
+                            let (il, ir) = (l.left.unwrap_or(0.0).max(0.0), l.right.unwrap_or(0.0).max(0.0));
+                            tx += il;
+                            tw -= il + ir;
+                            frame_x = Some((tx - l.pad_left(), tw + l.pad_left() + l.pad_right()));
+                        }
+                        if first_in_box {
+                            self.y += l.pad_top();
+                        }
+                    }
                     let top = self.y;
-                    self.text_block(spans, self.ml + indent, self.cw - indent, face, size, color, italic, None);
+                    let ops_at = self.page().ops.len();
+                    let page_at = self.breaks;
+                    self.text_block(spans, tx, tw.max(24.0), face, size, color, italic, None);
                     self.line = LINE;
                     self.first_indent = 0.0;
                     self.y += st.space_after.unwrap_or(0.0);
+                    if let (Some(l), Some((fx, fw))) = (boxed, frame_x) {
+                        self.paint_box(l, fx, fw, if page_at == self.breaks { Some(ops_at) } else { None }, top, first_in_box, last_in_box, page_at == self.breaks);
+                    }
                     if *quote > 0 {
                         let x = self.ml + indent - 9.0;
                         let start = if self.breaks == page_before { top } else { self.rt };
@@ -2268,6 +2348,28 @@ mod tests {
         lay.new_page();
         lay.run(&blocks);
         lay.pages.swap_remove(0).ops
+    }
+
+    #[test]
+    fn framed_paragraphs_and_text_boxes_are_painted() {
+        let pp = |frame: &str| format!("<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\"{frame}-->");
+        // En ram med egen bredd (textruta): två stycken ger en fyllning bakom texten och fyra kanter.
+        let md = format!(
+            "<!--k:tb 1-->\n\nEtt{m}\n\nTvå{m}\n\n<!--k:/tb-->\n\nEfter\n",
+            m = pp(" fr=\"w=200 x=end pl=8 pr=8\"")
+        );
+        let ops = page_ops(&md);
+        let rects: Vec<(f32, f32, (u8, u8, u8))> = ops.iter().filter_map(|o| if let Op::Rect { x, w, color, .. } = o { Some((*x, *w, *color)) } else { None }).collect();
+        let fills: Vec<_> = rects.iter().filter(|r| r.2 == (0xFF, 0xF2, 0xCC)).collect();
+        assert_eq!(fills.len(), 2, "{rects:?}");
+        // Fyllningen ligger före texten i ritordningen.
+        let first_text = ops.iter().position(|o| matches!(o, Op::Text { .. })).unwrap();
+        let first_fill = ops.iter().position(|o| matches!(o, Op::Rect { color: (0xFF, 0xF2, 0xCC), .. })).unwrap();
+        assert!(first_fill < first_text);
+        // Rutan är 200 pt bred och ligger vid högerkanten; kantlinjerna har kantens färg; inga markörer som text.
+        assert!((fills[0].1 - 200.0).abs() < 0.5);
+        assert!(rects.iter().filter(|r| r.2 == (0x11, 0x22, 0x33)).count() >= 6, "{rects:?}");
+        assert!(ops.iter().all(|o| !matches!(o, Op::Text { text, .. } if text.contains("k:tb") || text.contains("k:pp"))));
     }
 
     #[test]

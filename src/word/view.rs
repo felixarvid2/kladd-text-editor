@@ -159,6 +159,7 @@ enum BarAct {
     Landscape(bool),
     ColumnBreak,
     PageBreak,
+    TextBox,
     Columns,
     TableOp(TableOp),
     PageSetup,
@@ -748,6 +749,9 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Innehållsförteckning"), "", None, true) {
                             acts.push(BarAct::Toc);
                         }
+                        if crate::app::menu_item(ui, p, t("Textruta"), "", None, true) {
+                            acts.push(BarAct::TextBox);
+                        }
                         menu_divider(ui, p);
                         if crate::app::menu_item(ui, p, t("Avsnittsbrytning (ny sida)"), "", None, true) {
                             acts.push(BarAct::SectionBreak);
@@ -826,6 +830,7 @@ impl KladdApp {
                 BarAct::Landscape(l) => self.section_landscape(&ctx, l),
                 BarAct::ColumnBreak => self.column_break(&ctx),
                 BarAct::PageBreak => self.page_break(&ctx),
+                BarAct::TextBox => self.insert_text_box(&ctx),
                 BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),

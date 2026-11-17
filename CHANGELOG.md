@@ -6,6 +6,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ### Nytt
 
+- **Textrutor syns, går att redigera och infoga.** Texten i en textruta (`w:txbxContent` i Word, `draw:text-box` i LibreOffice) visas som stycken med rutans fyllning, ram, bredd och läge i spalten, före stycket rutan sitter i. Ändringar sparas tillbaka i rutan med form, ram och läge bevarade, och orörda rutor sparas som förut, byte för byte. *Infoga → Textruta* sätter in en ny ruta med ram som sparas som riktig textruta i `.docx` och `.odt`, och PDF-exporten ritar rutans fyllning och ram. Rutan ritas i flödet (text flödar inte runt den). Rutor i tabeller, rubriker och listor, rutor med bilder eller fotnoter, och rutor i rutor visas inte, men bevaras i `.docx`.
 - **Fler testdokument.** Testkorpusen har ett nyhetsbrev (spalter, textruta, bild) och en skolrapport (sidhuvud med logga, sidfot, fotnoter, innehållsförteckning), både i Word 365-stil och som LibreOffice skapar dem.
 - **Olika breda spalter och skiljelinje.** Spalter med olika bredd (`w:equalWidth="0"` i Word, `style:column` i LibreOffice) och linjen mellan spalterna visas som i Word och LibreOffice, och följer med till `.docx`, `.odt` och PDF (`column-widths` och `column-rule` i avsnittsraden).
 - **Sidhuvud och sidfot som i Word.** Loggor i sidhuvud och sidfot (inline och förankrade, från Word och LibreOffice) ritas i dokumentläget och i PDF-exporten och följer med vid sparning. Sidnummerfält läses med format (`\* roman`, `\* ROMAN`, `\* Arabic`), `SECTIONPAGES` och sidnumrering som börjar om per avsnitt, och "Sida X av Y" räknas från den faktiska sidindelningen. Tabbstopp, en tabell utan ramar (logga | titel | datum), textstorlek, färg och linjen under sidhuvudet läses, och annorlunda första sida, olika udda/jämna sidor, egna sidhuvuden per avsnitt (med arv från föregående avsnitt) och avståndet från sidkanten (`w:pgMar w:header/w:footer`) visas som i originalet. Brödtexten skjuts ned om sidhuvudet med logga behöver mer plats. Orörda dokument sparas som förut, och ett sidhuvud som ändras i dialogen skrivs om med loggan och fälten kvar.
@@ -15,10 +16,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - **Sidbrytningar i Word- och LibreOffice-dokument.** En vanlig sidbrytning (`w:br w:type="page"`, `w:pageBreakBefore` direkt eller i en formatmall, `fo:break-before` och `fo:break-after` i `.odt`) lästes tidigare som en radbrytning eller försvann, så ett dokument fick för få sidor. Den blir nu raden `<!-- kladd: sidbrytning -->`, börjar en ny sida i dokumentläget och PDF, och sparas tillbaka som sidbrytning. Nytt: *Infoga → Sidbrytning*.
 - **Stabil sparning av rubrikformat och justering.** Ett Word-dokument med svenska rubrikmallar (`Rubrik1` …) fick rubrikformaten omflyttade mellan nivåer vid andra sparningen, eftersom Kladd lade till egna `Heading1` … med samma namn. Nya rubriker använder nu dokumentets egna mallar. I `.odt` blev vänsterställda stycken justerade när brödtextmallen var justerad.
 - Spalterna i ett avsnitt jämnas nu ut på avsnittets sista sida, också när avsnittet går över en sidgräns.
-- **Textrutor i Word-dokument syns och går att redigera.** Texten i en textruta (`w:txbxContent`) visas som stycken med rutans fyllning och ram, direkt före stycket rutan sitter i, och ändringar sparas tillbaka i rutan med form, ram och läge bevarade. Orörda rutor sparas som förut, byte för byte. Rutan ritas i flödet över hela spaltbredden (text flödar inte runt den). Rutor i tabeller, rubriker och listor, rutor med bilder och rutor i rutor visas inte, men bevaras.
-
-
 - Den osynliga skyddskoden `&#8203;` framför ett bokmärke eller en förankrad ruta syntes som text i dokumentläget.
+- Ramar och skuggning runt stycken (`k:pp`) ritades på fel plats i avsnitt med flera spalter, och PDF-exporten ritade inga stycke-ramar alls.
 
 ## [2.3.0] – 2026-11-17
 

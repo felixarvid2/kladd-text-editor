@@ -261,13 +261,19 @@ Gemensamma format (alla moduler ska använda dessa):
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
 - **Textrutor** (`src/docx_tbox.rs`): `<!--k:tb N-->` … `<!--k:/tb-->` före ankarstycket, där `N` är markören
   `<!--k:N-->` som bär originalkörningen (rutans form, ram och läge). Stycken i rutan får en syntetisk
-  `k:pp`-markör (fyllning, ram och inre marginal; rutan fyller spalten) som `write` tar bort igen innan texten jämförs
-  med originalet (`Source::tboxes`). Orörd ruta: originalet byte för byte. Ändrad: `w:txbxContent` byts i hela
-  körningen (både `mc:Choice` och `mc:Fallback`) mot nygenererade stycken. Blocket ger inga enheter (rutans stycken
-  är inga egna element). Utan original tas bara markörraderna bort. Begränsningar: rutan ritas i flödet ovanför
-  stycket (ingen omflytning, ingen fast höjd, läge och bredd räknas inte om), ramen (som alla styckeramar, `pboxui::shapes`) ritas fel i avsnitt med flera spalter, rutor i tabeller/rubriker/
-  listor, med bilder eller fotnoter, och rutor i rutor visas inte (bevaras), ODT läses inte ännu, PDF-exporten
-  ritar texten utan ram, nya rutor kan inte infogas.
+  `k:pp`-markör med `fr="w=… x=… pl=… pr=…"` (`pbox::Frame`: rutans bredd och vågräta läge `start|center|end|<pt>` i
+  spalten, luft mot texten) samt fyllning och ram. Layouten (`layout_para`) räknar indragen mot spaltbredden och
+  `pboxui::shapes` ritar rutans kanter (spalten väljs efter radens x, inte galleriets första spalt). `write` tar bort
+  markören igen innan texten jämförs med originalet (`Source::tboxes`). Orörd ruta: originalet byte för byte.
+  Ändrad: `w:txbxContent` byts i hela körningen (både `mc:Choice` och `mc:Fallback`). Ett block med okänt nummer
+  (`docx_tbox::NEW_TOKEN`, Infoga → Textruta) är en ny ruta: den ersätts av en bärarrad `<!--k:N-->` med nytt nummer och
+  skrivs som en förankrad `wps`-ruta (`wrapTopAndBottom`, `spAutoFit`) av `docx_tbox::new_box_run`. Blocket ger inga enheter
+  (rutans stycken är inga egna element). ODT: `draw:text-box` läses till samma block (`Rd::text_box`, nummer 0) och
+  block skrivs som en `draw:frame` med `draw:text-box` i ett eget stycke (`W::finish_box`). PDF: `Block::Para::look`
+  ritar fyllning (bakom texten) och kanter (`Layout::paint_box`), också för vanliga stycke-ramar. Begränsningar: rutan
+  ritas i flödet (text flödar inte runt den, ingen fast höjd), rutor i tabeller/rubriker/listor, med bilder eller
+  fotnoter, och rutor i rutor visas inte (bevaras i docx), läge relativt sidans högerkant räknas inte om, och en
+  ruta bredare än textytan krymps vid ODT-sparning.
 - **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda

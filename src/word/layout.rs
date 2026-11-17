@@ -397,6 +397,9 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
             None => 0u8.hash(&mut h),
         }
         (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
+        if let Some(f) = para.look.as_ref().and_then(|l| l.frame) {
+            (f.w.to_bits(), f.pl.to_bits(), f.pr.to_bits(), format!("{:?}", f.x)).hash(&mut h);
+        }
         para.empty_h.map(f32::to_bits).hash(&mut h);
     }
     // Tabellformatet (kommentarsraden före en tabell) ändrar utläggningen.
@@ -1477,6 +1480,8 @@ struct Para {
     ind_left: f32,
     ind_right: f32,
     hang: f32,
+    /// Pixlar per punkt, för indrag som först räknas ut när spaltbredden är känd (ramar med egen bredd).
+    ppx: f32,
     /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
     empty_h: Option<f32>,
 }
@@ -1632,6 +1637,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             ind_left: 0.0,
             ind_right: 0.0,
             hang: 0.0,
+            ppx: 0.0,
             empty_h: ep.as_ref().map(|(_, h)| *h),
         });
         if e >= text.len() {
@@ -1698,6 +1704,7 @@ fn apply_looks(text: &str, out: &mut [Para], before0: &[f32], after: &[f32], zoo
         let Some(l) = q.look.clone() else { continue };
         q.ind_left = l.left.unwrap_or(0.0).max(0.0) * ppx;
         q.ind_right = l.right.unwrap_or(0.0).max(0.0) * ppx;
+        q.ppx = ppx;
         match l.first {
             Some(f) if f < 0.0 => {
                 q.hang = -f * ppx;
@@ -2085,7 +2092,12 @@ fn layout_piece(
     }
     let list = para.list;
     // Indrag från vänster och höger (listor har sitt eget).
-    let (ind_l, ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
+    let (mut ind_l, mut ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
+    // Ram med egen bredd och eget läge (textruta): indragen räknas mot spaltens bredd.
+    if let (true, true, Some(g)) = (list.is_none() && !para.collapse, avail.is_finite() && para.ppx > 0.0, para.look.as_ref().and_then(|l| l.frame_geom(avail / para.ppx.max(0.001)))) {
+        ind_l = g.0 * para.ppx;
+        ind_r = g.1 * para.ppx;
+    }
     let wrap_w = match list {
         Some(l) => (avail - l.text_x).max(24.0),
         None => (avail - ind_l - ind_r).max(24.0).min(avail),

@@ -20,7 +20,7 @@
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::word::pbox::{Border, Borders, LineStyle, PPr};
+use crate::word::pbox::{Border, Borders, Frame, FrameX, LineStyle, PPr};
 
 pub const OPEN: &str = "<!--k:tb ";
 pub const CLOSE: &str = "<!--k:/tb-->";
@@ -210,10 +210,9 @@ pub fn read_shape(xml: &str, scheme: &dyn Fn(&str) -> Option<[u8; 3]>) -> Shape 
     sh
 }
 
-/// Styckeutseendet som får rutan att se ut som en ruta: ram och fyllning runt styckena, och
-/// indrag så att den blir lika bred som i dokumentet. `left` är rutans vänsterkant och `width`
-/// dess bredd (pt), `text_w` textytans bredd (pt).
-pub fn frame(sh: &Shape, left: f32, width: f32, text_w: f32) -> PPr {
+/// Styckeutseendet som får rutan att se ut som en ruta: ram och fyllning runt styckena i en ram
+/// med rutans bredd och läge (`pbox::Frame`). `width` är rutans bredd (pt, 0 = hela spalten).
+pub fn frame(sh: &Shape, x: FrameX, width: f32) -> PPr {
     if sh.fill.is_none() && sh.line.is_none() {
         return PPr::default();
     }
@@ -223,16 +222,9 @@ pub fn frame(sh: &Shape, left: f32, width: f32, text_w: f32) -> PPr {
     };
     let borders = Borders { top: side(it), left: side(il), bottom: side(ib), right: side(ir), between: None };
     let lw = sh.line.map_or(0.0, |(w, _)| w);
-    let left = left.clamp(0.0, (text_w - 36.0).max(0.0));
-    let right = (text_w - left - width).max(0.0);
-    PPr {
-        borders,
-        shd: sh.fill,
-        // Kanten utanför texten räknas bort så att rutans ytterkant hamnar där Word har den.
-        left: Some((left + il.min(31.0) + lw).max(0.0)),
-        right: Some((right + ir.min(31.0) + lw).max(0.0)),
-        ..Default::default()
-    }
+    let w = if width > 1.0 { width } else { 10_000.0 };
+    // Rutans ytterkant ligger där Word har den; texten ligger innanför luften och linjen.
+    PPr { borders, shd: sh.fill, frame: Some(Frame { w, x, pl: il.min(31.0) + lw, pr: ir.min(31.0) + lw }), ..Default::default() }
 }
 
 /// Ett block ur Markdown-texten: rutans nummer och innehållet mellan markörerna.
@@ -242,28 +234,40 @@ pub struct Found {
     pub inner: String,
 }
 
+/// Numret på en ny ruta (Infoga → Textruta): ingen ruta i originalet har det.
+pub const NEW_TOKEN: usize = 4_000_000_000;
+
 /// Plockar ut rutblocken ur texten (de ska inte bli stycken av sig själva). Det som blir kvar är
-/// texten utan rutorna.
-pub fn extract(md: &str) -> (String, Vec<Found>) {
+/// texten utan rutorna. Block vars nummer `known` inte godkänner är nya rutor: de ersätts av en
+/// rad `<!--k:N-->` med ett nytt nummer från `next` och kommer med i andra listan.
+pub fn extract(md: &str, known: &dyn Fn(usize) -> bool, next: usize) -> (String, Vec<Found>, Vec<Found>) {
     if !md.contains(OPEN) {
-        return (md.to_owned(), Vec::new());
+        return (md.to_owned(), Vec::new(), Vec::new());
     }
     let mut out = String::with_capacity(md.len());
-    let mut found = Vec::new();
+    let (mut kept, mut fresh) = (Vec::new(), Vec::new());
     let mut cur: Option<(usize, String, usize)> = None;
     let mut skip_blank = false;
     for line in md.split_inclusive('\n') {
         let t = line.trim();
         if let Some((n, buf, at)) = cur.as_mut() {
             if t == CLOSE {
-                found.push(Found { token: *n, inner: buf.trim_matches(['\n', '\r']).to_owned() });
+                let (n, inner) = (*n, buf.trim_matches(['\n', '\r']).to_owned());
                 cur = None;
                 skip_blank = true;
-            } else if parse_open(t).is_some() {
+                if known(n) {
+                    kept.push(Found { token: n, inner });
+                } else {
+                    // Ny ruta: en bärarrad med ett nytt markörnummer tar dess plats.
+                    let idx = next + fresh.len();
+                    out.push_str(&format!("<!--k:{idx}-->\n\n"));
+                    fresh.push(Found { token: idx, inner });
+                }
+            } else if let Some(m) = parse_open(t) {
                 // Ett block i ett block: det första avbryts och läggs tillbaka som vanlig text.
                 out.insert_str(*at, &format!("{}\n", open_tag(*n)));
                 out.push_str(buf);
-                cur = parse_open(t).map(|n| (n, String::new(), out.len()));
+                cur = Some((m, String::new(), out.len()));
             } else {
                 buf.push_str(line);
             }
@@ -286,16 +290,72 @@ pub fn extract(md: &str) -> (String, Vec<Found>) {
         out.insert_str(at, &format!("{}\n", open_tag(n)));
         out.push_str(&buf);
     }
-    (out, found)
+    (out, kept, fresh)
 }
 
-/// Tar bort bara markörraderna (rutans stycken blir vanliga stycken): för dokument utan original
-/// och för andra format.
-pub fn strip_tags(md: &str) -> String {
-    if !md.contains("<!--k:") {
-        return md.to_owned();
+/// Ramen för en ny ruta ur dess första markör med `fr=`, och texten utan ramarna (de skrivs inte som
+/// styckeram inne i rutan).
+pub fn split_frame(inner: &str) -> (PPr, String) {
+    let mut look = PPr::default();
+    let mut clean = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while let Some(i) = rest.find(crate::word::pbox::MARK.trim_end()) {
+        clean.push_str(&rest[..i]);
+        let Some(e) = rest[i..].find("-->") else { break };
+        let tag = &rest[i..i + e + 3];
+        match PPr::parse_marker(tag) {
+            Some(pp) if pp.frame.is_some() => {
+                if look.is_empty() {
+                    look = pp;
+                }
+            }
+            _ => clean.push_str(tag),
+        }
+        rest = &rest[i + e + 3..];
     }
-    md.split_inclusive('\n').filter(|l| !is_mark(l)).collect()
+    clean.push_str(rest);
+    (look, clean.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim().to_owned())
+}
+
+/// Texten som Infoga → Textruta sätter in: en ruta med ram, 3 tum bred.
+pub fn new_block() -> String {
+    let sh = Shape { fill: None, line: Some((0.75, [0, 0, 0])), ins: Some([5.0; 4]) };
+    let pp = frame(&sh, FrameX::Start, 216.0);
+    format!("{}\n\nText{}\n\n{CLOSE}", open_tag(NEW_TOKEN), pp.marker())
+}
+
+/// Originalkörningen (`w:r` med en förankrad `wps`-textruta) för en ny ruta. `content` är styckena som XML,
+/// `pp` rutans ram (bredd, läge, kant och fyllning), `text_w` textytans bredd i punkter och `lines` ungefär
+/// hur många rader texten har (för starthöjden; rutan växer med texten i Word).
+pub fn new_box_run(content: &str, pp: &PPr, id: u32, text_w: f32, lines: usize) -> String {
+    let w = pp.frame.map(|f| f.w).filter(|w| *w < 5000.0).unwrap_or(text_w).clamp(36.0, text_w.max(36.0));
+    let h = (lines as f32 * 18.0 + 14.0).max(30.0);
+    let emu = |v: f32| (v * 12700.0).round() as i64;
+    let col = |c: [u8; 3]| format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+    let fill = pp.shd.map_or("<a:noFill/>".to_owned(), |c| format!("<a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill>", col(c)));
+    let ln = match pp.borders.left {
+        Some(b) => format!(
+            "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill></a:ln>",
+            emu(b.width_pt()),
+            b.color.map_or("000000".to_owned(), col)
+        ),
+        None => "<a:ln><a:noFill/></a:ln>".to_owned(),
+    };
+    let ins = |b: Option<Border>| emu(b.map_or(0.0, |b| f32::from(b.space)).max(2.0));
+    let pos = match pp.frame.map(|f| f.x) {
+        Some(FrameX::Center) => "<wp:align>center</wp:align>".to_owned(),
+        Some(FrameX::End) => "<wp:align>right</wp:align>".to_owned(),
+        Some(FrameX::Off(v)) => format!("<wp:posOffset>{}</wp:posOffset>", emu(v)),
+        _ => "<wp:align>left</wp:align>".to_owned(),
+    };
+    let (cx, cy) = (emu(w), emu(h));
+    format!(
+        "<w:r><w:drawing><wp:anchor xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\" distT=\"0\" distB=\"91440\" distL=\"114300\" distR=\"114300\" simplePos=\"0\" relativeHeight=\"251659264\" behindDoc=\"0\" locked=\"0\" layoutInCell=\"1\" allowOverlap=\"1\"><wp:simplePos x=\"0\" y=\"0\"/><wp:positionH relativeFrom=\"column\">{pos}</wp:positionH><wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/><wp:wrapTopAndBottom/><wp:docPr id=\"{id}\" name=\"Textruta {id}\"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><wps:wsp><wps:cNvSpPr txBox=\"1\"/><wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>{fill}{ln}</wps:spPr><wps:txbx><w:txbxContent>{content}</w:txbxContent></wps:txbx><wps:bodyPr rot=\"0\" vert=\"horz\" wrap=\"square\" lIns=\"{}\" tIns=\"{}\" rIns=\"{}\" bIns=\"{}\" anchor=\"t\" anchorCtr=\"0\"><a:spAutoFit/></wps:bodyPr></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>",
+        ins(pp.borders.left),
+        ins(pp.borders.top),
+        ins(pp.borders.right),
+        ins(pp.borders.bottom)
+    )
 }
 
 /// Byter innehållet i alla `w:txbxContent` i rutans originalkörning (både `mc:Choice` och
@@ -363,12 +423,17 @@ mod tests {
     #[test]
     fn extract_and_strip() {
         let md = "A\n\n<!--k:tb 3-->\n\nIn **rutan**\n\nTvå\n\n<!--k:/tb-->\n\nB\n";
-        let (rest, found) = extract(md);
+        let (rest, found, fresh) = extract(md, &|n| n == 3, 100);
         assert_eq!(rest, "A\n\nB\n");
         assert_eq!(found, vec![Found { token: 3, inner: "In **rutan**\n\nTvå".into() }]);
-        assert_eq!(strip_tags(md), "A\n\n\nIn **rutan**\n\nTvå\n\n\nB\n");
+        assert!(fresh.is_empty());
+        // Okänt nummer: en ny ruta, ersatt av en bärarrad med nytt nummer.
+        let (rest, found, fresh) = extract(md, &|_| false, 100);
+        assert_eq!(rest, "A\n\n<!--k:100-->\n\nB\n");
+        assert!(found.is_empty());
+        assert_eq!(fresh, vec![Found { token: 100, inner: "In **rutan**\n\nTvå".into() }]);
         // Ett block utan slut är vanlig text.
-        let (rest, found) = extract("x\n<!--k:tb 1-->\ny\n");
+        let (rest, found, _) = extract("x\n<!--k:tb 1-->\ny\n", &|_| true, 0);
         assert!(found.is_empty());
         assert!(rest.contains("y"));
         assert!(rest.contains("k:tb 1"));
@@ -384,12 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn frame_has_borders_and_indent() {
+    fn frame_has_borders_and_geometry() {
         let sh = Shape { fill: Some([255, 255, 255]), line: Some((0.75, [0, 0, 0])), ins: None };
-        let pp = frame(&sh, 50.0, 200.0, 450.0);
+        let pp = frame(&sh, FrameX::Center, 200.0);
         assert!(pp.borders.any());
         assert_eq!(pp.shd, Some([255, 255, 255]));
-        assert!(pp.left.unwrap() > 50.0 && pp.right.unwrap() > 200.0);
-        assert!(frame(&Shape::default(), 0.0, 100.0, 400.0).is_empty());
+        let (tl, tr, l, w) = pp.frame_geom(450.0).unwrap();
+        assert_eq!((l, w), (125.0, 200.0));
+        assert!(tl > l && tr > 125.0);
+        // Hela spalten när bredden saknas, och markören överlever en tur och retur.
+        assert_eq!(frame(&sh, FrameX::Start, 0.0).frame_geom(300.0).map(|g| g.3), Some(300.0));
+        assert_eq!(PPr::parse_marker(&pp.marker()), Some(pp));
+        assert!(frame(&Shape::default(), FrameX::Start, 100.0).is_empty());
     }
 }

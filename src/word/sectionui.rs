@@ -59,6 +59,11 @@ impl KladdApp {
         self.word_edit(ctx, |t, s| sections::insert_page_break(t, s.end));
     }
 
+    /// Infoga → Textruta: en ruta med ram vid markören, med platshållartexten markerad.
+    pub(crate) fn insert_text_box(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| sections::insert_block(t, s.end, &crate::docx_tbox::new_block(), "Text"));
+   }
+
     /// Öppnar "Spalter" för avsnittet som markören står i.
     pub(crate) fn open_columns_dialog(&mut self, ctx: &egui::Context) {
         if let Some((_, s)) = self.current_section(ctx) {

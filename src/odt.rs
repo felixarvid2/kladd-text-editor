@@ -284,6 +284,10 @@ struct GfxPlace {
     run_through: Option<String>,
     clip: Option<String>,
     margin: [Option<f32>; 4],
+    /// Fyllning (`draw:fill-color` när `draw:fill="solid"`), kant (`fo:border`) och luft (`fo:padding`) för textrutor.
+    fill: Option<String>,
+    border: Option<String>,
+    pad: Option<f32>,
 }
 
 /// Längd med tecken (`svg:x` kan vara negativ) i pt.
@@ -520,6 +524,9 @@ impl Styles {
                     if let Some(m) = c.attr("fo:margin").and_then(style::parse_length) {
                         g.margin = [Some(m); 4];
                     }
+                    g.fill = c.attr("draw:fill-color").filter(|_| c.attr("draw:fill") == Some("solid")).map(str::to_owned);
+                    g.border = c.attr("fo:border").map(str::to_owned);
+                    g.pad = c.attr("fo:padding").and_then(style::parse_length);
                 }
                 _ => {}
             }
@@ -845,6 +852,8 @@ enum Block {
     Para(Para),
     Table(Tbl),
     Rule,
+    /// Färdig Markdown på egna rader (textrutans markörer).
+    Raw(String),
 }
 
 #[derive(Default)]
@@ -909,6 +918,9 @@ struct Rd<'s, 'b> {
     notes: Vec<String>,
     /// Sant medan en fotnots stycken läses.
     in_note: bool,
+    /// Textrutor som lästs i stycket som byggs: läggs före stycket (`docx_tbox`), och sant medan en ruta läses.
+    pending_boxes: Vec<Vec<Block>>,
+    in_box: bool,
     /// Sidmallarnas sida och spalter, sidmallen som gäller just nu och dess egenskaper (avsnitt).
     masters: HashMap<String, sections::SectionProps>,
     cur_master: Option<String>,
@@ -1241,8 +1253,8 @@ impl<'s, 'b> Rd<'s, 'b> {
     }
 
     fn frame(&mut self, e: &Node, st: &St, pc: &mut Pc, runs: &mut Vec<Run>) {
-        if e.child("draw:text-box").is_some() {
-            self.dropped.textboxes = true;
+        if let Some(tb) = e.child("draw:text-box") {
+            self.text_box(e, tb);
             return;
         }
         let Some(img) = e.child("draw:image") else {
@@ -1360,7 +1372,88 @@ impl<'s, 'b> Rd<'s, 'b> {
         Para { kind, runs, align: self.st.align(style), list }
     }
 
+    /// Lägger de lästa textrutorna som block (`<!--k:tb 0-->` … `<!--k:/tb-->`) på brödtexten.
+    fn flush_boxes(&mut self) {
+        if self.in_box {
+            return;
+        }
+        for inner in std::mem::take(&mut self.pending_boxes) {
+            self.blocks.push(Block::Raw(crate::docx_tbox::open_tag(0)));
+            self.blocks.extend(inner);
+            self.blocks.push(Block::Raw(crate::docx_tbox::CLOSE.to_owned()));
+        }
+    }
+
+    /// Fyllning, kant och luft för ramen med grafikformatet `name`.
+    fn box_shape(&self, name: Option<&str>) -> crate::docx_tbox::Shape {
+        let mut g = GfxPlace::default();
+        for d in name.map(|n| self.st.chain("graphic", n)).unwrap_or_default() {
+            g.fill = d.gfx.fill.clone().or(g.fill);
+            g.border = d.gfx.border.clone().or(g.border);
+            g.pad = d.gfx.pad.or(g.pad);
+        }
+        let hex = |c: &str| {
+            let c = c.trim().trim_start_matches('#');
+            (c.len() == 6 && c.is_ascii()).then(|| u32::from_str_radix(c, 16).ok()).flatten().map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8])
+        };
+        let line = g.border.as_deref().and_then(|b| {
+            let parts: Vec<&str> = b.split_whitespace().collect();
+            if parts.len() < 3 || parts[1] == "none" || parts[1] == "hidden" {
+                return None;
+            }
+            Some((style::parse_length(parts[0])?.max(0.25), hex(parts[2])?))
+        });
+        let pad = g.pad.unwrap_or(5.7);
+        crate::docx_tbox::Shape { fill: g.fill.as_deref().and_then(hex), line, ins: Some([pad; 4]) }
+    }
+
+    /// En textruta (`draw:text-box`): innehållet läses som stycken och läggs före stycket ramen sitter i.
+    fn text_box(&mut self, e: &Node, tb: &Node) {
+        use crate::word::pbox::FrameX;
+        if self.in_box {
+            self.dropped.textboxes = true;
+            return;
+        }
+        let name = e.attr("draw:style-name");
+        let shape = self.box_shape(name);
+        let width = e.attr("svg:width").and_then(style::parse_length).unwrap_or(0.0);
+        let place = self.st.frame_place(e, name);
+        // Läget från sidans kant räknas om till spaltens vänsterkant.
+        let from_page = place.as_ref().is_some_and(|a| a.hrel == HRel::Page);
+        let x = match place.map(|a| a.h) {
+            Some(Pos::Center) => FrameX::Center,
+            Some(Pos::End) => FrameX::End,
+            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3] } else { 0.0 }).max(0.0) * 10.0).round() / 10.0),
+            _ => FrameX::Start,
+        };
+        let saved = std::mem::take(&mut self.blocks);
+        self.in_box = true;
+        for c in tb.els() {
+            self.walk(c);
+        }
+        self.in_box = false;
+        let mut inner = std::mem::replace(&mut self.blocks, saved);
+        // En ruta utan text (bara tomma stycken) ger inget block.
+        let has_text = inner.iter().any(|b| match b {
+            Block::Para(p) => !para_md(p).trim().is_empty(),
+            Block::Table(_) | Block::Raw(_) => true,
+            Block::Rule => false,
+        });
+        let pp = crate::docx_tbox::frame(&shape, x, width);
+        for b in inner.iter_mut() {
+            if let Block::Para(p) = b {
+                if p.list.is_none() && p.kind != Kind::Code && !pp.is_empty() {
+                    p.runs.push(Rd::marker_run(pp.marker()));
+                }
+            }
+        }
+        if has_text {
+            self.pending_boxes.push(inner);
+        }
+    }
+
     fn emit(&mut self, p: Para) {
+        self.flush_boxes();
         if p.kind == Kind::Rule {
             self.blocks.push(Block::Rule);
             return;
@@ -1818,6 +1911,15 @@ fn render(blocks: &[Block], text_w: Option<f64>) -> String {
                     }
                 }
             }
+            Block::Raw(r) => {
+                prev_list = None;
+                if cur_align != Align::Left {
+                    set_align(&mut out, &mut cur_align, Align::Left);
+                } else if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(r);
+            }
             Block::Rule => {
                 prev_list = None;
                 if cur_align != Align::Left {
@@ -2055,6 +2157,8 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         list_id: 0,
         notes: Vec::new(),
         in_note: false,
+        pending_boxes: Vec::new(),
+        in_box: false,
         cur_page: start_master.as_ref().and_then(|m| masters.get(m)).cloned().unwrap_or_default(),
         cur_master: start_master,
         page_defaults: defaults.clone(),
@@ -2065,6 +2169,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     for c in body.els() {
         rd.walk(c);
     }
+    rd.flush_boxes();
     let text_w = {
         let (w, _) = defaults.page();
         let m = defaults.margins();
@@ -2329,6 +2434,8 @@ struct W<'a> {
     section_open: bool,
     n_sect: usize,
     pending_break: Option<String>,
+    /// Öppna textrutor (`<!--k:tb N-->`): var rutans innehåll börjar i brödtexten och ramen (första `k:pp`).
+    boxes: Vec<(usize, Option<crate::word::pbox::PPr>)>,
     review: ReviewWr,
 }
 
@@ -2438,6 +2545,7 @@ impl<'a> W<'a> {
             section_open: false,
             n_sect: 0,
             pending_break: None,
+            boxes: Vec::new(),
             review: ReviewWr::default(),
         }
     }
@@ -3083,6 +3191,50 @@ impl<'a> W<'a> {
         self.body.push_str(&x);
     }
 
+    /// Stänger en textruta: stycknen sedan öppningen läggs i en `draw:text-box` i en ram som är förankrad
+    /// i ett eget stycke, med rutans fyllning, kant, bredd och läge ur ramens markör.
+    fn finish_box(&mut self) {
+        use crate::word::pbox::FrameX;
+        let Some((start, pp)) = self.boxes.pop() else { return };
+        let inner = self.body.split_off(start.min(self.body.len()));
+        if inner.trim().is_empty() {
+            return;
+        }
+        let pp = pp.unwrap_or_default();
+        let frame = pp.frame;
+        let bd = &pp.borders;
+        let pt = |v: f32| format!("{:.3}pt", v);
+        let hex = |c: [u8; 3]| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+        let (hpos, x) = match frame.map(|f| f.x) {
+            Some(FrameX::Center) => ("center", None),
+            Some(FrameX::End) => ("right", None),
+            Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v)),
+            _ => ("left", None),
+        };
+        let width = frame.map(|f| f.w).filter(|w| *w < 5000.0).unwrap_or(self.text_w).min(self.text_w.max(36.0));
+        let border = match (bd.left, bd.left.and_then(|b| b.color)) {
+            (Some(b), c) => format!("{} solid {}", pt(f32::from(b.sz) / 8.0), c.map_or("#000000".to_owned(), hex)),
+            _ => "none".to_owned(),
+        };
+        // Luften är avståndet från kanten (inklusive linjen) till texten, så att läsningen ger samma tal.
+        let pad = (frame.map_or(0.0, |f| f.pl) - bd.left.map_or(0.0, |b| f32::from(b.sz) / 8.0)).max(0.0);
+        let fill = pp.shd.map_or("draw:fill=\"none\"".to_owned(), |c| format!("draw:fill=\"solid\" draw:fill-color=\"{}\"", hex(c)));
+        self.n_frame += 1;
+        let name = format!("tb{}", self.n_frame);
+        self.auto.push_str(&format!(
+            "<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:wrap=\"none\" style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\" style:horizontal-pos=\"{hpos}\" style:horizontal-rel=\"paragraph\" style:run-through=\"foreground\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.2cm\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:padding=\"{}\" fo:border=\"{border}\" {fill} draw:auto-grow-height=\"true\" draw:textarea-vertical-align=\"top\"/></style:style>",
+            pt(pad)
+        ));
+        let svg_x = x.map_or(String::new(), |v| format!(" svg:x=\"{}\"", pt(v)));
+        self.open_para();
+        self.body.push_str(&format!(
+            "<draw:frame draw:style-name=\"{name}\" draw:name=\"Textruta{}\" text:anchor-type=\"paragraph\"{svg_x} svg:width=\"{}\" fo:min-height=\"0.5cm\"><draw:text-box>{inner}</draw:text-box></draw:frame>",
+            self.n_frame,
+            pt(width)
+        ));
+        self.close_para();
+    }
+
     fn html(&mut self, s: &str) {
         let t = s.trim();
         let single_line = t.lines().count() == 1;
@@ -3112,6 +3264,17 @@ impl<'a> W<'a> {
                 if self.body.is_empty() {
                     self.flush_break();
                 }
+            }
+        } else if crate::docx_tbox::parse_open(t).is_some() && self.table.is_none() {
+            self.close_para();
+            self.boxes.push((self.body.len(), None));
+        } else if t == crate::docx_tbox::CLOSE && !self.boxes.is_empty() {
+            self.close_para();
+            self.finish_box();
+        } else if let Some(pp) = crate::word::pbox::PPr::parse_marker(t) {
+            // Styckeutseende: bara ramen i en textruta tas med (rutans fyllning, kant och bredd).
+            if let Some(b) = self.boxes.last_mut().filter(|b| b.1.is_none()) {
+                b.1 = Some(pp);
             }
         } else if t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />") {
             self.line_break();
@@ -3888,8 +4051,6 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     // Spårade ändringar och kommentarer: posterna lyfts ur texten och skrivs som `text:tracked-changes`
     // och `office:annotation`.
     let (stripped, revs, comments) = review::split_records(markdown);
-    // Textrutornas blockmarkörer (`docx_tbox`): rutans stycken blir vanliga stycken.
-    let stripped = crate::docx_tbox::strip_tags(&stripped);
     let markdown = stripped.as_str();
     let first = markdown.lines().next().unwrap_or("");
     let (defaults, markdown) = match DocDefaults::from_comment(first) {
@@ -4148,6 +4309,25 @@ Slut.
         let back = read(&w.bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
         assert_eq!(back.markdown, md, "\n--- fick ---\n{}\n{c}", back.markdown);
+    }
+
+    #[test]
+    fn text_box_roundtrip() {
+        let pp = "<!--k:pp bdr=\"t=single:6:6:112233 l=single:6:6:112233 b=single:6:6:112233 r=single:6:6:112233\" shd=\"FFF2CC\" fr=\"w=200 x=end pl=6.75 pr=6.75\"-->";
+        let md = format!("Före\n\n<!--k:tb 0-->\n\n**Faktaruta**{pp}\n\nText i rutan{pp}\n\n<!--k:/tb-->\n\nEfter\n");
+        let w = write(&md, "T", &resolver()).unwrap();
+        let c = content_xml(&w.bytes);
+        assert!(c.contains("<draw:text-box>") && c.contains("svg:width=\"200.000pt\""), "{c}");
+        assert!(c.contains("draw:fill-color=\"#FFF2CC\"") && c.contains("style:horizontal-pos=\"right\""), "{c}");
+        assert!(c.contains("Text i rutan") && !c.contains("k:tb") && !c.contains("k:pp"), "{c}");
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        let m = back.markdown;
+        assert!(m.contains("<!--k:tb 0-->") && m.contains("<!--k:/tb-->"), "{m}");
+        let block = m.split("<!--k:tb 0-->").nth(1).unwrap().split("<!--k:/tb-->").next().unwrap();
+        assert!(block.contains("**Faktaruta**") && block.contains("Text i rutan") && block.contains("shd=\"FFF2CC\""), "{m}");
+        assert!(block.contains("x=end") && block.contains("w=200"), "{m}");
+        assert!(m.find("Före").unwrap() < m.find("k:tb").unwrap() && m.find("k:/tb").unwrap() < m.find("Efter").unwrap(), "{m}");
     }
 
     #[test]
