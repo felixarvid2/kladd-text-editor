@@ -144,6 +144,7 @@ enum Block {
     SectionBreak(SectionProps),
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     ColumnBreak,
+    PageBreak,
 }
 
 /// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
@@ -517,6 +518,9 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     } else if let Some(props) = SectionProps::from_comment(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::SectionBreak(props));
+                    } else if sections::is_page_break(tag) {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::PageBreak);
                     } else if sections::is_column_break(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::ColumnBreak);
@@ -1862,6 +1866,13 @@ impl<'a> Layout<'a> {
                 Block::Toc => self.toc(),
                 Block::SectionBreak(props) => self.section_break(props),
                 Block::ColumnBreak => self.new_page(),
+                Block::PageBreak => {
+                    // Ny sida (i alla spalter) om den nuvarande har innehåll.
+                    let empty = self.pages.last().is_some_and(|p| p.ops.is_empty()) && self.col == 0 && (self.y - self.rt).abs() < 0.5;
+                    if !empty && !self.pages.is_empty() {
+                        self.real_page();
+                    }
+                }
             }
         }
     }

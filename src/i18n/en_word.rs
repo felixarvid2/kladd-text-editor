@@ -112,6 +112,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Slå på grammatik- och stilkontroll (LanguageTool)", "Turn on grammar and style checking (LanguageTool)"),
     ("Smala (12,7 mm)", "Narrow (12.7 mm)"),
     ("Spaltbrytning", "Column Break"),
+    ("Sidbrytning", "Page Break"),
     ("Spalter", "Columns"),
     ("Språk för stavningskontroll", "Spelling language"),
     ("Spåra ändringar (Ctrl+Shift+E)", "Track Changes (Ctrl+Shift+E)"),

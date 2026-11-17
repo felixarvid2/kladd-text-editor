@@ -510,6 +510,7 @@ fn relayout(
     let multi = pages.is_some_and(|g| g.multi());
     let mut row_sec: Vec<u32> = Vec::new();
     let mut col_breaks: Vec<usize> = Vec::new();
+    let mut page_breaks: Vec<usize> = Vec::new();
     let page_wrap = wrap_width;
     // Uppskattad sidbrytning (som `pages::paginate`) så att bilder som placeras mot sidan eller
     // marginalen vet var på arket stycket ligger.
@@ -628,10 +629,15 @@ fn relayout(
         if multi {
             let n: usize = galleys.iter().map(|g| g.rows.len()).sum();
             row_sec.extend(std::iter::repeat(sec as u32).take(n));
+        }
+        {
             let mut r = row_no;
             for (q, lg) in gp.iter().zip(galleys.iter()) {
-                if q.col_break {
+                if multi && q.col_break {
                     col_breaks.push(r);
+                }
+                if q.page_break {
+                    page_breaks.push(r);
                 }
                 r += lg.rows.len();
             }
@@ -688,7 +694,7 @@ fn relayout(
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks);
             // Tabellernas kolumnkanter följer med raderna i sidled.
             for (t, r) in geoms.iter_mut().zip(&geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
@@ -697,7 +703,7 @@ fn relayout(
             st.page_boxes = Arc::new(paged.boxes);
         }
         Some(geom) => {
-            super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+            super::pages::paginate_breaks(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks);
             st.page_boxes = Arc::new(geom.uniform_boxes(super::pages::page_count(&g, geom)));
         }
         None => st.page_boxes = Arc::default(),
@@ -1459,6 +1465,8 @@ struct Para {
     first_indent: f32,
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     col_break: bool,
+    /// Sidbrytningsraden (`<!-- kladd: sidbrytning -->`): raden börjar en ny sida.
+    page_break: bool,
     /// Styckeutseende ur markören `<!--k:pp …-->` (`pbox`): avstånd, indrag, ram och skuggning.
     look: Option<Arc<PPr>>,
     /// Höjd (px) på den tomma raden mellan två stycken när avståndet kommer från `look`.
@@ -1604,6 +1612,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             None
         };
         let col_break = super::sections::is_column_break(t);
+        let page_break = super::sections::is_page_break(t);
         out.push(Para {
             range,
             align,
@@ -1616,6 +1625,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             space_before,
             first_indent,
             col_break,
+            page_break,
             look: None,
             gap: None,
             line: None,

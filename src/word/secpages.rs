@@ -444,6 +444,7 @@ pub fn paginate_sections(
     groups: &[Range<usize>],
     row_sec: &[u32],
     col_breaks: &[usize],
+    page_breaks: &[usize],
 ) -> Paged {
     let n_rows = g.rows.len();
     let mut boxes: Vec<PageBox> = Vec::new();
@@ -573,8 +574,9 @@ pub fn paginate_sections(
 
         // Spaltbrytning: nästa spalt (eller sida) innan raden placeras.
         let is_break = col_breaks.binary_search(&i).is_ok();
-        let advance = |boxes: &mut Vec<PageBox>, col: &mut usize, col_y: &mut f32, region_top: &mut f32, region_page: &mut usize, page_bottom: &mut f32, broke: &mut bool, units: &mut Vec<Unit>| {
-            if *col + 1 < sg.cols {
+        let is_page_break = page_breaks.binary_search(&i).is_ok();
+        let advance = |boxes: &mut Vec<PageBox>, col: &mut usize, col_y: &mut f32, region_top: &mut f32, region_page: &mut usize, page_bottom: &mut f32, broke: &mut bool, units: &mut Vec<Unit>, force_page: bool| {
+            if !force_page && *col + 1 < sg.cols {
                 *col += 1;
                 *col_y = *region_top;
             } else {
@@ -592,11 +594,16 @@ pub fn paginate_sections(
             }
         };
         if is_break {
-            advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units);
+            advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, false);
+        } else if is_page_break {
+            // Sidbrytning: ny sida om den nuvarande har innehåll (i någon spalt).
+            if col > 0 || col_y > region_top + eps || page_bottom > region_top + eps {
+                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, true);
+            }
         } else {
             let text_bottom = boxes[boxes.len() - 1].text_bottom();
             if col_y + h.max(fh) > text_bottom + eps && col_y > region_top + eps {
-                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units);
+                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, false);
             }
         }
         let _ = region_page;

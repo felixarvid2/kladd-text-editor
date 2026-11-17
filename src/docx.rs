@@ -233,6 +233,11 @@ fn local(name: &[u8]) -> &[u8] {
 }
 
 /// Värdet på ett attribut, matchat på lokalt namn (`w:val`, `r:id` …).
+/// Ett på/av-element (`<w:pageBreakBefore/>`, `w:val="0"` är av).
+fn on_val(e: &BytesStart<'_>) -> bool {
+    !matches!(attr(e, b"val").as_deref(), Some("0" | "false" | "off"))
+}
+
 fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes().flatten().find(|a| local(a.key.as_ref()) == name).map(|a| {
         a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
@@ -481,6 +486,8 @@ struct StyleInfo {
     rpr: RProps,
     /// Justering (`w:jc`) i formatmallen.
     jc: Option<Align>,
+    /// `w:pageBreakBefore` i formatmallen.
+    page_before: Option<bool>,
 }
 
 /// Formatmallarna i `styles.xml`: stycke- och teckenmallar plus dokumentets standardvärden.
@@ -531,6 +538,19 @@ impl Styles {
             cur = info.based_on.as_deref();
         }
         None
+    }
+
+    /// Börjar stycken med formatmallen alltid på en ny sida (`w:pageBreakBefore`, även ärvt)?
+    fn page_before(&self, style: Option<&str>) -> bool {
+        let mut cur = Some(self.para_id(style));
+        for _ in 0..10 {
+            let Some(info) = cur.and_then(|c| self.map.get(c)) else { return false };
+            if let Some(v) = info.page_before {
+                return v;
+            }
+            cur = info.based_on.as_deref();
+        }
+        false
     }
 
     /// Dokumentets grundformat: typsnitt och storlek hos Normal (docDefaults + Normal).
@@ -600,6 +620,7 @@ fn parse_styles(xml: &str, theme: &Theme) -> Styles {
                         b"name" => info.name = attr(e, b"val").unwrap_or_default().to_lowercase(),
                         b"basedOn" => info.based_on = attr(e, b"val"),
                         b"jc" if in_ppr => info.jc = attr(e, b"val").map(|v| Align::from_jc(&v)),
+                        b"pageBreakBefore" if in_ppr => info.page_before = Some(on_val(e)),
                         b"outlineLvl" => {
                             info.outline = attr(e, b"val").and_then(|v| v.parse::<u8>().ok()).filter(|&v| v < 9)
                         }
@@ -1920,6 +1941,9 @@ fn run_span(
 
 /// Slutet (exklusivt) på elementet som börjar vid `from` i `xml`.
 /// Ett stycke med bara en rad råtext (Kladds egna markörer: avsnitt, spaltbrytning).
+/// Körningen som markerar en sidbrytning i ett stycke som läses (tas bort av `split_page_breaks`).
+const PAGE_BREAK_RUN: &str = "\u{E0F0}";
+
 fn raw_para(text: String, origin: usize) -> Para {
     let mut p = Para::new();
     p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
@@ -2020,6 +2044,8 @@ fn parse_body(
     // Avsnittsslut (`w:sectPr` i `w:pPr`) och spaltbrytning i stycket som läses.
     let mut para_sect: Option<String> = None;
     let mut para_col_break = false;
+    // `w:pageBreakBefore` i stycket självt (`Some(false)` upphäver formatmallens).
+    let mut para_page_before: Option<bool> = None;
     let mut fmt = Fmt::default();
     // Körningens egna egenskaper (`w:rPr`) och teckenmall (`w:rStyle`).
     let mut direct = RProps::default();
@@ -2417,6 +2443,7 @@ fn parse_body(
                         para = Some(Para::new());
                         para_marks.clear();
                         para_fchange = None;
+                        para_page_before = None;
                     }
                     b"pPr" => in_ppr = !empty,
                     b"pStyle" if in_ppr => {
@@ -2510,6 +2537,11 @@ fn parse_body(
                     b"br" if !hidden(&field_depth) && attr(e, b"type").as_deref() == Some("column") && tables.is_empty() => {
                         para_col_break = true;
                     }
+                    // Sidbrytning i en körning: stycket delas vid den när det avslutas (`split_page_breaks`).
+                    b"br" if !hidden(&field_depth) && attr(e, b"type").as_deref() == Some("page") && tables.is_empty() && para.is_some() && skip == 0 => {
+                        para.as_mut().expect("stycke").runs.push(Run { text: PAGE_BREAK_RUN.to_owned(), fmt: Fmt::default(), link: None, raw: true });
+                    }
+                    b"pageBreakBefore" if in_ppr && para.is_some() => para_page_before = Some(on_val(e)),
                     b"br" | b"cr" if !hidden(&field_depth) => {
                         // En infogad eller struken radbrytning får en markör före sig.
                         if let Some((kind @ (RevKind::Ins | RevKind::Del), id)) = cur_rev {
@@ -2746,14 +2778,31 @@ fn parse_body(
                                 p.origin = info.elems.len().wrapping_sub(1);
                                 // Spaltbrytning före stycket (eller ensam), avsnittsrad efter det.
                                 let origin = p.origin;
-                                // Stycket som bär en avsnitts- eller spaltbrytning är ingen blankrad.
-                                if (para_sect.is_some() || para_col_break) && is_blank_para(&p) {
-                                    p.runs.push(Run { text: String::new(), fmt: Fmt::default(), link: None, raw: true });
+                                // Sidbrytning före stycket (`w:pageBreakBefore`, också ur formatmallen) och i det.
+                                let before = para_page_before.take().unwrap_or_else(|| styles.page_before(p.style.as_deref()));
+                                let pieces = split_page_breaks(p);
+                                let n = pieces.len();
+                                if before && !matches!(blocks.last(), Some(Block::Para(q)) if q.origin == origin && q.runs.first().is_some_and(|r| r.raw && r.text == sections::PAGE_BREAK_LINE)) {
+                                    blocks.push(Block::Para(raw_para(sections::PAGE_BREAK_LINE.to_owned(), origin)));
                                 }
-                                if std::mem::take(&mut para_col_break) {
-                                    blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
+                                let has_sect = para_sect.is_some();
+                                for (i, mut p) in pieces.into_iter().enumerate() {
+                                    if i > 0 {
+                                        blocks.push(Block::Para(raw_para(sections::PAGE_BREAK_LINE.to_owned(), origin)));
+                                    }
+                                    // Ett stycke som bara bär en sidbrytning blir bara brytningsraden.
+                                    if n > 1 && is_blank_para(&p) && !(has_sect && i + 1 == n) {
+                                        continue;
+                                    }
+                                    // Stycket som bär en avsnitts- eller spaltbrytning är ingen blankrad.
+                                    if (has_sect || para_col_break) && is_blank_para(&p) {
+                                        p.runs.push(Run { text: String::new(), fmt: Fmt::default(), link: None, raw: true });
+                                    }
+                                    if i == 0 && std::mem::take(&mut para_col_break) {
+                                        blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
+                                    }
+                                    blocks.push(Block::Para(p));
                                 }
-                                blocks.push(Block::Para(p));
                                 if let Some(x) = para_sect.take() {
                                     info.sects.push(x);
                                     blocks.push(Block::Para(raw_para(section_placeholder(info.sects.len() - 1), origin)));
@@ -2947,6 +2996,26 @@ fn inline_md(run: &Run) -> String {
 /// Styckeutseendet (ram, skuggning, avstånd, indrag) ur stycket, dess mall och docDefaults, för
 /// de stycken som kommer från ett toppnivåelement i brödtexten (`word::pbox`, markören `k:pp`).
 /// Ett tomt stycke (bara blanktecken, inga objekt): används som lodrätt avstånd i Word.
+/// Delar ett stycke vid sidbrytningarna (`PAGE_BREAK_RUN`) i dess körningar; ett stycke utan
+/// sidbrytning blir ett enda. Listpunkten (och dess tecken) gäller bara första delen.
+fn split_page_breaks(p: Para) -> Vec<Para> {
+    if !p.runs.iter().any(|r| r.raw && r.text == PAGE_BREAK_RUN) {
+        return vec![p];
+    }
+    let mut out: Vec<Para> = Vec::new();
+    let rest = Para { runs: Vec::new(), list: None, ..p.clone() };
+    let mut cur = Para { runs: Vec::new(), ..p.clone() };
+    for r in p.runs {
+        if r.raw && r.text == PAGE_BREAK_RUN {
+            out.push(std::mem::replace(&mut cur, rest.clone()));
+        } else {
+            cur.runs.push(r);
+        }
+    }
+    out.push(cur);
+    out
+}
+
 fn is_blank_para(p: &Para) -> bool {
     p.kind == ParaKind::Normal && p.list.is_none() && p.origin != usize::MAX && p.runs.iter().all(|r| !r.raw && r.link.is_none() && r.text.trim().is_empty())
 }
@@ -4515,6 +4584,9 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 } else if sections::is_column_break(&s) && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.body.push_str("<w:p><w:r><w:br w:type=\"column\"/></w:r></w:p>");
+                } else if sections::is_page_break(&s) && w.table.is_none() && w.quote == 0 {
+                    w.close_para();
+                    w.body.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
                 } else if s.trim().eq_ignore_ascii_case("<br>") || s.trim().eq_ignore_ascii_case("<br/>") {
                     w.line_break();
                 } else if let Some(style) = style::parse_span_open(&s) {
@@ -4574,6 +4646,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                             || key == crate::word::nav::TOC_LINE
                             || sections::SectionProps::from_comment(&key).is_some()
                             || sections::is_column_break(&key)
+                            || sections::is_page_break(&key)
                             || crate::word::pbox::parse_empty(&key).is_some();
                         if ok && !key.is_empty() {
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
@@ -6541,6 +6614,52 @@ mod tests {
     /// Skriver om `word/styles.xml`.
     fn patch_styles(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
         patch_part(bytes, "word/styles.xml", f)
+    }
+
+    /// Läser `word/document.xml` med handgjorda stycken före ett avslutande stycke "Slut".
+    fn md_with_body(body: &str) -> String {
+        let base = write("Slut\n", "T", &|_| None, None).unwrap().bytes;
+        let xml = patch_document(&base, |x| x.replacen("<w:body>", &format!("<w:body>{body}"), 1));
+        read(&xml).unwrap().markdown
+    }
+
+    const BRK: &str = "<!-- kladd: sidbrytning -->";
+
+    #[test]
+    fn page_break_in_run_splits_paragraph() {
+        let md = md_with_body(r#"<w:p><w:r><w:t>Före</w:t></w:r><w:r><w:br w:type="page"/></w:r><w:r><w:t>Efter</w:t></w:r></w:p>"#);
+        assert!(md.contains(&format!("Före\n\n{BRK}\n\nEfter")), "{md}");
+    }
+
+    #[test]
+    fn page_break_alone_in_paragraph() {
+        let md = md_with_body(r#"<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
+        assert!(md.contains(&format!("A\n\n{BRK}\n\nSlut")), "{md}");
+    }
+
+    #[test]
+    fn page_break_before_direct_and_off() {
+        let md = md_with_body(r#"<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#);
+        assert!(md.contains(&format!("A\n\n{BRK}\n\nB")), "{md}");
+        let md = md_with_body(r#"<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore w:val="0"/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#);
+        assert!(!md.contains(BRK), "{md}");
+    }
+
+    #[test]
+    fn page_break_before_from_style() {
+        let base = write("Slut\n", "T", &|_| None, None).unwrap().bytes;
+        let base = patch_styles(&base, |x| x.replacen("</w:styles>", r#"<w:style w:type="paragraph" w:styleId="Nysida"><w:name w:val="Nysida"/><w:pPr><w:pageBreakBefore/></w:pPr></w:style></w:styles>"#, 1));
+        let xml = patch_document(&base, |x| x.replacen("<w:body>", r#"<w:body><w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Nysida"/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#, 1));
+        let md = read(&xml).unwrap().markdown;
+        assert!(md.contains(&format!("A\n\n{BRK}\n\nB")), "{md}");
+    }
+
+    #[test]
+    fn page_break_roundtrips() {
+        let md = format!("Före\n\n{BRK}\n\nEfter\n");
+        assert_eq!(rt(&md), md);
+        let again = rt(&rt(&md));
+        assert_eq!(again, md);
     }
 
     #[test]

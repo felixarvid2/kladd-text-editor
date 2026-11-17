@@ -22,6 +22,8 @@ use crate::style;
 pub const SECTION_KEY: &str = "avsnitt";
 /// Raden som flyttar texten till nästa spalt.
 pub const COLUMN_BREAK_LINE: &str = "<!-- kladd: spaltbrytning -->";
+/// Raden som börjar en ny sida (som Words sidbrytning); avsnittet och dess format fortsätter.
+pub const PAGE_BREAK_LINE: &str = "<!-- kladd: sidbrytning -->";
 /// Mellanrum mellan spalter (pt) när `column-gap` saknas (som Words 1,25 cm = 708 twips).
 pub const DEFAULT_GAP: f32 = 35.4;
 /// Största antal spalter.
@@ -30,7 +32,7 @@ pub const MAX_COLUMNS: usize = 6;
 /// Sant om `css` (texten efter `kladd:`) börjar en avsnittsrad.
 pub fn is_section_keyword(css: &str) -> bool {
     let t = css.trim_start();
-    for key in [SECTION_KEY, "spaltbrytning"] {
+    for key in [SECTION_KEY, "spaltbrytning", "sidbrytning"] {
         if let Some(rest) = t.strip_prefix(key) {
             if rest.is_empty() || rest.starts_with(|c: char| c == ';' || c.is_whitespace()) {
                 return true;
@@ -43,6 +45,11 @@ pub fn is_section_keyword(css: &str) -> bool {
 /// Sant om `line` är spaltbrytningsraden.
 pub fn is_column_break(line: &str) -> bool {
     line.trim() == COLUMN_BREAK_LINE
+}
+
+/// Sant om `line` är sidbrytningsraden.
+pub fn is_page_break(line: &str) -> bool {
+    line.trim() == PAGE_BREAK_LINE
 }
 
 /// Egenskaperna som står på en avsnittsrad. `None` = ärv dokumentets grundformat.
@@ -265,6 +272,11 @@ pub fn insert_column_break(text: &str, at: usize) -> Edit {
     insert_line(text, at, COLUMN_BREAK_LINE)
 }
 
+/// Sätter in en sidbrytning vid `at`.
+pub fn insert_page_break(text: &str, at: usize) -> Edit {
+    insert_line(text, at, PAGE_BREAK_LINE)
+}
+
 /// Egenskaperna för avsnittet som `at` ligger i, och avsnittets index.
 pub fn current(text: &str, at: usize, d: &DocDefaults) -> (usize, Section) {
     let secs = scan(text, d);
@@ -374,6 +386,14 @@ mod tests {
     use crate::word::markup;
 
     const MARK: &str = "<!-- kladd: avsnitt; page: A4 landscape; columns: 2; column-gap: 12mm -->";
+
+    #[test]
+    fn page_break_line_is_recognised() {
+        assert!(is_page_break(PAGE_BREAK_LINE));
+        assert!(is_page_break(&format!("  {PAGE_BREAK_LINE}  ")));
+        assert!(!is_page_break("<!-- kladd: toc -->"));
+        assert!(SectionProps::from_comment(PAGE_BREAK_LINE).is_none());
+    }
 
     #[test]
     fn marker_roundtrip() {

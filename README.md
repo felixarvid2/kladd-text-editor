@@ -166,6 +166,7 @@ Word-dokumentets Normal, Title, Subtitle, Rubrik 1–6 och Citat läses in (med 
 Som i Word kan en del av dokumentet ha egna sidor eller flera spalter. Öppna *Infoga* i formateringsfältet:
 
 - **Avsnittsbrytning (ny sida)** börjar ett nytt avsnitt på en ny sida. Avsnittet börjar som det förra.
+- **Sidbrytning** börjar en ny sida utan att ändra sidformat. Sidbrytningar i Word- och LibreOffice-dokument visas på samma sätt.
 - **Liggande sidor härifrån** (och *Stående sidor härifrån*) vänder sidorna från markören och framåt. Står markören först i dokumentet gäller det hela första avsnittet.
 - **Spalter…** ger avsnittet som markören står i 1, 2 eller 3 spalter med valfritt mellanrum. Texten flyter uppifrån och ned i första spalten, sedan i nästa och sedan på nästa sida.
 - **Spaltbrytning** flyttar texten efter markören till nästa spalt.
@@ -241,7 +242,7 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 | Spårat stycketecken | `<!--k:pm ins 5-->` / `<!--k:pm del 5-->` sist på raden, före radbrytningen |
 | Spårad formatering | `<fmt data-k="6">text</fmt>` (teckenformat) och `<!--k:pm fmt 7-->` (styckeformat); det gamla formatet står i postradens `old` |
 | Kommentar | `<!--k:c:1-->text<!--k:/c:1-->` och en postrad `<!--k:c id="1" …-->` sist |
-| Liggande sidor, andra marginaler, spalter | `<!-- kladd: avsnitt; page: A4 landscape; columns: 2 -->` på en egen rad (börjar ett avsnitt), `<!-- kladd: spaltbrytning -->` |
+| Liggande sidor, andra marginaler, spalter | `<!-- kladd: avsnitt; page: A4 landscape; columns: 2 -->` på en egen rad (börjar ett avsnitt), `<!-- kladd: spaltbrytning -->`; `<!-- kladd: sidbrytning -->` på en egen rad ger en ny sida |
 | Punktlistor och numrerade listor | `-` och `1.` |
 | Citat | `>` |
 | Tabeller | `\| kolumn \| kolumn \|` |

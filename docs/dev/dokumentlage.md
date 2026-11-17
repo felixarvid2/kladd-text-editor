@@ -662,7 +662,18 @@ Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som
 *Liggande sidor härifrån* / *Stående sidor härifrån* (ändrar avsnittet om inget står före markören i det,
 annars börjar ett nytt avsnitt där), *Spalter…* (dialog: 1–3 spalter och mellanrum i mm; gäller avsnittet
 som markören står i och skriver om dess rad, eller lägger en rad före all text i första avsnittet) och
-*Spaltbrytning*.
+*Spaltbrytning*, *Sidbrytning*.
+
+### Sidbrytning
+
+`<!-- kladd: sidbrytning -->` (`sections::PAGE_BREAK_LINE`) är en dold rad som spaltbrytningen: `layout` samlar dem i
+`page_breaks` och `pages::paginate_breaks` / `secpages::paginate_sections` (`force_page`) börjar en ny sida, men bara
+om sidan har innehåll (i alla spalter), så en brytning på en tom sida ignoreras. docx läser `w:br w:type="page"` i en
+körning (stycket delas av `split_page_breaks`), `w:pageBreakBefore` direkt och i formatmall (`Styles::page_before`, direkt
+`val=0` upphäver mallens). odt läser `fo:break-before`/`fo:break-after` (`Styles::page_breaks`, med arv); ingen rad först i
+dokumentet, inte två i rad och inte där ett sidmallsbyte redan börjar en ny sida, men ett tomt första stycke med brytning
+behåller den (så en avslutande brytning överlever spara och öppna). Skrivning: docx `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`,
+odt `fo:break-before="page"` på nästa stycke (ett eget tomt stycke först i dokumentet och sist), PDF `Block::PageBreak`.
 
 ### Utläggning och sidbrytning
 

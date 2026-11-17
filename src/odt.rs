@@ -315,6 +315,9 @@ struct StyleDef {
     master: Option<String>,
     /// Spalter i ett avsnittsformat (`style:columns`).
     cols: Option<ColsDef>,
+    /// `fo:break-before` och `fo:break-after` (`page` = true, `auto` = false) i styckeformatet.
+    break_before: Option<bool>,
+    break_after: Option<bool>,
 }
 
 #[derive(Default)]
@@ -477,6 +480,13 @@ impl Styles {
                     if let Some(a) = c.attr("fo:text-align") {
                         d.align = Some(parse_align(a));
                     }
+                    let brk = |v: &str| match v {
+                        "page" => Some(true),
+                        "auto" => Some(false),
+                        _ => None,
+                    };
+                    d.break_before = c.attr("fo:break-before").and_then(brk);
+                    d.break_after = c.attr("fo:break-after").and_then(brk);
                     d.pp.before = c.attr("fo:margin-top").and_then(style::parse_length);
                     d.pp.after = c.attr("fo:margin-bottom").and_then(style::parse_length);
                     d.pp.indent = c.attr("fo:text-indent").and_then(style::parse_length);
@@ -654,6 +664,14 @@ impl Styles {
     /// Sidmallen som ett stycke byter till (`style:master-page-name`), direkt eller ärvd.
     fn master_of(&self, style: &str) -> Option<&str> {
         self.chain("paragraph", style).iter().rev().find_map(|d| d.master.as_deref())
+    }
+
+    /// Sidbrytning före och efter ett stycke (`fo:break-before`/`fo:break-after`), direkt eller ärvd.
+    fn page_breaks(&self, style: &str) -> (bool, bool) {
+        let chain = self.chain("paragraph", style);
+        let before = chain.iter().rev().find_map(|d| d.break_before).unwrap_or(false);
+        let after = chain.iter().rev().find_map(|d| d.break_after).unwrap_or(false);
+        (before, after)
     }
 
     /// Spalterna i ett avsnittsformat.
@@ -1375,6 +1393,17 @@ impl<'s, 'b> Rd<'s, 'b> {
         self.blocks.push(Block::Para(Para { kind: Kind::Normal, runs: vec![run], align: Align::Left, list: None }));
     }
 
+    /// En rad `<!-- kladd: sidbrytning -->` (inte först i dokumentet och inte två i rad).
+    /// `allow_first`: ett tomt stycke som bär brytningen (så skriver Kladd en avslutande brytning).
+    fn page_break_row(&mut self, allow_first: bool) {
+        let last_is_break = matches!(self.blocks.last(), Some(Block::Para(p)) if matches!(p.runs.as_slice(), [r] if r.raw && r.text == sections::PAGE_BREAK_LINE));
+        if (self.blocks.is_empty() && !allow_first) || last_is_break {
+            return;
+        }
+        let run = Run { text: sections::PAGE_BREAK_LINE.to_owned(), fmt: Fmt::default(), link: None, raw: true };
+        self.blocks.push(Block::Para(Para { kind: Kind::Normal, runs: vec![run], align: Align::Left, list: None }));
+    }
+
     /// Byter stycket sidmall börjar en ny sida med nya mått: en avsnittsrad.
     fn check_master(&mut self, n: &Node) {
         let Some(m) = n.attr("text:style-name").and_then(|s| self.st.master_of(s)) else { return };
@@ -1390,9 +1419,17 @@ impl<'s, 'b> Rd<'s, 'b> {
     fn walk(&mut self, n: &Node) {
         match n.name.as_str() {
             "text:p" | "text:h" => {
+                let before_master = self.blocks.len();
                 self.check_master(n);
+                let (brk_before, brk_after) = n.attr("text:style-name").map_or((false, false), |s| self.st.page_breaks(s));
+                if brk_before && self.blocks.len() == before_master {
+                    self.page_break_row(n.deep_text().trim().is_empty());
+                }
                 let p = self.build_para(n, None);
                 self.emit(p);
+                if brk_after {
+                    self.page_break_row(false);
+                }
             }
             // Avsnitt med spalter: en löpande avsnittsrad före och en som återställer efter.
             "text:section" if n.attr("text:style-name").and_then(|s| self.st.section_columns(s)).is_some() => {
@@ -3137,6 +3174,17 @@ impl<'a> W<'a> {
         } else if sections::is_column_break(t) && self.table.is_none() {
             self.close_para();
             self.pending_break = Some(if self.section_open { "column" } else { "page" }.to_owned());
+        } else if sections::is_page_break(t) && self.table.is_none() {
+            self.close_para();
+            // Ett väntande avsnittsbyte (sidmall) börjar redan en ny sida.
+            if self.pending_break.is_none() {
+                self.pending_break = Some("page".to_owned());
+                // Först i dokumentet bärs brytningen av ett eget tomt stycke: läsaren hoppar
+                // över en brytning på första stycket med text, men inte på ett tomt.
+                if self.body.is_empty() {
+                    self.flush_break();
+                }
+            }
         } else if t.eq_ignore_ascii_case("<br>") || t.eq_ignore_ascii_case("<br/>") || t.eq_ignore_ascii_case("<br />") {
             self.line_break();
         } else if let Some(style) = style::parse_span_open(s) {
@@ -4214,6 +4262,33 @@ Slut.
     fn numbered_list_start_and_spaces() {
         let md = "5. fem\n6. sex\n\nTre    mellanslag och\ttab.\n";
         assert_eq!(read(&write(md, "T", &|_| None).unwrap().bytes).unwrap().markdown, md);
+    }
+
+    fn md_of_body(auto: &str, body: &str) -> String {
+        let c = format!(r##"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3"><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:text>{body}</office:text></office:body></office:document-content>"##);
+        read(&make_odt(&c, LO_STYLES, &[])).unwrap().markdown
+    }
+
+    const BRK_AUTO: &str = r#"<style:style style:name="PB" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:break-before="page"/></style:style><style:style style:name="PA" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:break-after="page"/></style:style>"#;
+
+    #[test]
+    fn break_before_and_after_give_page_break_rows() {
+        let brk = "<!-- kladd: sidbrytning -->";
+        let md = md_of_body(BRK_AUTO, r#"<text:p text:style-name="Standard">A</text:p><text:p text:style-name="PB">B</text:p>"#);
+        assert!(md.contains(&format!("A\n\n{brk}\n\nB")), "{md}");
+        let md = md_of_body(BRK_AUTO, r#"<text:p text:style-name="PA">A</text:p><text:p text:style-name="Standard">B</text:p>"#);
+        assert!(md.contains(&format!("A\n\n{brk}\n\nB")), "{md}");
+        // Efter + före på granna stycken ger bara en rad (och först i dokumentet ingen).
+        let md = md_of_body(BRK_AUTO, r#"<text:p text:style-name="PB">A</text:p><text:p text:style-name="PA">B</text:p><text:p text:style-name="PB">C</text:p>"#);
+        assert_eq!(md.matches(brk).count(), 1, "{md}");
+        assert!(!md.contains(&format!("{brk}\n\nA")), "{md}");
+    }
+
+    #[test]
+    fn page_break_row_roundtrips() {
+        let md = "Före\n\n<!-- kladd: sidbrytning -->\n\nEfter\n";
+        let back = read(&write(md, "T", &|_| None).unwrap().bytes).unwrap().markdown;
+        assert_eq!(back, md);
     }
 
     fn make_odt(content: &str, styles: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {

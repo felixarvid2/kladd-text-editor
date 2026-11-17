@@ -415,6 +415,7 @@ pub static ALL: &[Command] = &[
     Command::new("insert.portrait", "Stående sidor härifrån", Insert, "", |e| e.word, |a, c| a.section_landscape(c, false)).scope(Scope::Word),
     Command::new("insert.columns", "Spalter…", Insert, "", |e| e.word, |a, c| a.open_columns_dialog(c)).scope(Scope::Word),
     Command::new("insert.column_break", "Spaltbrytning", Insert, "", |e| e.word, |a, c| a.column_break(c)).scope(Scope::Word),
+    Command::new("insert.page_break", "Sidbrytning", Insert, "", |e| e.word, |a, c| a.page_break(c)).scope(Scope::Word),
     // ---------------------------------------------------------------- Format
     Command::new("format.bold", "Fetstil", Format, "Ctrl+B", |e| e.word, |a, c| a.word_toggle(c, Inline::Bold)).scope(Scope::Word),
     Command::new("format.italic", "Kursiv", Format, "Ctrl+I", |e| e.word, |a, c| a.word_toggle(c, Inline::Italic)).scope(Scope::Word),

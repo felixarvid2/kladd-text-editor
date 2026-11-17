@@ -106,6 +106,12 @@ impl Geom {
 /// rad av sin höjd, så att en bild som inte ryms flyttas till nästa sida tillsammans med texten
 /// efter den.
 pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], groups: &[std::ops::Range<usize>]) {
+    paginate_breaks(g, geom, ppp, floats, groups, &[]);
+}
+
+/// Som `paginate`, men raderna i `breaks` (stigande; sidbrytningsraderna, `<!-- kladd: sidbrytning -->`)
+/// börjar alltid en ny sida om den nuvarande har innehåll.
+pub fn paginate_breaks(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], groups: &[std::ops::Range<usize>], breaks: &[usize]) {
     if g.rows.is_empty() {
         return;
     }
@@ -136,7 +142,8 @@ pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], 
         let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
         let top = y0 + shift;
         let page_top = page as f32 * stride;
-        if top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
+        let forced = breaks.binary_search(&i).is_ok();
+        if forced && top > page_top + eps || top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
             // Nästa sida, men inte över en rad som sträcker sig förbi arket.
             page += 1;
             while (page as f32 * stride) < prev_bottom - eps {

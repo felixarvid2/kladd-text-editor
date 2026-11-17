@@ -550,7 +550,7 @@ fn parse(text: &str) -> Parsed {
                         // Innehållsförteckningen (en dold rad som dokumentläget ersätter med rubrikerna)
                         // och tabellformatet före en tabell: dolda rader.
                         fill(&mut st, tr, |s| s.markup = true);
-                    } else if super::sections::SectionProps::from_comment(t).is_some() || super::sections::is_column_break(t) {
+                    } else if super::sections::SectionProps::from_comment(t).is_some() || super::sections::is_column_break(t) || super::sections::is_page_break(t) {
                         // Avsnittsrad och spaltbrytning: dolda rader (visas bara när markören står på dem).
                         fill(&mut st, tr, |s| s.markup = true);
                     } else if ls == 0 {

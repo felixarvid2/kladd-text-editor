@@ -54,6 +54,11 @@ impl KladdApp {
         self.word_edit(ctx, |t, s| sections::insert_column_break(t, s.end));
     }
 
+    /// Sidbrytning vid markören.
+    pub(crate) fn page_break(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| sections::insert_page_break(t, s.end));
+    }
+
     /// Öppnar "Spalter" för avsnittet som markören står i.
     pub(crate) fn open_columns_dialog(&mut self, ctx: &egui::Context) {
         if let Some((_, s)) = self.current_section(ctx) {

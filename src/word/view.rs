@@ -158,6 +158,7 @@ enum BarAct {
     SectionBreak,
     Landscape(bool),
     ColumnBreak,
+    PageBreak,
     Columns,
     TableOp(TableOp),
     PageSetup,
@@ -762,6 +763,9 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Spaltbrytning"), "", None, true) {
                             acts.push(BarAct::ColumnBreak);
                         }
+                        if crate::app::menu_item(ui, p, t("Sidbrytning"), "", None, true) {
+                            acts.push(BarAct::PageBreak);
+                        }
                     });
                     // Granska: spåra ändringar och kommentarer.
                     let track_label = if tracking { t("Spårar: på") } else { t("Spåra: av") };
@@ -821,6 +825,7 @@ impl KladdApp {
                 BarAct::SectionBreak => self.section_break(&ctx),
                 BarAct::Landscape(l) => self.section_landscape(&ctx, l),
                 BarAct::ColumnBreak => self.column_break(&ctx),
+                BarAct::PageBreak => self.page_break(&ctx),
                 BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
