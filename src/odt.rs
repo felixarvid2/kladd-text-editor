@@ -10,8 +10,8 @@
 //! dokumentets grundformat (standardstycket + Standard) skrivs som `<span style>`.
 //!
 //! Beslut om saker Kladd inte kan visa:
-//! - Fotnoter och slutnoter (`text:note`) blir `[^N]` och en definition `[^N]: text` sist i dokumentet
-//!   (slutnoter blir fotnoter).
+//! - Fotnoter (`text:note`) blir `[^N]` och en definition `[^N]: text` sist i dokumentet; slutnoter
+//!   (`text:note-class="endnote"`) blir `[^ei]`, `[^eii]` … (egen numrering, definitionerna efter fotnoternas).
 //! - Spårade ändringar och kommentarer läses som i .docx (`crate::review`): `text:insertion` (mellan
 //!   `text:change-start` och `text:change-end`) blir `<ins>`, `text:deletion` (platsen markeras av
 //!   `text:change`, den raderade texten ligger i `text:changed-region`) blir `<del>`, och
@@ -915,7 +915,8 @@ struct Rd<'s, 'b> {
     blocks: Vec<Block>,
     list_id: usize,
     /// Fotnotstexterna (Markdown på en rad) i dokumentordning; fotnot N är `[^N]`.
-    notes: Vec<String>,
+    /// Noternas Markdown, med sant för slutnoter.
+    notes: Vec<(bool, String)>,
     /// Sant medan en fotnots stycken läses.
     in_note: bool,
     /// Textrutor som lästs i stycket som byggs: läggs före stycket (`docx_tbox`), och sant medan en ruta läses.
@@ -1230,8 +1231,10 @@ impl<'s, 'b> Rd<'s, 'b> {
             self.note_paras(body, &mut parts);
         }
         self.in_note = false;
-        self.notes.push(escape_line_start(&parts.join("<br>")));
-        let label = format!("[^{}]", self.notes.len());
+        let end = e.attr("text:note-class") == Some("endnote");
+        self.notes.push((end, escape_line_start(&parts.join("<br>"))));
+        let n = self.notes.iter().filter(|x| x.0 == end).count();
+        let label = if end { format!("[^{}]", crate::word::markup::endnote_label(n)) } else { format!("[^{n}]") };
         push_run(runs, Run { text: label, fmt: Fmt::default(), link: None, raw: true });
     }
 
@@ -2178,8 +2181,12 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let mut markdown = render(&rd.blocks, Some(text_w));
     if !rd.notes.is_empty() {
         markdown.push('\n');
-        for (i, n) in rd.notes.iter().enumerate() {
-            markdown.push_str(&format!("[^{}]: {n}\n", i + 1));
+        // Fotnoterna först (1..n), sedan slutnoterna (`ei`, `eii` …).
+        for end in [false, true] {
+            for (i, (_, n)) in rd.notes.iter().filter(|x| x.0 == end).enumerate() {
+                let label = if end { crate::word::markup::endnote_label(i + 1) } else { (i + 1).to_string() };
+                markdown.push_str(&format!("[^{label}]: {n}\n"));
+            }
         }
     }
     if !rd.review.revs.is_empty() || !rd.review.comments.is_empty() {
@@ -3347,10 +3354,19 @@ impl<'a> W<'a> {
                     .map(|(_, x)| x.as_str())
                     .filter(|x| !x.is_empty())
                     .unwrap_or("<text:p text:style-name=\"Footnote\"/>");
-                let k = n + 1;
-                out.push_str(&format!(
-                    "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{k}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
-                ));
+                let k = self.note_order[..=n].iter().filter(|l| !crate::word::markup::is_endnote_label(l)).count();
+                if crate::word::markup::is_endnote_label(label) {
+                    // Slutnoterna numreras för sig, med romerska tal.
+                    let m = self.note_order[..=n].iter().filter(|l| crate::word::markup::is_endnote_label(l)).count();
+                    let cit = crate::word::markup::roman(m);
+                    out.push_str(&format!(
+                        "<text:note text:id=\"edn{m}\" text:note-class=\"endnote\"><text:note-citation>{cit}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{k}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
+                    ));
+                }
             }
             rest = &r[e + '\u{E005}'.len_utf8()..];
         }
@@ -3911,6 +3927,7 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
 
     apply_style_overrides(&mut named, &d.styles);
     named.push_str("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"1\" text:start-value=\"0\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>");
+    named.push_str("<text:notes-configuration text:note-class=\"endnote\" style:num-format=\"i\" text:start-value=\"0\"/>");
 
     format!(
         "{XML_DECL}<office:document-styles {NS} office:version=\"1.2\">{}<office:styles>{named}</office:styles><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>",

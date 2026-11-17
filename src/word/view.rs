@@ -154,6 +154,7 @@ enum BarAct {
     /// Ekvation: tom (`None`) eller en mall ur paletten.
     Equation(Option<usize>),
     Footnote,
+    Endnote,
     Toc,
     SectionBreak,
     Landscape(bool),
@@ -373,6 +374,15 @@ impl KladdApp {
         }
     }
 
+    /// Infogar en slutnot vid markören och flyttar markören till den nya definitionen.
+    pub(crate) fn word_endnote(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| markup::insert_endnote(t, s.end));
+        let b = self.word_selection(ctx).start;
+        if let Some(doc) = self.docs.get(self.active) {
+            self.scroll_to_char = Some(byte_to_char(&doc.text, b));
+        }
+    }
+
     /// Backspace direkt efter (eller Delete direkt före) en fotnotsreferens tar bort hela fotnoten,
     /// både referensen och definitionen; annars skulle en trasig `[^1` lämna en föräldralös definition.
     fn word_footnote_keys(&mut self, ctx: &egui::Context) {
@@ -390,7 +400,7 @@ impl KladdApp {
         if sel.start != sel.end {
             return;
         }
-        let hit = markup::footnotes(&doc.text)
+        let hit = markup::all_notes(&doc.text)
             .refs
             .into_iter()
             .find(|r| if back { r.full.end == sel.start } else { r.full.start == sel.start });
@@ -505,6 +515,9 @@ impl KladdApp {
         }
         if hit(ctrl_alt, Key::F) {
             self.word_footnote(ctx);
+        }
+        if hit(ctrl_alt, Key::D) {
+            self.word_endnote(ctx);
         }
         for (k, b) in [
             (Key::Num1, Block::Heading(1)),
@@ -746,6 +759,9 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Fotnot"), "Ctrl+Alt+F", None, true) {
                             acts.push(BarAct::Footnote);
                         }
+                        if crate::app::menu_item(ui, p, t("Slutnot"), "Ctrl+Alt+D", None, true) {
+                            acts.push(BarAct::Endnote);
+                        }
                         if crate::app::menu_item(ui, p, t("Innehållsförteckning"), "", None, true) {
                             acts.push(BarAct::Toc);
                         }
@@ -842,6 +858,7 @@ impl KladdApp {
                     markup::Edit { text: e.text, sel: e.sel }
                 }),
                 BarAct::Footnote => self.word_footnote(&ctx),
+                BarAct::Endnote => self.word_endnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::EditStyles => {
                     let sel = crate::style::StyleId::for_block(act.block);

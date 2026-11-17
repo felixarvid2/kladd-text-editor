@@ -101,6 +101,8 @@ struct FnPart {
 struct FnRefInfo {
     id: String,
     origin: usize,
+    /// Sant för en slutnot (`w:endnoteReference`), som blir `[^ei]` i texten.
+    endnote: bool,
 }
 
 /// Originalet av ett öppnat Word-dokument: alla delar i paketet, `w:sectPr`, varje blocks
@@ -121,6 +123,8 @@ pub struct Source {
     tokens: Vec<Opaque>,
     /// Originalets fotnoter (footnotes.xml), om dokumentet har några.
     footnotes: Option<FnPart>,
+    /// Originalets slutnoter (endnotes.xml), om dokumentet har några.
+    endnotes: Option<FnPart>,
     /// Sida, sidhuvud och sidfot så som de lästes (övriga fält i DocDefaults är tomma).
     page: DocDefaults,
     /// Formatmallarna så som de lästes ur `styles.xml` (se `docx_styles`).
@@ -1008,7 +1012,13 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
 
     // Fotnoterna: texten läses ur footnotes.xml och läggs som definitioner sist i dokumentet.
     let footnotes = match find_part("/footnotes") {
-        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering)?,
+        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering, "footnote")?,
+        None => None,
+    };
+
+    // Slutnoterna: endnotes.xml, som fotnoterna men med etiketterna `ei`, `eii` …
+    let endnotes = match find_part("/endnotes") {
+        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering, "endnote")?,
         None => None,
     };
 
@@ -1103,12 +1113,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     base.styles = style_set;
     if !info.fn_refs.is_empty() {
         markdown.push('\n');
-        for (i, r) in info.fn_refs.iter().enumerate() {
-            let md = footnotes
-                .as_ref()
-                .and_then(|f| f.items.iter().find(|x| x.id == r.id && x.ty.is_none()))
-                .map_or("", |x| x.md.as_str());
-            markdown.push_str(&format!("[^{}]: {md}\n", i + 1));
+        // Fotnoterna först (numrerade 1..n), sedan slutnoterna (`e1`, `e2` …), var och en i textens ordning.
+        for end in [false, true] {
+            let part = if end { endnotes.as_ref() } else { footnotes.as_ref() };
+            for (i, r) in info.fn_refs.iter().filter(|r| r.endnote == end).enumerate() {
+                let md = part
+                    .and_then(|f| f.items.iter().find(|x| x.id == r.id && x.ty.is_none()))
+                    .map_or("", |x| x.md.as_str());
+                let label = if end { crate::word::markup::endnote_label(i + 1) } else { (i + 1).to_string() };
+                markdown.push_str(&format!("[^{label}]: {md}\n"));
+            }
         }
     }
     let mut comments = comments;
@@ -1188,14 +1202,14 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 e.fn_ids.push(r.id.clone());
             }
         }
-        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles, comments, hf_secs: sect_hf.iter().map(|h| h.own.clone()).collect(), sect_prs, tboxes })
+        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, endnotes, page, styles: read_styles, comments, hf_secs: sect_hf.iter().map(|h| h.own.clone()).collect(), sect_prs, tboxes })
     });
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
 
 /// Delar upp footnotes.xml: allt före och efter, och varje `<w:footnote>` med id, typ, hela
 /// elementet och innehållets intervall (utan start- och sluttaggen).
-fn split_footnotes(xml: &str) -> Option<(String, Vec<(String, Option<String>, String, std::ops::Range<usize>)>, String)> {
+fn split_footnotes(xml: &str, tag: &str) -> Option<(String, Vec<(String, Option<String>, String, std::ops::Range<usize>)>, String)> {
     let mut r = Reader::from_str(xml);
     let mut depth = 0usize;
     let mut cur: Option<(usize, usize, String, Option<String>)> = None; // (start, inner start, id, typ)
@@ -1209,14 +1223,14 @@ fn split_footnotes(xml: &str) -> Option<(String, Vec<(String, Option<String>, St
         let after = r.buffer_position() as usize;
         match &ev {
             Event::Start(e) => {
-                if depth == 1 && local(e.name().as_ref()) == b"footnote" {
+                if depth == 1 && local(e.name().as_ref()) == tag.as_bytes() {
                     first.get_or_insert(before);
                     cur = Some((before, after, attr(e, b"id").unwrap_or_default(), attr(e, b"type")));
                 }
                 depth += 1;
             }
             Event::Empty(e) => {
-                if depth == 1 && local(e.name().as_ref()) == b"footnote" {
+                if depth == 1 && local(e.name().as_ref()) == tag.as_bytes() {
                     first.get_or_insert(before);
                     items.push((attr(e, b"id").unwrap_or_default(), attr(e, b"type"), xml[before..after].to_owned(), after..after));
                     last_end = after;
@@ -1286,9 +1300,9 @@ fn footnote_md(
     escape_line_start(&joined)
 }
 
-fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Theme, numbering: &Numbering) -> Result<Option<FnPart>, String> {
+fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Theme, numbering: &Numbering, tag: &str) -> Result<Option<FnPart>, String> {
     let Some(xml) = pkg.part(name)? else { return Ok(None) };
-    let Some((head, raw, tail)) = split_footnotes(&xml) else { return Ok(None) };
+    let Some((head, raw, tail)) = split_footnotes(&xml, tag) else { return Ok(None) };
     // Hyperlänkar i fotnoterna pekar på footnotes.xml:s egna relationer.
     let (dir, file) = name.rsplit_once('/').unwrap_or(("", name));
     let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
@@ -1949,6 +1963,7 @@ fn parse_body(
     let mut run_start = 0usize;
     let mut run_opaque = false;
     let mut run_fnref: Option<String> = None;
+    let mut run_fnend = false;
     // Hur långt stycket var när körningen började, så att den kan backas om den blir en markör.
     let mut run_mark = (0usize, 0usize);
     let mut run_found_mark = 0usize;
@@ -2163,15 +2178,18 @@ fn parse_body(
                 } else if in_run
                     && matches!(
                         name.as_slice(),
-                        b"endnoteReference" | b"commentReference" | b"fldChar" | b"instrText" | b"sym" | b"object"
+                        b"commentReference" | b"fldChar" | b"instrText" | b"sym" | b"object"
                     )
                 {
                     run_opaque = true;
                 }
                 match name.as_slice() {
                     // Fotnotsreferens: blir `[^N]` i texten (anpassad hänvisning och dolda fält förblir markörer).
-                    b"footnoteReference" if in_run => match attr(e, b"id") {
-                        Some(id) if attr(e, b"customMarkFollows").is_none() && !hidden(&field_depth) => run_fnref = Some(id),
+                    b"footnoteReference" | b"endnoteReference" if in_run => match attr(e, b"id") {
+                        Some(id) if attr(e, b"customMarkFollows").is_none() && !hidden(&field_depth) => {
+                            run_fnref = Some(id);
+                            run_fnend = name.as_slice() == b"endnoteReference";
+                        }
                         _ => run_opaque = true,
                     },
                     // Bilder: samla ihop till ett `![…](bild:…)` när elementet tar slut.
@@ -2582,8 +2600,13 @@ fn parse_body(
                                         l.text.truncate(run_mark.1);
                                     }
                                 }
-                                info.fn_refs.push(FnRefInfo { id, origin: info.elems.len().wrapping_sub(1) });
-                                let label = format!("[^{}]", info.fn_refs.len());
+                                let endnote = std::mem::take(&mut run_fnend);
+                                info.fn_refs.push(FnRefInfo { id, origin: info.elems.len().wrapping_sub(1), endnote });
+                                let label = if endnote {
+                                    format!("[^{}]", crate::word::markup::endnote_label(info.fn_refs.iter().filter(|r| r.endnote).count()))
+                                } else {
+                                    format!("[^{}]", info.fn_refs.iter().filter(|r| !r.endnote).count())
+                                };
                                 let p = para.get_or_insert_with(Para::new);
                                 p.runs.push(Run { text: label, fmt: Fmt::default(), link: None, raw: true });
                             } else if run_opaque {
@@ -4500,9 +4523,15 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 w.fn_order.push(t.to_string());
                 let n = w.fn_order.len() - 1;
                 let ph = format!("\u{E004}{n}\u{E005}");
-                w.body.push_str(&format!(
-                    "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"{ph}\"/></w:r>"
-                ));
+                if crate::word::markup::is_endnote_label(&t) {
+                    w.body.push_str(&format!(
+                        "<w:r><w:rPr><w:rStyle w:val=\"EndnoteReference\"/></w:rPr><w:endnoteReference w:id=\"{ph}\"/></w:r>"
+                    ));
+                } else {
+                    w.body.push_str(&format!(
+                        "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"{ph}\"/></w:r>"
+                    ));
+                }
             }
         }
         match ended {
@@ -4627,7 +4656,7 @@ fn kladd_styles() -> String {
             r#"<w:style w:type="paragraph" w:styleId="TOC{n}"><w:name w:val="toc {n}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:autoRedefine/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9016"/></w:tabs><w:spacing w:after="100"/><w:ind w:left="{ind}"/></w:pPr></w:style>"#
         ));
     }
-    s.push_str(r#"<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="29"/><w:qFormat/><w:pPr><w:spacing w:before="120"/><w:ind w:left="567" w:right="567"/><w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="A0A0A0"/></w:pBdr></w:pPr><w:rPr><w:i/><w:color w:val="404040"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/><w:qFormat/><w:pPr><w:spacing w:after="60"/><w:ind w:left="720"/><w:contextualSpacing/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="39"/><w:qFormat/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="character" w:styleId="CodeChar"><w:name w:val="Code Char"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="39"/><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:rPr></w:style><w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style><w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:basedOn w:val="TableNormal"/><w:uiPriority w:val="39"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/></w:tblBorders></w:tblPr></w:style>"#);
+    s.push_str(r#"<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="29"/><w:qFormat/><w:pPr><w:spacing w:before="120"/><w:ind w:left="567" w:right="567"/><w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="A0A0A0"/></w:pBdr></w:pPr><w:rPr><w:i/><w:color w:val="404040"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/><w:qFormat/><w:pPr><w:spacing w:after="60"/><w:ind w:left="720"/><w:contextualSpacing/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="39"/><w:qFormat/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="character" w:styleId="CodeChar"><w:name w:val="Code Char"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="39"/><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:rPr></w:style><w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style><w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="character" w:styleId="EndnoteReference"><w:name w:val="endnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="EndnoteText"><w:name w:val="endnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:basedOn w:val="TableNormal"/><w:uiPriority w:val="39"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/></w:tblBorders></w:tblPr></w:style>"#);
     s
 }
 
@@ -5468,7 +5497,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Fo
     if body.is_empty() || body.ends_with("</w:tbl>") {
         body.push_str("<w:p/>");
     }
-    let (body, footnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None);
+    let (body, footnotes_xml, endnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None, None);
     let comments_out = review_xml::build_comments(None, &rv.comments, &review_xml::anchored_ids(&body));
     let mut extras = Extras::default();
     let fields = style::Fields::for_export(title, "docx");
@@ -5520,6 +5549,10 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Fo
         doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdFn1" Type="{REL_NS}/footnotes" Target="footnotes.xml"/>"#));
         extras.types.push_str(&format!(r#"<Override PartName="/word/footnotes.xml" ContentType="{FOOTNOTES_MIME}"/>"#));
     }
+    if endnotes_xml.is_some() {
+        doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdEn1" Type="{REL_NS}/endnotes" Target="endnotes.xml"/>"#));
+        extras.types.push_str(&format!(r#"<Override PartName="/word/endnotes.xml" ContentType="{ENDNOTES_MIME}"/>"#));
+    }
     if let Some(c) = &comments_out {
         doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdCm1" Type="{REL_NS}/comments" Target="comments.xml"/>"#));
         extras.types.push_str(&format!(r#"<Override PartName="/word/comments.xml" ContentType="{}"/>"#, review_xml::COMMENTS_MIME));
@@ -5546,9 +5579,16 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Fo
     ];
     if let Some(xml) = footnotes_xml {
         parts.push(("word/footnotes.xml".into(), xml.into_bytes()));
-        let settings = SETTINGS.replace("<w:compat>", r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:compat>"#);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
-            p.1 = settings.into_bytes();
+            let cur = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = cur.replace("<w:compat>", r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:compat>"#).into_bytes();
+        }
+    }
+    if let Some(xml) = endnotes_xml {
+        parts.push(("word/endnotes.xml".into(), xml.into_bytes()));
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
+            let cur = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = cur.replace("<w:compat>", r#"<w:endnotePr><w:endnote w:id="-1"/><w:endnote w:id="0"/></w:endnotePr><w:compat>"#).into_bytes();
         }
     }
     if let Some(c) = comments_out {
@@ -5788,11 +5828,12 @@ fn fn_placeholders(xml: &str) -> Vec<usize> {
 }
 
 /// Id:n för alla `w:footnoteReference` i `xml` (utom platshållare), i ordning.
-fn footnote_ids_in(xml: &str) -> Vec<String> {
+fn footnote_ids_in(xml: &str, end: bool) -> Vec<String> {
+    let open = if end { "<w:endnoteReference" } else { "<w:footnoteReference" };
     let mut out = Vec::new();
     let mut rest = xml;
-    while let Some(i) = rest.find("<w:footnoteReference") {
-        rest = &rest[i + 20..];
+    while let Some(i) = rest.find(open) {
+        rest = &rest[i + open.len()..];
         let Some(end) = rest.find('>') else { break };
         let tag = &rest[..end];
         if let Some(a) = tag.find("w:id=\"") {
@@ -5810,16 +5851,19 @@ fn footnote_ids_in(xml: &str) -> Vec<String> {
 
 /// Fotnotselementet för en definition som skrivits ur Markdown: första stycket får Words
 /// fotnotsnummer och ett blanksteg före texten.
-fn footnote_xml(id: &str, paras: &str) -> String {
+fn footnote_xml(id: &str, paras: &str, end: bool) -> String {
     const LEAD: &str = "<w:pPr><w:pStyle w:val=\"FootnoteText\"/></w:pPr><w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space=\"preserve\"> </w:t></w:r>";
+    const LEAD_END: &str = "<w:pPr><w:pStyle w:val=\"EndnoteText\"/></w:pPr><w:r><w:rPr><w:rStyle w:val=\"EndnoteReference\"/></w:rPr><w:endnoteRef/></w:r><w:r><w:t xml:space=\"preserve\"> </w:t></w:r>";
+    let lead = if end { LEAD_END } else { LEAD };
     let body = match paras.strip_prefix("<w:p>") {
         Some(rest) => {
             let rest = if rest.starts_with("<w:pPr>") { rest.find("</w:pPr>").map_or(rest, |e| &rest[e + 8..]) } else { rest };
-            format!("<w:p>{LEAD}{rest}")
+            format!("<w:p>{lead}{rest}")
         }
-        None => format!("<w:p>{LEAD}</w:p>"),
+        None => format!("<w:p>{lead}</w:p>"),
     };
-    format!("<w:footnote w:id=\"{id}\">{body}</w:footnote>")
+    let tag = if end { "endnote" } else { "footnote" };
+    format!("<w:{tag} w:id=\"{id}\">{body}</w:{tag}>")
 }
 
 const FOOTNOTES_HEAD: &str = concat!(
@@ -5828,6 +5872,13 @@ const FOOTNOTES_HEAD: &str = concat!(
     r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#
 );
 const FOOTNOTE_SEPARATORS: &str = r#"<w:footnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>"#;
+const ENDNOTES_HEAD: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\n",
+    r#"<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#
+);
+const ENDNOTE_SEPARATORS: &str = r#"<w:endnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:endnote><w:endnote w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:endnote>"#;
+const ENDNOTES_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
 const FOOTNOTES_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 
 /// Knyter ihop fotnotsreferenserna i brödtexten med definitionerna: ger varje referens ett id,
@@ -5835,10 +5886,38 @@ const FOOTNOTES_MIME: &str = "application/vnd.openxmlformats-officedocument.word
 /// `w.fn_order`) som ligger i orört originalstycke och redan har sitt id. En fotnot vars text är
 /// oförändrad får sin ursprungliga XML (med sitt id); övriga skrivs om. Svaret är den färdiga
 /// brödtexten och, om dokumentet har fotnoter, hela footnotes.xml.
-fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String>, orig: Option<&FnPart>) -> (String, Option<String>) {
-    let present = footnote_ids_in(&body);
-    if w.fn_order.is_empty() && present.is_empty() && orig.is_none() {
-        return (body, None);
+fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String>, orig: Option<&FnPart>, orig_end: Option<&FnPart>) -> (String, Option<String>, Option<String>) {
+    let (ids_fn, xml_fn) = resolve_note_kind(&body, w, bound, orig, false);
+    let (ids_en, xml_en) = resolve_note_kind(&body, w, bound, orig_end, true);
+    // Platshållarna byts mot idn.
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body.as_str();
+    while let Some(i) = rest.find('\u{E004}') {
+        out.push_str(&rest[..i]);
+        let r = &rest[i + '\u{E004}'.len_utf8()..];
+        let Some(e) = r.find('\u{E005}') else {
+            rest = "";
+            break;
+        };
+        if let Some(n) = r[..e].parse::<usize>().ok() {
+            if let Some(id) = ids_fn.get(n).and_then(Option::as_ref).or(ids_en.get(n).and_then(Option::as_ref)) {
+                out.push_str(id);
+            }
+        }
+        rest = &r[e + '\u{E005}'.len_utf8()..];
+    }
+    out.push_str(rest);
+    (out, xml_fn, xml_en)
+}
+
+/// Fotnoterna (`end` = falskt) eller slutnoterna (`end` = sant): id för varje referens i `fn_order`
+/// (`None` för den andra sortens) och hela footnotes.xml / endnotes.xml.
+fn resolve_note_kind(body: &str, w: &Writer<'_>, bound: &HashMap<usize, String>, orig: Option<&FnPart>, end: bool) -> (Vec<Option<String>>, Option<String>) {
+    let mine = |label: &str| crate::word::markup::is_endnote_label(label) == end;
+    let present = footnote_ids_in(body, end);
+    let mut ids: Vec<Option<String>> = vec![None; w.fn_order.len()];
+    if !w.fn_order.iter().any(|l| mine(l)) && present.is_empty() && orig.is_none() {
+        return (ids, None);
     }
     let items: &[FnOrig] = orig.map_or(&[], |o| o.items.as_slice());
     let normal = |id: &str| items.iter().find(|f| f.id == id && f.ty.is_none());
@@ -5847,23 +5926,25 @@ fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String
         .iter()
         .map(|f| f.id.as_str())
         .chain(present.iter().map(String::as_str))
-        .chain(bound.values().map(String::as_str))
+        .chain(bound.iter().filter(|(i, _)| w.fn_order.get(**i).is_some_and(|l| mine(l))).map(|(_, v)| v.as_str()))
         .filter_map(|i| i.parse::<i64>().ok())
         .max()
         .unwrap_or(0)
         .max(0)
         + 1;
     let mut taken_ids: std::collections::HashSet<String> = present.iter().cloned().collect();
-    let mut ids: Vec<String> = Vec::with_capacity(w.fn_order.len());
     let mut entries: Vec<(String, String)> = Vec::new(); // (id, XML)
     let mut label_done: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (i, label) in w.fn_order.iter().enumerate() {
+        if !mine(label) {
+            continue;
+        }
         let def = w.footnotes.iter().find(|d| d.label == *label);
         let first = label_done.insert(label.as_str());
         let id = match bound.get(&i) {
             Some(id) => id.clone(),
             None => {
-                // Oförändrad text: den ursprungliga fotnoten (om ingen annan redan använder den).
+                // Oförändrad text: den ursprungliga noten (om ingen annan redan använder den).
                 let same = def.filter(|_| first).and_then(|d| {
                     items.iter().find(|f| f.ty.is_none() && !taken_ids.contains(&f.id) && norm(&f.md) == d.key).map(|f| f.id.clone())
                 });
@@ -5877,52 +5958,37 @@ fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String
             }
         };
         taken_ids.insert(id.clone());
-        ids.push(id.clone());
+        ids[i] = Some(id.clone());
         if bound.contains_key(&i) && !first {
-            continue; // en andra referens i ett orört stycke: dess fotnot finns redan i originalet
+            continue; // en andra referens i ett orört stycke: noten finns redan i originalet
         }
         let Some(def) = def else { continue };
         let xml = match normal(&id) {
             Some(f) if norm(&f.md) == def.key => f.xml.clone(),
-            _ => footnote_xml(&id, &def.xml),
+            _ => footnote_xml(&id, &def.xml, end),
         };
         entries.push((id, xml));
     }
-    // Platshållarna byts mot idn.
-    let mut out = String::with_capacity(body.len());
-    let mut rest = body.as_str();
-    while let Some(i) = rest.find('\u{E004}') {
-        out.push_str(&rest[..i]);
-        let r = &rest[i + '\u{E004}'.len_utf8()..];
-        let Some(e) = r.find('\u{E005}') else {
-            rest = "";
-            break;
-        };
-        if let Some(id) = r[..e].parse::<usize>().ok().and_then(|n| ids.get(n)) {
-            out.push_str(id);
-        }
-        rest = &r[e + '\u{E005}'.len_utf8()..];
-    }
-    out.push_str(rest);
 
     if entries.is_empty() && orig.is_none() {
-        return (out, None);
+        return (ids, None);
     }
     let emitted: std::collections::HashSet<&str> = entries.iter().map(|(i, _)| i.as_str()).collect();
     let mut xml = String::new();
-    let (head, tail) = match orig {
-        Some(o) => (o.head.as_str(), o.tail.as_str()),
-        None => (FOOTNOTES_HEAD, "</w:footnotes>"),
+    let (head, tail) = match (orig, end) {
+        (Some(o), _) => (o.head.as_str(), o.tail.as_str()),
+        (None, false) => (FOOTNOTES_HEAD, "</w:footnotes>"),
+        (None, true) => (ENDNOTES_HEAD, "</w:endnotes>"),
     };
     xml.push_str(head);
-    // Skiljelinjerna först, sedan fotnoterna i textens ordning, sist de som bara hänvisas till av okända objekt.
+    // Skiljelinjerna först, sedan noterna i textens ordning, sist de som bara hänvisas till av okända objekt.
     if orig.is_none() {
-        xml.push_str(FOOTNOTE_SEPARATORS);
+        xml.push_str(if end { ENDNOTE_SEPARATORS } else { FOOTNOTE_SEPARATORS });
     }
     for f in items.iter().filter(|f| f.ty.is_some()) {
         xml.push_str(&f.xml);
     }
-    // Fotnoter som fanns förut behåller sin ordning i filen; nya kommer efter, i textens ordning.
+    // Noter som fanns förut behåller sin ordning i filen; nya kommer efter, i textens ordning.
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&k| items.iter().position(|f| f.id == entries[k].0).unwrap_or(usize::MAX));
     for k in order {
@@ -5932,7 +5998,7 @@ fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String
         xml.push_str(&f.xml);
     }
     xml.push_str(tail);
-    (out, Some(xml))
+    (ids, Some(xml))
 }
 
 /// Sätter ihop brödtexten: originalets XML för oförändrade block, nyskrivet för resten.
@@ -6267,7 +6333,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
         .map(|x| crate::docx_styles::foreign_heading_ids(&x).into_iter().map(|(n, id)| (format!("Heading{n}"), id)).collect())
         .unwrap_or_default();
     let body = heading_remap.iter().fold(body, |b, (k, v)| b.replace(&format!("<w:pStyle w:val=\"{k}\"/>"), &format!("<w:pStyle w:val=\"{v}\"/>")));
-    let (body, footnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref());
+    let (body, footnotes_xml, endnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref(), src.endnotes.as_ref());
     let comments_out = review_xml::build_comments(src.comments.as_ref(), &rv.comments, &review_xml::anchored_ids(&body));
 
     // ---- sida, sidhuvud och sidfot: per avsnitt, bara det som ändrats skrivs om
@@ -6413,6 +6479,32 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
             let cur = replaced.get(&name.to_lowercase()).map(|b| decode_xml(b));
             if let Some(xml) = cur.or_else(|| src.part(&name).map(decode_xml)) {
                 replaced.insert(name.to_lowercase(), fix_decl(&with_update_fields(&xml)).into_bytes());
+            }
+        }
+    }
+
+    // ---- slutnoter
+    if let Some(xml) = endnotes_xml {
+        match &src.endnotes {
+            Some(o) => {
+                replaced.insert(o.name.trim_start_matches('/').to_lowercase(), fix_decl(&xml).into_bytes());
+            }
+            None => {
+                let (part, xml) = fresh_part("word/endnotes.xml", "endnotes", ENDNOTES_MIME, xml, &mut doc_rel_add, &mut type_add);
+                new_parts.push((part, xml.into_bytes()));
+                if let Some((name, x)) = find_rel("/settings").and_then(|n| src.part(&n).map(|b| (n, decode_xml(b)))) {
+                    let x = replaced.get(&name.to_lowercase()).map_or(x, |b| decode_xml(b));
+                    if x.contains("</w:settings>") && !x.contains("<w:endnotePr") {
+                        let add = r#"<w:endnotePr><w:endnote w:id="-1"/><w:endnote w:id="0"/></w:endnotePr>"#;
+                        let at = ["<w:compat", "<w:docVars", "<w:rsids", "<m:mathPr", "<w:themeFontLang", "<w:clrSchemeMapping", "</w:settings>"]
+                            .iter()
+                            .filter_map(|m| x.find(m))
+                            .min()
+                            .unwrap_or(0);
+                        let patched = format!("{}{add}{}", &x[..at], &x[at..]);
+                        replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
+                    }
+                }
             }
         }
     }

@@ -55,7 +55,7 @@ fn footnotes_roundtrip_with_other_base_font() {
 }
 
 #[test]
-fn endnotes_are_read_as_footnotes() {
+fn endnotes_are_read_as_endnotes() {
     let c = r##"<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" office:version="1.3">
 <office:body><office:text>
@@ -63,5 +63,17 @@ fn endnotes_are_read_as_footnotes() {
 </office:text></office:body></office:document-content>"##;
     let l = read(&make(c)).unwrap();
     assert!(l.dropped.is_empty());
-    assert_eq!(l.markdown, "Före[^1] mitt[^2] efter.\n\n[^1]: Första noten med blanksteg<br>Andra stycket\n[^2]: Slutnot\n");
+    assert_eq!(l.markdown, "Före[^1] mitt[^ei] efter.\n\n[^1]: Första noten med blanksteg<br>Andra stycket\n[^ei]: Slutnot\n");
+}
+
+#[test]
+fn endnotes_roundtrip() {
+    let md = "Fot[^1] och slut[^ei] och mer[^eii].\n\n[^1]: Fotnot.\n[^ei]: Slut ett.\n[^eii]: Slut *två*.\n";
+    let w = write(md, "T", &|_| None).unwrap();
+    let c = content_of(&w.bytes);
+    assert_eq!(c.matches(r#"text:note-class="endnote""#).count(), 2, "{c}");
+    assert!(c.contains("<text:note-citation>ii</text:note-citation>") && c.contains("<text:note-citation>1</text:note-citation>"), "{c}");
+    let back = read(&w.bytes).unwrap();
+    assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+    assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
 }

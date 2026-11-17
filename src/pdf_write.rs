@@ -119,6 +119,8 @@ struct Style {
     span: SpanStyle,
     /// Fotnotsnummer (1-baserat): texten ritas som litet upphöjt nummer.
     fnref: Option<usize>,
+    /// Slutnotsnummer (romerskt tal): ritas upphöjt men hör inte till någon sida.
+    endref: bool,
     /// Formel (LaTeX-kod, egen rad): ritas som glyfer; `Span::text` är koden.
     math: Option<(String, bool)>,
 }
@@ -254,6 +256,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     opts.insert(crate::style::titles::OPTS);
     // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
     let mut note_labels: Vec<String> = Vec::new();
+    let mut end_labels: Vec<String> = Vec::new();
     let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
     let mut note_cur: Option<(String, Vec<Block>)> = None;
 
@@ -552,6 +555,18 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
             }
             MdEvent::TaskListMarker(done) => push_text(&mut spans, if done { "☑ " } else { "☐ " }, &style),
             MdEvent::FootnoteReference(t) if note_cur.is_some() => push_text(&mut spans, &format!("[{t}]"), &style),
+            // Slutnoter: romersk siffra upphöjd i texten, noten kommer efter sista texten.
+            MdEvent::FootnoteReference(t) if crate::word::markup::is_endnote_label(&t) => {
+                let n = match end_labels.iter().position(|l| l.as_str() == &*t) {
+                    Some(i) => i + 1,
+                    None => {
+                        end_labels.push(t.to_string());
+                        end_labels.len()
+                    }
+                };
+                let st = Style { endref: true, ..style.clone() };
+                spans.push(Span { text: crate::word::markup::roman(n), style: st });
+            }
             MdEvent::FootnoteReference(t) => {
                 // Samma etikett flera gånger är samma fotnot (som i Markdown).
                 let n = match note_labels.iter().position(|l| l.as_str() == &*t) {
@@ -571,6 +586,18 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         .iter()
         .map(|l| note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default())
         .collect();
+    // Slutnoterna efter sista texten, under en linje (hela dokumentet, inte per sida).
+    if !end_labels.is_empty() {
+        blocks.push(Block::Rule);
+        for (i, l) in end_labels.iter().enumerate() {
+            let mut spans = vec![
+                Span { text: crate::word::markup::roman(i + 1), style: Style { endref: true, ..Style::default() } },
+                Span { text: " ".into(), style: Style::default() },
+            ];
+            spans.extend(note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default());
+            blocks.push(Block::Para { spans, indent: 0.0, quote: 0, align: Align::Left, look: None });
+        }
+    }
     (blocks, notes)
 }
 
@@ -1204,7 +1231,7 @@ impl<'a> Layout<'a> {
             let face = face_for(&s.style, base);
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
-            let sz = if s.style.fnref.is_some() { sz * 0.65 } else { sz };
+            let sz = if s.style.fnref.is_some() || s.style.endref { sz * 0.65 } else { sz };
             if let Some((src, disp)) = &s.style.math {
                 if let Some(f) = crate::math::formula(src, *disp) {
                     // Raden ska rymma formeln: storleken höjs så att över- och underdelen får plats.
@@ -1447,7 +1474,7 @@ impl<'a> Layout<'a> {
                     (false, None) => color,
                 };
                 // Fotnotsnummer ritas upphöjda.
-                let ty = if st.fnref.is_some() { baseline - size * 0.38 } else { baseline };
+                let ty = if st.fnref.is_some() || st.endref { baseline - size * 0.38 } else { baseline };
                 self.page().ops.push(Op::Text { x: rx, y: ty, face, size: sz, text, color: c, italic: st.italic || italic_all });
                 if st.link.is_some() {
                     self.page().ops.push(Op::Line { x1: rx, y1: baseline + 1.6, x2: rx + w, y2: baseline + 1.6, width: 0.6, color: LINK });

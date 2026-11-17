@@ -26,6 +26,8 @@ pub mod bench;
 #[cfg(test)]
 mod fn_tests;
 #[cfg(test)]
+mod en_tests;
+#[cfg(test)]
 mod float_tests;
 #[cfg(test)]
 mod float_layout_tests;

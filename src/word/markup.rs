@@ -366,8 +366,9 @@ fn parse(text: &str) -> Parsed {
                         if let Some((lab, colon_end)) = def_label(text, r.start) {
                             labels.push(text[lab.clone()].to_owned());
                             let idx = (labels.len() - 1) as u32;
-                            fill(&mut st, r.start..lab.start, |s| s.markup = true);
-                            fill(&mut st, lab.clone(), |s| s.fndef = Some(idx));
+                            let hide = usize::from(is_endnote_label(&text[lab.clone()]));
+                            fill(&mut st, r.start..lab.start + hide, |s| s.markup = true);
+                            fill(&mut st, lab.start + hide..lab.end, |s| s.fndef = Some(idx));
                             fill(&mut st, lab.end..colon_end, |s| s.markup = true);
                         }
                     }
@@ -429,8 +430,10 @@ fn parse(text: &str) -> Parsed {
                 if r.len() >= 4 && text[r.clone()].starts_with("[^") && tb[r.end - 1] == b']' {
                     labels.push(text[r.start + 2..r.end - 1].to_owned());
                     let idx = (labels.len() - 1) as u32;
-                    fill(&mut st, r.start..r.start + 2, |s| s.markup = true);
-                    fill(&mut st, r.start + 2..r.end - 1, |s| s.fnref = Some(idx));
+                    // Slutnotens `e` är dolt: det som visas är det romerska talet.
+                    let hide = usize::from(is_endnote_label(&text[r.start + 2..r.end - 1]));
+                    fill(&mut st, r.start..r.start + 2 + hide, |s| s.markup = true);
+                    fill(&mut st, r.start + 2 + hide..r.end - 1, |s| s.fnref = Some(idx));
                     fill(&mut st, r.end - 1..r.end, |s| s.markup = true);
                 }
             }
@@ -3138,6 +3141,32 @@ pub const FOOTNOTE_OPTS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_MATH)
     .union(crate::style::titles::OPTS);
 
+/// Är etiketten en slutnots: `e` och ett litet romerskt tal (`ei`, `eii`, `eiii` …)? Slutnoter
+/// numreras och ordnas för sig, och `e` är dolt så att det som syns är `i`, `ii` … som i Word.
+pub fn is_endnote_label(label: &str) -> bool {
+    label.strip_prefix('e').is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b"ivxlcdm".contains(&b)))
+}
+
+/// Slutnotsetiketten för löpnummer `n` (1-baserat): `ei`, `eii` …
+pub fn endnote_label(n: usize) -> String {
+    format!("e{}", roman(n))
+}
+
+/// Litet romerskt tal (1–3999; större tal blir arabiska siffror).
+pub fn roman(mut n: usize) -> String {
+    if n == 0 || n >= 4000 {
+        return n.to_string();
+    }
+    let mut out = String::new();
+    for (v, r) in [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
+        while n >= v {
+            out.push_str(r);
+            n -= v;
+        }
+    }
+    out
+}
+
 /// Etikettens intervall och slutet på `]:` för definitionen som börjar på `start` (`[^etikett]:`).
 fn def_label(text: &str, start: usize) -> Option<(Range<usize>, usize)> {
     let rest = text.get(start..)?;
@@ -3165,7 +3194,24 @@ pub struct Notes {
     pub defs: Vec<Note>,
 }
 
+/// Fotnoterna (utan slutnoterna, som hanteras för sig: `endnotes`).
 pub fn footnotes(text: &str) -> Notes {
+    let mut n = all_notes(text);
+    n.refs.retain(|r| !is_endnote_label(&r.label));
+    n.defs.retain(|d| !is_endnote_label(&d.label));
+    n
+}
+
+/// Slutnoterna (etiketter som `eii`).
+pub fn endnotes(text: &str) -> Notes {
+    let mut n = all_notes(text);
+    n.refs.retain(|r| is_endnote_label(&r.label));
+    n.defs.retain(|d| is_endnote_label(&d.label));
+    n
+}
+
+/// Alla noter: fotnoter och slutnoter.
+pub fn all_notes(text: &str) -> Notes {
     let mut n = Notes::default();
     if !text.contains("[^") {
         return n;
@@ -3206,7 +3252,25 @@ fn labels_in_order(notes: &Notes) -> Vec<String> {
 pub fn footnotes_in_order(a: &Analysis) -> bool {
     let mut seen: Vec<&str> = Vec::new();
     let mut defs: Vec<&str> = Vec::new();
+    let (mut en_seen, mut en_defs): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     for pc in &a.pieces {
+        // Slutnoterna: etiketterna `ei`, `eii` … i referensernas ordning, definitionerna i samma ordning sist.
+        if let Some(l) = pc.footnote_ref.as_deref().filter(|l| is_endnote_label(l)) {
+            if !en_seen.contains(&l) {
+                if l != endnote_label(en_seen.len() + 1) {
+                    return false;
+                }
+                en_seen.push(l);
+            }
+            continue;
+        }
+        if let Some(l) = pc.footnote_def.as_deref().filter(|l| is_endnote_label(l)) {
+            if en_defs.len() != en_seen.iter().position(|x| x == &l).unwrap_or(usize::MAX) && en_seen.contains(&l) {
+                return false;
+            }
+            en_defs.push(l);
+            continue;
+        }
         if let Some(l) = pc.footnote_ref.as_deref() {
             if !seen.contains(&l) {
                 if l != (seen.len() + 1).to_string() {
@@ -3215,8 +3279,11 @@ pub fn footnotes_in_order(a: &Analysis) -> bool {
                 seen.push(l);
             }
         } else if let Some(l) = pc.footnote_def.as_deref() {
+            if !en_defs.is_empty() {
+                return false; // fotnotsdefinitioner efter slutnotsdefinitioner
+            }
             defs.push(l);
-        } else if !defs.is_empty() && pc.block != Block::Footnote && !pc.range.is_empty() {
+        } else if (!defs.is_empty() || !en_defs.is_empty()) && pc.block != Block::Footnote && !pc.range.is_empty() {
             // Brödtext efter en definition: definitionerna ligger inte sist.
             return false;
         }
@@ -3233,7 +3300,7 @@ pub fn footnotes_in_order(a: &Analysis) -> bool {
             return false;
         }
     }
-    next == seen.len() + 1
+    next == seen.len() + 1 && en_defs.iter().filter(|d| en_seen.contains(d)).count() == en_seen.len()
 }
 
 /// Numrerar om fotnoterna: etiketterna blir 1..n i den ordning referenserna kommer, och
@@ -3249,7 +3316,7 @@ pub fn renumber_footnotes_at(text: &str, caret: usize) -> (String, usize) {
 }
 
 /// Kärnan: ny text, det nya numret för etiketten `track` och den flyttade markören.
-fn renumber_core(text: &str, track: Option<&str>, caret: usize) -> (String, Option<usize>, usize) {
+fn renumber_fn_core(text: &str, track: Option<&str>, caret: usize) -> (String, Option<usize>, usize) {
     let notes = footnotes(text);
     if notes.refs.is_empty() && notes.defs.is_empty() {
         return (text.to_owned(), None, caret);
@@ -3393,6 +3460,225 @@ fn renumber_core(text: &str, track: Option<&str>, caret: usize) -> (String, Opti
     (out, tracked, c)
 }
 
+/// Kärnan för fotnoter och slutnoter: slutnoterna numreras för sig (`relabel_endnotes`) och
+/// definitionerna läggs sist, efter fotnotsdefinitionerna.
+fn renumber_core(text: &str, track: Option<&str>, caret: usize) -> (String, Option<usize>, usize) {
+    if !text.contains("[^e") {
+        return renumber_fn_core(text, track, caret);
+    }
+    let (t1, _, c1) = relabel_endnotes(text, None, caret);
+    let en = endnotes(&t1).defs;
+    if en.is_empty() {
+        return renumber_fn_core(&t1, track, c1);
+    }
+    let (stripped, lines, c) = cut_defs(&t1, &en, c1);
+    let cs = c.unwrap_or(stripped.len());
+    let (t2, tracked, c2) = renumber_fn_core(&stripped, track, cs);
+    let (out, starts) = append_defs(t2, &lines);
+    let caret = match c {
+        Ok(_) => c2.min(out.len()),
+        Err((i, off)) => (starts[i] + off).min(out.len()),
+    };
+    (out, tracked, caret)
+}
+
+/// Var `p` hamnar efter ersättningarna `edits` (stigande, utan överlapp).
+fn map_through(edits: &[(Range<usize>, String)], p: usize) -> usize {
+    let mut q = p as isize;
+    for (r, s) in edits {
+        if r.end <= p {
+            q += s.len() as isize - r.len() as isize;
+        } else if r.start < p {
+            q = q - (p - r.start) as isize + s.len() as isize;
+            break;
+        }
+    }
+    q as usize
+}
+
+/// Klipper ut definitionerna `defs` (med radbrytningarna efter) ur `text`: texten utan dem, de
+/// utklippta raderna och markören (`Ok` = ny plats i texten utan dem, `Err((i, avstånd))` = inne i
+/// definition `i`).
+fn cut_defs(text: &str, defs: &[Note], caret: usize) -> (String, Vec<String>, Result<usize, (usize, usize)>) {
+    let mut out = String::with_capacity(text.len());
+    let mut lines = Vec::new();
+    let mut at = 0;
+    let mut removed = 0usize;
+    let mut c = Ok(caret);
+    let mut shift_done = false;
+    for (i, d) in defs.iter().enumerate() {
+        let end = d.full.end + text[d.full.end..].len() - text[d.full.end..].trim_start().len();
+        out.push_str(&text[at..d.full.start]);
+        lines.push(text[d.full.clone()].to_owned());
+        if d.full.start <= caret && caret <= d.full.end && !shift_done {
+            c = Err((i, caret - d.full.start));
+            shift_done = true;
+        } else if end <= caret && !shift_done {
+            removed += end - d.full.start;
+        }
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    if let Ok(p) = c {
+        c = Ok(p.saturating_sub(removed).min(out.len()));
+    }
+    (out, lines, c)
+}
+
+/// Lägger definitionsraderna sist (efter eventuella fotnotsdefinitioner) och ger var och ens startplats.
+fn append_defs(mut base: String, lines: &[String]) -> (String, Vec<usize>) {
+    let trimmed = base.trim_end().len();
+    base.truncate(trimmed);
+    let after_defs = footnotes(&base).defs.last().is_some_and(|d| base[d.full.end..].trim().is_empty());
+    let mut starts = Vec::with_capacity(lines.len());
+    for (k, l) in lines.iter().enumerate() {
+        base.push_str(if k > 0 || after_defs {
+            "\n"
+        } else if base.is_empty() {
+            ""
+        } else {
+            "\n\n"
+        });
+        starts.push(base.len());
+        base.push_str(l);
+        if l.ends_with("]:") {
+            base.push(' ');
+        }
+    }
+    if !lines.is_empty() {
+        base.push('\n');
+    }
+    (base, starts)
+}
+
+/// Numrerar slutnoterna `ei`, `eii` … i den ordning referenserna kommer, och lägger definitionerna
+/// sist i samma ordning (föräldralösa efter). Ger texten, det nya namnet på `track` och markören.
+fn relabel_endnotes(text: &str, track: Option<&str>, caret: usize) -> (String, Option<String>, usize) {
+    let en = endnotes(text);
+    if en.refs.is_empty() && en.defs.is_empty() {
+        return (text.to_owned(), None, caret);
+    }
+    let order = labels_in_order(&en);
+    let n = order.len();
+    let new_of = |l: &str| order.iter().position(|x| x == l).map(|i| endnote_label(i + 1));
+    let mut used: Vec<String> = (1..=n).map(endnote_label).collect();
+    let mut taken = vec![false; n + 1];
+    // (ny etikett, sorteringsnyckel)
+    let mut def_new: Vec<(String, (u8, usize, usize))> = Vec::new();
+    let mut orphan = Vec::new();
+    for (i, d) in en.defs.iter().enumerate() {
+        match order.iter().position(|x| *x == d.label) {
+            Some(k) if !taken[k + 1] => {
+                taken[k + 1] = true;
+                def_new.push((endnote_label(k + 1), (0, k + 1, i)));
+            }
+            _ => {
+                orphan.push(i);
+                def_new.push((String::new(), (1, 0, i)));
+            }
+        }
+    }
+    let mut fresh = n + 1;
+    for i in orphan {
+        let l = if !used.contains(&en.defs[i].label) {
+            en.defs[i].label.clone()
+        } else {
+            loop {
+                let c = endnote_label(fresh);
+                fresh += 1;
+                if !used.contains(&c) {
+                    break c;
+                }
+            }
+        };
+        used.push(l.clone());
+        def_new[i].0 = l;
+    }
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for r in &en.refs {
+        let new = new_of(&r.label).unwrap_or_else(|| r.label.clone());
+        if new != r.label {
+            edits.push((r.label_range.clone(), new));
+        }
+    }
+    for (d, (new, _)) in en.defs.iter().zip(&def_new) {
+        if *new != d.label {
+            edits.push((d.label_range.clone(), new.clone()));
+        }
+    }
+    edits.sort_by_key(|e| e.0.start);
+    let tracked = track.and_then(new_of);
+    let t = splice(text, &edits);
+    let caret1 = map_through(&edits, caret).min(t.len());
+    let defs2 = endnotes(&t).defs;
+    if defs2.len() != def_new.len() {
+        return (t, tracked, caret1);
+    }
+    let sorted = def_new.windows(2).all(|w| w[0].1 <= w[1].1);
+    let mut tail = true;
+    if let Some(first) = defs2.first() {
+        let mut at = first.full.start;
+        for d in &defs2 {
+            tail &= t[at..d.full.start].trim().is_empty();
+            at = d.full.end;
+        }
+        tail &= t[at..].trim().is_empty();
+    }
+    if sorted && tail {
+        return (t, tracked, caret1);
+    }
+    let (stripped, lines, c) = cut_defs(&t, &defs2, caret1);
+    let mut idx: Vec<usize> = (0..lines.len()).collect();
+    idx.sort_by_key(|&i| def_new[i].1);
+    let sorted_lines: Vec<String> = idx.iter().map(|&i| lines[i].clone()).collect();
+    let (out, starts) = append_defs(stripped, &sorted_lines);
+    let caret = match c {
+        Ok(p) => p.min(out.len()),
+        Err((i, off)) => idx.iter().position(|&x| x == i).map_or(out.len(), |k| (starts[k] + off).min(out.len())),
+    };
+    (out, tracked, caret)
+}
+
+/// Sätter in en slutnotsreferens vid `caret`, numrerar om slutnoterna och lägger en tom definition
+/// sist. Markören hamnar i den nya definitionen.
+pub fn insert_endnote(text: &str, caret: usize) -> Edit {
+    let mut caret = floor_boundary(text, caret.min(text.len()));
+    let notes = all_notes(text);
+    if notes.defs.iter().any(|d| d.full.start <= caret && caret <= d.full.end) {
+        return unchanged(text, caret);
+    }
+    if let Some(r) = notes.refs.iter().find(|r| r.full.start < caret && caret < r.full.end) {
+        caret = r.full.end;
+    }
+    // Ett tillfälligt namn som bara består av romerska tecken (så att det räknas som slutnot).
+    const TMP: &str = "emmmmmmmmmm";
+    let mut t = String::with_capacity(text.len() + 32);
+    t.push_str(&text[..caret]);
+    t.push_str("[^");
+    t.push_str(TMP);
+    t.push(']');
+    t.push_str(&text[caret..]);
+    let trimmed = t.trim_end().len();
+    t.truncate(trimmed);
+    t.push_str("\n\n[^");
+    t.push_str(TMP);
+    t.push_str("]: ");
+    let (t, label, _) = relabel_endnotes(&t, Some(TMP), 0);
+    let Some(label) = label else { return unchanged(text, caret) };
+    let (out, _, _) = renumber_core(&t, None, 0);
+    let at = endnotes(&out)
+        .defs
+        .into_iter()
+        .find(|d| d.label == label)
+        .map_or(out.len(), |d| (d.label_range.end + 3).min(line_end(&out, d.label_range.end)));
+    Edit { sel: at..at, text: out }
+}
+
+/// Tar bort slutnoten `label` (som `delete_footnote`; etiketterna är olika för fotnoter och slutnoter).
+pub fn delete_endnote(text: &str, label: &str) -> String {
+    delete_footnote(text, label)
+}
+
 /// Sätter in en fotnotsreferens `[^k]` vid `caret` (k = dess löpnummer), numrerar om de senare
 /// referenserna och definitionerna och lägger till en tom definition i ordning. Markören hamnar i
 /// den nya definitionen.
@@ -3433,7 +3719,7 @@ pub fn insert_footnote(text: &str, caret: usize) -> Edit {
 
 /// Tar bort fotnoten `label`: alla referenser och definitionen. De övriga numreras om.
 pub fn delete_footnote(text: &str, label: &str) -> String {
-    let notes = footnotes(text);
+    let notes = all_notes(text);
     let mut cuts: Vec<Range<usize>> = notes.refs.iter().filter(|r| r.label == label).map(|r| r.full.clone()).collect();
     for d in notes.defs.iter().filter(|d| d.label == label) {
         let end = if text[d.full.end..].starts_with('\n') { d.full.end + 1 } else { d.full.end };
@@ -3450,7 +3736,7 @@ pub fn delete_footnote(text: &str, label: &str) -> String {
         at = r.end.max(at);
     }
     out.push_str(&text[at..]);
-    let out = if footnotes(&out).defs.is_empty() {
+    let out = if all_notes(&out).defs.is_empty() {
         let t = out.trim_end();
         if text.ends_with('\n') {
             format!("{t}\n")

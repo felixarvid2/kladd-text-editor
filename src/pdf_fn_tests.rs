@@ -95,3 +95,26 @@ fn pdf_with_footnotes_is_written() {
     let (lay, _) = laid_out("Bara text.\n");
     assert!(lay.pages[0].ops.iter().all(|o| !matches!(o, Op::Line { .. })));
 }
+
+#[test]
+fn endnotes_follow_the_last_text() {
+    let (lay, d) = laid_out("Första[^ei] och fot[^1] och andra[^eii].\n\nSista stycket.\n\n[^1]: Fotnot.\n[^ei]: Slutnoten ett.\n[^eii]: Slutnoten två.\n");
+    assert_eq!(lay.pages.len(), 1);
+    let (_, last) = find(&lay, 0, "Sista").unwrap();
+    let (_, e1) = find(&lay, 0, "Slutnoten").unwrap();
+    let (_, e2) = find(&lay, 0, "två").unwrap();
+    let (_, foot) = find(&lay, 0, "Fotnot.").unwrap();
+    // Slutnoterna ligger direkt efter sista texten (inte nere vid sidfoten), fotnoten längst ned.
+    assert!(e1 > last && e1 < last + 80.0 && e2 > e1, "{last} {e1} {e2}");
+    assert!(foot > e2 + 100.0 && foot < d.page().1, "{foot} {e2}");
+    // Numren är romerska och upphöjda.
+    let sup: Vec<String> = lay.pages[0]
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::Text { size, text, .. } if *size < 9.0 && !text.contains("Fotnot") => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(sup.iter().any(|t| t == "ii") && sup.iter().any(|t| t == "i"), "{sup:?}");
+}

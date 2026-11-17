@@ -521,6 +521,23 @@ när sidan fylls. Referensen är ett litet upphöjt nummer. En enskild not som �
 **HTML/EPUB** (`export.rs`) hade redan fotnoter via pulldown (`<aside class="footnote">`, EPUB-`noteref`);
 kontrollerat med de befintliga testerna.
 
+
+### Slutnoter
+
+Slutnoter är en egen etikettnamnrymd: `[^ei]`, `[^eii]` … (`e` och ett litet romerskt tal,
+`markup::is_endnote_label`). Analysen döljer `e`, så det som visas är det romerska talet, upphöjt
+som en fotnotsreferens. `markup::footnotes` ser bara fotnoter och `markup::endnotes` bara
+slutnoter (`all_notes` båda); numreringen (`renumber_core`, `relabel_endnotes`) och
+`footnotes_in_order` hanterar de två sorterna var för sig, och definitionerna ligger sist, fotnoter
+före slutnoter, under samma skiljelinje. `insert_endnote` / `delete_endnote` motsvarar fotnotens
+funktioner (`Ctrl+Alt+D`).
+
+- **docx**: `w:endnoteReference` + `word/endnotes.xml` läses som fotnoterna (separator- och
+  continuationSeparator-noterna hoppas över). Skrivningen följer `resolve_note_kind`: orörd not behåller sin XML,
+  ett dokument utan endnotes.xml får delen, relationen, innehållstypen och `w:endnotePr` i settings.xml.
+- **odt**: `text:note-class="endnote"` ↔ `[^eN]`, med `notes-configuration` för slutnoter (`i`).
+- **PDF**: slutnoterna läggs som en linje och stycken efter sista texten (inte per sida).
+- Fotnoter längst ned på varje sida i dokumentläget är inte gjort.
 ## Granska: spårade ändringar och kommentarer
 
 Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad `docx`), gränssnitt i
