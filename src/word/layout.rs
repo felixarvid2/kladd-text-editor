@@ -396,6 +396,10 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
         para.empty_h.map(f32::to_bits).hash(&mut h);
     }
+    // Tabellformatet (kommentarsraden före en tabell) ändrar utläggningen.
+    if let Some((r, _)) = super::tablefmt::before(text, w.start) {
+        text[r].hash(&mut h);
+    }
     // Markörens rader i förhållande till fönstret.
     if intersects(&p.reveal, w) {
         (p.reveal.start.max(w.start) - w.start).hash(&mut h);
@@ -1086,6 +1090,8 @@ pub struct Table {
     /// Från första till sista tabellbiten.
     pub region: Range<usize>,
     pub rows: Vec<TableRow>,
+    /// Kladd gör rubrikraden fet (tabeller utan Word-format).
+    pub header_bold: bool,
 }
 
 /// Alla tabeller i texten (sammanhängande tabellbitar), rad för rad.
@@ -1120,7 +1126,8 @@ pub fn tables(text: &str, a: &Analysis) -> Vec<Table> {
             idx += 1;
             pos = le + 1;
         }
-        out.push(Table { region, rows });
+        let header_bold = super::tablefmt::before(text, region.start).is_none_or(|(_, f)| f.header_bold);
+        out.push(Table { region, rows, header_bold });
     }
     out
 }
@@ -1272,7 +1279,7 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
         let grid_hdr = if pc.block == Block::Table {
             grid.iter()
                 .find(|t| t.region.start <= r.start && r.start < t.region.end)
-                .map(|t| t.rows.first().is_some_and(|row| r.start <= row.line.end))
+                .map(|t| t.header_bold && t.rows.first().is_some_and(|row| r.start <= row.line.end))
         } else {
             None
         };
@@ -3423,5 +3430,164 @@ mod tests {
         assert!(counts[0] > 150);
         assert!(counts[1] <= 3, "{counts:?}");
         assert!(counts[2] <= 3, "{counts:?}");
+    }
+
+    // ---------------------------------------------------------------- tabellformat
+
+    use super::super::tablefmt::{TableFmt, VAlign};
+
+    fn with_meta(f: &TableFmt, table: &str) -> String {
+        format!("{}\n\n{table}", f.to_comment())
+    }
+
+    const SMALL: &str = "| a | b |\n| - | - |\n| c | d |\n";
+
+    #[test]
+    fn table_format_line_is_hidden_and_sets_the_width() {
+        let mut f = TableFmt::word_base();
+        f.width = super::super::tablefmt::Width::Pct(50);
+        let t = with_meta(&f, SMALL);
+        let a = markup::analyze(&t);
+        // Raden är dold markup; den hör till ingen tabell.
+        assert!(a.pieces.iter().any(|p| p.markup && p.range.start == 0 && p.range.end >= f.to_comment().len()));
+        with_grid(&t, 400.0, |_, gs, _| {
+            assert_eq!(gs.len(), 1);
+            assert!(gs[0].fmt.is_some());
+            // Halva textbredden, lika breda kolumner.
+            assert!((gs[0].col_x[2] - gs[0].col_x[0] - 200.0).abs() < 1.0, "{:?}", gs[0].col_x);
+            assert!(((gs[0].col_x[1] - gs[0].col_x[0]) - 100.0).abs() < 1.0);
+        });
+    }
+
+    #[test]
+    fn table_width_alignment_and_indent() {
+        use super::super::tablefmt::{TAlign, Width};
+        let mut f = TableFmt::word_base();
+        f.width = Width::Pt(150);
+        f.align = TAlign::Center;
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| {
+            let t = &gs[0];
+            // 150 pt = 200 px, centrerad i 400 px.
+            assert!((t.col_x[0] - 100.0).abs() < 1.0 && (t.col_x[2] - 300.0).abs() < 1.0, "{:?}", t.col_x);
+        });
+        f.align = TAlign::Right;
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| assert!((gs[0].col_x[2] - 400.0).abs() < 1.0));
+        f.align = TAlign::Left;
+        f.indent = 18.0;
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| assert!((gs[0].col_x[0] - 24.0).abs() < 1.0));
+        // Bredare än spalten: aldrig bredare än spalten.
+        f.indent = 0.0;
+        f.width = Width::Pt(900);
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| assert!(*gs[0].col_x.last().unwrap() <= 400.01));
+    }
+
+    #[test]
+    fn format_header_row_is_not_bold_unless_asked() {
+        let f = TableFmt::word_base();
+        let t = with_meta(&f, SMALL);
+        let a = markup::analyze(&t);
+        let job = layout_job(&t, &a, &Params {
+            palette: &theme::palette(false),
+            zoom: 1.0,
+            reveal: 0..0,
+            matches: &[],
+            image_size: &no_img,
+            measure: &|s: &str, _| s.len() as f32 * 7.0,
+            font_family: &fam,
+            fonts_gen: 0,
+        });
+        let at = t.find("| a").unwrap() + 2;
+        let sec = job.sections.iter().find(|s| s.byte_range.start.0 <= at && at < s.byte_range.end.0).unwrap();
+        assert_eq!(sec.format.font_id.family, theme::doc_font(false, false));
+        // Utan formatrad är rubrikraden fet som förut.
+        let plain = markup::analyze(SMALL);
+        let job = layout_job(SMALL, &plain, &Params {
+            palette: &theme::palette(false),
+            zoom: 1.0,
+            reveal: 0..0,
+            matches: &[],
+            image_size: &no_img,
+            measure: &|s: &str, _| s.len() as f32 * 7.0,
+            font_family: &fam,
+            fonts_gen: 0,
+        });
+        let at = SMALL.find("a").unwrap();
+        let sec = job.sections.iter().find(|s| s.byte_range.start.0 <= at && at < s.byte_range.end.0).unwrap();
+        assert_eq!(sec.format.font_id.family, theme::doc_font(true, false));
+    }
+
+    #[test]
+    fn row_height_cell_padding_and_vertical_alignment() {
+        let mut f = TableFmt::word_base();
+        f.pad = [5.4, 5.4, 6.0, 6.0];
+        f.rows.insert(0, super::super::tablefmt::RowFmt { h: 60, exact: false, head: false });
+        f.cell_mut(0, 1).valign = VAlign::Center;
+        let t = with_meta(&f, SMALL);
+        let plain = with_meta(&TableFmt::word_base(), SMALL);
+        let (h_plain, y_plain) = with_grid(&plain, 400.0, |g, gs, _| {
+            let idx = grid::GalleyIndex::new(&plain, g);
+            (g.rect.height(), grid::row_extent(g, &idx, &gs[0], 0).0)
+        });
+        with_grid(&t, 400.0, |g, gs, _| {
+            let idx = grid::GalleyIndex::new(&t, g);
+            let (top, bottom) = grid::row_extent(g, &idx, &gs[0], 0);
+            let (top1, _) = grid::row_extent(g, &idx, &gs[0], 1);
+            // Raden är minst 60 pt (80 px) hög: nästa rad börjar efter den.
+            assert!(top1 - (top - px(1.0, 6.0)) >= 80.0 - 1.0, "{top} {top1}");
+            assert!(g.rect.height() > h_plain + 60.0);
+            // Överkantsmarginalen flyttar texten ned; den vertikalt centrerade cellen ligger lägre än den vänstra.
+            assert!(top >= y_plain + px(1.0, 6.0) - 0.5);
+            assert!(bottom > top);
+            let left_y = g.rows[g.rows.iter().position(|r| r.pos.x < gs[0].col_x[1]).unwrap()].pos.y;
+            let right_y = g.rows[g.rows.iter().position(|r| r.pos.x >= gs[0].col_x[1]).unwrap()].pos.y;
+            assert!(right_y > left_y + 10.0, "{left_y} {right_y}");
+        });
+    }
+
+    #[test]
+    fn centered_cell_text_moves_inside_the_cell() {
+        use super::super::tablefmt::TAlign;
+        let mut f = TableFmt::word_base();
+        f.width = super::super::tablefmt::Width::Pt(150);
+        f.cell_mut(0, 0).halign = TAlign::Center;
+        let t = with_meta(&f, "| a | b |\n| - | - |\n| c | d |\n");
+        let base = with_meta(&TableFmt { width: super::super::tablefmt::Width::Pt(150), ..TableFmt::word_base() }, "| a | b |\n| - | - |\n| c | d |\n");
+        let x_of = |text: &str, g: &Galley| {
+            let idx = grid::GalleyIndex::new(text, g);
+            g.rows[idx.row_of(idx.chr(text.find("| a").unwrap() + 2))].pos.x
+        };
+        let x0 = with_grid(&base, 400.0, |g, _, _| x_of(&base, g));
+        with_grid(&t, 400.0, |g, gs, _| {
+            // Cellen är 100 px bred: den enda bokstaven hamnar mitt i den.
+            let x = x_of(&t, g);
+            assert!(x > x0 + 35.0, "{x} {x0}");
+            assert!(x < gs[0].col_x[1]);
+        });
+    }
+
+    #[test]
+    fn cache_key_follows_the_format_line() {
+        let mut f = TableFmt::word_base();
+        f.cell_mut(0, 0).fill = Some([1, 2, 3]);
+        let a = with_meta(&f, SMALL);
+        f.cell_mut(0, 0).fill = Some([9, 9, 9]);
+        let b = with_meta(&f, SMALL);
+        let key = |t: &str| {
+            let an = markup::analyze(t);
+            let pal = theme::palette(false);
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal: 0..0,
+                matches: &[],
+                image_size: &no_img,
+                measure: &|s: &str, _| s.len() as f32,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let start = t.find("| a").unwrap();
+            unit_key(0, t, &an, &p, &(start..t.len()), &[])
+        };
+        assert_ne!(key(&a), key(&b));
     }
 }

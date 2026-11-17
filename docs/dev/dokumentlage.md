@@ -348,6 +348,37 @@ Gemensamma format (alla moduler ska använda dessa):
   (`layout::Cache::headings`, dokumentläget) eller en radskanning (`nav::headings_scan`, textläget)
   som görs om bara när texten ändrats.
 
+**Tabellformat (`src/word/tablefmt.rs`, `tablepaint.rs`, `tableops.rs`, `src/docx_tables.rs`).** Skuggning, ramar, bredd,
+justering, marginaler och radhöjd ligger i en dold rad rakt före tabellen (en tom rad emellan):
+`<!-- kladd-tabell: width 60%; align center; indent 12pt; layout fixed; pad 5.4 5.4 0 0; header off; border top double 6 C00000; border h dashed 4 808080; row 0 h=45 head; cell 0.0 fill=5B3A9E va=center ha=center bt=single/12/FF0000 -->`.
+`rad.kolumn` räknas som i tabellens Markdown (rubrikraden är rad 0, avgränsarraden räknas inte, kolumnen är cellens första
+rutnätskolumn). `border` har sidorna `top left bottom right h v` (h/v = mellan rader/kolumner), stil `none|single|double|dashed|dotted`,
+bredd i åttondels punkter (`w:sz`) och färg eller `auto`; utan några `border`-ord är det rutnätet. Saknas raden är det
+Kladds egen tabell: rutnät, fet rubrikrad, `width` följer innehållet eller kolumnstrecken. `header off` = rubrikraden görs inte fet
+av Kladd. Bredd: `width N%` (av textbredden) eller `width Npt` (aldrig bredare än spalten); kolumnerna delar den efter streckantalet i
+avgränsarraden, annars lika. Raden är markup i analysen (dold, visas på markörens rad som avsnittsraderna) och ingår i layoutcachens nyckel.
+- Läsning (docx): `docx_tables::read` tar en tabells XML och `TableStyles` (alla `w:type="table"`-mallar i `styles.xml`, `basedOn`-kedjan)
+  och ger `TableFmt` plus mallens text per cell (fet/kursiv/färg från `firstRow` m.fl.; läggs på cellens text som `**`/`<span>`).
+  Villkorsdelarna läggs i Words ordning: hela tabellen, kolumnband, radband, första/sista kolumn, första/sista rad, hörn; cellens egna
+  `w:tcPr` vinner. `TableGrid` utan definition i filen räknas som rutnät (det blir det när Kladd sparar). `tcMar` utan `tblCellMar` ger
+  tabellens marginal. Lodrätt sammanfogade fortsättningsceller får ingen överkant. En tabell utan avvikelser från Kladds egna ger ingen rad
+  (och en helt fet rubrikrad blir Kladds fetstil), så orörda Kladd-tabeller läses som förut.
+- Skrivning: orörda tabeller skrivs tillbaka som originalets XML; en ändrad tabell skrivs om med `tblPr` (bredd, `jc`, `tblInd`,
+  alla sex `tblBorders` uttryckligen), `trPr` (`trHeight`, `tblHeader`) och `tcPr` (`tcBorders`, `shd`, `vAlign`, `jc` på styckena).
+  ODT: ett cellformat per formaterad cell (`fo:background-color`, `fo:border-*`, `fo:padding-*`, `style:vertical-align`) och tabellens
+  bredd/`table:align`; PDF: skuggning och Words ramar, bredd, justering, radhöjd, lodrät justering; HTML/EPUB: inline-CSS per cell.
+  ODT-filer läses ännu inte till tabellformat.
+- Utläggning: `grid::plan` löser bredden (`Width`, streck, innehåll), flyttar tabellen i sidled (`align`, `indent`) och ger `TableGeom::pad`
+  (vänster, höger, över, under, px) och `min_h`; `layout_line` flyttar cellens rader för överkantsmarginal, lodrät justering och
+  vågrät justering och gör radens sista rad så hög att `Galley::concat` räknar med nederkantsmarginal och lägsta radhöjd.
+  `tablepaint::paint` ritar skuggning (egen ritlucka bakom texten) och ramar med Words konfliktregel (cellens egen kant före tabellens,
+  kraftigaste vid två egna) för alla celler.
+- Redigering: `tableops::apply_format` (skugga/ta bort skuggning, rutnät/inga ramar på markerade celler) och `follow_structure`
+  (formatraden flyttar med vid rad- och kolumnoperationer och tas bort med tabellen).
+- Begränsningar: rubrikrad som upprepas på varje sida (`w:tblHeader`) bevaras och skrivs tillbaka men upprepas inte i vyn; stycken i en
+  cell har gemensam justering (cellens), inte egen; styckeavstånd i celler ritas inte; ramar mellan celler ritas per cell utan
+  hörnanslutning; skuggfärger anpassas i mörkt tema (`adapt_background`) och kan därför få låg kontrast mot mörkt papper.
+
 Tabelllayout (`src/word/grid.rs`): varje tabellrad läggs ut som ett galleri per cell (radbredd =
 kolumnbredd − cellmarginal, `<br>` ger ett galleri per del) och cellernas rader placeras bredvid
 varandra med `PlacedRow::pos`; raderna ligger i källordning så teckenräkningen är exakt.

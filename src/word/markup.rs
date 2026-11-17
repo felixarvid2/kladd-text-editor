@@ -538,8 +538,9 @@ fn parse(text: &str) -> Parsed {
                     } else if super::pbox::parse_empty(t).is_some() {
                         // Tomt stycke (`<!--k:ep-->`): dold rad med ett styckes höjd, se `pbox`.
                         fill(&mut st, tr, |s| s.markup = true);
-                    } else if t == super::nav::TOC_LINE {
-                        // Innehållsförteckningen: en dold rad som dokumentläget ersätter med rubrikerna.
+                    } else if t == super::nav::TOC_LINE || super::tablefmt::is_comment(t) {
+                        // Innehållsförteckningen (en dold rad som dokumentläget ersätter med rubrikerna)
+                        // och tabellformatet före en tabell: dolda rader.
                         fill(&mut st, tr, |s| s.markup = true);
                     } else if super::sections::SectionProps::from_comment(t).is_some() || super::sections::is_column_break(t) {
                         // Avsnittsrad och spaltbrytning: dolda rader (visas bara när markören står på dem).

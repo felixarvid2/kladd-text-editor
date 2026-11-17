@@ -187,7 +187,7 @@ I `.docx` sparas formlerna som Office Math (`m:oMath`) och formler i Word-dokume
 
 ### Tabeller, bilder och inklistring
 
-Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.
+Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. Skuggning, ramar, bredd, justering, cellmarginaler och radhöjd från Word och LibreOffice visas som i originalet (tabeller utan ramar visas utan linjer) och följer med när du sparar; *Skugga celler* och *Ramar runt alla celler* / *Inga ramar* finns i högerklicksmenyn. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.
 
 Klicka på en bild för att markera den. Dra i hörnen för att ändra storlek (håll Skift för fri proportion) eller dra i själva bilden för att flytta den: en linje visar var den hamnar, och Esc avbryter. En liten verktygsrad vid bilden justerar läget (vänster, centrerat eller höger), väljer radbrytning (*I texten*, eller *Vänster*/*Höger* så att texten flyter runt bilden), återställer originalstorleken eller tar bort bilden. Delete tar bort en markerad bild. Flytande bilder sparas som förankrade bilder med textomflöde i Word och LibreOffice. Bilder från Word och LibreOffice behåller sitt läge (mot sidan, marginalen, spalten eller stycket), omflöde (runt, över och under, bakom eller framför texten), avstånd och beskärning; drar du en sådan bild sparas det nya läget.
 

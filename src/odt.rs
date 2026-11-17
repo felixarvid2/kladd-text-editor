@@ -2092,6 +2092,45 @@ fn fmt_num(v: f32, decimals: usize) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_owned() } else { s }
 }
 
+/// Ett cellformat med skuggning, ramar, marginaler och lodrät justering ur tabellformatet.
+fn odt_cell_style(f: &crate::word::tablefmt::TableFmt, name: &str, r: usize, c: usize, nrows: usize, last_col: bool) -> String {
+    use crate::word::tablefmt::{BOTTOM, BStyle, LEFT, RIGHT, TOP, VAlign};
+    let own = |side: usize| f.own_border(r, c, side);
+    let b = |b: crate::word::tablefmt::Border| {
+        if !b.visible() {
+            return "none".to_owned();
+        }
+        let style = match b.style {
+            BStyle::Double => "double",
+            BStyle::Dashed => "dashed",
+            BStyle::Dotted => "dotted",
+            _ => "solid",
+        };
+        let col = b.color.map_or("#000000".to_owned(), |c| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]));
+        format!("{:.2}pt {style} {col}", b.pt())
+    };
+    let mut a = format!(
+        "fo:border-top=\"{}\" fo:border-left=\"{}\" fo:border-bottom=\"{}\" fo:border-right=\"{}\" fo:padding-left=\"{}\" fo:padding-right=\"{}\" fo:padding-top=\"{}\" fo:padding-bottom=\"{}\"",
+        b(f.edge(TOP, None, own(TOP), r > 0)),
+        b(f.edge(LEFT, None, own(LEFT), c > 0)),
+        b(f.edge(BOTTOM, own(BOTTOM), None, r + 1 < nrows)),
+        b(f.edge(RIGHT, own(RIGHT), None, !last_col)),
+        cm(f.pad[0]),
+        cm(f.pad[1]),
+        cm(f.pad[2]),
+        cm(f.pad[3])
+    );
+    if let Some(x) = f.fill(r, c) {
+        a.push_str(&format!(" fo:background-color=\"#{:02X}{:02X}{:02X}\"", x[0], x[1], x[2]));
+    }
+    match f.valign(r, c) {
+        VAlign::Center => a.push_str(" style:vertical-align=\"middle\""),
+        VAlign::Bottom => a.push_str(" style:vertical-align=\"bottom\""),
+        VAlign::Top => {}
+    }
+    format!("<style:style style:name=\"{name}\" style:family=\"table-cell\"><style:table-cell-properties {a}/></style:style>")
+}
+
 fn cm(pt: f32) -> String {
     format!("{}cm", fmt_num(pt * 2.54 / 72.0, 4))
 }
@@ -2183,6 +2222,9 @@ struct WTable {
     rows: usize,
     cell: usize,
     covered: bool,
+    /// Tabellens format (skuggning, ramar …) och tabellnumret för cellformaten.
+    fmt: Option<crate::word::tablefmt::TableFmt>,
+    n: usize,
 }
 
 struct W<'a> {
@@ -2215,6 +2257,8 @@ struct W<'a> {
     code: bool,
     table: Option<WTable>,
     cell_style: bool,
+    /// Tabellformatet (`<!-- kladd-tabell: … -->`) som väntar på tabellen efter det.
+    pending_tfmt: Option<crate::word::tablefmt::TableFmt>,
     frame_style: bool,
     /// Grafikformat för förankrade/beskurna bilder: egenskaperna och formatets namn.
     frame_styles: Vec<(String, String)>,
@@ -2330,6 +2374,7 @@ impl<'a> W<'a> {
             code: false,
             table: None,
             cell_style: false,
+            pending_tfmt: None,
             frame_style: false,
             frame_styles: Vec::new(),
             image: None,
@@ -2986,7 +3031,9 @@ impl<'a> W<'a> {
     fn html(&mut self, s: &str) {
         let t = s.trim();
         let single_line = t.lines().count() == 1;
-        if let Some((start, id)) = review::parse_marker(t) {
+        if crate::word::tablefmt::is_comment(t) && self.table.is_none() {
+            self.pending_tfmt = crate::word::tablefmt::TableFmt::from_comment(t);
+        } else if let Some((start, id)) = review::parse_marker(t) {
             self.comment_marker(start, id);
         } else if let Some(open) = review::parse_open_tag(t) {
             self.review.cur = Some(open).filter(|_| !self.in_note);
@@ -3174,10 +3221,32 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                         w.auto.push_str("<style:style style:name=\"TabellCell\" style:family=\"table-cell\"><style:table-cell-properties fo:padding=\"0.097cm\" fo:border=\"0.5pt solid #000000\"/></style:style>");
                     }
                     let src = markup::table_src(md.get(range.clone()).unwrap_or(""));
+                    let tfmt = w.pending_tfmt.take();
+                    // Tabellens bredd och läge (`w:tblW`, `w:jc`, `w:tblInd`).
+                    let (table_w, align, margin_left) = match &tfmt {
+                        Some(f) => {
+                            use crate::word::tablefmt::{TAlign, Width};
+                            let tw = match f.width {
+                                Width::Pct(p) => w.text_w * f32::from(p) / 100.0,
+                                Width::Pt(p) => f32::from(p),
+                                Width::Auto => w.text_w,
+                            }
+                            .min(w.text_w);
+                            match f.align {
+                                TAlign::Center => (tw, "center", None),
+                                TAlign::Right => (tw, "right", None),
+                                TAlign::Left if f.indent.abs() > 0.01 => (tw, "left", Some(f.indent)),
+                                TAlign::Left => (tw, if tw < w.text_w { "left" } else { "margins" }, None),
+                            }
+                        }
+                        None => (w.text_w, "margins", None),
+                    };
+                    let ml = margin_left.map(|v| format!(" fo:margin-left=\"{}\"", cm(v))).unwrap_or_default();
                     w.auto.push_str(&format!(
-                        "<style:style style:name=\"Tabell{n}\" style:family=\"table\"><style:table-properties style:width=\"{tw}\" table:align=\"margins\"/></style:style>",
-                        tw = cm(w.text_w)
+                        "<style:style style:name=\"Tabell{n}\" style:family=\"table\"><style:table-properties style:width=\"{tw}\" table:align=\"{align}\"{ml}/></style:style>",
+                        tw = cm(table_w)
                     ));
+                    let text_w_cols = table_w;
                     w.body.push_str(&format!("<table:table table:name=\"Tabell{n}\" table:style-name=\"Tabell{n}\">"));
                     match src.weights.as_ref().filter(|ws| ws.len() == cols) {
                         // Olika många streck: en kolumnformat per kolumn med proportionell bredd.
@@ -3186,7 +3255,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                             for (j, &d) in ws.iter().enumerate() {
                                 w.auto.push_str(&format!(
                                     "<style:style style:name=\"Tabell{n}.C{j}\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{}\"/></style:style>",
-                                    cm(w.text_w * d as f32 / sum as f32)
+                                    cm(text_w_cols * d as f32 / sum as f32)
                                 ));
                                 w.body.push_str(&format!("<table:table-column table:style-name=\"Tabell{n}.C{j}\"/>"));
                             }
@@ -3194,14 +3263,14 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                         None => {
                             w.auto.push_str(&format!(
                                 "<style:style style:name=\"Tabell{n}.A\" style:family=\"table-column\"><style:table-column-properties style:column-width=\"{cw}\"/></style:style>",
-                                cw = cm(w.text_w / cols as f32)
+                                cw = cm(text_w_cols / cols as f32)
                             ));
                             w.body.push_str(&format!(
                                 "<table:table-column table:style-name=\"Tabell{n}.A\" table:number-columns-repeated=\"{cols}\"/>"
                             ));
                         }
                     }
-                    w.table = Some(WTable { in_head: false, spans: src.spans, rows: 0, cell: 0, covered: false });
+                    w.table = Some(WTable { in_head: false, spans: src.spans, rows: 0, cell: 0, covered: false, fmt: tfmt, n });
                 }
                 Tag::TableHead => {
                     if let Some(t) = w.table.as_mut() {
@@ -3224,12 +3293,23 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                         t.covered = span == 0;
                         span
                     });
+                    // Cellformat ur tabellformatet: ett eget cellformat per formaterad cell.
+                    let style = match w.table.as_ref().filter(|_| span > 0) {
+                        Some(t) if t.fmt.is_some() => {
+                            let (r, c) = (t.rows.saturating_sub(1), t.cell);
+                            let name = format!("Tabell{}.R{r}C{c}", t.n);
+                            let xml = t.fmt.as_ref().map(|f| odt_cell_style(f, &name, r, c, t.spans.len(), c + span >= t.spans.get(r).map_or(0, Vec::len))).unwrap_or_default();
+                            w.auto.push_str(&xml);
+                            name
+                        }
+                        _ => "TabellCell".to_owned(),
+                    };
                     match span {
                         // Täckt av cellen före: ingen text, bara platshållaren.
                         0 => w.body.push_str("<table:covered-table-cell/>"),
-                        1 => w.body.push_str("<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\">"),
+                        1 => w.body.push_str(&format!("<table:table-cell table:style-name=\"{style}\" office:value-type=\"string\">")),
                         n => w.body.push_str(&format!(
-                            "<table:table-cell table:style-name=\"TabellCell\" office:value-type=\"string\" table:number-columns-spanned=\"{n}\">"
+                            "<table:table-cell table:style-name=\"{style}\" office:value-type=\"string\" table:number-columns-spanned=\"{n}\">"
                         )),
                     }
                 }
@@ -4294,6 +4374,26 @@ Slut.
         let back = crate::docx::read(&docx).unwrap();
         assert!(back.markdown.contains("Rubrik ett") && back.markdown.contains("fjärde"), "{}", back.markdown);
         eprintln!("{}", back.markdown);
+    }
+
+    #[test]
+    fn table_format_gives_cell_styles_and_hides_the_comment() {
+        use crate::word::tablefmt::{TableFmt, Width};
+        let mut f = TableFmt::word_base();
+        f.cell_mut(0, 0).fill = Some([0x5B, 0x3A, 0x9E]);
+        f.width = Width::Pct(50);
+        let md = format!("{}\n\n| A | B |\n| - | - |\n| c | d |\n", f.to_comment());
+        let w = write(&md, "x", &|_| None).unwrap();
+        let content = {
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(&w.bytes)).unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut z.by_name("content.xml").unwrap(), &mut s).unwrap();
+            s
+        };
+        assert!(!content.contains("kladd-tabell"), "{content}");
+        assert!(content.contains("fo:background-color=\"#5B3A9E\""), "{content}");
+        assert!(content.contains("fo:border-top=\"none\""), "{content}");
+        assert!(content.contains("table:style-name=\"Tabell1.R0C0\""), "{content}");
     }
 }
 

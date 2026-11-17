@@ -488,6 +488,8 @@ struct Styles {
     defaults: RProps,
     /// Standardstyckemallen (`w:default="1"`, oftast `Normal`).
     default_para: String,
+    /// Tabellmallarna (ramar, skuggning och villkorsformatering).
+    tables: crate::docx_tables::TableStyles,
 }
 
 impl Styles {
@@ -837,6 +839,9 @@ struct Tbl {
     row_spans: Vec<usize>,
     cell: Option<String>,
     span: usize,
+    /// Var `<w:tbl>` börjar i dokumentet och tabellens format (skuggning, ramar …).
+    start: usize,
+    read: Option<crate::docx_tables::TableRead>,
 }
 
 /// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade formateringsändringar på
@@ -931,7 +936,9 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 let kladd = format!("<w:styles>{}</w:styles>", kladd_styles());
                 let th = crate::docx_styles::Theme { font: &|t| theme.font(t), color: &|n| theme.color(n) };
                 style_set = crate::docx_styles::read_relative(&x, &th, &kladd);
-                parse_styles(&x, &theme)
+                let mut st = parse_styles(&x, &theme);
+                st.tables = crate::docx_tables::TableStyles::parse(&x);
+                st
             })
             .unwrap_or_default(),
         None => Styles::default(),
@@ -2448,7 +2455,7 @@ fn parse_body(
                         if let Some(p) = para.take() {
                             blocks.push(Block::Para(p));
                         }
-                        tables.push(Tbl::default());
+                        tables.push(Tbl { start: before, ..Tbl::default() });
                     }
                     b"tr" if !empty => {
                         if let Some(t) = tables.last_mut() {
@@ -2672,7 +2679,10 @@ fn parse_body(
                         }
                     }
                     b"tbl" => {
-                        if let Some(t) = tables.pop() {
+                        if let Some(mut t) = tables.pop() {
+                            if tables.is_empty() {
+                                t.read = crate::docx_tables::read(&xml[t.start..after], &styles.tables);
+                            }
                             if let Some(outer) = tables.last_mut() {
                                 // Nästlad tabell: platta till i den yttre cellen.
                                 let flat: Vec<String> = t.rows.iter().map(|r| r.iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" ")).collect();
@@ -3070,7 +3080,8 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 top_num = None;
                 // Rubrikraden skrivs i fetstil av Kladd; visa den utan **.
                 let mut rows = tbl.rows.clone();
-                if rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
+                let (fmt, widths) = crate::docx_tables::prepare(&mut rows, &tbl.spans, tbl.read.as_ref(), &tbl.widths, text_w);
+                if tbl.read.is_none() && rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
                     for c in rows[0].iter_mut() {
                         if c.len() > 4 {
                             *c = c[2..c.len() - 2].to_owned();
@@ -3083,10 +3094,13 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
+                // Tabellens format (skuggning, ramar …) i en dold kommentarsrad före tabellen.
+                if let Some(f) = &fmt {
+                    out.push_str(&f.to_comment());
+                    out.push_str("\n\n");
+                }
                 let start = out.len();
-                let narrow = text_w.is_some_and(|tw| tw > 0.0 && tbl.widths.iter().sum::<f64>() < tw * 0.9);
-                let widths: &[f64] = if narrow { &[] } else { &tbl.widths };
-                out.push_str(&markup::table_markdown(&rows, &tbl.spans, widths));
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, &widths));
                 units.push(MdUnit { origin: *origin, desc: "t|left".to_owned(), key: norm(&out[start..]) });
             }
         }
@@ -3232,6 +3246,8 @@ struct Writer<'a> {
     para_at: usize,
     /// Styckeutseende (`<!--k:pp …-->`) som väntar på styckets slut.
     pending_pp: Option<crate::word::pbox::PPr>,
+    /// Tabellformatet (`<!-- kladd-tabell: … -->`) som väntar på tabellen efter det.
+    pending_tfmt: Option<crate::word::tablefmt::TableFmt>,
     /// Nästa `w:id` för en skriven ändring.
     rev_next: u32,
     /// Kommentarsområden som redan skrivits (ett område får bara finnas en gång).
@@ -3257,6 +3273,10 @@ struct TableState {
     cell: usize,
     /// Den här cellen är täckt av cellen före och skrivs inte.
     covered: bool,
+    /// Tabellens format, om den har något.
+    fmt: Option<crate::word::tablefmt::TableFmt>,
+    /// Justering för styckena i cellen som skrivs.
+    cell_jc: Option<&'static str>,
 }
 
 /// Platshållare i den skrivna texten för markör nummer N (byts mot originalets XML när
@@ -3284,6 +3304,7 @@ impl<'a> Writer<'a> {
             quote: 0,
             heading: None,
             title: None,
+            pending_tfmt: None,
             table: None,
             in_code_block: false,
             image: None,
@@ -3469,6 +3490,9 @@ impl<'a> Writer<'a> {
         }
         if self.table.as_ref().is_some_and(|t| t.in_head) {
             ppr.push_str("<w:keepNext/>");
+        }
+        if let Some(j) = self.table.as_ref().and_then(|t| t.cell_jc) {
+            ppr.push_str(&format!("<w:jc w:val=\"{j}\"/>"));
         }
         if let Some(&(_, num)) = self.lists.last() {
             if self.heading.is_none() {
@@ -4077,7 +4101,13 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     let src = markup::table_src(md.get(range.clone()).unwrap_or(""));
                     let cols = aligns.len().max(1);
                     // Textytans bredd i tjugondels punkter (A4 med tums marginaler: 9026).
-                    let total = if w.ctx.max_width > 0 { (w.ctx.max_width / 635) as u32 } else { 9026 };
+                    let text_total = if w.ctx.max_width > 0 { (w.ctx.max_width / 635) as u32 } else { 9026 };
+                    let tfmt = w.pending_tfmt.take();
+                    let total = match tfmt.as_ref().map(|f| f.width) {
+                        Some(crate::word::tablefmt::Width::Pct(p)) => (f64::from(text_total) * f64::from(p) / 100.0).round() as u32,
+                        Some(crate::word::tablefmt::Width::Pt(p)) => u32::from(p) * 20,
+                        _ => text_total,
+                    };
                     // Kolumnbredd efter antalet streck i avgränsarraden, annars lika breda.
                     let widths: Vec<u32> = match src.weights.as_ref().filter(|ws| ws.len() == cols) {
                         Some(ws) => {
@@ -4086,14 +4116,20 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         }
                         None => vec![total / cols as u32; cols],
                     };
-                    w.body.push_str(
-                        "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
-                    );
+                    match &tfmt {
+                        Some(f) => w.body.push_str(&format!(
+                            "<w:tbl><w:tblPr>{}<w:tblLook w:val=\"04A0\" w:firstRow=\"0\" w:lastRow=\"0\" w:firstColumn=\"0\" w:lastColumn=\"0\" w:noHBand=\"1\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
+                            crate::docx_tables::tbl_pr_xml(f)
+                        )),
+                        None => w.body.push_str(
+                            "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
+                        ),
+                    }
                     for cw in &widths {
                         w.body.push_str(&format!("<w:gridCol w:w=\"{cw}\"/>"));
                     }
                     w.body.push_str("</w:tblGrid>");
-                    w.table = Some(TableState { in_head: false, widths, spans: src.spans, rows: 0, cell: 0, covered: false });
+                    w.table = Some(TableState { in_head: false, widths, spans: src.spans, rows: 0, cell: 0, covered: false, fmt: tfmt, cell_jc: None });
                 }
                 Tag::TableHead => {
                     if let Some(t) = w.table.as_mut() {
@@ -4101,14 +4137,26 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         t.rows += 1;
                         t.cell = 0;
                     }
-                    w.body.push_str("<w:tr><w:trPr><w:tblHeader/></w:trPr>");
+                    let pr = match w.table.as_ref().and_then(|t| t.fmt.as_ref()) {
+                        Some(f) => crate::docx_tables::tr_pr_xml(f, 0, true),
+                        None => "<w:tblHeader/>".to_owned(),
+                    };
+                    w.body.push_str(&format!("<w:tr><w:trPr>{pr}</w:trPr>"));
                 }
                 Tag::TableRow => {
                     if let Some(t) = w.table.as_mut() {
                         t.rows += 1;
                         t.cell = 0;
                     }
-                    w.body.push_str("<w:tr>");
+                    let pr = match w.table.as_ref() {
+                        Some(t) => t.fmt.as_ref().map(|f| crate::docx_tables::tr_pr_xml(f, t.rows - 1, false)).unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    if pr.is_empty() {
+                        w.body.push_str("<w:tr>");
+                    } else {
+                        w.body.push_str(&format!("<w:tr><w:trPr>{pr}</w:trPr>"));
+                    }
                 }
                 Tag::TableCell => {
                     let (span, width) = match w.table.as_mut() {
@@ -4123,7 +4171,22 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     // En täckt cell skrivs inte: den före den spänner över den (`w:gridSpan`).
                     if span > 0 {
                         let grid = if span > 1 { format!("<w:gridSpan w:val=\"{span}\"/>") } else { String::new() };
-                        w.body.push_str(&format!("<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>{grid}</w:tcPr>"));
+                        let extra = match w.table.as_ref() {
+                            Some(t) => t.fmt.as_ref().map(|f| crate::docx_tables::tc_pr_xml(f, t.rows.saturating_sub(1), t.cell)).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        let jc = w.table.as_ref().and_then(|t| {
+                            let f = t.fmt.as_ref()?;
+                            match f.cell(t.rows.saturating_sub(1), t.cell)?.halign {
+                                crate::word::tablefmt::TAlign::Left => None,
+                                crate::word::tablefmt::TAlign::Center => Some("center"),
+                                crate::word::tablefmt::TAlign::Right => Some("right"),
+                            }
+                        });
+                        if let Some(t) = w.table.as_mut() {
+                            t.cell_jc = jc;
+                        }
+                        w.body.push_str(&format!("<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>{grid}{extra}</w:tcPr>"));
                         w.open_para();
                     }
                 }
@@ -4241,7 +4304,10 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 let s = t.to_string();
                 let single_line = s.trim().lines().count() == 1;
-                if let Some(ns) = parse_tokens(&s) {
+                if crate::word::tablefmt::is_comment(s.trim()) && w.table.is_none() {
+                    // Tabellens format: gäller tabellen som följer.
+                    w.pending_tfmt = crate::word::tablefmt::TableFmt::from_comment(s.trim());
+                } else if let Some(ns) = parse_tokens(&s) {
                     for n in ns {
                         w.token(n);
                     }
@@ -7233,6 +7299,9 @@ Marginal
         });
         let back = read(&patched).unwrap();
         let md = back.markdown.trim_end();
+        // Tabellformatet (här: inga ramar, ingen automatisk fetstil) står i en dold rad före tabellen.
+        let (meta, md) = md.split_once("\n\n").expect("formatrad");
+        assert!(meta.starts_with("<!-- kladd-tabell:") && meta.contains("header off"), "{meta}");
         let ts = markup::table_src(md);
         assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![1, 1, 1]], "{md}");
         // 2000:6000:2000 av 40 streck = 8:24:8.
@@ -7256,6 +7325,127 @@ Marginal
         });
         let md = read(&patched).unwrap().markdown;
         assert!(md.contains("| --- | --- |"), "{md}");
+    }
+
+    // ------------------------------------------------------------ tabellformat (Word-struktur, påhittad text)
+
+    const W_BOX: &str = "<w:tbl><w:tblPr><w:tblW w:type=\"pct\" w:w=\"100%\"/><w:tblBorders><w:top w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:left w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:right w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:insideH w:val=\"none\"/><w:insideV w:val=\"none\"/></w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:type=\"pct\" w:w=\"100%\"/><w:shd w:fill=\"EFEAF7\" w:val=\"clear\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"150\"/><w:left w:type=\"dxa\" w:w=\"200\"/><w:bottom w:type=\"dxa\" w:w=\"150\"/><w:right w:type=\"dxa\" w:w=\"200\"/></w:tcMar></w:tcPr><w:p><w:r><w:rPr><w:b/><w:color w:val=\"5B3E96\"/></w:rPr><w:t>Rubrik i rutan</w:t></w:r></w:p><w:p><w:r><w:t>Första raden</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>Efter radbrytning</w:t></w:r></w:p><w:p><w:r><w:t>Sista stycket</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+
+    const W_DATA: &str = "<w:tbl><w:tblPr><w:tblW w:type=\"pct\" w:w=\"100%\"/><w:tblBorders><w:top w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:left w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:right w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:insideH w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:insideV w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/></w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w=\"2200\"/><w:gridCol w:w=\"5700\"/></w:tblGrid>\
+<w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"2200\"/><w:shd w:fill=\"2E5395\" w:val=\"clear\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val=\"FFFFFF\"/></w:rPr><w:t>Namn</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"5700\"/><w:shd w:fill=\"2E5395\" w:val=\"clear\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val=\"FFFFFF\"/></w:rPr><w:t>Beskrivning</w:t></w:r></w:p></w:tc></w:tr>\
+<w:tr><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"2200\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:r><w:t>alfa</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"5700\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:r><w:t>Första cellen med en lång text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+
+    fn with_tables(tables: &[&str]) -> (Vec<u8>, Loaded) {
+        let w = write("x\n", "x", &|_| None, None).unwrap();
+        let all: String = tables.iter().map(|t| format!("{t}<w:p><w:r><w:t>mellan</w:t></w:r></w:p>")).collect();
+        let patched = patch_document(&w.bytes, |x| {
+            let start = x.find("<w:p>").unwrap();
+            let end = x.rfind("</w:p>").unwrap() + "</w:p>".len();
+            format!("{}{all}{}", &x[..start], &x[end..])
+        });
+        let l = read(&patched).unwrap();
+        (patched, l)
+    }
+
+    fn document_xml(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn word_box_is_a_shaded_single_cell_table_with_line_breaks() {
+        let (_, l) = with_tables(&[W_BOX]);
+        let md = &l.markdown;
+        let meta = md.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).expect(md);
+        let f = crate::word::tablefmt::TableFmt::from_comment(meta).unwrap();
+        assert_eq!(f.fill(0, 0), Some([0xEF, 0xEA, 0xF7]), "{meta}");
+        assert!(!f.header_bold, "{meta}");
+        assert_eq!(f.width, crate::word::tablefmt::Width::Pct(100));
+        assert_eq!(f.borders[0].color, Some([0x5B, 0x3E, 0x96]));
+        assert!(!f.borders[4].visible() && !f.borders[5].visible());
+        assert!((f.pad[0] - 10.0).abs() < 0.01 && (f.pad[2] - 7.5).abs() < 0.01, "{:?}", f.pad);
+        // Stycken och radbrytning blir <br> i cellen; ingen fetstil på allt.
+        assert!(md.contains("Första raden<br>Efter radbrytning<br>Sista stycket"), "{md}");
+        assert!(md.contains("**Rubrik i rutan**"), "{md}");
+        assert!(!md.contains("**Första"), "{md}");
+    }
+
+    #[test]
+    fn word_table_header_shading_widths_and_alignment() {
+        let (_, l) = with_tables(&[W_DATA]);
+        let md = &l.markdown;
+        let meta = md.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).expect(md);
+        let f = crate::word::tablefmt::TableFmt::from_comment(meta).unwrap();
+        assert_eq!(f.fill(0, 0), Some([0x2E, 0x53, 0x95]));
+        assert_eq!(f.fill(0, 1), Some([0x2E, 0x53, 0x95]));
+        assert_eq!(f.fill(1, 0), None);
+        assert_eq!(f.cell(0, 0).unwrap().halign, crate::word::tablefmt::TAlign::Center);
+        assert_eq!(f.cells.get(&(1, 0)), None);
+        // Rubrikraden är helt fet och vit: fet via Kladd, färgen som span.
+        assert!(f.header_bold && md.contains("color: #FFFFFF"), "{md}");
+        assert!(!md.contains("**Namn"), "{md}");
+        // Kolumnbredderna 2200:5700 (11:28,5 streck) och tabellen i full bredd.
+        let table = md.split("\n\n").find(|b| b.starts_with("| ")).unwrap();
+        let w = markup::table_src(table).weights.unwrap();
+        assert!((w[0] * 5).abs_diff(w[1] * 2) <= 6, "{w:?}");
+        // Cellmarginaler 100 twips = 5 pt på alla sidor.
+        assert!((f.pad[2] - 5.0).abs() < 0.01 && (f.pad[0] - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn untouched_word_tables_are_written_back_byte_for_byte() {
+        let (bytes, l) = with_tables(&[W_BOX, W_DATA]);
+        let w = write(&l.markdown, "x", &|_| None, l.source.as_ref()).unwrap();
+        let (a, b) = (document_xml(&bytes), document_xml(&w.bytes));
+        assert!(b.contains(W_BOX) && b.contains(W_DATA), "{b}");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn edited_word_table_keeps_shading_borders_and_widths() {
+        let (_, l) = with_tables(&[W_DATA]);
+        let md = l.markdown.replace("Första cellen", "Ändrad cell");
+        let w = write(&md, "x", &|_| None, l.source.as_ref()).unwrap();
+        let xml = document_xml(&w.bytes);
+        // Skrivs om, men med skuggning, ramar, marginaler, justering och upprepad rubrikrad.
+        assert!(xml.contains("Ändrad cell"));
+        assert!(xml.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"2E5395\"/>"), "{xml}");
+        assert!(xml.contains("<w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"), "{xml}");
+        assert!(xml.contains("<w:tblCellMar>") && xml.contains("<w:tblHeader/>"));
+        assert!(xml.contains("<w:jc w:val=\"center\"/>"));
+        let again = read(&w.bytes).unwrap().markdown;
+        let meta = |m: &str| m.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).unwrap().to_owned();
+        assert_eq!(meta(&again), meta(&l.markdown), "{again}");
+        assert!(again.contains("Ändrad cell"));
+    }
+
+    #[test]
+    fn table_without_format_stays_free_of_format_lines() {
+        let md = "| a | b |\n| - | - |\n| c | d |\n";
+        let w = write(md, "x", &|_| None, None).unwrap();
+        let back = read(&w.bytes).unwrap().markdown;
+        assert!(!back.contains("kladd-tabell"), "{back}");
+        assert!(back.contains("| a | b |"));
+    }
+
+    #[test]
+    fn format_line_survives_a_markdown_round_trip_of_a_new_table() {
+        let mut f = crate::word::tablefmt::TableFmt::word_base();
+        f.cell_mut(0, 0).fill = Some([1, 2, 3]);
+        f.width = crate::word::tablefmt::Width::Pct(60);
+        f.align = crate::word::tablefmt::TAlign::Center;
+        let md = format!("{}\n\n| a | b |\n| - | - |\n| c | d |\n", f.to_comment());
+        let w = write(&md, "x", &|_| None, None).unwrap();
+        let xml = document_xml(&w.bytes);
+        assert!(xml.contains("<w:tblW w:w=\"3000\" w:type=\"pct\"/>") && xml.contains("<w:jc w:val=\"center\"/>"), "{xml}");
+        assert!(!xml.contains("kladd-tabell"));
+        let back = read(&w.bytes).unwrap().markdown;
+        let meta = back.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).expect(&back);
+        let g = crate::word::tablefmt::TableFmt::from_comment(meta).unwrap();
+        assert_eq!(g.fill(0, 0), Some([1, 2, 3]));
+        assert_eq!(g.width, crate::word::tablefmt::Width::Pct(60));
     }
 
 }

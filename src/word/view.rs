@@ -25,6 +25,7 @@ use super::secpages;
 use super::sections;
 use super::markup::{self, Block, Inline, SpanProp};
 use super::nav;
+use super::tablepaint;
 use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::i18n::t;
@@ -1143,6 +1144,7 @@ impl KladdApp {
             let mut new_target: Option<Option<SpellTarget>> = None;
             let mut table_menu: Option<bool> = None;
             let mut table_act: Option<TableOp> = None;
+            let mut table_fmt_act: Option<super::tableops::FormatOp> = None;
             let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
             let mut open_hf_dlg: Option<(bool, usize)> = None;
@@ -1166,6 +1168,8 @@ impl KladdApp {
                 // Bilder bakom texten ritas före texten (platsen fylls när bilderna är placerade).
                 let behind_slot = ui.painter().add(Shape::Noop);
                 let mut behind_shapes: Vec<Shape> = Vec::new();
+                // Cellskuggning ligger ovanpå arket men bakom texten.
+                let cell_fill_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
                     pos2(page_left + geom.origin_x(), page_top + geom.top),
@@ -1637,35 +1641,25 @@ impl KladdApp {
                 };
                 img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
 
-                // Tabellrutnät: 1 px kantlinjer runt varje cell, och en förhandsvisning av kolumnkanten som dras.
+                // Tabellrutnät: skuggning bakom texten och ramar (Words ramar, annars rutnät) ovanpå,
+                // och en förhandsvisning av kolumnkanten som dras.
+                let mut cell_fills: Vec<Shape> = Vec::new();
                 if let Some((_, geoms)) = &tview {
-                    let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
+                    let sel = out.state.cursor.char_range().map(|r| (char_to_byte(text, r.primary.index.0), char_to_byte(text, r.secondary.index.0)));
                     for vt in &vtabs {
                         let t = &geoms[vt.ti];
-                        for (ri, row) in t.rows.iter().enumerate() {
-                            let (Some(first), Some(last)) = (row.cells.first(), row.cells.last()) else { continue };
-                            let (y0, y1) = (gpos.y + vt.exts[ri].0, gpos.y + vt.exts[ri].1);
-                            if y1 < clip.top() || y0 > clip.bottom() {
-                                continue;
-                            }
-                            for c in &row.cells {
-                                let x = snap(gpos.x + t.cell_x(c).0);
-                                painter.line_segment([pos2(x, snap(y0)), pos2(x, snap(y1))], stroke);
-                            }
-                            let (x0, x1) = (snap(gpos.x + t.cell_x(first).0), snap(gpos.x + t.cell_x(last).1));
-                            painter.line_segment([pos2(x1, snap(y0)), pos2(x1, snap(y1))], stroke);
-                            if ri == 0 {
-                                painter.line_segment([pos2(x0, snap(y0)), pos2(x1, snap(y0))], stroke);
-                            }
-                            painter.line_segment([pos2(x0, snap(y1)), pos2(x1, snap(y1))], stroke);
-                        }
+                        let editing = focused && sel.is_some_and(|(a, b)| a.min(b) <= t.region.end && a.max(b) >= t.region.start);
+                        let sh = tablepaint::paint(t, &vt.exts, gpos.to_vec2(), p, z, clip, editing);
+                        cell_fills.extend(sh.fills);
+                        painter.extend(sh.lines);
                     }
                     if let Some((x, y0, y1)) = drag_preview {
                         painter.line_segment([pos2(snap(x), y0), pos2(snap(x), y1)], Stroke::new(2.0, p.accent));
                     }
                 }
 
+                ui.painter().set(cell_fill_slot, cell_fills);
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
                 page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
@@ -1838,6 +1832,7 @@ impl KladdApp {
                         }
                         if in_table_menu {
                             table_act = tables::menu_items(ui, p);
+                            table_fmt_act = tables::format_menu_items(ui, p);
                         }
                     });
                 }
@@ -1899,6 +1894,9 @@ impl KladdApp {
             }
             if let Some(op) = table_act {
                 self.word_table_op(&ctx, op);
+            }
+            if let Some(op) = table_fmt_act {
+                self.word_table_format(&ctx, op);
             }
             if let Some((at, dashes)) = col_resize {
                 self.word_edit(&ctx, |t, s| markup::table_set_widths(t, at, s, &dashes));

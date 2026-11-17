@@ -135,7 +135,7 @@ enum Block {
     Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
     Code { text: String, indent: f32 },
     /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
-    Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>> },
+    Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>>, fmt: Option<crate::word::tablefmt::TableFmt> },
     Rule,
     Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float>, place: ImgPlace },
     /// Innehållsförteckning (`<!-- kladd: toc -->`).
@@ -314,6 +314,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     };
 
     let mut table_src: Option<crate::word::markup::TableSrc> = None;
+    // Tabellformatet (`<!-- kladd-tabell: … -->`) som väntar på tabellen efter det.
+    let mut pending_tfmt: Option<crate::word::tablefmt::TableFmt> = None;
     for (ev, range) in Parser::new_ext(md, opts).into_offset_iter() {
         let is_display = matches!(ev, MdEvent::DisplayMath(_));
         let align = aligns.last().copied().unwrap_or_default();
@@ -434,7 +436,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     if let Some(rows) = table.take() {
                         if !rows.is_empty() {
                             let src = table_src.take().unwrap_or(crate::word::markup::TableSrc { cols: 0, spans: Vec::new(), weights: None });
-                            blocks.push(Block::Table { rows, spans: src.spans, weights: src.weights });
+                            blocks.push(Block::Table { rows, spans: src.spans, weights: src.weights, fmt: pending_tfmt.take() });
                         }
                     }
                 }
@@ -518,6 +520,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     } else if sections::is_column_break(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::ColumnBreak);
+                    } else if crate::word::tablefmt::is_comment(tag) {
+                        pending_tfmt = crate::word::tablefmt::TableFmt::from_comment(tag);
                     } else if tag.starts_with("<!--") && tag.ends_with("-->") {
                         // Kommentarer (också grundformatraden) skrivs inte ut.
                     } else {
@@ -1491,11 +1495,19 @@ impl<'a> Layout<'a> {
         self.floats.push(FloatBox { side, full, w: rw, page, top, bottom });
     }
 
-    fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>) {
+    fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>, fmt: Option<&crate::word::tablefmt::TableFmt>) {
+        use crate::word::tablefmt::{BOTTOM, LEFT, RIGHT, TAlign, TOP, VAlign, Width};
         self.clear_floats();
         let cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
         let size = self.body * 0.95;
-        let pad = 5.0;
+        let pad = fmt.map_or(5.0, |f| (f.pad[0] + f.pad[1]) / 2.0);
+        let pad_v = fmt.map_or(pad, |f| (f.pad[2] + f.pad[3]) / 2.0);
+        // Tabellens egen bredd (`w:tblW`).
+        let target: Option<f32> = fmt.and_then(|f| match f.width {
+            Width::Pct(p) => Some(self.cw * f32::from(p) / 100.0),
+            Width::Pt(p) => Some(f32::from(p)),
+            Width::Auto => None,
+        });
         let span_of = |ri: usize, ci: usize| spans.get(ri).and_then(|r| r.get(ci)).copied().unwrap_or(1);
         // Cellens text rad för rad (`<br>` är ett radslut).
         let widest = |this: &mut Self, cell: &[Span]| -> f32 {
@@ -1506,8 +1518,10 @@ impl<'a> Layout<'a> {
         let widths: Vec<f32> = match weights.filter(|w| w.len() == cols) {
             Some(w) => {
                 let sum: usize = w.iter().sum();
-                w.iter().map(|&n| self.cw * n as f32 / sum as f32).collect()
+                let total = target.unwrap_or(self.cw).min(self.cw);
+                w.iter().map(|&n| total * n as f32 / sum as f32).collect()
             }
+            None if target.is_some() => vec![target.unwrap_or(self.cw).min(self.cw) / cols as f32; cols],
             None => {
                 let mut natural = vec![24.0f32; cols];
                 let mut wide: Vec<(usize, usize, f32)> = Vec::new();
@@ -1563,24 +1577,71 @@ impl<'a> Layout<'a> {
             out
         };
         for (ri, r) in rows.iter().enumerate() {
-            let face = if ri == 0 { Face::SansSemi } else { self.base };
+            let face = if ri == 0 && fmt.is_none_or(|f| f.header_bold) { Face::SansSemi } else { self.base };
             let layout = cells_of(ri, r.len());
             // Mät radens höjd genom att lägga ut cellerna på en provsida.
             let mut heights = Vec::new();
             for &(ci, _, w) in &layout {
                 heights.push(self.cell_height(&r[ci], w - 2.0 * pad, size, face));
             }
-            let row_h = heights.iter().copied().fold(line_h, f32::max) + 2.0 * pad;
+            let min_h = fmt.and_then(|f| f.rows.get(&ri)).map_or(0.0, |r| f32::from(r.h));
+            let text_h = heights.iter().copied().fold(line_h, f32::max);
+            let row_h = (text_h + 2.0 * pad_v).max(min_h);
             self.ensure(row_h);
             let top = self.y;
-            if ri == 0 {
+            let x_off = match fmt.map(|f| f.align) {
+                Some(TAlign::Center) => (self.cw - total_w).max(0.0) / 2.0,
+                Some(TAlign::Right) => (self.cw - total_w).max(0.0),
+                _ => fmt.map_or(0.0, |f| f.indent),
+            };
+            if ri == 0 && fmt.is_none() {
                 let ml = self.ml;
                 self.page().ops.push(Op::Rect { x: ml, y: top, w: total_w, h: row_h, color: CODE_BG });
             }
-            for &(ci, x, w) in &layout {
-                self.y = top + pad;
-                let ml = self.ml;
+            if let Some(f) = fmt {
+                for &(ci, x, w) in &layout {
+                    if let Some(c) = f.fill(ri, ci) {
+                        let ml = self.ml + x_off;
+                        self.page().ops.push(Op::Rect { x: ml + x, y: top, w, h: row_h, color: (c[0], c[1], c[2]) });
+                    }
+                }
+            }
+            for (k, &(ci, x, w)) in layout.iter().enumerate() {
+                let dy = match fmt.map_or(VAlign::Top, |f| f.valign(ri, ci)) {
+                    VAlign::Top => 0.0,
+                    VAlign::Center => (row_h - 2.0 * pad_v - heights[k]).max(0.0) / 2.0,
+                    VAlign::Bottom => (row_h - 2.0 * pad_v - heights[k]).max(0.0),
+                };
+                self.y = top + pad_v + dy;
+                let ml = self.ml + x_off;
                 self.text_block(&r[ci], ml + x + pad, w - 2.0 * pad, face, size, INK, false, None);
+            }
+            if let Some(f) = fmt {
+                // Ramarna efter Words regler; en cells egna kanter går före tabellens.
+                let nrows = rows.len();
+                let ml = self.ml + x_off;
+                let last = layout.len().saturating_sub(1);
+                let color = |b: crate::word::tablefmt::Border| b.color.map_or(INK, |c| (c[0], c[1], c[2]));
+                let mut lines: Vec<(f32, f32, f32, f32, crate::word::tablefmt::Border)> = Vec::new();
+                for (k, &(ci, x, w)) in layout.iter().enumerate() {
+                    let own = |side: usize| f.own_border(ri, ci, side);
+                    lines.push((x, 0.0, x + w, 0.0, f.edge(TOP, None, own(TOP), ri > 0)));
+                    lines.push((x, 0.0, x, row_h, f.edge(LEFT, None, own(LEFT), k > 0)));
+                    if k == last {
+                        lines.push((x + w, 0.0, x + w, row_h, f.edge(RIGHT, own(RIGHT), None, false)));
+                    }
+                    if ri + 1 == nrows {
+                        lines.push((x, row_h, x + w, row_h, f.edge(BOTTOM, own(BOTTOM), None, false)));
+                    }
+                }
+                let page = self.page();
+                for (x1, y1, x2, y2, b) in lines {
+                    if b.visible() {
+                        page.ops.push(Op::Line { x1: ml + x1, y1: top + y1, x2: ml + x2, y2: top + y2, width: b.pt().max(0.4), color: color(b) });
+                    }
+                }
+                self.y = top + row_h;
+                continue;
             }
             // Rutnät: kanter runt varje cell (en sammanfogad cell har inga streck inuti).
             let ml = self.ml;
@@ -1743,7 +1804,7 @@ impl<'a> Layout<'a> {
                     self.y += if next_is_item { 2.0 } else { PARA_GAP };
                 }
                 Block::Code { text, indent } => self.code(text, *indent),
-                Block::Table { rows, spans, weights } => self.table(rows, spans, weights.as_deref()),
+                Block::Table { rows, spans, weights, fmt } => self.table(rows, spans, weights.as_deref(), fmt.as_ref()),
                 Block::Rule => {
                     self.clear_floats();
                     self.ensure(16.0);
@@ -2063,6 +2124,38 @@ mod tests {
             }
         }
         (vlines, texts, lay.ml, lay.cw)
+    }
+
+    fn page_ops(md: &str) -> Vec<Op> {
+        let blocks = parse_blocks(md);
+        let defaults = doc_defaults(md);
+        let resolve = |_: &str| None;
+        let mut lay = Layout::new(&resolve, &defaults);
+        lay.new_page();
+        lay.run(&blocks);
+        lay.pages.swap_remove(0).ops
+    }
+
+    #[test]
+    fn table_format_gives_fills_borders_and_no_comment_text() {
+        use crate::word::tablefmt::{TableFmt, Width};
+        let mut f = TableFmt::word_base();
+        f.cell_mut(0, 0).fill = Some([0x5B, 0x3A, 0x9E]);
+        f.width = Width::Pct(50);
+        let md = format!("{}\n\n| A | B |\n| - | - |\n| c | d |\n", f.to_comment());
+        let ops = page_ops(&md);
+        // Skuggningen i cellens färg, halva textbredden, och ingen linje (inga ramar).
+        let fills: Vec<_> = ops.iter().filter_map(|o| if let Op::Rect { w, color, .. } = o { Some((*w, *color)) } else { None }).collect();
+        assert_eq!(fills.len(), 1, "{fills:?}");
+        assert_eq!(fills[0].1, (0x5B, 0x3A, 0x9E));
+        assert!(ops.iter().all(|o| !matches!(o, Op::Line { .. })));
+        assert!(ops.iter().all(|o| !matches!(o, Op::Text { text, .. } if text.contains("kladd-tabell"))));
+        // Med rutnät ritas linjer och rubrikraden är inte fet av sig själv.
+        let mut g = TableFmt::word_base();
+        g.borders = [crate::word::tablefmt::Border::GRID; 6];
+        let md = format!("{}\n\n| A | B |\n| - | - |\n| c | d |\n", g.to_comment());
+        assert!(page_ops(&md).iter().any(|o| matches!(o, Op::Line { .. })));
+        assert!(write(&md, "x", &|_| None).is_ok());
     }
 
     #[test]
