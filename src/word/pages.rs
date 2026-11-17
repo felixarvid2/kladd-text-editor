@@ -467,6 +467,10 @@ mod tests {
 
     /// Ett galleri med många rader (en per stycke) som `paginate` sedan bryter.
     fn paged(n: usize, tall: Option<(usize, f32)>) -> Arc<Galley> {
+        paged_breaks(n, tall, &[])
+    }
+
+    fn paged_breaks(n: usize, tall: Option<(usize, f32)>, breaks: &[usize]) -> Arc<Galley> {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         let mut out = None;
@@ -486,12 +490,29 @@ mod tests {
                 }
                 job.wrap.max_width = 200.0;
                 let mut g = ui.ctx().fonts_mut(|f| f.layout_job(job));
-                paginate(Arc::make_mut(&mut g), &geom(), 1.0, &[], &[]);
+                paginate_breaks(Arc::make_mut(&mut g), &geom(), 1.0, &[], &[], breaks);
                 out = Some(g);
             });
             std::mem::forget(r);
         }
         out.unwrap()
+    }
+
+    #[test]
+    fn sidbrytning_borjar_ny_sida() {
+        let geom = geom();
+        // Rad 3 är en sidbrytningsrad; rad 0 står redan överst på sidan (ingen tom sida först).
+        let g = paged_breaks(8, None, &[0, 3]);
+        let page = |i: usize| geom.page_of(g.rows[i].pos.y);
+        assert_eq!(page(0), 0);
+        assert_eq!(page(2), 0);
+        assert_eq!(page(3), 1, "brytningsraden börjar den nya sidan");
+        assert!((g.rows[3].pos.y - geom.stride()).abs() < 0.01);
+        assert_eq!(page(4), 1);
+        assert_eq!(page(7), 1);
+        assert_eq!(page_count(&g, &geom), 2);
+        // Utan brytningar ryms allt på en sida.
+        assert_eq!(page_count(&paged(8, None), &geom), 1);
     }
 
     #[test]

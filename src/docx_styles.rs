@@ -150,6 +150,8 @@ pub fn read(xml: &str, th: &Theme) -> StyleSet {
 /// som saknar egna men ska jämföras med dokumentets).
 fn parse(xml: &str, th: &Theme, forced: Option<&StyleOverride>) -> (StyleSet, StyleOverride) {
     let mut map: HashMap<String, St> = HashMap::new();
+    // Ordningen mallarna står i (första träffen gäller när flera heter lika).
+    let mut order: Vec<String> = Vec::new();
     let mut default_para = String::new();
     let mut r = Reader::from_str(xml);
     let mut cur: Option<(String, St)> = None;
@@ -168,7 +170,9 @@ fn parse(xml: &str, th: &Theme, forced: Option<&StyleOverride>) -> (StyleSet, St
                             if st.default && st.paragraph {
                                 default_para = id.to_lowercase();
                             }
-                            map.insert(id.to_lowercase(), st);
+                            if map.insert(id.to_lowercase(), st).is_none() {
+                                order.push(id.to_lowercase());
+                            }
                         }
                     }
                     b"pPr" => in_ppr = false,
@@ -265,7 +269,7 @@ fn parse(xml: &str, th: &Theme, forced: Option<&StyleOverride>) -> (StyleSet, St
         acc
     };
     let find = |keys: &[&str]| -> Option<String> {
-        map.iter().find(|(id, st)| st.paragraph && (keys.contains(&id.as_str()) || keys.contains(&st.name.as_str()))).map(|(id, _)| id.clone())
+        order.iter().find(|id| map.get(*id).is_some_and(|st| st.paragraph && (keys.contains(&id.as_str()) || keys.contains(&st.name.as_str())))).cloned()
     };
     let mut set = StyleSet::default();
     for id in STYLE_IDS {
@@ -578,6 +582,33 @@ fn locate(xml: &str, id: StyleId, default_para: bool) -> Option<(usize, usize)> 
         at = end;
     }
     fallback
+}
+
+/// Rubrikmallarna (nivå, `w:styleId`) som dokumentet har under något annat id än Kladds `Heading{n}`
+/// (Words svenska `Rubrik1` heter "heading 1"). Först i dokumentet gäller, som i `locate`.
+pub fn foreign_heading_ids(xml: &str) -> Vec<(u8, String)> {
+    let mut out: Vec<(u8, String)> = Vec::new();
+    let mut at = 0;
+    while let Some(i) = xml[at..].find("<w:style ") {
+        let start = at + i;
+        let Some(len) = xml[start..].find("</w:style>") else { break };
+        let el = &xml[start..start + len];
+        at = start + len + "</w:style>".len();
+        let head = &el[..el.find('>').unwrap_or(0)];
+        let attrs = attrs_of(head);
+        if attrs.iter().any(|(k, v)| k.ends_with(":type") && v != "paragraph") {
+            continue;
+        }
+        let Some(id) = attrs.into_iter().find(|(k, _)| k.ends_with("styleId")).map(|(_, v)| v) else { continue };
+        let name = el.find("<w:name ").and_then(|n| attrs_of(&el[n..]).into_iter().find(|(k, _)| k.ends_with("val")).map(|(_, v)| v.to_lowercase()));
+        for n in 1..=6u8 {
+            let by_name = name.as_deref() == Some(format!("heading {n}").as_str()) || name.as_deref() == Some(format!("heading{n}").as_str());
+            if (by_name || id.eq_ignore_ascii_case(&format!("heading{n}"))) && id != format!("Heading{n}") && !out.iter().any(|(m, _)| *m == n) {
+                out.push((n, id.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Skriver de formatmallar som skiljer `old` från `new` in i `styles.xml`. Allt annat lämnas orört.

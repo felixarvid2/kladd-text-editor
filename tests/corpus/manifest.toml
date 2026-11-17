@@ -183,7 +183,6 @@ headings = 9
 ["docx/gen-nyhetsbrev.docx"]
 dropped = []
 headings = 9
-skip_idempotent = "Kladd-raden med rubrikformaten (h1, h2 …) ändras vid andra sparningen"
 
 ["docx/gen-sidhuvud-sektioner.docx"]
 dropped = []
@@ -196,7 +195,6 @@ headings = 9
 ["docx/gen-skolrapport.docx"]
 dropped = []
 headings = 9
-skip_idempotent = "Kladd-raden med sidmarginaler, sidhuvud och formatval ändras vid andra sparningen"
 note = "textrutan (faktarutan i marginalen) syns inte som text; sidhuvudet med logga och tabell läses som text utan bild"
 
 ["docx/gen-spara-andringar.docx"]
@@ -920,7 +918,6 @@ headings = 2
 ["odt/gen-nyhetsbrev-lo.odt"]
 dropped = ["textrutor"]
 headings = 9
-skip_edit = "den tillagda raden hamnar i en justerad div som den omlästa texten inte har"
 note = "textrutan syns inte som text"
 
 ["odt/gen-sidhuvud-sektioner.odt"]
@@ -930,7 +927,6 @@ headings = 2
 ["odt/gen-skolrapport-lo.odt"]
 dropped = ["textrutor"]
 headings = 9
-skip_idempotent = "styckejustering (div align=justify) ändras av sparningen på titelsidans vänsterställda stycken"
 note = "textrutan (faktarutan) syns inte som text"
 
 ["odt/gen-spara-andringar.odt"]

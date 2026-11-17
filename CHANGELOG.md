@@ -12,6 +12,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Rättat
 
 - **Sidbrytningar i Word- och LibreOffice-dokument.** En vanlig sidbrytning (`w:br w:type="page"`, `w:pageBreakBefore` direkt eller i en formatmall, `fo:break-before` och `fo:break-after` i `.odt`) lästes tidigare som en radbrytning eller försvann, så ett dokument fick för få sidor. Den blir nu raden `<!-- kladd: sidbrytning -->`, börjar en ny sida i dokumentläget och PDF, och sparas tillbaka som sidbrytning. Nytt: *Infoga → Sidbrytning*.
+- **Stabil sparning av rubrikformat och justering.** Ett Word-dokument med svenska rubrikmallar (`Rubrik1` …) fick rubrikformaten omflyttade mellan nivåer vid andra sparningen, eftersom Kladd lade till egna `Heading1` … med samma namn. Nya rubriker använder nu dokumentets egna mallar. I `.odt` blev vänsterställda stycken justerade när brödtextmallen var justerad.
 - Spalterna i ett avsnitt jämnas nu ut på avsnittets sista sida, också när avsnittet går över en sidgräns.
 - **Textrutor i Word-dokument syns och går att redigera.** Texten i en textruta (`w:txbxContent`) visas som stycken med rutans fyllning och ram, direkt före stycket rutan sitter i, och ändringar sparas tillbaka i rutan med form, ram och läge bevarade. Orörda rutor sparas som förut, byte för byte. Rutan ritas i flödet över hela spaltbredden (text flödar inte runt den). Rutor i tabeller, rubriker och listor, rutor med bilder och rutor i rutor visas inte, men bevaras.
 

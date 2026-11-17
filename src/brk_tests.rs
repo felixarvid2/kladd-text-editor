@@ -18,9 +18,11 @@ fn dump_markdown() {
         if odt { crate::odt::write(md, "K", &resolve).unwrap().bytes } else { crate::docx::write(md, "K", &resolve, src).unwrap().bytes }
     };
     let b2 = save(&l.markdown, l.source.as_ref());
+    std::fs::write(format!("{out}.2.bin"), &b2).unwrap();
     let l2 = rd(&b2).unwrap();
     std::fs::write(format!("{out}.2.md"), &l2.markdown).unwrap();
     let b3 = save(&l2.markdown, l2.source.as_ref());
+    std::fs::write(format!("{out}.3.bin"), &b3).unwrap();
     let l3 = rd(&b3).unwrap();
     std::fs::write(format!("{out}.3.md"), &l3.markdown).unwrap();
 }

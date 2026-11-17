@@ -6224,6 +6224,14 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, boxes: &[d
     if body.is_empty() || body.ends_with("</w:tbl>") {
         body.push_str("<w:p/>");
     }
+    // Har dokumentet egna rubrikmallar under andra id (Words `Rubrik1`) får de nya rubrikerna dem, inte Kladds.
+    let heading_remap: Vec<(String, String)> = styles_name
+        .as_deref()
+        .and_then(|n| src.part(n).map(decode_xml))
+        .filter(|x| x.contains("</w:styles>"))
+        .map(|x| crate::docx_styles::foreign_heading_ids(&x).into_iter().map(|(n, id)| (format!("Heading{n}"), id)).collect())
+        .unwrap_or_default();
+    let body = heading_remap.iter().fold(body, |b, (k, v)| b.replace(&format!("<w:pStyle w:val=\"{k}\"/>"), &format!("<w:pStyle w:val=\"{v}\"/>")));
     let (body, footnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref());
     let comments_out = review_xml::build_comments(src.comments.as_ref(), &rv.comments, &review_xml::anchored_ids(&body));
 
@@ -6309,6 +6317,9 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, boxes: &[d
             let missing: String = split_styles(&kladd_styles())
                 .into_iter()
                 .filter(|(id, _)| !xml.contains(&format!("w:styleId=\"{id}\"")))
+                // Har dokumentet redan en rubrikmall (t.ex. `Rubrik1`) används den i stället för Kladds.
+                .filter(|(id, _)| !heading_remap.iter().any(|(k, _)| k == id))
+                .map(|(id, x)| (id, heading_remap.iter().fold(x, |x, (k, v)| x.replace(&format!("w:val=\"{k}\""), &format!("w:val=\"{v}\"")))))
                 // Titel och Underrubrik läggs bara till när de används och dokumentet saknar en mall med namnet.
                 .filter(|(id, _)| match id.as_str() {
                     "Title" | "Subtitle" => {

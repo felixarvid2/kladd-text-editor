@@ -2744,7 +2744,16 @@ impl<'a> W<'a> {
     fn para_style(&mut self) -> String {
         let base = self.base_para_style();
         let align = self.aligns.last().copied().unwrap_or(Align::Left);
-        if align == Align::Left || self.code {
+        if self.code {
+            return base;
+        }
+        // Står formatmallen justerad (`body: justify`) måste ett vänsterställt stycke säga det själv.
+        let base_align = style::STYLE_IDS
+            .iter()
+            .find(|&&id| odt_style_name(id) == base)
+            .and_then(|&id| self.defaults.styles.get(id).align)
+            .unwrap_or(Align::Left);
+        if align == Align::Left && base_align == Align::Left {
             return base;
         }
         let key = (base.clone(), align.as_attr());
@@ -3274,6 +3283,17 @@ impl<'a> W<'a> {
         let name = format!("L{}", self.n_list);
         self.auto.push_str(&list_style_xml(&name, start.is_some(), start.unwrap_or(1)));
         self.body.push_str(&format!("<text:list text:style-name=\"{name}\">"));
+    }
+}
+
+/// Formatmallens namn i `.odt` för en av Kladds formatmallar.
+fn odt_style_name(id: style::StyleId) -> String {
+    match id {
+        style::StyleId::Body => "Text_20_body".to_owned(),
+        style::StyleId::Heading(n) => format!("Heading_20_{n}"),
+        style::StyleId::Quote => "Quotations".to_owned(),
+        style::StyleId::Title => "Title".to_owned(),
+        style::StyleId::Subtitle => "Subtitle".to_owned(),
     }
 }
 
