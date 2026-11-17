@@ -546,7 +546,7 @@ fn parse(text: &str) -> Parsed {
                     } else if super::pbox::parse_empty(t).is_some() {
                         // Tomt stycke (`<!--k:ep-->`): dold rad med ett styckes höjd, se `pbox`.
                         fill(&mut st, tr, |s| s.markup = true);
-                    } else if t == super::nav::TOC_LINE || super::tablefmt::is_comment(t) {
+                    } else if t == super::nav::TOC_LINE || super::tablefmt::is_comment(t) || crate::docx_tbox::is_mark(t) {
                         // Innehållsförteckningen (en dold rad som dokumentläget ersätter med rubrikerna)
                         // och tabellformatet före en tabell: dolda rader.
                         fill(&mut st, tr, |s| s.markup = true);
@@ -563,8 +563,9 @@ fn parse(text: &str) -> Parsed {
             }
             Event::Text(t) => {
                 // Ett tabbtecken som skrivits som `&#9;` (eller ett blanksteg som `&#32;`) först i ett
-                // Word-stycke: koden är dold, layouten ritar tabben som ett tabbstopp.
-                if !in_code_block && (&*t == "\t" || &*t == " ") && text[r.clone()].starts_with("&#") {
+                // Word-stycke: koden är dold, layouten ritar tabben som ett tabbstopp. Samma för skyddet
+                // `&#8203;` framför en markör i radens början (ankare, bokmärken).
+                if !in_code_block && (&*t == "\t" || &*t == " " || &*t == "\u{200B}") && text[r.clone()].starts_with("&#") {
                     fill(&mut st, r.clone(), |s| s.markup = true);
                 }
                 if !in_code_block
@@ -3876,6 +3877,15 @@ mod tests {
         // `docx::escape_line_start` skriver en tabb först i stycket som `&#9;`.
         let t = "&#9;1\\. Kontor";
         assert!(markup_str(t).starts_with("&#9;"), "{}", markup_str(t));
+    }
+
+    #[test]
+    fn skyddskod_framför_markör_är_dold() {
+        // `docx::para_md` skriver `&#8203;` framför en markör i radens början (ankare, bokmärken).
+        let t = "&#8203;<!--k:0-->Hej";
+        assert!(markup_str(t).starts_with("&#8203;"), "{}", markup_str(t));
+        let t = "# &#8203;<!--k:0-->Hej";
+        assert!(markup_str(t).contains("&#8203;"), "{}", markup_str(t));
     }
 
     #[test]

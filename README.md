@@ -235,7 +235,8 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 | Dokumentets grundtypsnitt | `<!-- kladd: font-family: "Times New Roman"; font-size: 12pt -->` på första raden |
 | Sidstorlek, marginaler, sidhuvud och sidfot | Samma kommentar: `page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"` |
 | Formatmallar (Brödtext, Rubrik 1–6, Citat) | Samma kommentar: `h1: "Calibri Light" 16pt bold #2F5496 space-before 12pt; body: justify line-spacing 1.15; quote: italic` |
-| Fotnoter, fält, textrutor m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
+| Fotnoter, fält m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
+| Textruta | `<!--k:tb N-->` … `<!--k:/tb-->` före stycket (innehållet är vanliga stycken med `<!--k:pp …-->` för fyllning och ram) |
 | Spårad infogning och radering | `<ins data-k="3">text</ins>`, `<del data-k="4">text</del>` (författare och datum i en postrad sist) |
 | Spårat stycketecken | `<!--k:pm ins 5-->` / `<!--k:pm del 5-->` sist på raden, före radbrytningen |
 | Spårad formatering | `<fmt data-k="6">text</fmt>` (teckenformat) och `<!--k:pm fmt 7-->` (styckeformat); det gamla formatet står i postradens `old` |
@@ -251,7 +252,7 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 
 Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
 
-Diagram, former, textrutor och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
+Textrutor visas som stycken med rutans fyllning och ram före stycket de sitter i (texten kan ändras, men rutan flyter inte). Diagram, former och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
 
 Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
 

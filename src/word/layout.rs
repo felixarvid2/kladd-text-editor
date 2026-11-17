@@ -1537,7 +1537,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             && ps.iter().all(|pc| pc.markup || body(pc).trim().is_empty());
         tag.push(if !is_tag || intersects(&range, &p.reveal) {
             0
-        } else if t.starts_with("</div") {
+        } else if t.starts_with("</div") || t == crate::docx_tbox::CLOSE {
             2
         } else {
             1

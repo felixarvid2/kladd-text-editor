@@ -12,6 +12,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Rättat
 
 - Spalterna i ett avsnitt jämnas nu ut på avsnittets sista sida, också när avsnittet går över en sidgräns.
+- **Textrutor i Word-dokument syns och går att redigera.** Texten i en textruta (`w:txbxContent`) visas som stycken med rutans fyllning och ram, direkt före stycket rutan sitter i, och ändringar sparas tillbaka i rutan med form, ram och läge bevarade. Orörda rutor sparas som förut, byte för byte. Rutan ritas i flödet över hela spaltbredden (text flödar inte runt den). Rutor i tabeller, rubriker och listor, rutor med bilder och rutor i rutor visas inte, men bevaras.
+
+
+- Den osynliga skyddskoden `&#8203;` framför ett bokmärke eller en förankrad ruta syntes som text i dokumentläget.
 
 ## [2.3.0] – 2026-11-17
 

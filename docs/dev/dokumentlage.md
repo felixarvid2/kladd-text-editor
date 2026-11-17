@@ -238,6 +238,15 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
+- **Textrutor** (`src/docx_tbox.rs`): `<!--k:tb N-->` … `<!--k:/tb-->` före ankarstycket, där `N` är markören
+  `<!--k:N-->` som bär originalkörningen (rutans form, ram och läge). Stycken i rutan får en syntetisk
+  `k:pp`-markör (fyllning, ram och inre marginal; rutan fyller spalten) som `write` tar bort igen innan texten jämförs
+  med originalet (`Source::tboxes`). Orörd ruta: originalet byte för byte. Ändrad: `w:txbxContent` byts i hela
+  körningen (både `mc:Choice` och `mc:Fallback`) mot nygenererade stycken. Blocket ger inga enheter (rutans stycken
+  är inga egna element). Utan original tas bara markörraderna bort. Begränsningar: rutan ritas i flödet ovanför
+  stycket (ingen omflytning, ingen fast höjd, läge och bredd räknas inte om), ramen (som alla styckeramar, `pboxui::shapes`) ritas fel i avsnitt med flera spalter, rutor i tabeller/rubriker/
+  listor, med bilder eller fotnoter, och rutor i rutor visas inte (bevaras), ODT läses inte ännu, PDF-exporten
+  ritar texten utan ram, nya rutor kan inte infogas.
 - **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda

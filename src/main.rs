@@ -15,6 +15,7 @@ mod docx;
 mod docx_para;
 mod docx_styles;
 mod docx_tables;
+mod docx_tbox;
 mod export;
 mod grammar;
 mod grammar_ui;

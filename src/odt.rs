@@ -3872,6 +3872,8 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     // Spårade ändringar och kommentarer: posterna lyfts ur texten och skrivs som `text:tracked-changes`
     // och `office:annotation`.
     let (stripped, revs, comments) = review::split_records(markdown);
+    // Textrutornas blockmarkörer (`docx_tbox`): rutans stycken blir vanliga stycken.
+    let stripped = crate::docx_tbox::strip_tags(&stripped);
     let markdown = stripped.as_str();
     let first = markdown.lines().next().unwrap_or("");
     let (defaults, markdown) = match DocDefaults::from_comment(first) {

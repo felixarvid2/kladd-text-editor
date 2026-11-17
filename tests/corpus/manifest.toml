@@ -256,8 +256,7 @@ dropped = []
 headings = 0
 
 ["docx/mammoth-text-box.docx"]
-empty = true
-note = "innehållet är en textruta som bevaras orörd vid sparning men inte visas som text"
+note = "innehållet är en textruta: visas som ett `<!--k:tb N-->`-block och sparas orörd om texten inte ändras"
 dropped = []
 headings = 0
 
