@@ -10,6 +10,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **Markdown-filer öppnas i läsläge.** En öppnad `.md`-fil visas färdig i hela fönstret i stället för som text med förhandsvisning bredvid. *Redigera* uppe till höger (eller `Ctrl+Shift+M`) byter till texten, och sidknappen i namnlisten eller `Ctrl+Shift+M` går tillbaka. Nya flikar och stora filer öppnas direkt i redigeraren, och sök och hopp i läsläget öppnar redigeraren. Förhandsvisningen bredvid texten finns kvar som val (*Visa → Förhandsvisning bredvid texten*, av som standard).
 
+### Rättat
+
+- Fet text och rubriker på nivå 2–3 visas feta i Markdown-förhandsvisningen. Förut syntes fetstil inte alls.
+
 ## [2.2.0] – 2026-11-17
 
 ### Nytt

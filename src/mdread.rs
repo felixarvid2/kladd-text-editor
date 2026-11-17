@@ -14,6 +14,9 @@ use crate::doc::Document;
 use crate::i18n::t;
 use crate::theme::{self, Palette};
 
+/// Samma nyckel som `egui_commonmark_backend::misc::BOLD_FAMILY_ID` i den lappade kopian i `vendor/`.
+const BOLD_FAMILY_ID: &str = "egui_commonmark_bold_family";
+
 /// Bredden på textspalten i läsläget, som i en vanlig läsvy.
 const COLUMN_W: f32 = 760.0;
 
@@ -37,6 +40,10 @@ pub fn render(ui: &mut Ui, p: &Palette, doc: &Document, images: &mut HashSet<Str
     st.text_styles.insert(egui::TextStyle::Heading, FontId::new(26.0, theme::semibold()));
     st.spacing.item_spacing.y = 8.0;
     st.visuals.override_text_color = Some(p.text);
+    // Fet text (`RichText::strong`) får textens färg; fetstilen kommer från typsnittet nedan.
+    st.visuals.widgets.active.fg_stroke.color = p.text;
+    // Den lappade egui_commonmark_backend (vendor/) ritar fet text med den här familjen.
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(BOLD_FAMILY_ID), theme::semibold()));
     // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
     // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
     let with_math = crate::math::preview::replace(&doc.text, ui.ctx(), 15.0, p.text, ui.available_width());
