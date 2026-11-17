@@ -4,6 +4,37 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.2.0] – 2026-11-17
+
+### Nytt
+
+- **Word- och LibreOffice-dokument ser ut som i Word.** Formatmallar, stycken, tabeller och bilder ritas i dokumentläget som i originalet, och orörda delar sparas tillbaka oförändrade.
+
+**Formatmallar**
+
+- **Titel och Underrubrik** som egna stilar i dokumentläget (stilvalet, *Ändra formatmall…*). En Word-titel (Title) är inte längre en liten Rubrik 1: den ritas med sin egen storlek, sitt typsnitt och sin färg, och Underrubrik (Subtitle) med kursiv och teckenavstånd. I Markdown skrivs de `# Text {.title}` och `## Text {.subtitle}` (markören döljs) och följer med som Wordstilarna Title/Subtitle till `.docx`, som `.odt`-stilarna Title/Subtitle, till PDF och som `<h1 class="title">` i HTML. Titel och underrubrik hamnar inte i rubrikträdet. Stilvalet har också Rubrik 4–6.
+- **Formatmallarna läses som i Word.** `docDefaults` (storlek, fet, kursiv) och temafärger (`w:themeColor` med tint/shade ur temats `clrScheme`) räknas in, teckenavstånd (`w:spacing`), versaler och kapitäler (`w:caps`, `w:smallCaps`) och linjen under stycket (`w:pBdr/w:bottom`, t.ex. under titeln) läses och skrivs tillbaka, och teckenmallar med fet eller kursiv (Subtil betoning m.fl.) syns i texten. En mall som inte anger färg eller fet är vanlig svart text, inte Kladds blå fetstilsrubrik. Grundformatskommentaren får `letter-spacing`, `caps`, `smallcaps` och `border-bottom`.
+- **Vita sidor i mörkt tema** (*Visa → Vita sidor i mörkt tema* och *Inställningar → Dokument*, på som standard): dokumentläget ritar sidan vit med dokumentets riktiga färger och svart text som i Word och LibreOffice, så att mörkblå och lila text går att läsa. Stavningsvågor och markering syns som förut.
+
+**Stycken**
+
+- **Styckeutseende som i Word.** Dokumentläget ritar styckeramar (`w:pBdr`: enkel, dubbel, streckad, prickad och tjock linje med egen färg, tjocklek och luft), skuggade stycken (`w:shd`), exakt avstånd före och efter (`w:spacing` med auto, exakt och minst radavstånd, även ur formatmallar och dokumentets standardvärden, `contextualSpacing`) och indrag (vänster, höger, första raden, hängande). Efterföljande stycken med lika ram och skuggning blir en enda ruta (mellanlinjer ritas), rutan delas vid en sidbrytning, och stycken utan avstånd ligger tätt som i Word och LibreOffice. Läses ur `.docx` till en dold markör `<!--k:pp …-->` sist i stycket (`docs/dev/dokumentlage.md`) och skrivs tillbaka i schemaordning för nya och ändrade stycken; orörda stycken skrivs som förut byte för byte.
+- **Tomma stycken bevaras.** Ett tomt Word-stycke (som många använder som lodrätt avstånd) blir en egen rad `<!--k:ep-->` med stycketeckens storlek och avstånd, får höjd i dokumentläget, och skrivs tillbaka som samma XML. Att ta bort eller lägga till raden tar bort respektive lägger till ett tomt stycke.
+
+**Tabeller**
+
+- **Tabeller från Word och LibreOffice ser ut som i originalet.** Cellskuggning (`w:shd`, också från tabellmallar som *Grid Table 4 Accent 1* med villkorsformatering för rubrikrad, första kolumn och radband enligt `w:tblLook`), ramar (`w:tblBorders` och `w:tcBorders`: ingen, enkel, dubbel, streckad, prickad, tjocklek och färg, kraftigaste linjen vinner mellan två celler), tabellbredd (`w:tblW` auto, dxa och procent, `w:tblGrid`, fast utläggning), justering och indrag, cellmarginaler (`w:tblCellMar`/`w:tcMar`), lodrät och vågrät justering i cellen, radhöjd (`w:trHeight`) och lodrätt sammanfogade celler visas i dokumentläget. En tabell utan ramar visar inga linjer (en svag hjälplinje syns bara medan markören står i den), en ensam skuggad cell är en ruta med flera stycken och radbrytningar, och rubrikraden är bara fet när dokumentet gör den fet. Formatet ligger i en dold kommentarsrad före tabellen (`<!-- kladd-tabell: … -->`, se `docs/dev/dokumentlage.md`), orörda tabeller skrivs tillbaka byte för byte och ändrade tabeller behåller formatet (och skriver det som riktiga tabellegenskaper). Formatet följer också med till `.odt`, PDF, HTML och EPUB. Högerklicksmenyn har *Skugga celler*, *Ta bort skuggning*, *Ramar runt alla celler* och *Inga ramar*, och formatet följer med när rader och kolumner läggs till eller tas bort.
+
+**Bilder**
+
+- **Bilder sitter där Word och LibreOffice la dem.** Förankrade bilder (`wp:anchor`, äldre VML-bilder, ODT `draw:frame`) behåller nu sitt läge mot sidan, marginalen, spalten eller stycket (förskjutning eller vänster/mitten/höger respektive topp/mitten/botten), textomflöde (runt, över och under, bakom eller framför texten) och avstånd till texten, och ritas på rätt plats i dokumentläget och i PDF-exporten: texten flyter på den bredare sidan, hoppar förbi bilder över hela bredden, och bilder bakom/framför påverkar inte texten. Beskärning (`a:srcRect`, `fo:clip`) och exakt storlek (också sträckta bilder) bevaras, bilder i tabellceller blir vanliga bilder som inte blir bredare än cellen. Att dra en förankrad bild skriver tillbaka nytt läge till `.docx`/`.odt`. Orörda dokument är oförändrade.
+
+### Rättat
+
+- En tabb först i ett Word-stycke visas som tabbstopp i stället för som `&#9;`.
+- När en fil öppnas i dokumentläget hamnar markören i första stycket, och dold markup visas först när du flyttar markören.
+- `|` i kod i en tabellcell visas utan backstreck.
+
 ## [2.1.0] – 2026-11-13
 
 ### Nytt

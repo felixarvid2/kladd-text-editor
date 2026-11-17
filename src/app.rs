@@ -119,6 +119,8 @@ pub struct Settings {
     pub lsp_commands: Vec<(String, String)>,
     /// Vim-tangentbindningar i textläget (av som standard).
     pub vim: bool,
+    /// Dokumentlägets sidor är vita med dokumentets egna färger även i mörkt tema (som Word/LibreOffice).
+    pub white_paper: bool,
 }
 
 impl Default for Settings {
@@ -155,6 +157,7 @@ impl Default for Settings {
             lsp: true,
             lsp_commands: Vec::new(),
             vim: false,
+            white_paper: true,
         }
     }
 }

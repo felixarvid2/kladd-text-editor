@@ -87,6 +87,10 @@ pub fn headings_scan(text: &str) -> Vec<Heading> {
         if hashes > 6 || !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
             continue;
         }
+        // Titel och Underrubrik är inte med i innehållet (som i Words navigeringsfönster).
+        if crate::style::titles::trailing_marker(rest).is_some() {
+            continue;
+        }
         let rest = rest.trim();
         // Avslutande ##.
         let core = rest.trim_end_matches('#');

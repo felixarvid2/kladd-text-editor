@@ -19,7 +19,9 @@ use quick_xml::Reader;
 
 use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
+use crate::style::titles::{self, TitleKind};
 use crate::style::{self, Align, DocDefaults, SpanStyle};
+use crate::word::anchor::{Anchor, HRel, Pos, VRel, Wrap};
 use crate::word::markup::{self, Float};
 
 /// Högsta antal poster i ett paket (WordCraft: zip_guard).
@@ -310,6 +312,9 @@ struct RProps {
     highlight: Option<Option<[u8; 3]>>,
     /// `w:shd w:fill`.
     shading: Option<[u8; 3]>,
+    /// Fet och kursiv (`w:b`, `w:i`): används för teckenmallar som Betoning och Stark.
+    bold: Option<bool>,
+    italic: Option<bool>,
 }
 
 impl RProps {
@@ -321,6 +326,8 @@ impl RProps {
             color: inner.color.or(self.color),
             highlight: inner.highlight.or(self.highlight),
             shading: inner.shading.or(self.shading),
+            bold: inner.bold.or(self.bold),
+            italic: inner.italic.or(self.italic),
         }
     }
 
@@ -338,9 +345,25 @@ impl RProps {
 struct Theme {
     major: Option<String>,
     minor: Option<String>,
+    /// `a:clrScheme`: dk1, lt1, dk2, lt2, accent1-6, hlink, folHlink (gemener).
+    colors: HashMap<String, [u8; 3]>,
 }
 
 impl Theme {
+    /// `w:themeColor` (`accent1`, `text2`, `background1` …) → temats färg, utan tint/shade.
+    fn color(&self, name: &str) -> Option<[u8; 3]> {
+        let key = match name {
+            "text1" | "dark1" => "dk1",
+            "background1" | "light1" => "lt1",
+            "text2" | "dark2" => "dk2",
+            "background2" | "light2" => "lt2",
+            "hyperlink" => "hlink",
+            "followedHyperlink" => "folhlink",
+            n => return self.colors.get(&n.to_ascii_lowercase()).copied(),
+        };
+        self.colors.get(key).copied()
+    }
+
     /// `minorHAnsi`, `majorAscii` … → typsnittets namn.
     fn font(&self, theme_name: &str) -> Option<String> {
         let n = theme_name.to_ascii_lowercase();
@@ -359,15 +382,33 @@ fn parse_theme(xml: &str) -> Theme {
     let mut r = Reader::from_str(xml);
     // 0 = utanför, 1 = majorFont, 2 = minorFont
     let mut cur = 0u8;
+    // Färgen i `a:clrScheme` som just läses (dk1, accent1 …).
+    let mut slot: Option<String> = None;
     loop {
         match r.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if matches!(local(e.name().as_ref()), b"srgbClr" | b"sysClr") => {
+                let c = attr(&e, b"val").filter(|_| local(e.name().as_ref()) == b"srgbClr").or_else(|| attr(&e, b"lastClr"));
+                if let (Some(s), Some(c)) = (&slot, c.and_then(|c| style::parse_color(&c))) {
+                    t.colors.entry(s.clone()).or_insert(c);
+                }
+            }
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
                 b"majorFont" => cur = 1,
                 b"minorFont" => cur = 2,
                 b"latin" => theme_latin(&mut t, cur, &e),
+                n @ (b"dk1" | b"lt1" | b"dk2" | b"lt2" | b"accent1" | b"accent2" | b"accent3" | b"accent4" | b"accent5"
+                | b"accent6" | b"hlink" | b"folHlink") => slot = Some(String::from_utf8_lossy(n).to_ascii_lowercase()),
                 _ => {}
             },
             Ok(Event::Empty(e)) if local(e.name().as_ref()) == b"latin" => theme_latin(&mut t, cur, &e),
+            Ok(Event::End(e))
+                if matches!(
+                    local(e.name().as_ref()),
+                    b"dk1" | b"lt1" | b"dk2" | b"lt2" | b"accent1" | b"accent2" | b"accent3" | b"accent4" | b"accent5" | b"accent6" | b"hlink" | b"folHlink"
+                ) =>
+            {
+                slot = None
+            }
             Ok(Event::End(e)) if matches!(local(e.name().as_ref()), b"majorFont" | b"minorFont") => cur = 0,
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -396,7 +437,8 @@ fn apply_rpr_elem(rp: &mut RProps, name: &[u8], e: &BytesStart<'_>, theme: &Them
             }
         }
         b"color" => {
-            if let Some(c) = attr(e, b"val").filter(|v| !v.eq_ignore_ascii_case("auto")).and_then(|v| style::parse_color(&v)) {
+            let tc = crate::docx_styles::Theme { font: &|_| None, color: &|n| theme.color(n) };
+            if let Some(c) = crate::docx_styles::color_of(e, &tc) {
                 rp.color = Some(c);
             }
         }
@@ -405,6 +447,8 @@ fn apply_rpr_elem(rp: &mut RProps, name: &[u8], e: &BytesStart<'_>, theme: &Them
                 rp.size = Some(half / 2.0);
             }
         }
+        b"b" => rp.bold = Some(!matches!(attr(e, b"val").as_deref(), Some("0" | "false" | "off" | "none"))),
+        b"i" => rp.italic = Some(!matches!(attr(e, b"val").as_deref(), Some("0" | "false" | "off" | "none"))),
         b"highlight" => match attr(e, b"val").as_deref() {
             Some("none") => rp.highlight = Some(None),
             Some(n) => {
@@ -444,6 +488,8 @@ struct Styles {
     defaults: RProps,
     /// Standardstyckemallen (`w:default="1"`, oftast `Normal`).
     default_para: String,
+    /// Tabellmallarna (ramar, skuggning och villkorsformatering).
+    tables: crate::docx_tables::TableStyles,
 }
 
 impl Styles {
@@ -577,15 +623,24 @@ fn parse_styles(xml: &str, theme: &Theme) -> Styles {
 enum ParaKind {
     Normal,
     Heading(u8),
+    /// Wordstilen Title / Subtitle (Kladds `Block::Title` / `Block::Subtitle`).
+    Title,
+    Subtitle,
     Quote,
     Code,
 }
 
+/// Wordstilarna Title och Subtitle (id eller namn; "Rubrik" är svenska Words Title).
+fn title_from_name(s: &str) -> Option<ParaKind> {
+    match s.to_lowercase().replace([' ', '_', '-'], "").as_str() {
+        "title" | "rubrik" | "titel" => Some(ParaKind::Title),
+        "subtitle" | "underrubrik" | "undertitel" => Some(ParaKind::Subtitle),
+        _ => None,
+    }
+}
+
 fn heading_from_name(s: &str) -> Option<u8> {
     let s = s.to_lowercase().replace([' ', '_', '-'], "");
-    if s == "title" || s == "rubrik" || s == "titel" {
-        return Some(1);
-    }
     for prefix in ["heading", "rubrik", "überschrift", "titre", "kop", "otsikko", "overskrift"] {
         if let Some(n) = s.strip_prefix(prefix) {
             if let Ok(n) = n.parse::<u8>() {
@@ -614,10 +669,16 @@ fn kind_for_style(styles: &HashMap<String, StyleInfo>, id: &str) -> ParaKind {
     let mut cur = Some(id.to_owned());
     for _ in 0..10 {
         let Some(sid) = cur else { break };
+        if let Some(k) = title_from_name(&sid) {
+            return k;
+        }
         if let Some(h) = heading_from_name(&sid) {
             return ParaKind::Heading(h);
         }
         let Some(info) = styles.get(&sid) else { break };
+        if let Some(k) = title_from_name(&info.name) {
+            return k;
+        }
         if let Some(h) = heading_from_name(&info.name) {
             return ParaKind::Heading(h);
         }
@@ -748,11 +809,15 @@ struct Para {
     direct_align: Option<Align>,
     /// Indexet i `BodyInfo::elems` för toppnivåelementet stycket kommer från.
     origin: usize,
+    /// Ram, skuggning, avstånd och indrag som hamnar i dialektens markör (`word::pbox`).
+    ppr: crate::word::pbox::PPr,
+    /// Teckenstorlek (pt) på stycketecknet i ett tomt stycke, om stycket anger den.
+    mark_sz: Option<f32>,
 }
 
 impl Para {
     fn new() -> Para {
-        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None, origin: usize::MAX }
+        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None, origin: usize::MAX, ppr: Default::default(), mark_sz: None }
     }
 }
 
@@ -774,6 +839,9 @@ struct Tbl {
     row_spans: Vec<usize>,
     cell: Option<String>,
     span: usize,
+    /// Var `<w:tbl>` börjar i dokumentet och tabellens format (skuggning, ramar …).
+    start: usize,
+    read: Option<crate::docx_tables::TableRead>,
 }
 
 /// Det som faktiskt går förlorat: det mesta bevaras nu orört, men spårade formateringsändringar på
@@ -859,13 +927,18 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let theme_part = find_part("/theme").unwrap_or_else(|| "word/theme/theme1.xml".to_owned());
     let theme = pkg.part(&theme_part)?.map(|x| parse_theme(&x)).unwrap_or_default();
     let mut style_set = style::StyleSet::default();
+    let mut para_styles = crate::docx_para::ParaStyles::default();
     let styles = match find_part("/styles") {
         Some(p) => pkg
             .part(&p)?
             .map(|x| {
+                para_styles = crate::docx_para::ParaStyles::parse(&x);
                 let kladd = format!("<w:styles>{}</w:styles>", kladd_styles());
-                style_set = crate::docx_styles::read_relative(&x, &|t| theme.font(t), &kladd);
-                parse_styles(&x, &theme)
+                let th = crate::docx_styles::Theme { font: &|t| theme.font(t), color: &|n| theme.color(n) };
+                style_set = crate::docx_styles::read_relative(&x, &th, &kladd);
+                let mut st = parse_styles(&x, &theme);
+                st.tables = crate::docx_tables::TableStyles::parse(&x);
+                st
             })
             .unwrap_or_default(),
         None => Styles::default(),
@@ -911,6 +984,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let m = page.margins();
         Some(((w - m[1] - m[3]) * 20.0) as f64)
     };
+    fill_para_looks(&mut blocks, &info.elems, &para_styles);
     let (mut markdown, units) = to_markdown_units(&blocks, &numbering, text_w);
     let mut keys: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
     // Grundformatet (typsnitt, storlek och sida) står först när det avviker från standard.
@@ -977,8 +1051,13 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let repl = match name {
             Some(name) => {
                 let img = images.iter().find(|(n, _)| *n == name).map(|(_, i)| i);
-                let float = f.anchor.as_ref().and_then(|a| anchor_float(a, f.extent, &page));
-                image_md(&name, &f.alt, f.extent, img, float)
+                // Bilder i en tabellcell flyter inte (cellen har sin egen bredd): vanlig bild.
+                let in_cell = markdown.find(&f.placeholder).is_some_and(|at| {
+                    let ls = markdown[..at].rfind('\n').map_or(0, |i| i + 1);
+                    markdown[ls..].trim_start().starts_with('|')
+                });
+                let anchor = f.anchor.as_ref().filter(|_| !in_cell).map(|a| anchor_of(a, &page));
+                image_md(&name, &f.alt, f.extent, img, anchor, f.crop)
             }
             // Bilden går inte att visa: originalkörningen bevaras som markör.
             None => f.fallback.map(token_text).unwrap_or_default(),
@@ -1124,16 +1203,24 @@ fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Th
 
 /// Hur en bild skrivs i texten: `![alt](bild:namn)`, eller `<img … width>` när storleken avviker
 /// från bildens egen (96 dpi) eller från den som redan lagrats för bilden.
-fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Image>, float: Option<Float>) -> String {
+fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Image>, anchor: Option<Anchor>, crop: Option<[i64; 4]>) -> String {
+    let float = anchor.as_ref().and_then(Anchor::legacy_side);
+    let anchor = anchor.filter(|_| float.is_none());
+    // Beskärning i procent (`a:srcRect` är i tusendels procent).
+    let crop = crop
+        .map(|c| c.map(|v| v as f32 / 1000.0))
+        .filter(|c| c.iter().all(|v| (0.0..100.0).contains(v)) && c[0] + c[2] < 100.0 && c[1] + c[3] < 100.0);
+    let floating = float.is_some() || anchor.is_some();
     let differs = |a: f64, b: f64| b > 0.0 && (a - b).abs() / b > 0.02;
     let want = extent.map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
-    let natural = img.and_then(|i| imagesize::blob_size(&i.bytes).ok()).map(|s| s.width as f64);
+    let nat = img.and_then(|i| imagesize::blob_size(&i.bytes).ok()).map(|s| (s.width as f64, s.height as f64));
+    let natural = nat.map(|n| n.0);
     let stored = img.and_then(|i| i.extent).map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
     let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
-    // En flytande bild skrivs alltid som `<img … width align>`.
-    let want = if float.is_some() { want.or(natural) } else { want };
+    // En flytande eller beskuren bild skrivs alltid som `<img … width …>`.
+    let want = if floating || crop.is_some() { want.or(natural) } else { want };
     match want {
-        Some(w) if float.is_some() || natural.is_some_and(|n| differs(w, n)) || stored.is_some_and(|st| differs(w, st)) => {
+        Some(w) if floating || crop.is_some() || natural.is_some_and(|n| differs(w, n)) || stored.is_some_and(|st| differs(w, st)) => {
             let mut a = String::new();
             for c in alt.chars() {
                 match c {
@@ -1145,12 +1232,34 @@ fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Imag
                     c => a.push(c),
                 }
             }
-            let al = match float {
-                Some(Float::Left) => " align=\"left\"",
-                Some(Float::Right) => " align=\"right\"",
-                None => "",
-            };
-            format!("<img src=\"{src}\" alt=\"{a}\" width=\"{}\"{al}>", w.round().max(1.0) as i64)
+            // Höjden skrivs när den inte följer av bredden (beskuren eller sträckt bild).
+            let h = extent.map(|(_, cy)| cy as f64 / EMU_PER_PIXEL as f64).filter(|h| {
+                let ratio = match (nat, crop) {
+                    (Some((nw, nh)), Some(c)) => Some(nh * (1.0 - (c[1] + c[3]) as f64 / 100.0) / (nw * (1.0 - (c[0] + c[2]) as f64 / 100.0))),
+                    (Some((nw, nh)), None) => Some(nh / nw),
+                    _ => None,
+                };
+                match ratio {
+                    Some(r) => differs(*h, w * r),
+                    None => crop.is_some(),
+                }
+            });
+            let mut tag = format!("<img src=\"{src}\" alt=\"{a}\" width=\"{}\"", w.round().max(1.0) as i64);
+            if let Some(h) = h {
+                tag.push_str(&format!(" height=\"{}\"", h.round().max(1.0) as i64));
+            }
+            match (anchor, float) {
+                (Some(an), _) => an.write_attrs(&mut tag),
+                (None, Some(Float::Left)) => tag.push_str(" align=\"left\""),
+                (None, Some(Float::Right)) => tag.push_str(" align=\"right\""),
+                (None, None) => {}
+            }
+            if let Some(c) = crop {
+                let f = |v: f32| format!("{}", (v * 100.0).round() / 100.0);
+                tag.push_str(&format!(" crop=\"{} {} {} {}\"", f(c[0]), f(c[1]), f(c[2]), f(c[3])));
+            }
+            tag.push('>');
+            tag
         }
         _ => format!("![{}]({src})", escape_alt(alt)),
     }
@@ -1505,51 +1614,76 @@ struct FoundImage {
     target: String,
     alt: String,
     extent: Option<(i64, i64)>,
-    /// Förankrad bild med omflöde (`wp:anchor` + `wrapSquare/Tight/Through`): läget i sidled.
+    /// Förankrad bild (`wp:anchor`): läge, omflöde och avstånd.
     anchor: Option<AnchorPos>,
+    /// Beskärning (`a:srcRect`): vänster, ovan, höger, under i tusendels procent.
+    crop: Option<[i64; 4]>,
     /// Markör för hela körningen, om bilden inte går att visa.
     fallback: Option<usize>,
 }
 
-/// `wp:positionH` för en förankrad bild med textomflöde.
+/// Placeringen i en `wp:anchor`: `positionH`/`positionV`, omflöde och avstånd.
 #[derive(Default, Clone)]
 struct AnchorPos {
-    /// `relativeFrom` ("column", "margin", "page" …).
+    /// `relativeFrom` ("column", "margin", "page" …) i sidled.
     rel: String,
     /// `wp:align`: left, right, center, inside, outside.
     align: Option<String>,
     /// `wp:posOffset` i EMU.
     off: Option<i64>,
+    /// Samma i höjdled.
+    rel_v: String,
+    align_v: Option<String>,
+    off_v: Option<i64>,
+    /// Omflöde; `None` om ingen `wrap*`-tagg fanns (då ligger bilden framför texten).
+    wrap: Option<Wrap>,
+    /// `behindDoc="1"`.
+    behind: bool,
+    /// Avstånd till texten (ovan, under, vänster, höger) i EMU.
+    dist: [i64; 4],
+    /// `simplePos="1"`: läget i `wp:simplePos` (EMU från sidans hörn).
+    simple: Option<(i64, i64)>,
 }
 
-/// Sidan en förankrad bild flyter på: `align` left/right, eller en förskjutning nära vänster
-/// respektive höger marginal. Mitt på raden, "inside/outside" och okända lägen ger `None`
-/// (bilden blir en egen rad).
-fn anchor_float(a: &AnchorPos, extent: Option<(i64, i64)>, page: &DocDefaults) -> Option<Float> {
-    match a.align.as_deref() {
-        Some("left") => return Some(Float::Left),
-        Some("right") => return Some(Float::Right),
-        Some(_) => return None,
-        None => {}
-    }
-    let off = a.off? as f64;
-    let (pw, _) = page.page();
-    let [_, r, _, l] = page.margins();
-    let (l, text_w) = (l as f64 * 12700.0, (pw - l - r) as f64 * 12700.0);
-    let w = extent.map_or(0.0, |e| e.0 as f64);
-    // Bildens vänsterkant räknad från textspaltens vänsterkant.
-    let left = match a.rel.as_str() {
-        "page" => off - l,
-        "column" | "margin" | "leftMargin" | "character" | "" => off,
-        _ => return None,
+/// Dialektens ankare för en förankrad bild. Lägen relativt kanter som Kladd inte har egna
+/// (`leftMargin`, `bottomMargin` …) räknas om till sidan eller marginalen.
+fn anchor_of(a: &AnchorPos, page: &DocDefaults) -> Anchor {
+    let emu = |v: i64| (v as f64 / EMU_PER_PIXEL as f64) as f32;
+    let (pw, ph) = page.page();
+    let [_, mr, mb, _] = page.margins();
+    let half = |v: Option<&str>| match v {
+        Some("left" | "top" | "inside") => Some(Pos::Start),
+        Some("center") => Some(Pos::Center),
+        Some("right" | "bottom" | "outside") => Some(Pos::End),
+        _ => None,
     };
-    if left <= 0.25 * text_w {
-        Some(Float::Left)
-    } else if left + w >= 0.75 * text_w {
-        Some(Float::Right)
-    } else {
-        None
+    let (mut hrel, hbase) = match a.rel.as_str() {
+        "page" => (HRel::Page, None),
+        "margin" | "insideMargin" | "outsideMargin" => (HRel::Margin, None),
+        "leftMargin" => (HRel::Page, None),
+        "rightMargin" => (HRel::Page, Some(pw - mr)),
+        _ => (HRel::Column, None),
+    };
+    let mut hpos = half(a.align.as_deref()).unwrap_or_else(|| Pos::Off(emu(a.off.unwrap_or(0)) + hbase.unwrap_or(0.0)));
+    let (mut vrel, vbase) = match a.rel_v.as_str() {
+        "page" | "topMargin" => (VRel::Page, None),
+        "margin" | "insideMargin" | "outsideMargin" => (VRel::Margin, None),
+        "bottomMargin" => (VRel::Page, Some(ph - mb)),
+        _ => (VRel::Paragraph, None),
+    };
+    let mut vpos = half(a.align_v.as_deref()).unwrap_or_else(|| Pos::Off(emu(a.off_v.unwrap_or(0)) + vbase.unwrap_or(0.0)));
+    if vrel == VRel::Paragraph && !matches!(vpos, Pos::Off(_)) {
+        vpos = Pos::Off(0.0);
     }
+    if let Some((x, y)) = a.simple {
+        (hrel, hpos, vrel, vpos) = (HRel::Page, Pos::Off(emu(x)), VRel::Page, Pos::Off(emu(y)));
+    }
+    let wrap = match a.wrap {
+        Some(w) => w,
+        None if a.behind => Wrap::Behind,
+        None => Wrap::Front,
+    };
+    Anchor { hrel, h: hpos, vrel, v: vpos, wrap, dist: [emu(a.dist[0]), emu(a.dist[3]), emu(a.dist[1]), emu(a.dist[2])] }
 }
 
 /// Lägger originalets XML i listan över okända objekt och ger dess nummer.
@@ -1582,12 +1716,80 @@ struct Drawing {
     extent: Option<(i64, i64)>,
     /// `wp:anchor` (inte `wp:inline`).
     anchored: bool,
-    /// `wrapSquare`, `wrapTight` eller `wrapThrough`: texten flyter runt bilden.
-    wraps: bool,
     pos: AnchorPos,
-    in_pos_h: bool,
+    /// Inuti `positionH` (1) eller `positionV` (2).
+    in_pos: u8,
     /// Vad nästa text är: 1 = `wp:align`, 2 = `wp:posOffset`.
     text_of: u8,
+    /// `a:srcRect` (vänster, ovan, höger, under; tusendels procent).
+    crop: Option<[i64; 4]>,
+    /// Läget kommer från en VML-form (`v:shape`).
+    vml: bool,
+}
+
+/// Läser storlek och läge ur `style` på en VML-form (`width:72pt;margin-left:10pt;position:absolute …`).
+fn vml_style(style: &str, d: &mut Drawing) {
+    let get = |k: &str| {
+        style.split(';').find_map(|kv| {
+            let (a, b) = kv.split_once(':')?;
+            (a.trim().eq_ignore_ascii_case(k)).then(|| b.trim().to_owned())
+        })
+    };
+    // Längd i EMU.
+    let emu = |v: &str| -> Option<i64> {
+        let v = v.trim().to_ascii_lowercase();
+        let (n, f) = if let Some(n) = v.strip_suffix("pt") {
+            (n, 12700.0)
+        } else if let Some(n) = v.strip_suffix("in") {
+            (n, 914_400.0)
+        } else if let Some(n) = v.strip_suffix("cm") {
+            (n, 360_000.0)
+        } else if let Some(n) = v.strip_suffix("mm") {
+            (n, 36_000.0)
+        } else if let Some(n) = v.strip_suffix("px") {
+            (n, 9525.0)
+        } else {
+            (v.as_str(), 9525.0)
+        };
+        n.trim().parse::<f64>().ok().filter(|x| x.is_finite() && x.abs() < 1.0e5).map(|x| (x * f) as i64)
+    };
+    let (w, h) = (get("width").and_then(|v| emu(&v)), get("height").and_then(|v| emu(&v)));
+    if let (Some(w), Some(h)) = (w, h) {
+        if w > 0 && h > 0 {
+            d.extent = Some((w, h));
+        }
+    }
+    d.vml = true;
+    if get("position").as_deref() == Some("absolute") {
+        d.anchored = true;
+        d.pos.off = get("margin-left").or_else(|| get("left")).and_then(|v| emu(&v)).or(Some(0));
+        d.pos.off_v = get("margin-top").or_else(|| get("top")).and_then(|v| emu(&v)).or(Some(0));
+        d.pos.rel = match get("mso-position-horizontal-relative").as_deref() {
+            Some("page") => "page",
+            Some("margin") => "margin",
+            _ => "column",
+        }
+        .to_owned();
+        d.pos.rel_v = match get("mso-position-vertical-relative").as_deref() {
+            Some("page") => "page",
+            Some("margin") => "margin",
+            _ => "paragraph",
+        }
+        .to_owned();
+        if let Some(a) = get("mso-position-horizontal") {
+            if matches!(a.as_str(), "left" | "center" | "right" | "inside" | "outside") {
+                d.pos.align = Some(a);
+            }
+        }
+        if let Some(a) = get("mso-position-vertical") {
+            if matches!(a.as_str(), "top" | "center" | "bottom" | "inside" | "outside") {
+                d.pos.align_v = Some(a);
+            }
+        }
+        d.pos.behind = get("z-index").and_then(|z| z.parse::<i64>().ok()).is_some_and(|z| z < 0);
+        d.pos.dist = [0, 0, 114_300, 114_300];
+        // Utan `w10:wrap` ligger formen framför texten.
+    }
 }
 
 fn escape_alt(s: &str) -> String {
@@ -1633,7 +1835,7 @@ fn run_span(
     }
     let eff = eff.over(direct);
     let mut reference = match para.map_or(ParaKind::Normal, |p| p.kind) {
-        ParaKind::Heading(_) | ParaKind::Quote => para_eff,
+        ParaKind::Heading(_) | ParaKind::Quote | ParaKind::Title | ParaKind::Subtitle => para_eff,
         _ => RProps { font: Some(base.font().to_owned()), size: Some(base.size()), ..Default::default() },
     };
     // Länkar har Words länkfärg; den ska inte bli en span.
@@ -1902,14 +2104,58 @@ fn parse_body(
                                 skip = 1;
                             }
                         }
-                        b"anchor" => d.anchored = true,
-                        b"wrapSquare" | b"wrapTight" | b"wrapThrough" => d.wraps = true,
+                        b"anchor" => {
+                            d.anchored = true;
+                            let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0).max(0);
+                            d.pos.dist = [n(b"distT"), n(b"distB"), n(b"distL"), n(b"distR")];
+                            d.pos.behind = matches!(attr(e, b"behindDoc").as_deref(), Some("1" | "true"));
+                            if matches!(attr(e, b"simplePos").as_deref(), Some("1" | "true")) {
+                                d.pos.simple = Some((0, 0));
+                            }
+                        }
+                        b"simplePos" if d.pos.simple.is_some() => {
+                            let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                            d.pos.simple = Some((n(b"x"), n(b"y")));
+                        }
+                        b"wrapSquare" | b"wrapTight" | b"wrapThrough" | b"wrapTopAndBottom" => {
+                            d.pos.wrap = Some(if name == b"wrapTopAndBottom" { Wrap::TopBottom } else { Wrap::Square });
+                            // Avstånd på wrap-taggen går före anchorns.
+                            for (i, k) in [&b"distT"[..], b"distB", b"distL", b"distR"].iter().enumerate() {
+                                if let Some(v) = attr(e, k).and_then(|v| v.parse::<i64>().ok()) {
+                                    d.pos.dist[i] = v.max(0);
+                                }
+                            }
+                        }
+                        // Äldre VML-bild (`v:shape` med `v:imagedata`): storlek och läge ur `style`.
+                        b"shape" if d.extent.is_none() => {
+                            if let Some(st) = attr(e, b"style") {
+                                vml_style(&st, d);
+                            }
+                        }
+                        b"wrap" if d.vml => {
+                            d.pos.wrap = match attr(e, b"type").as_deref() {
+                                Some("square" | "tight" | "through") => Some(Wrap::Square),
+                                Some("topAndBottom") => Some(Wrap::TopBottom),
+                                _ => None,
+                            };
+                        }
+                        b"srcRect" => {
+                            let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                            let c = [n(b"l"), n(b"t"), n(b"r"), n(b"b")];
+                            if d.crop.is_none() && c.iter().any(|v| *v != 0) {
+                                d.crop = Some(c);
+                            }
+                        }
                         b"positionH" => {
                             d.pos.rel = attr(e, b"relativeFrom").unwrap_or_default();
-                            d.in_pos_h = !empty;
+                            d.in_pos = if empty { 0 } else { 1 };
                         }
-                        b"align" if d.in_pos_h && !empty => d.text_of = 1,
-                        b"posOffset" if d.in_pos_h && !empty => d.text_of = 2,
+                        b"positionV" => {
+                            d.pos.rel_v = attr(e, b"relativeFrom").unwrap_or_default();
+                            d.in_pos = if empty { 0 } else { 2 };
+                        }
+                        b"align" if d.in_pos != 0 && !empty => d.text_of = 1,
+                        b"posOffset" if d.in_pos != 0 && !empty => d.text_of = 2,
                         _ => {}
                     }
                     continue;
@@ -2070,6 +2316,14 @@ fn parse_body(
                             skip = 1;
                         }
                     }
+                    b"p" if empty => {
+                        // `<w:p/>` på toppnivå: ett tomt stycke (utan egen stängningstagg).
+                        if tables.is_empty() && info.body_depth == Some(depth) {
+                            let mut p = Para::new();
+                            p.origin = info.elems.len().wrapping_sub(1);
+                            blocks.push(Block::Para(p));
+                        }
+                    }
                     b"p" => {
                         para = Some(Para::new());
                         para_marks.clear();
@@ -2143,6 +2397,16 @@ fn parse_body(
                         if s == "emphasis" || s.contains("betoning") {
                             fmt.italic = true;
                         }
+                        // Andra teckenmallar (Subtil betoning, Bokens titel, egna) med fet/kursiv.
+                        // (Inte i rubriker: deras teckenmallar är bara rubrikens eget utseende.)
+                        let in_head = para.as_ref().is_some_and(|p| matches!(p.kind, ParaKind::Heading(_) | ParaKind::Title | ParaKind::Subtitle));
+                        let rp = styles.rchain(attr(e, b"val").unwrap_or_default().as_str());
+                        if let (Some(b), false) = (rp.bold, in_head) {
+                            fmt.bold = b;
+                        }
+                        if let (Some(i), false) = (rp.italic, in_head) {
+                            fmt.italic = i;
+                        }
                     }
                     b"rFonts" if in_rpr => {
                         let f = attr(e, b"ascii").unwrap_or_default().to_lowercase();
@@ -2191,7 +2455,7 @@ fn parse_body(
                         if let Some(p) = para.take() {
                             blocks.push(Block::Para(p));
                         }
-                        tables.push(Tbl::default());
+                        tables.push(Tbl { start: before, ..Tbl::default() });
                     }
                     b"tr" if !empty => {
                         if let Some(t) = tables.last_mut() {
@@ -2241,7 +2505,7 @@ fn parse_body(
                 if let Some(d) = drawing.as_mut() {
                     d.depth -= 1;
                     match local(e.name().as_ref()) {
-                        b"positionH" => d.in_pos_h = false,
+                        b"positionH" | b"positionV" => d.in_pos = 0,
                         b"align" | b"posOffset" => d.text_of = 0,
                         _ => {}
                     }
@@ -2260,7 +2524,8 @@ fn parse_body(
                                 target: resolve_target(dir, &target),
                                 alt: alt.trim().to_owned(),
                                 extent: d.extent,
-                                anchor: (d.anchored && d.wraps).then_some(d.pos),
+                                anchor: d.anchored.then_some(d.pos),
+                                crop: d.crop,
                                 fallback: None,
                             });
                         }
@@ -2375,6 +2640,10 @@ fn parse_body(
                                 p.origin = info.elems.len().wrapping_sub(1);
                                 // Spaltbrytning före stycket (eller ensam), avsnittsrad efter det.
                                 let origin = p.origin;
+                                // Stycket som bär en avsnitts- eller spaltbrytning är ingen blankrad.
+                                if (para_sect.is_some() || para_col_break) && is_blank_para(&p) {
+                                    p.runs.push(Run { text: String::new(), fmt: Fmt::default(), link: None, raw: true });
+                                }
                                 if std::mem::take(&mut para_col_break) {
                                     blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
                                 }
@@ -2410,7 +2679,10 @@ fn parse_body(
                         }
                     }
                     b"tbl" => {
-                        if let Some(t) = tables.pop() {
+                        if let Some(mut t) = tables.pop() {
+                            if tables.is_empty() {
+                                t.read = crate::docx_tables::read(&xml[t.start..after], &styles.tables);
+                            }
                             if let Some(outer) = tables.last_mut() {
                                 // Nästlad tabell: platta till i den yttre cellen.
                                 let flat: Vec<String> = t.rows.iter().map(|r| r.iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" ")).collect();
@@ -2431,9 +2703,12 @@ fn parse_body(
             Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => {
                 if let Some(d) = drawing.as_mut().filter(|d| d.text_of != 0) {
                     let t = text_of(&ev);
-                    match d.text_of {
-                        1 => d.pos.align = Some(t.trim().to_ascii_lowercase()),
-                        _ => d.pos.off = t.trim().parse().ok(),
+                    let v = d.in_pos == 2;
+                    match (d.text_of, v) {
+                        (1, false) => d.pos.align = Some(t.trim().to_ascii_lowercase()),
+                        (1, true) => d.pos.align_v = Some(t.trim().to_ascii_lowercase()),
+                        (_, false) => d.pos.off = t.trim().parse().ok(),
+                        (_, true) => d.pos.off_v = t.trim().parse().ok(),
                     }
                 } else if skip == 0 && in_t && !hidden(&field_depth) {
                     let t = text_of(&ev).replace(['\n', '\r'], " ");
@@ -2563,6 +2838,32 @@ fn inline_md(run: &Run) -> String {
     parts.concat()
 }
 
+/// Styckeutseendet (ram, skuggning, avstånd, indrag) ur stycket, dess mall och docDefaults, för
+/// de stycken som kommer från ett toppnivåelement i brödtexten (`word::pbox`, markören `k:pp`).
+/// Ett tomt stycke (bara blanktecken, inga objekt): används som lodrätt avstånd i Word.
+fn is_blank_para(p: &Para) -> bool {
+    p.kind == ParaKind::Normal && p.list.is_none() && p.origin != usize::MAX && p.runs.iter().all(|r| !r.raw && r.link.is_none() && r.text.trim().is_empty())
+}
+
+fn fill_para_looks(blocks: &mut [Block], elems: &[String], ps: &crate::docx_para::ParaStyles) {
+    for b in blocks.iter_mut() {
+        let Block::Para(p) = b else { continue };
+        let Some(xml) = elems.get(p.origin).filter(|x| x.starts_with("<w:p>") || x.starts_with("<w:p ")) else { continue };
+        if p.runs.iter().any(|r| r.raw && r.text.starts_with("<!-- kladd:")) || matches!(p.kind, ParaKind::Code | ParaKind::Quote) || p.list.is_some() {
+            continue;
+        }
+        let direct = crate::docx_para::direct_ppr(xml);
+        let plain = p.kind == ParaKind::Normal;
+        // Rubriker, Titel och Underrubrik: deras mallar (med ram och skuggning) ligger redan i
+        // grundformatets formatmallar (`StyleSet`); bara stycket eget utseende blir en markör.
+        let eff = if plain { ps.resolve(p.style.as_deref(), &direct) } else { direct.clone().finish() };
+        p.ppr = crate::docx_para::for_marker(&eff, plain);
+        if is_blank_para(p) {
+            p.mark_sz = crate::docx_para::mark_size(xml);
+        }
+    }
+}
+
 fn para_md(p: &Para) -> String {
     let mut s: String = p.runs.iter().map(inline_md).collect();
     // Ta bort mellanslag i slutet av varje rad (de syns inte och blir "hårda radbrytningar").
@@ -2653,12 +2954,32 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
     let mut counters: HashMap<(String, usize), u64> = HashMap::new();
     // Justeringen hos den `<div>` som är öppen just nu (`Left` = ingen).
     let mut cur_align = Align::Left;
-    for b in blocks {
+    // Ett dokument som bara består av ett tomt stycke (som `write` själv lägger dit) ger ingen rad.
+    let only_blank = matches!(blocks, [Block::Para(p)] if is_blank_para(p) && para_md(p).trim().is_empty());
+    // Words obligatoriska tomma slutstycke efter en avslutande tabell (som `write` också lägger dit) ger ingen rad.
+    let after_table_end = matches!(blocks, [.., Block::Table(..), Block::Para(p)] if is_blank_para(p) && para_md(p).trim().is_empty());
+    let last_content = if only_blank {
+        0
+    } else if after_table_end {
+        blocks.len() - 1
+    } else {
+        blocks.len()
+    };
+    for (bi, b) in blocks.iter().enumerate() {
         match b {
             Block::Para(p) => {
-                let text = para_md(p);
-                if without_tokens(&text).trim().is_empty() {
+                let mut text = para_md(p);
+                // Tomt stycke: en egen rad `<!--k:ep-->` med stycketeckens storlek och avstånd.
+                let blank = is_blank_para(p) && text.trim().is_empty() && bi < last_content;
+                if blank {
+                    text = crate::word::pbox::empty_marker(&p.ppr, p.mark_sz);
+                } else if without_tokens(&text).trim().is_empty() {
                     continue;
+                }
+                // Ram, skuggning, avstånd och indrag: dold markör sist i stycket (spårade stycketecken
+                // `k:pm` ska stå sist, så de stycken får ingen).
+                if !blank && !p.ppr.is_empty() && !text.contains("<!--k:pm ") && !text.trim_start().starts_with("<!--") && !text.starts_with("&#8203;") && !text.trim_start().starts_with('\u{e000}') {
+                    text.push_str(&p.ppr.marker());
                 }
                 // Kodblock justeras inte; Kladds egna markörrader följer omgivningen.
                 let is_marker = matches!(p.runs.as_slice(), [r] if r.raw && r.text.starts_with("<!-- kladd:"));
@@ -2669,7 +2990,7 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 } else {
                     p.align
                 };
-                let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_));
+                let is_list = p.list.is_some() && !matches!(p.kind, ParaKind::Heading(_) | ParaKind::Title | ParaKind::Subtitle);
                 let same_list = match &p.list {
                     Some((num, 0)) => top_num.as_deref() == Some(num.as_str()),
                     Some(_) => true,
@@ -2722,6 +3043,13 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                         let kind = if ordered { 'o' } else { 'u' };
                         units.push(MdUnit { origin: p.origin, desc: format!("l{l}{kind}|{}", align.as_attr()), key: norm(&key) });
                     }
+                    (k @ (ParaKind::Title | ParaKind::Subtitle), _) => {
+                        let tk = if k == ParaKind::Title { TitleKind::Title } else { TitleKind::Subtitle };
+                        let one_line = text.replace('\n', " ");
+                        let h = format!("{} {} {}", "#".repeat(tk.level() as usize), one_line.trim(), tk.marker());
+                        units.push(MdUnit { origin: p.origin, desc: format!("{}|{}", tk.class(), align.as_attr()), key: norm(&h) });
+                        out.push_str(&h);
+                    }
                     (ParaKind::Quote, None) => {
                         let q: Vec<String> = text.lines().map(|l| format!("> {}", escape_line_start(l))).collect();
                         let q = q.join("\n");
@@ -2734,6 +3062,10 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                         let code = format!("{fence}\n{}\n{fence}", raw.trim_matches('\n'));
                         units.push(MdUnit { origin: p.origin, desc: format!("c|{}", align.as_attr()), key: norm(&code) });
                         out.push_str(&code);
+                    }
+                    (ParaKind::Normal, None) if blank => {
+                        units.push(MdUnit { origin: p.origin, desc: format!("e|{}", align.as_attr()), key: norm(&text) });
+                        out.push_str(&text);
                     }
                     (ParaKind::Normal, None) => {
                         let lines: Vec<String> = text.lines().map(escape_line_start).collect();
@@ -2748,7 +3080,8 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 top_num = None;
                 // Rubrikraden skrivs i fetstil av Kladd; visa den utan **.
                 let mut rows = tbl.rows.clone();
-                if rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
+                let (fmt, widths) = crate::docx_tables::prepare(&mut rows, &tbl.spans, tbl.read.as_ref(), &tbl.widths, text_w);
+                if tbl.read.is_none() && rows[0].iter().all(|c| c.is_empty() || (c.len() > 4 && c.starts_with("**") && c.ends_with("**"))) {
                     for c in rows[0].iter_mut() {
                         if c.len() > 4 {
                             *c = c[2..c.len() - 2].to_owned();
@@ -2761,10 +3094,13 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                 } else if !out.is_empty() {
                     out.push_str("\n\n");
                 }
+                // Tabellens format (skuggning, ramar …) i en dold kommentarsrad före tabellen.
+                if let Some(f) = &fmt {
+                    out.push_str(&f.to_comment());
+                    out.push_str("\n\n");
+                }
                 let start = out.len();
-                let narrow = text_w.is_some_and(|tw| tw > 0.0 && tbl.widths.iter().sum::<f64>() < tw * 0.9);
-                let widths: &[f64] = if narrow { &[] } else { &tbl.widths };
-                out.push_str(&markup::table_markdown(&rows, &tbl.spans, widths));
+                out.push_str(&markup::table_markdown(&rows, &tbl.spans, &widths));
                 units.push(MdUnit { origin: *origin, desc: "t|left".to_owned(), key: norm(&out[start..]) });
             }
         }
@@ -2876,6 +3212,8 @@ struct Writer<'a> {
     item_first_para: bool,
     quote: u32,
     heading: Option<u8>,
+    /// Titel/Underrubrik (`{.title}` / `{.subtitle}`): stycket får Wordstilen Title/Subtitle.
+    title: Option<TitleKind>,
     table: Option<TableState>,
     in_code_block: bool,
     /// Bild som håller på att läsas: (källa, alt-text).
@@ -2906,6 +3244,10 @@ struct Writer<'a> {
     pending_pm: Vec<(RevKind, u32)>,
     /// Var det öppna stycket börjar i `body`.
     para_at: usize,
+    /// Styckeutseende (`<!--k:pp …-->`) som väntar på styckets slut.
+    pending_pp: Option<crate::word::pbox::PPr>,
+    /// Tabellformatet (`<!-- kladd-tabell: … -->`) som väntar på tabellen efter det.
+    pending_tfmt: Option<crate::word::tablefmt::TableFmt>,
     /// Nästa `w:id` för en skriven ändring.
     rev_next: u32,
     /// Kommentarsområden som redan skrivits (ett område får bara finnas en gång).
@@ -2931,6 +3273,10 @@ struct TableState {
     cell: usize,
     /// Den här cellen är täckt av cellen före och skrivs inte.
     covered: bool,
+    /// Tabellens format, om den har något.
+    fmt: Option<crate::word::tablefmt::TableFmt>,
+    /// Justering för styckena i cellen som skrivs.
+    cell_jc: Option<&'static str>,
 }
 
 /// Platshållare i den skrivna texten för markör nummer N (byts mot originalets XML när
@@ -2951,11 +3297,14 @@ impl<'a> Writer<'a> {
             ordered_nums: Vec::new(),
             para_open: false,
             ppr: String::new(),
+            pending_pp: None,
             fmt: WFmt::default(),
             lists: Vec::new(),
             item_first_para: false,
             quote: 0,
             heading: None,
+            title: None,
+            pending_tfmt: None,
             table: None,
             in_code_block: false,
             image: None,
@@ -3029,7 +3378,7 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str, float: Option<Float>) {
+    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str, place: Option<(Option<Float>, Option<Anchor>)>, crop: Option<[f64; 4]>) {
         let Some(ext) = image_ext(&bytes) else { return };
         // Samma bild flera gånger bäddas bara in en gång; en bild som redan finns i
         // originalpaketet återanvänds.
@@ -3064,19 +3413,55 @@ impl<'a> Writer<'a> {
         const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
         // Gemensam del efter placeringen: storlek, beskrivning och själva bilden.
         let tail = format!(
-            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
+            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/>{{SRC_RECT}}<a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
         );
-        let drawing = match float {
-            // Flytande bild: förankrad vid stycket, vid vänster/höger textkant, text runt (12 px luft).
-            Some(side) => {
-                let (al, dist_l, dist_r) = match side {
-                    Float::Left => ("left", 0, 114300),
-                    Float::Right => ("right", 114300, 0),
+        let src_rect = crop
+            .map(|c| format!(r#"<a:srcRect l="{}" t="{}" r="{}" b="{}"/>"#, (c[0] * 1000.0).round() as i64, (c[1] * 1000.0).round() as i64, (c[2] * 1000.0).round() as i64, (c[3] * 1000.0).round() as i64))
+            .unwrap_or_default();
+        let tail = tail.replace("{SRC_RECT}", &src_rect);
+        // Dialektens ankare, eller kortformen `align` (vid vänster/höger textkant, 12 px luft).
+        let anchor = match place {
+            Some((_, Some(a))) => Some(a),
+            Some((Some(side), None)) => Some(Anchor {
+                h: if side == Float::Left { Pos::Start } else { Pos::End },
+                dist: if side == Float::Left { [0.0, 12.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0, 12.0] },
+                ..Anchor::default()
+            }),
+            _ => None,
+        };
+        let drawing = match anchor {
+            Some(a) => {
+                let emu = |v: f32| ((v as f64) * EMU_PER_PIXEL as f64).round() as i64;
+                let pos = |p: Pos, names: [&str; 3]| match p {
+                    Pos::Off(o) => format!("<wp:posOffset>{}</wp:posOffset>", emu(o)),
+                    Pos::Start => format!("<wp:align>{}</wp:align>", names[0]),
+                    Pos::Center => format!("<wp:align>{}</wp:align>", names[1]),
+                    Pos::End => format!("<wp:align>{}</wp:align>", names[2]),
                 };
+                let hrel = match a.hrel {
+                    HRel::Column => "column",
+                    HRel::Margin => "margin",
+                    HRel::Page => "page",
+                };
+                let vrel = match a.vrel {
+                    VRel::Paragraph => "paragraph",
+                    VRel::Margin => "margin",
+                    VRel::Page => "page",
+                };
+                let wrap = match a.wrap {
+                    Wrap::Square => r#"<wp:wrapSquare wrapText="bothSides"/>"#,
+                    Wrap::TopBottom => "<wp:wrapTopAndBottom/>",
+                    Wrap::Behind | Wrap::Front => "<wp:wrapNone/>",
+                };
+                let [dt, dr, db, dl] = a.dist.map(emu);
                 format!(
-                    r#"<wp:anchor xmlns:wp="{WP}" xmlns:r="{R_NS}" distT="0" distB="0" distL="{dist_l}" distR="{dist_r}" simplePos="0" relativeHeight="{}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>{al}</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>{}</wp:anchor>"#,
+                    r#"<wp:anchor xmlns:wp="{WP}" xmlns:r="{R_NS}" distT="{dt}" distB="{db}" distL="{dl}" distR="{dr}" simplePos="0" relativeHeight="{}" behindDoc="{}" locked="0" layoutInCell="1" allowOverlap="{}"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="{hrel}">{}</wp:positionH><wp:positionV relativeFrom="{vrel}">{}</wp:positionV>{}</wp:anchor>"#,
                     251_658_240 + doc_pr,
-                    tail.replace("{WRAP}", r#"<wp:wrapSquare wrapText="bothSides"/>"#)
+                    u8::from(a.wrap == Wrap::Behind),
+                    u8::from(!a.wrap.affects_text()),
+                    pos(a.h, ["left", "center", "right"]),
+                    pos(a.v, ["top", "center", "bottom"]),
+                    tail.replace("{WRAP}", wrap)
                 )
             }
             None => format!(
@@ -3089,7 +3474,12 @@ impl<'a> Writer<'a> {
 
     fn para_props(&self) -> String {
         let mut ppr = String::new();
-        if let Some(h) = self.heading {
+        if let Some(t) = self.title {
+            ppr.push_str(match t {
+                TitleKind::Title => "<w:pStyle w:val=\"Title\"/>",
+                TitleKind::Subtitle => "<w:pStyle w:val=\"Subtitle\"/>",
+            });
+        } else if let Some(h) = self.heading {
             ppr.push_str(&format!("<w:pStyle w:val=\"Heading{h}\"/>"));
         } else if self.in_code_block {
             ppr.push_str("<w:pStyle w:val=\"Code\"/>");
@@ -3100,6 +3490,9 @@ impl<'a> Writer<'a> {
         }
         if self.table.as_ref().is_some_and(|t| t.in_head) {
             ppr.push_str("<w:keepNext/>");
+        }
+        if let Some(j) = self.table.as_ref().and_then(|t| t.cell_jc) {
+            ppr.push_str(&format!("<w:jc w:val=\"{j}\"/>"));
         }
         if let Some(&(_, num)) = self.lists.last() {
             if self.heading.is_none() {
@@ -3137,11 +3530,13 @@ impl<'a> Writer<'a> {
 
     fn close_para(&mut self) {
         if self.para_open {
+            self.apply_para_look();
             self.apply_para_marks();
             self.body.push_str("</w:p>");
             self.para_open = false;
         }
         self.pending_pm.clear();
+        self.pending_pp = None;
         self.fchange_para = None;
     }
 
@@ -3154,6 +3549,23 @@ impl<'a> Writer<'a> {
         let date = if d.is_empty() { String::new() } else { format!(" w:date=\"{d}\"") };
         self.rev_next += 1;
         format!("w:id=\"{}\" w:author=\"{a}\"{date}", self.rev_next)
+    }
+
+    /// Ram, skuggning, avstånd och indrag ur markören `<!--k:pp …-->` skrivs in i styckets `w:pPr`
+    /// (i schemaordning). Orörda och omskrivna stycken får sin ursprungliga `w:pPr` tillbaka senare.
+    fn apply_para_look(&mut self) {
+        let Some(pp) = self.pending_pp.take() else { return };
+        let head = self.para_at;
+        if !self.body[head..].starts_with("<w:p>") {
+            return;
+        }
+        let old_len = if self.ppr.is_empty() { 0 } else { 7 + self.ppr.len() + 8 };
+        let merged = crate::docx_para::merge_ppr(&self.ppr, &pp);
+        if merged.is_empty() || !self.body.is_char_boundary(head + 5 + old_len) {
+            return;
+        }
+        self.body.replace_range(head + 5..head + 5 + old_len, &format!("<w:pPr>{merged}</w:pPr>"));
+        self.ppr = merged;
     }
 
     /// Spårade stycketecken (`w:rPr/w:ins|w:del`) och styckeformatering (`w:pPrChange`) läggs i styckets
@@ -3354,15 +3766,18 @@ impl<'a> Writer<'a> {
     }
 
     /// Bäddar in en bild från en `![](…)` eller `<img>`; saknas bilden stannar texten.
-    fn image_ref(&mut self, src: &str, alt: &str, size: (Option<f64>, Option<f64>), float: Option<Float>, resolve: &dyn Fn(&str) -> Option<Image>) {
+    fn image_ref(&mut self, tag: &ImgTag, resolve: &dyn Fn(&str) -> Option<Image>) {
+        let (src, alt) = (tag.src.as_str(), tag.alt.as_str());
         if self.in_footnote {
             self.run(alt, false);
             return;
         }
         match resolve(src) {
             Some(img) if is_supported_image(&img.bytes) => {
-                let extent = sized_extent(&img, size);
-                self.picture(img.bytes, extent, alt, float);
+                let extent = sized_extent(&img, (tag.width, tag.height), tag.crop);
+                // En bild i en tabellcell eller i en lista flyter inte.
+                let place = if self.table.is_some() { None } else { Some((tag.align, tag.anchor)) };
+                self.picture(img.bytes, extent, alt, place, tag.crop);
             }
             _ => {
                 self.missing.push(src.to_owned());
@@ -3441,6 +3856,9 @@ struct ImgTag {
     width: Option<f64>,
     height: Option<f64>,
     align: Option<Float>,
+    anchor: Option<Anchor>,
+    /// Beskärning i procent: vänster, ovan, höger, under.
+    crop: Option<[f64; 4]>,
 }
 
 fn parse_img(s: &str) -> Option<ImgTag> {
@@ -3454,6 +3872,7 @@ fn parse_img(s: &str) -> Option<ImgTag> {
     }
     let decode = |v: &str| v.replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
     let (mut src, mut alt, mut width, mut height, mut align) = (None, String::new(), None, None, None);
+    let mut extra: Vec<(String, String)> = Vec::new();
     let mut chars = inner.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
         if c.is_whitespace() {
@@ -3514,16 +3933,26 @@ fn parse_img(s: &str) -> Option<ImgTag> {
                     _ => None,
                 }
             }
-            _ => {}
+            _ => extra.push((name, value.clone())),
         }
     }
-    Some(ImgTag { src: src.filter(|s| !s.is_empty())?, alt, width, height, align })
+    let anchor = Anchor::from_attrs(&|k| extra.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()));
+    let crop = extra.iter().find(|(n, _)| n == "crop").and_then(|(_, v)| {
+        let n: Vec<f64> = v.split_whitespace().filter_map(|s| s.parse::<f64>().ok()).filter(|x| x.is_finite() && (0.0..100.0).contains(x)).collect();
+        (n.len() == 4 && n[0] + n[2] < 100.0 && n[1] + n[3] < 100.0 && n.iter().any(|x| *x > 0.0)).then(|| [n[0], n[1], n[2], n[3]])
+    });
+    Some(ImgTag { src: src.filter(|s| !s.is_empty())?, alt, width, height, align, anchor, crop })
 }
 
 /// Bildens storlek i EMU när taggen anger bredd och/eller höjd i CSS-pixlar (bevarar proportionerna).
-fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>)) -> Option<(i64, i64)> {
+fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>), crop: Option<[f64; 4]>) -> Option<(i64, i64)> {
     let px = EMU_PER_PIXEL as f64;
     let natural = imagesize::blob_size(&img.bytes).ok().map(|s| (s.width as f64, s.height as f64)).or(img.extent.map(|(x, y)| (x as f64, y as f64)));
+    // Den synliga delen av en beskuren bild bestämmer proportionerna och grundstorleken.
+    let natural = natural.map(|(w, h)| match crop {
+        Some(c) => (w * (1.0 - (c[0] + c[2]) / 100.0), h * (1.0 - (c[1] + c[3]) / 100.0)),
+        None => (w, h),
+    });
     match (size, natural) {
         ((None, None), _) => img.extent,
         ((Some(w), Some(h)), _) => Some(((w * px) as i64, (h * px) as i64)),
@@ -3553,6 +3982,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(titles::OPTS);
     let mut next_num: u32 = base + 1; // base = punktlistor
     // Enheter (stycke, listpunkt, tabell …) i brödtexten, för att kunna bytas mot originalet.
     let mut cur: Option<OpenUnit> = None;
@@ -3569,8 +3999,12 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 {
                     w.close_para();
                     let kind = match tag {
+                        Tag::HtmlBlock if crate::word::pbox::parse_empty(md.get(range.clone()).unwrap_or("").trim()).is_some() => "e".to_owned(),
                         Tag::Paragraph | Tag::HtmlBlock => "p".to_owned(),
-                        Tag::Heading { level, .. } => format!("h{}", heading_num(*level)),
+                        Tag::Heading { level, classes, .. } => match titles::kind(classes) {
+                            Some(k) => k.class().to_owned(),
+                            None => format!("h{}", heading_num(*level)),
+                        },
                         Tag::CodeBlock(_) => "c".to_owned(),
                         Tag::Table(_) => "t".to_owned(),
                         _ => "q".to_owned(),
@@ -3632,8 +4066,9 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     w.close_para();
                     w.open_para();
                 }
-                Tag::Heading { level, .. } => {
+                Tag::Heading { level, classes, .. } => {
                     w.close_para();
+                    w.title = titles::kind(&classes);
                     w.heading = Some(heading_num(level));
                     w.open_para();
                 }
@@ -3666,7 +4101,13 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     let src = markup::table_src(md.get(range.clone()).unwrap_or(""));
                     let cols = aligns.len().max(1);
                     // Textytans bredd i tjugondels punkter (A4 med tums marginaler: 9026).
-                    let total = if w.ctx.max_width > 0 { (w.ctx.max_width / 635) as u32 } else { 9026 };
+                    let text_total = if w.ctx.max_width > 0 { (w.ctx.max_width / 635) as u32 } else { 9026 };
+                    let tfmt = w.pending_tfmt.take();
+                    let total = match tfmt.as_ref().map(|f| f.width) {
+                        Some(crate::word::tablefmt::Width::Pct(p)) => (f64::from(text_total) * f64::from(p) / 100.0).round() as u32,
+                        Some(crate::word::tablefmt::Width::Pt(p)) => u32::from(p) * 20,
+                        _ => text_total,
+                    };
                     // Kolumnbredd efter antalet streck i avgränsarraden, annars lika breda.
                     let widths: Vec<u32> = match src.weights.as_ref().filter(|ws| ws.len() == cols) {
                         Some(ws) => {
@@ -3675,14 +4116,20 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         }
                         None => vec![total / cols as u32; cols],
                     };
-                    w.body.push_str(
-                        "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
-                    );
+                    match &tfmt {
+                        Some(f) => w.body.push_str(&format!(
+                            "<w:tbl><w:tblPr>{}<w:tblLook w:val=\"04A0\" w:firstRow=\"0\" w:lastRow=\"0\" w:firstColumn=\"0\" w:lastColumn=\"0\" w:noHBand=\"1\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
+                            crate::docx_tables::tbl_pr_xml(f)
+                        )),
+                        None => w.body.push_str(
+                            "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
+                        ),
+                    }
                     for cw in &widths {
                         w.body.push_str(&format!("<w:gridCol w:w=\"{cw}\"/>"));
                     }
                     w.body.push_str("</w:tblGrid>");
-                    w.table = Some(TableState { in_head: false, widths, spans: src.spans, rows: 0, cell: 0, covered: false });
+                    w.table = Some(TableState { in_head: false, widths, spans: src.spans, rows: 0, cell: 0, covered: false, fmt: tfmt, cell_jc: None });
                 }
                 Tag::TableHead => {
                     if let Some(t) = w.table.as_mut() {
@@ -3690,14 +4137,26 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         t.rows += 1;
                         t.cell = 0;
                     }
-                    w.body.push_str("<w:tr><w:trPr><w:tblHeader/></w:trPr>");
+                    let pr = match w.table.as_ref().and_then(|t| t.fmt.as_ref()) {
+                        Some(f) => crate::docx_tables::tr_pr_xml(f, 0, true),
+                        None => "<w:tblHeader/>".to_owned(),
+                    };
+                    w.body.push_str(&format!("<w:tr><w:trPr>{pr}</w:trPr>"));
                 }
                 Tag::TableRow => {
                     if let Some(t) = w.table.as_mut() {
                         t.rows += 1;
                         t.cell = 0;
                     }
-                    w.body.push_str("<w:tr>");
+                    let pr = match w.table.as_ref() {
+                        Some(t) => t.fmt.as_ref().map(|f| crate::docx_tables::tr_pr_xml(f, t.rows - 1, false)).unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    if pr.is_empty() {
+                        w.body.push_str("<w:tr>");
+                    } else {
+                        w.body.push_str(&format!("<w:tr><w:trPr>{pr}</w:trPr>"));
+                    }
                 }
                 Tag::TableCell => {
                     let (span, width) = match w.table.as_mut() {
@@ -3712,7 +4171,22 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     // En täckt cell skrivs inte: den före den spänner över den (`w:gridSpan`).
                     if span > 0 {
                         let grid = if span > 1 { format!("<w:gridSpan w:val=\"{span}\"/>") } else { String::new() };
-                        w.body.push_str(&format!("<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>{grid}</w:tcPr>"));
+                        let extra = match w.table.as_ref() {
+                            Some(t) => t.fmt.as_ref().map(|f| crate::docx_tables::tc_pr_xml(f, t.rows.saturating_sub(1), t.cell)).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        let jc = w.table.as_ref().and_then(|t| {
+                            let f = t.fmt.as_ref()?;
+                            match f.cell(t.rows.saturating_sub(1), t.cell)?.halign {
+                                crate::word::tablefmt::TAlign::Left => None,
+                                crate::word::tablefmt::TAlign::Center => Some("center"),
+                                crate::word::tablefmt::TAlign::Right => Some("right"),
+                            }
+                        });
+                        if let Some(t) = w.table.as_mut() {
+                            t.cell_jc = jc;
+                        }
+                        w.body.push_str(&format!("<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>{grid}{extra}</w:tcPr>"));
                         w.open_para();
                     }
                 }
@@ -3743,6 +4217,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 TagEnd::Heading(_) => {
                     w.close_para();
                     w.heading = None;
+                    w.title = None;
                 }
                 TagEnd::BlockQuote(_) => {
                     w.close_para();
@@ -3798,7 +4273,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 TagEnd::Link => w.fmt.link = None,
                 TagEnd::Image => {
                     if let Some((src, alt)) = w.image.take() {
-                        w.image_ref(&src, &alt, (None, None), None, resolve);
+                        w.image_ref(&ImgTag { src, alt, width: None, height: None, align: None, anchor: None, crop: None }, resolve);
                     }
                 }
                 _ => {}
@@ -3829,12 +4304,31 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 let s = t.to_string();
                 let single_line = s.trim().lines().count() == 1;
-                if let Some(ns) = parse_tokens(&s) {
+                if crate::word::tablefmt::is_comment(s.trim()) && w.table.is_none() {
+                    // Tabellens format: gäller tabellen som följer.
+                    w.pending_tfmt = crate::word::tablefmt::TableFmt::from_comment(s.trim());
+                } else if let Some(ns) = parse_tokens(&s) {
                     for n in ns {
                         w.token(n);
                     }
                 } else if let Some((start, id)) = review::parse_marker(s.trim()) {
                     w.comment_marker(start, id);
+                } else if let (Some((pp, sz)), true) = (crate::word::pbox::parse_empty(s.trim()), w.table.is_none() && w.quote == 0) {
+                    // Tomt stycke med stycketecknets storlek och avstånd.
+                    w.close_para();
+                    let mut inner = w.para_props();
+                    if let Some(sz) = sz {
+                        let half = (sz * 2.0).round() as i64;
+                        inner.push_str(&format!("<w:rPr><w:sz w:val=\"{half}\"/><w:szCs w:val=\"{half}\"/></w:rPr>"));
+                    }
+                    let inner = crate::docx_para::merge_ppr(&inner, &pp);
+                    if inner.is_empty() {
+                        w.body.push_str("<w:p/>");
+                    } else {
+                        w.body.push_str(&format!("<w:p><w:pPr>{inner}</w:pPr></w:p>"));
+                    }
+                } else if let Some(pp) = crate::word::pbox::PPr::parse_marker(s.trim()) {
+                    w.pending_pp = Some(pp);
                 } else if let Some((kind, id)) = review::parse_pmark_exact(s.trim()) {
                     if kind == RevKind::Fmt {
                         w.fchange_para = Some(id);
@@ -3854,7 +4348,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         w.rev = None;
                     }
                 } else if let Some(img) = parse_img(&s) {
-                    w.image_ref(&img.src, &img.alt, (img.width, img.height), img.align, resolve);
+                    w.image_ref(&img, resolve);
                 } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.toc(md);
@@ -3927,7 +4421,8 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                             || (key.to_ascii_lowercase().starts_with("<img") && !key.contains('\n'))
                             || key == crate::word::nav::TOC_LINE
                             || sections::SectionProps::from_comment(&key).is_some()
-                            || sections::is_column_break(&key);
+                            || sections::is_column_break(&key)
+                            || crate::word::pbox::parse_empty(&key).is_some();
                         if ok && !key.is_empty() {
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
                         }
@@ -4020,6 +4515,8 @@ fn kladd_styles() -> String {
     for (n, size, color) in heads {
         s.push_str(&heading_style(n, size, color));
     }
+    // Word-lika Title och Subtitle (Calibri Light 28 pt respektive 14 pt).
+    s.push_str(r#"<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="10"/><w:qFormat/><w:pPr><w:spacing w:after="120" w:line="240" w:lineRule="auto"/><w:contextualSpacing/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="1F3864"/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="11"/><w:qFormat/><w:pPr><w:spacing w:after="160"/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="595959"/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr></w:style>"#);
     s.push_str(r#"<w:style w:type="paragraph" w:styleId="TOCHeading"><w:name w:val="TOC Heading"/><w:basedOn w:val="Heading1"/><w:next w:val="Normal"/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:qFormat/><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:style>"#);
     for (n, ind) in [(1, 0), (2, 220), (3, 440)] {
         s.push_str(&format!(
@@ -5522,6 +6019,13 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
             let missing: String = split_styles(&kladd_styles())
                 .into_iter()
                 .filter(|(id, _)| !xml.contains(&format!("w:styleId=\"{id}\"")))
+                // Titel och Underrubrik läggs bara till när de används och dokumentet saknar en mall med namnet.
+                .filter(|(id, _)| match id.as_str() {
+                    "Title" | "Subtitle" => {
+                        w.body.contains(&format!("<w:pStyle w:val=\"{id}\"/>")) && !xml.to_lowercase().contains(&format!("<w:name w:val=\"{}\"/>", id.to_lowercase()))
+                    }
+                    _ => true,
+                })
                 .map(|(_, x)| x)
                 .collect();
             let mut patched = if missing.is_empty() { xml.clone() } else { insert_before(&xml, "</w:styles>", &missing) };
@@ -5993,7 +6497,7 @@ Sist vänster.
             format!("{}{}{}", &x[..start], body, &x[end..])
         });
         let back = read(&bytes).unwrap();
-        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt; h1: \"Georgia\" 20pt #2F5496 -->
+        let expected = "<!-- kladd: font-family: Cambria; font-size: 12pt; h1: \"Georgia\" 20pt nobold #2F5496 -->
 
 # Titel
 
@@ -6003,13 +6507,13 @@ vanlig <span style=\"font-size: 14pt; color: #C00000; background-color: #FFFF00\
 
 <div align=\"center\">
 
-Mitt
+Mitt<!--k:pp shd=\"EEEEEE\"-->
 
-<span style=\"font-family: Verdana; color: #0000FF\">Blå mitt</span>
+<span style=\"font-family: Verdana; color: #0000FF\">Blå mitt</span><!--k:pp shd=\"EEEEEE\"-->
 
 </div>
 
-Vänster
+Vänster<!--k:pp shd=\"EEEEEE\"-->
 
 <div align=\"right\">
 
@@ -6479,7 +6983,7 @@ Marginal
         let back = read(&out.bytes).unwrap();
         let name = &back.images[0].0;
         let want = format!(
-            "<img src=\"bild:{name}\" alt=\"Sol &amp; måne\" width=\"240\">\n\nText med <img src=\"bild:{name}\" alt=\"\" width=\"100\"> inne.\n\n<img src=\"bild:{name}\" alt=\"Ren\" width=\"1\">\n"
+            "<img src=\"bild:{name}\" alt=\"Sol &amp; måne\" width=\"240\">\n\nText med <img src=\"bild:{name}\" alt=\"\" width=\"100\" height=\"50\"> inne.\n\n<img src=\"bild:{name}\" alt=\"Ren\" width=\"1\">\n"
         );
         assert_eq!(back.markdown, want);
         // Och tillbaka igen, nu med Source, med bilderna från dokumentet.
@@ -6535,39 +7039,104 @@ Marginal
         let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
         let md = "<img src=\"bild:a.png\" alt=\"\" width=\"200\" align=\"left\">\n";
         let w = write(md, "x", &resolve, None).unwrap().bytes;
-        // Byter `from` mot `to` i document.xml och ger sidan bilden får vid inläsning.
+        // Byter `from` mot `to` i document.xml och ger bildtaggens attribut vid inläsning.
         let read_with = |from: &str, to: &str| {
             let b = patch_document(&w, |x| x.replace(from, to));
             let m = read(&b).unwrap().markdown;
-            if m.contains("align=\"left\"") {
-                "left"
-            } else if m.contains("align=\"right\"") {
-                "right"
-            } else {
-                "none"
-            }
+            let t = m.split("<img ").nth(1).and_then(|t| t.split('>').next()).unwrap_or("").to_owned();
+            t.split("alt=\"\" ").nth(1).unwrap_or("").to_owned()
         };
         let al = |a: &str| read_with("<wp:align>left</wp:align>", &format!("<wp:align>{a}</wp:align>"));
-        assert_eq!(al("left"), "left");
-        assert_eq!(al("right"), "right");
-        assert_eq!(al("center"), "none");
-        // wrapTight och wrapThrough flyter också; wrapTopAndBottom och wrapNone gör det inte.
+        assert_eq!(al("left"), "width=\"200\" align=\"left\"");
+        // (Avståndet 12 px ligger på höger sida i den skrivna bilden, så detta är inte "align".)
+        assert_eq!(al("right"), "width=\"200\" x=\"right\" y=\"0\" dist=\"0 12 0 0\"");
+        assert_eq!(al("center"), "width=\"200\" x=\"center\" y=\"0\" dist=\"0 12 0 0\"");
+        // wrapTight och wrapThrough flyter också; wrapTopAndBottom och wrapNone får egna lägen.
         let sq = r#"<wp:wrapSquare wrapText="bothSides"/>"#;
         let poly = r#"<wp:wrapPolygon edited="0"><wp:start x="0" y="0"/></wp:wrapPolygon>"#;
-        assert_eq!(read_with(sq, &format!(r#"<wp:wrapTight wrapText="bothSides">{poly}</wp:wrapTight>"#)), "left");
-        assert_eq!(read_with(sq, &format!(r#"<wp:wrapThrough wrapText="bothSides">{poly}</wp:wrapThrough>"#)), "left");
-        assert_eq!(read_with(sq, "<wp:wrapTopAndBottom/>"), "none");
-        assert_eq!(read_with(sq, "<wp:wrapNone/>"), "none");
-        // Förskjutning nära vänster/höger marginal i stället för align (A4: textbredd 5731510 EMU).
+        assert_eq!(read_with(sq, &format!(r#"<wp:wrapTight wrapText="bothSides">{poly}</wp:wrapTight>"#)), "width=\"200\" align=\"left\"");
+        assert_eq!(read_with(sq, &format!(r#"<wp:wrapThrough wrapText="bothSides">{poly}</wp:wrapThrough>"#)), "width=\"200\" align=\"left\"");
+        assert_eq!(read_with(sq, "<wp:wrapTopAndBottom/>"), "width=\"200\" x=\"left\" y=\"0\" wrap=\"top\" dist=\"0 12 0 0\"");
+        assert_eq!(read_with(sq, "<wp:wrapNone/>"), "width=\"200\" x=\"left\" y=\"0\" wrap=\"front\" dist=\"0 12 0 0\"");
+        let behind = patch_document(&w, |x| x.replace(sq, "<wp:wrapNone/>").replace("behindDoc=\"0\"", "behindDoc=\"1\""));
+        assert!(read(&behind).unwrap().markdown.contains("wrap=\"behind\""));
+        // Förskjutning i stället för align, med referens.
         let h = r#"<wp:positionH relativeFrom="column"><wp:align>left</wp:align></wp:positionH>"#;
         let off = |rel: &str, o: i64| read_with(h, &format!(r#"<wp:positionH relativeFrom="{rel}"><wp:posOffset>{o}</wp:posOffset></wp:positionH>"#));
-        assert_eq!(off("column", 0), "left");
-        assert_eq!(off("column", 3_800_000), "right");
-        assert_eq!(off("column", 2_000_000), "none");
-        assert_eq!(off("page", 720_000), "left");
+        assert_eq!(off("column", 0), "width=\"200\" x=\"0\" y=\"0\" dist=\"0 12 0 0\"");
+        assert_eq!(off("column", 1_905_000), "width=\"200\" x=\"200\" y=\"0\" dist=\"0 12 0 0\"");
+        assert_eq!(off("page", 720_000), "width=\"200\" hrel=\"page\" x=\"75.6\" y=\"0\" dist=\"0 12 0 0\"");
+        // Lodrät placering mot sidan, avstånd och beskärning.
+        let v = r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#;
+        assert_eq!(
+            read_with(v, r#"<wp:positionV relativeFrom="page"><wp:align>bottom</wp:align></wp:positionV>"#),
+            "width=\"200\" x=\"left\" vrel=\"page\" y=\"bottom\" dist=\"0 12 0 0\""
+        );
+        assert_eq!(read_with("distT=\"0\" distB=\"0\"", "distT=\"95250\" distB=\"190500\""), "width=\"200\" x=\"left\" y=\"0\" dist=\"10 12 20 0\"");
+        let cropped = read_with("<a:stretch>", "<a:srcRect l=\"10000\" t=\"0\" r=\"5500\" b=\"0\"/><a:stretch>");
+        assert_eq!(cropped, "width=\"200\" height=\"200\" align=\"left\" crop=\"10 0 5.5 0\"");
         // Inline-bilder blir aldrig flytande.
         let inl = w_inline();
         assert!(!read(&inl).unwrap().markdown.contains("align="));
+    }
+
+    #[test]
+    fn anchored_image_roundtrip() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let md = concat!(
+            "<img src=\"bild:a.png\" alt=\"A\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\" dist=\"0 6 0 6\"> Text\n\n",
+            "<img src=\"bild:a.png\" alt=\"\" width=\"100\" height=\"60\" x=\"center\" y=\"12\" wrap=\"top\" crop=\"10 0 5.5 0\">\n\n",
+            "<img src=\"bild:a.png\" alt=\"\" width=\"50\" hrel=\"margin\" x=\"right\" vrel=\"margin\" y=\"20\" dist=\"3 4 5 6\">\n\nSlut\n"
+        );
+        let out = write(md, "x", &resolve, None).unwrap();
+        let doc = part_text(&out.bytes, "word/document.xml");
+        assert_eq!(doc.matches("<wp:anchor ").count(), 3, "{doc}");
+        assert!(doc.contains(r#"behindDoc="1""#) && doc.contains("<wp:wrapNone/>") && doc.contains("<wp:wrapTopAndBottom/>"));
+        assert!(doc.contains(r#"<wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset></wp:positionH><wp:positionV relativeFrom="page"><wp:align>bottom</wp:align></wp:positionV>"#), "{doc}");
+        assert!(doc.contains(r#"<wp:positionH relativeFrom="column"><wp:align>center</wp:align></wp:positionH>"#));
+        assert!(doc.contains(r#"<a:srcRect l="10000" t="0" r="5500" b="0"/>"#));
+        assert!(doc.contains(r#"distT="28575" distB="47625" distL="57150" distR="38100""#), "{doc}");
+        // Tillbaka: samma dialekt.
+        let back = read(&out.bytes).unwrap();
+        let name = &back.images[0].0;
+        assert_eq!(back.markdown, md.replace("bild:a.png", &format!("bild:{name}")), "{}", back.markdown);
+        // Och igen med Source: oförändrat.
+        let imgs = back.images.clone();
+        let again = write(&back.markdown, "x", &move |s| imgs.iter().find(|(n, _)| Some(n.as_str()) == s.strip_prefix(IMAGE_SCHEME)).map(|(_, i)| i.clone()), back.source.as_ref()).unwrap();
+        assert_eq!(read(&again.bytes).unwrap().markdown, back.markdown);
+    }
+
+    #[test]
+    fn anchored_image_in_table_cell_is_inline() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let w = write("<img src=\"bild:a.png\" alt=\"\" width=\"60\" align=\"left\">\n", "x", &resolve, None).unwrap().bytes;
+        // Flytta in anchor-elementet i en tabellcell.
+        let b = patch_document(&w, |x| {
+            let i = x.find("<w:p>").unwrap();
+            let j = x.find("</w:p>").unwrap() + 6;
+            let p = x[i..j].to_owned();
+            let tbl = format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"4000\"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w=\"4000\" w:type=\"dxa\"/></w:tcPr>{p}</w:tc></w:tr></w:tbl><w:p/>");
+            format!("{}{}{}", &x[..i], tbl, &x[j..])
+        });
+        let m = read(&b).unwrap().markdown;
+        assert!(m.contains("<img") && !m.contains("align=") && !m.contains(" x="), "{m}");
+    }
+
+    #[test]
+    fn vml_picture_position_is_read() {
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let w = write("<img src=\"bild:a.png\" alt=\"\" width=\"60\" align=\"left\">\n", "x", &resolve, None).unwrap().bytes;
+        let b = patch_document(&w, |x| {
+            let id = x.split("r:embed=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_owned();
+            let i = x.find("<w:drawing>").unwrap();
+            let j = x.find("</w:drawing>").unwrap() + "</w:drawing>".len();
+            let pict = format!(
+                "<w:pict><v:shape id=\"s1\" type=\"#_x0000_t75\" style=\"position:absolute;margin-left:72pt;margin-top:36pt;width:144pt;height:72pt;z-index:-1;mso-position-horizontal-relative:page;mso-position-vertical-relative:page\"><v:imagedata r:id=\"{id}\"/><w10:wrap type=\"square\"/></v:shape></w:pict>"
+            );
+            format!("{}{}{}", &x[..i], pict, &x[j..])
+        });
+        let m = read(&b).unwrap().markdown;
+        assert!(m.contains("width=\"192\" height=\"96\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"48\">"), "{m}");
     }
 
     fn w_inline() -> Vec<u8> {
@@ -6730,6 +7299,9 @@ Marginal
         });
         let back = read(&patched).unwrap();
         let md = back.markdown.trim_end();
+        // Tabellformatet (här: inga ramar, ingen automatisk fetstil) står i en dold rad före tabellen.
+        let (meta, md) = md.split_once("\n\n").expect("formatrad");
+        assert!(meta.starts_with("<!-- kladd-tabell:") && meta.contains("header off"), "{meta}");
         let ts = markup::table_src(md);
         assert_eq!(ts.spans, vec![vec![2, 0, 1], vec![1, 1, 1], vec![1, 1, 1]], "{md}");
         // 2000:6000:2000 av 40 streck = 8:24:8.
@@ -6753,6 +7325,127 @@ Marginal
         });
         let md = read(&patched).unwrap().markdown;
         assert!(md.contains("| --- | --- |"), "{md}");
+    }
+
+    // ------------------------------------------------------------ tabellformat (Word-struktur, påhittad text)
+
+    const W_BOX: &str = "<w:tbl><w:tblPr><w:tblW w:type=\"pct\" w:w=\"100%\"/><w:tblBorders><w:top w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:left w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:right w:val=\"single\" w:color=\"5B3E96\" w:sz=\"4\"/><w:insideH w:val=\"none\"/><w:insideV w:val=\"none\"/></w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:type=\"pct\" w:w=\"100%\"/><w:shd w:fill=\"EFEAF7\" w:val=\"clear\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"150\"/><w:left w:type=\"dxa\" w:w=\"200\"/><w:bottom w:type=\"dxa\" w:w=\"150\"/><w:right w:type=\"dxa\" w:w=\"200\"/></w:tcMar></w:tcPr><w:p><w:r><w:rPr><w:b/><w:color w:val=\"5B3E96\"/></w:rPr><w:t>Rubrik i rutan</w:t></w:r></w:p><w:p><w:r><w:t>Första raden</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>Efter radbrytning</w:t></w:r></w:p><w:p><w:r><w:t>Sista stycket</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+
+    const W_DATA: &str = "<w:tbl><w:tblPr><w:tblW w:type=\"pct\" w:w=\"100%\"/><w:tblBorders><w:top w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:left w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:right w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:insideH w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/><w:insideV w:val=\"single\" w:color=\"999999\" w:sz=\"4\"/></w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w=\"2200\"/><w:gridCol w:w=\"5700\"/></w:tblGrid>\
+<w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"2200\"/><w:shd w:fill=\"2E5395\" w:val=\"clear\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val=\"FFFFFF\"/></w:rPr><w:t>Namn</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"5700\"/><w:shd w:fill=\"2E5395\" w:val=\"clear\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val=\"FFFFFF\"/></w:rPr><w:t>Beskrivning</w:t></w:r></w:p></w:tc></w:tr>\
+<w:tr><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"2200\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:r><w:t>alfa</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"5700\"/><w:tcMar><w:top w:type=\"dxa\" w:w=\"100\"/><w:left w:type=\"dxa\" w:w=\"100\"/><w:bottom w:type=\"dxa\" w:w=\"100\"/><w:right w:type=\"dxa\" w:w=\"100\"/></w:tcMar></w:tcPr><w:p><w:r><w:t>Första cellen med en lång text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+
+    fn with_tables(tables: &[&str]) -> (Vec<u8>, Loaded) {
+        let w = write("x\n", "x", &|_| None, None).unwrap();
+        let all: String = tables.iter().map(|t| format!("{t}<w:p><w:r><w:t>mellan</w:t></w:r></w:p>")).collect();
+        let patched = patch_document(&w.bytes, |x| {
+            let start = x.find("<w:p>").unwrap();
+            let end = x.rfind("</w:p>").unwrap() + "</w:p>".len();
+            format!("{}{all}{}", &x[..start], &x[end..])
+        });
+        let l = read(&patched).unwrap();
+        (patched, l)
+    }
+
+    fn document_xml(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn word_box_is_a_shaded_single_cell_table_with_line_breaks() {
+        let (_, l) = with_tables(&[W_BOX]);
+        let md = &l.markdown;
+        let meta = md.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).expect(md);
+        let f = crate::word::tablefmt::TableFmt::from_comment(meta).unwrap();
+        assert_eq!(f.fill(0, 0), Some([0xEF, 0xEA, 0xF7]), "{meta}");
+        assert!(!f.header_bold, "{meta}");
+        assert_eq!(f.width, crate::word::tablefmt::Width::Pct(100));
+        assert_eq!(f.borders[0].color, Some([0x5B, 0x3E, 0x96]));
+        assert!(!f.borders[4].visible() && !f.borders[5].visible());
+        assert!((f.pad[0] - 10.0).abs() < 0.01 && (f.pad[2] - 7.5).abs() < 0.01, "{:?}", f.pad);
+        // Stycken och radbrytning blir <br> i cellen; ingen fetstil på allt.
+        assert!(md.contains("Första raden<br>Efter radbrytning<br>Sista stycket"), "{md}");
+        assert!(md.contains("**Rubrik i rutan**"), "{md}");
+        assert!(!md.contains("**Första"), "{md}");
+    }
+
+    #[test]
+    fn word_table_header_shading_widths_and_alignment() {
+        let (_, l) = with_tables(&[W_DATA]);
+        let md = &l.markdown;
+        let meta = md.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).expect(md);
+        let f = crate::word::tablefmt::TableFmt::from_comment(meta).unwrap();
+        assert_eq!(f.fill(0, 0), Some([0x2E, 0x53, 0x95]));
+        assert_eq!(f.fill(0, 1), Some([0x2E, 0x53, 0x95]));
+        assert_eq!(f.fill(1, 0), None);
+        assert_eq!(f.cell(0, 0).unwrap().halign, crate::word::tablefmt::TAlign::Center);
+        assert_eq!(f.cells.get(&(1, 0)), None);
+        // Rubrikraden är helt fet och vit: fet via Kladd, färgen som span.
+        assert!(f.header_bold && md.contains("color: #FFFFFF"), "{md}");
+        assert!(!md.contains("**Namn"), "{md}");
+        // Kolumnbredderna 2200:5700 (11:28,5 streck) och tabellen i full bredd.
+        let table = md.split("\n\n").find(|b| b.starts_with("| ")).unwrap();
+        let w = markup::table_src(table).weights.unwrap();
+        assert!((w[0] * 5).abs_diff(w[1] * 2) <= 6, "{w:?}");
+        // Cellmarginaler 100 twips = 5 pt på alla sidor.
+        assert!((f.pad[2] - 5.0).abs() < 0.01 && (f.pad[0] - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn untouched_word_tables_are_written_back_byte_for_byte() {
+        let (bytes, l) = with_tables(&[W_BOX, W_DATA]);
+        let w = write(&l.markdown, "x", &|_| None, l.source.as_ref()).unwrap();
+        let (a, b) = (document_xml(&bytes), document_xml(&w.bytes));
+        assert!(b.contains(W_BOX) && b.contains(W_DATA), "{b}");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn edited_word_table_keeps_shading_borders_and_widths() {
+        let (_, l) = with_tables(&[W_DATA]);
+        let md = l.markdown.replace("Första cellen", "Ändrad cell");
+        let w = write(&md, "x", &|_| None, l.source.as_ref()).unwrap();
+        let xml = document_xml(&w.bytes);
+        // Skrivs om, men med skuggning, ramar, marginaler, justering och upprepad rubrikrad.
+        assert!(xml.contains("Ändrad cell"));
+        assert!(xml.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"2E5395\"/>"), "{xml}");
+        assert!(xml.contains("<w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"), "{xml}");
+        assert!(xml.contains("<w:tblCellMar>") && xml.contains("<w:tblHeader/>"));
+        assert!(xml.contains("<w:jc w:val=\"center\"/>"));
+        let again = read(&w.bytes).unwrap().markdown;
+        let meta = |m: &str| m.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).unwrap().to_owned();
+        assert_eq!(meta(&again), meta(&l.markdown), "{again}");
+        assert!(again.contains("Ändrad cell"));
+    }
+
+    #[test]
+    fn table_without_format_stays_free_of_format_lines() {
+        let md = "| a | b |\n| - | - |\n| c | d |\n";
+        let w = write(md, "x", &|_| None, None).unwrap();
+        let back = read(&w.bytes).unwrap().markdown;
+        assert!(!back.contains("kladd-tabell"), "{back}");
+        assert!(back.contains("| a | b |"));
+    }
+
+    #[test]
+    fn format_line_survives_a_markdown_round_trip_of_a_new_table() {
+        let mut f = crate::word::tablefmt::TableFmt::word_base();
+        f.cell_mut(0, 0).fill = Some([1, 2, 3]);
+        f.width = crate::word::tablefmt::Width::Pct(60);
+        f.align = crate::word::tablefmt::TAlign::Center;
+        let md = format!("{}\n\n| a | b |\n| - | - |\n| c | d |\n", f.to_comment());
+        let w = write(&md, "x", &|_| None, None).unwrap();
+        let xml = document_xml(&w.bytes);
+        assert!(xml.contains("<w:tblW w:w=\"3000\" w:type=\"pct\"/>") && xml.contains("<w:jc w:val=\"center\"/>"), "{xml}");
+        assert!(!xml.contains("kladd-tabell"));
+        let back = read(&w.bytes).unwrap().markdown;
+        let meta = back.lines().find(|l| l.starts_with("<!-- kladd-tabell:")).expect(&back);
+        let g = crate::word::tablefmt::TableFmt::from_comment(meta).unwrap();
+        assert_eq!(g.fill(0, 0), Some([1, 2, 3]));
+        assert_eq!(g.width, crate::word::tablefmt::Width::Pct(60));
     }
 
 }
@@ -6812,6 +7505,9 @@ mod review_xml;
 #[path = "docx_section_tests.rs"]
 mod section_tests;
 
+#[cfg(test)]
+#[path = "docx_para_tests.rs"]
+mod para_tests;
 #[cfg(test)]
 #[path = "docx_track2_tests.rs"]
 mod track2_tests;

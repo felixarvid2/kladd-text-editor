@@ -190,6 +190,7 @@ impl KladdApp {
         let hint = self.review_author();
         ui.add(TextEdit::singleline(&mut self.settings.author_name).hint_text(hint).desired_width(260.0));
         ui.checkbox(&mut self.settings.word_comments, t("Visa kommentarer"));
+        ui.checkbox(&mut self.settings.white_paper, t("Vita sidor i mörkt tema"));
 
         heading(ui, t("Stavning"));
         ui.checkbox(&mut self.settings.spell, t("Stavningskontroll"));

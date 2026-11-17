@@ -198,6 +198,26 @@ pub struct Painted {
     pub range: Range<usize>,
     pub index: usize,
     pub uri: String,
+    /// Förankrad bild: dagens förskjutningar (x, y; CSS-px) från ankarets referenser.
+    pub pos_off: Option<(f32, f32)>,
+    pub crop: Option<[f32; 4]>,
+}
+
+/// Bildytan som visas (UV) för en beskuren bild: `crop` är vänster, ovan, höger, under i procent.
+pub fn crop_uv(crop: Option<[f32; 4]>) -> Rect {
+    match crop {
+        Some(c) => Rect::from_min_max(egui::pos2(c[0] / 100.0, c[1] / 100.0), egui::pos2(1.0 - c[2] / 100.0, 1.0 - c[3] / 100.0)),
+        None => Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+    }
+}
+
+/// Bilden som en form (för bilder som ritas bakom texten, i en reserverad plats i målarlistan).
+/// `None` om bilden inte är inläst än.
+pub fn image_shape(ctx: &egui::Context, uri: &str, rect: Rect, uv: Rect) -> Option<egui::Shape> {
+    match egui::Image::new(uri.to_owned()).load_for_size(ctx, rect.size()) {
+        Ok(egui::load::TexturePoll::Ready { texture }) => Some(egui::Shape::image(texture.id, rect, uv, Color32::WHITE)),
+        _ => None,
+    }
 }
 
 /// Något användaren bett om; utförs av `word_page` via `word_edit` efter ritningen.
@@ -210,6 +230,8 @@ pub enum Act {
     Resize { w: f32, h: Option<f32> },
     /// Radbrytning: texten flyter runt bilden (`Some`) eller bilden är en egen rad (`None`).
     Float(Option<Float>),
+    /// Ny placering av en förankrad bild: förskjutningar (CSS-px) från ankarets referenser.
+    Place { x: f32, y: f32 },
     /// Flytta bilden till före/efter raden som innehåller byteläget `target`.
     Move { target: usize, after: bool },
 }
@@ -232,6 +254,9 @@ struct Moving {
     size: Vec2,
     uri: String,
     align: Option<Float>,
+    /// Förankrad bild: släpp ger `Act::Place` (rutans förflyttning läggs på `pos_off`).
+    anchored: Option<(f32, f32, Vec2)>,
+    crop: Option<[f32; 4]>,
 }
 
 struct Drag {
@@ -310,7 +335,14 @@ pub fn ui(
                 st.drag = Some(Drag { handle: h, index: im.index, orig: im.rect, origin: origin.unwrap_or_default(), last: im.rect.size() });
             } else if let Some(o) = origin.filter(|o| im.rect.contains(*o)) {
                 // Bildens mitt: flytta den.
-                st.mv = Some(Moving { grab: o - im.rect.min, size: im.rect.size(), uri: im.uri.clone(), align: im.align });
+                st.mv = Some(Moving {
+                    grab: o - im.rect.min,
+                    size: im.rect.size(),
+                    uri: im.uri.clone(),
+                    align: im.align,
+                    anchored: im.pos_off.map(|(x, y)| (x, y, im.rect.min.to_vec2())),
+                    crop: im.crop,
+                });
             }
         }
     }
@@ -357,13 +389,14 @@ pub fn ui(
         let down = ctx.input(|i| i.pointer.primary_down());
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if !esc {
-            let target = drop_at(pos);
-            ctx.set_cursor_icon(if target.is_some() { CursorIcon::Grabbing } else { CursorIcon::NotAllowed });
+            let target = if m.anchored.is_some() { None } else { drop_at(pos) };
+            let free = m.anchored.is_some();
+            ctx.set_cursor_icon(if target.is_some() || free { CursorIcon::Grabbing } else { CursorIcon::NotAllowed });
             let layer = LayerId::new(Order::Tooltip, Id::unique("kladd-img-move"));
             let pt = ctx.layer_painter(layer);
             let ghost = Rect::from_min_size(pos - m.grab, m.size);
             let mut child = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(ghost));
-            egui::Image::new(m.uri.clone()).tint(Color32::from_white_alpha(110)).paint_at(&mut child, ghost);
+            egui::Image::new(m.uri.clone()).uv(crop_uv(m.crop)).tint(Color32::from_white_alpha(110)).paint_at(&mut child, ghost);
             pt.rect_stroke(ghost, 0.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Middle);
             if let Some(d) = target {
                 pt.rect_filled(Rect::from_min_max(pos2(d.x0, d.y - 1.0), pos2(d.x1, d.y + 1.0)), 1.0, p.accent);
@@ -392,6 +425,10 @@ pub fn ui(
             }
             if down {
                 st.mv = Some(m);
+            } else if let Some((ox, oy, from)) = m.anchored {
+                // Förankrad bild: den nya platsen skrivs som förskjutningar från referenserna.
+                let d = (pos - m.grab).to_vec2() - from;
+                act = Some(Act::Place { x: ox + d.x / z, y: oy + d.y / z });
             } else if let Some(d) = target {
                 act = Some(Act::Move { target: d.target, after: d.after });
             }
@@ -499,7 +536,7 @@ mod tests {
     use super::*;
 
     fn img(w: Option<f32>, h: Option<f32>) -> ImageRef {
-        ImageRef { alt: "a".into(), src: "x.png".into(), width: w, height: h, align: None }
+        ImageRef { alt: "a".into(), src: "x.png".into(), width: w, height: h, align: None, anchor: None, crop: None }
     }
 
     #[test]

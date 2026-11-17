@@ -35,7 +35,12 @@ enum Mode {
 }
 
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_FOOTNOTES | Options::ENABLE_MATH
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
+        | crate::style::titles::OPTS
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -412,7 +417,7 @@ fn map_events<'a>(
             Event::Start(Tag::Table(aligns)) => {
                 let end = (i + 1..evs.len()).find(|&j| matches!(evs[j].0, Event::End(TagEnd::Table))).unwrap_or(evs.len() - 1);
                 let table_src = src.get(range.clone()).unwrap_or("");
-                let html = render_table(cx, aligns, &evs[i + 1..end], table_src, src);
+                let html = render_table(cx, aligns, &evs[i + 1..end], table_src, src, range.start);
                 out.push(Event::Html(CowStr::from(html)));
                 i = end + 1;
                 continue;
@@ -558,7 +563,10 @@ fn render_table<'a>(
     evs: &[(Event<'a>, Range<usize>)],
     table_src: &str,
     src: &'a str,
+    table_start: usize,
 ) -> String {
+    // Formatet ur kommentarsraden före tabellen (skuggning, ramar, bredd …).
+    let fmt = crate::word::tablefmt::before(src, table_start).map(|(_, f)| f);
     // Spann och kolumnbredder ur källan (samma tolkning som dokumentläget och övriga format):
     // en cell utan något blanksteg mellan två `|` täcks av cellen före.
     let ts = markup::table_src(table_src);
@@ -603,7 +611,10 @@ fn render_table<'a>(
 
     let widths = col_widths(table_src, aligns.len());
     let mut s = String::new();
-    s.push_str(if widths.is_some() { "<table style=\"table-layout:fixed;width:100%\">\n" } else { "<table>\n" });
+    match &fmt {
+        Some(f) => s.push_str(&format!("<table style=\"{}\">\n", table_css(f, widths.is_some()))),
+        None => s.push_str(if widths.is_some() { "<table style=\"table-layout:fixed;width:100%\">\n" } else { "<table>\n" }),
+    }
     if let Some(w) = widths {
         s.push_str("<colgroup>");
         for p in w {
@@ -612,7 +623,8 @@ fn render_table<'a>(
         s.push_str("</colgroup>\n");
     }
     let mut section: Option<&str> = None;
-    for (head, cells) in &rows {
+    let nrows = rows.len();
+    for (ri, (head, cells)) in rows.iter().enumerate() {
         let want = if *head { "thead" } else { "tbody" };
         if section != Some(want) {
             if let Some(old) = section {
@@ -629,11 +641,15 @@ fn render_table<'a>(
             if c.span > 1 {
                 attrs.push_str(&format!(" colspan=\"{}\"", c.span));
             }
-            match aligns.get(col) {
-                Some(Alignment::Left) => attrs.push_str(" style=\"text-align:left\""),
+            if let Some(f) = &fmt {
+                attrs.push_str(&format!(" style=\"{}\"", cell_css(f, ri, col, nrows, *head, cells.len(), c.span)));
+            } else {
+                match aligns.get(col) {
+                    Some(Alignment::Left) => attrs.push_str(" style=\"text-align:left\""),
                 Some(Alignment::Center) => attrs.push_str(" style=\"text-align:center\""),
-                Some(Alignment::Right) => attrs.push_str(" style=\"text-align:right\""),
-                _ => {}
+                    Some(Alignment::Right) => attrs.push_str(" style=\"text-align:right\""),
+                    _ => {}
+                }
             }
             s.push_str(&format!("<{tag}{attrs}>{}</{tag}>", c.html));
             col += c.span;
@@ -645,6 +661,81 @@ fn render_table<'a>(
     }
     s.push_str("</table>\n");
     s
+}
+
+fn css_color(c: Option<[u8; 3]>) -> String {
+    c.map_or_else(|| "#000".to_owned(), |c| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]))
+}
+
+fn border_css(b: crate::word::tablefmt::Border) -> String {
+    use crate::word::tablefmt::BStyle;
+    if !b.visible() {
+        return "none".to_owned();
+    }
+    let style = match b.style {
+        BStyle::Double => "double",
+        BStyle::Dashed => "dashed",
+        BStyle::Dotted => "dotted",
+        _ => "solid",
+    };
+    // `double` behöver minst 3 px för att synas som två linjer.
+    let w = if b.style == BStyle::Double { (b.pt() * 3.0).max(3.0) } else { b.pt().max(0.5) };
+    format!("{w:.1}pt {style} {}", css_color(b.color))
+}
+
+/// Tabellens CSS: bredd, justering, indrag och sammanslagna kanter.
+fn table_css(f: &crate::word::tablefmt::TableFmt, fixed: bool) -> String {
+    use crate::word::tablefmt::{TAlign, Width};
+    let mut c = String::from("border-collapse:collapse;");
+    if fixed {
+        c.push_str("table-layout:fixed;");
+    }
+    match f.width {
+        Width::Pct(p) => c.push_str(&format!("width:{p}%;")),
+        Width::Pt(p) => c.push_str(&format!("width:{p}pt;")),
+        Width::Auto if fixed => c.push_str("width:100%;"),
+        Width::Auto => {}
+    }
+    match f.align {
+        TAlign::Center => c.push_str("margin-left:auto;margin-right:auto;"),
+        TAlign::Right => c.push_str("margin-left:auto;"),
+        TAlign::Left if f.indent.abs() > 0.01 => c.push_str(&format!("margin-left:{:.1}pt;", f.indent)),
+        TAlign::Left => {}
+    }
+    c
+}
+
+/// Cellens CSS: ramar (cellens egna före tabellens), skuggning, justering och marginaler.
+fn cell_css(f: &crate::word::tablefmt::TableFmt, ri: usize, col: usize, nrows: usize, head: bool, ncells: usize, span: usize) -> String {
+    use crate::word::tablefmt::{BOTTOM, LEFT, RIGHT, TAlign, TOP, VAlign};
+    let own = |side: usize| f.own_border(ri, col, side);
+    let right_edge = col + span >= ncells;
+    let mut c = String::new();
+    c.push_str(&format!("border-top:{};", border_css(f.edge(TOP, None, own(TOP), ri > 0))));
+    c.push_str(&format!("border-left:{};", border_css(f.edge(LEFT, None, own(LEFT), col > 0))));
+    c.push_str(&format!("border-bottom:{};", border_css(f.edge(BOTTOM, own(BOTTOM), None, ri + 1 < nrows))));
+    c.push_str(&format!("border-right:{};", border_css(f.edge(RIGHT, own(RIGHT), None, !right_edge))));
+    c.push_str(&format!("background:{};", f.fill(ri, col).map_or("transparent".to_owned(), |x| css_color(Some(x)))));
+    if head && !(ri == 0 && f.header_bold) {
+        c.push_str("font-weight:normal;");
+    }
+    c.push_str(&format!("padding:{:.1}pt {:.1}pt {:.1}pt {:.1}pt;", f.pad[2], f.pad[1], f.pad[3], f.pad[0]));
+    if let Some(cf) = f.cell(ri, col) {
+        match cf.valign {
+            VAlign::Center => c.push_str("vertical-align:middle;"),
+            VAlign::Bottom => c.push_str("vertical-align:bottom;"),
+            VAlign::Top => {}
+        }
+        match cf.halign {
+            TAlign::Center => c.push_str("text-align:center;"),
+            TAlign::Right => c.push_str("text-align:right;"),
+            TAlign::Left => {}
+        }
+    }
+    if let Some(r) = f.rows.get(&ri).filter(|r| r.h > 0) {
+        c.push_str(&format!("height:{}pt;", r.h));
+    }
+    c
 }
 
 /// Kolumnbredder i procent från bindestrecken i avgränsarraden. `None` = automatisk bredd.
@@ -1256,6 +1347,8 @@ fn style_css(d: &DocDefaults) -> String {
             crate::style::StyleId::Body => "p, li".to_owned(),
             crate::style::StyleId::Heading(n) => format!("h{n}"),
             crate::style::StyleId::Quote => "blockquote".to_owned(),
+            crate::style::StyleId::Title => "h1.title".to_owned(),
+            crate::style::StyleId::Subtitle => "h2.subtitle".to_owned(),
         };
         let mut decl: Vec<String> = Vec::new();
         if let Some(f) = o.font_family.as_deref() {
@@ -1287,6 +1380,15 @@ fn style_css(d: &DocDefaults) -> String {
         }
         if let Some(v) = o.first_indent {
             decl.push(format!("text-indent: {}pt", num(v)));
+        }
+        if let Some(v) = o.letter_spacing {
+            decl.push(format!("letter-spacing: {}pt", num(v)));
+        }
+        if o.caps == Some(true) {
+            decl.push("text-transform: uppercase".to_owned());
+        }
+        if let Some(b) = o.border_bottom {
+            decl.push(format!("border-bottom: {}pt solid {}; padding-bottom: {}pt", num(b.width), crate::style::hex(b.color), num(b.space)));
         }
         if !decl.is_empty() {
             s.push_str(&format!("{sel} {{ {}; }}\n", decl.join("; ")));
@@ -1620,5 +1722,25 @@ Slut & tecken < 5. Se [länk](https://exempel.se?a=1&b=2).\n\n\
         let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         println!("{log}");
         assert!(out.status.success(), "{log}");
+    }
+
+    #[test]
+    fn table_format_becomes_css_and_the_comment_is_hidden() {
+        use crate::word::tablefmt::{TAlign, TableFmt, Width};
+        let mut f = TableFmt::word_base();
+        f.cell_mut(0, 1).fill = Some([0x2E, 0x53, 0x95]);
+        f.width = Width::Pct(60);
+        f.align = TAlign::Center;
+        f.borders[0] = crate::word::tablefmt::Border { style: crate::word::tablefmt::BStyle::Double, sz: 6, color: Some([0xC0, 0, 0]) };
+        let md = format!("{}\n\n| A | B |\n| - | - |\n| c | d |\n", f.to_comment());
+        let out = html(&md, "t", &|_| None).unwrap();
+        let s = String::from_utf8_lossy(&out.bytes).to_string();
+        assert!(!s.contains("kladd-tabell"), "{s}");
+        assert!(s.contains("width:60%") && s.contains("margin-left:auto;margin-right:auto"), "{s}");
+        assert!(s.contains("background:#2E5395"), "{s}");
+        assert!(s.contains("border-top:") && s.contains("double #C00000"), "{s}");
+        assert!(s.contains("border-left:none"), "{s}");
+        // Rubrikraden är inte fet när Word inte gjort den fet.
+        assert!(s.contains("font-weight:normal"), "{s}");
     }
 }

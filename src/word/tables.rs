@@ -17,6 +17,7 @@ use egui::{Context, Event, Galley, Id, Key, Pos2, Response, Ui};
 
 use super::grid::{self, TableGeom};
 use super::markup::{self, Edit, TableInfo};
+use super::tableops::{self, FormatOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item};
 use crate::i18n::t;
 use crate::icons::{self, Icon};
@@ -82,6 +83,14 @@ impl TableOp {
     /// Kör operationen på markeringen `sel` (sammanfoga använder hela markeringen, övriga
     /// markörens läge).
     pub fn apply(self, text: &str, sel: Range<usize>) -> Edit {
+        let pos = sel.start;
+        let e = self.apply_unformatted(text, sel);
+        // Tabellformatet (skuggning …) före tabellen följer med raderna och kolumnerna.
+        super::tableops::follow_structure(text, pos, self, e)
+    }
+
+    /// Som `apply`, men utan att röra tabellens formatrad.
+    pub fn apply_unformatted(self, text: &str, sel: Range<usize>) -> Edit {
         let pos = sel.start;
         match self {
             TableOp::RowAbove => markup::table_insert_row(text, pos, false),
@@ -401,6 +410,23 @@ pub fn bar_group(ui: &mut Ui, p: &Palette) -> Option<TableOp> {
     hit
 }
 
+/// Formatvalen (skuggning och ramar) i högerklicksmenyn.
+pub fn format_menu_items(ui: &mut Ui, p: &Palette) -> Option<FormatOp> {
+    let mut hit = None;
+    menu_divider(ui, p);
+    for (label, op) in [
+        (t("Skugga celler"), FormatOp::Shade(tableops::SHADE)),
+        (t("Ta bort skuggning"), FormatOp::Unshade),
+        (t("Ramar runt alla celler"), FormatOp::BordersAll),
+        (t("Inga ramar"), FormatOp::BordersNone),
+    ] {
+        if menu_item(ui, p, label, "", None, true) {
+            hit = Some(op);
+        }
+    }
+    hit
+}
+
 /// Tabellvalen i högerklicksmenyn.
 pub fn menu_items(ui: &mut Ui, p: &Palette) -> Option<TableOp> {
     let mut hit = None;
@@ -613,6 +639,11 @@ impl KladdApp {
     /// Kör en tabelloperation på cellen vid markören.
     pub(crate) fn word_table_op(&mut self, ctx: &Context, op: TableOp) {
         self.word_edit(ctx, |t, s| op.apply(t, s));
+    }
+
+    /// Skuggning eller ramar på cellerna i markeringen.
+    pub(crate) fn word_table_format(&mut self, ctx: &Context, op: FormatOp) {
+        self.word_edit(ctx, |t, s| tableops::apply_format(t, s, op));
     }
 }
 

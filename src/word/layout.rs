@@ -14,12 +14,17 @@ use egui::epaint::text::FontsView;
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
+use super::anchor::{self, Anchor, PageCtx, VAt, Wrap};
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
+use super::pbox::{self, LineRule, PPr};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
 /// Punkter till pixlar vid zoom (96 dpi).
+/// Words standardavstånd mellan tabbstopp (0,5 tum).
+pub const TAB_STOP_PT: f32 = 36.0;
+
 pub fn px(zoom: f32, pt: f32) -> f32 {
     pt * 96.0 / 72.0 * zoom
 }
@@ -110,6 +115,8 @@ struct DocState {
     tables: Option<Arc<Vec<Table>>>,
     images: Option<Arc<Vec<markup::ImageRef>>>,
     headings: Option<Arc<Vec<super::nav::Heading>>>,
+    /// Stycken med styckeutseende (`<!--k:pp …-->`) och rutorna de bildar, se `pbox`.
+    pspecs: Option<Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)>>,
     fonts: Option<Arc<BTreeSet<(String, bool, bool)>>>,
     /// Hela galleriet för förra bildrutan, med nyckeln det byggdes med.
     frame: Option<(u64, Arc<Galley>)>,
@@ -153,6 +160,7 @@ impl Cache {
             tables: None,
             images: None,
             headings: None,
+            pspecs: None,
             fonts: None,
             frame: None,
             units: HashMap::new(),
@@ -191,6 +199,7 @@ impl Cache {
                 }
             }
             st.headings = None;
+            st.pspecs = None;
         }
         st
     }
@@ -236,6 +245,19 @@ impl Cache {
     pub fn float_side(&mut self, doc_id: u64, text: &str, byte: usize) -> Option<(Float, usize)> {
         let st = self.state(doc_id, text);
         st.float_starts.iter().find(|f| f.0 == byte).map(|f| (f.1, f.2))
+    }
+
+    /// Stycken med styckeutseende och deras rutor (räknas om bara när texten ändrats).
+    pub fn para_boxes(&mut self, doc_id: u64, text: &str) -> Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)> {
+        let st = self.state(doc_id, text);
+        let t = &st.text;
+        st.pspecs
+            .get_or_insert_with(|| {
+                let specs = if t.contains(pbox::MARK) { pbox::scan(t) } else { Vec::new() };
+                let runs = pbox::box_runs(t, &specs);
+                Arc::new((specs, runs))
+            })
+            .clone()
     }
 
     /// Rubrikerna i ordning (räknas om bara när texten ändrats).
@@ -367,6 +389,19 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         para.reserve.map(f32::to_bits).hash(&mut h);
         para.toc_h.to_bits().hash(&mut h);
         (para.space_before.to_bits(), para.first_indent.to_bits()).hash(&mut h);
+        para.gap.map(f32::to_bits).hash(&mut h);
+        match para.line {
+            Some(LineRule::Auto(v)) => (1u8, v.to_bits()).hash(&mut h),
+            Some(LineRule::Exact(v)) => (2u8, v.to_bits()).hash(&mut h),
+            Some(LineRule::AtLeast(v)) => (3u8, v.to_bits()).hash(&mut h),
+            None => 0u8.hash(&mut h),
+        }
+        (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
+        para.empty_h.map(f32::to_bits).hash(&mut h);
+    }
+    // Tabellformatet (kommentarsraden före en tabell) ändrar utläggningen.
+    if let Some((r, _)) = super::tablefmt::before(text, w.start) {
+        text[r].hash(&mut h);
     }
     // Markörens rader i förhållande till fönstret.
     if intersects(&p.reveal, w) {
@@ -397,6 +432,8 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
             Block::Normal => 0u8,
             Block::Heading(n) => 10 + n,
             Block::Quote => 1,
+            Block::Title => 20,
+            Block::Subtitle => 21,
             Block::Bullet => 2,
             Block::Numbered => 3,
             Block::Code => 4,
@@ -410,6 +447,9 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         pc.footnote_ref.is_some().hash(&mut h);
         pc.footnote_def.is_some().hash(&mut h);
         pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
+        if let Some(i) = pc.image.as_ref().filter(|i| i.anchor.is_some() || i.crop.is_some()) {
+            format!("{:?}{:?}", i.anchor, i.crop).hash(&mut h);
+        }
         if let Some(s) = &pc.span {
             s.font_family.hash(&mut h);
             s.font_size.map(f32::to_bits).hash(&mut h);
@@ -451,10 +491,10 @@ fn relayout(
 
     // Grupperna läggs ut i ordning: en flytande bild påverkar bredden på stycken efter den, och
     // hur högt dessa är avgör var bilden slutar.
-    let gap = FLOAT_GAP * p.zoom;
     struct FloatBox {
-        side: Float,
+        side: Side,
         w: f32,
+        top: f32,
         bottom: f32,
     }
     let mut active: Vec<FloatBox> = Vec::new();
@@ -471,6 +511,9 @@ fn relayout(
     let mut row_sec: Vec<u32> = Vec::new();
     let mut col_breaks: Vec<usize> = Vec::new();
     let page_wrap = wrap_width;
+    // Uppskattad sidbrytning (som `pages::paginate`) så att bilder som placeras mot sidan eller
+    // marginalen vet var på arket stycket ligger.
+    let mut sim = pages.filter(|_| !multi).map(PageSim::new);
     for (pr, w, tbl) in groups.iter() {
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
@@ -481,11 +524,18 @@ fn relayout(
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
-        let mut anchor = None;
+        let mut anchor: Option<(FloatSpec, FloatPlan)> = None;
         if let (Some(f), false) = (gp[0].float, table) {
-            let used: f32 = active.iter().map(|f| f.w).sum();
-            let same = active.iter().any(|a| a.side == f.side);
-            if same || wrap_width - used - f.size.x - gap < FLOAT_MIN_ROOM * p.zoom {
+            let ctx = match pages {
+                Some(g) => PageCtx { page_w: g.page_w, page_h: g.page_h, margin: [g.top, g.right, g.bottom, g.left], col_left: g.left, col_w: wrap_width },
+                None => PageCtx::column_only(wrap_width),
+            };
+            let page_y = sim.as_ref().map(|s| s.sheet_y(y));
+            let mut plan = plan_float(&f, p.zoom, wrap_width, &ctx, page_y, min_h);
+            let used: f32 = active.iter().filter(|a| a.side != Side::Full).map(|f| f.w).fold(0.0, f32::max);
+            let same = active.iter().any(|a| Some(a.side) == plan.side && f.anchor.is_none());
+            let room = |pl: &FloatPlan| pl.side.is_some_and(|s| s != Side::Full) && wrap_width - used.max(pl.w) < FLOAT_MIN_ROOM * p.zoom;
+            if f.anchor.is_none() && (same || room(&plan)) {
                 // Ryms inte bredvid texten: en ensam bild får en egen rad, annars ritas den på texten.
                 gp[0].float = None;
                 if f.alone {
@@ -493,27 +543,34 @@ fn relayout(
                     gp[0].reserve = Some(f.size.y);
                 }
             } else {
-                anchor = Some(f);
+                if room(&plan) {
+                    // Förankrad bild utan plats vid sidan: texten fortsätter under den.
+                    plan.side = Some(Side::Full);
+                }
+                anchor = Some((f, plan));
             }
         } else if gp[0].float.is_some() {
             gp[0].float = None;
         }
         // Stycket flyter också runt sin egen bild (om det har text).
-        let own = anchor.filter(|f| !f.alone).map(|f| FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+        let own = anchor
+            .filter(|(f, _)| !f.alone || f.anchor.is_some())
+            .and_then(|(_, pl)| pl.side.map(|side| FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom }));
         let rel: Vec<ActiveFloat> = if table {
             Vec::new()
         } else {
+            let half = |v: f32| (v * 2.0).round() / 2.0;
             active
                 .iter()
                 .chain(own.iter())
-                .map(|f| (f.side, f.w, ((f.bottom - y) * 2.0).round() / 2.0))
+                .map(|f| ActiveFloat { side: f.side, w: f.w, top: half(f.top - y), bottom: half(f.bottom - y) })
                 .collect()
         };
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
             wrap_width.to_bits().hash(&mut h);
             for f in &rel {
-                (f.0, f.1.to_bits(), f.2.to_bits()).hash(&mut h);
+                (f.side, f.w.to_bits(), f.top.to_bits(), f.bottom.to_bits()).hash(&mut h);
             }
             h.finish()
         };
@@ -566,14 +623,28 @@ fn relayout(
                 r += lg.rows.len();
             }
         }
-        if let Some(f) = anchor {
-            anchors.push((row_no, f.size.y));
+        if let Some((f, pl)) = anchor {
+            // Sidbrytningen räknar bilden som en rad av dess höjd (om den ligger vid stycket).
+            if pl.side.is_some() && (f.anchor.is_none() || (pl.para_rel && pl.top > -0.5)) {
+                anchors.push((row_no, f.size.y + pl.top.max(0.0)));
+            }
             if let Some(pc) = pieces_in(&a, &gp[0].range).iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some())) {
                 starts.push((pc.range.start, f.side, row_no));
             }
-            active.push(FloatBox { side: f.side, w: f.size.x + gap, bottom: y + f.size.y });
+            if let Some(side) = pl.side {
+                active.push(FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom });
+            }
         }
         row_no += galleys.iter().map(|g| g.rows.len()).sum::<usize>();
+        if let Some(sm) = sim.as_mut() {
+            let mut gy = y;
+            for g in galleys.iter() {
+                for r in &g.rows {
+                    sm.place(gy + r.pos.y, r.row.size.y);
+                }
+                gy += g.rect.height();
+            }
+        }
         y += galleys.iter().map(|g| g.rect.height()).sum::<f32>();
         all.extend(galleys.iter().cloned());
     }
@@ -676,6 +747,8 @@ fn block_size_pt(b: Block, mono: bool, body: f32) -> f32 {
         Block::Heading(1) => 18.0,
         Block::Heading(2) => 15.0,
         Block::Heading(3) => 13.0,
+        Block::Title => 28.0,
+        Block::Subtitle => 14.0,
         Block::Heading(4) => 12.0,
         Block::Heading(_) => 11.0,
         Block::Footnote => body * 0.85,
@@ -741,7 +814,9 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     let zoom = p.zoom;
     let table_raw = pc.block == Block::Table && grid.is_none();
     let mono = pc.code || matches!(pc.block, Block::Code) || table_raw;
-    let heading = matches!(pc.block, Block::Heading(_));
+    // Titel och underrubrik delar rubrikernas typsnitt och radhöjd, men är inte feta som standard.
+    let heading = matches!(pc.block, Block::Heading(_) | Block::Title | Block::Subtitle);
+    let bold_default = matches!(pc.block, Block::Heading(_));
     let body_family = |bold: bool, italic: bool| (p.font_family)(Some(d.font()), bold, italic);
     let ov = if mono { None } else { d.styles.for_block(pc.block) };
     let block_pt = ov.and_then(|o| o.size).unwrap_or_else(|| block_size_pt(pc.block, mono, d.size()));
@@ -774,7 +849,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     let span = pc.span.as_deref();
     let size = px(zoom, span.and_then(|s| s.font_size).unwrap_or(block_pt));
     let header = grid == Some(true);
-    let bold = pc.bold || ov.and_then(|o| o.bold).unwrap_or(heading) || header;
+    let bold = pc.bold || ov.and_then(|o| o.bold).unwrap_or(bold_default) || header;
     let italic = pc.italic || ov.and_then(|o| o.italic).unwrap_or(matches!(pc.block, Block::Quote));
     let family = if mono {
         FontFamily::Monospace
@@ -791,9 +866,10 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     };
     let mut color = match pc.block {
         Block::Heading(1) => pal.page_heading1,
+        Block::Title => pal.page_heading1,
         Block::Heading(6) => pal.page_muted,
         Block::Heading(_) => pal.page_heading,
-        Block::Quote => pal.page_muted,
+        Block::Quote | Block::Subtitle => pal.page_muted,
         _ => pal.page_text,
     };
     if let Some(c) = ov.and_then(|o| o.color) {
@@ -809,6 +885,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
         font_id: FontId::new(size, family),
         line_height: Some(lh_for(size)),
         color,
+        extra_letter_spacing: ov.and_then(|o| o.letter_spacing).map_or(0.0, |s| px(zoom, s)),
         ..Default::default()
     };
     // Fotnotsnummer (referens och definition): litet, upphöjt och i länkfärg. Med egen radhöjd
@@ -942,7 +1019,8 @@ pub fn needed_fonts(a: &Analysis) -> BTreeSet<(String, bool, bool)> {
         if pc.markup || pc.code || matches!(pc.block, Block::Code) {
             continue;
         }
-        let heading = matches!(pc.block, Block::Heading(_));
+        let heading = matches!(pc.block, Block::Heading(_) | Block::Title | Block::Subtitle);
+        let bold_default = matches!(pc.block, Block::Heading(_));
         let ov = d.styles.for_block(pc.block);
         let span_font = pc.span.as_deref().and_then(|s| s.font_family.as_deref());
         let style_font = ov.and_then(|o| o.font_family.as_deref());
@@ -951,7 +1029,7 @@ pub fn needed_fonts(a: &Analysis) -> BTreeSet<(String, bool, bool)> {
         }
         let name = span_font.or(style_font).unwrap_or(d.font()).to_owned();
         let italic = pc.italic || ov.and_then(|o| o.italic).unwrap_or(matches!(pc.block, Block::Quote));
-        set.insert((name.clone(), pc.bold || ov.and_then(|o| o.bold).unwrap_or(heading), italic));
+        set.insert((name.clone(), pc.bold || ov.and_then(|o| o.bold).unwrap_or(bold_default), italic));
         if pc.block == Block::Table {
             set.insert((name.clone(), true, false));
             set.insert((name, false, false));
@@ -1015,6 +1093,8 @@ pub struct Table {
     /// Från första till sista tabellbiten.
     pub region: Range<usize>,
     pub rows: Vec<TableRow>,
+    /// Kladd gör rubrikraden fet (tabeller utan Word-format).
+    pub header_bold: bool,
 }
 
 /// Alla tabeller i texten (sammanhängande tabellbitar), rad för rad.
@@ -1049,7 +1129,8 @@ pub fn tables(text: &str, a: &Analysis) -> Vec<Table> {
             idx += 1;
             pos = le + 1;
         }
-        out.push(Table { region, rows });
+        let header_bold = super::tablefmt::before(text, region.start).is_none_or(|(_, f)| f.header_bold);
+        out.push(Table { region, rows, header_bold });
     }
     out
 }
@@ -1201,11 +1282,19 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
         let grid_hdr = if pc.block == Block::Table {
             grid.iter()
                 .find(|t| t.region.start <= r.start && r.start < t.region.end)
-                .map(|t| t.rows.first().is_some_and(|row| r.start <= row.line.end))
+                .map(|t| t.header_bold && t.rows.first().is_some_and(|row| r.start <= row.line.end))
         } else {
             None
         };
 
+        // Ett kodat tabbtecken (`&#9;`, se `docx::escape_line_start`): dolt, men ger luft fram till
+        // nästa tabbstopp (Words standard: var 36:e punkt, räknat från styckets början).
+        if hide && &text[r.clone()] == "&#9;" {
+            let fam = (p.font_family)(Some(a.defaults.font()), false, false);
+            bld.lead.push((r.start, px(p.zoom, TAB_STOP_PT)));
+            bld.push(r, &hidden_format(fam));
+            continue;
+        }
         // Formel: källtexten är dold och första tecknet reserverar formelns bredd och höjd.
         if let (Some(m), true) = (&pc.math, hide) {
             let _ = m;
@@ -1343,11 +1432,25 @@ struct Para {
     first_indent: f32,
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     col_break: bool,
+    /// Styckeutseende ur markören `<!--k:pp …-->` (`pbox`): avstånd, indrag, ram och skuggning.
+    look: Option<Arc<PPr>>,
+    /// Höjd (px) på den tomma raden mellan två stycken när avståndet kommer från `look`.
+    gap: Option<f32>,
+    /// Radavstånd ur `look` (exakt och minst i px).
+    line: Option<LineRule>,
+    /// Indrag från vänster, höger (px) och hängande första rad (px, positivt tal).
+    ind_left: f32,
+    ind_right: f32,
+    hang: f32,
+    /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
+    empty_h: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct FloatSpec {
     side: Float,
+    /// Dialektens ankare (`<img x= y= …>`); `None` för den äldre kortformen `align`.
+    anchor: Option<Anchor>,
     size: Vec2,
     /// Raden innehåller bara bilden (då kollapsar den).
     alone: bool,
@@ -1387,7 +1490,23 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let body = |pc: &Piece| &text[pc.range.start.max(s)..pc.range.end.min(e)];
 
         let t = text[range.clone()].trim();
-        let is_tag = (t.starts_with("<div") || t.starts_with("</div") || t.starts_with("<!--"))
+        // Tomt Word-stycke: ett eget stycke med ett styckes höjd (inte en dold taggrad).
+        let ep = if intersects(&range, &p.reveal) {
+            None
+        } else {
+            pbox::parse_empty(t).map(|(pp, sz)| {
+                let size = px(p.zoom, sz.unwrap_or_else(|| a.defaults.size()));
+                let h = match pp.line {
+                    Some(LineRule::Auto(m)) => size * 1.22 * m,
+                    Some(LineRule::Exact(v)) => px(p.zoom, v),
+                    Some(LineRule::AtLeast(v)) => (size * 1.22).max(px(p.zoom, v)),
+                    None => size * 1.4,
+                };
+                (pp, h)
+            })
+        };
+        let is_tag = ep.is_none()
+            && (t.starts_with("<div") || t.starts_with("</div") || t.starts_with("<!--"))
             && ps.iter().all(|pc| pc.markup || body(pc).trim().is_empty());
         tag.push(if !is_tag || intersects(&range, &p.reveal) {
             0
@@ -1413,7 +1532,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         }
         // Luft och indrag gäller vanliga stycken, rubriker och citat (inte listor).
         let (space_before, space_after, first_indent) = match style {
-            Some((Block::Normal | Block::Heading(_) | Block::Quote, o)) => (
+            Some((Block::Normal | Block::Heading(_) | Block::Quote | Block::Title | Block::Subtitle, o)) => (
                 px(p.zoom, o.space_before.unwrap_or(0.0)),
                 px(p.zoom, o.space_after.unwrap_or(0.0)),
                 px(p.zoom, o.first_indent.unwrap_or(0.0)),
@@ -1442,6 +1561,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             if let Some((pc, img)) = first.and_then(|pc| pc.image.as_ref().map(|i| (*pc, i))) {
                 float = (p.image_size)(&super::images::size_key(img)).zip(img.align).map(|(size, side)| FloatSpec {
                     side,
+                    anchor: img.anchor,
                     size,
                     alone: is_float_line(text, pc),
                 });
@@ -1469,12 +1589,20 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             space_before,
             first_indent,
             col_break,
+            look: None,
+            gap: None,
+            line: None,
+            ind_left: 0.0,
+            ind_right: 0.0,
+            hang: 0.0,
+            empty_h: ep.as_ref().map(|(_, h)| *h),
         });
         if e >= text.len() {
             break;
         }
         s = e + 1;
     }
+    let before0: Vec<f32> = out.iter().map(|q| q.space_before).collect();
     let mut carry = 0.0;
     for (para, a) in out.iter_mut().zip(&after) {
         if para.collapse {
@@ -1493,7 +1621,84 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let before_close = tag.get(i + 1) == Some(&2);
         out[i].collapse = after_open || before_close;
     }
+    empty_looks(text, &mut out);
+    apply_looks(text, &mut out, &before0, &after, p.zoom);
     out
+}
+
+/// `Para::look` för tomma stycken kommer ur deras egen markör.
+fn empty_looks(text: &str, out: &mut [Para]) {
+    for q in out.iter_mut().filter(|q| q.empty_h.is_some()) {
+        if let Some((pp, _)) = pbox::parse_empty(text[q.range.clone()].trim()) {
+            if pp.has_spacing() {
+                q.look = Some(Arc::new(pp));
+            }
+        }
+    }
+}
+
+/// Styckeutseendet (`pbox`): avstånd mellan stycken, radavstånd och indrag från markörerna
+/// `<!--k:pp …-->`. Avståndet läggs på den tomma raden mellan två stycken (`Para::gap`) och blir
+/// största av "efter" och "före" plus rutans luft; `before0`/`after` är formatmallarnas luft (px).
+fn apply_looks(text: &str, out: &mut [Para], before0: &[f32], after: &[f32], zoom: f32) {
+    if !text.contains(pbox::MARK) && !text.contains(pbox::EMPTY) {
+        return;
+    }
+    let ppx = px(zoom, 1.0);
+    for spec in pbox::scan(text) {
+        let mut i = out.partition_point(|q| q.range.start < spec.range.start);
+        while i < out.len() && out[i].range.end <= spec.range.end {
+            let q = &mut out[i];
+            i += 1;
+            if q.collapse || q.range.is_empty() || q.list.is_some() {
+                continue;
+            }
+            q.look = Some(spec.pp.clone());
+        }
+    }
+    // Indrag och radavstånd per stycke.
+    for q in out.iter_mut() {
+        let Some(l) = q.look.clone() else { continue };
+        q.ind_left = l.left.unwrap_or(0.0).max(0.0) * ppx;
+        q.ind_right = l.right.unwrap_or(0.0).max(0.0) * ppx;
+        match l.first {
+            Some(f) if f < 0.0 => {
+                q.hang = -f * ppx;
+                q.first_indent = 0.0;
+            }
+            Some(f) => q.first_indent = f * ppx,
+            None => {}
+        }
+        q.line = l.line.map(|r| match r {
+            LineRule::Auto(m) => LineRule::Auto(m),
+            LineRule::Exact(v) => LineRule::Exact(v * ppx),
+            LineRule::AtLeast(v) => LineRule::AtLeast(v * ppx),
+        });
+    }
+    // Avståndet: för varje par av innehållsstycken med minst en tom rad emellan.
+    let content: Vec<usize> = (0..out.len()).filter(|&i| !out[i].collapse && !out[i].range.is_empty()).collect();
+    if let Some(&f) = content.first() {
+        if let Some(l) = out[f].look.clone() {
+            let pad = if l.has_box() { l.pad_top() } else { 0.0 };
+            out[f].space_before = (l.before.unwrap_or(0.0) + pad) * ppx;
+        }
+    }
+    for w in content.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if out[a].look.is_none() && out[b].look.is_none() {
+            continue;
+        }
+        // Första tomma raden mellan dem (utan att något annat än tomma rader och dolda taggar ligger emellan).
+        let Some(k) = (a + 1..b).find(|&k| out[k].range.is_empty() && !out[k].collapse) else { continue };
+        let la = out[a].look.clone();
+        let lb = out[b].look.clone();
+        // Utan eget avstånd: tomma raden (8 pt) plus formatmallens luft.
+        let a_after = pbox::BASE_AFTER + after[a] / ppx;
+        let b_before = before0[b] / ppx;
+        let gap = pbox::gap_pt(la.as_deref(), lb.as_deref(), a_after, b_before);
+        out[k].gap = Some(gap * ppx);
+        out[b].space_before = 0.0;
+    }
 }
 
 /// Utsnitt av `full` för byteintervallet `r`, med sektionerna omräknade till 0. Ett tomt
@@ -1616,7 +1821,103 @@ fn justify_row(
 
 /// En flytande bild som är aktiv vid ett stycke: sida, upptagen bredd (bild + luft) och
 /// understa kanten i px under styckets överkant.
-pub(crate) type ActiveFloat = (Float, f32, f32);
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ActiveFloat {
+    pub side: Side,
+    /// Bredd från den egna kanten (bild + luft, och förskjutning från kanten).
+    pub w: f32,
+    /// Övre och understa kanten i px under styckets överkant (kan vara negativ).
+    pub top: f32,
+    pub bottom: f32,
+}
+
+/// Vilken del av raden en flytande bild tar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Side {
+    Left,
+    Right,
+    /// Hela radens bredd: texten hoppar förbi bilden.
+    Full,
+}
+
+/// Var en flytande bild tar plats relativt stycket den är förankrad vid.
+#[derive(Clone, Copy, Debug)]
+struct FloatPlan {
+    /// `None` om bilden inte påverkar texten (bakom/framför).
+    side: Option<Side>,
+    w: f32,
+    top: f32,
+    bottom: f32,
+    /// Bilden är placerad relativt stycket (inte sidan).
+    para_rel: bool,
+}
+
+/// Planen för en flytande bild: den äldre kortformen sitter vid textkanten överst i stycket;
+/// ett ankare räknas mot spalten/sidan (se `anchor`) och ger sida, bredd och lodrät utsträckning.
+/// Idén med att texten tar den bredare sidan och att en bild utan plats trycker texten under den
+/// motsvarar hur WordCraft (crates/layout) hanterar omflöde.
+fn plan_float(f: &FloatSpec, zoom: f32, col_w: f32, ctx: &PageCtx, page_y: Option<f32>, line_h: f32) -> FloatPlan {
+    let Some(a) = f.anchor.map(|a| a.scaled(zoom)) else {
+        let side = if f.side == Float::Left { Side::Left } else { Side::Right };
+        return FloatPlan { side: Some(side), w: f.size.x + FLOAT_GAP * zoom, top: 0.0, bottom: f.size.y, para_rel: true };
+    };
+    let (w, h) = (f.size.x, f.size.y);
+    let x = a.x_in_column(w, ctx);
+    let (top, para_rel) = match a.y_at(h, ctx) {
+        VAt::Para(o) => (o, true),
+        VAt::Page(py) => (page_y.map_or(0.0, |s| py - s), false),
+    };
+    let (t, b) = (top - a.dist[0], top + h + a.dist[2]);
+    let (side, rw) = match a.wrap {
+        Wrap::Behind | Wrap::Front => (None, 0.0),
+        Wrap::TopBottom => (Some(Side::Full), 0.0),
+        Wrap::Square => match anchor::reserve(&a, x, w, col_w) {
+            anchor::Reserve::Left(r) => (Some(Side::Left), r),
+            anchor::Reserve::Right(r) => (Some(Side::Right), r),
+            anchor::Reserve::Full => (Some(Side::Full), 0.0),
+        },
+    };
+    // En rad som börjar strax ovanför en bild över hela bredden skulle överlappa den: den hoppar också.
+    let t = if side == Some(Side::Full) { t - line_h } else { t };
+    FloatPlan { side, w: rw, top: t, bottom: b, para_rel }
+}
+
+/// Uppskattning av var på arket en rad hamnar: samma regel som `pages::paginate` (en rad som inte
+/// ryms flyttas till nästa sida), utan tabellgrupper och bildhöjder.
+struct PageSim {
+    text_h: f32,
+    stride: f32,
+    top: f32,
+    page: usize,
+    shift: f32,
+}
+
+impl PageSim {
+    fn new(g: &super::pages::Geom) -> Self {
+        PageSim { text_h: g.text_h(), stride: g.stride(), top: g.top, page: 0, shift: 0.0 }
+    }
+
+    /// Radens läge på arket (från arkets överkant) för galleriets y före sidbrytning.
+    fn sheet_y(&self, y: f32) -> f32 {
+        let mut page = self.page;
+        let mut shift = self.shift;
+        // En rad som inte längre ryms går till nästa sida: håll fast vid sidans början.
+        if y + shift > page as f32 * self.stride + self.text_h {
+            page += 1;
+            shift = page as f32 * self.stride - y;
+        }
+        y + shift - page as f32 * self.stride + self.top
+    }
+
+    fn place(&mut self, y0: f32, h: f32) {
+        let top = y0 + self.shift;
+        let page_top = self.page as f32 * self.stride;
+        if top + h > page_top + self.text_h + 0.5 && top > page_top + 0.5 {
+            self.page += 1;
+            self.shift = self.page as f32 * self.stride - y0;
+        }
+    }
+}
 
 /// Lägger ut ett stycke och placerar dess rader: hängande indrag, centrering, högerjustering
 /// och marginaljustering.
@@ -1643,13 +1944,28 @@ fn layout_para_floats(
     let mut cur = para.clone();
     let mut y = 0.0f32;
     loop {
-        let act: Vec<&ActiveFloat> = floats.iter().filter(|f| f.2 > y + 0.25).collect();
-        let sum = |side: Float| act.iter().filter(|f| f.0 == side).map(|f| f.1).sum::<f32>();
-        let (lw, rw) = (sum(Float::Left), sum(Float::Right));
-        let cut = act.iter().map(|f| f.2).fold(f32::NEG_INFINITY, f32::max) - y;
+        let act: Vec<&ActiveFloat> = floats.iter().filter(|f| f.bottom > y + 0.25 && f.top <= y + 0.25).collect();
+        // Bild över hela bredden: texten hoppar till under bilden (luft ovanför nästa del).
+        let skip = act.iter().filter(|f| f.side == Side::Full).map(|f| f.bottom).fold(f32::NEG_INFINITY, f32::max);
+        let gap = if skip.is_finite() { skip - y } else { 0.0 };
+        let y_text = y + gap;
+        let act: Vec<&ActiveFloat> = if gap > 0.0 {
+            floats.iter().filter(|f| f.bottom > y_text + 0.25 && f.top <= y_text + 0.25).collect()
+        } else {
+            act
+        };
+        let wide = |side: Side| act.iter().filter(|f| f.side == side).map(|f| f.w).fold(0.0, f32::max);
+        let (lw, rw) = (wide(Side::Left), wide(Side::Right));
+        // Nästa gräns där bredden ändras: en bild slutar eller börjar.
+        let next = floats
+            .iter()
+            .flat_map(|f| [f.top, f.bottom])
+            .filter(|t| *t > y_text + 0.25)
+            .fold(f32::INFINITY, f32::min);
+        let cut = next.is_finite().then(|| next - y_text);
         let eff = (avail - lw - rw).max(24.0);
-        let (g, consumed) =
-            layout_piece(fonts, full, &cur, eff, lw, ppp, act.first().map(|_| cut), !pieces.is_empty(), true);
+        let (g, consumed) = layout_piece(fonts, full, &cur, eff, lw, ppp, cut, !pieces.is_empty(), true);
+        let g = add_space(g, gap);
         y += g.rect.height();
         pieces.push(g);
         let Some(n) = consumed else { break };
@@ -1708,11 +2024,34 @@ fn layout_piece(
         for s in &mut pj.sections {
             s.format.line_height = Some(h);
         }
+    } else if let Some(h) = para.empty_h {
+        for s in &mut pj.sections {
+            s.format.line_height = Some(h);
+        }
+    } else if let (Some(g), true) = (para.gap, para.range.is_empty()) {
+        for s in &mut pj.sections {
+            s.format.line_height = Some(g.max(HIDDEN_PX));
+        }
+    } else if let Some(rule) = para.line {
+        // Radavstånd ur styckeutseendet: bara textrader (inte bilder med egen höjd).
+        for s in &mut pj.sections {
+            let size = s.format.font_id.size;
+            if let Some(_) = s.format.line_height.filter(|h| *h <= size * 2.0 && size > 1.0) {
+                let single = size * 1.22;
+                s.format.line_height = Some(match rule {
+                    LineRule::Auto(m) => single * m,
+                    LineRule::Exact(v) => v,
+                    LineRule::AtLeast(v) => single.max(v),
+                });
+            }
+        }
     }
     let list = para.list;
+    // Indrag från vänster och höger (listor har sitt eget).
+    let (ind_l, ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
     let wrap_w = match list {
         Some(l) => (avail - l.text_x).max(24.0),
-        None => avail,
+        None => (avail - ind_l - ind_r).max(24.0).min(avail),
     };
     pj.wrap.max_width = wrap_w;
     if para.first_indent > 0.0 && !cont && list.is_none() && !para.collapse {
@@ -1740,7 +2079,7 @@ fn layout_piece(
     }
 
     let finite = avail.is_finite();
-    let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0);
+    let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0 || ind_l != 0.0 || ind_r != 0.0 || para.hang != 0.0);
     // Formatmallens luft: ovanför första delen.
     let before = if cont { 0.0 } else { para.space_before };
     if !shifts {
@@ -1760,9 +2099,10 @@ fn layout_piece(
                 (l.text_x - prefix).max(0.0)
             }
             Some(l) => l.text_x,
-            None => 0.0,
+            None if i == 0 && !cont => ind_l - para.hang,
+            None => ind_l,
         };
-        let target = (avail - left).max(1.0);
+        let target = (avail - ind_r - left).max(1.0);
         let mut x = left;
         match para.align {
             Align::Center if list.is_none() => x += ((target - end.max(para.image_w)) / 2.0).max(0.0),
@@ -1864,6 +2204,10 @@ pub fn layout_galley_full(
     }
     (g, geoms)
 }
+
+#[cfg(test)]
+#[path = "pbox_layout_tests.rs"]
+mod pbox_layout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3097,5 +3441,164 @@ mod tests {
         assert!(counts[0] > 150);
         assert!(counts[1] <= 3, "{counts:?}");
         assert!(counts[2] <= 3, "{counts:?}");
+    }
+
+    // ---------------------------------------------------------------- tabellformat
+
+    use super::super::tablefmt::{TableFmt, VAlign};
+
+    fn with_meta(f: &TableFmt, table: &str) -> String {
+        format!("{}\n\n{table}", f.to_comment())
+    }
+
+    const SMALL: &str = "| a | b |\n| - | - |\n| c | d |\n";
+
+    #[test]
+    fn table_format_line_is_hidden_and_sets_the_width() {
+        let mut f = TableFmt::word_base();
+        f.width = super::super::tablefmt::Width::Pct(50);
+        let t = with_meta(&f, SMALL);
+        let a = markup::analyze(&t);
+        // Raden är dold markup; den hör till ingen tabell.
+        assert!(a.pieces.iter().any(|p| p.markup && p.range.start == 0 && p.range.end >= f.to_comment().len()));
+        with_grid(&t, 400.0, |_, gs, _| {
+            assert_eq!(gs.len(), 1);
+            assert!(gs[0].fmt.is_some());
+            // Halva textbredden, lika breda kolumner.
+            assert!((gs[0].col_x[2] - gs[0].col_x[0] - 200.0).abs() < 1.0, "{:?}", gs[0].col_x);
+            assert!(((gs[0].col_x[1] - gs[0].col_x[0]) - 100.0).abs() < 1.0);
+        });
+    }
+
+    #[test]
+    fn table_width_alignment_and_indent() {
+        use super::super::tablefmt::{TAlign, Width};
+        let mut f = TableFmt::word_base();
+        f.width = Width::Pt(150);
+        f.align = TAlign::Center;
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| {
+            let t = &gs[0];
+            // 150 pt = 200 px, centrerad i 400 px.
+            assert!((t.col_x[0] - 100.0).abs() < 1.0 && (t.col_x[2] - 300.0).abs() < 1.0, "{:?}", t.col_x);
+        });
+        f.align = TAlign::Right;
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| assert!((gs[0].col_x[2] - 400.0).abs() < 1.0));
+        f.align = TAlign::Left;
+        f.indent = 18.0;
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| assert!((gs[0].col_x[0] - 24.0).abs() < 1.0));
+        // Bredare än spalten: aldrig bredare än spalten.
+        f.indent = 0.0;
+        f.width = Width::Pt(900);
+        with_grid(&with_meta(&f, SMALL), 400.0, |_, gs, _| assert!(*gs[0].col_x.last().unwrap() <= 400.01));
+    }
+
+    #[test]
+    fn format_header_row_is_not_bold_unless_asked() {
+        let f = TableFmt::word_base();
+        let t = with_meta(&f, SMALL);
+        let a = markup::analyze(&t);
+        let job = layout_job(&t, &a, &Params {
+            palette: &theme::palette(false),
+            zoom: 1.0,
+            reveal: 0..0,
+            matches: &[],
+            image_size: &no_img,
+            measure: &|s: &str, _| s.len() as f32 * 7.0,
+            font_family: &fam,
+            fonts_gen: 0,
+        });
+        let at = t.find("| a").unwrap() + 2;
+        let sec = job.sections.iter().find(|s| s.byte_range.start.0 <= at && at < s.byte_range.end.0).unwrap();
+        assert_eq!(sec.format.font_id.family, theme::doc_font(false, false));
+        // Utan formatrad är rubrikraden fet som förut.
+        let plain = markup::analyze(SMALL);
+        let job = layout_job(SMALL, &plain, &Params {
+            palette: &theme::palette(false),
+            zoom: 1.0,
+            reveal: 0..0,
+            matches: &[],
+            image_size: &no_img,
+            measure: &|s: &str, _| s.len() as f32 * 7.0,
+            font_family: &fam,
+            fonts_gen: 0,
+        });
+        let at = SMALL.find("a").unwrap();
+        let sec = job.sections.iter().find(|s| s.byte_range.start.0 <= at && at < s.byte_range.end.0).unwrap();
+        assert_eq!(sec.format.font_id.family, theme::doc_font(true, false));
+    }
+
+    #[test]
+    fn row_height_cell_padding_and_vertical_alignment() {
+        let mut f = TableFmt::word_base();
+        f.pad = [5.4, 5.4, 6.0, 6.0];
+        f.rows.insert(0, super::super::tablefmt::RowFmt { h: 60, exact: false, head: false });
+        f.cell_mut(0, 1).valign = VAlign::Center;
+        let t = with_meta(&f, SMALL);
+        let plain = with_meta(&TableFmt::word_base(), SMALL);
+        let (h_plain, y_plain) = with_grid(&plain, 400.0, |g, gs, _| {
+            let idx = grid::GalleyIndex::new(&plain, g);
+            (g.rect.height(), grid::row_extent(g, &idx, &gs[0], 0).0)
+        });
+        with_grid(&t, 400.0, |g, gs, _| {
+            let idx = grid::GalleyIndex::new(&t, g);
+            let (top, bottom) = grid::row_extent(g, &idx, &gs[0], 0);
+            let (top1, _) = grid::row_extent(g, &idx, &gs[0], 1);
+            // Raden är minst 60 pt (80 px) hög: nästa rad börjar efter den.
+            assert!(top1 - (top - px(1.0, 6.0)) >= 80.0 - 1.0, "{top} {top1}");
+            assert!(g.rect.height() > h_plain + 60.0);
+            // Överkantsmarginalen flyttar texten ned; den vertikalt centrerade cellen ligger lägre än den vänstra.
+            assert!(top >= y_plain + px(1.0, 6.0) - 0.5);
+            assert!(bottom > top);
+            let left_y = g.rows[g.rows.iter().position(|r| r.pos.x < gs[0].col_x[1]).unwrap()].pos.y;
+            let right_y = g.rows[g.rows.iter().position(|r| r.pos.x >= gs[0].col_x[1]).unwrap()].pos.y;
+            assert!(right_y > left_y + 10.0, "{left_y} {right_y}");
+        });
+    }
+
+    #[test]
+    fn centered_cell_text_moves_inside_the_cell() {
+        use super::super::tablefmt::TAlign;
+        let mut f = TableFmt::word_base();
+        f.width = super::super::tablefmt::Width::Pt(150);
+        f.cell_mut(0, 0).halign = TAlign::Center;
+        let t = with_meta(&f, "| a | b |\n| - | - |\n| c | d |\n");
+        let base = with_meta(&TableFmt { width: super::super::tablefmt::Width::Pt(150), ..TableFmt::word_base() }, "| a | b |\n| - | - |\n| c | d |\n");
+        let x_of = |text: &str, g: &Galley| {
+            let idx = grid::GalleyIndex::new(text, g);
+            g.rows[idx.row_of(idx.chr(text.find("| a").unwrap() + 2))].pos.x
+        };
+        let x0 = with_grid(&base, 400.0, |g, _, _| x_of(&base, g));
+        with_grid(&t, 400.0, |g, gs, _| {
+            // Cellen är 100 px bred: den enda bokstaven hamnar mitt i den.
+            let x = x_of(&t, g);
+            assert!(x > x0 + 35.0, "{x} {x0}");
+            assert!(x < gs[0].col_x[1]);
+        });
+    }
+
+    #[test]
+    fn cache_key_follows_the_format_line() {
+        let mut f = TableFmt::word_base();
+        f.cell_mut(0, 0).fill = Some([1, 2, 3]);
+        let a = with_meta(&f, SMALL);
+        f.cell_mut(0, 0).fill = Some([9, 9, 9]);
+        let b = with_meta(&f, SMALL);
+        let key = |t: &str| {
+            let an = markup::analyze(t);
+            let pal = theme::palette(false);
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal: 0..0,
+                matches: &[],
+                image_size: &no_img,
+                measure: &|s: &str, _| s.len() as f32,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let start = t.find("| a").unwrap();
+            unit_key(0, t, &an, &p, &(start..t.len()), &[])
+        };
+        assert_ne!(key(&a), key(&b));
     }
 }

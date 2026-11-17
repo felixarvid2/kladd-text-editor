@@ -156,7 +156,7 @@ impl KladdApp {
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
                         let sel = dlg.sel;
-                        let heading = matches!(sel, StyleId::Heading(_));
+                        let heading = matches!(sel, StyleId::Heading(_) | StyleId::Title | StyleId::Subtitle);
                         let mut o = dlg.set.get(sel).clone();
                         egui::Grid::new("kladd-styles-grid").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
                             ui.label(RichText::new(t("Typsnitt")).color(p.muted));
@@ -236,8 +236,8 @@ impl KladdApp {
                 let size = px(1.0, o.size.unwrap_or_else(|| sel.default_size(body_size)));
                 let color = match (o.color, sel) {
                     (Some(c), _) => Color32::from_rgb(c[0], c[1], c[2]),
-                    (None, StyleId::Heading(1)) => p.page_heading1,
-                    (None, StyleId::Heading(6)) | (None, StyleId::Quote) => p.page_muted,
+                    (None, StyleId::Heading(1) | StyleId::Title) => p.page_heading1,
+                    (None, StyleId::Heading(6) | StyleId::Quote | StyleId::Subtitle) => p.page_muted,
                     (None, StyleId::Heading(_)) => p.page_heading,
                     (None, StyleId::Body) => p.page_text,
                 };

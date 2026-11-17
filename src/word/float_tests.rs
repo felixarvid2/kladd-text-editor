@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+use super::anchor;
 use super::markup::*;
 
 fn img_range(t: &str) -> Range<usize> {
@@ -107,4 +108,42 @@ fn flytta_hoppar_over_tabeller() {
     let mid = t.find("| 1").unwrap();
     let e = move_image(t, r, mid, true).unwrap();
     assert_eq!(e.text, "| a | b |\n| - | - |\n| 1 | 2 |\n\n<img src=\"a.png\">\n\nslut");
+}
+
+fn first_img(t: &str) -> ImageRef {
+    analyze(t).pieces.iter().find_map(|p| p.image.clone()).unwrap()
+}
+
+#[test]
+fn ankare_och_beskarning_lases_och_skrivs_tillbaka() {
+    let t = "<img src=\"a.png\" alt=\"\" width=\"200\" height=\"100\" hrel=\"page\" x=\"120.5\" vrel=\"margin\" y=\"bottom\" wrap=\"behind\" dist=\"1 2 3 4\" crop=\"10 0 5.5 0\">";
+    let im = first_img(t);
+    let a = im.anchor.unwrap();
+    assert_eq!((a.hrel, a.vrel, a.wrap), (anchor::HRel::Page, anchor::VRel::Margin, anchor::Wrap::Behind));
+    assert_eq!(im.crop, Some([10.0, 0.0, 5.5, 0.0]));
+    assert!(im.align.is_some(), "förankrad bild är flytande");
+    // Ändrad storlek behåller allt annat.
+    let e = set_image_size(t, 0..t.len(), Some(100.0));
+    assert!(e.text.contains("width=\"100\" height=\"50\" hrel=\"page\" x=\"120.5\""), "{}", e.text);
+    assert!(e.text.ends_with("crop=\"10 0 5.5 0\">"));
+    assert_eq!(first_img(&e.text).anchor, first_img(t).anchor);
+}
+
+#[test]
+fn flytt_av_forankrad_bild_skriver_nytt_lage() {
+    let t = "före\n\n<img src=\"a.png\" alt=\"\" width=\"100\" x=\"10\" y=\"20\" wrap=\"top\">\n\nefter";
+    let r = img_range(t);
+    let e = set_image_pos(t, r.clone(), 55.26, -12.0);
+    assert!(e.text.contains("x=\"55.3\" y=\"-12\" wrap=\"top\""), "{}", e.text);
+    // Samma läge: orört.
+    assert_eq!(set_image_pos(&e.text, e.sel.clone(), 55.3, -12.0).text, e.text);
+    // En bild med bara `align` blir förankrad med sin sida kvar (luft mot texten).
+    let l = "<img src=\"a.png\" alt=\"\" width=\"100\" align=\"right\">";
+    let e = set_image_pos(l, 0..l.len(), 300.0, 5.0);
+    let im = first_img(&e.text);
+    assert_eq!(im.anchor.unwrap().h, anchor::Pos::Off(300.0));
+    assert_eq!(im.anchor.unwrap().dist, [0.0, 0.0, 0.0, 12.0]);
+    // Tillbaka till vanligt omflöde tar bort ankaret.
+    let f = set_image_float(&e.text, e.sel.clone(), Some(Float::Left));
+    assert_eq!(f.text, "<img src=\"a.png\" alt=\"\" width=\"100\" align=\"left\">");
 }

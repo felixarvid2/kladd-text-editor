@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
+use crate::style::titles::TitleKind;
 use crate::style::{div_open, is_div_close, is_span_close, parse_div_open, parse_span_open};
 pub use crate::style::{Align, DocDefaults, SpanStyle};
 
@@ -19,6 +20,9 @@ pub use crate::style::{Align, DocDefaults, SpanStyle};
 pub enum Block {
     Normal,
     Heading(u8),
+    /// Wordstilen Titel och Underrubrik: `# Text {.title}` / `## Text {.subtitle}` (se `style::titles`).
+    Title,
+    Subtitle,
     Quote,
     Bullet,
     Numbered,
@@ -53,6 +57,11 @@ pub struct ImageRef {
     pub height: Option<f32>,
     /// `<img align="left|right">`: bilden flyter vid vänster/höger textkant.
     pub align: Option<Float>,
+    /// Förankrad bild (`hrel`/`x`/`vrel`/`y`/`wrap`/`dist`): läge och omflöde. Då är `align` bara
+    /// en antydan om sida (bilden är flytande); layouten räknar sidan ur ankaret.
+    pub anchor: Option<super::anchor::Anchor>,
+    /// Beskärning i procent av bilden: vänster, ovan, höger, under (`crop="l t r b"`).
+    pub crop: Option<[f32; 4]>,
 }
 
 /// Spårad ändring som biten ligger i: slag, nummer och författarens färgindex.
@@ -329,10 +338,16 @@ fn parse(text: &str) -> Parsed {
                     }
                 }
                 match tag {
-                    Tag::Heading { level, .. } => {
+                    Tag::Heading { level, classes, .. } => {
                         let lvl = level as u8;
-                        fill(&mut st, r.clone(), |s| s.block = Block::Heading(lvl));
-                        mark_heading(text, &mut st, &r);
+                        let tk = crate::style::titles::kind(&classes);
+                        let block = match tk {
+                            Some(TitleKind::Title) => Block::Title,
+                            Some(TitleKind::Subtitle) => Block::Subtitle,
+                            None => Block::Heading(lvl),
+                        };
+                        fill(&mut st, r.clone(), |s| s.block = block);
+                        mark_heading(text, &mut st, &r, tk.is_some());
                     }
                     Tag::BlockQuote(_) => {
                         fill(&mut st, r.clone(), |s| s.block = Block::Quote);
@@ -378,7 +393,7 @@ fn parse(text: &str) -> Parsed {
                     }
                     Tag::Link { link_type, .. } => link = Some((r.clone(), link_type, r.start + 1)),
                     Tag::Image { dest_url, .. } => {
-                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None, align: None });
+                        images.push(ImageRef { alt: String::new(), src: dest_url.to_string(), width: None, height: None, align: None, anchor: None, crop: None });
                         let idx = (images.len() - 1) as u32;
                         fill(&mut st, r.clone(), |s| {
                             s.image = Some(idx);
@@ -441,6 +456,14 @@ fn parse(text: &str) -> Parsed {
                     fill(&mut st, r.end - d..r.end, |s| s.markup = true);
                     fill(&mut st, r.start + d..r.end - d, |s| s.code = true);
                 }
+                // I en tabellcell skrivs `|` i kod som `\\|` (GFM, annars delar det cellen); dokumentläget
+                // visar bara `|`. Tabellrader börjar med `|`.
+                let line_start = text[..r.start].rfind('\n').map_or(0, |i| i + 1);
+                if text[line_start..].trim_start().starts_with('|') {
+                    for (i, _) in text[r.clone()].match_indices("\\|") {
+                        fill(&mut st, r.start + i..r.start + i + 1, |s| s.markup = true);
+                    }
+                }
             }
             Event::InlineHtml(h) => {
                 let t = h.trim();
@@ -456,6 +479,9 @@ fn parse(text: &str) -> Parsed {
                         s.object = Some(n);
                         s.markup = true;
                     });
+                } else if super::pbox::is_marker(t) {
+                    // Styckeutseende (`<!--k:pp …-->`): dold markup, se `pbox`.
+                    fill(&mut st, r.clone(), |s| s.markup = true);
                 } else if is_br_tag(t) && st.get(r.start).is_some_and(|x| x.block == Block::Table) {
                     // Radbrytning i en tabellcell: dold markup, själva brytningen görs av layouten.
                     fill(&mut st, r.clone(), |s| s.markup = true);
@@ -517,8 +543,12 @@ fn parse(text: &str) -> Parsed {
                                 }),
                             }
                         }
-                    } else if t == super::nav::TOC_LINE {
-                        // Innehållsförteckningen: en dold rad som dokumentläget ersätter med rubrikerna.
+                    } else if super::pbox::parse_empty(t).is_some() {
+                        // Tomt stycke (`<!--k:ep-->`): dold rad med ett styckes höjd, se `pbox`.
+                        fill(&mut st, tr, |s| s.markup = true);
+                    } else if t == super::nav::TOC_LINE || super::tablefmt::is_comment(t) {
+                        // Innehållsförteckningen (en dold rad som dokumentläget ersätter med rubrikerna)
+                        // och tabellformatet före en tabell: dolda rader.
                         fill(&mut st, tr, |s| s.markup = true);
                     } else if super::sections::SectionProps::from_comment(t).is_some() || super::sections::is_column_break(t) {
                         // Avsnittsrad och spaltbrytning: dolda rader (visas bara när markören står på dem).
@@ -532,6 +562,11 @@ fn parse(text: &str) -> Parsed {
                 }
             }
             Event::Text(t) => {
+                // Ett tabbtecken som skrivits som `&#9;` (eller ett blanksteg som `&#32;`) först i ett
+                // Word-stycke: koden är dold, layouten ritar tabben som ett tabbstopp.
+                if !in_code_block && (&*t == "\t" || &*t == " ") && text[r.clone()].starts_with("&#") {
+                    fill(&mut st, r.clone(), |s| s.markup = true);
+                }
                 if !in_code_block
                     && r.start >= 1
                     && tb[r.start - 1] == b'\\'
@@ -700,7 +735,7 @@ fn finish_link(text: &str, st: &mut [St], r: &Range<usize>, lt: LinkType, last: 
     fill(st, last..r.end, |s| s.markup = true);
 }
 
-fn mark_heading(text: &str, st: &mut [St], r: &Range<usize>) {
+fn mark_heading(text: &str, st: &mut [St], r: &Range<usize>, titled: bool) {
     let s = &text[r.clone()];
     let b = s.as_bytes();
     let indent = ws_run(b, 0);
@@ -708,6 +743,13 @@ fn mark_heading(text: &str, st: &mut [St], r: &Range<usize>) {
         let hashes = b[indent..].iter().take_while(|c| **c == b'#').count();
         let open_end = indent + hashes + ws_run(b, indent + hashes);
         fill(st, r.start..r.start + open_end, |s| s.markup = true);
+        // Klassmarkören `{.title}` är markup.
+        if titled {
+            let line = s.find('\n').map_or(s, |i| &s[..i]);
+            if let Some((at, _)) = crate::style::titles::trailing_marker(line) {
+                fill(st, r.start + at..r.start + line.trim_end().len(), |s| s.markup = true);
+            }
+        }
         // Avslutande ##.
         let line = s.find('\n').map_or(s, |i| &s[..i]).trim_end();
         let core = line.trim_end_matches('#');
@@ -948,16 +990,25 @@ fn parse_img(tag: &str) -> Option<ImageRef> {
     }
     let attrs = html_attrs(tag);
     let get = |n: &str| attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    let anchor = super::anchor::Anchor::from_attrs(&get);
+    let align = get("align").and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+        "left" => Some(Float::Left),
+        "right" => Some(Float::Right),
+        _ => None,
+    });
+    let crop = get("crop").and_then(|v| {
+        let n: Vec<f32> = v.split_whitespace().filter_map(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite() && (0.0..100.0).contains(x)).collect();
+        (n.len() == 4 && n[0] + n[2] < 100.0 && n[1] + n[3] < 100.0 && n.iter().any(|x| *x > 0.0)).then(|| [n[0], n[1], n[2], n[3]])
+    });
     Some(ImageRef {
         src: get("src")?,
         alt: get("alt").unwrap_or_default(),
         width: get("width").and_then(|v| px_value(&v)),
         height: get("height").and_then(|v| px_value(&v)),
-        align: get("align").and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-            "left" => Some(Float::Left),
-            "right" => Some(Float::Right),
-            _ => None,
-        }),
+        // Förankrad bild är flytande också utan `align`.
+        align: align.or(anchor.map(|a| a.side_hint())),
+        anchor,
+        crop,
     })
 }
 
@@ -1015,7 +1066,11 @@ pub fn image_at(text: &str, a: &Analysis, pos: usize) -> Option<(Range<usize>, I
     piece_at(a, prev).and_then(hit)
 }
 
-/// `<img src alt [width] [height] [align]>` (attributen i den ordningen).
+fn fmt_pct(v: f32) -> String {
+    format!("{}", (v * 100.0).round() / 100.0)
+}
+
+/// `<img src alt [width] [height] [align | hrel x vrel y wrap dist] [crop]>` (attributen i den ordningen).
 fn img_tag(img: &ImageRef) -> String {
     let mut s = format!("<img src=\"{}\" alt=\"{}\"", encode_attr(&img.src), encode_attr(&img.alt));
     if let Some(w) = img.width {
@@ -1024,10 +1079,14 @@ fn img_tag(img: &ImageRef) -> String {
     if let Some(h) = img.height {
         s.push_str(&format!(" height=\"{h}\""));
     }
-    match img.align {
-        Some(Float::Left) => s.push_str(" align=\"left\""),
-        Some(Float::Right) => s.push_str(" align=\"right\""),
-        None => {}
+    match (&img.anchor, img.align) {
+        (Some(a), _) => a.write_attrs(&mut s),
+        (None, Some(Float::Left)) => s.push_str(" align=\"left\""),
+        (None, Some(Float::Right)) => s.push_str(" align=\"right\""),
+        (None, None) => {}
+    }
+    if let Some(c) = img.crop {
+        s.push_str(&format!(" crop=\"{} {} {} {}\"", fmt_pct(c[0]), fmt_pct(c[1]), fmt_pct(c[2]), fmt_pct(c[3])));
     }
     s.push('>');
     s
@@ -1068,7 +1127,7 @@ pub fn set_image_size(text: &str, image_range: Range<usize>, width: Option<f32>)
         None => {
             img.width = None;
             img.height = None;
-            if img.align.is_some() { img_tag(&img) } else { md_image(&img) }
+            if img.align.is_some() || img.crop.is_some() { img_tag(&img) } else { md_image(&img) }
         }
     };
     replace_tag(text, image_range, &new)
@@ -1086,8 +1145,32 @@ pub fn set_image_float(text: &str, image_range: Range<usize>, float: Option<Floa
         return keep();
     }
     img.align = float;
-    let new = if float.is_none() && img.width.is_none() && img.height.is_none() { md_image(&img) } else { img_tag(&img) };
+    img.anchor = None;
+    let new = if float.is_none() && img.width.is_none() && img.height.is_none() && img.crop.is_none() { md_image(&img) } else { img_tag(&img) };
     replace_tag(text, image_range, &new)
+}
+
+/// Flyttar en förankrad bild: nya förskjutningar `x`/`y` (px från ankarets referens, se
+/// `anchor::Anchor`); omflöde, avstånd och referenser behålls. En bild som inte var förankrad blir
+/// förankrad i spalten/stycket med textomflöde på sidan den stod. Texten orörd om `range` inte är en bild.
+pub fn set_image_pos(text: &str, image_range: Range<usize>, x: f32, y: f32) -> Edit {
+    let keep = || Edit { text: text.to_string(), sel: image_range.clone() };
+    let a = analyze(text);
+    let Some(mut img) = a.pieces.iter().find(|p| p.range == image_range).and_then(|p| p.image.clone()) else {
+        return keep();
+    };
+    let base = img.anchor.unwrap_or_else(|| {
+        let mut an = super::anchor::Anchor::default();
+        an.dist = if img.align == Some(Float::Right) { [0.0, 0.0, 0.0, 12.0] } else { [0.0, 12.0, 0.0, 0.0] };
+        an
+    });
+    let new_anchor = base.with_offsets((x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0);
+    if img.anchor == Some(new_anchor) {
+        return keep();
+    }
+    img.anchor = Some(new_anchor);
+    img.align = Some(new_anchor.side_hint());
+    replace_tag(text, image_range, &img_tag(&img))
 }
 
 /// Byteintervall (utan radbrytning) för raden som innehåller `pos`.
@@ -1785,6 +1868,8 @@ pub fn set_block(text: &str, sel: Range<usize>, b: Block) -> Edit {
         let old_list = matches!(pre.kind, Some(Block::Bullet | Block::Numbered));
         let marker = match target {
             Block::Heading(n) => format!("{} ", "#".repeat(n as usize)),
+            Block::Title => "# ".to_string(),
+            Block::Subtitle => "## ".to_string(),
             Block::Quote => "> ".to_string(),
             Block::Bullet => "- ".to_string(),
             Block::Numbered => {
@@ -1800,6 +1885,25 @@ pub fn set_block(text: &str, sel: Range<usize>, b: Block) -> Edit {
             (*ls + pre.indent..*ls + pre.indent, marker)
         };
         edits.push((range, vec![Part::Lit(new)]));
+        // Titel och Underrubrik slutar med klassmarkören; en gammal markör byts eller tas bort.
+        let line = &text[*ls..le];
+        let old_marker = crate::style::titles::trailing_marker(line);
+        let new_marker = match target {
+            Block::Title => Some(TitleKind::Title),
+            Block::Subtitle => Some(TitleKind::Subtitle),
+            _ => None,
+        };
+        match (old_marker, new_marker) {
+            (Some((at, _)), nm) => {
+                let lit = nm.map(|k| format!(" {}", k.marker())).unwrap_or_default();
+                edits.push((*ls + at..*ls + line.trim_end().len(), vec![Part::Lit(lit)]));
+            }
+            (None, Some(k)) => {
+                let end = *ls + line.trim_end().len();
+                edits.push((end..end, vec![Part::Lit(format!(" {}", k.marker()))]));
+            }
+            (None, None) => {}
+        }
     }
     let mut r = apply(text, edits, s, e);
     if s == e {
@@ -3030,7 +3134,8 @@ pub const FOOTNOTE_OPTS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
     .union(Options::ENABLE_FOOTNOTES)
-    .union(Options::ENABLE_MATH);
+    .union(Options::ENABLE_MATH)
+    .union(crate::style::titles::OPTS);
 
 /// Etikettens intervall och slutet på `]:` för definitionen som börjar på `start` (`[^etikett]:`).
 fn def_label(text: &str, start: usize) -> Option<(Range<usize>, usize)> {
@@ -3748,7 +3853,7 @@ mod tests {
         let t = "före\n\n![Sol](bild:image1.png)\n\nefter";
         let p = pc(t, "![Sol](bild:image1.png)");
         assert!(p.markup);
-        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None, align: None }));
+        assert_eq!(p.image, Some(ImageRef { alt: "Sol".into(), src: "bild:image1.png".into(), width: None, height: None, align: None, anchor: None, crop: None }));
         assert_eq!(p.range.len(), "![Sol](bild:image1.png)".len());
         // Två bilder intill varandra blir två bitar.
         let t = "![a](1.png)![b](2.png)";
@@ -3758,6 +3863,19 @@ mod tests {
         // Bildtext med formatering ger fortfarande en bit.
         let t = "![**a** b](x.png)";
         assert_eq!(analyze(t).pieces.len(), 1);
+    }
+
+    #[test]
+    fn rör_i_kod_i_tabell_visas_utan_backstreck() {
+        let t = "| a | b |\n|---|---|\n| `x \\| y` | z |\n";
+        assert!(markup_str(t).contains('\\'), "{}", markup_str(t));
+    }
+
+    #[test]
+    fn kodad_tabb_är_dold() {
+        // `docx::escape_line_start` skriver en tabb först i stycket som `&#9;`.
+        let t = "&#9;1\\. Kontor";
+        assert!(markup_str(t).starts_with("&#9;"), "{}", markup_str(t));
     }
 
     #[test]
@@ -4147,6 +4265,24 @@ mod tests {
 
     fn blk(t: &str, sel: Range<usize>, b: Block) -> Edit {
         set_block(t, sel, b)
+    }
+
+    #[test]
+    fn titel_och_underrubrik_i_analysen_och_set_block() {
+        let t = "# Mitt dokument {.title}\n\n## Under {.subtitle}\n\n## Rubrik\n";
+        assert_eq!(pc(t, "Mitt").block, Block::Title);
+        assert!(pc(t, "{.title}").markup);
+        assert_eq!(pc(t, "Under").block, Block::Subtitle);
+        assert_eq!(pc(t, "Rubrik").block, Block::Heading(2));
+        // Normal -> Titel lägger på markören, Titel -> Normal tar bort den.
+        let e = blk("Hej", 0..0, Block::Title);
+        assert_eq!(e.text, "# Hej {.title}");
+        let e = blk(&e.text, 0..0, Block::Title);
+        assert_eq!(e.text, "Hej");
+        let e = blk("# Hej {.title}", 0..0, Block::Subtitle);
+        assert_eq!(e.text, "## Hej {.subtitle}");
+        let e = blk("# Hej {.title}", 0..0, Block::Heading(1));
+        assert_eq!(e.text, "# Hej");
     }
 
     #[test]
@@ -4996,7 +5132,7 @@ mod tests {
     // ---- bilder (HTML) och objektmarkörer
 
     fn iref(alt: &str, src: &str, width: Option<f32>, height: Option<f32>) -> ImageRef {
-        ImageRef { alt: alt.into(), src: src.into(), width, height, align: None }
+        ImageRef { alt: alt.into(), src: src.into(), width, height, align: None, anchor: None, crop: None }
     }
 
     fn at(t: &str, needle: &str) -> usize {

@@ -1,3 +1,4 @@
+pub mod anchor;
 pub mod fonts;
 pub mod grid;
 pub mod headers;
@@ -6,8 +7,13 @@ pub mod images;
 pub mod layout;
 pub mod markup;
 pub mod nav;
+pub mod pbox;
+pub mod pboxui;
 pub mod navui;
 pub mod tables;
+pub mod tablefmt;
+pub mod tablepaint;
+pub mod tableops;
 pub mod pages;
 pub mod stylesdlg;
 pub mod reviewui;

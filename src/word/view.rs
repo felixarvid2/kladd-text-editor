@@ -3,6 +3,7 @@
 //! Allt här är en vy över samma Markdown-`String` som textvyn redigerar (se
 //! `docs/dev/dokumentlage.md`): `TextEdit` med samma id, så markör och ångra överlever växlingen.
 
+use crate::word::anchor::{PageCtx, VAt, Wrap};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::ops::Range;
@@ -24,6 +25,7 @@ use super::secpages;
 use super::sections;
 use super::markup::{self, Block, Inline, SpanProp};
 use super::nav;
+use super::tablepaint;
 use super::tables::{self, TableOp};
 use crate::app::{KladdApp, byte_to_char, char_to_byte, editor_id, menu_divider, menu_item, status_button};
 use crate::i18n::t;
@@ -119,6 +121,9 @@ pub struct State {
     pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Öppen dialog "Sidhuvud och sidfot".
     pub(crate) hf_dlg: Option<super::headers::HfDialog>,
+    /// Dokument (id) vars markör fortfarande står där den sattes när filen öppnades (bytes): markupen
+    /// visas inte förrän användaren flyttat markören eller skrivit.
+    pub(crate) quiet_caret: std::collections::HashMap<u64, Range<usize>>,
     /// Öppen dialog "Ändra formatmall".
     pub(crate) styles_dlg: Option<super::stylesdlg::StylesDialog>,
     /// Öppen dialog "Spalter" (avsnitt).
@@ -174,6 +179,8 @@ fn block_label(b: Block) -> String {
         Block::Normal => t("Brödtext").into(),
         Block::Heading(n) => tf!("Rubrik {n}", n = n),
         Block::Quote => t("Citat").into(),
+        Block::Title => t("Titel").into(),
+        Block::Subtitle => t("Underrubrik").into(),
         Block::Bullet => t("Punktlista").into(),
         Block::Numbered => t("Numrerad lista").into(),
         Block::Code => t("Kod").into(),
@@ -295,6 +302,24 @@ impl KladdApp {
         state.store(ctx, id);
         self.focus_editor = true;
         self.find.current = None;
+    }
+
+    /// Första gången ett dokument visas har editorn ingen markör, och den hamnar då i början av texten:
+    /// på grundformatsraden (`<!-- kladd: … -->`), som då visas som rå markup. Lägg i stället markören
+    /// i början av första riktiga stycket.
+    fn word_initial_caret(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let id = editor_id(doc.id);
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        if state.cursor.char_range().is_some() {
+            return;
+        }
+        let at = content_start(&doc.text);
+        let c = byte_to_char(&doc.text, at);
+        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(c))));
+        state.store(ctx, id);
+        let doc_id = doc.id;
+        self.wv.quiet_caret.insert(doc_id, at..at);
     }
 
     pub(crate) fn word_undo(&mut self, ctx: &egui::Context, redo: bool) {
@@ -550,9 +575,14 @@ impl KladdApp {
                         .show_ui(ui, |ui| {
                             for b in [
                                 Block::Normal,
+                                Block::Title,
+                                Block::Subtitle,
                                 Block::Heading(1),
                                 Block::Heading(2),
                                 Block::Heading(3),
+                                Block::Heading(4),
+                                Block::Heading(5),
+                                Block::Heading(6),
                                 Block::Quote,
                             ] {
                                 if ui.selectable_label(act.block == b, block_label(b)).clicked() {
@@ -867,6 +897,7 @@ impl KladdApp {
             Act::Resize { w, h: None } => self.word_edit(ctx, |t, _| markup::set_image_size(t, r, Some(w))),
             Act::Resize { w, h: Some(h) } => self.word_edit(ctx, |t, _| images::set_free_size(t, r, w, h)),
             Act::Float(f) => self.word_edit(ctx, |t, _| markup::set_image_float(t, r, f)),
+            Act::Place { x, y } => self.word_edit(ctx, |t, _| markup::set_image_pos(t, r, x, y)),
             Act::Move { target, after } => {
                 // Ett ångra-steg; bilden förblir vald på sin nya plats.
                 let mut at = None;
@@ -892,8 +923,16 @@ impl KladdApp {
 
     /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
+        self.word_initial_caret(ui.ctx());
+        let paper = if self.settings.white_paper { p.paper() } else { *p };
+        let p = &paper;
         CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
             self.editor_rect = ui.max_rect();
+            if self.settings.white_paper && paper_differs(&paper, self.settings.dark) {
+                // Markering och markör på en vit sida (de globala färgerna hör till det mörka temat).
+                ui.visuals_mut().selection.bg_fill = p.selection;
+                ui.visuals_mut().text_cursor.stroke.color = Color32::BLACK;
+            }
             let ctx = ui.ctx().clone();
             if self.speller.is_none() {
                 self.speller = Some(crate::spell::Speller::new(self.settings.spell_lang.as_deref()));
@@ -929,6 +968,7 @@ impl KladdApp {
             let refs = self.word.images(doc_id, &self.docs[self.active].text);
             let n_images = refs.len();
             let mut sizes: HashMap<String, Vec2> = HashMap::new();
+            let prev_tables = self.word.table_view(doc_id, &self.docs[self.active].text).map(|(_, g)| g);
             // Bilderna i dokumentordning och var de står (för spaltbredden i avsnitt).
             let img_starts: Vec<usize> =
                 analysis.pieces.iter().filter(|pc| pc.image.is_some()).map(|pc| pc.range.start).collect();
@@ -937,7 +977,21 @@ impl KladdApp {
                 if let Some(Some(info)) = self.wv.images.get(&(doc_id, img.src.clone())) {
                     // Bilder är aldrig bredare än spalten de står i.
                     let sec = img_starts.get(k).map_or(0, |b| sections::index_at(&analysis.sections, *b));
-                    let max_w = geom1.wrap_for(sec);
+                    // Förankrade bilder får vara bredare än spalten (upp till arket).
+                    let mut max_w = if img.anchor.is_some() { geom1.max_page_w() } else { geom1.wrap_for(sec) };
+                    // I en tabellcell: högst cellens bredd (från förra utläggningen).
+                    if let (Some(gs), Some(b)) = (&prev_tables, img_starts.get(k)) {
+                        let pad = grid::cell_pad(1.0) * 2.0;
+                        let cell = gs.iter().filter(|t| t.region.contains(b)).find_map(|t| {
+                            t.rows.iter().flat_map(|r| r.cells.iter()).find(|c| c.seg.contains(b)).map(|c| {
+                                let (x0, x1) = t.cell_x(c);
+                                (x1 - x0) / z - pad
+                            })
+                        });
+                        if let Some(w) = cell.filter(|w| *w >= 16.0) {
+                            max_w = max_w.min(w);
+                        }
+                    }
                     let size = images::display_size(info.size, &img, max_w, z);
                     sizes.entry(images::size_key(&img)).and_modify(|s| if size.x < s.x { *s = size }).or_insert(size);
                 }
@@ -1033,7 +1087,17 @@ impl KladdApp {
             // Markupen visas bara på markörens rader när editorn har fokus.
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
-            let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
+            // Direkt efter öppning står markören där Kladd satte den; visa inte stycket som rå markup
+            // förrän användaren flyttat den eller ändrat texten.
+            let quiet = match self.wv.quiet_caret.get(&doc_id) {
+                Some(r) if *r == sel_now && !self.docs[self.active].dirty => true,
+                Some(_) => {
+                    self.wv.quiet_caret.remove(&doc_id);
+                    false
+                }
+                None => false,
+            };
+            let reveal = if focused && !quiet { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
             let heads = self.word.headings(doc_id, &self.docs[self.active].text);
             let mut toc_click: Option<usize> = None;
 
@@ -1080,6 +1144,7 @@ impl KladdApp {
             let mut new_target: Option<Option<SpellTarget>> = None;
             let mut table_menu: Option<bool> = None;
             let mut table_act: Option<TableOp> = None;
+            let mut table_fmt_act: Option<super::tableops::FormatOp> = None;
             let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
             let mut open_hf_dlg: Option<(bool, usize)> = None;
@@ -1098,6 +1163,13 @@ impl KladdApp {
                 let page_top = origin.y + GAP;
                 let shadow_slot = ui.painter().add(Shape::Noop);
                 let page_slot = ui.painter().add(Shape::Noop);
+                // Styckenas rutor (skuggning och ramar) ligger över arket och under texten.
+                let pbox_slot = ui.painter().add(Shape::Noop);
+                // Bilder bakom texten ritas före texten (platsen fylls när bilderna är placerade).
+                let behind_slot = ui.painter().add(Shape::Noop);
+                let mut behind_shapes: Vec<Shape> = Vec::new();
+                // Cellskuggning ligger ovanpå arket men bakom texten.
+                let cell_fill_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
                     pos2(page_left + geom.origin_x(), page_top + geom.top),
@@ -1278,6 +1350,28 @@ impl KladdApp {
                 let (shadows, sheets) = pages::sheet_shapes(p, &boxes, page_left, origin_y, clip);
                 ui.painter().set(shadow_slot, shadows);
                 ui.painter().set(page_slot, sheets);
+                if !edited {
+                    let pb = word.para_boxes(doc_id, text);
+                    if !pb.1.is_empty() {
+                        let vis = {
+                            let lo = galley.cursor_from_pos(vec2(0.0, clip.top() - gpos.y - 300.0)).index.0;
+                            let hi = galley.cursor_from_pos(vec2(0.0, clip.bottom() - gpos.y + 300.0)).index.0;
+                            char_to_byte(text, lo)..char_to_byte(text, hi)
+                        };
+                        let env = super::pboxui::Env {
+                            galley: &galley,
+                            gpos: gpos.to_vec2(),
+                            text,
+                            boxes: &boxes,
+                            col_at: &col_at,
+                            zoom: z,
+                            palette: p,
+                            clip,
+                            vis,
+                        };
+                        ui.painter().set(pbox_slot, Shape::Vec(super::pboxui::shapes(&env, &pb.0, &pb.1)));
+                    }
+                }
                 let last_bottom = boxes[total - 1].rect(page_left, origin_y).bottom();
                 ui.allocate_rect(
                     Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),
@@ -1388,6 +1482,22 @@ impl KladdApp {
                             }
                         };
                     }
+                    // Linje under en titel (formatmallens `border-bottom`): ritas vid radens första bit.
+                    if matches!(pc.block, Block::Title | Block::Subtitle)
+                        && pc.markup
+                        && (pc.range.start == 0 || text[..pc.range.start].ends_with('\n'))
+                    {
+                        if let Some(b) = analysis.defaults.styles.for_block(pc.block).and_then(|o| o.border_bottom) {
+                            let end = pc.range.start + text[pc.range.start..].find('\n').unwrap_or(text.len() - pc.range.start);
+                            let rb = galley.pos_from_cursor(CCursor::new(conv.at(end))).translate(gpos.to_vec2());
+                            let (cl, cw) = col_at(rb.left() - gpos.x, rb.top() - gpos.y);
+                            let y = rb.bottom() + px(z, b.space * 0.5);
+                            if y >= clip.top() && y <= clip.bottom() {
+                                let c = Color32::from_rgb(b.color[0], b.color[1], b.color[2]);
+                                painter.hline(gpos.x + cl..=gpos.x + cl + cw, y, Stroke::new((b.width * z).max(1.0), c));
+                            }
+                        }
+                    }
                     if pc.image.is_some() {
                         img_index += 1;
                     }
@@ -1401,20 +1511,52 @@ impl KladdApp {
                                 let uri = image_uri(&img.src, doc_id);
                                 let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
                                 let (cl, cw) = col_at(r.left() - gpos.x, top - gpos.y);
-                                let min = match side {
-                                    Some((markup::Float::Left, _)) => pos2(gpos.x + cl, top),
-                                    Some((markup::Float::Right, _)) => pos2(gpos.x + cl + cw - sz.x, top),
-                                    None => r.min,
+                                let mut pos_off = None;
+                                let min = match (side, img.anchor) {
+                                    (Some(_), Some(an)) => {
+                                        // Förankrad bild: läge mot sidan, marginalen, spalten eller stycket.
+                                        let gy = top - gpos.y;
+                                        let ctx = match boxes.get(secpages::page_index(&boxes, gy)) {
+                                            Some(b) => {
+                                                let sheet = b.rect(page_left, origin_y);
+                                                PageCtx { page_w: b.w, page_h: b.h, margin: b.margin, col_left: gpos.x + cl - sheet.left(), col_w: cw }
+                                            }
+                                            None => PageCtx::column_only(cw),
+                                        };
+                                        let sheet_top = boxes.get(secpages::page_index(&boxes, gy)).map_or(top, |b| b.rect(page_left, origin_y).top());
+                                        let a = an.scaled(z);
+                                        let x = gpos.x + cl + a.x_in_column(sz.x, &ctx);
+                                        let y = match a.y_at(sz.y, &ctx) {
+                                            VAt::Para(o) => top + o,
+                                            VAt::Page(py) => sheet_top + py,
+                                        };
+                                        // Förskjutningar (CSS-px) som ger dagens läge: för flytt med musen.
+                                        let (ref_x, ref_y) = (gpos.x + cl + a.h_ref_left(&ctx), a.v_ref_top(&ctx).map_or(top, |t| sheet_top + t));
+                                        pos_off = Some(((x - ref_x) / z, (y - ref_y) / z));
+                                        pos2(x, y)
+                                    }
+                                    (Some((markup::Float::Left, _)), _) => pos2(gpos.x + cl, top),
+                                    (Some((markup::Float::Right, _)), _) => pos2(gpos.x + cl + cw - sz.x, top),
+                                    (None, _) => r.min,
                                 };
                                 let rect = Rect::from_min_size(min, *sz);
                                 if rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
-                                    egui::Image::new(uri.clone()).paint_at(ui, rect);
+                                    let uv = images::crop_uv(img.crop);
+                                    if img.anchor.is_some_and(|a| a.wrap == Wrap::Behind) && side.is_some() {
+                                        if let Some(sh) = images::image_shape(ui.ctx(), &uri, rect, uv) {
+                                            behind_shapes.push(sh);
+                                        }
+                                    } else {
+                                        egui::Image::new(uri.clone()).uv(uv).paint_at(ui, rect);
+                                    }
                                     painted.push(images::Painted {
                                         rect,
                                         align: img.align,
                                         range: pc.range.clone(),
                                         index: img_index - 1,
                                         uri,
+                                        pos_off: pos_off.filter(|_| img.anchor.is_some()),
+                                        crop: img.crop,
                                     });
                                 }
                             }
@@ -1422,6 +1564,7 @@ impl KladdApp {
                     }
                 }
                 flush_bar(&mut bar);
+                ui.painter().set(behind_slot, Shape::Vec(std::mem::take(&mut behind_shapes)));
 
                 // Innehållsförteckningar: raden är dold och har reserverat höjden; posterna
                 // ritas här med sidnumren från galleriet (sidbrytningen är redan gjord, så en
@@ -1498,35 +1641,25 @@ impl KladdApp {
                 };
                 img_act = images::ui(ui, &mut imgs, doc_id, &painted, n_images, (z, max_w), id, p, &drop_at);
 
-                // Tabellrutnät: 1 px kantlinjer runt varje cell, och en förhandsvisning av kolumnkanten som dras.
+                // Tabellrutnät: skuggning bakom texten och ramar (Words ramar, annars rutnät) ovanpå,
+                // och en förhandsvisning av kolumnkanten som dras.
+                let mut cell_fills: Vec<Shape> = Vec::new();
                 if let Some((_, geoms)) = &tview {
-                    let stroke = Stroke::new(1.0, p.page_text.gamma_multiply(0.6));
                     let snap = |v: f32| (v - 0.5).round() + 0.5;
+                    let sel = out.state.cursor.char_range().map(|r| (char_to_byte(text, r.primary.index.0), char_to_byte(text, r.secondary.index.0)));
                     for vt in &vtabs {
                         let t = &geoms[vt.ti];
-                        for (ri, row) in t.rows.iter().enumerate() {
-                            let (Some(first), Some(last)) = (row.cells.first(), row.cells.last()) else { continue };
-                            let (y0, y1) = (gpos.y + vt.exts[ri].0, gpos.y + vt.exts[ri].1);
-                            if y1 < clip.top() || y0 > clip.bottom() {
-                                continue;
-                            }
-                            for c in &row.cells {
-                                let x = snap(gpos.x + t.cell_x(c).0);
-                                painter.line_segment([pos2(x, snap(y0)), pos2(x, snap(y1))], stroke);
-                            }
-                            let (x0, x1) = (snap(gpos.x + t.cell_x(first).0), snap(gpos.x + t.cell_x(last).1));
-                            painter.line_segment([pos2(x1, snap(y0)), pos2(x1, snap(y1))], stroke);
-                            if ri == 0 {
-                                painter.line_segment([pos2(x0, snap(y0)), pos2(x1, snap(y0))], stroke);
-                            }
-                            painter.line_segment([pos2(x0, snap(y1)), pos2(x1, snap(y1))], stroke);
-                        }
+                        let editing = focused && sel.is_some_and(|(a, b)| a.min(b) <= t.region.end && a.max(b) >= t.region.start);
+                        let sh = tablepaint::paint(t, &vt.exts, gpos.to_vec2(), p, z, clip, editing);
+                        cell_fills.extend(sh.fills);
+                        painter.extend(sh.lines);
                     }
                     if let Some((x, y0, y1)) = drag_preview {
                         painter.line_segment([pos2(snap(x), y0), pos2(snap(x), y1)], Stroke::new(2.0, p.accent));
                     }
                 }
 
+                ui.painter().set(cell_fill_slot, cell_fills);
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
                 page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
@@ -1699,6 +1832,7 @@ impl KladdApp {
                         }
                         if in_table_menu {
                             table_act = tables::menu_items(ui, p);
+                            table_fmt_act = tables::format_menu_items(ui, p);
                         }
                     });
                 }
@@ -1760,6 +1894,9 @@ impl KladdApp {
             }
             if let Some(op) = table_act {
                 self.word_table_op(&ctx, op);
+            }
+            if let Some(op) = table_fmt_act {
+                self.word_table_format(&ctx, op);
             }
             if let Some((at, dashes)) = col_resize {
                 self.word_edit(&ctx, |t, s| markup::table_set_widths(t, at, s, &dashes));
@@ -1968,5 +2105,35 @@ mod tests {
         assert_eq!(step_size(8.0, -1), 8.0);
         assert_eq!(step_size(72.0, 1), 82.0);
         assert_eq!(step_size(13.0, 1), 14.0);
+    }
+}
+
+/// Är sidan vit trots mörkt tema?
+fn paper_differs(p: &Palette, dark_theme: bool) -> bool {
+    dark_theme && !p.dark
+}
+
+/// Byteposition för första riktiga stycket: efter inledande `<!-- kladd: … -->`-rader och tomma rader.
+fn content_start(text: &str) -> usize {
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.is_empty() || (t.starts_with("<!-- kladd:") && t.ends_with("-->")) {
+            pos += line.len();
+        } else {
+            break;
+        }
+    }
+    pos.min(text.len())
+}
+
+#[cfg(test)]
+mod initial_caret_tests {
+    #[test]
+    fn caret_skips_defaults_line() {
+        let t = "<!-- kladd: font-family: \"Calibri\" -->\n\n# Titel\n";
+        assert_eq!(&t[super::content_start(t)..], "# Titel\n");
+        assert_eq!(super::content_start("Text"), 0);
+        assert_eq!(super::content_start(""), 0);
     }
 }

@@ -19,6 +19,7 @@ use egui::{FontId, Galley, Rect, Vec2, pos2};
 
 use super::layout::{CELL_PAD_PT, EMPTY_COL_EM, Params, clip_job, is_hidden_format, px};
 use super::markup::{self, Analysis};
+use super::tablefmt::{self, TAlign, TableFmt, VAlign, Width};
 use crate::app::char_to_byte;
 
 /// En cell: kolumnen den börjar i, hur många kolumner den spänner över, hela texten den äger
@@ -48,6 +49,12 @@ pub struct TableGeom {
     /// Rader i tabellens ordning: rubrikraden först, avgränsarraden utelämnad.
     pub rows: Vec<RowGeom>,
     pub delim: Option<Range<usize>>,
+    /// Formatet ur kommentarsraden före tabellen (skuggning, ramar …), om den har någon.
+    pub fmt: Option<Arc<TableFmt>>,
+    /// Cellmarginal vänster, höger, överkant, nederkant (px).
+    pub pad: [f32; 4],
+    /// Lägsta radhöjd (px) per rad i `rows` (0 = ingen).
+    pub min_h: Vec<f32>,
 }
 
 impl TableGeom {
@@ -69,7 +76,15 @@ impl TableGeom {
                 })
                 .collect(),
             delim: self.delim.as_ref().map(r),
+            fmt: self.fmt.clone(),
+            pad: self.pad,
+            min_h: self.min_h.clone(),
         }
+    }
+
+    /// Radens nederkant när texten slutar vid `bottom`: minst radens egen höjd (`w:trHeight`).
+    pub fn row_bottom(&self, row: usize, top: f32, bottom: f32) -> f32 {
+        bottom.max(top + self.min_h.get(row).copied().unwrap_or(0.0))
     }
 
     /// Relativ till fönstret som börjar på `off`.
@@ -170,7 +185,13 @@ fn fit(nat: &[f32], avail: f32, min: &[f32]) -> Vec<f32> {
 pub fn plan(text: &str, a: &Analysis, lines: &[Range<usize>], p: &Params, wrap_width: f32) -> TableGeom {
     let b = text.as_bytes();
     let z = p.zoom;
-    let pad = cell_pad(z);
+    let fmt = lines.first().and_then(|l| tablefmt::before(text, l.start)).map(|(_, f)| Arc::new(f));
+    let pads: [f32; 4] = match fmt.as_ref() {
+        Some(f) => [px(z, f.pad[0]), px(z, f.pad[1]), px(z, f.pad[2]), px(z, f.pad[3])],
+        None => [cell_pad(z), cell_pad(z), 0.0, 0.0],
+    };
+    let pad = (pads[0] + pads[1]) / 2.0;
+    let header_bold = fmt.as_ref().is_none_or(|f| f.header_bold);
     let size = px(z, a.defaults.size());
     let mut rows: Vec<RowGeom> = Vec::new();
     let mut delim = None;
@@ -203,17 +224,25 @@ pub fn plan(text: &str, a: &Analysis, lines: &[Range<usize>], p: &Params, wrap_w
 
     let avail = if wrap_width.is_finite() && wrap_width > 0.0 { wrap_width } else { f32::INFINITY };
     let weights = delim.as_ref().and_then(|d| markup::parse_weights(&text[d.clone()])).filter(|w| w.len() == ncols);
-    let widths: Vec<f32> = match weights {
-        Some(w) if avail.is_finite() => {
+    // Tabellens egen bredd (`w:tblW`): procent av textbredden eller fast, aldrig bredare än spalten.
+    let target = fmt.as_ref().and_then(|f| match f.width {
+        Width::Pct(pc) if avail.is_finite() => Some(avail * f32::from(pc) / 100.0),
+        Width::Pt(w) => Some(if avail.is_finite() { px(z, f32::from(w)).min(avail) } else { px(z, f32::from(w)) }),
+        _ => None,
+    });
+    let widths: Vec<f32> = match (&weights, target) {
+        (Some(w), t) if t.is_some() || avail.is_finite() => {
+            let total = t.unwrap_or(avail);
             let sum: usize = w.iter().sum();
-            w.iter().map(|&x| (avail * x as f32 / sum as f32).max(2.0 * pad + 4.0)).collect()
+            w.iter().map(|&x| (total * x as f32 / sum as f32).max(2.0 * pad + 4.0)).collect()
         }
+        (None, Some(total)) => vec![(total / ncols as f32).max(2.0 * pad + 4.0); ncols],
         _ => {
             // Naturlig bredd: det bredaste cellinnehållet (en rad i taget) per kolumn.
             let mut content = vec![0.0f32; ncols];
             let mut spanned: Vec<(usize, usize, f32)> = Vec::new();
             for (ri, row) in rows.iter().enumerate() {
-                let font = FontId::new(size, (p.font_family)(Some(a.defaults.font()), ri == 0, false));
+                let font = FontId::new(size, (p.font_family)(Some(a.defaults.font()), ri == 0 && header_bold, false));
                 for c in &row.cells {
                     let w = br_parts(text, &c.seg)
                         .iter()
@@ -244,15 +273,28 @@ pub fn plan(text: &str, a: &Analysis, lines: &[Range<usize>], p: &Params, wrap_w
             fit(&nat, avail, &min)
         }
     };
-    let mut col_x = vec![0.0f32; ncols + 1];
+    // Tabellens läge i sidled: justering (`w:jc`) och indrag (`w:tblInd`).
+    let total: f32 = widths.iter().sum();
+    let x0 = match fmt.as_ref().map(|f| f.align) {
+        Some(TAlign::Center) if avail.is_finite() => ((avail - total) / 2.0).max(0.0),
+        Some(TAlign::Right) if avail.is_finite() => (avail - total).max(0.0),
+        _ => fmt.as_ref().map_or(0.0, |f| px(z, f.indent)),
+    };
+    let mut col_x = vec![x0; ncols + 1];
     for j in 0..ncols {
         col_x[j + 1] = col_x[j] + widths[j];
     }
+    let min_h = (0..rows.len())
+        .map(|r| fmt.as_ref().and_then(|f| f.rows.get(&r)).map_or(0.0, |rf| px(z, f32::from(rf.h))))
+        .collect();
     TableGeom {
         region: lines.first().map_or(0..0, |l| l.start..lines.last().map_or(l.end, |m| m.end)),
         col_x,
         rows,
         delim,
+        fmt,
+        pad: pads,
+        min_h,
     }
 }
 
@@ -270,10 +312,10 @@ pub fn layout_line(
     row: usize,
     line: Range<usize>,
     ppp: f32,
-    p: &Params,
+    _p: &Params,
     min_h: f32,
 ) -> Arc<Galley> {
-    let pad = cell_pad(p.zoom);
+    let (padl, padr, padt, padb) = (geom.pad[0], geom.pad[1], geom.pad[2], geom.pad[3]);
     let rg = &geom.rows[row];
     let round = |v: f32| (v * ppp).round() / ppp;
     let mut cell_galleys: Vec<Arc<Galley>> = Vec::new();
@@ -281,7 +323,7 @@ pub fn layout_line(
     for c in &rg.cells {
         let (x0, x1) = geom.cell_x(c);
         // En pixel marginal: bredden mättes utan radbrytning och får inte brytas av avrundning.
-        let wrap = (x1 - x0 - 2.0 * pad + 1.0).max(8.0);
+        let wrap = (x1 - x0 - padl - padr + 1.0).max(8.0);
         let (chunk_s, chunk_e) = (c.chunk.start - off, c.chunk.end - off);
         let seg_text = &full.text[c.seg.start - off..c.seg.end - off];
         // Delar: varje del slutar med sin `<br>`.
@@ -308,15 +350,34 @@ pub fn layout_line(
             Arc::new(Galley::concat(Arc::new(clip_job(full, chunk_s..chunk_e)), &parts, ppp))
         };
         cell_galleys.push(g);
-        xs.push(x0 + pad);
+        xs.push(x0 + padl);
     }
     let mut g = Galley::concat(Arc::new(clip_job(full, line)), &cell_galleys, ppp);
+    // Radens höjd: den högsta cellen, minst `w:trHeight`; lodrät justering flyttar cellens rader.
+    let tallest = cell_galleys.iter().map(|c| c.rect.height()).fold(0.0f32, f32::max) + padt + padb;
+    let row_h = tallest.max(geom.min_h.get(row).copied().unwrap_or(0.0));
+    let valign = |ci: usize| geom.fmt.as_ref().map_or(VAlign::Top, |f| f.valign(row, rg.cells[ci].col));
     // Samla cellernas rader på rätt plats: x efter kolumnen, y från cellens egen överkant.
     let mut i = 0;
-    for (cg, x) in cell_galleys.iter().zip(&xs) {
+    for (ci, (cg, x)) in cell_galleys.iter().zip(&xs).enumerate() {
+        let inner = row_h - padt - padb;
+        let dy = padt
+            + match valign(ci) {
+                VAlign::Top => 0.0,
+                VAlign::Center => ((inner - cg.rect.height()) / 2.0).max(0.0),
+                VAlign::Bottom => (inner - cg.rect.height()).max(0.0),
+            };
+        let avail_w = geom.cell_x(&rg.cells[ci]).1 - geom.cell_x(&rg.cells[ci]).0 - padl - padr;
+        let ha = geom.fmt.as_ref().map_or(TAlign::Left, |f| f.cell(row, rg.cells[ci].col).map_or(TAlign::Left, |c| c.halign));
         for r in &cg.rows {
             let pr = &mut g.rows[i];
-            pr.pos = pos2(round(x + r.pos.x), r.pos.y);
+            // Cellens justering: raden flyttas i sidled efter sin synliga bredd.
+            let dx = match ha {
+                TAlign::Left => 0.0,
+                TAlign::Center => ((avail_w - r.size.x) / 2.0).max(0.0),
+                TAlign::Right => (avail_w - r.size.x).max(0.0),
+            };
+            pr.pos = pos2(round(x + dx + r.pos.x), round(r.pos.y + dy));
             pr.ends_with_newline = false;
             i += 1;
         }
@@ -326,6 +387,17 @@ pub fn layout_line(
     for pr in &g.rows {
         g.rect |= pr.rect();
         g.mesh_bounds |= pr.row.visuals.mesh_bounds.translate(pr.pos.to_vec2());
+    }
+    // Nederkantsmarginal och lägsta radhöjd: concat räknar bara radernas mått, så den sista raden
+    // (den som når längst ned) görs så hög att raden fyller `row_h`.
+    let bottom = g.rows.iter().map(|r| r.pos.y + r.row.size.y).fold(0.0f32, f32::max);
+    if row_h > bottom + 0.01 {
+        if let Some(pr) = g.rows.iter_mut().rev().find(|r| (r.pos.y + r.row.size.y - bottom).abs() < 0.01) {
+            Arc::make_mut(&mut pr.row).size.y += row_h - bottom;
+        }
+        for pr in &g.rows {
+            g.rect |= pr.rect();
+        }
     }
     Arc::new(g)
 }

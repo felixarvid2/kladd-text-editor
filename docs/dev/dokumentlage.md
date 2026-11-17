@@ -225,9 +225,10 @@ Gemensamma format (alla moduler ska använda dessa):
   redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
   fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
 - **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
-  grundformatskommentaren, `h1`–`h6`, `body`, `quote`, med ord i valfri ordning: `"Typsnitt"`,
+  grundformatskommentaren, `h1`–`h6`, `body`, `quote`, `title`, `subtitle`, med ord i valfri ordning: `"Typsnitt"`,
   `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
-  `space-before L`, `space-after L`, `line-spacing N` (gånger enkelt, `LINE_SINGLE` = 1,25 i
+  `letter-spacing L`, `caps`, `smallcaps`, `border-bottom W #RRGGBB S` (linje under stycket; ritas
+  av `word/view.rs` för titel och underrubrik, av `pdf_write.rs` i PDF), `space-before L`, `space-after L`, `line-spacing N` (gånger enkelt, `LINE_SINGLE` = 1,25 i
   layouten), `indent L` (första raden). Layouten läser dem i `piece_format` (typsnitt, storlek,
   färg, radhöjd) och `paragraphs` (justering, luft, indrag). Luft efter ett stycke läggs som luft
   före nästa, eftersom `Galley::concat` staplar efter radernas höjd. Docx: `docx_styles.rs`
@@ -315,6 +316,26 @@ Gemensamma format (alla moduler ska använda dessa):
     `text:anchor-type="paragraph"` och grafikformat med `style:wrap="right|left"` (bilden
     till vänster/höger) och `style:horizontal-pos`. PDF: samma per-rad-flöde (`FloatBox`). HTML/EPUB:
     CSS `float`.
+  - **Förankrade bilder** (`word::anchor`): attribut på `<img>` utöver `align`: `hrel="column|margin|page"`
+    + `x="N|left|center|right"` (px, kan vara negativt), `vrel="paragraph|margin|page"` + `y="N|top|center|bottom"`,
+    `wrap="top|behind|front"` (utelämnat = text runt, `top` = över och under), `dist="ovan höger under vänster"`
+    (px, standard `0 12 0 12`) och `crop="v o h u"` (procent, även för vanliga bilder). `x`/`y` skrivs alltid när
+    ankaret finns; `align="left|right"` är kortformen för en bild vid kanten överst i stycket med normalt avstånd
+    (`Anchor::legacy_side`) och gäller bara utan ankare. `ImageRef.anchor`/`crop`; `set_image_pos` skriver nytt läge
+    (dra en förankrad bild = `Act::Place`), `set_image_float` tar bort ankaret.
+  - Layout: `layout::plan_float` ger sida (`Side::Left/Right/Full`), bredd och lodrät utsträckning relativt
+    stycket. Text runt tar den bredare sidan (`anchor::reserve`; WordCrafts `float.rs` gör likadant), en bild utan
+    plats vid sidan eller `wrap="top"` är `Full` och texten hoppar under den (luft ovanför nästa del), bakom/framför
+    påverkar inte texten. Lägen mot sidan/marginalen räknas om till stycket med `PageSim` (uppskattad sidbrytning som
+    `pages::paginate`); själva ritningen (`view.rs`) använder arkets verkliga läge. Bilder bakom texten ritas i en
+    reserverad plats före texten. `ActiveFloat` har nu övre och nedre kant, så rader ovanför en bild flyter normalt.
+  - Word: `wp:anchor` med `positionH/V` (`relativeFrom` page/margin/column/paragraph m.fl., `align` eller `posOffset`),
+    `simplePos`, `wrapSquare/Tight/Through/TopAndBottom/None` + `behindDoc`, `distT/B/L/R`, `a:srcRect`; VML `v:shape`
+    med `style` (`position:absolute`, `margin-left/top`, `mso-position-*`, `w10:wrap`) och `v:imagedata`. Bilder i en
+    tabellcell blir vanliga bilder. Rotation och spegling, textrutor (`wps:wsp`) med bilder och `layoutInCell` /
+    `allowOverlap` läses inte (textrutor bevaras som förut). ODT: `draw:frame` med `text:anchor-type`
+    (paragraph/page/char), `svg:x/y`, `style:wrap`, `horizontal/vertical-pos/-rel`, `style:run-through`, `fo:margin-*` och
+    `fo:clip` (96 dpi antas). PDF: samma regler (`Layout::anchored_image`), beskärning med klippning.
   - Flytt med musen: dra i bildens mitt (inte ett handtag); `images::Act::Move` utförs via
     `word_edit` (ett ångra-steg). Esc och släpp utanför arken avbryter.
 - **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
@@ -326,6 +347,37 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Navigeringsfönster** (`word::nav`, `word::navui`): rubriker ur den cachade analysen
   (`layout::Cache::headings`, dokumentläget) eller en radskanning (`nav::headings_scan`, textläget)
   som görs om bara när texten ändrats.
+
+**Tabellformat (`src/word/tablefmt.rs`, `tablepaint.rs`, `tableops.rs`, `src/docx_tables.rs`).** Skuggning, ramar, bredd,
+justering, marginaler och radhöjd ligger i en dold rad rakt före tabellen (en tom rad emellan):
+`<!-- kladd-tabell: width 60%; align center; indent 12pt; layout fixed; pad 5.4 5.4 0 0; header off; border top double 6 C00000; border h dashed 4 808080; row 0 h=45 head; cell 0.0 fill=5B3A9E va=center ha=center bt=single/12/FF0000 -->`.
+`rad.kolumn` räknas som i tabellens Markdown (rubrikraden är rad 0, avgränsarraden räknas inte, kolumnen är cellens första
+rutnätskolumn). `border` har sidorna `top left bottom right h v` (h/v = mellan rader/kolumner), stil `none|single|double|dashed|dotted`,
+bredd i åttondels punkter (`w:sz`) och färg eller `auto`; utan några `border`-ord är det rutnätet. Saknas raden är det
+Kladds egen tabell: rutnät, fet rubrikrad, `width` följer innehållet eller kolumnstrecken. `header off` = rubrikraden görs inte fet
+av Kladd. Bredd: `width N%` (av textbredden) eller `width Npt` (aldrig bredare än spalten); kolumnerna delar den efter streckantalet i
+avgränsarraden, annars lika. Raden är markup i analysen (dold, visas på markörens rad som avsnittsraderna) och ingår i layoutcachens nyckel.
+- Läsning (docx): `docx_tables::read` tar en tabells XML och `TableStyles` (alla `w:type="table"`-mallar i `styles.xml`, `basedOn`-kedjan)
+  och ger `TableFmt` plus mallens text per cell (fet/kursiv/färg från `firstRow` m.fl.; läggs på cellens text som `**`/`<span>`).
+  Villkorsdelarna läggs i Words ordning: hela tabellen, kolumnband, radband, första/sista kolumn, första/sista rad, hörn; cellens egna
+  `w:tcPr` vinner. `TableGrid` utan definition i filen räknas som rutnät (det blir det när Kladd sparar). `tcMar` utan `tblCellMar` ger
+  tabellens marginal. Lodrätt sammanfogade fortsättningsceller får ingen överkant. En tabell utan avvikelser från Kladds egna ger ingen rad
+  (och en helt fet rubrikrad blir Kladds fetstil), så orörda Kladd-tabeller läses som förut.
+- Skrivning: orörda tabeller skrivs tillbaka som originalets XML; en ändrad tabell skrivs om med `tblPr` (bredd, `jc`, `tblInd`,
+  alla sex `tblBorders` uttryckligen), `trPr` (`trHeight`, `tblHeader`) och `tcPr` (`tcBorders`, `shd`, `vAlign`, `jc` på styckena).
+  ODT: ett cellformat per formaterad cell (`fo:background-color`, `fo:border-*`, `fo:padding-*`, `style:vertical-align`) och tabellens
+  bredd/`table:align`; PDF: skuggning och Words ramar, bredd, justering, radhöjd, lodrät justering; HTML/EPUB: inline-CSS per cell.
+  ODT-filer läses ännu inte till tabellformat.
+- Utläggning: `grid::plan` löser bredden (`Width`, streck, innehåll), flyttar tabellen i sidled (`align`, `indent`) och ger `TableGeom::pad`
+  (vänster, höger, över, under, px) och `min_h`; `layout_line` flyttar cellens rader för överkantsmarginal, lodrät justering och
+  vågrät justering och gör radens sista rad så hög att `Galley::concat` räknar med nederkantsmarginal och lägsta radhöjd.
+  `tablepaint::paint` ritar skuggning (egen ritlucka bakom texten) och ramar med Words konfliktregel (cellens egen kant före tabellens,
+  kraftigaste vid två egna) för alla celler.
+- Redigering: `tableops::apply_format` (skugga/ta bort skuggning, rutnät/inga ramar på markerade celler) och `follow_structure`
+  (formatraden flyttar med vid rad- och kolumnoperationer och tas bort med tabellen).
+- Begränsningar: rubrikrad som upprepas på varje sida (`w:tblHeader`) bevaras och skrivs tillbaka men upprepas inte i vyn; stycken i en
+  cell har gemensam justering (cellens), inte egen; styckeavstånd i celler ritas inte; ramar mellan celler ritas per cell utan
+  hörnanslutning; skuggfärger anpassas i mörkt tema (`adapt_background`) och kan därför få låg kontrast mot mörkt papper.
 
 Tabelllayout (`src/word/grid.rs`): varje tabellrad läggs ut som ett galleri per cell (radbredd =
 kolumnbredd − cellmarginal, `<br>` ger ett galleri per del) och cellernas rader placeras bredvid
@@ -684,3 +736,54 @@ Export: docx skriver `m:oMath`/`m:oMathPara` med `xmlns:m` på elementet (`omml:
 `math:`-prefix) och `ObjectReplacements/Object N` (PNG). pdf: `Style::math`, en `Piece` per formel, `Op::Math`
 ritas som fyllda glyfkonturer via krilla. html/epub: `export::map_events` byter matematikhändelser mot
 `<math>`; EPUB-posten får `properties="mathml"`.
+
+## Titel och Underrubrik
+
+Wordstilarna Title/Subtitle är egna blockslag (`Block::Title`/`Block::Subtitle`, `ParaKind`, `StyleId::Title`/`Subtitle`).
+I texten är de rubriker med klassmarkör sist på raden, `# Text {.title}` och `## Text {.subtitle}`, via Markdowns
+rubrikattribut (`style::titles::OPTS` läggs till i alla tolkare; `titles::kind` läser klassen). Analysen döljer markören som
+markup, `set_block` lägger på och tar bort den, `nav::headings_scan` hoppar över raderna. docx: `pStyle` Title/Subtitle
+(Kladds egna mallar läggs bara till i en befintlig fil när de används och namnet saknas), odt: `text:p` med mallen
+Title/Subtitle. `docx_styles::read` räknar in docDefaults, `basedOn`, temafärger (`Theme::color` + `tint_shade`) och
+teckenavstånd, versaler och `pBdr/bottom`.
+
+## Vita sidor i mörkt tema
+
+`Settings::white_paper` (på som standard). `Palette::paper()` (`theme.rs`) ger sidans färger från det ljusa temat med svart
+automatisk textfärg och `dark: false`, så att `adapt_text_color`/`adapt_background` inte ändrar dokumentets färger.
+`word_page` byter palett och sätter markeringsfärg och markör för vit botten; skrivbordet och fälten förblir mörka.
+
+## Styckeutseende: ramar, skuggning, avstånd, indrag (`word::pbox`)
+
+Moduler: `src/word/pbox.rs` (modell, markör, ihopslagning till rutor, avståndsregler), `src/docx_para.rs`
+(läsa `w:pPr` ur stycke, formatmall och `docDefaults`; skriva `w:pBdr`/`w:shd`/`w:spacing`/`w:ind`),
+`src/word/pboxui.rs` (ritar rutorna), `layout::apply_looks` (avstånd, radavstånd, indrag).
+
+**Dialekten** är en dold markör sist på styckets sista rad (`markup: true`, som `<!--k:N-->`):
+
+```text
+Text i rutan<!--k:pp bdr="t=single:8:4:6E4BAA l=single:8:4:6E4BAA" shd="EDE7F6" sp="b=0 a=0 l=exact:14 c=1" ind="l=36 r=0 f=-18"-->
+```
+
+- `bdr`: sidorna `t l b r` och `w` (mellan stycken i samma ruta), var och en `stil:sz:space:färg`
+  (`single|double|dashed|dotted|thick`; `sz` i åttondels punkter; `space` i punkter; `RRGGBB` eller `auto`).
+- `shd`: fyllnadsfärg. `sp`: `b=` före, `a=` efter (punkter), `l=` radavstånd (`1.15` gånger enkelt,
+  `exact:14`, `least:14`), `c=1` = `contextualSpacing`. `ind`: `l= r= f=` (punkter, `f` negativt = hängande).
+- Markören skrivs bara när Word-stycket avviker från det layouten själv utgår från (8 pt efter, 0 före,
+  radavstånd ≈ 1,15): ram och skuggning alltid, avstånd och indrag för vanliga brödtextstycken. Rubriker,
+  listor, citat (Kladd ritar egen vänsterlinje) och kod får bara ram och skuggning. Spårade stycketecken (`k:pm`)
+  går före: stycken med sådana får ingen `k:pp`.
+- Avstånd mellan två stycken = största av "efter" och "före" (Word/LibreOffice) plus rutans luft, `contextualSpacing`
+  tar bort det mellan två stycken med den; det läggs som höjd på den tomma raden mellan dem
+  (`Para::gap`). Ett stycke utan egen markör räknas som 8 pt efter, 0 före.
+- Rutor: stycken med lika `bdr`, `shd` och sidindrag och bara tomma rader emellan (`pbox::box_runs`). Rutan sträcker
+  sig `space + linje` utanför texten åt sidorna (som Word); luften upptill och nedtill ligger i avståndet.
+  Går rutan över en sidbrytning delas den utan kant där den bryts (`pboxui::segments`).
+- Skrivning: `docx::Writer::apply_para_look` lägger `w:pBdr, w:shd, w:spacing, w:ind, w:contextualSpacing` i schemaordning
+  (`docx_para::merge_ppr`). Omskrivna stycken behåller originalets `w:pPr` som förut (`with_orig_ppr`), orörda
+  stycken originalets XML.
+
+**Tomma stycken**: `<!--k:ep sz="11" sp="b=0 a=8"-->` är ett eget block (enhetsslag `e`, så att det aldrig paras ihop
+med ett textstycke). `sz` = stycketeckens storlek (`w:pPr/w:rPr/w:sz`), övrigt som `k:pp`. Layouten ger raden
+styckets höjd (`Para::empty_h`); skrivs som `<w:p><w:pPr>…</w:pPr></w:p>`. `<w:p/>` på toppnivå läses också. Stycken som
+bär `w:sectPr` eller spaltbrytning och Words slutstycke efter en avslutande tabell ger ingen rad.
