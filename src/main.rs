@@ -36,6 +36,7 @@ mod i18n;
 mod icons;
 mod keys;
 mod lsp;
+mod mdread;
 mod macopen;
 mod menubar;
 mod math;

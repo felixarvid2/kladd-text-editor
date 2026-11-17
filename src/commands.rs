@@ -83,6 +83,8 @@ pub struct Env<'a> {
     pub blame_on: bool,
     pub scm_open: bool,
     pub lsp_panel: bool,
+    /// Den aktiva Markdown-fliken visas i läsläget.
+    pub md_reading: bool,
 }
 
 impl<'a> Env<'a> {
@@ -106,6 +108,7 @@ impl<'a> Env<'a> {
             blame_on: app.git.blame_on,
             scm_open: app.git.scm && app.settings.workspace_panel,
             lsp_panel: app.lsp.ui.panel,
+            md_reading: app.md_read_mode(),
         }
     }
 
@@ -130,6 +133,7 @@ impl<'a> Env<'a> {
             blame_on: false,
             scm_open: false,
             lsp_panel: false,
+            md_reading: false,
         }
     }
 }
@@ -358,7 +362,8 @@ pub static ALL: &[Command] = &[
     Command::new("view.line_numbers", "Radnummer", View, "", always, |a, _| a.settings.line_numbers = !a.settings.line_numbers).checked(|e| e.settings.line_numbers),
     Command::new("view.vim", "Vim-läge", View, "", always, |a, _| { a.settings.vim = !a.settings.vim; a.vimui.vim.switch_doc(); }).checked(|e| e.settings.vim),
     Command::new("view.nav_pane", "Navigeringsfönster", View, "Ctrl+Shift+O", |e| e.markdown, |a, _| a.settings.nav_pane = !a.settings.nav_pane).checked(|e| e.settings.nav_pane),
-    Command::new("view.preview", "Förhandsvisa Markdown", View, "Ctrl+Shift+M", always, |a, _| a.settings.preview = !a.settings.preview).checked(|e| e.settings.preview),
+    Command::new("view.preview", "Förhandsvisa Markdown", View, "Ctrl+Shift+M", |e| e.markdown && !e.word && !e.pdf, |a, _| a.toggle_md_reading()).checked(|e| e.md_reading),
+    Command::new("view.side_preview", "Förhandsvisning bredvid texten", View, "", always, |a, _| a.settings.side_preview = !a.settings.side_preview).checked(|e| e.settings.side_preview),
     Command::new("view.workspace", "Mappträd", View, "Ctrl+Shift+E", always, |a, c| a.toggle_workspace_panel(c)).checked(|e| e.settings.workspace_panel),
     Command::new("view.document", "Visa som dokument", View, "", |e| e.doc_capable, |a, _| {
         if let Some(d) = a.docs.get_mut(a.active) {

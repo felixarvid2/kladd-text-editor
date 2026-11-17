@@ -32,22 +32,37 @@ fn open_type_undo_save_txt() {
 }
 
 #[test]
-fn markdown_preview_toggle() {
+fn markdown_opens_in_reading_view() {
     let mut ui = Ui::new();
     let file = ui.dir.write("rubrik.md", "# Unik rubrik\n\ntext\n");
     ui.open(&file);
-    assert!(ui.app().settings.preview);
-    assert!(ui.has("Dölj förhandsvisning (Ctrl+Shift+M)"));
-    // Förhandsvisningen ritar rubriken som egen text vid sidan av redigeraren.
-    assert!(ui.h.query_all_by_label("Unik rubrik").count() >= 1, "rubriken syns i förhandsvisningen");
+    // En öppnad .md-fil visas färdigritad i hela fönstret, utan delad skärm.
+    assert!(ui.app().md_read_mode());
+    assert!(!ui.app().settings.side_preview);
+    assert!(ui.h.query_all_by_label("Unik rubrik").count() >= 1, "rubriken syns färdigritad");
+    assert!(ui.has("Redigera (Ctrl+Shift+M)"));
 
-    ui.click("Dölj förhandsvisning (Ctrl+Shift+M)");
-    assert!(!ui.app().settings.preview);
-    assert!(ui.has("Visa förhandsvisning (Ctrl+Shift+M)"));
-    assert_eq!(ui.h.query_all_by_label("Unik rubrik").count(), 0, "ingen förhandsvisning kvar");
+    // Redigera byter till textredigeraren, och förhandsvisningen försvinner.
+    ui.click_last("Redigera");
+    assert!(!ui.app().md_read_mode());
+    assert_eq!(ui.h.query_all_by_label("Unik rubrik").count(), 0, "ingen förhandsvisning bredvid");
+    ui.focus_editor();
+    ui.type_text("mer");
+    assert!(ui.text().contains("mer"), "texten går att redigera");
+    assert!(ui.app().docs[0].dirty);
 
+    // Knappen i namnlisten (och Ctrl+Skift+M) går tillbaka till läsläget.
     ui.click("Visa förhandsvisning (Ctrl+Shift+M)");
-    assert!(ui.app().settings.preview);
+    assert!(ui.app().md_read_mode());
+    ui.key(CTRL | Modifiers::SHIFT, Key::M);
+    assert!(!ui.app().md_read_mode());
+}
+
+#[test]
+fn new_markdown_tab_is_edited_directly() {
+    let mut ui = Ui::new();
+    ui.key(CTRL, Key::N);
+    assert!(!ui.app().md_read_mode(), "en namnlös flik öppnas i redigeraren");
 }
 
 #[test]

@@ -103,7 +103,10 @@ pub const EN: &[(&str, &str)] = &[
     ("Byt till mörkt tema (Ctrl+Shift+K)", "Switch to Dark Theme (Ctrl+Shift+K)"),
     ("Dölj navigeringsfönstret (Ctrl+Shift+O)", "Hide Navigation Pane (Ctrl+Shift+O)"),
     ("Visa navigeringsfönstret (Ctrl+Shift+O)", "Show Navigation Pane (Ctrl+Shift+O)"),
-    ("Dölj förhandsvisning (Ctrl+Shift+M)", "Hide Preview (Ctrl+Shift+M)"),
+    ("Redigera (Ctrl+Shift+M)", "Edit (Ctrl+Shift+M)"),
+    ("Redigera texten (Ctrl+Shift+M)", "Edit the text (Ctrl+Shift+M)"),
+    ("Förhandsvisning bredvid texten", "Preview Beside the Text"),
+    ("Öppnade Markdown-filer visas annars färdiga i hela fönstret, med en Redigera-knapp", "Otherwise opened Markdown files are shown rendered in the whole window, with an Edit button"),
     ("Visa förhandsvisning (Ctrl+Shift+M)", "Show Preview (Ctrl+Shift+M)"),
     ("Inte sparad än", "Not saved yet"),
     // Huvudmenyn

@@ -178,7 +178,8 @@ impl KladdApp {
         let s = &mut self.settings;
         ui.checkbox(&mut s.wrap, t("Radbrytning"));
         ui.checkbox(&mut s.line_numbers, t("Radnummer"));
-        ui.checkbox(&mut s.preview, t("Förhandsvisa Markdown"));
+        ui.checkbox(&mut s.side_preview, t("Förhandsvisning bredvid texten"))
+            .on_hover_text(t("Öppnade Markdown-filer visas annars färdiga i hela fönstret, med en Redigera-knapp"));
         ui.checkbox(&mut s.nav_pane, t("Navigeringsfönster"))
             .on_hover_text(t("Rubrikträd för Markdown-baserade flikar"));
         ui.checkbox(&mut s.workspace_panel, t("Mappträd"));
