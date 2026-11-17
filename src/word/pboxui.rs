@@ -167,10 +167,13 @@ pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
         if y1 + 200.0 < env.clip.top() - env.gpos.y || y0 - 200.0 > env.clip.bottom() - env.gpos.y {
             continue;
         }
-        let i0 = g.rows.partition_point(|r| r.rect().max.y <= y0 + 0.5);
-        let rows: Vec<RowSpan> = g.rows[i0..]
+        // Spalten rutan börjar i. I ett avsnitt med flera spalter är radernas y inte stigande genom
+        // galleriet (varje spalt börjar om), så raderna väljs efter läge och spalt, inte med bisektion.
+        let (cl, cw) = (env.col_at)(ra.left(), y0);
+        let rows: Vec<RowSpan> = g
+            .rows
             .iter()
-            .take_while(|r| r.pos.y < y1 - 0.01)
+            .filter(|r| r.rect().max.y > y0 + 0.5 && r.pos.y < y1 - 0.01 && r.pos.x >= cl - 1.0 && r.pos.x < cl + cw + 1.0)
             .map(|r| RowSpan {
                 top: r.pos.y,
                 bottom: r.rect().max.y,
@@ -184,11 +187,15 @@ pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
         let fill = first.shd.map(|c| adapt_background(c, env.palette.dark));
         let b = &first.borders;
         for s in &segs {
-            let (cl, cw) = (env.col_at)(0.0, s.y0.max(rows[0].top));
-            let il = first.left.unwrap_or(0.0).max(0.0) * ppx;
-            let ir = first.right.unwrap_or(0.0).max(0.0) * ppx;
-            let left = cl + il - first.pad_left() * ppx;
-            let right = cl + cw - ir + first.pad_right() * ppx;
+            let (left, right) = match first.frame_geom(cw / ppx) {
+                // Ram med egen bredd: rutans egna kanter.
+                Some((_, _, l, w)) => (cl + l * ppx, cl + (l + w) * ppx),
+                None => {
+                    let il = first.left.unwrap_or(0.0).max(0.0) * ppx;
+                    let ir = first.right.unwrap_or(0.0).max(0.0) * ppx;
+                    (cl + il - first.pad_left() * ppx, cl + cw - ir + first.pad_right() * ppx)
+                }
+            };
             let r = Rect::from_min_max(pos2(left, s.y0), pos2(right, s.y1)).translate(env.gpos);
             if r.bottom() < env.clip.top() || r.top() > env.clip.bottom() {
                 continue;

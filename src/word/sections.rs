@@ -22,6 +22,8 @@ use crate::style;
 pub const SECTION_KEY: &str = "avsnitt";
 /// Raden som flyttar texten till nästa spalt.
 pub const COLUMN_BREAK_LINE: &str = "<!-- kladd: spaltbrytning -->";
+/// Raden som börjar en ny sida (som Words sidbrytning); avsnittet och dess format fortsätter.
+pub const PAGE_BREAK_LINE: &str = "<!-- kladd: sidbrytning -->";
 /// Mellanrum mellan spalter (pt) när `column-gap` saknas (som Words 1,25 cm = 708 twips).
 pub const DEFAULT_GAP: f32 = 35.4;
 /// Största antal spalter.
@@ -30,7 +32,7 @@ pub const MAX_COLUMNS: usize = 6;
 /// Sant om `css` (texten efter `kladd:`) börjar en avsnittsrad.
 pub fn is_section_keyword(css: &str) -> bool {
     let t = css.trim_start();
-    for key in [SECTION_KEY, "spaltbrytning"] {
+    for key in [SECTION_KEY, "spaltbrytning", "sidbrytning"] {
         if let Some(rest) = t.strip_prefix(key) {
             if rest.is_empty() || rest.starts_with(|c: char| c == ';' || c.is_whitespace()) {
                 return true;
@@ -45,6 +47,11 @@ pub fn is_column_break(line: &str) -> bool {
     line.trim() == COLUMN_BREAK_LINE
 }
 
+/// Sant om `line` är sidbrytningsraden.
+pub fn is_page_break(line: &str) -> bool {
+    line.trim() == PAGE_BREAK_LINE
+}
+
 /// Egenskaperna som står på en avsnittsrad. `None` = ärv dokumentets grundformat.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SectionProps {
@@ -55,8 +62,14 @@ pub struct SectionProps {
     pub columns: Option<usize>,
     /// Mellanrum mellan spalter i pt.
     pub column_gap: Option<f32>,
+    /// Olika breda spalter: spaltbredderna i pt (minst två; antalet spalter är då antalet bredder).
+    pub column_widths: Option<Vec<f32>>,
+    /// Skiljelinje mellan spalterna.
+    pub column_rule: bool,
     /// Börjar på samma sida som föregående avsnitt (annars på en ny sida).
     pub continuous: bool,
+    /// Egna sidhuvuden och sidfötter, sidnumrering som börjar om (`crate::hf`).
+    pub hf: crate::hf::SecHf,
 }
 
 impl SectionProps {
@@ -75,9 +88,17 @@ impl SectionProps {
         if let Some(g) = self.column_gap {
             parts.push(format!("column-gap: {}", style::mm(g)));
         }
+        if let Some(w) = self.column_widths.as_ref().filter(|w| w.len() > 1) {
+            let list: Vec<String> = w.iter().map(|v| style::mm(*v)).collect();
+            parts.push(format!("column-widths: {}", list.join(" ")));
+        }
+        if self.column_rule {
+            parts.push("column-rule: yes".to_owned());
+        }
         if self.continuous {
             parts.push("type: continuous".to_owned());
         }
+        parts.extend(self.hf.to_parts());
         format!("<!-- kladd: {} -->", parts.join("; "))
     }
 
@@ -98,8 +119,15 @@ impl SectionProps {
                 "page-margin" | "margin" => p.page_margin = style::parse_margins(&v),
                 "columns" => p.columns = v.trim().parse::<usize>().ok().map(|c| c.clamp(1, MAX_COLUMNS)),
                 "column-gap" => p.column_gap = style::parse_length(&v),
+                "column-widths" => {
+                    let w: Vec<f32> = v.split_whitespace().filter_map(style::parse_length).filter(|w| *w > 0.0).collect();
+                    p.column_widths = Some(w).filter(|w| w.len() > 1 && w.len() <= MAX_COLUMNS);
+                }
+                "column-rule" => p.column_rule = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "ja" | "1" | "true" | "solid"),
                 "type" => p.continuous = v.trim().eq_ignore_ascii_case("continuous"),
-                _ => {}
+                k => {
+                    p.hf.read_decl(k, &v);
+                }
             }
         }
         Some(p)
@@ -121,20 +149,35 @@ pub struct Section {
     pub columns: usize,
     /// Mellanrum mellan spalter i pt.
     pub gap: f32,
+    /// Spaltbredder i pt när de är olika breda (annars tom: lika breda). Längd = `columns`.
+    pub col_widths: Vec<f32>,
+    /// Skiljelinje mellan spalterna.
+    pub rule: bool,
     pub continuous: bool,
 }
 
 impl Section {
     /// Räknar ut ett avsnitt av radens egenskaper och dokumentets grundformat.
     pub fn resolve(props: &SectionProps, d: &DocDefaults) -> Section {
+        // Olika breda spalter bestämmer antalet spalter (om `columns` saknas eller står emot).
+        let widths = props.column_widths.clone().filter(|w| w.len() > 1);
+        let columns = match &widths {
+            Some(w) => w.len().min(MAX_COLUMNS),
+            None => props.columns.unwrap_or(1).clamp(1, MAX_COLUMNS),
+        };
+        let col_widths = widths
+            .filter(|w| w.len() == columns && w.iter().any(|v| (v - w[0]).abs() > 0.5))
+            .unwrap_or_default();
         Section {
             start: 0,
             marker: None,
             props: props.clone(),
             page: props.page_size.unwrap_or_else(|| d.page()),
             margin: props.page_margin.unwrap_or_else(|| d.margins()),
-            columns: props.columns.unwrap_or(1).clamp(1, MAX_COLUMNS),
+            columns,
             gap: props.column_gap.unwrap_or(DEFAULT_GAP).max(0.0),
+            col_widths,
+            rule: props.column_rule && columns > 1,
             continuous: props.continuous,
         }
     }
@@ -224,6 +267,16 @@ fn insert_line(text: &str, at: usize, line: &str) -> Edit {
     Edit { text: t, sel: caret..caret }
 }
 
+/// Sätter in ett block (flera rader) som ett eget stycke vid `at` och markerar första `select` i det.
+pub fn insert_block(text: &str, at: usize, block: &str, select: &str) -> Edit {
+    let mut e = insert_line(text, at, block);
+    let from = at.min(text.len());
+    if let Some(i) = e.text[from..].find(select) {
+        e.sel = from + i..from + i + select.len();
+    }
+    e
+}
+
 /// Börjar ett nytt avsnitt med egenskaperna `props` vid `at`.
 pub fn insert_break(text: &str, at: usize, props: &SectionProps) -> Edit {
     insert_line(text, at, &props.to_comment())
@@ -232,6 +285,11 @@ pub fn insert_break(text: &str, at: usize, props: &SectionProps) -> Edit {
 /// Sätter in en spaltbrytning vid `at`.
 pub fn insert_column_break(text: &str, at: usize) -> Edit {
     insert_line(text, at, COLUMN_BREAK_LINE)
+}
+
+/// Sätter in en sidbrytning vid `at`.
+pub fn insert_page_break(text: &str, at: usize) -> Edit {
+    insert_line(text, at, PAGE_BREAK_LINE)
 }
 
 /// Egenskaperna för avsnittet som `at` ligger i, och avsnittets index.
@@ -345,6 +403,14 @@ mod tests {
     const MARK: &str = "<!-- kladd: avsnitt; page: A4 landscape; columns: 2; column-gap: 12mm -->";
 
     #[test]
+    fn page_break_line_is_recognised() {
+        assert!(is_page_break(PAGE_BREAK_LINE));
+        assert!(is_page_break(&format!("  {PAGE_BREAK_LINE}  ")));
+        assert!(!is_page_break("<!-- kladd: toc -->"));
+        assert!(SectionProps::from_comment(PAGE_BREAK_LINE).is_none());
+    }
+
+    #[test]
     fn marker_roundtrip() {
         let p = SectionProps::from_comment(MARK).unwrap();
         assert_eq!(p.page_size, Some((841.89, 595.28)));
@@ -363,6 +429,28 @@ mod tests {
         assert!(back.continuous);
         assert_eq!(back.page_margin.map(|m| m.map(|v| v.round())), Some([36.0, 72.0, 36.0, 72.0]));
         assert_eq!(SectionProps::default().to_comment(), "<!-- kladd: avsnitt -->");
+    }
+
+    #[test]
+    fn unequal_widths_and_rule() {
+        let l = "<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 40mm 120mm; column-rule: yes -->";
+        let p = SectionProps::from_comment(l).unwrap();
+        assert_eq!(p.column_widths.as_ref().map(Vec::len), Some(2));
+        assert!(p.column_rule);
+        assert_eq!(p.to_comment(), l);
+        let s = Section::resolve(&p, &DocDefaults::default());
+        assert_eq!(s.columns, 2);
+        assert_eq!(s.col_widths.len(), 2);
+        assert!(s.col_widths[1] > s.col_widths[0] * 2.9);
+        assert!(s.rule);
+        // Bredderna avgör antalet spalter; lika breda bredder är vanliga spalter.
+        let p3 = SectionProps::from_comment("<!-- kladd: avsnitt; column-widths: 30mm 50mm 30mm -->").unwrap();
+        assert_eq!(Section::resolve(&p3, &DocDefaults::default()).columns, 3);
+        let eq = SectionProps::from_comment("<!-- kladd: avsnitt; column-widths: 50mm 50mm -->").unwrap();
+        assert!(Section::resolve(&eq, &DocDefaults::default()).col_widths.is_empty());
+        // Ingen skiljelinje utan flera spalter.
+        let one = SectionProps::from_comment("<!-- kladd: avsnitt; column-rule: yes -->").unwrap();
+        assert!(!Section::resolve(&one, &DocDefaults::default()).rule);
     }
 
     #[test]

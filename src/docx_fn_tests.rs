@@ -67,11 +67,11 @@ fn fixture() -> Vec<u8> {
 }
 
 fn ref_ids(xml: &str) -> Vec<String> {
-    footnote_ids_in(xml)
+    footnote_ids_in(xml, false)
 }
 
 fn note_ids(xml: &str) -> Vec<String> {
-    let (_, items, _) = split_footnotes(xml).unwrap();
+    let (_, items, _) = split_footnotes(xml, "footnote").unwrap();
     items.into_iter().filter(|i| i.1.is_none()).map(|i| i.0).collect()
 }
 
@@ -228,7 +228,7 @@ fn new_footnote_in_a_document_without_footnote_part() {
 fn endnotes_and_custom_marks_stay_opaque() {
     let base = fixture();
     let doc = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {NS}><w:body><w:p><w:r><w:t>A</w:t></w:r><w:r><w:endnoteReference w:id="1"/></w:r><w:r><w:footnoteReference w:id="3" w:customMarkFollows="1"/></w:r><w:r><w:t>*</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {NS}><w:body><w:p><w:r><w:t>A</w:t></w:r><w:r><w:endnoteReference w:id="1" w:customMarkFollows="1"/></w:r><w:r><w:footnoteReference w:id="3" w:customMarkFollows="1"/></w:r><w:r><w:t>*</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
     );
     let b = patch_part(&base, "word/document.xml", |_| doc.clone());
     let l = read(&b).unwrap();
@@ -240,4 +240,65 @@ fn endnotes_and_custom_marks_stay_opaque() {
     let f = part_text(&out, "word/footnotes.xml");
     assert!(f.contains(FN3) && f.contains(SEPARATORS) && !f.contains(r#"w:id="7""#), "{f}");
     assert!(part_text(&out, "word/document.xml").contains(r#"w:customMarkFollows="1""#));
+}
+
+// ---------------------------------------------------------------- slutnoter
+
+#[test]
+fn endnotes_roundtrip_in_fresh_docx() {
+    let md = "Text[^1] och slut[^ei] samt mer[^eii].\n\n[^1]: Fotnot.\n[^ei]: Första slutnoten.\n[^eii]: Andra *slutnoten*.\n";
+    let out = write(md, "x", &|_| None, None).unwrap().bytes;
+    let e = part_text(&out, "word/endnotes.xml");
+    assert!(e.contains(r#"w:type="separator""#) && e.contains(r#"w:type="continuationSeparator""#), "{e}");
+    assert_eq!(e.matches("<w:endnote w:id=").count(), 2, "{e}");
+    assert!(e.contains("<w:endnoteRef/>") && e.contains("EndnoteText"), "{e}");
+    let d = part_text(&out, "word/document.xml");
+    assert_eq!(d.matches("<w:endnoteReference").count(), 2, "{d}");
+    assert_eq!(d.matches("<w:footnoteReference").count(), 1, "{d}");
+    assert!(part_text(&out, "word/_rels/document.xml.rels").contains("/endnotes"));
+    assert!(part_text(&out, "[Content_Types].xml").contains("endnotes+xml"));
+    assert!(part_text(&out, "word/settings.xml").contains("<w:endnotePr>"));
+    // Och tillbaka: fotnoterna numreras för sig, slutnoterna får romerska etiketter.
+    let l = read(&out).unwrap();
+    assert!(l.dropped.is_empty(), "{:?}", l.dropped);
+    assert_eq!(l.markdown.trim_end(), md.trim_end(), "{}", l.markdown);
+}
+
+#[test]
+fn endnotes_read_skips_separators_and_keeps_numbering_apart() {
+    let base = write("A[^ei]\n\n[^ei]: x\n", "x", &|_| None, None).unwrap().bytes;
+    let doc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {NS}><w:body><w:p><w:r><w:t>Först</w:t></w:r><w:r><w:endnoteReference w:id="2"/></w:r><w:r><w:t> sen</w:t></w:r>{}<w:r><w:endnoteReference w:id="1"/></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+        fn_ref(1)
+    );
+    let b = patch_part(&base, "word/document.xml", |_| doc.clone());
+    let en = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:endnotes {NS}><w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:endnote><w:endnote w:id="1"><w:p><w:r><w:endnoteRef/></w:r><w:r><w:t xml:space="preserve"> Ett</w:t></w:r></w:p></w:endnote><w:endnote w:id="2"><w:p><w:r><w:endnoteRef/></w:r><w:r><w:t xml:space="preserve"> Två</w:t></w:r></w:p></w:endnote></w:endnotes>"#
+    );
+    let b = patch_part(&b, "word/endnotes.xml", |_| en.clone());
+    let l = read(&b).unwrap();
+    // Referensernas ordning i texten: slutnot 2, fotnot 1, slutnot 1.
+    assert!(l.markdown.starts_with("Först[^ei] sen[^1][^eii]"), "{}", l.markdown);
+    assert!(l.markdown.contains("[^ei]: Två\n[^eii]: Ett\n"), "{}", l.markdown);
+    // Orört: byte för byte.
+    let out = write(&l.markdown, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    assert_eq!(part_text(&out, "word/endnotes.xml"), part_text(&b, "word/endnotes.xml"));
+    let para = |x: &str| x[x.find("<w:p>").unwrap()..x.find("</w:p>").unwrap()].to_owned();
+    assert_eq!(para(&part_text(&out, "word/document.xml")), para(&part_text(&b, "word/document.xml")));
+}
+
+#[test]
+fn endnote_added_to_document_without_endnotes_part() {
+    let l = read(&fixture()).unwrap();
+    assert!(l.source.is_some());
+    let md = l.markdown.replacen("Slutstycke", "Slutstycke[^ei]", 1) + "[^ei]: Ny slutnot\n";
+    let out = write(&md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    let e = part_text(&out, "word/endnotes.xml");
+    assert!(e.contains("Ny slutnot") && e.contains(r#"w:type="separator""#), "{e}");
+    assert!(part_text(&out, "word/_rels/document.xml.rels").contains("endnotes.xml"));
+    assert!(part_text(&out, "[Content_Types].xml").contains("/word/endnotes.xml"));
+    // Fotnoterna rörs inte.
+    assert_eq!(ref_ids(&part_text(&out, "word/document.xml")), vec!["7", "3"]);
+    let back = read(&out).unwrap();
+    assert!(back.markdown.contains("[^ei]: Ny slutnot"), "{}", back.markdown);
 }

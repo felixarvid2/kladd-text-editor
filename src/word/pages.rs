@@ -42,7 +42,7 @@ pub struct Geom {
 impl Geom {
     pub fn new(zoom: f32, d: &DocDefaults) -> Self {
         let (w, h) = d.page();
-        let [t, r, b, l] = d.margins();
+        let [t, r, b, l] = d.layout_margins();
         // Marginalerna får aldrig äta upp hela sidan.
         let cap = |m: f32, dim: f32| m.clamp(0.0, dim * 0.4);
         Self {
@@ -106,6 +106,12 @@ impl Geom {
 /// rad av sin höjd, så att en bild som inte ryms flyttas till nästa sida tillsammans med texten
 /// efter den.
 pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], groups: &[std::ops::Range<usize>]) {
+    paginate_breaks(g, geom, ppp, floats, groups, &[]);
+}
+
+/// Som `paginate`, men raderna i `breaks` (stigande; sidbrytningsraderna, `<!-- kladd: sidbrytning -->`)
+/// börjar alltid en ny sida om den nuvarande har innehåll.
+pub fn paginate_breaks(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], groups: &[std::ops::Range<usize>], breaks: &[usize]) {
     if g.rows.is_empty() {
         return;
     }
@@ -136,7 +142,8 @@ pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], 
         let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
         let top = y0 + shift;
         let page_top = page as f32 * stride;
-        if top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
+        let forced = breaks.binary_search(&i).is_ok();
+        if forced && top > page_top + eps || top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
             // Nästa sida, men inte över en rad som sträcker sig förbi arket.
             page += 1;
             while (page as f32 * stride) < prev_bottom - eps {
@@ -177,6 +184,15 @@ pub fn sheet_shapes(p: &Palette, boxes: &[PageBox], base: f32, origin_y: f32, cl
         }
         shadows.push(Shape::rect_filled(r.translate(vec2(0.0, 2.0)).expand(1.5), 2.0, p.page_shadow));
         sheets.push(Shape::rect_filled(r, 1.0, p.page));
+        // Skiljelinje mellan spalterna: från delens överkant till det nedersta som ligger i den.
+        for (k, reg) in b.regions.iter().enumerate() {
+            let end = b.regions.get(k + 1).map_or(b.text_bottom(), |n| n.y0).min(reg.used.max(reg.y0));
+            let (y0, y1) = (origin_y + reg.y0, origin_y + end);
+            for x in reg.rule_xs() {
+                let x = base + b.text_left() + x;
+                sheets.push(Shape::line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], Stroke::new(0.75, p.muted)));
+            }
+        }
     }
     (Shape::Vec(shadows), Shape::Vec(sheets))
 }
@@ -451,6 +467,10 @@ mod tests {
 
     /// Ett galleri med många rader (en per stycke) som `paginate` sedan bryter.
     fn paged(n: usize, tall: Option<(usize, f32)>) -> Arc<Galley> {
+        paged_breaks(n, tall, &[])
+    }
+
+    fn paged_breaks(n: usize, tall: Option<(usize, f32)>, breaks: &[usize]) -> Arc<Galley> {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         let mut out = None;
@@ -470,12 +490,29 @@ mod tests {
                 }
                 job.wrap.max_width = 200.0;
                 let mut g = ui.ctx().fonts_mut(|f| f.layout_job(job));
-                paginate(Arc::make_mut(&mut g), &geom(), 1.0, &[], &[]);
+                paginate_breaks(Arc::make_mut(&mut g), &geom(), 1.0, &[], &[], breaks);
                 out = Some(g);
             });
             std::mem::forget(r);
         }
         out.unwrap()
+    }
+
+    #[test]
+    fn sidbrytning_borjar_ny_sida() {
+        let geom = geom();
+        // Rad 3 är en sidbrytningsrad; rad 0 står redan överst på sidan (ingen tom sida först).
+        let g = paged_breaks(8, None, &[0, 3]);
+        let page = |i: usize| geom.page_of(g.rows[i].pos.y);
+        assert_eq!(page(0), 0);
+        assert_eq!(page(2), 0);
+        assert_eq!(page(3), 1, "brytningsraden börjar den nya sidan");
+        assert!((g.rows[3].pos.y - geom.stride()).abs() < 0.01);
+        assert_eq!(page(4), 1);
+        assert_eq!(page(7), 1);
+        assert_eq!(page_count(&g, &geom), 2);
+        // Utan brytningar ryms allt på en sida.
+        assert_eq!(page_count(&paged(8, None), &geom), 1);
     }
 
     #[test]

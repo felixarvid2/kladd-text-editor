@@ -176,9 +176,26 @@ headings = 1
 dropped = []
 headings = 2
 
+["docx/gen-nyhetsbrev-lo.docx"]
+dropped = []
+headings = 9
+
+["docx/gen-nyhetsbrev.docx"]
+dropped = []
+headings = 9
+
 ["docx/gen-sidhuvud-sektioner.docx"]
 dropped = []
 headings = 2
+
+["docx/gen-skolrapport-lo.docx"]
+dropped = []
+headings = 9
+
+["docx/gen-skolrapport.docx"]
+dropped = []
+headings = 9
+note = "textrutan (faktarutan i marginalen) syns inte som text; sidhuvudet med logga och tabell läses som text utan bild"
 
 ["docx/gen-spara-andringar.docx"]
 dropped = []
@@ -237,8 +254,7 @@ dropped = []
 headings = 0
 
 ["docx/mammoth-text-box.docx"]
-empty = true
-note = "innehållet är en textruta som bevaras orörd vid sparning men inte visas som text"
+note = "innehållet är en textruta: visas som ett `<!--k:tb N-->`-block och sparas orörd om texten inte ändras"
 dropped = []
 headings = 0
 
@@ -899,9 +915,20 @@ headings = 1
 dropped = ["diagram och former"]
 headings = 2
 
+["odt/gen-nyhetsbrev-lo.odt"]
+dropped = []
+headings = 9
+note = "textrutan syns inte som text"
+skip_idempotent = "textrutans stycken får dokumentets justering när de skrivs (LibreOffice-rutan hade ingen)"
+
 ["odt/gen-sidhuvud-sektioner.odt"]
 dropped = []
 headings = 2
+
+["odt/gen-skolrapport-lo.odt"]
+dropped = []
+headings = 9
+note = "textrutan (faktarutan) syns inte som text"
 
 ["odt/gen-spara-andringar.odt"]
 dropped = []
@@ -959,7 +986,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-btlr-frame.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-chapter-number-new-line.odt"]
@@ -983,19 +1010,19 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-fdo66811-1.odt"]
-dropped = ["textrutor"]
-headings = 0
+dropped = []
+headings = 1
 
 ["odt/lo-export-fdo79358.odt"]
 dropped = []
 headings = 0
 
 ["odt/lo-export-fillbitmap3.odt"]
-dropped = ["diagram och former", "textrutor"]
+dropped = ["diagram och former"]
 headings = 0
 
 ["odt/lo-export-framebackgrounds.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-gerrit13858.odt"]
@@ -1051,7 +1078,7 @@ dropped = ["diagram och former"]
 headings = 0
 
 ["odt/lo-export-redlineTextFrame.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-referencelanguage.odt"]
@@ -1059,11 +1086,11 @@ dropped = []
 headings = 12
 
 ["odt/lo-export-relh-page.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-relw-page.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-resolved-comment.odt"]
@@ -1155,7 +1182,7 @@ dropped = []
 headings = 7
 
 ["odt/lo-export-tdf111891_frameVertStyle.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-tdf114287.odt"]
@@ -1246,7 +1273,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-tdf169882.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 9
 
 ["odt/lo-export-tdf57317_autoListName.odt"]
@@ -1275,15 +1302,16 @@ dropped = ["diagram och former"]
 headings = 0
 
 ["odt/lo-export-textframe-gradient.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
+skip_idempotent = "en ruta som är bredare än textytan krymps till textytans bredd vid sparning"
 
 ["odt/lo-export-textframe-transparent-shadow.odt"]
 dropped = []
 headings = 0
 
 ["odt/lo-export-textframe-vertadjust.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-user-field-decl-fly.odt"]
@@ -1299,11 +1327,11 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-whitespace.odt"]
-dropped = ["diagram och former", "textrutor"]
+dropped = ["diagram och former"]
 headings = 0
 
 ["odt/lo-export-z-index-header.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-BibliographyEntryField.odt"]
@@ -1311,7 +1339,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-PageBackground.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 skip_idempotent = "textfärg från sidmall tappas"
 
@@ -1362,7 +1390,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-fdo68839.odt"]
-dropped = ["diagram och former", "textrutor"]
+dropped = ["diagram och former"]
 headings = 0
 
 ["odt/lo-import-fdo69862.odt"]
@@ -1390,7 +1418,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-fdo81223.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 skip_edit = "ändrat stycke i högerjusterat dokument ger tomt block"
 
@@ -1399,11 +1427,11 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-fdo90130-1.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-fdo90130-2.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-feature_table.odt"]
@@ -1468,11 +1496,11 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-tdf100033_1.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-tdf100033_2.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-tdf103025.odt"]
@@ -1505,7 +1533,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-tdf123968.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/lo-import-tdf128737.odt"]
@@ -1599,7 +1627,7 @@ dropped = []
 headings = 0
 
 ["odt/odfpy-imageslabels.odt"]
-dropped = ["textrutor"]
+dropped = []
 headings = 0
 
 ["odt/odfpy-nasty.odt"]
@@ -1815,3 +1843,4 @@ pages = 2
 dropped = ["sidlayouten", "typsnitten"]
 headings = 0
 pages = 1
+

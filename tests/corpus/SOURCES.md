@@ -28,6 +28,19 @@ tappar då formeln, så `gen-innehall-formler.odt` byggs av `generate/mkmath.py`
 `gen-innehall-formler.docx` får en OMML-formel av `generate/omml.py`. Skripten körs från `generate/`.
 `mk.py <utmapp>` skriver `.fodt`-filerna.
 
+Två dokument (sex filer) efterliknar riktiga filer från Word 365 och LibreOffice (påhittad svensk text, MIT som Kladd):
+nyhetsbrev (rubrik över hela bredden, avsnitt med 2 spalter och skiljelinje, spaltbrytning, bild i spalten, textruta med ram och
+fyllning, avsnitt med 3 spalter av olika bredd) och skolrapport (titelsida utan sidhuvud, sidhuvud med logga och
+rapportnamn, "Sida X av Y", udda/jämna sidhuvuden, fotnoter, slutnoter, innehållsförteckning, faktaruta i marginalen).
+`gen-nyhetsbrev.docx` och `gen-skolrapport.docx` skrivs av `generate/mknyhetsbrev.py` och `generate/mkskolrapport.py`
+(hjälpmodul `wordgen.py`) som handskriven XML med Word 365:s delar och namnrymder (mc:Ignorable, w14, rsid, theme,
+fontTable, webSettings, settings med docDefaults i styles; textrutor som mc:AlternateContent med wps i Choice och VML i
+Fallback). Fältkoderna PAGE/NUMPAGES finns både som `w:fldSimple` (udda sidor) och som `w:fldChar` (jämna sidor).
+`gen-nyhetsbrev-lo.*` och `gen-skolrapport-lo.*` kommer från `generate/nyhetsbrev-lo.fodt` och `skolrapport-lo.fodt`
+(skrivs av `mklo.py`; spalter, `draw:frame` + `draw:text-box`, sidhuvud med bild, `text:page-number`/`text:page-count`,
+annorlunda första sida, olika udda/jämna sidhuvuden), konverterade med `soffice --headless --convert-to odt|docx`.
+`sh generate/bygg-nyhetsbrev-skolrapport.sh` bygger alla sex filerna.
+
 ## Fil för fil
 
 | Fil | Källa | Licens |
@@ -74,7 +87,11 @@ tappar då formeln, så `gen-innehall-formler.odt` byggs av `generate/mkmath.py`
 | `docx/gen-bild-listor.docx` | genererad här, se generate/ | MIT (som Kladd) |
 | `docx/gen-fotnoter-kommentarer.docx` | genererad här, se generate/ | MIT (som Kladd) |
 | `docx/gen-innehall-formler.docx` | genererad här, se generate/ | MIT (som Kladd) |
+| `docx/gen-nyhetsbrev-lo.docx` | genererad här, se generate/ | MIT (som Kladd) |
+| `docx/gen-nyhetsbrev.docx` | genererad här, se generate/ | MIT (som Kladd) |
 | `docx/gen-sidhuvud-sektioner.docx` | genererad här, se generate/ | MIT (som Kladd) |
+| `docx/gen-skolrapport-lo.docx` | genererad här, se generate/ | MIT (som Kladd) |
+| `docx/gen-skolrapport.docx` | genererad här, se generate/ | MIT (som Kladd) |
 | `docx/gen-spara-andringar.docx` | genererad här, se generate/ | MIT (som Kladd) |
 | `docx/gen-tabeller-sammanslagna.docx` | genererad här, se generate/ | MIT (som Kladd) |
 | `docx/mammoth-comments.docx` | https://github.com/mwilliamson/mammoth.js/blob/master/test/test-data/comments.docx | BSD-2-Clause |
@@ -256,7 +273,9 @@ tappar då formeln, så `gen-innehall-formler.odt` byggs av `generate/mkmath.py`
 | `odt/gen-bild-listor.odt` | genererad här, se generate/ | MIT (som Kladd) |
 | `odt/gen-fotnoter-kommentarer.odt` | genererad här, se generate/ | MIT (som Kladd) |
 | `odt/gen-innehall-formler.odt` | genererad här, se generate/ | MIT (som Kladd) |
+| `odt/gen-nyhetsbrev-lo.odt` | genererad här, se generate/ | MIT (som Kladd) |
 | `odt/gen-sidhuvud-sektioner.odt` | genererad här, se generate/ | MIT (som Kladd) |
+| `odt/gen-skolrapport-lo.odt` | genererad här, se generate/ | MIT (som Kladd) |
 | `odt/gen-spara-andringar.odt` | genererad här, se generate/ | MIT (som Kladd) |
 | `odt/gen-tabeller-sammanslagna.odt` | genererad här, se generate/ | MIT (som Kladd) |
 | `odt/lo-export-DUMMY2.odt` | https://github.com/LibreOffice/core/blob/master/sw/qa/extras/odfexport/data/DUMMY2.odt | MPL-2.0 |

@@ -202,6 +202,42 @@ pub enum LineRule {
     AtLeast(f32),
 }
 
+/// Vågrätt läge för en ram med egen bredd (textruta).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrameX {
+    /// Avstånd från spaltens vänsterkant (punkter).
+    Off(f32),
+    Start,
+    Center,
+    End,
+}
+
+/// En ram med egen bredd och eget läge i spalten (textruta): stycket och dess grannar i rutan
+/// får indrag så att texten hamnar i rutan. Längder i punkter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    /// Rutans ytterbredd.
+    pub w: f32,
+    pub x: FrameX,
+    /// Luft mellan rutans kant och texten (vänster, höger), inklusive kantlinjen.
+    pub pl: f32,
+    pub pr: f32,
+}
+
+impl Frame {
+    /// Rutans vänsterkant och ytterbredd i en spalt `avail` punkter bred.
+    pub fn span(&self, avail: f32) -> (f32, f32) {
+        let w = self.w.clamp(1.0, avail.max(1.0));
+        let l = match self.x {
+            FrameX::Off(v) => v,
+            FrameX::Start => 0.0,
+            FrameX::Center => (avail - w) / 2.0,
+            FrameX::End => avail - w,
+        };
+        (l.clamp(0.0, (avail - w).max(0.0)), w)
+    }
+}
+
 /// Styckeegenskaper (allt valfritt: bara det som anges gäller). Längder i punkter.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PPr {
@@ -215,6 +251,8 @@ pub struct PPr {
     pub right: Option<f32>,
     /// Första radens indrag; negativt = hängande.
     pub first: Option<f32>,
+    /// Ram med egen bredd och eget läge (textruta); går före `left`/`right`.
+    pub frame: Option<Frame>,
 }
 
 fn num(v: f32) -> String {
@@ -235,6 +273,7 @@ impl PPr {
             left: self.left.or(base.left),
             right: self.right.or(base.right),
             first: self.first.or(base.first),
+            frame: self.frame.or(base.frame),
         }
     }
 
@@ -254,6 +293,15 @@ impl PPr {
             && self.shd == o.shd
             && self.left.unwrap_or(0.0) == o.left.unwrap_or(0.0)
             && self.right.unwrap_or(0.0) == o.right.unwrap_or(0.0)
+            && self.frame == o.frame
+    }
+
+    /// Textens indrag (vänster, höger) och rutans vänsterkant och bredd i en spalt `avail` punkter bred,
+    /// om stycket ligger i en ram med egen bredd.
+    pub fn frame_geom(&self, avail: f32) -> Option<(f32, f32, f32, f32)> {
+        let f = self.frame?;
+        let (l, w) = f.span(avail);
+        Some((l + f.pl, (avail - l - w).max(0.0) + f.pr, l, w))
     }
 
     pub fn has_spacing(&self) -> bool {
@@ -323,6 +371,15 @@ impl PPr {
         if !ind.is_empty() {
             s.push_str(&format!(" ind=\"{}\"", ind.join(" ")));
         }
+        if let Some(f) = self.frame {
+            let x = match f.x {
+                FrameX::Off(v) => num(v),
+                FrameX::Start => "start".into(),
+                FrameX::Center => "center".into(),
+                FrameX::End => "end".into(),
+            };
+            s.push_str(&format!(" fr=\"w={} x={x} pl={} pr={}\"", num(f.w), num(f.pl), num(f.pr)));
+        }
         s.push_str("-->");
         s
     }
@@ -382,6 +439,27 @@ impl PPr {
                             _ => {}
                         }
                     }
+                }
+                "fr" => {
+                    let (mut w, mut x, mut pl, mut pr) = (None, FrameX::Start, 0.0, 0.0);
+                    for part in v.split_whitespace() {
+                        let Some((k, v)) = part.split_once('=') else { continue };
+                        match k {
+                            "w" => w = v.parse::<f32>().ok(),
+                            "pl" => pl = v.parse().unwrap_or(0.0),
+                            "pr" => pr = v.parse().unwrap_or(0.0),
+                            "x" => {
+                                x = match v {
+                                    "start" => FrameX::Start,
+                                    "center" => FrameX::Center,
+                                    "end" => FrameX::End,
+                                    o => FrameX::Off(o.parse().unwrap_or(0.0)),
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    pp.frame = w.filter(|w| *w > 0.0 && w.is_finite()).map(|w| Frame { w, x, pl, pr });
                 }
                 _ => {}
             }
@@ -570,6 +648,7 @@ mod tests {
             left: Some(36.0),
             right: None,
             first: Some(-18.0),
+            frame: Some(Frame { w: 200.0, x: FrameX::Off(12.5), pl: 8.0, pr: 8.0 }),
         };
         let m = pp.marker();
         assert!(m.starts_with("<!--k:pp ") && m.ends_with("-->") && !m.contains("--->") && !m[4..m.len() - 3].contains("--"), "{m}");

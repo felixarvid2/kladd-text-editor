@@ -119,6 +119,8 @@ struct Style {
     span: SpanStyle,
     /// Fotnotsnummer (1-baserat): texten ritas som litet upphöjt nummer.
     fnref: Option<usize>,
+    /// Slutnotsnummer (romerskt tal): ritas upphöjt men hör inte till någon sida.
+    endref: bool,
     /// Formel (LaTeX-kod, egen rad): ritas som glyfer; `Span::text` är koden.
     math: Option<(String, bool)>,
 }
@@ -131,7 +133,8 @@ struct Span {
 
 enum Block {
     Heading(u8, Vec<Span>, Align),
-    Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align },
+    /// `look`: ram, fyllning och bredd ur `<!--k:pp …-->` (`word::pbox`).
+    Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align, look: Option<crate::word::pbox::PPr> },
     Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
     Code { text: String, indent: f32 },
     /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
@@ -144,6 +147,7 @@ enum Block {
     SectionBreak(SectionProps),
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     ColumnBreak,
+    PageBreak,
 }
 
 /// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
@@ -153,7 +157,7 @@ fn strip_markers(s: &str) -> String {
     while let Some(i) = rest.find("<!--k:") {
         let after = &rest[i + 6..];
         match after.find("-->") {
-            Some(j) if after[..j].chars().all(|c| c.is_ascii_digit()) || crate::word::pbox::is_marker(&rest[i..i + 6 + j + 3]) => {
+            Some(j) if after[..j].chars().all(|c| c.is_ascii_digit()) || crate::word::pbox::is_marker(&rest[i..i + 6 + j + 3]) || crate::docx_tbox::is_mark(&rest[i..i + 6 + j + 3]) => {
                 out.push_str(&rest[..i]);
                 rest = &after[j + 3..];
             }
@@ -252,6 +256,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     opts.insert(crate::style::titles::OPTS);
     // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
     let mut note_labels: Vec<String> = Vec::new();
+    let mut end_labels: Vec<String> = Vec::new();
     let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
     let mut note_cur: Option<(String, Vec<Block>)> = None;
 
@@ -275,6 +280,8 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     let mut table: Option<Vec<Vec<Vec<Span>>>> = None;
     let mut row: Vec<Vec<Span>> = Vec::new();
 
+    // Styckeutseendet (`k:pp`) som hör till stycket som läses; `flush` lägger det på stycket.
+    let look_cell: std::cell::RefCell<Option<crate::word::pbox::PPr>> = std::cell::RefCell::new(None);
     let indent_now = |lists: &Vec<Option<u64>>, quote: u8| lists.len() as f32 * INDENT + quote as f32 * 14.0;
 
     let flush = |spans: &mut Vec<Span>,
@@ -284,6 +291,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                  lists: &Vec<Option<u64>>,
                  quote: u8,
                  align: Align| {
+        let look = look_cell.borrow_mut().take();
         if spans.iter().all(|s| s.text.trim().is_empty()) && pending_marker.is_none() {
             spans.clear();
             return;
@@ -299,7 +307,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         } else if let Some(m) = pending_marker.take() {
             blocks.push(Block::Item { spans: taken, indent, marker: m, quote, align });
         } else {
-            blocks.push(Block::Para { spans: taken, indent, quote, align });
+            blocks.push(Block::Para { spans: taken, indent, quote, align, look: look.filter(|l| l.has_box() || l.frame.is_some()) });
         }
     };
 
@@ -483,6 +491,11 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => {
                 // Ett HTML-block kan ha flera rader; varje rad som är en känd tagg tolkas för sig.
                 let mut first = true;
+                for line in t.split('\n') {
+                    if let Some(pp) = crate::word::pbox::PPr::parse_marker(line.trim()) {
+                        *look_cell.borrow_mut() = Some(pp);
+                    }
+                }
                 let t = strip_markers(&t);
                 for line in t.split('\n') {
                     let tag = line.trim();
@@ -517,6 +530,9 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     } else if let Some(props) = SectionProps::from_comment(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::SectionBreak(props));
+                    } else if sections::is_page_break(tag) {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::PageBreak);
                     } else if sections::is_column_break(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::ColumnBreak);
@@ -539,6 +555,18 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
             }
             MdEvent::TaskListMarker(done) => push_text(&mut spans, if done { "☑ " } else { "☐ " }, &style),
             MdEvent::FootnoteReference(t) if note_cur.is_some() => push_text(&mut spans, &format!("[{t}]"), &style),
+            // Slutnoter: romersk siffra upphöjd i texten, noten kommer efter sista texten.
+            MdEvent::FootnoteReference(t) if crate::word::markup::is_endnote_label(&t) => {
+                let n = match end_labels.iter().position(|l| l.as_str() == &*t) {
+                    Some(i) => i + 1,
+                    None => {
+                        end_labels.push(t.to_string());
+                        end_labels.len()
+                    }
+                };
+                let st = Style { endref: true, ..style.clone() };
+                spans.push(Span { text: crate::word::markup::roman(n), style: st });
+            }
             MdEvent::FootnoteReference(t) => {
                 // Samma etikett flera gånger är samma fotnot (som i Markdown).
                 let n = match note_labels.iter().position(|l| l.as_str() == &*t) {
@@ -558,6 +586,18 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         .iter()
         .map(|l| note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default())
         .collect();
+    // Slutnoterna efter sista texten, under en linje (hela dokumentet, inte per sida).
+    if !end_labels.is_empty() {
+        blocks.push(Block::Rule);
+        for (i, l) in end_labels.iter().enumerate() {
+            let mut spans = vec![
+                Span { text: crate::word::markup::roman(i + 1), style: Style { endref: true, ..Style::default() } },
+                Span { text: " ".into(), style: Style::default() },
+            ];
+            spans.extend(note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default());
+            blocks.push(Block::Para { spans, indent: 0.0, quote: 0, align: Align::Left, look: None });
+        }
+    }
     (blocks, notes)
 }
 
@@ -590,6 +630,8 @@ struct PageGeom {
 struct PageOps {
     ops: Vec<Op>,
     geom: PageGeom,
+    /// Avsnittet sidan börjar i (för sidhuvud, sidfot och sidnummer).
+    sec: usize,
 }
 
 struct Heading {
@@ -638,11 +680,19 @@ struct Layout<'a> {
     text_l: f32,
     text_w: f32,
     col_w: f32,
+    /// Spaltbredderna när de är olika breda (annars tom), och skiljelinje mellan spalterna.
+    col_ws: Vec<f32>,
+    rule: bool,
     rt: f32,
     /// Längsta y som använts i spalter som lämnats på sidan (för löpande avsnitt).
     page_ymax: f32,
     /// Räknas upp vid varje spalt- eller sidbyte.
     breaks: usize,
+    /// Avsnittet vi står i och om en avsnittsrad redan setts (en rad före all text gäller första avsnittet).
+    cur_sec: usize,
+    sec_row_seen: bool,
+    /// Minsta marginal uppifrån och nedifrån per avsnitt för sidhuvud och sidfot (`hf::Plan::reserve`).
+    hf_reserve: Vec<[f32; 2]>,
     /// Fotnoternas text (nummer − 1), och de som hör till sidan som läggs ut just nu.
     notes: Vec<Vec<Span>>,
     page_notes: Vec<usize>,
@@ -774,7 +824,7 @@ impl<'a> Layout<'a> {
             _ => Face::Sans,
         };
         let (pw, ph) = defaults.page();
-        let [mt, mr, mb, ml] = defaults.margins();
+        let [mt, mr, mb, ml] = defaults.layout_margins();
         // Orimliga marginaler (större än sidan) ger ändå en användbar textyta.
         let cw = (pw - ml - mr).max(36.0);
         Layout {
@@ -805,9 +855,14 @@ impl<'a> Layout<'a> {
             text_l: ml,
             text_w: cw,
             col_w: cw,
+            col_ws: Vec::new(),
+            rule: false,
             rt: mt,
             page_ymax: 0.0,
             breaks: 0,
+            cur_sec: 0,
+            sec_row_seen: false,
+            hf_reserve: Vec::new(),
             notes: Vec::new(),
             page_notes: Vec::new(),
             reserved: 0.0,
@@ -875,42 +930,78 @@ impl<'a> Layout<'a> {
         self.y += PARA_GAP;
     }
 
-    /// Sidhuvud och sidfot för sidan `f.page` (1-baserad) av `f.pages`, som ritinstruktioner.
-    /// Baslinjen ligger halvvägs mellan sidkanten och marginalen på sidans egen storlek (avsnitt kan ha
-    /// olika). Delarna vänster|mitten|höger ritas var för sig.
+    /// Sidhuvud och sidfot för sidan `f.page` (1-baserad) av `f.pages` i ett dokument utan avsnitt.
+    #[cfg(test)]
     fn header_footer(&mut self, d: &DocDefaults, f: &style::Fields) -> Vec<Op> {
-        let size = self.body * 0.9;
-        let g = self.pages.get(f.page.wrapping_sub(1)).map_or(
+        let plan = crate::hf::Plan::new(d, &[]);
+        let pp = plan.pages(&vec![0; f.pages]);
+        self.header_footer_page(d, &plan, &pp, f, f.page.wrapping_sub(1))
+    }
+
+    /// Sidhuvud och sidfot för ark `k` (0-baserat) som ritinstruktioner. Raden ställs upp av
+    /// `hf::layout_zone` på sidans egen storlek (avsnitt kan ha olika): avstånd från sidkanten,
+    /// delar vänster|mitten|höger, bilder och linjen mot brödtexten. `base` har sidantalet.
+    fn header_footer_page(&mut self, d: &DocDefaults, plan: &crate::hf::Plan, pp: &crate::hf::PagePlan, base: &style::Fields, k: usize) -> Vec<Op> {
+        use crate::hf::{self, Placed};
+        let g = self.pages.get(k).map_or(
             PageGeom { pw: self.pw, ph: self.ph, mt: self.mt, mb: self.mb, ml: self.text_l, cw: self.text_w },
             |p| p.geom,
         );
-        let mut out = Vec::new();
-        let first = f.page == 1 && d.different_first();
+        let hf_page = plan.page(pp, k, base);
+        let f = &hf_page.fields;
+        // Utan eget sidfotstecken visas ändå "N av M" till höger när dokumentet har flera sidor.
+        let first = d.different_first() && k == 0;
+        let auto_footer = (d.footer.is_none() && d.footer_even.is_none() && plan.secs.len() == 1 && !first && f.pages > 1).then(|| "{sida} av {sidor}".to_owned());
         let items = [
-            (d.header_template(f.page - 1).map(str::to_owned), d.header_align, g.mt / 2.0),
+            (false, hf_page.header.map(str::to_owned), hf_page.header_align, &d.header_style, d.header_dist),
             (
-                // Utan eget sidfotstecken visas ändå "N av M" till höger när dokumentet har flera sidor.
-                d.footer_template(f.page - 1)
-                    .map(str::to_owned)
-                    .or_else(|| (d.footer.is_none() && !first && f.pages > 1).then(|| "{sida} av {sidor}".to_owned())),
-                if d.footer.is_some() || first { d.footer_align } else { Align::Right },
-                g.ph - g.mb / 2.0,
+                true,
+                hf_page.footer.map(str::to_owned).or(auto_footer.clone()),
+                if auto_footer.is_some() { Align::Right } else { hf_page.footer_align },
+                &d.footer_style,
+                d.footer_dist,
             ),
         ];
-        for (tpl, align, y) in items {
+        let mut out = Vec::new();
+        for (footer, tpl, align, st, dist) in items {
             let Some(tpl) = tpl else { continue };
-            for (i, part) in style::parts_of(&tpl, align).iter().enumerate() {
-                let text = style::fill_fields(part, f).replace('\n', " ");
-                if text.trim().is_empty() {
+            let parts = hf::filled_parts(&tpl, align, f);
+            let size = st.size.unwrap_or(self.body * 0.9);
+            let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
+            // Bilderna först: de behöver sin egen storlek för uppställningen.
+            let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
+            for src in parts.iter().flat_map(|p| hf::image_srcs(p)) {
+                if loaded.contains_key(&src) {
                     continue;
                 }
-                let w = self.m.width(self.base, size, &text);
-                let x = match i {
-                    1 => g.ml + ((g.cw - w) / 2.0).max(0.0),
-                    2 => g.ml + (g.cw - w).max(0.0),
-                    _ => g.ml,
-                };
-                out.push(Op::Text { x, y, face: self.base, size, text, color: MUTED, italic: false });
+                if let Some(img) = (self.resolve)(&src).and_then(|i| make_image(&i.bytes)) {
+                    let (pw, ph) = img.size();
+                    self.images.push(img);
+                    loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
+                }
+            }
+            let base_face = self.base;
+            let m = std::cell::RefCell::new(&mut self.m);
+            let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
+            let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
+            let zn = hf::layout_zone(&parts, size, 1.0, g.cw, &measure, &natural);
+            let edge = dist.unwrap_or(hf::DEFAULT_DIST);
+            let top = if footer { g.ph - edge - zn.height } else { edge };
+            for it in &zn.items {
+                match it {
+                    Placed::Text { x, y, text, size } => {
+                        out.push(Op::Text { x: g.ml + x, y: top + y + size * 0.95, face: self.base, size: *size, text: text.clone(), color, italic: st.italic });
+                    }
+                    Placed::Image { x, y, w, h, src, anchored } => {
+                        let Some((index, ..)) = loaded.get(src) else { continue };
+                        let (ox, oy) = if *anchored { (0.0, 0.0) } else { (g.ml, top) };
+                        out.push(Op::Image { x: ox + x, y: oy + y, w: *w, h: *h, index: *index, crop: None });
+                    }
+                }
+            }
+            if let Some((c, w)) = st.line {
+                let y = if footer { top - 3.0 } else { top + zn.height + 3.0 };
+                out.push(Op::Line { x1: g.ml, y1: y, x2: g.ml + g.cw, y2: y, width: w, color: (c[0], c[1], c[2]) });
             }
         }
         out
@@ -953,8 +1044,8 @@ impl<'a> Layout<'a> {
         if self.cols > 1 && self.col + 1 < self.cols && !self.pages.is_empty() {
             self.page_ymax = self.page_ymax.max(self.y);
             self.col += 1;
-            self.ml = self.text_l + self.col as f32 * (self.col_w + self.gap);
-            self.cw = self.col_w;
+            self.ml = self.text_l + self.col_left(self.col);
+            self.cw = self.col_width(self.col);
             self.y = self.rt;
             self.floats.clear();
             self.breaks += 1;
@@ -967,22 +1058,54 @@ impl<'a> Layout<'a> {
         PageGeom { pw: self.pw, ph: self.ph, mt: self.mt, mb: self.mb, ml: self.text_l, cw: self.text_w }
     }
 
+    /// Spaltens bredd.
+    fn col_width(&self, c: usize) -> f32 {
+        self.col_ws.get(c).copied().unwrap_or(self.col_w)
+    }
+
+    /// Spaltens vänsterkant från textytans vänsterkant.
+    fn col_left(&self, c: usize) -> f32 {
+        (0..c).map(|k| self.col_width(k) + self.gap).sum()
+    }
+
+    /// Skiljelinjerna mellan spalterna för delen av sidan som just lämnas (från spalternas överkant
+    /// till längsta använda höjd), ritade med sidans innehåll.
+    fn flush_rules(&mut self) {
+        let end = self.y.max(self.page_ymax);
+        if !self.rule || self.cols < 2 || self.pages.is_empty() || end <= self.rt + 1.0 {
+            return;
+        }
+        let (rt, text_l) = (self.rt, self.text_l);
+        let xs: Vec<f32> = (0..self.cols - 1).map(|c| text_l + self.col_left(c) + self.col_width(c) + self.gap / 2.0).collect();
+        for x in xs {
+            self.page().ops.push(Op::Line { x1: x, y1: rt, x2: x, y2: end, width: 0.5, color: MUTED });
+        }
+    }
+
     fn real_page(&mut self) {
+        self.flush_rules();
+        self.start_page();
+    }
+
+    fn start_page(&mut self) {
         self.flush_notes();
         let geom = self.page_geom();
-        self.pages.push(PageOps { ops: Vec::new(), geom });
+        let sec = self.cur_sec;
+        self.pages.push(PageOps { ops: Vec::new(), geom, sec });
         self.y = self.mt;
         self.rt = self.mt;
         self.page_ymax = 0.0;
         self.col = 0;
         self.ml = self.text_l;
-        self.cw = self.col_w;
+        self.cw = self.col_width(0);
         self.breaks += 1;
     }
 
     /// Tar avsnittets sidstorlek, marginaler och spalter i bruk (sidan eller spalten byts av anroparen).
     fn set_section(&mut self, sec: &Section) {
         let [mt, mr, mb, ml] = sec.margin;
+        let res = self.hf_reserve.get(self.cur_sec).copied().unwrap_or([0.0; 2]);
+        let (mt, mb) = (mt.max(res[0]), mb.max(res[1]));
         self.pw = sec.page.0;
         self.ph = sec.page.1;
         self.mt = mt;
@@ -993,9 +1116,17 @@ impl<'a> Layout<'a> {
         let n = self.cols as f32;
         self.gap = if self.cols > 1 { sec.gap.min(((self.text_w - 18.0 * n) / (n - 1.0)).max(0.0)) } else { 0.0 };
         self.col_w = ((self.text_w - self.gap * (n - 1.0)) / n).max(18.0);
+        // Olika breda spalter skalas så att de med mellanrummen fyller textytan.
+        let sum: f32 = sec.col_widths.iter().sum();
+        self.col_ws = if self.cols > 1 && sec.col_widths.len() == self.cols && sum > 0.0 {
+            sec.col_widths.iter().map(|w| (w / sum * (self.text_w - self.gap * (n - 1.0))).max(18.0)).collect()
+        } else {
+            Vec::new()
+        };
+        self.rule = sec.rule && self.cols > 1;
         self.col = 0;
         self.ml = ml;
-        self.cw = self.col_w;
+        self.cw = self.col_width(0);
     }
 
     /// Avsnittsbrytning: ny sida med avsnittets mått, eller (löpande, samma sidstorlek) vidare på samma sida.
@@ -1005,12 +1136,21 @@ impl<'a> Layout<'a> {
         let same_sheet = [(self.pw, sec.page.0), (self.ph, sec.page.1), (self.mt, sec.margin[0]), (self.mb, sec.margin[2]), (self.text_l, sec.margin[3])]
             .iter()
             .all(|(a, b)| (a - b).abs() < 0.5);
+        if !page_empty {
+            self.flush_rules();
+        }
+        if !(self.pages.len() <= 1 && page_empty && !self.sec_row_seen) {
+            self.cur_sec += 1;
+        }
+        self.sec_row_seen = true;
         if page_empty {
             // Början av dokumentet (eller två rader i rad): sidan görs om i stället för att lämnas tom.
             self.set_section(&sec);
             let geom = self.page_geom();
+            let cur = self.cur_sec;
             if let Some(p) = self.pages.last_mut() {
                 p.geom = geom;
+                p.sec = cur;
             }
             self.y = self.mt;
             self.rt = self.mt;
@@ -1026,7 +1166,7 @@ impl<'a> Layout<'a> {
         } else {
             self.flush_notes();
             self.set_section(&sec);
-            self.real_page();
+            self.start_page();
         }
     }
 
@@ -1091,7 +1231,7 @@ impl<'a> Layout<'a> {
             let face = face_for(&s.style, base);
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
-            let sz = if s.style.fnref.is_some() { sz * 0.65 } else { sz };
+            let sz = if s.style.fnref.is_some() || s.style.endref { sz * 0.65 } else { sz };
             if let Some((src, disp)) = &s.style.math {
                 if let Some(f) = crate::math::formula(src, *disp) {
                     // Raden ska rymma formeln: storleken höjs så att över- och underdelen får plats.
@@ -1334,7 +1474,7 @@ impl<'a> Layout<'a> {
                     (false, None) => color,
                 };
                 // Fotnotsnummer ritas upphöjda.
-                let ty = if st.fnref.is_some() { baseline - size * 0.38 } else { baseline };
+                let ty = if st.fnref.is_some() || st.endref { baseline - size * 0.38 } else { baseline };
                 self.page().ops.push(Op::Text { x: rx, y: ty, face, size: sz, text, color: c, italic: st.italic || italic_all });
                 if st.link.is_some() {
                     self.page().ops.push(Op::Line { x1: rx, y1: baseline + 1.6, x2: rx + w, y2: baseline + 1.6, width: 0.6, color: LINK });
@@ -1706,6 +1846,47 @@ impl<'a> Layout<'a> {
         self.y += PARA_GAP;
     }
 
+    /// Ritar fyllning (bakom texten, på `ops_at`) och kanter för ett stycke i en ram. Bara delen på
+    /// sidan där stycket slutar ritas när det bryts över en sida.
+    fn paint_box(&mut self, l: &crate::word::pbox::PPr, x: f32, w: f32, ops_at: Option<usize>, top: f32, first: bool, last: bool, same_page: bool) {
+        // Luften under sista stycket, och avståndet fram till nästa stycke i samma ruta fylls också.
+        let bottom = self.y + if last { l.pad_bottom() } else { PARA_GAP };
+        let start = if same_page { top - if first { l.pad_top() } else { 0.0 } } else { self.rt };
+        let h = (bottom - start).max(1.0);
+        let col = |c: Option<[u8; 3]>| c.map_or(INK, |c| (c[0], c[1], c[2]));
+        let mut ops: Vec<Op> = Vec::new();
+        let bd = &l.borders;
+        if let Some(c) = l.shd {
+            ops.push(Op::Rect { x, y: start, w, h, color: (c[0], c[1], c[2]) });
+        }
+        let draw_top = first && same_page;
+        if let (Some(b), true) = (bd.top, draw_top) {
+            ops.push(Op::Rect { x, y: start, w, h: b.width_pt(), color: col(b.color) });
+        }
+        if let (Some(b), true) = (bd.bottom, last) {
+            ops.push(Op::Rect { x, y: bottom - b.width_pt(), w, h: b.width_pt(), color: col(b.color) });
+        }
+        if let Some(b) = bd.left {
+            ops.push(Op::Rect { x, y: start, w: b.width_pt(), h, color: col(b.color) });
+        }
+        if let Some(b) = bd.right {
+            ops.push(Op::Rect { x: x + w - b.width_pt(), y: start, w: b.width_pt(), h, color: col(b.color) });
+        }
+        // Fyllningen först (bakom texten), kanterna ovanpå.
+        let mut at = ops_at.unwrap_or(0);
+        let fill = l.shd.is_some();
+        for (i, op) in ops.into_iter().enumerate() {
+            if i == 0 && fill {
+                let pg = self.page();
+                let n = pg.ops.len();
+                pg.ops.insert(at.min(n), op);
+                at += 1;
+            } else {
+                self.page().ops.push(op);
+            }
+        }
+    }
+
     fn run(&mut self, blocks: &[Block]) {
         for (bi, b) in blocks.iter().enumerate() {
             self.align = Align::Left;
@@ -1768,7 +1949,7 @@ impl<'a> Layout<'a> {
                         self.y += 3.0;
                     }
                 }
-                Block::Para { spans, indent, quote, align } => {
+                Block::Para { spans, indent, quote, align, look } => {
                     self.align = *align;
                     let page_before = self.breaks;
                     let (color, italic) = if *quote > 0 { (MUTED, true) } else { (INK, false) };
@@ -1782,11 +1963,41 @@ impl<'a> Layout<'a> {
                     self.line = st.line_spacing.map_or(LINE, |m| m * LINE_SINGLE);
                     self.first_indent = st.first_indent.unwrap_or(0.0);
                     self.y += st.space_before.unwrap_or(0.0);
+                    // Ram och fyllning (textruta eller stycke med ram): text inne i rutan, ramen ritas under och runt.
+                    let look_of = |b: Option<&Block>| match b {
+                        Some(Block::Para { look: Some(l), .. }) => Some(l.clone()),
+                        _ => None,
+                    };
+                    let boxed = look.as_ref().filter(|l| l.has_box());
+                    let first_in_box = boxed.is_some_and(|l| bi == 0 || !look_of(blocks.get(bi.wrapping_sub(1)).filter(|_| bi > 0)).is_some_and(|p| p.same_box(l)));
+                    let last_in_box = boxed.is_some_and(|l| !look_of(blocks.get(bi + 1)).is_some_and(|n| n.same_box(l)));
+                    let (mut tx, mut tw) = (self.ml + indent, self.cw - indent);
+                    let mut frame_x: Option<(f32, f32)> = None;
+                    if let Some(l) = boxed {
+                        if let Some((tl, tr, fl, fw)) = l.frame_geom(self.cw - indent) {
+                            tx += tl;
+                            tw -= tl + tr;
+                            frame_x = Some((self.ml + indent + fl, fw));
+                        } else {
+                            let (il, ir) = (l.left.unwrap_or(0.0).max(0.0), l.right.unwrap_or(0.0).max(0.0));
+                            tx += il;
+                            tw -= il + ir;
+                            frame_x = Some((tx - l.pad_left(), tw + l.pad_left() + l.pad_right()));
+                        }
+                        if first_in_box {
+                            self.y += l.pad_top();
+                        }
+                    }
                     let top = self.y;
-                    self.text_block(spans, self.ml + indent, self.cw - indent, face, size, color, italic, None);
+                    let ops_at = self.page().ops.len();
+                    let page_at = self.breaks;
+                    self.text_block(spans, tx, tw.max(24.0), face, size, color, italic, None);
                     self.line = LINE;
                     self.first_indent = 0.0;
                     self.y += st.space_after.unwrap_or(0.0);
+                    if let (Some(l), Some((fx, fw))) = (boxed, frame_x) {
+                        self.paint_box(l, fx, fw, if page_at == self.breaks { Some(ops_at) } else { None }, top, first_in_box, last_in_box, page_at == self.breaks);
+                    }
                     if *quote > 0 {
                         let x = self.ml + indent - 9.0;
                         let start = if self.breaks == page_before { top } else { self.rt };
@@ -1817,6 +2028,13 @@ impl<'a> Layout<'a> {
                 Block::Toc => self.toc(),
                 Block::SectionBreak(props) => self.section_break(props),
                 Block::ColumnBreak => self.new_page(),
+                Block::PageBreak => {
+                    // Ny sida (i alla spalter) om den nuvarande har innehåll.
+                    let empty = self.pages.last().is_some_and(|p| p.ops.is_empty()) && self.col == 0 && (self.y - self.rt).abs() < 0.5;
+                    if !empty && !self.pages.is_empty() {
+                        self.real_page();
+                    }
+                }
             }
         }
     }
@@ -1915,6 +2133,21 @@ fn doc_defaults(md: &str) -> DocDefaults {
 
 /// Lägger ut alla block. Med en innehållsförteckning görs två passager: förteckningens höjd beror
 /// bara på antalet rubriker, så sidnumren från första passet stämmer i det andra.
+/// Sidhuvudets och sidfotens utrymme per avsnitt (se `hf::Plan::reserve`); avsnittsraderna räknas som i
+/// `Layout::section_break` (en rad före all text gäller första avsnittet).
+fn hf_reserve(blocks: &[Block], defaults: &DocDefaults) -> Vec<[f32; 2]> {
+    let mut secs: Vec<Section> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::SectionBreak(p) => secs.push(Section::resolve(p, defaults)),
+            _ if secs.is_empty() => secs.push(Section::resolve(&SectionProps::default(), defaults)),
+            _ => {}
+        }
+    }
+    let plan = crate::hf::Plan::new(defaults, &secs);
+    (0..secs.len().max(1)).map(|i| plan.reserve(defaults, i)).collect()
+}
+
 fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
     // Rubrikerna H1–H3 till en eventuell innehållsförteckning (samma urval som bokmärkena).
     let toc_entries: Vec<(u8, String)> = blocks
@@ -1927,21 +2160,26 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
             _ => None,
         })
         .collect();
+    let reserve = hf_reserve(blocks, defaults);
     let mut lay = Layout::new(resolve, defaults);
+    lay.hf_reserve = reserve.clone();
     lay.toc_entries = toc_entries.clone();
     lay.notes = notes.to_vec();
     lay.new_page();
     lay.run(blocks);
+    lay.flush_rules();
     lay.flush_notes();
     if blocks.iter().any(|b| matches!(b, Block::Toc)) {
         let pos: Vec<(usize, f32)> =
             lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
         let mut second = Layout::new(resolve, defaults);
+        second.hf_reserve = reserve;
         second.toc_entries = toc_entries;
         second.toc_pos = pos;
         second.notes = notes.to_vec();
         second.new_page();
         second.run(blocks);
+        second.flush_rules();
         second.flush_notes();
         lay = second;
     }
@@ -1964,10 +2202,13 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
 
     let mut doc = Document::new();
     let total = lay.pages.len();
-    let images = std::mem::take(&mut lay.images);
     // Sidhuvud och sidfot ritas sist, när sidantalet är känt.
-    let fields = style::Fields::for_export(title, "pdf");
-    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer(&defaults, &fields.at(pi + 1, total))).collect();
+    let fields = style::Fields::for_export(title, "pdf").at(1, total);
+    let secs = sections::scan(markdown, &defaults);
+    let hf_plan = crate::hf::Plan::new(&defaults, &secs);
+    let hf_pages = hf_plan.pages(&lay.pages.iter().map(|p| p.sec).collect::<Vec<_>>());
+    let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer_page(&defaults, &hf_plan, &hf_pages, &fields, pi)).collect();
+    let images = std::mem::take(&mut lay.images);
     for (pi, page_ops) in lay.pages.iter().enumerate() {
         let mut page = doc.start_page_with(PageSettings::from_wh(page_ops.geom.pw, page_ops.geom.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
@@ -2134,6 +2375,28 @@ mod tests {
         lay.new_page();
         lay.run(&blocks);
         lay.pages.swap_remove(0).ops
+    }
+
+    #[test]
+    fn framed_paragraphs_and_text_boxes_are_painted() {
+        let pp = |frame: &str| format!("<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\"{frame}-->");
+        // En ram med egen bredd (textruta): två stycken ger en fyllning bakom texten och fyra kanter.
+        let md = format!(
+            "<!--k:tb 1-->\n\nEtt{m}\n\nTvå{m}\n\n<!--k:/tb-->\n\nEfter\n",
+            m = pp(" fr=\"w=200 x=end pl=8 pr=8\"")
+        );
+        let ops = page_ops(&md);
+        let rects: Vec<(f32, f32, (u8, u8, u8))> = ops.iter().filter_map(|o| if let Op::Rect { x, w, color, .. } = o { Some((*x, *w, *color)) } else { None }).collect();
+        let fills: Vec<_> = rects.iter().filter(|r| r.2 == (0xFF, 0xF2, 0xCC)).collect();
+        assert_eq!(fills.len(), 2, "{rects:?}");
+        // Fyllningen ligger före texten i ritordningen.
+        let first_text = ops.iter().position(|o| matches!(o, Op::Text { .. })).unwrap();
+        let first_fill = ops.iter().position(|o| matches!(o, Op::Rect { color: (0xFF, 0xF2, 0xCC), .. })).unwrap();
+        assert!(first_fill < first_text);
+        // Rutan är 200 pt bred och ligger vid högerkanten; kantlinjerna har kantens färg; inga markörer som text.
+        assert!((fills[0].1 - 200.0).abs() < 0.5);
+        assert!(rects.iter().filter(|r| r.2 == (0x11, 0x22, 0x33)).count() >= 6, "{rects:?}");
+        assert!(ops.iter().all(|o| !matches!(o, Op::Text { text, .. } if text.contains("k:tb") || text.contains("k:pp"))));
     }
 
     #[test]
@@ -2482,9 +2745,10 @@ mod tests {
             assert_eq!(t.len(), 2);
             assert_eq!(t[0].2, "Rapport");
             assert_eq!(t[1].2, format!("Sida {p} av {total}"));
-            // Baslinjer halvvägs i topp- och bottenmarginalen.
-            assert!((t[0].1 - lay.mt / 2.0).abs() < 0.01);
-            assert!((t[1].1 - (lay.ph - lay.mb / 2.0)).abs() < 0.01);
+            // Sidhuvudet börjar `DEFAULT_DIST` från överkanten och sidfoten slutar lika långt från nederkanten.
+            let size = lay.body * 0.9;
+            assert!((t[0].1 - (crate::hf::DEFAULT_DIST + size * 0.95)).abs() < 0.01);
+            assert!(t[1].1 < lay.ph - crate::hf::DEFAULT_DIST + 0.01 && t[1].1 > lay.ph - lay.mb);
             // Sidfoten är centrerad, sidhuvudet högerställt.
             let fw = lay.m.width(lay.base, lay.body * 0.9, &t[1].2);
             assert!((t[1].0 + fw / 2.0 - (lay.ml + lay.cw / 2.0)).abs() < 0.01);
@@ -2501,7 +2765,7 @@ mod tests {
         let (mut lay, d) = laid_out(&md, &|_| None);
         let total = lay.pages.len();
         assert!(total >= 3);
-        let f = |p: usize| style::Fields { page: p, pages: total, title: "Min rapport".into(), file: "Min rapport.pdf".into(), date: "2026-11-13".into() };
+        let f = |p: usize| style::Fields { page: p, pages: total, title: "Min rapport".into(), file: "Min rapport.pdf".into(), date: "2026-11-13".into(), sec_pages: total, fmt: Default::default() };
         // Första sidan: tomt sidhuvud och egen sidfot.
         let t1 = texts(&lay.header_footer(&d, &f(1)));
         assert_eq!(t1.iter().map(|t| t.2.as_str()).collect::<Vec<_>>(), ["Omslag"]);
@@ -2689,3 +2953,7 @@ mod fn_tests;
 #[cfg(test)]
 #[path = "pdf_section_tests.rs"]
 mod section_tests;
+
+#[cfg(test)]
+#[path = "pdf_hf_tests.rs"]
+mod hf_tests;

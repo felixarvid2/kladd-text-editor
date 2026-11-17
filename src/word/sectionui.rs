@@ -15,11 +15,13 @@ const MM: f32 = 72.0 / 25.4;
 pub struct ColumnsDialog {
     cols: usize,
     gap_mm: f32,
+    /// Antal spalter när dialogen öppnades (olika bredder och skiljelinje nollställs när det ändras).
+    orig_cols: usize,
 }
 
 impl ColumnsDialog {
     pub fn from_section(s: &Section) -> Self {
-        Self { cols: s.columns.min(3), gap_mm: (s.gap / MM * 10.0).round() / 10.0 }
+        Self { cols: s.columns.min(3), gap_mm: (s.gap / MM * 10.0).round() / 10.0, orig_cols: s.columns.min(3) }
     }
 }
 
@@ -51,6 +53,16 @@ impl KladdApp {
     pub(crate) fn column_break(&mut self, ctx: &egui::Context) {
         self.word_edit(ctx, |t, s| sections::insert_column_break(t, s.end));
     }
+
+    /// Sidbrytning vid markören.
+    pub(crate) fn page_break(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| sections::insert_page_break(t, s.end));
+    }
+
+    /// Infoga → Textruta: en ruta med ram vid markören, med platshållartexten markerad.
+    pub(crate) fn insert_text_box(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| sections::insert_block(t, s.end, &crate::docx_tbox::new_block(), "Text"));
+   }
 
     /// Öppnar "Spalter" för avsnittet som markören står i.
     pub(crate) fn open_columns_dialog(&mut self, ctx: &egui::Context) {
@@ -113,11 +125,16 @@ impl KladdApp {
             return;
         }
         let Some((defaults, _)) = self.current_section(ctx) else { return };
-        let (cols, gap) = (d.cols, d.gap_mm * MM);
+        let (cols, gap, changed) = (d.cols, d.gap_mm * MM, d.cols != d.orig_cols);
         self.word_edit(ctx, |t, s| {
             sections::update_current(t, s.start, &defaults, |p| {
                 p.columns = (cols > 1).then_some(cols);
                 p.column_gap = (cols > 1).then_some(gap);
+                // Nya spalter får lika bredd och ingen skiljelinje; bredderna passar inte längre.
+                if changed || cols <= 1 {
+                    p.column_widths = None;
+                    p.column_rule = false;
+                }
             })
         });
     }

@@ -135,3 +135,21 @@ fn style_overrides_apply_inside_columns() {
     });
     assert_eq!(size, Some(30.0));
 }
+
+#[test]
+fn unequal_columns_get_own_x_and_width_and_a_rule() {
+    let md = "<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 40mm 120mm; column-rule: yes -->\n\nVänster\n\n<!-- kladd: spaltbrytning -->\n\nHöger\n";
+    let mut l = lay(md);
+    let (w0, w1) = (l.col_width(0), l.col_width(1));
+    assert!((w1 / w0 - 3.0).abs() < 0.01, "{w0} {w1}");
+    assert!((l.col_left(1) - (w0 + l.gap)).abs() < 0.01);
+    // Efter spaltbrytningen står texten i den breda spalten.
+    assert_eq!(l.col, 1);
+    assert!((l.cw - w1).abs() < 0.01);
+    l.flush_rules();
+    let x = l.text_l + w0 + l.gap / 2.0;
+    let rules = l.pages[0].ops.iter().filter(|o| matches!(o, Op::Line { x1, x2, .. } if (x1 - x2).abs() < 0.01 && (x1 - x).abs() < 0.01)).count();
+    assert_eq!(rules, 1);
+    let right = texts(&l.pages[0].ops).into_iter().find(|t| t.2.contains("Höger")).map(|t| t.0);
+    assert!((right.expect("text") - (l.text_l + w0 + l.gap)).abs() < 0.5);
+}

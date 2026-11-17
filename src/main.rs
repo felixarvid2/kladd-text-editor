@@ -15,9 +15,11 @@ mod docx;
 mod docx_para;
 mod docx_styles;
 mod docx_tables;
+mod docx_tbox;
 mod export;
 mod grammar;
 mod grammar_ui;
+mod hf;
 mod ocr;
 mod odt;
 mod pdf_read;
@@ -61,6 +63,8 @@ mod git;
 mod git_ui;
 #[cfg(test)]
 mod corpus_tests;
+#[cfg(test)]
+mod brk_tests;
 
 use std::path::PathBuf;
 

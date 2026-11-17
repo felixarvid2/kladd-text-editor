@@ -18,8 +18,13 @@ use crate::style::{self, Fields};
 use crate::tf;
 use crate::theme::{self, Palette};
 
+/// Bilder i sidhuvud och sidfot: källa → (adress för ritning, egen storlek i px).
+pub type HfImages = std::collections::HashMap<String, (String, egui::Vec2)>;
+
 /// Ritar sidhuvud och sidfot på ett ark och ger `Some(true)` vid dubbelklick på sidfoten och
-/// `Some(false)` på sidhuvudet. `fields` har sidnummer 1 och är mallen för alla sidor.
+/// `Some(false)` på sidhuvudet. `hf` är det som står på arket (se `crate::hf::Plan`), `z` zoomen.
+/// Texten ställs upp av `hf::layout_zone`: delar, bilder, avstånd från sidkanten och linjen mot
+/// brödtexten (`header-style`).
 #[allow(clippy::too_many_arguments)]
 pub fn header_footer(
     ui: &mut Ui,
@@ -27,38 +32,62 @@ pub fn header_footer(
     geom: &Geom,
     sheet: Rect,
     k: usize,
-    total: usize,
+    hf: &crate::hf::PageHf<'_>,
     d: &DocDefaults,
-    fields: &Fields,
     font: FontId,
     doc_id: u64,
+    z: f32,
+    imgs: &HfImages,
 ) -> Option<bool> {
+    use crate::hf::{self, Placed};
     let mut open = None;
     let painter: Painter = ui.painter().clone();
-    let f = fields.at(k + 1, total);
+    let scale = crate::word::layout::px(z, 1.0);
+    let text_w = (sheet.width() - geom.left - geom.right).max(1.0);
     let zones = [
-        (false, Rect::from_min_max(sheet.min, pos2(sheet.right(), sheet.top() + geom.top)), d.header_template(k), d.header_align),
-        (true, Rect::from_min_max(pos2(sheet.left(), sheet.bottom() - geom.bottom), sheet.max), d.footer_template(k), d.footer_align),
+        (false, Rect::from_min_max(sheet.min, pos2(sheet.right(), sheet.top() + geom.top)), hf.header, hf.header_align, &d.header_style, d.header_dist),
+        (true, Rect::from_min_max(pos2(sheet.left(), sheet.bottom() - geom.bottom), sheet.max), hf.footer, hf.footer_align, &d.footer_style, d.footer_dist),
     ];
-    for (footer, zone, text, align) in zones {
+    for (footer, zone, text, align, st, dist) in zones {
         let resp = ui.interact(zone, ui.make_persistent_id(("kladd-hf", doc_id, k, footer)), Sense::click());
         if resp.double_clicked() {
             open = Some(footer);
         }
         resp.on_hover_text(t("Dubbelklicka för att ändra sidhuvud och sidfot"));
-        let Some(t) = text else { continue };
-        let y = zone.center().y;
-        for (i, part) in style::parts_of(t, align).iter().enumerate() {
-            let part = style::fill_fields(part, &f).replace('\n', " ");
-            if part.is_empty() {
-                continue;
+        let Some(tpl) = text else { continue };
+        let parts = hf::filled_parts(tpl, align, &hf.fields);
+        let size_pt = st.size.unwrap_or(font.size / scale);
+        let color = st.color.map_or(p.page_muted, |c| Color32::from_rgb(c[0], c[1], c[2]));
+        let family = font.family.clone();
+        let measure = |s: &str, size: f32| painter.layout_no_wrap(s.to_owned(), FontId::new(size, family.clone()), color).size().x;
+        let natural = |src: &str| imgs.get(src).map(|(_, s)| (s.x * 0.75, s.y * 0.75));
+        let zn = hf::layout_zone(&parts, size_pt, scale, text_w, &measure, &natural);
+        let edge = dist.unwrap_or(hf::DEFAULT_DIST) * scale;
+        let top = if footer { sheet.bottom() - edge - zn.height } else { sheet.top() + edge };
+        let left = sheet.left() + geom.left;
+        for it in &zn.items {
+            match it {
+                Placed::Text { x, y, text, size } => {
+                    painter.text(pos2(left + x, top + y), Align2::LEFT_TOP, text, FontId::new(*size, font.family.clone()), color);
+                }
+                Placed::Image { x, y, w, h, src, anchored } => {
+                    let Some((uri, _)) = imgs.get(src) else { continue };
+                    let origin = if *anchored { sheet.min } else { pos2(left, top) };
+                    let rect = Rect::from_min_size(pos2(origin.x + x, origin.y + y), vec2(*w, *h));
+                    match super::images::image_shape(ui.ctx(), uri, rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))) {
+                        Some(sh) => {
+                            painter.add(sh);
+                        }
+                        None => ui.ctx().request_repaint(),
+                    }
+                }
             }
-            let (x, anchor) = match i {
-                1 => (sheet.center().x, Align2::CENTER_CENTER),
-                2 => (sheet.right() - geom.right, Align2::RIGHT_CENTER),
-                _ => (sheet.left() + geom.left, Align2::LEFT_CENTER),
-            };
-            painter.text(pos2(x, y), anchor, part, font.clone(), p.page_muted);
+        }
+        if let Some((c, w)) = st.line {
+            let gap = 3.0 * scale;
+            let y = if footer { top - gap } else { top + zn.height + gap };
+            let stroke = Stroke::new((w * scale).max(0.5), Color32::from_rgb(c[0], c[1], c[2]));
+            painter.hline(left..=left + text_w, y, stroke);
         }
     }
     open

@@ -224,6 +224,27 @@ Gemensamma format (alla moduler ska använda dessa):
   varianter (`Some("")` = tom första sida; `DocDefaults::header_template(sida)`). Dialogen för
   redigering på sidan finns i `word/headers.rs`. docx: `titlePg` + `type="first"`-referenser,
   fält som PAGE/NUMPAGES/DATE/TITLE/FILENAME och flikar för delarna; odt: `style:header-first`.
+- **Sidhuvud och sidfot, rik mall** (`src/hf.rs`, läsning i `docx_hf.rs` och `odt_hf.rs`). Mallen har fler märken:
+  `{sida:roman}`/`{sida:ROMAN}`/`{sida:abc}`/`{sida:ABC}`/`{sida:1}` (och samma för `{sidor}`), `{avsnittssidor}` och
+  `{bild:namn 80x30}` (bredd x höjd i pt) eller `{bild:namn 80x30 @12,20}` för en bild förankrad 12 pt från sidans
+  vänsterkant och 20 pt från överkanten (förankrade bilder i docx räknas om med `word/anchor.rs`). Bilden är en av
+  dokumentets vanliga bilder (`bild:namn`, relationen ligger i `header*.xml.rels`). Grundformatet har dessutom
+  `header-even`/`footer-even` (udda/jämna sidor, `w:evenAndOddHeaders`), `header-style: "9pt #666666 bold line=#999999/0.5pt"`
+  (storlek, färg och linjen under sidhuvudet via `w:pBdr`), `header-dist`/`footer-dist` (`w:pgMar w:header/w:footer`),
+  `page-start` och `page-format: roman` (`w:pgNumType`). En avsnittsrad kan ha egna `header`, `footer`, `header-first`,
+  `footer-first`, `header-even`, `footer-even`, `title-page: yes`, `page-start` och `page-format`; en del som saknas
+  ärvs från föregående avsnitt (som i Word), `""` är uttryckligen tom. `hf::Plan::new(defaults, sections)` utreder arvet,
+  `Plan::pages(arkens avsnitt)` ger visade sidnummer (med omstart), antal sidor i avsnittet och första sidan i avsnittet,
+  och `Plan::page` väljer rätt del (första, jämn, vanlig). `hf::layout_zone` ställer upp en rad (delar, bilder, anpassat
+  avstånd) i både dokumentläget (`word/headers.rs`) och PDF-exporten (`Layout::header_footer_page`). `Plan::reserve`
+  ger den marginal sidhuvudet och sidfoten behöver (avstånd + höjd + linje); `DocDefaults::layout_margins`, `SecGeom` och
+  PDF-layouten skjuter ned brödtexten med den, medan `margins()` (det som skrivs till filen) är orörd.
+  docx-skrivning: oförändrade delar och `w:sectPr` skrivs tillbaka orörda; ändras en del skrivs bara den (och sektionens
+  referens) om, med fält, bilder och linje. Sektioner som skrivs om från grunden får originalets referenser (`seed_hf`).
+  odt: `style:header-left` är jämna sidor, tabbstoppens typer avgör vänster/höger, `text:page-number` följer
+  `style:num-format`, och sidmallens övre/nedre marginal är avståndet till sidhuvudet (marginalen i Kladd är avståndet plus
+  sidhuvudets minsta höjd och mellanrum). Begränsningar: ett sidhuvud med flera rader slås ihop till en rad, text i
+  tabellceller placeras efter kolumnens ordning (inte dess bredd) och odt-sidnumrering som börjar om per avsnitt läses inte.
 - **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
   grundformatskommentaren, `h1`–`h6`, `body`, `quote`, `title`, `subtitle`, med ord i valfri ordning: `"Typsnitt"`,
   `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
@@ -238,6 +259,21 @@ Gemensamma format (alla moduler ska använda dessa):
 - **Bilder med storlek**: `<img src="bild:image1.png" alt="Diagram" width="240">` (bredd i
   CSS-pixlar, 1/96 tum; `height` valfri, annars bevaras proportionerna). Bilder utan storlek
   skrivs som förut, `![alt](src)`. Justering av en bild görs med `<div align>` runt den.
+- **Textrutor** (`src/docx_tbox.rs`): `<!--k:tb N-->` … `<!--k:/tb-->` före ankarstycket, där `N` är markören
+  `<!--k:N-->` som bär originalkörningen (rutans form, ram och läge). Stycken i rutan får en syntetisk
+  `k:pp`-markör med `fr="w=… x=… pl=… pr=…"` (`pbox::Frame`: rutans bredd och vågräta läge `start|center|end|<pt>` i
+  spalten, luft mot texten) samt fyllning och ram. Layouten (`layout_para`) räknar indragen mot spaltbredden och
+  `pboxui::shapes` ritar rutans kanter (spalten väljs efter radens x, inte galleriets första spalt). `write` tar bort
+  markören igen innan texten jämförs med originalet (`Source::tboxes`). Orörd ruta: originalet byte för byte.
+  Ändrad: `w:txbxContent` byts i hela körningen (både `mc:Choice` och `mc:Fallback`). Ett block med okänt nummer
+  (`docx_tbox::NEW_TOKEN`, Infoga → Textruta) är en ny ruta: den ersätts av en bärarrad `<!--k:N-->` med nytt nummer och
+  skrivs som en förankrad `wps`-ruta (`wrapTopAndBottom`, `spAutoFit`) av `docx_tbox::new_box_run`. Blocket ger inga enheter
+  (rutans stycken är inga egna element). ODT: `draw:text-box` läses till samma block (`Rd::text_box`, nummer 0) och
+  block skrivs som en `draw:frame` med `draw:text-box` i ett eget stycke (`W::finish_box`). PDF: `Block::Para::look`
+  ritar fyllning (bakom texten) och kanter (`Layout::paint_box`), också för vanliga stycke-ramar. Begränsningar: rutan
+  ritas i flödet (text flödar inte runt den, ingen fast höjd), rutor i tabeller/rubriker/listor, med bilder eller
+  fotnoter, och rutor i rutor visas inte (bevaras i docx), läge relativt sidans högerkant räknas inte om, och en
+  ruta bredare än textytan krymps vid ODT-sparning.
 - **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda
@@ -485,6 +521,23 @@ när sidan fylls. Referensen är ett litet upphöjt nummer. En enskild not som �
 **HTML/EPUB** (`export.rs`) hade redan fotnoter via pulldown (`<aside class="footnote">`, EPUB-`noteref`);
 kontrollerat med de befintliga testerna.
 
+
+### Slutnoter
+
+Slutnoter är en egen etikettnamnrymd: `[^ei]`, `[^eii]` … (`e` och ett litet romerskt tal,
+`markup::is_endnote_label`). Analysen döljer `e`, så det som visas är det romerska talet, upphöjt
+som en fotnotsreferens. `markup::footnotes` ser bara fotnoter och `markup::endnotes` bara
+slutnoter (`all_notes` båda); numreringen (`renumber_core`, `relabel_endnotes`) och
+`footnotes_in_order` hanterar de två sorterna var för sig, och definitionerna ligger sist, fotnoter
+före slutnoter, under samma skiljelinje. `insert_endnote` / `delete_endnote` motsvarar fotnotens
+funktioner (`Ctrl+Alt+D`).
+
+- **docx**: `w:endnoteReference` + `word/endnotes.xml` läses som fotnoterna (separator- och
+  continuationSeparator-noterna hoppas över). Skrivningen följer `resolve_note_kind`: orörd not behåller sin XML,
+  ett dokument utan endnotes.xml får delen, relationen, innehållstypen och `w:endnotePr` i settings.xml.
+- **odt**: `text:note-class="endnote"` ↔ `[^eN]`, med `notes-configuration` för slutnoter (`i`).
+- **PDF**: slutnoterna läggs som en linje och stycken efter sista texten (inte per sida).
+- Fotnoter längst ned på varje sida i dokumentläget är inte gjort.
 ## Granska: spårade ändringar och kommentarer
 
 Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad `docx`), gränssnitt i
@@ -627,6 +680,15 @@ Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som
 - `page` (även `page-size`) följer `page-size` i grundformatet (`A4`, `Letter`, `210mm 297mm`, `landscape` efter
   namnet), `page-margin` (även `margin`) följer CSS, `columns` är 1–6, `column-gap` en längd (standard 35,4 pt
   = 1,25 cm, Words 708 twips) och `type: continuous` låter avsnittet börja på samma sida (annars en ny sida).
+  `column-widths: 40mm 120mm` ger olika breda spalter (minst två längder; de bestämmer antalet spalter, skalas så att
+  de med mellanrummen fyller textytan, och lika långa längder är vanliga spalter) och `column-rule: yes` en
+  skiljelinje mitt i varje mellanrum. Docx: `w:cols w:equalWidth="0"` med `w:col w:w`, och `w:sep`. Odt:
+  `style:column` med `style:rel-width` (andel av textytan inklusive utfyllnad, skrivs i twips) och
+  `fo:start-padding`/`fo:end-padding` (LibreOffice: `fo:start-indent`/`fo:end-indent`; lika andelar är lika breda
+  spalter), och `style:column-sep` (skrivs före spalterna). PDF: x och bredd per spalt, linjerna ritas med sidan.
+  Layout: vid olika bredder balanseras inte spalterna, och `ColSim` (secpages.rs) följer spaltfyllnaden så att varje
+  stycke läggs ut i sin spalts bredd (ett stycke som byter spalt får den smalare spaltens bredd).
+  Spalter jämnas ut på avsnittets sista sida när ett löpande avsnitt följer, som i Word och LibreOffice.
 - **Egenskaper som saknas ärver dokumentets grundformat**, inte föregående avsnitt. Ett avsnitt utan egenskaper
   är alltså "tillbaka till grundformatet".
 - En avsnittsrad som står före all text (bara tomma rader och grundformatraden före) gäller **första avsnittet**
@@ -644,7 +706,18 @@ Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som
 *Liggande sidor härifrån* / *Stående sidor härifrån* (ändrar avsnittet om inget står före markören i det,
 annars börjar ett nytt avsnitt där), *Spalter…* (dialog: 1–3 spalter och mellanrum i mm; gäller avsnittet
 som markören står i och skriver om dess rad, eller lägger en rad före all text i första avsnittet) och
-*Spaltbrytning*.
+*Spaltbrytning*, *Sidbrytning*.
+
+### Sidbrytning
+
+`<!-- kladd: sidbrytning -->` (`sections::PAGE_BREAK_LINE`) är en dold rad som spaltbrytningen: `layout` samlar dem i
+`page_breaks` och `pages::paginate_breaks` / `secpages::paginate_sections` (`force_page`) börjar en ny sida, men bara
+om sidan har innehåll (i alla spalter), så en brytning på en tom sida ignoreras. docx läser `w:br w:type="page"` i en
+körning (stycket delas av `split_page_breaks`), `w:pageBreakBefore` direkt och i formatmall (`Styles::page_before`, direkt
+`val=0` upphäver mallens). odt läser `fo:break-before`/`fo:break-after` (`Styles::page_breaks`, med arv); ingen rad först i
+dokumentet, inte två i rad och inte där ett sidmallsbyte redan börjar en ny sida, men ett tomt första stycke med brytning
+behåller den (så en avslutande brytning överlever spara och öppna). Skrivning: docx `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`,
+odt `fo:break-before="page"` på nästa stycke (ett eget tomt stycke först i dokumentet och sist), PDF `Block::PageBreak`.
 
 ### Utläggning och sidbrytning
 
@@ -661,8 +734,8 @@ avsnittet (`row_sec`) och spaltbrytningarna. `secpages::paginate_sections` flytt
 - ark med olika storlek centreras på skrivbordet (`Geom::sheet_left`). Galleriets x = 0 ligger vid den
   vänstraste textkanten (`Geom::origin_x`), så alla rader har x ≥ 0 och TextEdits yta (`Geom::edit_w`) täcker allt;
 - resultatet är `Paged { boxes: Vec<PageBox>, dx }`; `Cache::page_boxes` ger arken till vyn (ritning av ark,
-  sidhuvud/sidfot per ark, sidnummer med `secpages::page_index`). Sidnumren löper över avsnitten och
-  sidhuvud/sidfot är gemensamma. Ett vanligt dokument (`Geom::for_sections` ger en `Geom` utan `secs`) går
+  sidhuvud/sidfot per ark, sidnummer med `secpages::page_index`). Sidnumren löper över avsnitten (om inte avsnittet börjar om,
+  `page-start`) och sidhuvud/sidfot ärvs från föregående avsnitt tills ett avsnitt anger egna (`hf::Plan`). Ett vanligt dokument (`Geom::for_sections` ger en `Geom` utan `secs`) går
   den gamla vägen (`pages::paginate`) och får `uniform_boxes`, så ritningen är gemensam.
 - Tabeller och bilder anpassas till spaltens bredd (tabellplanen och `images::display_size` får spaltbredden;
   en bild i ett smalare avsnitt kläms mot det avsnittets spalt). Tabellernas kolumnkanter (`TableGeom::col_x`)

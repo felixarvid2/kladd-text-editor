@@ -154,10 +154,13 @@ enum BarAct {
     /// Ekvation: tom (`None`) eller en mall ur paletten.
     Equation(Option<usize>),
     Footnote,
+    Endnote,
     Toc,
     SectionBreak,
     Landscape(bool),
     ColumnBreak,
+    PageBreak,
+    TextBox,
     Columns,
     TableOp(TableOp),
     PageSetup,
@@ -371,6 +374,15 @@ impl KladdApp {
         }
     }
 
+    /// Infogar en slutnot vid markören och flyttar markören till den nya definitionen.
+    pub(crate) fn word_endnote(&mut self, ctx: &egui::Context) {
+        self.word_edit(ctx, |t, s| markup::insert_endnote(t, s.end));
+        let b = self.word_selection(ctx).start;
+        if let Some(doc) = self.docs.get(self.active) {
+            self.scroll_to_char = Some(byte_to_char(&doc.text, b));
+        }
+    }
+
     /// Backspace direkt efter (eller Delete direkt före) en fotnotsreferens tar bort hela fotnoten,
     /// både referensen och definitionen; annars skulle en trasig `[^1` lämna en föräldralös definition.
     fn word_footnote_keys(&mut self, ctx: &egui::Context) {
@@ -388,7 +400,7 @@ impl KladdApp {
         if sel.start != sel.end {
             return;
         }
-        let hit = markup::footnotes(&doc.text)
+        let hit = markup::all_notes(&doc.text)
             .refs
             .into_iter()
             .find(|r| if back { r.full.end == sel.start } else { r.full.start == sel.start });
@@ -503,6 +515,9 @@ impl KladdApp {
         }
         if hit(ctrl_alt, Key::F) {
             self.word_footnote(ctx);
+        }
+        if hit(ctrl_alt, Key::D) {
+            self.word_endnote(ctx);
         }
         for (k, b) in [
             (Key::Num1, Block::Heading(1)),
@@ -744,8 +759,14 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Fotnot"), "Ctrl+Alt+F", None, true) {
                             acts.push(BarAct::Footnote);
                         }
+                        if crate::app::menu_item(ui, p, t("Slutnot"), "Ctrl+Alt+D", None, true) {
+                            acts.push(BarAct::Endnote);
+                        }
                         if crate::app::menu_item(ui, p, t("Innehållsförteckning"), "", None, true) {
                             acts.push(BarAct::Toc);
+                        }
+                        if crate::app::menu_item(ui, p, t("Textruta"), "", None, true) {
+                            acts.push(BarAct::TextBox);
                         }
                         menu_divider(ui, p);
                         if crate::app::menu_item(ui, p, t("Avsnittsbrytning (ny sida)"), "", None, true) {
@@ -761,6 +782,9 @@ impl KladdApp {
                         }
                         if crate::app::menu_item(ui, p, t("Spaltbrytning"), "", None, true) {
                             acts.push(BarAct::ColumnBreak);
+                        }
+                        if crate::app::menu_item(ui, p, t("Sidbrytning"), "", None, true) {
+                            acts.push(BarAct::PageBreak);
                         }
                     });
                     // Granska: spåra ändringar och kommentarer.
@@ -821,6 +845,8 @@ impl KladdApp {
                 BarAct::SectionBreak => self.section_break(&ctx),
                 BarAct::Landscape(l) => self.section_landscape(&ctx, l),
                 BarAct::ColumnBreak => self.column_break(&ctx),
+                BarAct::PageBreak => self.page_break(&ctx),
+                BarAct::TextBox => self.insert_text_box(&ctx),
                 BarAct::Columns => self.open_columns_dialog(&ctx),
                 BarAct::TableOp(op) => self.word_table_op(&ctx, op),
                 BarAct::Table => self.word_edit(&ctx, |t, s| markup::insert_table(t, s.end)),
@@ -832,6 +858,7 @@ impl KladdApp {
                     markup::Edit { text: e.text, sel: e.sel }
                 }),
                 BarAct::Footnote => self.word_footnote(&ctx),
+                BarAct::Endnote => self.word_endnote(&ctx),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::EditStyles => {
                     let sel = crate::style::StyleId::for_block(act.block);
@@ -994,6 +1021,14 @@ impl KladdApp {
                     }
                     let size = images::display_size(info.size, &img, max_w, z);
                     sizes.entry(images::size_key(&img)).and_modify(|s| if size.x < s.x { *s = size }).or_insert(size);
+                }
+            }
+            // Bilderna i sidhuvud och sidfot (mallens `{bild:…}`).
+            let mut hf_imgs: super::headers::HfImages = HashMap::new();
+            for src in crate::hf::all_image_srcs(&analysis.defaults, &analysis.sections) {
+                self.word_image(&ctx, &src);
+                if let Some(Some(info)) = self.wv.images.get(&(doc_id, src.clone())) {
+                    hf_imgs.insert(src.clone(), (image_uri(&src, doc_id), info.size));
                 }
             }
             let image_size = |src: &str| sizes.get(src).copied();
@@ -1384,13 +1419,16 @@ impl KladdApp {
                     font_family(Some(analysis.defaults.font()), false, false),
                 );
                 let hf_fields = crate::style::Fields::new(1, total, &doc.title());
+                let hf_plan = crate::hf::Plan::new(&analysis.defaults, &analysis.sections);
+                let hf_pages = hf_plan.pages(&boxes.iter().map(|b| b.sec).collect::<Vec<_>>());
                 for (k, b) in boxes.iter().enumerate() {
                     let sheet = b.rect(page_left, origin_y);
                     if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() {
                         continue;
                     }
                     // Varje ark har sin egen storlek: sidhuvudet och sidfoten följer arkets mått.
-                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, total, &analysis.defaults, &hf_fields, hf_font.clone(), doc_id) {
+                    let page_hf = hf_plan.page(&hf_pages, k, &hf_fields);
+                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, &page_hf, &analysis.defaults, hf_font.clone(), doc_id, z, &hf_imgs) {
                         open_hf_dlg = Some((footer, k));
                     }
                 }

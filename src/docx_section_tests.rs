@@ -165,3 +165,34 @@ fn first_page_header_refs_follow_the_first_section() {
     let again = write(&back.markdown, "t.docx", &|_| None, back.source.as_ref()).unwrap();
     assert_eq!(part_text(&again.bytes, "word/document.xml"), doc);
 }
+
+#[test]
+fn unequal_columns_and_rule_round_trip() {
+    let sect = r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1417" w:right="1134" w:bottom="1417" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/><w:cols w:num="2" w:sep="1" w:equalWidth="0"><w:col w:w="2000" w:space="567"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
+    let d = crate::word::markup::DocDefaults::default();
+    let p = section_props(Some(sect), &d);
+    assert_eq!(p.columns, Some(2));
+    assert!(p.column_rule);
+    let ws = p.column_widths.clone().expect("bredder");
+    assert!((ws[0] - 100.0).abs() < 0.1 && (ws[1] - 300.0).abs() < 0.1, "{ws:?}");
+    assert!(p.to_comment().contains("column-widths:") && p.to_comment().contains("column-rule: yes"));
+    // Oförändrat avsnitt: orörd XML.
+    let sec = sections::Section::resolve(&p, &d);
+    assert_eq!(apply_section(sect, &sec, None), sect);
+    // Ändrade bredder skrivs som w:col med w:equalWidth="0" och läses tillbaka.
+    let mut p2 = p.clone();
+    p2.column_widths = Some(vec![50.0, 50.0, 100.0]);
+    p2.columns = Some(3);
+    let out = apply_section(sect, &sections::Section::resolve(&p2, &d), None);
+    assert!(out.contains("w:equalWidth=\"0\"") && out.contains("w:sep=\"1\"") && out.matches("<w:col ").count() == 3, "{out}");
+    let back = section_props(Some(&out), &d);
+    assert_eq!(back.columns, Some(3));
+    let bw = back.column_widths.expect("bredder");
+    assert!((bw[2] / bw[0] - 2.0).abs() < 0.05, "{bw:?}");
+    // Lika breda spalter utan skiljelinje: vanliga w:cols utan barn.
+    let mut p3 = p.clone();
+    p3.column_widths = None;
+    p3.column_rule = false;
+    let out = apply_section(sect, &sections::Section::resolve(&p3, &d), None);
+    assert!(!out.contains("equalWidth") && !out.contains("w:sep") && out.contains("<w:cols w:num=\"2\""), "{out}");
+}

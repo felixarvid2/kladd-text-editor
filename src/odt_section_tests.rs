@@ -85,3 +85,44 @@ fn three_part_header_gets_tab_stops_per_master_page() {
     };
     assert_ne!(tab("MP1"), tab("MP1_1"));
 }
+
+#[test]
+fn unequal_columns_and_rule_round_trip() {
+    let md = "<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 40mm 110mm; column-rule: yes; type: continuous -->\n\nSmal och bred\n\n<!-- kladd: spaltbrytning -->\n\nBred\n\n<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n";
+    let w = write(md, "T", &|_| None).unwrap();
+    let content = part(&w.bytes, "content.xml");
+    // Skiljelinjen först, sedan spalterna med relativ bredd i twips och halva mellanrummet på inre kanten.
+    let sep = content.find("<style:column-sep").expect("skiljelinje");
+    let first = content.find("<style:column ").expect("spalt");
+    assert!(sep < first, "{content}");
+    assert_eq!(content.matches("<style:column ").count(), 2, "{content}");
+    assert!(content.contains("fo:end-padding=\"0.5cm\"") && content.contains("fo:start-padding=\"0.5cm\""), "{content}");
+    let back = read(&w.bytes).unwrap();
+    let m = marks(&back.markdown);
+    let p = &m[0];
+    assert_eq!(p.columns, Some(2), "{}", back.markdown);
+    assert!(p.column_rule);
+    let ws = p.column_widths.clone().expect("bredder");
+    assert_eq!(ws.len(), 2);
+    assert!((ws[0] / ws[1] - 40.0 / 110.0).abs() < 0.02, "{ws:?}");
+    assert!(m[1].column_widths.is_none() && !m[1].column_rule);
+}
+
+#[test]
+fn reads_libreoffice_style_columns() {
+    // LibreOffice: rel-width i twips (summan = textytans bredd), utfyllnad på inre kanterna, skiljelinje.
+    let xml = r#"<style:columns fo:column-count="2" fo:column-gap="0cm"><style:column-sep style:width="0.035cm" style:style="solid"/><style:column style:rel-width="2268*" fo:start-indent="0cm" fo:end-indent="0.5cm"/><style:column style:rel-width="6803*" fo:start-indent="0.5cm" fo:end-indent="0cm"/></style:columns>"#;
+    let root = parse_xml(xml).unwrap();
+    let c = columns_of(&root).unwrap();
+    assert_eq!(c.n, 2);
+    assert!(c.rule);
+    assert!((c.gap - 28.35).abs() < 0.1, "{}", c.gap);
+    // Textyta 453,5 pt: första spaltens andel är 1/4, minus 14,17 pt utfyllnad.
+    let w = c.widths(453.5);
+    assert_eq!(w.len(), 2);
+    assert!((w[0] - (453.5 / 4.0 - 14.17)).abs() < 0.2, "{w:?}");
+    // Lika breda spalter utan skiljelinje: inga bredder.
+    let eq = parse_xml(r#"<style:columns fo:column-count="2" fo:column-gap="1cm"/>"#).unwrap();
+    let c = columns_of(&eq).unwrap();
+    assert!(c.widths(453.5).is_empty() && !c.rule);
+}

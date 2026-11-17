@@ -17,6 +17,7 @@ use pulldown_cmark::{CowStr, Event as MdEvent, HeadingLevel, Options, Parser, Ta
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
+use crate::docx_tbox;
 use crate::review::{self, CommentRec, RevKind, RevRec};
 use crate::word::sections;
 use crate::style::titles::{self, TitleKind};
@@ -100,6 +101,8 @@ struct FnPart {
 struct FnRefInfo {
     id: String,
     origin: usize,
+    /// Sant för en slutnot (`w:endnoteReference`), som blir `[^ei]` i texten.
+    endnote: bool,
 }
 
 /// Originalet av ett öppnat Word-dokument: alla delar i paketet, `w:sectPr`, varje blocks
@@ -120,14 +123,20 @@ pub struct Source {
     tokens: Vec<Opaque>,
     /// Originalets fotnoter (footnotes.xml), om dokumentet har några.
     footnotes: Option<FnPart>,
+    /// Originalets slutnoter (endnotes.xml), om dokumentet har några.
+    endnotes: Option<FnPart>,
     /// Sida, sidhuvud och sidfot så som de lästes (övriga fält i DocDefaults är tomma).
     page: DocDefaults,
     /// Formatmallarna så som de lästes ur `styles.xml` (se `docx_styles`).
     styles: style::StyleSet,
     /// Originalets kommentarer (comments.xml), om dokumentet har några.
     comments: Option<review_xml::CmPart>,
-    /// Sidhuvuds- och sidfotsreferenserna i första avsnittets `w:sectPr` (de gäller också senare avsnitt).
-    first_refs: String,
+    /// Textrutornas ram (markören som tas bort igen) och text så som den lästes, per markörnummer.
+    tboxes: HashMap<usize, (String, String)>,
+    /// Sidhuvud och sidfot per avsnitt så som de lästes (för att se vad som ändrats).
+    hf_secs: Vec<crate::hf::SecHf>,
+    /// Alla avsnittens `w:sectPr` i ordning (för avsnitt som skrivs om från grunden).
+    sect_prs: Vec<String>,
 }
 
 // ============================================================== läsning
@@ -230,6 +239,11 @@ fn local(name: &[u8]) -> &[u8] {
 }
 
 /// Värdet på ett attribut, matchat på lokalt namn (`w:val`, `r:id` …).
+/// Ett på/av-element (`<w:pageBreakBefore/>`, `w:val="0"` är av).
+fn on_val(e: &BytesStart<'_>) -> bool {
+    !matches!(attr(e, b"val").as_deref(), Some("0" | "false" | "off"))
+}
+
 fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes().flatten().find(|a| local(a.key.as_ref()) == name).map(|a| {
         a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
@@ -478,6 +492,8 @@ struct StyleInfo {
     rpr: RProps,
     /// Justering (`w:jc`) i formatmallen.
     jc: Option<Align>,
+    /// `w:pageBreakBefore` i formatmallen.
+    page_before: Option<bool>,
 }
 
 /// Formatmallarna i `styles.xml`: stycke- och teckenmallar plus dokumentets standardvärden.
@@ -528,6 +544,19 @@ impl Styles {
             cur = info.based_on.as_deref();
         }
         None
+    }
+
+    /// Börjar stycken med formatmallen alltid på en ny sida (`w:pageBreakBefore`, även ärvt)?
+    fn page_before(&self, style: Option<&str>) -> bool {
+        let mut cur = Some(self.para_id(style));
+        for _ in 0..10 {
+            let Some(info) = cur.and_then(|c| self.map.get(c)) else { return false };
+            if let Some(v) = info.page_before {
+                return v;
+            }
+            cur = info.based_on.as_deref();
+        }
+        false
     }
 
     /// Dokumentets grundformat: typsnitt och storlek hos Normal (docDefaults + Normal).
@@ -597,6 +626,7 @@ fn parse_styles(xml: &str, theme: &Theme) -> Styles {
                         b"name" => info.name = attr(e, b"val").unwrap_or_default().to_lowercase(),
                         b"basedOn" => info.based_on = attr(e, b"val"),
                         b"jc" if in_ppr => info.jc = attr(e, b"val").map(|v| Align::from_jc(&v)),
+                        b"pageBreakBefore" if in_ppr => info.page_before = Some(on_val(e)),
                         b"outlineLvl" => {
                             info.outline = attr(e, b"val").and_then(|v| v.parse::<u8>().ok()).filter(|&v| v < 9)
                         }
@@ -813,14 +843,31 @@ struct Para {
     ppr: crate::word::pbox::PPr,
     /// Teckenstorlek (pt) på stycketecknet i ett tomt stycke, om stycket anger den.
     mark_sz: Option<f32>,
+    /// Textrutor förankrade i stycket (`docx_tbox`).
+    boxes: Vec<BoxRead>,
+}
+
+/// En textruta som lästs: innehållet som block, formen och läget.
+#[derive(Clone)]
+struct BoxRead {
+    /// Markören (`<!--k:N-->`) som bär originalkörningen.
+    token: usize,
+    shape: docx_tbox::Shape,
+    blocks: Vec<Block>,
+    /// Bredd (pt) och vågrätt läge ur ankaret (`wp:anchor`), annars rutan i flödet.
+    width: f32,
+    x: crate::word::pbox::FrameX,
+    /// `x` är ett avstånd från sidans vänsterkant (räknas om till spalten när sidan är känd).
+    page_rel: bool,
 }
 
 impl Para {
     fn new() -> Para {
-        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None, origin: usize::MAX, ppr: Default::default(), mark_sz: None }
+        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None, origin: usize::MAX, ppr: Default::default(), mark_sz: None, boxes: Vec::new() }
     }
 }
 
+#[derive(Clone)]
 enum Block {
     Para(Para),
     /// Tabellen och toppnivåelementets index.
@@ -882,6 +929,8 @@ struct BodyInfo {
     revs: Vec<RevRec>,
     /// Kommentarer som har ett område i texten.
     comment_ids: Vec<u32>,
+    /// Läser en textruta: den får inte innehålla fler rutor.
+    in_box: bool,
 }
 
 pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
@@ -963,28 +1012,84 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
 
     // Fotnoterna: texten läses ur footnotes.xml och läggs som definitioner sist i dokumentet.
     let footnotes = match find_part("/footnotes") {
-        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering)?,
+        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering, "footnote")?,
+        None => None,
+    };
+
+    // Slutnoterna: endnotes.xml, som fotnoterna men med etiketterna `ei`, `eii` …
+    let endnotes = match find_part("/endnotes") {
+        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering, "endnote")?,
         None => None,
     };
 
     // Sida, sidhuvud och sidfot ur första avsnittet (de övriga avsnitten blir avsnittsrader).
     let page = match info.sects.first().or(info.sect_pr.as_ref()) {
-        Some(sect) => read_page(sect, &mut pkg, &rels, dir)?,
+        Some(sect) => read_page(sect)?,
         None => DocDefaults::default(),
     };
     let mut all_sects: Vec<&str> = info.sects.iter().map(String::as_str).collect();
     all_sects.extend(info.sect_pr.as_deref());
-    fill_section_rows(&mut blocks, &all_sects, &page);
+    let sect_prs: Vec<String> = all_sects.iter().map(|x| (*x).to_owned()).collect();
+    // Sidhuvud och sidfot per avsnitt (bilderna i dem blir dokumentets bilder).
+    let even_odd = find_part("/settings").and_then(|p| pkg.part(&p).ok().flatten()).is_some_and(|x| hf::even_and_odd(&x));
+    let mut hf_images = hf::HfImages::default();
+    let mut sect_hf: Vec<hf::SectHfRead> = Vec::new();
+    for (i, sx) in all_sects.iter().enumerate() {
+        let raw = read_sect(sx);
+        let geo = hf::PageGeo { size: raw.size.unwrap_or_else(|| page.page()), margin: raw.margin.unwrap_or_else(|| page.margins()) };
+        sect_hf.push(hf::read_sect(sx, i == 0, even_odd, geo, &mut pkg, &rels, dir, &mut hf_images)?);
+    }
+    let mut page = page;
+    if let Some(h) = sect_hf.first() {
+        page.header = h.own.header.clone();
+        page.footer = h.own.footer.clone();
+        page.header_first = h.own.header_first.clone();
+        page.footer_first = h.own.footer_first.clone();
+        page.header_even = h.own.header_even.clone();
+        page.footer_even = h.own.footer_even.clone();
+        page.header_align = h.header_align;
+        page.footer_align = h.footer_align;
+        page.header_style = h.header_style.clone();
+        page.footer_style = h.footer_style.clone();
+        page.header_dist = h.header_dist;
+        page.footer_dist = h.footer_dist;
+        page.page_start = h.own.page_start;
+        page.page_format = h.own.page_fmt;
+    }
+    fill_section_rows(&mut blocks, &all_sects, &page, &sect_hf);
 
     // Packa upp bilderna som dokumentet faktiskt använder.
-    let mut images: Vec<(String, Image)> = Vec::new();
-    let mut by_target: HashMap<String, String> = HashMap::new();
+    let mut images: Vec<(String, Image)> = std::mem::take(&mut hf_images.list);
+    let mut by_target: HashMap<String, String> = std::mem::take(&mut hf_images.by_target);
     let text_w = {
         let (w, _) = page.page();
         let m = page.margins();
         Some(((w - m[1] - m[3]) * 20.0) as f64)
     };
     fill_para_looks(&mut blocks, &info.elems, &para_styles);
+    // Rutor placerade från sidans kant: räknas om till spaltens vänsterkant.
+    let left_margin = page.margins()[3];
+    for b in blocks.iter_mut() {
+        if let Block::Para(p) = b {
+            for bx in p.boxes.iter_mut().filter(|b| b.page_rel) {
+                if let crate::word::pbox::FrameX::Off(v) = bx.x {
+                    bx.x = crate::word::pbox::FrameX::Off((v - left_margin).max(0.0));
+                }
+                bx.page_rel = false;
+            }
+        }
+    }
+    let mut tboxes: HashMap<usize, (String, String)> = HashMap::new();
+    for b in &blocks {
+        if let Block::Para(p) = b {
+            for bx in p.boxes.iter().filter(|_| box_shown(p)) {
+                let (marker, md) = box_md(bx, &numbering, text_w);
+                if !md.is_empty() {
+                    tboxes.entry(bx.token).or_insert_with(|| (marker.clone(), strip_frame(&md, &marker)));
+                }
+            }
+        }
+    }
     let (mut markdown, units) = to_markdown_units(&blocks, &numbering, text_w);
     let mut keys: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
     // Grundformatet (typsnitt, storlek och sida) står först när det avviker från standard.
@@ -997,15 +1102,27 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     base.footer_align = page.footer_align;
     base.header_first = page.header_first.clone();
     base.footer_first = page.footer_first.clone();
+    base.header_even = page.header_even.clone();
+    base.footer_even = page.footer_even.clone();
+    base.header_style = page.header_style.clone();
+    base.footer_style = page.footer_style.clone();
+    base.header_dist = page.header_dist;
+    base.footer_dist = page.footer_dist;
+    base.page_start = page.page_start;
+    base.page_format = page.page_format;
     base.styles = style_set;
     if !info.fn_refs.is_empty() {
         markdown.push('\n');
-        for (i, r) in info.fn_refs.iter().enumerate() {
-            let md = footnotes
-                .as_ref()
-                .and_then(|f| f.items.iter().find(|x| x.id == r.id && x.ty.is_none()))
-                .map_or("", |x| x.md.as_str());
-            markdown.push_str(&format!("[^{}]: {md}\n", i + 1));
+        // Fotnoterna först (numrerade 1..n), sedan slutnoterna (`e1`, `e2` …), var och en i textens ordning.
+        for end in [false, true] {
+            let part = if end { endnotes.as_ref() } else { footnotes.as_ref() };
+            for (i, r) in info.fn_refs.iter().filter(|r| r.endnote == end).enumerate() {
+                let md = part
+                    .and_then(|f| f.items.iter().find(|x| x.id == r.id && x.ty.is_none()))
+                    .map_or("", |x| x.md.as_str());
+                let label = if end { crate::word::markup::endnote_label(i + 1) } else { (i + 1).to_string() };
+                markdown.push_str(&format!("[^{label}]: {md}\n"));
+            }
         }
     }
     let mut comments = comments;
@@ -1085,15 +1202,14 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                 e.fn_ids.push(r.id.clone());
             }
         }
-        let first_refs = info.sects.first().or(info.sect_pr.as_ref()).map(|x| header_refs(x)).unwrap_or_default();
-        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, page, styles: read_styles, comments, first_refs })
+        Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, endnotes, page, styles: read_styles, comments, hf_secs: sect_hf.iter().map(|h| h.own.clone()).collect(), sect_prs, tboxes })
     });
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
 
 /// Delar upp footnotes.xml: allt före och efter, och varje `<w:footnote>` med id, typ, hela
 /// elementet och innehållets intervall (utan start- och sluttaggen).
-fn split_footnotes(xml: &str) -> Option<(String, Vec<(String, Option<String>, String, std::ops::Range<usize>)>, String)> {
+fn split_footnotes(xml: &str, tag: &str) -> Option<(String, Vec<(String, Option<String>, String, std::ops::Range<usize>)>, String)> {
     let mut r = Reader::from_str(xml);
     let mut depth = 0usize;
     let mut cur: Option<(usize, usize, String, Option<String>)> = None; // (start, inner start, id, typ)
@@ -1107,14 +1223,14 @@ fn split_footnotes(xml: &str) -> Option<(String, Vec<(String, Option<String>, St
         let after = r.buffer_position() as usize;
         match &ev {
             Event::Start(e) => {
-                if depth == 1 && local(e.name().as_ref()) == b"footnote" {
+                if depth == 1 && local(e.name().as_ref()) == tag.as_bytes() {
                     first.get_or_insert(before);
                     cur = Some((before, after, attr(e, b"id").unwrap_or_default(), attr(e, b"type")));
                 }
                 depth += 1;
             }
             Event::Empty(e) => {
-                if depth == 1 && local(e.name().as_ref()) == b"footnote" {
+                if depth == 1 && local(e.name().as_ref()) == tag.as_bytes() {
                     first.get_or_insert(before);
                     items.push((attr(e, b"id").unwrap_or_default(), attr(e, b"type"), xml[before..after].to_owned(), after..after));
                     last_end = after;
@@ -1184,9 +1300,9 @@ fn footnote_md(
     escape_line_start(&joined)
 }
 
-fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Theme, numbering: &Numbering) -> Result<Option<FnPart>, String> {
+fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Theme, numbering: &Numbering, tag: &str) -> Result<Option<FnPart>, String> {
     let Some(xml) = pkg.part(name)? else { return Ok(None) };
-    let Some((head, raw, tail)) = split_footnotes(&xml) else { return Ok(None) };
+    let Some((head, raw, tail)) = split_footnotes(&xml, tag) else { return Ok(None) };
     // Hyperlänkar i fotnoterna pekar på footnotes.xml:s egna relationer.
     let (dir, file) = name.rsplit_once('/').unwrap_or(("", name));
     let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
@@ -1297,11 +1413,18 @@ struct RawSect {
     cols: usize,
     /// Mellanrum mellan spalter i pt.
     gap: Option<f32>,
+    /// Spaltbredder i pt när spalterna är olika breda (`w:equalWidth="0"`), annars tom.
+    widths: Vec<f32>,
+    /// Skiljelinje mellan spalterna (`w:sep`).
+    rule: bool,
     continuous: bool,
 }
 
 fn read_sect(sect: &str) -> RawSect {
-    let mut o = RawSect { size: None, margin: None, cols: 1, gap: None, continuous: false };
+    let mut o = RawSect { size: None, margin: None, cols: 1, gap: None, widths: Vec::new(), rule: false, continuous: false };
+    let mut unequal = false;
+    let mut col_ws: Vec<f32> = Vec::new();
+    let mut first_space: Option<f32> = None;
     let mut mar = [style::DEFAULT_MARGIN; 4];
     let mut r = Reader::from_str(sect);
     let tw = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
@@ -1328,9 +1451,17 @@ fn read_sect(sect: &str) -> RawSect {
                 b"cols" => {
                     o.cols = attr(&e, b"num").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, sections::MAX_COLUMNS);
                     o.gap = tw(&e, b"space").map(|v| v / 20.0);
+                    o.rule = matches!(attr(&e, b"sep").as_deref(), Some("1" | "true" | "on"));
+                    unequal = matches!(attr(&e, b"equalWidth").as_deref(), Some("0" | "false" | "off"));
                 }
-                // Olika breda spalter: antalet räknas, mellanrummet tas från första spalten.
+                // Olika breda spalter: bredderna samlas, mellanrummet tas från första spalten.
                 b"col" => {
+                    if let Some(w) = tw(&e, b"w").filter(|w| *w > 0.0) {
+                        col_ws.push(w / 20.0);
+                    }
+                    if col_ws.len() == 1 {
+                        first_space = tw(&e, b"space").map(|v| v / 20.0);
+                    }
                     if o.gap.is_none() {
                         o.gap = tw(&e, b"space").map(|v| v / 20.0);
                     }
@@ -1340,6 +1471,17 @@ fn read_sect(sect: &str) -> RawSect {
             },
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
+        }
+    }
+    if unequal && col_ws.len() > 1 {
+        o.cols = col_ws.len().min(sections::MAX_COLUMNS);
+        col_ws.truncate(o.cols);
+        if let Some(g) = first_space {
+            o.gap = Some(g);
+        }
+        // Lika breda i praktiken: vanliga spalter.
+        if col_ws.iter().any(|w| (w - col_ws[0]).abs() > 0.5) {
+            o.widths = col_ws;
         }
     }
     o
@@ -1355,6 +1497,8 @@ fn section_props(sect: Option<&str>, d: &DocDefaults) -> sections::SectionProps 
     if raw.cols > 1 {
         p.columns = Some(raw.cols);
         p.column_gap = raw.gap.filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
+        p.column_widths = Some(raw.widths.clone()).filter(|w| w.len() > 1);
+        p.column_rule = raw.rule;
     }
     p.continuous = raw.continuous;
     p
@@ -1362,7 +1506,7 @@ fn section_props(sect: Option<&str>, d: &DocDefaults) -> sections::SectionProps 
 
 /// Byter platshållarna i avsnittsraderna mot raderna med respektive avsnitts egenskaper.
 /// `sects[n]` är `w:sectPr` för avsnitt n (0 = första); rad n börjar avsnitt n + 1.
-fn fill_section_rows(blocks: &mut [Block], sects: &[&str], d: &DocDefaults) {
+fn fill_section_rows(blocks: &mut [Block], sects: &[&str], d: &DocDefaults, hfs: &[hf::SectHfRead]) {
     for b in blocks {
         let Block::Para(p) = b else { continue };
         let [run] = p.runs.as_mut_slice() else { continue };
@@ -1370,21 +1514,20 @@ fn fill_section_rows(blocks: &mut [Block], sects: &[&str], d: &DocDefaults) {
         else {
             continue;
         };
-        run.text = section_props(sects.get(n + 1).copied(), d).to_comment();
+        let mut props = section_props(sects.get(n + 1).copied(), d);
+        if let Some(h) = hfs.get(n + 1) {
+            props.hf = h.own.clone();
+        }
+        run.text = props.to_comment();
     }
 }
 
 /// Sidstorlek, marginaler, sidhuvud och sidfot ur en `w:sectPr`.
-fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, String, bool)>, dir: &str) -> Result<DocDefaults, String> {
+fn read_page(sect: &str) -> Result<DocDefaults, String> {
     let mut d = DocDefaults::default();
     let mut size: Option<(f32, f32)> = None;
     let mut mar = [style::DEFAULT_MARGIN; 4];
     let mut has_mar = false;
-    let mut hdr: Option<String> = None;
-    let mut ftr: Option<String> = None;
-    let mut hdr_first: Option<String> = None;
-    let mut ftr_first: Option<String> = None;
-    let mut title_pg = false;
     let mut r = Reader::from_str(sect);
     let twips = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
     loop {
@@ -1408,17 +1551,6 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
                         }
                     }
                 }
-                b"headerReference" | b"footerReference" if matches!(attr(&e, b"type").as_deref(), Some("default" | "first")) => {
-                    let id = attr(&e, b"id");
-                    let (header, first) = (local(e.name().as_ref()) == b"headerReference", attr(&e, b"type").as_deref() == Some("first"));
-                    match (header, first) {
-                        (true, false) => hdr = id,
-                        (true, true) => hdr_first = id,
-                        (false, false) => ftr = id,
-                        (false, true) => ftr_first = id,
-                    }
-                }
-                b"titlePg" => title_pg = !matches!(attr(&e, b"val").as_deref(), Some("0" | "false" | "off")),
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
@@ -1427,185 +1559,7 @@ fn read_page(sect: &str, pkg: &mut Package<'_>, rels: &HashMap<String, (String, 
     }
     d.page_size = size;
     d.page_margin = has_mar.then_some(mar);
-    for (id, header) in [(hdr, true), (ftr, false)] {
-        let Some((target, _, false)) = id.and_then(|i| rels.get(&i)) else { continue };
-        let Some(xml) = pkg.part(&resolve_target(dir, target))? else { continue };
-        if let Some((text, align)) = hf_text(&xml) {
-            if header {
-                d.header = Some(text);
-                d.header_align = align;
-            } else {
-                d.footer = Some(text);
-                d.footer_align = align;
-            }
-        }
-    }
-    // Annorlunda första sida (`w:titlePg`): en saknad eller oläslig del blir en tom första sida.
-    if title_pg {
-        for (id, header) in [(hdr_first, true), (ftr_first, false)] {
-            let mut found = None;
-            if let Some((target, _, false)) = id.and_then(|i| rels.get(&i)) {
-                if let Some(xml) = pkg.part(&resolve_target(dir, target))? {
-                    found = hf_text(&xml);
-                }
-            }
-            let text = found.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
-            if header {
-                d.header_first = Some(text);
-                if d.header.is_none() {
-                    d.header_align = found.map_or(Align::Left, |(_, a)| a);
-                }
-            } else {
-                d.footer_first = Some(text);
-                if d.footer.is_none() {
-                    d.footer_align = found.map_or(Align::Left, |(_, a)| a);
-                }
-            }
-        }
-    }
     Ok(d)
-}
-
-/// `{sida}` för PAGE, `{sidor}` för NUMPAGES/SECTIONPAGES, `{datum}` för DATE/TIME, `{titel}` för
-/// TITLE och `{fil}` för FILENAME.
-fn field_placeholder(instr: &str) -> Option<&'static str> {
-    match instr.split_whitespace().next().map(str::to_ascii_uppercase).as_deref() {
-        Some("PAGE") => Some("{sida}"),
-        Some("NUMPAGES" | "SECTIONPAGES") => Some("{sidor}"),
-        Some("DATE" | "TIME") => Some("{datum}"),
-        Some("TITLE") => Some("{titel}"),
-        Some("FILENAME") => Some("{fil}"),
-        _ => None,
-    }
-}
-
-/// Texten i ett sidhuvud eller en sidfot: styckenas text sammanfogad med mellanslag, fält som
-/// `{sida}`/`{sidor}`/`{datum}`/`{titel}`/`{fil}`, och det första styckets justering. Ett enda
-/// stycke med en eller två flikar blir vänster|mitten|höger (`a|b|c`); `|` i texten skrivs `\|`.
-fn hf_text(xml: &str) -> Option<(String, Align)> {
-    let mut r = Reader::from_str(xml);
-    let mut paras: Vec<String> = Vec::new();
-    // Styckenas delar uppdelade vid flikar, och det senaste styckets egna tabbstopp.
-    let mut para_segs: Vec<Vec<String>> = Vec::new();
-    let mut segs: Vec<String> = Vec::new();
-    let mut tab_stops: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut align: Option<Align> = None;
-    let mut seen_p = false;
-    let mut in_p = false;
-    let mut in_ppr = false;
-    let mut in_t = false;
-    let mut in_instr = false;
-    // Komplexa fält: (kod, i resultatet, ersättning).
-    let mut fields: Vec<(String, bool, Option<&'static str>)> = Vec::new();
-    let mut simples: Vec<bool> = Vec::new();
-    loop {
-        let ev = r.read_event().ok()?;
-        match &ev {
-            Event::Eof => break,
-            Event::Start(e) | Event::Empty(e) => {
-                let empty = matches!(ev, Event::Empty(_));
-                match local(e.name().as_ref()) {
-                    b"p" if !empty => {
-                        in_p = true;
-                        cur.clear();
-                        segs.clear();
-                        tab_stops.clear();
-                        if !seen_p {
-                            seen_p = true;
-                        }
-                    }
-                    b"pPr" => in_ppr = !empty,
-                    b"jc" if in_ppr && align.is_none() && paras.is_empty() => align = attr(e, b"val").map(|v| Align::from_jc(&v)),
-                    b"t" => in_t = !empty,
-                    b"instrText" => in_instr = !empty,
-                    b"tab" if in_p && !in_ppr => segs.push(std::mem::take(&mut cur)),
-                    b"tab" if in_ppr => {
-                        if let Some(v) = attr(e, b"val").filter(|v| v != "clear") {
-                            tab_stops.push(v);
-                        }
-                    }
-                    b"fldChar" => match attr(e, b"fldCharType").as_deref() {
-                        Some("begin") => fields.push((String::new(), false, None)),
-                        Some("separate") => {
-                            if let Some(f) = fields.last_mut() {
-                                f.1 = true;
-                                f.2 = field_placeholder(&f.0);
-                                if let Some(ph) = f.2 {
-                                    cur.push_str(ph);
-                                }
-                            }
-                        }
-                        Some("end") => {
-                            fields.pop();
-                        }
-                        _ => {}
-                    },
-                    b"fldSimple" => {
-                        let ph = attr(e, b"instr").and_then(|i| field_placeholder(&i));
-                        if let Some(ph) = ph {
-                            cur.push_str(ph);
-                        }
-                        if !empty {
-                            simples.push(ph.is_some());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Event::End(e) => match local(e.name().as_ref()) {
-                b"p" => {
-                    if in_p {
-                        segs.push(std::mem::take(&mut cur));
-                        let parts: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
-                        let t = parts.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
-                        if !t.is_empty() {
-                            paras.push(t);
-                            // Två delar utan egna tabbstopp: Words standard är mitt och höger.
-                            let mut p = parts;
-                            if p.len() == 2 {
-                                let right = tab_stops.len() == 1 && tab_stops[0] == "right";
-                                p = if right { vec![p[0].clone(), String::new(), p[1].clone()] } else { vec![p[0].clone(), p[1].clone(), String::new()] };
-                            }
-                            para_segs.push(p);
-                        } else if paras.is_empty() {
-                            // Ett tomt första stycke ger ingen justering.
-                            align = None;
-                        }
-                        in_p = false;
-                    }
-                }
-                b"pPr" => in_ppr = false,
-                b"t" => in_t = false,
-                b"instrText" => in_instr = false,
-                b"fldSimple" => {
-                    simples.pop();
-                }
-                _ => {}
-            },
-            Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => {
-                let t = text_of(&ev);
-                if in_instr {
-                    if let Some(f) = fields.last_mut() {
-                        f.0.push_str(&t);
-                    }
-                } else if in_t && in_p {
-                    let hidden = fields.iter().any(|f| !f.1) || fields.iter().any(|f| f.1 && f.2.is_some()) || simples.iter().any(|&x| x);
-                    if !hidden {
-                        cur.push_str(&t.replace(['\n', '\r'], " "));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if let [p] = para_segs.as_slice() {
-        if p.len() == 3 {
-            return Some((p.join("|"), Align::Left));
-        }
-    }
-    let text = paras.join(" ");
-    (!text.is_empty()).then(|| (text, align.unwrap_or(Align::Left)))
 }
 
 /// En bild som hittats i texten; platshållaren byts mot `![…](bild:…)` när bilden lästs.
@@ -1725,6 +1679,10 @@ struct Drawing {
     crop: Option<[i64; 4]>,
     /// Läget kommer från en VML-form (`v:shape`).
     vml: bool,
+    /// Var elementet börjar i XML:en.
+    start: usize,
+    /// Intervallet för innehållet i `w:txbxContent`.
+    tx: Option<(usize, usize)>,
 }
 
 /// Läser storlek och läge ur `style` på en VML-form (`width:72pt;margin-left:10pt;position:absolute …`).
@@ -1860,6 +1818,9 @@ fn run_span(
 
 /// Slutet (exklusivt) på elementet som börjar vid `from` i `xml`.
 /// Ett stycke med bara en rad råtext (Kladds egna markörer: avsnitt, spaltbrytning).
+/// Körningen som markerar en sidbrytning i ett stycke som läses (tas bort av `split_page_breaks`).
+const PAGE_BREAK_RUN: &str = "\u{E0F0}";
+
 fn raw_para(text: String, origin: usize) -> Para {
     let mut p = Para::new();
     p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
@@ -1917,6 +1878,45 @@ fn is_toc_xml(xml: &str) -> bool {
     xml.contains("w:instr=\" TOC") || xml.contains("w:instr=\"TOC")
 }
 
+/// Läser en textruta: innehållet som block (egna markörer räknas på samma lista som resten) och formen.
+/// `None` om innehållet inte går att visa som text (bilder, fotnoter) eller är tomt.
+fn read_box(
+    inner: &str,
+    shape_xml: &str,
+    d: &Drawing,
+    (styles, theme, numbering, rels): (&Styles, &Theme, &Numbering, &HashMap<String, (String, String, bool)>),
+    dropped: &mut Dropped,
+    dir: &str,
+    info: &mut BodyInfo,
+) -> Option<BoxRead> {
+    let doc = format!("<w:body>{inner}</w:body>");
+    let mut sub = BodyInfo { in_box: true, tokens: std::mem::take(&mut info.tokens), ..Default::default() };
+    let mut sub_found = Vec::new();
+    let blocks = parse_body(&doc, styles, theme, numbering, rels, dropped, &mut sub_found, dir, &mut sub);
+    info.tokens = std::mem::take(&mut sub.tokens);
+    let blocks = blocks.ok()?;
+    if !sub_found.is_empty() || !sub.fn_refs.is_empty() || blocks.is_empty() {
+        return None;
+    }
+    let shape = docx_tbox::read_shape(shape_xml, &|n| theme.color(n));
+    use crate::word::pbox::FrameX;
+    let width = d.extent.map_or(0.0, |(cx, _)| cx as f32 / 12700.0);
+    // Läget i spalten: justering eller förskjutning från kolumn/marginal. Sidrelativa lägen är inte kända här.
+    let x = match (d.anchored, d.pos.align.as_deref()) {
+        (true, Some("center")) => FrameX::Center,
+        (true, Some("right" | "outside")) => FrameX::End,
+        (true, Some(_)) => FrameX::Start,
+        (true, None) if matches!(d.pos.rel.as_str(), "" | "column" | "margin" | "character") => FrameX::Off(d.pos.off.unwrap_or(0) as f32 / 12700.0),
+        _ => FrameX::Start,
+    };
+    let page_rel = d.anchored && d.pos.align.is_none() && matches!(d.pos.rel.as_str(), "page" | "leftMargin");
+    let x = match (page_rel, x) {
+        (true, _) => FrameX::Off(d.pos.off.unwrap_or(0) as f32 / 12700.0),
+        (_, x) => x,
+    };
+    Some(BoxRead { token: 0, shape, blocks, width, x, page_rel })
+}
+
 fn parse_body(
     xml: &str,
     styles: &Styles,
@@ -1937,6 +1937,8 @@ fn parse_body(
     // Avsnittsslut (`w:sectPr` i `w:pPr`) och spaltbrytning i stycket som läses.
     let mut para_sect: Option<String> = None;
     let mut para_col_break = false;
+    // `w:pageBreakBefore` i stycket självt (`Some(false)` upphäver formatmallens).
+    let mut para_page_before: Option<bool> = None;
     let mut fmt = Fmt::default();
     // Körningens egna egenskaper (`w:rPr`) och teckenmall (`w:rStyle`).
     let mut direct = RProps::default();
@@ -1961,10 +1963,14 @@ fn parse_body(
     let mut run_start = 0usize;
     let mut run_opaque = false;
     let mut run_fnref: Option<String> = None;
+    let mut run_fnend = false;
     // Hur långt stycket var när körningen började, så att den kan backas om den blir en markör.
     let mut run_mark = (0usize, 0usize);
     let mut run_found_mark = 0usize;
     let mut omath_start: Option<usize> = None;
+    // Textrutan i bilden/formen som läses (innehållets början) och den färdigläsa rutan i körningen.
+    let mut txbx_start: Option<usize> = None;
+    let mut run_box: Option<BoxRead> = None;
     let mut simple_fields: Vec<()> = Vec::new();
     // Spårade ändringar: öppna `w:ins`/`w:del` och den som gäller just nu.
     let mut rev_stack: Vec<Option<(RevKind, u32)>> = Vec::new();
@@ -2102,6 +2108,9 @@ fn parse_body(
                             if !empty {
                                 d.depth -= 1;
                                 skip = 1;
+                                if d.tx.is_none() && !info.in_box {
+                                    txbx_start = Some(after);
+                                }
                             }
                         }
                         b"anchor" => {
@@ -2169,21 +2178,24 @@ fn parse_body(
                 } else if in_run
                     && matches!(
                         name.as_slice(),
-                        b"endnoteReference" | b"commentReference" | b"fldChar" | b"instrText" | b"sym" | b"object"
+                        b"commentReference" | b"fldChar" | b"instrText" | b"sym" | b"object"
                     )
                 {
                     run_opaque = true;
                 }
                 match name.as_slice() {
                     // Fotnotsreferens: blir `[^N]` i texten (anpassad hänvisning och dolda fält förblir markörer).
-                    b"footnoteReference" if in_run => match attr(e, b"id") {
-                        Some(id) if attr(e, b"customMarkFollows").is_none() && !hidden(&field_depth) => run_fnref = Some(id),
+                    b"footnoteReference" | b"endnoteReference" if in_run => match attr(e, b"id") {
+                        Some(id) if attr(e, b"customMarkFollows").is_none() && !hidden(&field_depth) => {
+                            run_fnref = Some(id);
+                            run_fnend = name.as_slice() == b"endnoteReference";
+                        }
                         _ => run_opaque = true,
                     },
                     // Bilder: samla ihop till ett `![…](bild:…)` när elementet tar slut.
                     b"drawing" | b"pict" => {
                         if !empty {
-                            drawing = Some(Drawing { depth: 1, ..Default::default() });
+                            drawing = Some(Drawing { depth: 1, start: before, ..Default::default() });
                         } else {
                             run_opaque = true;
                         }
@@ -2328,6 +2340,7 @@ fn parse_body(
                         para = Some(Para::new());
                         para_marks.clear();
                         para_fchange = None;
+                        para_page_before = None;
                     }
                     b"pPr" => in_ppr = !empty,
                     b"pStyle" if in_ppr => {
@@ -2421,6 +2434,11 @@ fn parse_body(
                     b"br" if !hidden(&field_depth) && attr(e, b"type").as_deref() == Some("column") && tables.is_empty() => {
                         para_col_break = true;
                     }
+                    // Sidbrytning i en körning: stycket delas vid den när det avslutas (`split_page_breaks`).
+                    b"br" if !hidden(&field_depth) && attr(e, b"type").as_deref() == Some("page") && tables.is_empty() && para.is_some() && skip == 0 => {
+                        para.as_mut().expect("stycke").runs.push(Run { text: PAGE_BREAK_RUN.to_owned(), fmt: Fmt::default(), link: None, raw: true });
+                    }
+                    b"pageBreakBefore" if in_ppr && para.is_some() => para_page_before = Some(on_val(e)),
                     b"br" | b"cr" if !hidden(&field_depth) => {
                         // En infogad eller struken radbrytning får en markör före sig.
                         if let Some((kind @ (RevKind::Ins | RevKind::Del), id)) = cur_rev {
@@ -2488,6 +2506,11 @@ fn parse_body(
                 if skip > 0 {
                     skip -= 1;
                     if skip == 0 {
+                        if let Some(s) = txbx_start.take() {
+                            if let (Some(d), Some(e)) = (drawing.as_mut(), xml[..after].rfind("</")) {
+                                d.tx = Some((s, e));
+                            }
+                        }
                         if let Some(start) = omath_start.take() {
                             // Formel: LaTeX om den går att uttrycka, annars en markör.
                             match crate::math::omml::to_latex(&xml[start..after]) {
@@ -2531,7 +2554,14 @@ fn parse_body(
                         }
                         Some(_) => {}
                         // Former, diagram, textrutor och länkade bilder bevaras som markörer.
-                        None => run_opaque = true,
+                        None => {
+                            run_opaque = true;
+                            // Textrutan visas som stycken före ankarstycket (`docx_tbox`).
+                            if let Some((s, e)) = d.tx.filter(|_| !info.in_box && tables.is_empty() && !hidden(&field_depth)) {
+                                let shape_xml = format!("{}{}", &xml[d.start..s], &xml[e..after]);
+                                run_box = read_box(&xml[s..e], &shape_xml, &d, (styles, theme, numbering, rels), dropped, dir, info);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -2570,8 +2600,13 @@ fn parse_body(
                                         l.text.truncate(run_mark.1);
                                     }
                                 }
-                                info.fn_refs.push(FnRefInfo { id, origin: info.elems.len().wrapping_sub(1) });
-                                let label = format!("[^{}]", info.fn_refs.len());
+                                let endnote = std::mem::take(&mut run_fnend);
+                                info.fn_refs.push(FnRefInfo { id, origin: info.elems.len().wrapping_sub(1), endnote });
+                                let label = if endnote {
+                                    format!("[^{}]", crate::word::markup::endnote_label(info.fn_refs.iter().filter(|r| r.endnote).count()))
+                                } else {
+                                    format!("[^{}]", info.fn_refs.iter().filter(|r| !r.endnote).count())
+                                };
                                 let p = para.get_or_insert_with(Para::new);
                                 p.runs.push(Run { text: label, fmt: Fmt::default(), link: None, raw: true });
                             } else if run_opaque {
@@ -2583,6 +2618,10 @@ fn parse_body(
                                     }
                                 }
                                 push_token(&mut para, info, run_xml);
+                                if let Some(mut b) = run_box.take() {
+                                    b.token = info.tokens.len() - 1;
+                                    para.get_or_insert_with(Para::new).boxes.push(b);
+                                }
                             } else if found.len() > run_found_mark {
                                 // Bilder som inte går att visa ersätts av hela körningen.
                                 let n = new_token(info, run_xml);
@@ -2592,6 +2631,7 @@ fn parse_body(
                             }
                             run_opaque = false;
                             run_drop = false;
+                            run_box = None;
                         }
                     }
                     b"fldSimple" => {
@@ -2640,14 +2680,31 @@ fn parse_body(
                                 p.origin = info.elems.len().wrapping_sub(1);
                                 // Spaltbrytning före stycket (eller ensam), avsnittsrad efter det.
                                 let origin = p.origin;
-                                // Stycket som bär en avsnitts- eller spaltbrytning är ingen blankrad.
-                                if (para_sect.is_some() || para_col_break) && is_blank_para(&p) {
-                                    p.runs.push(Run { text: String::new(), fmt: Fmt::default(), link: None, raw: true });
+                                // Sidbrytning före stycket (`w:pageBreakBefore`, också ur formatmallen) och i det.
+                                let before = para_page_before.take().unwrap_or_else(|| styles.page_before(p.style.as_deref()));
+                                let pieces = split_page_breaks(p);
+                                let n = pieces.len();
+                                if before && !matches!(blocks.last(), Some(Block::Para(q)) if q.origin == origin && q.runs.first().is_some_and(|r| r.raw && r.text == sections::PAGE_BREAK_LINE)) {
+                                    blocks.push(Block::Para(raw_para(sections::PAGE_BREAK_LINE.to_owned(), origin)));
                                 }
-                                if std::mem::take(&mut para_col_break) {
-                                    blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
+                                let has_sect = para_sect.is_some();
+                                for (i, mut p) in pieces.into_iter().enumerate() {
+                                    if i > 0 {
+                                        blocks.push(Block::Para(raw_para(sections::PAGE_BREAK_LINE.to_owned(), origin)));
+                                    }
+                                    // Ett stycke som bara bär en sidbrytning blir bara brytningsraden.
+                                    if n > 1 && is_blank_para(&p) && !(has_sect && i + 1 == n) {
+                                        continue;
+                                    }
+                                    // Stycket som bär en avsnitts- eller spaltbrytning är ingen blankrad.
+                                    if (has_sect || para_col_break) && is_blank_para(&p) {
+                                        p.runs.push(Run { text: String::new(), fmt: Fmt::default(), link: None, raw: true });
+                                    }
+                                    if i == 0 && std::mem::take(&mut para_col_break) {
+                                        blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
+                                    }
+                                    blocks.push(Block::Para(p));
                                 }
-                                blocks.push(Block::Para(p));
                                 if let Some(x) = para_sect.take() {
                                     info.sects.push(x);
                                     blocks.push(Block::Para(raw_para(section_placeholder(info.sects.len() - 1), origin)));
@@ -2841,6 +2898,26 @@ fn inline_md(run: &Run) -> String {
 /// Styckeutseendet (ram, skuggning, avstånd, indrag) ur stycket, dess mall och docDefaults, för
 /// de stycken som kommer från ett toppnivåelement i brödtexten (`word::pbox`, markören `k:pp`).
 /// Ett tomt stycke (bara blanktecken, inga objekt): används som lodrätt avstånd i Word.
+/// Delar ett stycke vid sidbrytningarna (`PAGE_BREAK_RUN`) i dess körningar; ett stycke utan
+/// sidbrytning blir ett enda. Listpunkten (och dess tecken) gäller bara första delen.
+fn split_page_breaks(p: Para) -> Vec<Para> {
+    if !p.runs.iter().any(|r| r.raw && r.text == PAGE_BREAK_RUN) {
+        return vec![p];
+    }
+    let mut out: Vec<Para> = Vec::new();
+    let rest = Para { runs: Vec::new(), list: None, ..p.clone() };
+    let mut cur = Para { runs: Vec::new(), ..p.clone() };
+    for r in p.runs {
+        if r.raw && r.text == PAGE_BREAK_RUN {
+            out.push(std::mem::replace(&mut cur, rest.clone()));
+        } else {
+            cur.runs.push(r);
+        }
+    }
+    out.push(cur);
+    out
+}
+
 fn is_blank_para(p: &Para) -> bool {
     p.kind == ParaKind::Normal && p.list.is_none() && p.origin != usize::MAX && p.runs.iter().all(|r| !r.raw && r.link.is_none() && r.text.trim().is_empty())
 }
@@ -2929,6 +3006,33 @@ fn strip_fn_labels(s: &str) -> String {
     out
 }
 
+/// Visas styckets textrutor? Bara i vanliga stycken (inte rubriker, listor eller kod).
+fn box_shown(p: &Para) -> bool {
+    !p.boxes.is_empty() && p.kind == ParaKind::Normal && p.list.is_none()
+}
+
+/// Rutans styckemarkör (ram, fyllning och bredd) och innehåll som Markdown.
+fn box_md(b: &BoxRead, numbering: &Numbering, text_w: Option<f64>) -> (String, String) {
+    // Rutans bredd och läge räknas mot spaltens bredd först när dokumentet ritas (`pbox::Frame`).
+    let _ = text_w;
+    let pp = docx_tbox::frame(&b.shape, b.x, b.width);
+    let mut blocks = b.blocks.clone();
+    for bl in blocks.iter_mut() {
+        if let Block::Para(p) = bl {
+            if p.ppr.is_empty() && !is_blank_para(p) {
+                p.ppr = pp.clone();
+            }
+        }
+    }
+    (pp.marker(), to_markdown_units(&blocks, numbering, None).0.trim().to_owned())
+}
+
+/// Rutans text utan den syntetiska ramen, för att jämföra mot originalet.
+fn strip_frame(md: &str, marker: &str) -> String {
+    let s = if marker.is_empty() { md.to_owned() } else { md.replace(marker, "") };
+    s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim().to_owned()
+}
+
 /// Ett Markdown-block som kan matchas mot originalets XML: toppnivåelementet det kom från,
 /// en beskrivning av slaget (rubrik, listnivå, justering …) och den normaliserade texten.
 struct MdUnit {
@@ -2968,6 +3072,25 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
     for (bi, b) in blocks.iter().enumerate() {
         match b {
             Block::Para(p) => {
+                // Textrutor: block före stycket (`docx_tbox`), inga enheter av sig själva.
+                if box_shown(p) {
+                    for b in &p.boxes {
+                        let md = box_md(b, numbering, text_w).1;
+                        if md.is_empty() {
+                            continue;
+                        }
+                        if cur_align == Align::Left {
+                            if !out.is_empty() {
+                                out.push_str("\n\n");
+                            }
+                        } else {
+                            out.push_str("\n\n");
+                        }
+                        out.push_str(&format!("{}\n\n{md}\n\n{}", docx_tbox::open_tag(b.token), docx_tbox::CLOSE));
+                        prev_list = false;
+                        top_num = None;
+                    }
+                }
                 let mut text = para_md(p);
                 // Tomt stycke: en egen rad `<!--k:ep-->` med stycketeckens storlek och avstånd.
                 let blank = is_blank_para(p) && text.trim().is_empty() && bi < last_content;
@@ -4363,6 +4486,9 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 } else if sections::is_column_break(&s) && w.table.is_none() && w.quote == 0 {
                     w.close_para();
                     w.body.push_str("<w:p><w:r><w:br w:type=\"column\"/></w:r></w:p>");
+                } else if sections::is_page_break(&s) && w.table.is_none() && w.quote == 0 {
+                    w.close_para();
+                    w.body.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
                 } else if s.trim().eq_ignore_ascii_case("<br>") || s.trim().eq_ignore_ascii_case("<br/>") {
                     w.line_break();
                 } else if let Some(style) = style::parse_span_open(&s) {
@@ -4397,9 +4523,15 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 w.fn_order.push(t.to_string());
                 let n = w.fn_order.len() - 1;
                 let ph = format!("\u{E004}{n}\u{E005}");
-                w.body.push_str(&format!(
-                    "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"{ph}\"/></w:r>"
-                ));
+                if crate::word::markup::is_endnote_label(&t) {
+                    w.body.push_str(&format!(
+                        "<w:r><w:rPr><w:rStyle w:val=\"EndnoteReference\"/></w:rPr><w:endnoteReference w:id=\"{ph}\"/></w:r>"
+                    ));
+                } else {
+                    w.body.push_str(&format!(
+                        "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"{ph}\"/></w:r>"
+                    ));
+                }
             }
         }
         match ended {
@@ -4422,6 +4554,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                             || key == crate::word::nav::TOC_LINE
                             || sections::SectionProps::from_comment(&key).is_some()
                             || sections::is_column_break(&key)
+                            || sections::is_page_break(&key)
                             || crate::word::pbox::parse_empty(&key).is_some();
                         if ok && !key.is_empty() {
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
@@ -4523,7 +4656,7 @@ fn kladd_styles() -> String {
             r#"<w:style w:type="paragraph" w:styleId="TOC{n}"><w:name w:val="toc {n}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:autoRedefine/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9016"/></w:tabs><w:spacing w:after="100"/><w:ind w:left="{ind}"/></w:pPr></w:style>"#
         ));
     }
-    s.push_str(r#"<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="29"/><w:qFormat/><w:pPr><w:spacing w:before="120"/><w:ind w:left="567" w:right="567"/><w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="A0A0A0"/></w:pBdr></w:pPr><w:rPr><w:i/><w:color w:val="404040"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/><w:qFormat/><w:pPr><w:spacing w:after="60"/><w:ind w:left="720"/><w:contextualSpacing/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="39"/><w:qFormat/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="character" w:styleId="CodeChar"><w:name w:val="Code Char"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="39"/><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:rPr></w:style><w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style><w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:basedOn w:val="TableNormal"/><w:uiPriority w:val="39"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/></w:tblBorders></w:tblPr></w:style>"#);
+    s.push_str(r#"<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="29"/><w:qFormat/><w:pPr><w:spacing w:before="120"/><w:ind w:left="567" w:right="567"/><w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="A0A0A0"/></w:pBdr></w:pPr><w:rPr><w:i/><w:color w:val="404040"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/><w:qFormat/><w:pPr><w:spacing w:after="60"/><w:ind w:left="720"/><w:contextualSpacing/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="39"/><w:qFormat/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="character" w:styleId="CodeChar"><w:name w:val="Code Char"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="39"/><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:rPr></w:style><w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style><w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="character" w:styleId="EndnoteReference"><w:name w:val="endnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="EndnoteText"><w:name w:val="endnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:basedOn w:val="TableNormal"/><w:uiPriority w:val="39"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/></w:tblBorders></w:tblPr></w:style>"#);
     s
 }
 
@@ -4742,19 +4875,32 @@ fn remove_default_ref(x: &str, tag: &str, ty: &str) -> String {
 }
 
 /// Ändringar av sidhuvud och sidfot i en sektion: `Some(None)` tar bort referensen, `Some(Some(id))`
-/// byter den. `title_pg` slår på eller av annorlunda första sida.
+/// byter den. `title_pg` slår på eller av annorlunda första sida, `pg_num` ändrar sidnumreringen
+/// (start, format) och `dist` avståndet till sidkanten (sidhuvud, sidfot).
 #[derive(Default)]
 struct SectEdit {
     hdr: Option<Option<String>>,
     hdr_first: Option<Option<String>>,
+    hdr_even: Option<Option<String>>,
     ftr: Option<Option<String>>,
     ftr_first: Option<Option<String>>,
+    ftr_even: Option<Option<String>>,
     title_pg: Option<bool>,
+    pg_num: Option<(Option<u32>, Option<crate::hf::NumFmt>)>,
+    dist: Option<(Option<f32>, Option<f32>)>,
 }
 
 impl SectEdit {
     fn is_empty(&self) -> bool {
-        self.hdr.is_none() && self.hdr_first.is_none() && self.ftr.is_none() && self.ftr_first.is_none() && self.title_pg.is_none()
+        self.hdr.is_none()
+            && self.hdr_first.is_none()
+            && self.hdr_even.is_none()
+            && self.ftr.is_none()
+            && self.ftr_first.is_none()
+            && self.ftr_even.is_none()
+            && self.title_pg.is_none()
+            && self.pg_num.is_none()
+            && self.dist.is_none()
     }
 }
 
@@ -4780,8 +4926,22 @@ fn patch_sect(orig: &str, d: &DocDefaults, page: bool, edit: &SectEdit) -> Strin
             t
         });
     }
+    if let Some((h, f)) = edit.dist {
+        x = edit_tag(&x, "<w:pgMar", |t| {
+            let mut t = t.to_owned();
+            for (n, v) in [("header", h), ("footer", f)] {
+                t = set_xml_attr(&t, &format!("w:{n}"), &twips(v.unwrap_or(crate::hf::DEFAULT_DIST)).to_string());
+            }
+            if !t.contains("w:gutter=") {
+                t = set_xml_attr(&t, "w:gutter", "0");
+            }
+            t
+        });
+    }
     for (tag, ty, change) in [
+        ("<w:footerReference", "even", &edit.ftr_even),
         ("<w:footerReference", "first", &edit.ftr_first),
+        ("<w:headerReference", "even", &edit.hdr_even),
         ("<w:headerReference", "first", &edit.hdr_first),
         ("<w:footerReference", "default", &edit.ftr),
         ("<w:headerReference", "default", &edit.hdr),
@@ -4791,6 +4951,27 @@ fn patch_sect(orig: &str, d: &DocDefaults, page: bool, edit: &SectEdit) -> Strin
         if let Some(rid) = new {
             if let Some(open_end) = x.find('>') {
                 x.insert_str(open_end + 1, &format!("{tag} w:type=\"{ty}\" r:id=\"{rid}\"/>"));
+            }
+        }
+    }
+    if let Some((start, fmt)) = edit.pg_num {
+        x = remove_tag(&x, "<w:pgNumType");
+        if start.is_some() || fmt.is_some() {
+            let mut tag = String::from("<w:pgNumType");
+            if let Some(f) = fmt {
+                tag.push_str(&format!(" w:fmt=\"{}\"", f.docx_val()));
+            }
+            if let Some(s) = start {
+                tag.push_str(&format!(" w:start=\"{s}\""));
+            }
+            tag.push_str("/>");
+            // Schemat: efter pgMar (och ramar, radnummer), före cols.
+            let at = ["<w:cols", "<w:formProt", "<w:vAlign", "<w:noEndnote", "<w:titlePg", "<w:textDirection", "<w:bidi", "<w:rtlGutter", "<w:docGrid", "<w:printerSettings", "</w:sectPr>"]
+                .iter()
+                .filter_map(|m| x.find(m))
+                .min();
+            if let Some(at) = at {
+                x.insert_str(at, &tag);
             }
         }
     }
@@ -4828,24 +5009,33 @@ fn remove_title_pg(x: &str) -> String {
 struct HfRefs {
     hdr: Option<String>,
     hdr_first: Option<String>,
+    hdr_even: Option<String>,
     ftr: Option<String>,
     ftr_first: Option<String>,
+    ftr_even: Option<String>,
 }
 
 impl HfRefs {
     /// Skriver de delar av `d` som har text och ger deras id:n.
-    fn make(extras: &mut Extras, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> HfRefs {
-        let mut one = |header: bool, text: Option<&str>| text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, d, f, ids, taken));
+    fn make(extras: &mut Extras, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>, resolve: &dyn Fn(&str) -> Option<Image>) -> HfRefs {
+        let mut one = |header: bool, text: Option<&str>| {
+            let align = if header { d.header_align } else { d.footer_align };
+            text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, align, d, f, ids, taken, resolve))
+        };
         HfRefs {
             hdr: one(true, d.header.as_deref()),
             hdr_first: one(true, d.header_first.as_deref()),
+            hdr_even: one(true, d.header_even.as_deref()),
             ftr: one(false, d.footer.as_deref()),
             ftr_first: one(false, d.footer_first.as_deref()),
+            ftr_even: one(false, d.footer_even.as_deref()),
         }
     }
 }
 
 /// Tomt stycke som avslutar ett avsnitt; `fix_sections` fyller i egenskaperna.
+/// Innehållet i `w:sectPr` i `SECT_PARA` (ett avsnitt som skrivs om från grunden).
+const GEN_SECT: &str = "<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>";
 const SECT_PARA: &str = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:pPr></w:p>";
 
 fn same_pt(a: f32, b: f32, tol: f32) -> bool {
@@ -4866,6 +5056,39 @@ fn remove_tag(x: &str, start: &str) -> String {
     format!("{}{}", &x[..i], &x[end..])
 }
 
+/// Spaltbredderna `a` och `b` har samma proportioner (båda tomma = lika breda).
+fn same_widths(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let (sa, sb): (f32, f32) = (a.iter().sum(), b.iter().sum());
+    a.iter().zip(b).all(|(x, y)| (x / sa - y / sb).abs() < 0.01)
+}
+
+/// `w:cols` för ett avsnitt med flera spalter: antal, mellanrum, skiljelinje och olika bredder.
+fn cols_xml(sec: &sections::Section) -> String {
+    let sep = if sec.rule { " w:sep=\"1\"" } else { "" };
+    if sec.col_widths.len() != sec.columns {
+        return format!("<w:cols w:num=\"{}\" w:space=\"{}\"{sep}/>", sec.columns, twips(sec.gap));
+    }
+    // Bredderna skalas så att de med mellanrummen fyller textytan.
+    let n = sec.columns as f32;
+    let text_w = (sec.page.0 - sec.margin[1] - sec.margin[3]).max(1.0);
+    let avail = (text_w - sec.gap * (n - 1.0)).max(1.0);
+    let sum: f32 = sec.col_widths.iter().sum();
+    let mut out = format!("<w:cols w:num=\"{}\"{sep} w:equalWidth=\"0\">", sec.columns);
+    for (i, w) in sec.col_widths.iter().enumerate() {
+        let w = twips(w / sum * avail);
+        if i + 1 < sec.columns {
+            out.push_str(&format!("<w:col w:w=\"{w}\" w:space=\"{}\"/>", twips(sec.gap)));
+        } else {
+            out.push_str(&format!("<w:col w:w=\"{w}\"/>"));
+        }
+    }
+    out.push_str("</w:cols>");
+    out
+}
+
 /// Sätter sida, marginaler, spalter och avsnittstyp i en `w:sectPr` efter avsnittet `sec`. Är allt
 /// redan lika lämnas XML:en orörd (förlustfri sparning). `refs` = sidhuvud- och sidfotsreferenser att
 /// lägga först om `x` saknar egna (första avsnittet när brödtextens sectPr bär dem).
@@ -4874,7 +5097,8 @@ fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> Str
     let (w, h) = sec.page;
     let size_ok = raw.size.is_some_and(|(rw, rh)| same_pt(rw, w, 1.0) && same_pt(rh, h, 1.0));
     let mar_ok = raw.margin.is_some_and(|m| m.iter().zip(sec.margin).all(|(a, b)| same_pt(*a, b, 0.6)));
-    let cols_ok = raw.cols == sec.columns && (sec.columns == 1 || raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)));
+    let cols_ok = raw.cols == sec.columns
+        && (sec.columns == 1 || (raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)) && raw.rule == sec.rule && same_widths(&raw.widths, &sec.col_widths)));
     let type_ok = raw.continuous == sec.continuous;
     let refs_add = refs.filter(|r| !r.is_empty() && !orig.contains("headerReference") && !orig.contains("footerReference"));
     if size_ok && mar_ok && cols_ok && type_ok && refs_add.is_none() {
@@ -4911,7 +5135,7 @@ fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> Str
     if !cols_ok {
         x = remove_tag(&x, "<w:cols");
         let cols = if sec.columns > 1 {
-            format!("<w:cols w:num=\"{}\" w:space=\"{}\"/>", sec.columns, twips(sec.gap))
+            cols_xml(sec)
         } else {
             "<w:cols w:space=\"708\"/>".to_owned()
         };
@@ -4948,7 +5172,7 @@ fn header_refs(sect: &str) -> String {
         while let Some(i) = rest.find(tag) {
             let Some(j) = rest[i..].find('>') else { break };
             let one = &rest[i..i + j + 1];
-            if one.contains("w:type=\"default\"") || one.contains("w:type=\"first\"") {
+            if one.contains("w:type=\"default\"") || one.contains("w:type=\"first\"") || one.contains("w:type=\"even\"") {
                 out.push_str(one);
             }
             rest = &rest[i + j + 1..];
@@ -4957,34 +5181,9 @@ fn header_refs(sect: &str) -> String {
     out
 }
 
-/// Referenserna för sektionen `sect` med originalets första avsnitt (`base`) som reserv per plats:
-/// en plats som ändrats (`changed`: huvud, huvud första, fot, fot första) tas bara från `sect`.
-fn merge_refs(sect: &str, base: &str, changed: [bool; 4]) -> String {
-    let (own, old) = (header_refs(sect), base);
-    let mut out = String::new();
-    for (k, (tag, ty)) in [("<w:headerReference", "default"), ("<w:headerReference", "first"), ("<w:footerReference", "default"), ("<w:footerReference", "first")].into_iter().enumerate() {
-        let pick = |from: &str| {
-            let mut rest = from;
-            while let Some(i) = rest.find(tag) {
-                let Some(j) = rest[i..].find('>') else { break };
-                let one = &rest[i..i + j + 1];
-                if one.contains(&format!("w:type=\"{ty}\"")) {
-                    return Some(one.to_owned());
-                }
-                rest = &rest[i + j + 1..];
-            }
-            None
-        };
-        if let Some(one) = pick(&own).or_else(|| if changed[k] { None } else { pick(old) }) {
-            out.push_str(&one);
-        }
-    }
-    out
-}
-
 /// Sätter egenskaperna för avsnittens slut (`w:sectPr` i stycken, i ordning) efter avsnitten i texten.
 /// `refs` = sidhuvuds- och sidfotsreferenserna som också ska gälla första avsnittet om det saknar egna.
-fn fix_sections(body: &str, secs: &[sections::Section], refs: &str, replace_refs: bool) -> String {
+fn fix_sections(body: &str, secs: &[sections::Section], refs: &str, replace_refs: bool, edits: &[SectEdit], orig: &[String]) -> String {
     if secs.len() < 2 || !body.contains("<w:sectPr") {
         return body.to_owned();
     }
@@ -5017,7 +5216,23 @@ fn fix_sections(body: &str, secs: &[sections::Section], refs: &str, replace_refs
                 one = insert_title_pg(&one);
             }
         }
-        let one = one.as_str();
+        // Ett avsnitt som skrivs om från grunden får originalets sidhuvud, sidfot och sidnumrering.
+        // Första avsnittet utan egna referenser (dess `w:sectPr` skrevs om eller byttes) får originalets.
+        let no_refs = !one.contains("<w:headerReference") && !one.contains("<w:footerReference");
+        let seed_from = orig.get(k).filter(|_| one == GEN_SECT).or_else(|| orig.first().filter(|_| k == 0 && no_refs && !header_refs(&orig[0]).is_empty()));
+        let seeded = match seed_from {
+            Some(o) => seed_hf(&one, o),
+            None => one.clone(),
+        };
+        let one = seeded.as_str();
+        let edited;
+        let one = match edits.get(k).filter(|e| !e.is_empty()) {
+            Some(e) => {
+                edited = patch_sect(one, &DocDefaults::default(), false, e);
+                edited.as_str()
+            }
+            None => one,
+        };
         match secs.get(k).filter(|_| k + 1 < secs.len()) {
             Some(sec) => out.push_str(&apply_section(one, sec, (k == 0).then_some(refs))),
             None => out.push_str(one),
@@ -5037,85 +5252,37 @@ fn sect_pr_new(d: &DocDefaults, refs: &HfRefs) -> String {
     for (tag, ty, id) in [
         ("header", "default", &refs.hdr),
         ("header", "first", &refs.hdr_first),
+        ("header", "even", &refs.hdr_even),
         ("footer", "default", &refs.ftr),
         ("footer", "first", &refs.ftr_first),
+        ("footer", "even", &refs.ftr_even),
     ] {
         if let Some(id) = id {
             s.push_str(&format!("<w:{tag}Reference w:type=\"{ty}\" r:id=\"{id}\"/>"));
         }
     }
     let orient = if w > h { " w:orient=\"landscape\"" } else { "" };
+    let pg_num = match (d.page_start, d.page_format) {
+        (None, None) => String::new(),
+        (st, fm) => format!(
+            "<w:pgNumType{}{}/>",
+            fm.map_or(String::new(), |f| format!(" w:fmt=\"{}\"", f.docx_val())),
+            st.map_or(String::new(), |v| format!(" w:start=\"{v}\""))
+        ),
+    };
     s.push_str(&format!(
-        "<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/><w:cols w:space=\"708\"/>{title_pg}</w:sectPr>",
+        "<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"{}\" w:footer=\"{}\" w:gutter=\"0\"/>{pg_num}<w:cols w:space=\"708\"/>{title_pg}</w:sectPr>",
         twips(w),
         twips(h),
         twips(m[0]),
         twips(m[1]),
         twips(m[2]),
         twips(m[3]),
+        d.header_dist.map_or(708, twips),
+        d.footer_dist.map_or(708, twips),
         title_pg = if d.different_first() { "<w:titlePg/>" } else { "" }
     ));
     s
-}
-
-/// Ett fält (sidnummer) som en följd körningar.
-fn field_runs(instr: &str, shown: &str) -> String {
-    format!(
-        "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\"> {instr} </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>{shown}</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
-    )
-}
-
-/// Körningar för en text där fälten (`{sida}` …) blir Word-fält med värdena i `f` som förhandsvisning.
-fn hf_runs(text: &str, f: &style::Fields) -> String {
-    let fields: [(&str, &str, String); 5] = [
-        ("{sida}", "PAGE", f.page.to_string()),
-        ("{sidor}", "NUMPAGES", f.pages.to_string()),
-        ("{datum}", "DATE \\@ \"yyyy-MM-dd\"", f.date.clone()),
-        ("{titel}", "TITLE", f.title.clone()),
-        ("{fil}", "FILENAME", f.file.clone()),
-    ];
-    let mut runs = String::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let next = fields.iter().filter_map(|(p, i, sh)| rest.find(p).map(|at| (at, p.len(), i, sh))).min_by_key(|(at, ..)| *at);
-        let (plain, field) = match next {
-            Some((at, len, i, sh)) => (&rest[..at], Some((len, i, sh))),
-            None => (rest, None),
-        };
-        if !plain.is_empty() {
-            let mut t = String::new();
-            xml_escape(plain, &mut t);
-            runs.push_str(&format!("<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r>"));
-        }
-        match field {
-            Some((len, i, sh)) => {
-                let mut shown = String::new();
-                xml_escape(sh, &mut shown);
-                runs.push_str(&field_runs(i, &shown));
-                rest = &rest[plain.len() + len..];
-            }
-            None => rest = "",
-        }
-    }
-    runs
-}
-
-/// Ett sidhuvud (`hdr`) eller en sidfot (`ftr`) med ett stycke. Fälten blir Word-fält; en mall med
-/// `|` blir vänster, mitten och höger med flikar (mitt och höger tabbstopp över textbredden
-/// `text_w` i twips).
-fn hf_part(root: &str, template: &str, align: Align, text_w: i64, f: &style::Fields) -> String {
-    let (ppr, runs) = if style::split_parts(template).is_some() {
-        let p = style::parts_of(template, align);
-        let tab = "<w:r><w:tab/></w:r>";
-        let ppr = format!("<w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\"{}\"/><w:tab w:val=\"right\" w:pos=\"{text_w}\"/></w:tabs></w:pPr>", text_w / 2);
-        (ppr, format!("{}{tab}{}{tab}{}", hf_runs(&p[0], f), hf_runs(&p[1], f), hf_runs(&p[2], f)))
-    } else {
-        let [l, c, r] = style::parts_of(template, align);
-        let text = [l, c, r].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
-        let ppr = if align == Align::Left { String::new() } else { format!("<w:pPr><w:jc w:val=\"{}\"/></w:pPr>", align.as_jc()) };
-        (ppr, hf_runs(&text, f))
-    };
-    format!("{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p>{ppr}{runs}</w:p></w:{root}>")
 }
 
 /// Delar som läggs till i ett paket: relationer, innehållstyper och nya filer.
@@ -5124,13 +5291,27 @@ struct Extras {
     rels: String,
     types: String,
     parts: Vec<(String, Vec<u8>)>,
+    /// Filändelser för bilder i sidhuvuden och sidfötter (innehållstyper).
+    exts: Vec<String>,
 }
 
 impl Extras {
-    /// Lägger till sidhuvud/sidfot och ger dess relations-id.
-    fn header_footer(&mut self, header: bool, text: &str, d: &DocDefaults, f: &style::Fields, ids: &mut std::collections::HashSet<String>, taken: &mut std::collections::HashSet<String>) -> String {
-        let align = if header { d.header_align } else { d.footer_align };
+    /// Lägger till sidhuvud/sidfot och ger dess relations-id. `align` gäller ett enkelt värde utan `|`,
+    /// `st` är textens utseende, `geo` sidans mått och `text_w` textbredden.
+    #[allow(clippy::too_many_arguments)]
+    fn header_footer(
+        &mut self,
+        header: bool,
+        text: &str,
+        align: Align,
+        d: &DocDefaults,
+        f: &style::Fields,
+        ids: &mut std::collections::HashSet<String>,
+        taken: &mut std::collections::HashSet<String>,
+        resolve: &dyn Fn(&str) -> Option<Image>,
+    ) -> String {
         let text_w = twips(((d.page().0 - d.margins()[1] - d.margins()[3]).max(36.0)) as f32) as i64;
+        let st = if header { &d.header_style } else { &d.footer_style };
         let (stem, root, kind, mime) = if header {
             ("header", "hdr", "header", "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml")
         } else {
@@ -5154,7 +5335,17 @@ impl Extras {
         };
         self.rels.push_str(&format!(r#"<Relationship Id="{rid}" Type="{REL_NS}/{kind}" Target="{stem}{n}.xml"/>"#));
         self.types.push_str(&format!(r#"<Override PartName="/{name}" ContentType="{mime}"/>"#));
-        self.parts.push((name, hf_part(root, text, align, text_w, f).into_bytes()));
+        let out = hf::write_part(root, text, align, st, text_w, f, resolve, taken, d.page());
+        if !out.rels.is_empty() {
+            self.parts.push((format!("word/_rels/{stem}{n}.xml.rels"), hf::rels_xml(&out.rels).into_bytes()));
+        }
+        for (file, bytes) in out.media {
+            if let Some(ext) = file.rsplit('.').next() {
+                self.exts.push(ext.to_owned());
+            }
+            self.parts.push((format!("word/media/{file}"), bytes));
+        }
+        self.parts.push((name, out.xml.into_bytes()));
         rid
     }
 }
@@ -5243,9 +5434,15 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     // Ändrings- och kommentarsposterna sist i texten är inte text i dokumentet.
     let (markdown, revs, comments) = review::split_records(markdown);
     let rv = Review { revs, comments };
+    // Textrutornas block hör inte till brödtexten: med original byts deras innehåll in i rutan,
+    // utan original blir stycknen vanliga stycken.
+    let (markdown, boxes, new_boxes) = match source {
+        Some(src) => docx_tbox::extract(&markdown, &|n| src.tboxes.contains_key(&n), src.tokens.len()),
+        None => docx_tbox::extract(&markdown, &|_| false, 0),
+    };
     match source {
-        Some(src) => write_patched(src, defaults, &markdown, title, resolve, &rv),
-        None => write_fresh(defaults, &markdown, title, resolve, &rv),
+        Some(src) => write_patched(src, defaults, &markdown, (&boxes, &new_boxes), title, resolve, &rv),
+        None => write_fresh(defaults, &markdown, &new_boxes, title, resolve, &rv),
     }
 }
 
@@ -5262,7 +5459,7 @@ impl Review {
     }
 }
 
-fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
+fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Found], title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let mut taken: std::collections::HashSet<String> = [
         "[content_types].xml",
         "_rels/.rels",
@@ -5278,9 +5475,13 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     .map(str::to_owned)
     .collect();
     let secs = sections::scan(markdown, &defaults);
+    let mut tokens: Vec<Opaque> = Vec::new();
+    let mut doc_pr = 1u32;
+    add_new_boxes(new_boxes, &mut tokens, resolve, 1, &mut doc_pr, (text_width_emu(&defaults) / 12700) as f32);
     let mut ctx = Ctx {
+        tokens: tokens.len(),
         num_base: 1,
-        doc_pr_start: 1,
+        doc_pr_start: doc_pr,
         max_width: text_width_emu(&defaults),
         used_ids: ["rId1", "rId2", "rId3"].into_iter().map(str::to_owned).collect(),
         lead_section: secs[0].marker.is_some(),
@@ -5289,20 +5490,51 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     let mut body = std::mem::take(&mut w.body);
+    if !tokens.is_empty() {
+        body = resolve_markers(&[(false, body)], &tokens, &mut std::collections::HashSet::new()).0;
+    }
     // Ett dokument som slutar med en tabell måste ha ett stycke efter den.
     if body.is_empty() || body.ends_with("</w:tbl>") {
         body.push_str("<w:p/>");
     }
-    let (body, footnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None);
+    let (body, footnotes_xml, endnotes_xml) = resolve_footnotes(body, &w, &HashMap::new(), None, None);
     let comments_out = review_xml::build_comments(None, &rv.comments, &review_xml::anchored_ids(&body));
     let mut extras = Extras::default();
     let fields = style::Fields::for_export(title, "docx");
-    let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut w.ids, &mut taken);
+    let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut w.ids, &mut taken, resolve);
     let sect = sect_pr_new(&defaults, &refs);
-    let body = fix_sections(&body, &secs, &header_refs(&sect), false);
+    // Senare avsnitt med egna sidhuvuden, sidfötter eller sidnumrering skriver egna referenser.
+    let mut edits: Vec<SectEdit> = (0..secs.len())
+        .map(|i| {
+            if i == 0 {
+                SectEdit::default()
+            } else {
+                section_hf_edit(None, &secs[i].props.hf, &crate::hf::SecHf::default(), &defaults, &mut extras, &fields, &mut w.ids, &mut taken, resolve)
+            }
+        })
+        .collect();
+    // Avståndet till sidkanten gäller alla avsnitt; sidnumreringen är avsnittets egen (första: grundformatet).
+    let dist = (defaults.header_dist.is_some() || defaults.footer_dist.is_some()).then_some((defaults.header_dist, defaults.footer_dist));
+    if secs.len() > 1 {
+        for (i, e) in edits.iter_mut().enumerate() {
+            e.dist = dist;
+            if i == 0 && (defaults.page_start.is_some() || defaults.page_format.is_some()) {
+                e.pg_num = Some((defaults.page_start, defaults.page_format));
+            }
+        }
+    }
+    let mut last_edit = edits.pop().unwrap_or_default();
+    if secs.len() > 1 {
+        last_edit.dist = dist;
+        if let Some(l) = secs.last() {
+            last_edit.pg_num = Some((l.props.hf.page_start, l.props.hf.page_fmt));
+        }
+    }
+    let body = fix_sections(&body, &secs, &header_refs(&sect), false, &edits, &[]);
     // Sidhuvud och sidfot hör till första avsnittet (de senare ärver); annorlunda första sida gäller bara det.
     let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
     let sect = if secs.len() > 1 { remove_title_pg(&sect) } else { sect };
+    let sect = if last_edit.is_empty() { sect } else { patch_sect(&sect, &defaults, false, &last_edit) };
     let document = format!(
         r#"{XML_DECL}
 <w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}"><w:body>{body}{sect}</w:body></w:document>"#
@@ -5317,6 +5549,10 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
         doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdFn1" Type="{REL_NS}/footnotes" Target="footnotes.xml"/>"#));
         extras.types.push_str(&format!(r#"<Override PartName="/word/footnotes.xml" ContentType="{FOOTNOTES_MIME}"/>"#));
     }
+    if endnotes_xml.is_some() {
+        doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdEn1" Type="{REL_NS}/endnotes" Target="endnotes.xml"/>"#));
+        extras.types.push_str(&format!(r#"<Override PartName="/word/endnotes.xml" ContentType="{ENDNOTES_MIME}"/>"#));
+    }
     if let Some(c) = &comments_out {
         doc_rels.push_str(&format!(r#"<Relationship Id="rIdKladdCm1" Type="{REL_NS}/comments" Target="comments.xml"/>"#));
         extras.types.push_str(&format!(r#"<Override PartName="/word/comments.xml" ContentType="{}"/>"#, review_xml::COMMENTS_MIME));
@@ -5328,7 +5564,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     doc_rels.push_str("</Relationships>");
 
     let mut parts: Vec<(String, Vec<u8>)> = vec![
-        ("[Content_Types].xml".into(), patch_content_types(CONTENT_TYPES, &[], &extras.types).into_bytes()),
+        ("[Content_Types].xml".into(), patch_content_types(CONTENT_TYPES, &{ let mut e: Vec<&str> = extras.exts.iter().map(String::as_str).collect(); e.sort_unstable(); e.dedup(); e }, &extras.types).into_bytes()),
         ("_rels/.rels".into(), ROOT_RELS.as_bytes().to_vec()),
         ("word/document.xml".into(), document.into_bytes()),
         ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
@@ -5343,9 +5579,16 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
     ];
     if let Some(xml) = footnotes_xml {
         parts.push(("word/footnotes.xml".into(), xml.into_bytes()));
-        let settings = SETTINGS.replace("<w:compat>", r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:compat>"#);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
-            p.1 = settings.into_bytes();
+            let cur = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = cur.replace("<w:compat>", r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:compat>"#).into_bytes();
+        }
+    }
+    if let Some(xml) = endnotes_xml {
+        parts.push(("word/endnotes.xml".into(), xml.into_bytes()));
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
+            let cur = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = cur.replace("<w:compat>", r#"<w:endnotePr><w:endnote w:id="-1"/><w:endnote w:id="0"/></w:endnotePr><w:compat>"#).into_bytes();
         }
     }
     if let Some(c) = comments_out {
@@ -5354,11 +5597,92 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn
             parts.push(("word/commentsExtended.xml".into(), e.into_bytes()));
         }
     }
+    if defaults.header_even.is_some() || defaults.footer_even.is_some() {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
+            p.1 = hf::with_even_odd(&decode_xml(&p.1), true).into_bytes();
+        }
+    }
     parts.extend(extras.parts);
     for (_, file, bytes) in &w.media {
         parts.push((format!("word/media/{file}"), bytes.clone()));
     }
     Ok(Written { bytes: write_zip(parts)?, missing_images: w.missing })
+}
+
+/// Kopierar sidhuvud-/sidfotsreferenser, sidnumrering, annorlunda första sida och avstånden till
+/// sidkanten från originalets `w:sectPr` (`orig`) till en nyskriven (`x`).
+fn seed_hf(x: &str, orig: &str) -> String {
+    let mut out = x.to_owned();
+    let refs = header_refs(orig);
+    if let Some(oe) = out.find('>') {
+        out.insert_str(oe + 1, &refs);
+    }
+    let tag_of = |name: &str| orig.find(name).and_then(|i| orig[i..].find('>').map(|j| orig[i..i + j + 1].to_owned()));
+    let mut edit = SectEdit::default();
+    if let Some(t) = tag_of("<w:pgNumType") {
+        let n = |k: &str| t.split(&format!("w:{k}=\"")).nth(1).and_then(|r| r.split('"').next()).map(str::to_owned);
+        edit.pg_num = Some((n("start").and_then(|v| v.parse().ok()), n("fmt").and_then(|v| crate::hf::NumFmt::from_docx(&v))));
+    }
+    if let Some(t) = tag_of("<w:pgMar") {
+        let n = |k: &str| t.split(&format!("w:{k}=\"")).nth(1).and_then(|r| r.split('"').next()).and_then(|v| v.parse::<f32>().ok()).map(|v| v / 20.0);
+        edit.dist = Some((n("header"), n("footer")));
+    }
+    if orig.contains("<w:titlePg") && !orig.contains("<w:titlePg w:val=\"0\"") {
+        edit.title_pg = Some(true);
+    }
+    patch_sect(&out, &DocDefaults::default(), false, &edit)
+}
+
+/// Ändringarna av ett avsnitts sidhuvuden och sidfötter (`new` mot `old`, avsnittets egna värden).
+/// `aligns` finns för första avsnittet (dokumentets grundformat): ((huvud, fot) nu, (huvud, fot) förut).
+/// I senare avsnitt betyder `Some("")` en uttrycklig tom del och `None` att föregående avsnitts ärvs.
+#[allow(clippy::too_many_arguments)]
+fn section_hf_edit(
+    aligns: Option<((Align, Align), (Align, Align))>,
+    new: &crate::hf::SecHf,
+    old: &crate::hf::SecHf,
+    d: &DocDefaults,
+    extras: &mut Extras,
+    f: &style::Fields,
+    ids: &mut std::collections::HashSet<String>,
+    taken: &mut std::collections::HashSet<String>,
+    resolve: &dyn Fn(&str) -> Option<Image>,
+) -> SectEdit {
+    let first_sec = aligns.is_some();
+    let ((nh, nf), (oh, of)) = aligns.unwrap_or(((Align::Left, Align::Left), (Align::Left, Align::Left)));
+    let mut e = SectEdit::default();
+    let mut slot = |header: bool, kind: u8, nt: &Option<String>, ot: &Option<String>| -> Option<Option<String>> {
+        let (na, oa) = if header { (nh, oh) } else { (nf, of) };
+        let changed = if first_sec {
+            if kind == 0 { hf_changed(nt.as_deref(), na, ot.as_deref(), oa) } else { first_changed(nt.as_deref(), na, ot.as_deref(), oa) }
+        } else {
+            nt != ot
+        };
+        if !changed {
+            return None;
+        }
+        let align = if header { d.header_align } else { d.footer_align };
+        let mut make = |t: &str| extras.header_footer(header, t, align, d, f, ids, taken, resolve);
+        Some(match nt {
+            Some(t) if first_sec => (!t.is_empty()).then(|| make(t)),
+            Some(t) => Some(make(t)),
+            None => None,
+        })
+    };
+    e.hdr = slot(true, 0, &new.header, &old.header);
+    e.ftr = slot(false, 0, &new.footer, &old.footer);
+    e.hdr_first = slot(true, 1, &new.header_first, &old.header_first);
+    e.ftr_first = slot(false, 1, &new.footer_first, &old.footer_first);
+    e.hdr_even = slot(true, 2, &new.header_even, &old.header_even);
+    e.ftr_even = slot(false, 2, &new.footer_even, &old.footer_even);
+    let (nt, ot) = (new.title_pg == Some(true), old.title_pg == Some(true));
+    if nt != ot {
+        e.title_pg = Some(nt);
+    }
+    if (new.page_start, new.page_fmt) != (old.page_start, old.page_fmt) {
+        e.pg_num = Some((new.page_start, new.page_fmt));
+    }
+    e
 }
 
 /// Jämför två sidinställningar med rimlig marginal (mm-avrundning i texten).
@@ -5504,11 +5828,12 @@ fn fn_placeholders(xml: &str) -> Vec<usize> {
 }
 
 /// Id:n för alla `w:footnoteReference` i `xml` (utom platshållare), i ordning.
-fn footnote_ids_in(xml: &str) -> Vec<String> {
+fn footnote_ids_in(xml: &str, end: bool) -> Vec<String> {
+    let open = if end { "<w:endnoteReference" } else { "<w:footnoteReference" };
     let mut out = Vec::new();
     let mut rest = xml;
-    while let Some(i) = rest.find("<w:footnoteReference") {
-        rest = &rest[i + 20..];
+    while let Some(i) = rest.find(open) {
+        rest = &rest[i + open.len()..];
         let Some(end) = rest.find('>') else { break };
         let tag = &rest[..end];
         if let Some(a) = tag.find("w:id=\"") {
@@ -5526,16 +5851,19 @@ fn footnote_ids_in(xml: &str) -> Vec<String> {
 
 /// Fotnotselementet för en definition som skrivits ur Markdown: första stycket får Words
 /// fotnotsnummer och ett blanksteg före texten.
-fn footnote_xml(id: &str, paras: &str) -> String {
+fn footnote_xml(id: &str, paras: &str, end: bool) -> String {
     const LEAD: &str = "<w:pPr><w:pStyle w:val=\"FootnoteText\"/></w:pPr><w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space=\"preserve\"> </w:t></w:r>";
+    const LEAD_END: &str = "<w:pPr><w:pStyle w:val=\"EndnoteText\"/></w:pPr><w:r><w:rPr><w:rStyle w:val=\"EndnoteReference\"/></w:rPr><w:endnoteRef/></w:r><w:r><w:t xml:space=\"preserve\"> </w:t></w:r>";
+    let lead = if end { LEAD_END } else { LEAD };
     let body = match paras.strip_prefix("<w:p>") {
         Some(rest) => {
             let rest = if rest.starts_with("<w:pPr>") { rest.find("</w:pPr>").map_or(rest, |e| &rest[e + 8..]) } else { rest };
-            format!("<w:p>{LEAD}{rest}")
+            format!("<w:p>{lead}{rest}")
         }
-        None => format!("<w:p>{LEAD}</w:p>"),
+        None => format!("<w:p>{lead}</w:p>"),
     };
-    format!("<w:footnote w:id=\"{id}\">{body}</w:footnote>")
+    let tag = if end { "endnote" } else { "footnote" };
+    format!("<w:{tag} w:id=\"{id}\">{body}</w:{tag}>")
 }
 
 const FOOTNOTES_HEAD: &str = concat!(
@@ -5544,6 +5872,13 @@ const FOOTNOTES_HEAD: &str = concat!(
     r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#
 );
 const FOOTNOTE_SEPARATORS: &str = r#"<w:footnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>"#;
+const ENDNOTES_HEAD: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\n",
+    r#"<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#
+);
+const ENDNOTE_SEPARATORS: &str = r#"<w:endnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:endnote><w:endnote w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:endnote>"#;
+const ENDNOTES_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
 const FOOTNOTES_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 
 /// Knyter ihop fotnotsreferenserna i brödtexten med definitionerna: ger varje referens ett id,
@@ -5551,10 +5886,38 @@ const FOOTNOTES_MIME: &str = "application/vnd.openxmlformats-officedocument.word
 /// `w.fn_order`) som ligger i orört originalstycke och redan har sitt id. En fotnot vars text är
 /// oförändrad får sin ursprungliga XML (med sitt id); övriga skrivs om. Svaret är den färdiga
 /// brödtexten och, om dokumentet har fotnoter, hela footnotes.xml.
-fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String>, orig: Option<&FnPart>) -> (String, Option<String>) {
-    let present = footnote_ids_in(&body);
-    if w.fn_order.is_empty() && present.is_empty() && orig.is_none() {
-        return (body, None);
+fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String>, orig: Option<&FnPart>, orig_end: Option<&FnPart>) -> (String, Option<String>, Option<String>) {
+    let (ids_fn, xml_fn) = resolve_note_kind(&body, w, bound, orig, false);
+    let (ids_en, xml_en) = resolve_note_kind(&body, w, bound, orig_end, true);
+    // Platshållarna byts mot idn.
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body.as_str();
+    while let Some(i) = rest.find('\u{E004}') {
+        out.push_str(&rest[..i]);
+        let r = &rest[i + '\u{E004}'.len_utf8()..];
+        let Some(e) = r.find('\u{E005}') else {
+            rest = "";
+            break;
+        };
+        if let Some(n) = r[..e].parse::<usize>().ok() {
+            if let Some(id) = ids_fn.get(n).and_then(Option::as_ref).or(ids_en.get(n).and_then(Option::as_ref)) {
+                out.push_str(id);
+            }
+        }
+        rest = &r[e + '\u{E005}'.len_utf8()..];
+    }
+    out.push_str(rest);
+    (out, xml_fn, xml_en)
+}
+
+/// Fotnoterna (`end` = falskt) eller slutnoterna (`end` = sant): id för varje referens i `fn_order`
+/// (`None` för den andra sortens) och hela footnotes.xml / endnotes.xml.
+fn resolve_note_kind(body: &str, w: &Writer<'_>, bound: &HashMap<usize, String>, orig: Option<&FnPart>, end: bool) -> (Vec<Option<String>>, Option<String>) {
+    let mine = |label: &str| crate::word::markup::is_endnote_label(label) == end;
+    let present = footnote_ids_in(body, end);
+    let mut ids: Vec<Option<String>> = vec![None; w.fn_order.len()];
+    if !w.fn_order.iter().any(|l| mine(l)) && present.is_empty() && orig.is_none() {
+        return (ids, None);
     }
     let items: &[FnOrig] = orig.map_or(&[], |o| o.items.as_slice());
     let normal = |id: &str| items.iter().find(|f| f.id == id && f.ty.is_none());
@@ -5563,23 +5926,25 @@ fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String
         .iter()
         .map(|f| f.id.as_str())
         .chain(present.iter().map(String::as_str))
-        .chain(bound.values().map(String::as_str))
+        .chain(bound.iter().filter(|(i, _)| w.fn_order.get(**i).is_some_and(|l| mine(l))).map(|(_, v)| v.as_str()))
         .filter_map(|i| i.parse::<i64>().ok())
         .max()
         .unwrap_or(0)
         .max(0)
         + 1;
     let mut taken_ids: std::collections::HashSet<String> = present.iter().cloned().collect();
-    let mut ids: Vec<String> = Vec::with_capacity(w.fn_order.len());
     let mut entries: Vec<(String, String)> = Vec::new(); // (id, XML)
     let mut label_done: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (i, label) in w.fn_order.iter().enumerate() {
+        if !mine(label) {
+            continue;
+        }
         let def = w.footnotes.iter().find(|d| d.label == *label);
         let first = label_done.insert(label.as_str());
         let id = match bound.get(&i) {
             Some(id) => id.clone(),
             None => {
-                // Oförändrad text: den ursprungliga fotnoten (om ingen annan redan använder den).
+                // Oförändrad text: den ursprungliga noten (om ingen annan redan använder den).
                 let same = def.filter(|_| first).and_then(|d| {
                     items.iter().find(|f| f.ty.is_none() && !taken_ids.contains(&f.id) && norm(&f.md) == d.key).map(|f| f.id.clone())
                 });
@@ -5593,52 +5958,37 @@ fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String
             }
         };
         taken_ids.insert(id.clone());
-        ids.push(id.clone());
+        ids[i] = Some(id.clone());
         if bound.contains_key(&i) && !first {
-            continue; // en andra referens i ett orört stycke: dess fotnot finns redan i originalet
+            continue; // en andra referens i ett orört stycke: noten finns redan i originalet
         }
         let Some(def) = def else { continue };
         let xml = match normal(&id) {
             Some(f) if norm(&f.md) == def.key => f.xml.clone(),
-            _ => footnote_xml(&id, &def.xml),
+            _ => footnote_xml(&id, &def.xml, end),
         };
         entries.push((id, xml));
     }
-    // Platshållarna byts mot idn.
-    let mut out = String::with_capacity(body.len());
-    let mut rest = body.as_str();
-    while let Some(i) = rest.find('\u{E004}') {
-        out.push_str(&rest[..i]);
-        let r = &rest[i + '\u{E004}'.len_utf8()..];
-        let Some(e) = r.find('\u{E005}') else {
-            rest = "";
-            break;
-        };
-        if let Some(id) = r[..e].parse::<usize>().ok().and_then(|n| ids.get(n)) {
-            out.push_str(id);
-        }
-        rest = &r[e + '\u{E005}'.len_utf8()..];
-    }
-    out.push_str(rest);
 
     if entries.is_empty() && orig.is_none() {
-        return (out, None);
+        return (ids, None);
     }
     let emitted: std::collections::HashSet<&str> = entries.iter().map(|(i, _)| i.as_str()).collect();
     let mut xml = String::new();
-    let (head, tail) = match orig {
-        Some(o) => (o.head.as_str(), o.tail.as_str()),
-        None => (FOOTNOTES_HEAD, "</w:footnotes>"),
+    let (head, tail) = match (orig, end) {
+        (Some(o), _) => (o.head.as_str(), o.tail.as_str()),
+        (None, false) => (FOOTNOTES_HEAD, "</w:footnotes>"),
+        (None, true) => (ENDNOTES_HEAD, "</w:endnotes>"),
     };
     xml.push_str(head);
-    // Skiljelinjerna först, sedan fotnoterna i textens ordning, sist de som bara hänvisas till av okända objekt.
+    // Skiljelinjerna först, sedan noterna i textens ordning, sist de som bara hänvisas till av okända objekt.
     if orig.is_none() {
-        xml.push_str(FOOTNOTE_SEPARATORS);
+        xml.push_str(if end { ENDNOTE_SEPARATORS } else { FOOTNOTE_SEPARATORS });
     }
     for f in items.iter().filter(|f| f.ty.is_some()) {
         xml.push_str(&f.xml);
     }
-    // Fotnoter som fanns förut behåller sin ordning i filen; nya kommer efter, i textens ordning.
+    // Noter som fanns förut behåller sin ordning i filen; nya kommer efter, i textens ordning.
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&k| items.iter().position(|f| f.id == entries[k].0).unwrap_or(usize::MAX));
     for k in order {
@@ -5648,7 +5998,7 @@ fn resolve_footnotes(body: String, w: &Writer<'_>, bound: &HashMap<usize, String
         xml.push_str(&f.xml);
     }
     xml.push_str(tail);
-    (out, Some(xml))
+    (ids, Some(xml))
 }
 
 /// Sätter ihop brödtexten: originalets XML för oförändrade block, nyskrivet för resten.
@@ -5711,7 +6061,22 @@ fn fix_head(head: &str) -> String {
     h
 }
 
-fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
+/// Originalkörningar för nya textrutor (Infoga → Textruta): token för token, i samma ordning som
+/// `docx_tbox::extract` numrerade dem (de börjar där `tokens` slutar).
+fn add_new_boxes(new: &[docx_tbox::Found], tokens: &mut Vec<Opaque>, resolve: &dyn Fn(&str) -> Option<Image>, num_base: u32, doc_pr: &mut u32, text_w_pt: f32) {
+    for f in new {
+        let (pp, md) = docx_tbox::split_frame(&f.inner);
+        let ctx = Ctx { tokens: tokens.len(), num_base, doc_pr_start: *doc_pr, ..Default::default() };
+        let bw = body_from_markdown(&md, resolve, ctx);
+        let (inner, _) = resolve_markers(&[(false, bw.body)], tokens, &mut std::collections::HashSet::new());
+        let inner = if inner.is_empty() { "<w:p/>".to_owned() } else { inner };
+        let lines = md.lines().filter(|l| !l.trim().is_empty()).count().max(1);
+        tokens.push(Opaque { xml: docx_tbox::new_box_run(&inner, &pp, *doc_pr, text_w_pt, lines), fld: 0 });
+        *doc_pr += 1;
+    }
+}
+
+fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, new_boxes): (&[docx_tbox::Found], &[docx_tbox::Found]), title: &str, resolve: &dyn Fn(&str) -> Option<Image>, rv: &Review) -> Result<Written, String> {
     let main_dir = src.main.rsplit_once('/').map_or("", |(d, _)| d);
     let main_file = src.main.rsplit('/').next().unwrap_or("document.xml");
     let rels_name = if main_dir.is_empty() { format!("_rels/{main_file}.rels") } else { format!("{main_dir}/_rels/{main_file}.rels") };
@@ -5727,7 +6092,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         Some(x) => (max_id(x, "<w:num w:numId=\"").map_or(1, |m| m + 1), max_id(x, "w:abstractNumId=\"").map_or(0, |m| m + 1)),
         None => (1, 0),
     };
-    let doc_pr_start = src
+    let mut doc_pr_start = src
         .elems
         .iter()
         .map(|e| e.xml.as_str())
@@ -5737,8 +6102,10 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         .map_or(1, |m| m + 1);
     let mut taken: std::collections::HashSet<String> = src.parts.iter().map(|(n, _)| n.trim_start_matches('/').to_lowercase()).collect();
     let secs = sections::scan(markdown, &defaults);
+    let mut tokens = src.tokens.clone();
+    add_new_boxes(new_boxes, &mut tokens, resolve, num_base, &mut doc_pr_start, (text_width_emu(&defaults) / 12700) as f32);
     let mut ctx = Ctx {
-        tokens: src.tokens.len(),
+        tokens: tokens.len(),
         lead_section: secs[0].marker.is_some(),
         num_base,
         doc_pr_start,
@@ -5756,6 +6123,23 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
     rv.apply(&mut ctx);
     let mut w = body_from_markdown(markdown, resolve, ctx);
     w.units.sort_by_key(|u| u.range.start);
+    // Ändrade textrutor: originalkörningen med nytt `w:txbxContent`.
+    let mut swaps: Vec<(String, String)> = Vec::new();
+    for f in boxes {
+        let Some((marker, orig)) = src.tboxes.get(&f.token) else { continue };
+        let md = strip_frame(&f.inner, marker);
+        if md == *orig || md.is_empty() || md.contains("![") || md.contains("<img") || md.contains("[^") || swaps.iter().any(|(o, _)| *o == src.tokens[f.token].xml) {
+            continue;
+        }
+        let bctx = Ctx { tokens: tokens.len(), num_base, doc_pr_start, ..Default::default() };
+        let bw = body_from_markdown(&md, resolve, bctx);
+        let (inner, _) = resolve_markers(&[(false, bw.body)], &tokens, &mut std::collections::HashSet::new());
+        let inner = if inner.is_empty() { "<w:p/>".to_owned() } else { inner };
+        if let Some(new) = docx_tbox::replace_content(&src.tokens[f.token].xml, &inner) {
+            swaps.push((src.tokens[f.token].xml.clone(), new.clone()));
+            tokens[f.token].xml = new;
+        }
+    }
     // Fotnotsreferenserna (index i `fn_order`) i varje enhet.
     let unit_occ: Vec<Vec<usize>> = w.units.iter().map(|u| fn_placeholders(&w.body[u.range.clone()])).collect();
     let mut bound: HashMap<usize, String> = HashMap::new();
@@ -5922,7 +6306,14 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         at = u.range.end;
     }
     segs.push((false, w.body[at..].to_owned()));
-    let (mut body, open_fields) = resolve_markers(&segs, &src.tokens, &mut used);
+    for (old, new) in &swaps {
+        for (verbatim, text) in segs.iter_mut() {
+            if *verbatim && text.contains(old.as_str()) {
+                *text = text.replacen(old.as_str(), new, 1);
+            }
+        }
+    }
+    let (mut body, open_fields) = resolve_markers(&segs, &tokens, &mut used);
     if open_fields > 0 {
         // Ett fält utan slut skulle göra dokumentet felaktigt.
         body.push_str("<w:p>");
@@ -5934,48 +6325,52 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
     if body.is_empty() || body.ends_with("</w:tbl>") {
         body.push_str("<w:p/>");
     }
-    let (body, footnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref());
+    // Har dokumentet egna rubrikmallar under andra id (Words `Rubrik1`) får de nya rubrikerna dem, inte Kladds.
+    let heading_remap: Vec<(String, String)> = styles_name
+        .as_deref()
+        .and_then(|n| src.part(n).map(decode_xml))
+        .filter(|x| x.contains("</w:styles>"))
+        .map(|x| crate::docx_styles::foreign_heading_ids(&x).into_iter().map(|(n, id)| (format!("Heading{n}"), id)).collect())
+        .unwrap_or_default();
+    let body = heading_remap.iter().fold(body, |b, (k, v)| b.replace(&format!("<w:pStyle w:val=\"{k}\"/>"), &format!("<w:pStyle w:val=\"{v}\"/>")));
+    let (body, footnotes_xml, endnotes_xml) = resolve_footnotes(body, &w, &bound, src.footnotes.as_ref(), src.endnotes.as_ref());
     let comments_out = review_xml::build_comments(src.comments.as_ref(), &rv.comments, &review_xml::anchored_ids(&body));
 
-    // ---- sida, sidhuvud och sidfot
+    // ---- sida, sidhuvud och sidfot: per avsnitt, bara det som ändrats skrivs om
     let page_changed = !same_page(&defaults, &src.page);
-    let hdr_changed = hf_changed(defaults.header.as_deref(), defaults.header_align, src.page.header.as_deref(), src.page.header_align);
-    let ftr_changed = hf_changed(defaults.footer.as_deref(), defaults.footer_align, src.page.footer.as_deref(), src.page.footer_align);
-    let hdr1_changed = first_changed(defaults.header_first.as_deref(), defaults.header_align, src.page.header_first.as_deref(), src.page.header_align);
-    let ftr1_changed = first_changed(defaults.footer_first.as_deref(), defaults.footer_align, src.page.footer_first.as_deref(), src.page.footer_align);
     let mut extras = Extras::default();
     let mut ids = w.ids.clone();
     let fields = style::Fields::for_export(title, "docx");
-    // Utan originalets sektionsegenskaper skrivs allt om.
-    let refs_changed = src.sect_pr.is_some() && (hdr_changed || ftr_changed || hdr1_changed || ftr1_changed);
+    let n_secs = secs.len();
+    let dist_changed = {
+        let diff = |a: Option<f32>, b: Option<f32>| (a.unwrap_or(crate::hf::DEFAULT_DIST) - b.unwrap_or(crate::hf::DEFAULT_DIST)).abs() > 0.6;
+        diff(defaults.header_dist, src.page.header_dist) || diff(defaults.footer_dist, src.page.footer_dist)
+    };
+    let mut edits: Vec<SectEdit> = Vec::with_capacity(n_secs);
+    for i in 0..n_secs {
+        let (new, old) = if i == 0 {
+            (hf::own_of_defaults(&defaults), hf::own_of_defaults(&src.page))
+        } else {
+            (secs[i].props.hf.clone(), if src.hf_secs.len() == n_secs { src.hf_secs[i].clone() } else { crate::hf::SecHf::default() })
+        };
+        let aligns = if i == 0 { Some(((defaults.header_align, defaults.footer_align), (src.page.header_align, src.page.footer_align))) } else { None };
+        let mut e = section_hf_edit(aligns, &new, &old, &defaults, &mut extras, &fields, &mut ids, &mut taken, resolve);
+        if i == 0 && dist_changed {
+            e.dist = Some((defaults.header_dist, defaults.footer_dist));
+        }
+        edits.push(e);
+    }
+    let last_edit = edits.pop().unwrap_or_default();
     let sect = match &src.sect_pr {
         None => {
-            let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut ids, &mut taken);
+            let refs = HfRefs::make(&mut extras, &defaults, &fields, &mut ids, &mut taken, resolve);
             sect_pr_new(&defaults, &refs)
         }
         Some(orig) => {
-            let mut edit = SectEdit::default();
-            let mut make = |header: bool, text: Option<&str>| text.filter(|t| !t.is_empty()).map(|t| extras.header_footer(header, t, &defaults, &fields, &mut ids, &mut taken));
-            if hdr_changed {
-                edit.hdr = Some(make(true, defaults.header.as_deref()));
-            }
-            if ftr_changed {
-                edit.ftr = Some(make(false, defaults.footer.as_deref()));
-            }
-            if hdr1_changed {
-                edit.hdr_first = Some(make(true, defaults.header_first.as_deref()));
-            }
-            if ftr1_changed {
-                edit.ftr_first = Some(make(false, defaults.footer_first.as_deref()));
-            }
-            if defaults.different_first() != src.page.different_first() {
-                edit.title_pg = Some(defaults.different_first());
-            }
-            if !page_changed && edit.is_empty() { orig.clone() } else { patch_sect(orig, &defaults, page_changed, &edit) }
+            if !page_changed && last_edit.is_empty() { orig.clone() } else { patch_sect(orig, &defaults, page_changed, &last_edit) }
         }
     };
-    let refs = merge_refs(&sect, &src.first_refs, [hdr_changed, hdr1_changed, ftr_changed, ftr1_changed]);
-    let body = fix_sections(&body, &secs, &refs, refs_changed);
+    let body = fix_sections(&body, &secs, "", false, &edits, &src.sect_prs);
     let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
     let document = format!("{}{body}{sect}{}", fix_head(&src.head), src.tail);
 
@@ -6019,6 +6414,9 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
             let missing: String = split_styles(&kladd_styles())
                 .into_iter()
                 .filter(|(id, _)| !xml.contains(&format!("w:styleId=\"{id}\"")))
+                // Har dokumentet redan en rubrikmall (t.ex. `Rubrik1`) används den i stället för Kladds.
+                .filter(|(id, _)| !heading_remap.iter().any(|(k, _)| k == id))
+                .map(|(id, x)| (id, heading_remap.iter().fold(x, |x, (k, v)| x.replace(&format!("w:val=\"{k}\""), &format!("w:val=\"{v}\"")))))
                 // Titel och Underrubrik läggs bara till när de används och dokumentet saknar en mall med namnet.
                 .filter(|(id, _)| match id.as_str() {
                     "Title" | "Subtitle" => {
@@ -6066,11 +6464,47 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         }
     }
 
+    // Udda/jämna sidhuvuden slås på eller av i inställningarna.
+    let even_on = |d: &DocDefaults| d.header_even.is_some() || d.footer_even.is_some();
+    if even_on(&defaults) != even_on(&src.page) {
+        if let Some(name) = find_rel("/settings") {
+            if let Some(xml) = src.part(&name).map(decode_xml) {
+                replaced.insert(name.to_lowercase(), fix_decl(&hf::with_even_odd(&xml, even_on(&defaults))).into_bytes());
+            }
+        }
+    }
     // En ny innehållsförteckning har gissade sidnummer: be Word uppdatera fälten vid öppning.
     if body.contains(TOC_TAG) {
         if let Some(name) = find_rel("/settings") {
-            if let Some(xml) = src.part(&name).map(decode_xml) {
+            let cur = replaced.get(&name.to_lowercase()).map(|b| decode_xml(b));
+            if let Some(xml) = cur.or_else(|| src.part(&name).map(decode_xml)) {
                 replaced.insert(name.to_lowercase(), fix_decl(&with_update_fields(&xml)).into_bytes());
+            }
+        }
+    }
+
+    // ---- slutnoter
+    if let Some(xml) = endnotes_xml {
+        match &src.endnotes {
+            Some(o) => {
+                replaced.insert(o.name.trim_start_matches('/').to_lowercase(), fix_decl(&xml).into_bytes());
+            }
+            None => {
+                let (part, xml) = fresh_part("word/endnotes.xml", "endnotes", ENDNOTES_MIME, xml, &mut doc_rel_add, &mut type_add);
+                new_parts.push((part, xml.into_bytes()));
+                if let Some((name, x)) = find_rel("/settings").and_then(|n| src.part(&n).map(|b| (n, decode_xml(b)))) {
+                    let x = replaced.get(&name.to_lowercase()).map_or(x, |b| decode_xml(b));
+                    if x.contains("</w:settings>") && !x.contains("<w:endnotePr") {
+                        let add = r#"<w:endnotePr><w:endnote w:id="-1"/><w:endnote w:id="0"/></w:endnotePr>"#;
+                        let at = ["<w:compat", "<w:docVars", "<w:rsids", "<m:mathPr", "<w:themeFontLang", "<w:clrSchemeMapping", "</w:settings>"]
+                            .iter()
+                            .filter_map(|m| x.find(m))
+                            .min()
+                            .unwrap_or(0);
+                        let patched = format!("{}{add}{}", &x[..at], &x[at..]);
+                        replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
+                    }
+                }
             }
         }
     }
@@ -6150,7 +6584,10 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, title: &st
         None => format!("{XML_DECL}\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{doc_rel_add}</Relationships>"),
     };
     replaced.insert(rels_name.to_lowercase(), fix_decl(&rels_patched).into_bytes());
-    let exts = media_exts(&w);
+    let mut exts = media_exts(&w);
+    exts.extend(extras.exts.iter().map(String::as_str));
+    exts.sort_unstable();
+    exts.dedup();
     if let Some(ct) = src.part("[Content_Types].xml") {
         replaced.insert("[content_types].xml".into(), fix_decl(&patch_content_types(&decode_xml(ct), &exts, &type_add)).into_bytes());
     }
@@ -6324,6 +6761,52 @@ mod tests {
     /// Skriver om `word/styles.xml`.
     fn patch_styles(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
         patch_part(bytes, "word/styles.xml", f)
+    }
+
+    /// Läser `word/document.xml` med handgjorda stycken före ett avslutande stycke "Slut".
+    fn md_with_body(body: &str) -> String {
+        let base = write("Slut\n", "T", &|_| None, None).unwrap().bytes;
+        let xml = patch_document(&base, |x| x.replacen("<w:body>", &format!("<w:body>{body}"), 1));
+        read(&xml).unwrap().markdown
+    }
+
+    const BRK: &str = "<!-- kladd: sidbrytning -->";
+
+    #[test]
+    fn page_break_in_run_splits_paragraph() {
+        let md = md_with_body(r#"<w:p><w:r><w:t>Före</w:t></w:r><w:r><w:br w:type="page"/></w:r><w:r><w:t>Efter</w:t></w:r></w:p>"#);
+        assert!(md.contains(&format!("Före\n\n{BRK}\n\nEfter")), "{md}");
+    }
+
+    #[test]
+    fn page_break_alone_in_paragraph() {
+        let md = md_with_body(r#"<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
+        assert!(md.contains(&format!("A\n\n{BRK}\n\nSlut")), "{md}");
+    }
+
+    #[test]
+    fn page_break_before_direct_and_off() {
+        let md = md_with_body(r#"<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#);
+        assert!(md.contains(&format!("A\n\n{BRK}\n\nB")), "{md}");
+        let md = md_with_body(r#"<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore w:val="0"/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#);
+        assert!(!md.contains(BRK), "{md}");
+    }
+
+    #[test]
+    fn page_break_before_from_style() {
+        let base = write("Slut\n", "T", &|_| None, None).unwrap().bytes;
+        let base = patch_styles(&base, |x| x.replacen("</w:styles>", r#"<w:style w:type="paragraph" w:styleId="Nysida"><w:name w:val="Nysida"/><w:pPr><w:pageBreakBefore/></w:pPr></w:style></w:styles>"#, 1));
+        let xml = patch_document(&base, |x| x.replacen("<w:body>", r#"<w:body><w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Nysida"/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#, 1));
+        let md = read(&xml).unwrap().markdown;
+        assert!(md.contains(&format!("A\n\n{BRK}\n\nB")), "{md}");
+    }
+
+    #[test]
+    fn page_break_roundtrips() {
+        let md = format!("Före\n\n{BRK}\n\nEfter\n");
+        assert_eq!(rt(&md), md);
+        let again = rt(&rt(&md));
+        assert_eq!(again, md);
     }
 
     #[test]
@@ -6614,7 +7097,8 @@ Marginal
         assert!(l.markdown.contains("Sida "), "{}", l.markdown);
         assert!(l.markdown.contains("Efter rutan"), "{}", l.markdown);
         assert!(l.markdown.contains("Innehåll i kontroll"), "{}", l.markdown);
-        assert!(!l.markdown.contains("Inuti rutan"));
+        // Textrutans text visas som ett block före stycket den sitter i.
+        assert!(l.markdown.contains("<!--k:tb ") && l.markdown.contains("Inuti rutan"), "{}", l.markdown);
         // Sida, sidhuvud och sidfot.
         let first = l.markdown.lines().next().unwrap();
         let d = DocDefaults::from_comment(first).expect("grundformat");
@@ -7501,6 +7985,9 @@ mod fn_tests;
 #[path = "docx_review.rs"]
 mod review_xml;
 
+#[path = "docx_hf.rs"]
+mod hf;
+
 #[cfg(test)]
 #[path = "docx_section_tests.rs"]
 mod section_tests;
@@ -7511,3 +7998,6 @@ mod para_tests;
 #[cfg(test)]
 #[path = "docx_track2_tests.rs"]
 mod track2_tests;
+#[cfg(test)]
+#[path = "docx_tbox_tests.rs"]
+mod tbox_tests;

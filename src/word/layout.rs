@@ -397,6 +397,9 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
             None => 0u8.hash(&mut h),
         }
         (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
+        if let Some(f) = para.look.as_ref().and_then(|l| l.frame) {
+            (f.w.to_bits(), f.pl.to_bits(), f.pr.to_bits(), format!("{:?}", f.x)).hash(&mut h);
+        }
         para.empty_h.map(f32::to_bits).hash(&mut h);
     }
     // Tabellformatet (kommentarsraden före en tabell) ändrar utläggningen.
@@ -510,14 +513,19 @@ fn relayout(
     let multi = pages.is_some_and(|g| g.multi());
     let mut row_sec: Vec<u32> = Vec::new();
     let mut col_breaks: Vec<usize> = Vec::new();
+    let mut page_breaks: Vec<usize> = Vec::new();
     let page_wrap = wrap_width;
     // Uppskattad sidbrytning (som `pages::paginate`) så att bilder som placeras mot sidan eller
     // marginalen vet var på arket stycket ligger.
     let mut sim = pages.filter(|_| !multi).map(PageSim::new);
+    // Olika breda spalter: spaltfyllnaden följs i förväg så att varje stycke får sin spalts bredd.
+    let unequal = multi && pages.is_some_and(|g| g.unequal_cols());
+    let mut csim = super::secpages::ColSim::default();
     for (pr, w, tbl) in groups.iter() {
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
-        let wrap_width = match pages {
+        let mut wrap_width = match pages {
+            Some(g) if unequal => csim.start(g, sec, paras[pr.start].col_break),
             Some(g) if multi => g.wrap_for(sec),
             _ => page_wrap,
         };
@@ -566,6 +574,8 @@ fn relayout(
                 .map(|f| ActiveFloat { side: f.side, w: f.w, top: half(f.top - y), bottom: half(f.bottom - y) })
                 .collect()
         };
+        let mut retry = false;
+        let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = loop {
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
             wrap_width.to_bits().hash(&mut h);
@@ -574,7 +584,7 @@ fn relayout(
             }
             h.finish()
         };
-        let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
+        let laid_out: (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
             u.used = tick;
             (u.galleys.clone(), u.geom.clone())
         } else {
@@ -598,13 +608,39 @@ fn relayout(
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
             (gs, geom)
         };
+        // Hamnar stycket delvis i en smalare spalt läggs det ut en gång till med den bredden.
+        if let (true, Some(g), false, false) = (unequal, pages, retry, table) {
+            let mut t = csim.clone();
+            let hs: Vec<f32> = laid_out.0.iter().flat_map(|lg| lg.rows.iter().map(|r| r.row.size.y)).collect();
+            let min_w = t.place(g, sec, hs);
+            if min_w < wrap_width - 0.5 {
+                wrap_width = min_w;
+                retry = true;
+                continue;
+            }
+        }
+        break laid_out;
+        };
+        if let (true, Some(g)) = (unequal, pages) {
+            let hs: Vec<f32> = if table {
+                vec![galleys.iter().map(|lg| lg.rect.height()).sum()]
+            } else {
+                galleys.iter().flat_map(|lg| lg.rows.iter().map(|r| r.row.size.y)).collect()
+            };
+            csim.place(g, sec, hs);
+        }
         if multi {
             let n: usize = galleys.iter().map(|g| g.rows.len()).sum();
             row_sec.extend(std::iter::repeat(sec as u32).take(n));
+        }
+        {
             let mut r = row_no;
             for (q, lg) in gp.iter().zip(galleys.iter()) {
-                if q.col_break {
+                if multi && q.col_break {
                     col_breaks.push(r);
+                }
+                if q.page_break {
+                    page_breaks.push(r);
                 }
                 r += lg.rows.len();
             }
@@ -661,7 +697,7 @@ fn relayout(
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks);
             // Tabellernas kolumnkanter följer med raderna i sidled.
             for (t, r) in geoms.iter_mut().zip(&geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
@@ -670,7 +706,7 @@ fn relayout(
             st.page_boxes = Arc::new(paged.boxes);
         }
         Some(geom) => {
-            super::pages::paginate(&mut g, geom, ppp, &anchors, &row_groups);
+            super::pages::paginate_breaks(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks);
             st.page_boxes = Arc::new(geom.uniform_boxes(super::pages::page_count(&g, geom)));
         }
         None => st.page_boxes = Arc::default(),
@@ -1432,6 +1468,8 @@ struct Para {
     first_indent: f32,
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     col_break: bool,
+    /// Sidbrytningsraden (`<!-- kladd: sidbrytning -->`): raden börjar en ny sida.
+    page_break: bool,
     /// Styckeutseende ur markören `<!--k:pp …-->` (`pbox`): avstånd, indrag, ram och skuggning.
     look: Option<Arc<PPr>>,
     /// Höjd (px) på den tomma raden mellan två stycken när avståndet kommer från `look`.
@@ -1442,6 +1480,8 @@ struct Para {
     ind_left: f32,
     ind_right: f32,
     hang: f32,
+    /// Pixlar per punkt, för indrag som först räknas ut när spaltbredden är känd (ramar med egen bredd).
+    ppx: f32,
     /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
     empty_h: Option<f32>,
 }
@@ -1510,7 +1550,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             && ps.iter().all(|pc| pc.markup || body(pc).trim().is_empty());
         tag.push(if !is_tag || intersects(&range, &p.reveal) {
             0
-        } else if t.starts_with("</div") {
+        } else if t.starts_with("</div") || t == crate::docx_tbox::CLOSE {
             2
         } else {
             1
@@ -1577,6 +1617,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             None
         };
         let col_break = super::sections::is_column_break(t);
+        let page_break = super::sections::is_page_break(t);
         out.push(Para {
             range,
             align,
@@ -1589,12 +1630,14 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             space_before,
             first_indent,
             col_break,
+            page_break,
             look: None,
             gap: None,
             line: None,
             ind_left: 0.0,
             ind_right: 0.0,
             hang: 0.0,
+            ppx: 0.0,
             empty_h: ep.as_ref().map(|(_, h)| *h),
         });
         if e >= text.len() {
@@ -1661,6 +1704,7 @@ fn apply_looks(text: &str, out: &mut [Para], before0: &[f32], after: &[f32], zoo
         let Some(l) = q.look.clone() else { continue };
         q.ind_left = l.left.unwrap_or(0.0).max(0.0) * ppx;
         q.ind_right = l.right.unwrap_or(0.0).max(0.0) * ppx;
+        q.ppx = ppx;
         match l.first {
             Some(f) if f < 0.0 => {
                 q.hang = -f * ppx;
@@ -2048,7 +2092,12 @@ fn layout_piece(
     }
     let list = para.list;
     // Indrag från vänster och höger (listor har sitt eget).
-    let (ind_l, ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
+    let (mut ind_l, mut ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
+    // Ram med egen bredd och eget läge (textruta): indragen räknas mot spaltens bredd.
+    if let (true, true, Some(g)) = (list.is_none() && !para.collapse, avail.is_finite() && para.ppx > 0.0, para.look.as_ref().and_then(|l| l.frame_geom(avail / para.ppx.max(0.001)))) {
+        ind_l = g.0 * para.ppx;
+        ind_r = g.1 * para.ppx;
+    }
     let wrap_w = match list {
         Some(l) => (avail - l.text_x).max(24.0),
         None => (avail - ind_l - ind_r).max(24.0).min(avail),
