@@ -627,6 +627,15 @@ Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som
 - `page` (även `page-size`) följer `page-size` i grundformatet (`A4`, `Letter`, `210mm 297mm`, `landscape` efter
   namnet), `page-margin` (även `margin`) följer CSS, `columns` är 1–6, `column-gap` en längd (standard 35,4 pt
   = 1,25 cm, Words 708 twips) och `type: continuous` låter avsnittet börja på samma sida (annars en ny sida).
+  `column-widths: 40mm 120mm` ger olika breda spalter (minst två längder; de bestämmer antalet spalter, skalas så att
+  de med mellanrummen fyller textytan, och lika långa längder är vanliga spalter) och `column-rule: yes` en
+  skiljelinje mitt i varje mellanrum. Docx: `w:cols w:equalWidth="0"` med `w:col w:w`, och `w:sep`. Odt:
+  `style:column` med `style:rel-width` (andel av textytan inklusive utfyllnad, skrivs i twips) och
+  `fo:start-padding`/`fo:end-padding` (LibreOffice: `fo:start-indent`/`fo:end-indent`; lika andelar är lika breda
+  spalter), och `style:column-sep` (skrivs före spalterna). PDF: x och bredd per spalt, linjerna ritas med sidan.
+  Layout: vid olika bredder balanseras inte spalterna, och `ColSim` (secpages.rs) följer spaltfyllnaden så att varje
+  stycke läggs ut i sin spalts bredd (ett stycke som byter spalt får den smalare spaltens bredd).
+  Spalter jämnas ut på avsnittets sista sida när ett löpande avsnitt följer, som i Word och LibreOffice.
 - **Egenskaper som saknas ärver dokumentets grundformat**, inte föregående avsnitt. Ett avsnitt utan egenskaper
   är alltså "tillbaka till grundformatet".
 - En avsnittsrad som står före all text (bara tomma rader och grundformatraden före) gäller **första avsnittet**

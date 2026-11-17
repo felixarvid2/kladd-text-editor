@@ -514,10 +514,14 @@ fn relayout(
     // Uppskattad sidbrytning (som `pages::paginate`) så att bilder som placeras mot sidan eller
     // marginalen vet var på arket stycket ligger.
     let mut sim = pages.filter(|_| !multi).map(PageSim::new);
+    // Olika breda spalter: spaltfyllnaden följs i förväg så att varje stycke får sin spalts bredd.
+    let unequal = multi && pages.is_some_and(|g| g.unequal_cols());
+    let mut csim = super::secpages::ColSim::default();
     for (pr, w, tbl) in groups.iter() {
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
-        let wrap_width = match pages {
+        let mut wrap_width = match pages {
+            Some(g) if unequal => csim.start(g, sec, paras[pr.start].col_break),
             Some(g) if multi => g.wrap_for(sec),
             _ => page_wrap,
         };
@@ -566,6 +570,8 @@ fn relayout(
                 .map(|f| ActiveFloat { side: f.side, w: f.w, top: half(f.top - y), bottom: half(f.bottom - y) })
                 .collect()
         };
+        let mut retry = false;
+        let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = loop {
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
             wrap_width.to_bits().hash(&mut h);
@@ -574,7 +580,7 @@ fn relayout(
             }
             h.finish()
         };
-        let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
+        let laid_out: (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
             u.used = tick;
             (u.galleys.clone(), u.geom.clone())
         } else {
@@ -598,6 +604,27 @@ fn relayout(
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
             (gs, geom)
         };
+        // Hamnar stycket delvis i en smalare spalt läggs det ut en gång till med den bredden.
+        if let (true, Some(g), false, false) = (unequal, pages, retry, table) {
+            let mut t = csim.clone();
+            let hs: Vec<f32> = laid_out.0.iter().flat_map(|lg| lg.rows.iter().map(|r| r.row.size.y)).collect();
+            let min_w = t.place(g, sec, hs);
+            if min_w < wrap_width - 0.5 {
+                wrap_width = min_w;
+                retry = true;
+                continue;
+            }
+        }
+        break laid_out;
+        };
+        if let (true, Some(g)) = (unequal, pages) {
+            let hs: Vec<f32> = if table {
+                vec![galleys.iter().map(|lg| lg.rect.height()).sum()]
+            } else {
+                galleys.iter().flat_map(|lg| lg.rows.iter().map(|r| r.row.size.y)).collect()
+            };
+            csim.place(g, sec, hs);
+        }
         if multi {
             let n: usize = galleys.iter().map(|g| g.rows.len()).sum();
             row_sec.extend(std::iter::repeat(sec as u32).take(n));

@@ -7,6 +7,11 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Nytt
 
 - **Fler testdokument.** Testkorpusen har ett nyhetsbrev (spalter, textruta, bild) och en skolrapport (sidhuvud med logga, sidfot, fotnoter, innehållsförteckning), både i Word 365-stil och som LibreOffice skapar dem.
+- **Olika breda spalter och skiljelinje.** Spalter med olika bredd (`w:equalWidth="0"` i Word, `style:column` i LibreOffice) och linjen mellan spalterna visas som i Word och LibreOffice, och följer med till `.docx`, `.odt` och PDF (`column-widths` och `column-rule` i avsnittsraden).
+
+### Rättat
+
+- Spalterna i ett avsnitt jämnas nu ut på avsnittets sista sida, också när avsnittet går över en sidgräns.
 
 ## [2.3.0] – 2026-11-17
 

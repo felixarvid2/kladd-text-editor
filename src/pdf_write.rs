@@ -638,6 +638,9 @@ struct Layout<'a> {
     text_l: f32,
     text_w: f32,
     col_w: f32,
+    /// Spaltbredderna när de är olika breda (annars tom), och skiljelinje mellan spalterna.
+    col_ws: Vec<f32>,
+    rule: bool,
     rt: f32,
     /// Längsta y som använts i spalter som lämnats på sidan (för löpande avsnitt).
     page_ymax: f32,
@@ -805,6 +808,8 @@ impl<'a> Layout<'a> {
             text_l: ml,
             text_w: cw,
             col_w: cw,
+            col_ws: Vec::new(),
+            rule: false,
             rt: mt,
             page_ymax: 0.0,
             breaks: 0,
@@ -953,8 +958,8 @@ impl<'a> Layout<'a> {
         if self.cols > 1 && self.col + 1 < self.cols && !self.pages.is_empty() {
             self.page_ymax = self.page_ymax.max(self.y);
             self.col += 1;
-            self.ml = self.text_l + self.col as f32 * (self.col_w + self.gap);
-            self.cw = self.col_w;
+            self.ml = self.text_l + self.col_left(self.col);
+            self.cw = self.col_width(self.col);
             self.y = self.rt;
             self.floats.clear();
             self.breaks += 1;
@@ -967,7 +972,36 @@ impl<'a> Layout<'a> {
         PageGeom { pw: self.pw, ph: self.ph, mt: self.mt, mb: self.mb, ml: self.text_l, cw: self.text_w }
     }
 
+    /// Spaltens bredd.
+    fn col_width(&self, c: usize) -> f32 {
+        self.col_ws.get(c).copied().unwrap_or(self.col_w)
+    }
+
+    /// Spaltens vänsterkant från textytans vänsterkant.
+    fn col_left(&self, c: usize) -> f32 {
+        (0..c).map(|k| self.col_width(k) + self.gap).sum()
+    }
+
+    /// Skiljelinjerna mellan spalterna för delen av sidan som just lämnas (från spalternas överkant
+    /// till längsta använda höjd), ritade med sidans innehåll.
+    fn flush_rules(&mut self) {
+        let end = self.y.max(self.page_ymax);
+        if !self.rule || self.cols < 2 || self.pages.is_empty() || end <= self.rt + 1.0 {
+            return;
+        }
+        let (rt, text_l) = (self.rt, self.text_l);
+        let xs: Vec<f32> = (0..self.cols - 1).map(|c| text_l + self.col_left(c) + self.col_width(c) + self.gap / 2.0).collect();
+        for x in xs {
+            self.page().ops.push(Op::Line { x1: x, y1: rt, x2: x, y2: end, width: 0.5, color: MUTED });
+        }
+    }
+
     fn real_page(&mut self) {
+        self.flush_rules();
+        self.start_page();
+    }
+
+    fn start_page(&mut self) {
         self.flush_notes();
         let geom = self.page_geom();
         self.pages.push(PageOps { ops: Vec::new(), geom });
@@ -976,7 +1010,7 @@ impl<'a> Layout<'a> {
         self.page_ymax = 0.0;
         self.col = 0;
         self.ml = self.text_l;
-        self.cw = self.col_w;
+        self.cw = self.col_width(0);
         self.breaks += 1;
     }
 
@@ -993,9 +1027,17 @@ impl<'a> Layout<'a> {
         let n = self.cols as f32;
         self.gap = if self.cols > 1 { sec.gap.min(((self.text_w - 18.0 * n) / (n - 1.0)).max(0.0)) } else { 0.0 };
         self.col_w = ((self.text_w - self.gap * (n - 1.0)) / n).max(18.0);
+        // Olika breda spalter skalas så att de med mellanrummen fyller textytan.
+        let sum: f32 = sec.col_widths.iter().sum();
+        self.col_ws = if self.cols > 1 && sec.col_widths.len() == self.cols && sum > 0.0 {
+            sec.col_widths.iter().map(|w| (w / sum * (self.text_w - self.gap * (n - 1.0))).max(18.0)).collect()
+        } else {
+            Vec::new()
+        };
+        self.rule = sec.rule && self.cols > 1;
         self.col = 0;
         self.ml = ml;
-        self.cw = self.col_w;
+        self.cw = self.col_width(0);
     }
 
     /// Avsnittsbrytning: ny sida med avsnittets mått, eller (löpande, samma sidstorlek) vidare på samma sida.
@@ -1005,6 +1047,9 @@ impl<'a> Layout<'a> {
         let same_sheet = [(self.pw, sec.page.0), (self.ph, sec.page.1), (self.mt, sec.margin[0]), (self.mb, sec.margin[2]), (self.text_l, sec.margin[3])]
             .iter()
             .all(|(a, b)| (a - b).abs() < 0.5);
+        if !page_empty {
+            self.flush_rules();
+        }
         if page_empty {
             // Början av dokumentet (eller två rader i rad): sidan görs om i stället för att lämnas tom.
             self.set_section(&sec);
@@ -1026,7 +1071,7 @@ impl<'a> Layout<'a> {
         } else {
             self.flush_notes();
             self.set_section(&sec);
-            self.real_page();
+            self.start_page();
         }
     }
 
@@ -1932,6 +1977,7 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
     lay.notes = notes.to_vec();
     lay.new_page();
     lay.run(blocks);
+    lay.flush_rules();
     lay.flush_notes();
     if blocks.iter().any(|b| matches!(b, Block::Toc)) {
         let pos: Vec<(usize, f32)> =
@@ -1942,6 +1988,7 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
         second.notes = notes.to_vec();
         second.new_page();
         second.run(blocks);
+        second.flush_rules();
         second.flush_notes();
         lay = second;
     }

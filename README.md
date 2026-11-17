@@ -176,6 +176,8 @@ Avsnittet börjar vid en egen rad som visas bara när markören står på den. E
 <!-- kladd: avsnitt; page: A4 landscape; page-margin: 20mm; columns: 2; column-gap: 12mm -->
 ```
 
+`column-widths: 40mm 120mm` ger olika breda spalter och `column-rule: yes` en skiljelinje mellan spalterna (båda följer med till `.docx`, `.odt` och PDF, och läses från Word och LibreOffice). *Spalter…* nollställer bredderna och linjen när du byter antal spalter.
+
 Med `type: continuous` börjar avsnittet på samma sida (för att byta antal spalter mitt på en sida; spalterna i avsnittet före jämnas ut). Bilder och tabeller anpassas till spaltens bredd, sidnumren löper över avsnitten och sidhuvud och sidfot är gemensamma. Avsnitten följer med till `.docx` (`w:sectPr`: sidstorlek, orientering, marginaler, spalter och typ), `.odt` (sidmallar, och `text:section` för spalter) och PDF.
 
 ### Ekvationer

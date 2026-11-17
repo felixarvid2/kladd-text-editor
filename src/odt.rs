@@ -313,8 +313,8 @@ struct StyleDef {
     gfx: GfxPlace,
     /// `style:master-page-name`: stycket börjar en ny sida med den sidmallen (avsnitt).
     master: Option<String>,
-    /// Spalter i ett avsnittsformat (`style:columns`): antal och mellanrum i pt.
-    cols: Option<(usize, f32)>,
+    /// Spalter i ett avsnittsformat (`style:columns`).
+    cols: Option<ColsDef>,
 }
 
 #[derive(Default)]
@@ -330,11 +330,73 @@ struct Styles {
     col_widths: HashMap<String, f64>,
 }
 
-/// Antal spalter (minst två) och mellanrum i pt ur ett `style:columns`.
-fn columns_of(c: &Node) -> Option<(usize, f32)> {
+/// Spalter ur ett `style:columns`: antal (minst två), mellanrum, spaltandelar och skiljelinje.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ColsDef {
+    n: usize,
+    /// Mellanrum i pt.
+    gap: f32,
+    /// Per spalt `style:rel-width` (en andel av textytan, inklusive utfyllnaden) och utfyllnad
+    /// (start + slut) i pt; tom när spalterna saknar egna mått.
+    shares: Vec<(f32, f32)>,
+    rule: bool,
+}
+
+impl ColsDef {
+    /// Spaltbredderna i pt på en textyta `text_w` bred; tom när spalterna är lika breda.
+    fn widths(&self, text_w: f32) -> Vec<f32> {
+        let sum: f32 = self.shares.iter().map(|s| s.0).sum();
+        if self.shares.len() != self.n || sum <= 0.0 {
+            return Vec::new();
+        }
+        // Lika andelar är lika breda spalter (LibreOffice skriver så även om utfyllnaden skiljer mellan
+        // kant- och mittspalter).
+        if self.shares.iter().all(|(v, _)| (v / sum * self.n as f32 - 1.0).abs() < 0.01) {
+            return Vec::new();
+        }
+        let w: Vec<f32> = self.shares.iter().map(|(v, pad)| v / sum * text_w - pad).collect();
+        if w.iter().all(|w| *w > 1.0) && w.iter().any(|x| (x - w[0]).abs() > 0.5) { w } else { Vec::new() }
+    }
+
+    /// Egenskaper för ett avsnitt (de som skiljer sig från grundvärdena) på en textyta `text_w` bred.
+    fn apply(&self, p: &mut sections::SectionProps, text_w: f32) {
+        p.columns = Some(self.n);
+        p.column_gap = Some(self.gap).filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
+        p.column_widths = Some(self.widths(text_w)).filter(|w| w.len() > 1);
+        p.column_rule = self.rule;
+    }
+}
+
+/// Spalterna i ett `style:columns`. Utfyllnaden står som `fo:start-padding`/`fo:end-padding` eller
+/// (LibreOffice) `fo:start-indent`/`fo:end-indent`; mellanrummet är utfyllnaden mellan första och
+/// andra spalten, annars `fo:column-gap`.
+fn columns_of(c: &Node) -> Option<ColsDef> {
     let n = c.attr("fo:column-count")?.trim().parse::<usize>().ok()?;
-    let gap = c.attr("fo:column-gap").and_then(style::parse_length).unwrap_or(sections::DEFAULT_GAP);
-    (n > 1).then_some((n.min(sections::MAX_COLUMNS), gap))
+    if n < 2 {
+        return None;
+    }
+    let n = n.min(sections::MAX_COLUMNS);
+    let mut gap = c.attr("fo:column-gap").and_then(style::parse_length).unwrap_or(sections::DEFAULT_GAP);
+    let cols: Vec<&Node> = c.els().filter(|k| k.name == "style:column").collect();
+    let pad = |k: &Node, a: &str| k.attr(a).or_else(|| k.attr(&a.replace("padding", "indent"))).and_then(style::parse_length).unwrap_or(0.0);
+    let mut shares = Vec::new();
+    if cols.len() == n {
+        if let [a, b, ..] = cols[..] {
+            let g = pad(a, "fo:end-padding") + pad(b, "fo:start-padding");
+            if g > 0.0 {
+                gap = g;
+            }
+        }
+        shares = cols
+            .iter()
+            .map(|k| {
+                let v = k.attr("style:rel-width").and_then(|v| v.trim().trim_end_matches('*').parse::<f32>().ok()).unwrap_or(0.0);
+                (v, pad(k, "fo:start-padding") + pad(k, "fo:end-padding"))
+            })
+            .collect();
+    }
+    let rule = c.child("style:column-sep").is_some_and(|s| s.attr("style:style") != Some("none") && s.attr("style:width").and_then(style::parse_length).is_none_or(|w| w > 0.0));
+    Some(ColsDef { n, gap, shares, rule })
 }
 
 fn unquote_font(f: &str) -> String {
@@ -595,8 +657,8 @@ impl Styles {
     }
 
     /// Spalterna i ett avsnittsformat.
-    fn section_columns(&self, style: &str) -> Option<(usize, f32)> {
-        self.chain("section", style).iter().rev().find_map(|d| d.cols)
+    fn section_columns(&self, style: &str) -> Option<ColsDef> {
+        self.chain("section", style).iter().rev().find_map(|d| d.cols.clone())
     }
 
     /// Formatmallen och dess föräldrar, rot först.
@@ -824,6 +886,8 @@ struct Rd<'s, 'b> {
     masters: HashMap<String, sections::SectionProps>,
     cur_master: Option<String>,
     cur_page: sections::SectionProps,
+    /// Dokumentets grundsida (för spaltbredder i förhållande till textytan).
+    page_defaults: DocDefaults,
     review: ReviewRd,
 }
 
@@ -1332,18 +1396,15 @@ impl<'s, 'b> Rd<'s, 'b> {
             }
             // Avsnitt med spalter: en löpande avsnittsrad före och en som återställer efter.
             "text:section" if n.attr("text:style-name").and_then(|s| self.st.section_columns(s)).is_some() => {
-                let (cols, gap) = n.attr("text:style-name").and_then(|s| self.st.section_columns(s)).unwrap_or((2, sections::DEFAULT_GAP));
-                let open = sections::SectionProps {
-                    columns: Some(cols),
-                    column_gap: Some(gap).filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5),
-                    continuous: true,
-                    ..self.cur_page.clone()
-                };
+                let def = n.attr("text:style-name").and_then(|s| self.st.section_columns(s)).unwrap_or(ColsDef { n: 2, gap: sections::DEFAULT_GAP, ..Default::default() });
+                let mut open = sections::SectionProps { continuous: true, ..self.cur_page.clone() };
+                let cur = sections::Section::resolve(&self.cur_page, &self.page_defaults);
+                def.apply(&mut open, (cur.page.0 - cur.margin[1] - cur.margin[3]).max(1.0));
                 self.section_row(&open);
                 for c in n.els() {
                     self.walk(c);
                 }
-                let close = sections::SectionProps { columns: None, column_gap: None, continuous: true, ..self.cur_page.clone() };
+                let close = sections::SectionProps { columns: None, column_gap: None, column_widths: None, column_rule: false, continuous: true, ..self.cur_page.clone() };
                 self.section_row(&close);
             }
             // Innehållsförteckningen blir raden `<!-- kladd: toc -->`; innehållet byggs om av Kladd.
@@ -1857,9 +1918,10 @@ fn master_props(styles_root: &Node, d: &DocDefaults) -> (HashMap<String, section
             let m = [mm[0].unwrap_or(def), mm[1].unwrap_or(def), mm[2].unwrap_or(def), mm[3].unwrap_or(def)];
             p.page_margin = Some(m).filter(|m| m.iter().zip(d.margins()).any(|(a, b)| (a - b).abs() > 0.6));
         }
-        if let Some((n, gap)) = pp.child("style:columns").and_then(columns_of) {
-            p.columns = Some(n);
-            p.column_gap = Some(gap).filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
+        if let Some(def) = pp.child("style:columns").and_then(columns_of) {
+            let (pw, _) = p.page_size.unwrap_or_else(|| d.page());
+            let m = p.page_margin.unwrap_or_else(|| d.margins());
+            def.apply(&mut p, (pw - m[1] - m[3]).max(1.0));
         }
         out.insert(name.to_owned(), p);
     }
@@ -2039,6 +2101,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         in_note: false,
         cur_page: start_master.as_ref().and_then(|m| masters.get(m)).cloned().unwrap_or_default(),
         cur_master: start_master,
+        page_defaults: defaults.clone(),
         masters,
         review: ReviewRd::default(),
     };
@@ -2133,6 +2196,33 @@ fn odt_cell_style(f: &crate::word::tablefmt::TableFmt, name: &str, r: usize, c: 
 
 fn cm(pt: f32) -> String {
     format!("{}cm", fmt_num(pt * 2.54 / 72.0, 4))
+}
+
+/// `style:columns` för ett avsnitt. Olika breda spalter skrivs som `style:column` med `style:rel-width`
+/// i twips (spaltens bredd plus utfyllnad) och halva mellanrummet på var sida, skiljelinjen först.
+fn columns_xml(sec: &sections::Section) -> String {
+    let mut x = format!("<style:columns fo:column-count=\"{}\" fo:column-gap=\"{}\">", sec.columns, cm(sec.gap));
+    if sec.rule {
+        x.push_str("<style:column-sep style:width=\"0.0176cm\" style:color=\"#000000\" style:style=\"solid\" style:height=\"100%\" style:vertical-align=\"top\"/>");
+    }
+    if sec.col_widths.len() == sec.columns {
+        let n = sec.columns as f32;
+        let text_w = (sec.page.0 - sec.margin[1] - sec.margin[3]).max(1.0);
+        let avail = (text_w - sec.gap * (n - 1.0)).max(1.0);
+        let sum: f32 = sec.col_widths.iter().sum();
+        let half = cm(sec.gap / 2.0);
+        for (i, cw) in sec.col_widths.iter().enumerate() {
+            let (first, last) = (i == 0, i + 1 == sec.columns);
+            let w = cw / sum * avail;
+            // Ytterkanterna har ingen utfyllnad, så att bredderna summerar till textytans bredd.
+            let pads = sec.gap / 2.0 * (if first { 0.0 } else { 1.0 } + if last { 0.0 } else { 1.0 });
+            let rel = ((w + pads) * 20.0).round() as i64;
+            let (sp, ep) = (if first { "0cm".to_owned() } else { half.clone() }, if last { "0cm".to_owned() } else { half.clone() });
+            x.push_str(&format!("<style:column style:rel-width=\"{rel}*\" fo:start-padding=\"{sp}\" fo:end-padding=\"{ep}\"/>"));
+        }
+    }
+    x.push_str("</style:columns>");
+    x
 }
 
 fn pt_str(s: f32) -> String {
@@ -2542,9 +2632,9 @@ impl<'a> W<'a> {
             self.n_sect += 1;
             let name = format!("Sect{}", self.n_sect);
             self.auto.push_str(&format!(
-                "<style:style style:name=\"{name}\" style:family=\"section\"><style:section-properties text:dont-balance-text-columns=\"false\"><style:columns fo:column-count=\"{}\" fo:column-gap=\"{}\"/></style:section-properties></style:style>",
-                sec.columns,
-                cm(sec.gap)
+                "<style:style style:name=\"{name}\" style:family=\"section\"><style:section-properties text:dont-balance-text-columns=\"{}\">{}</style:section-properties></style:style>",
+                !sec.col_widths.is_empty(),
+                columns_xml(sec)
             ));
             self.body.push_str(&format!("<text:section text:style-name=\"{name}\" text:name=\"Avsnitt{}\">", self.n_sect));
             self.section_open = true;

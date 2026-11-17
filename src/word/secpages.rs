@@ -29,9 +29,13 @@ pub struct SecGeom {
     pub bottom: f32,
     pub left: f32,
     pub cols: usize,
-    /// Spaltens bredd.
+    /// Spaltens bredd (första spalten när de är olika breda).
     pub col_w: f32,
     pub gap: f32,
+    /// Spaltbredderna när de är olika breda (annars tom).
+    pub col_ws: Vec<f32>,
+    /// Skiljelinje mellan spalterna.
+    pub rule: bool,
     /// Börjar på samma sida som föregående avsnitt (om sidorna är lika stora).
     pub continuous: bool,
 }
@@ -49,6 +53,14 @@ impl SecGeom {
         let n = s.columns.max(1) as f32;
         // Spalterna får inte bli smalare än 20 px.
         let gap = if n > 1.0 { gap.min(((text_w - 20.0 * n) / (n - 1.0)).max(0.0)) } else { gap };
+        // Olika breda spalter: bredderna skalas så att de tillsammans med mellanrummen fyller textytan.
+        let avail = (text_w - gap * (n - 1.0)).max(1.0);
+        let sum: f32 = s.col_widths.iter().sum();
+        let col_ws: Vec<f32> = if s.col_widths.len() == s.columns && sum > 0.0 {
+            s.col_widths.iter().map(|w| (w / sum * avail).max(1.0)).collect()
+        } else {
+            Vec::new()
+        };
         SecGeom {
             page_w,
             page_h: px(zoom, h),
@@ -57,8 +69,10 @@ impl SecGeom {
             bottom: cap(b, h),
             left,
             cols: s.columns.max(1),
-            col_w: ((text_w - gap * (n - 1.0)) / n).max(1.0),
+            col_w: col_ws.first().copied().unwrap_or(((text_w - gap * (n - 1.0)) / n).max(1.0)),
             gap,
+            col_ws,
+            rule: s.rule,
             continuous: s.continuous,
         }
     }
@@ -79,6 +93,10 @@ impl SecGeom {
             v.to_bits().hash(h);
         }
         self.cols.hash(h);
+        self.rule.hash(h);
+        for w in &self.col_ws {
+            w.to_bits().hash(h);
+        }
         self.continuous.hash(h);
     }
 }
@@ -133,14 +151,21 @@ impl Geom {
                 cols: 1,
                 col_w: self.text_w(),
                 gap: 0.0,
+                col_ws: Vec::new(),
+                rule: false,
                 continuous: false,
             },
         }
     }
 
-    /// Bredd för utläggning av stycken i avsnitt `i`: spaltens.
+    /// Bredd för utläggning av stycken i avsnitt `i`: spaltens (första spaltens när de är olika breda).
     pub fn wrap_for(&self, i: usize) -> f32 {
         if self.multi() { self.sec(i).col_w } else { self.text_w() }
+    }
+
+    /// Något avsnitt har olika breda spalter (då läggs stycken ut med bredden för spalten de hamnar i).
+    pub fn unequal_cols(&self) -> bool {
+        self.secs.iter().any(|s| !s.col_ws.is_empty())
     }
 
     /// Bredaste arket.
@@ -186,7 +211,7 @@ impl Geom {
                 w: self.page_w,
                 h: self.page_h,
                 margin: [self.top, self.right, self.bottom, self.left],
-                regions: vec![Region { y0: k as f32 * self.stride(), cols: 1, col_w: self.text_w(), gap: 0.0 }],
+                regions: vec![Region { y0: k as f32 * self.stride(), cols: 1, col_w: self.text_w(), gap: 0.0, col_ws: Vec::new(), rule: false, used: 0.0 }],
                 sec: 0,
             })
             .collect()
@@ -202,6 +227,37 @@ pub struct Region {
     pub cols: usize,
     pub col_w: f32,
     pub gap: f32,
+    /// Spaltbredderna när de är olika breda (annars tom).
+    pub col_ws: Vec<f32>,
+    /// Skiljelinje mellan spalterna.
+    pub rule: bool,
+    /// Nedre kanten av det som ligger i delen (galleriets y); skiljelinjerna slutar här.
+    pub used: f32,
+}
+
+impl Region {
+    /// Spaltens bredd.
+    pub fn width_of(&self, c: usize) -> f32 {
+        self.col_ws.get(c).copied().unwrap_or(self.col_w)
+    }
+
+    /// Spaltens vänsterkant från textytans vänsterkant.
+    pub fn left_of(&self, c: usize) -> f32 {
+        (0..c).map(|k| self.width_of(k) + self.gap).sum()
+    }
+
+    /// Spalten som en x-position (från textytans vänsterkant) hör till.
+    pub fn col_at(&self, rel: f32) -> usize {
+        (0..self.cols.max(1) - 1).find(|c| rel < self.left_of(*c) + self.width_of(*c) + self.gap / 2.0).unwrap_or(self.cols.max(1) - 1)
+    }
+
+    /// Skiljelinjernas x (från textytans vänsterkant): mitt i varje mellanrum.
+    pub fn rule_xs(&self) -> Vec<f32> {
+        if !self.rule || self.cols < 2 {
+            return Vec::new();
+        }
+        (0..self.cols - 1).map(|c| self.left_of(c) + self.width_of(c) + self.gap / 2.0).collect()
+    }
 }
 
 /// Ett ark: läge och mått i px. `top` räknas från galleriets y = 0, `left` från skrivbordsytans
@@ -256,8 +312,78 @@ pub fn column_at(boxes: &[PageBox], origin_x: f32, x: f32, y: f32) -> (f32, f32)
     let Some(b) = boxes.get(page_index(boxes, y)) else { return (origin_x, 0.0) };
     let r = b.region_at(y);
     let rel = x + origin_x - b.text_left();
-    let c = ((rel / (r.col_w + r.gap).max(1.0)).floor().max(0.0) as usize).min(r.cols - 1);
-    (b.text_left() + c as f32 * (r.col_w + r.gap) - origin_x, r.col_w)
+    let c = r.col_at(rel);
+    (b.text_left() + r.left_of(c) - origin_x, r.width_of(c))
+}
+
+/// Uppskattad spaltfyllnad under utläggningen, för avsnitt med olika breda spalter: ett stycke måste
+/// läggas ut med bredden för spalten det hamnar i, men spalten avgörs först av sidbrytningen
+/// (`paginate_sections`). Utläggningen följer därför samma regler i förväg, rad för rad: spalten
+/// fylls ned till sidans botten, sedan nästa spalt, sedan nästa ark. Flytande bilder och balansering
+/// räknas inte; en rad som hamnar fel får nöja sig med den smalare spaltens bredd.
+#[derive(Clone, Debug, Default)]
+pub struct ColSim {
+    sec: Option<usize>,
+    col: usize,
+    /// Använd höjd i spalten (från delens överkant).
+    y: f32,
+    /// Delens överkant på arket (efter ett löpande avsnittsbyte), och längsta använda höjd på arket.
+    region_y: f32,
+    max_y: f32,
+    /// Textytans höjd.
+    cap: f32,
+}
+
+impl ColSim {
+    fn width(sg: &SecGeom, col: usize) -> f32 {
+        sg.col_ws.get(col).copied().unwrap_or(sg.col_w)
+    }
+
+    fn next_col(&mut self, sg: &SecGeom) {
+        if self.col + 1 < sg.cols {
+            self.col += 1;
+        } else {
+            self.col = 0;
+            self.region_y = 0.0;
+            self.max_y = 0.0;
+        }
+        self.y = 0.0;
+    }
+
+    /// Börjar ett stycke i avsnitt `sec` (`brk` = spaltbrytning före det): bredden där det börjar.
+    pub fn start(&mut self, geom: &Geom, sec: usize, brk: bool) -> f32 {
+        let sg = geom.sec(sec);
+        if self.sec != Some(sec) {
+            let same_sheet = self.sec.is_some() && sg.continuous;
+            self.region_y = if same_sheet { self.max_y.max(self.region_y + self.y) } else { 0.0 };
+            if !same_sheet {
+                self.max_y = 0.0;
+            }
+            self.col = 0;
+            self.y = 0.0;
+            self.cap = (sg.page_h - sg.top - sg.bottom).max(1.0);
+            self.sec = Some(sec);
+        }
+        if brk {
+            self.next_col(&sg);
+        }
+        Self::width(&sg, self.col)
+    }
+
+    /// Placerar enheter med höjderna `hs`; ger den smalaste spaltbredden de når.
+    pub fn place(&mut self, geom: &Geom, sec: usize, hs: impl IntoIterator<Item = f32>) -> f32 {
+        let sg = geom.sec(sec);
+        let mut min_w = Self::width(&sg, self.col);
+        for h in hs {
+            if self.y > 0.0 && self.region_y + self.y + h > self.cap + 0.5 {
+                self.next_col(&sg);
+                min_w = min_w.min(Self::width(&sg, self.col));
+            }
+            self.y += h;
+            self.max_y = self.max_y.max(self.region_y + self.y);
+        }
+        min_w
+    }
 }
 
 /// Resultatet av `paginate_sections`.
@@ -273,6 +399,11 @@ struct Unit {
     top: f32,
     col: usize,
     h: f32,
+}
+
+/// Spaltens vänsterkant från textytans vänsterkant i ett avsnitt.
+fn region_left(sg: &SecGeom, col: usize) -> f32 {
+    (0..col).map(|k| sg.col_ws.get(k).copied().unwrap_or(sg.col_w) + sg.gap).sum()
 }
 
 /// Minsta spalthöjd som rymmer enheterna `hs` i `cols` spalter (girig fyllning).
@@ -348,7 +479,7 @@ pub fn paginate_sections(
             w: sg.page_w,
             h: sg.page_h,
             margin: [sg.top, sg.right, sg.bottom, sg.left],
-            regions: vec![Region { y0: top + sg.top, cols: sg.cols, col_w: sg.col_w, gap: sg.gap }],
+            regions: vec![Region { y0: top + sg.top, cols: sg.cols, col_w: sg.col_w, gap: sg.gap, col_ws: sg.col_ws.clone(), rule: sg.rule, used: 0.0 }],
             sec,
         });
     }
@@ -362,7 +493,7 @@ pub fn paginate_sections(
     }
     let col_x = |boxes: &Vec<PageBox>, sg: &SecGeom, col: usize| -> f32 {
         let b = boxes.last().expect("minst ett ark");
-        b.text_left() + col as f32 * (sg.col_w + sg.gap) - origin
+        b.text_left() + region_left(sg, col) - origin
     };
 
     let mut next_group = 0;
@@ -388,12 +519,13 @@ pub fn paginate_sections(
         if sec != cur_sec {
             let ng = geom.sec(sec);
             let same = boxes.last().is_some_and(|b| {
-                let cmp = SecGeom { cols: 1, col_w: 0.0, gap: 0.0, continuous: false, page_w: b.w, page_h: b.h, top: b.margin[0], right: b.margin[1], bottom: b.margin[2], left: b.margin[3] };
+                let cmp = SecGeom { cols: 1, col_w: 0.0, gap: 0.0, col_ws: Vec::new(), rule: false, continuous: false, page_w: b.w, page_h: b.h, top: b.margin[0], right: b.margin[1], bottom: b.margin[2], left: b.margin[3] };
                 ng.same_sheet(&cmp)
             });
             if ng.continuous && same && cur_sec != usize::MAX {
-                // Föregående avsnitts spalter jämnas ut när det ryms på sidan.
-                if sg.cols > 1 && !broke_page && !units.is_empty() {
+                // Föregående avsnitts spalter jämnas ut på sista sidan (som Word och LibreOffice gör vid ett
+                // löpande avsnittsbyte); `units` innehåller bara den sidans stycken.
+                if sg.cols > 1 && sg.col_ws.is_empty() && !units.is_empty() {
                     let hs: Vec<f32> = units.iter().map(|u| u.h).collect();
                     let cap = balanced_height(&hs, sg.cols);
                     let (mut c, mut y) = (0usize, region_top);
@@ -420,7 +552,7 @@ pub fn paginate_sections(
                 }
                 let b = boxes.last_mut().expect("minst ett ark");
                 let top = round(page_bottom.max(region_top));
-                b.regions.push(Region { y0: top, cols: ng.cols, col_w: ng.col_w, gap: ng.gap });
+                b.regions.push(Region { y0: top, cols: ng.cols, col_w: ng.col_w, gap: ng.gap, col_ws: ng.col_ws.clone(), rule: ng.rule, used: 0.0 });
                 region_top = top;
                 region_page = boxes.len() - 1;
             } else {
@@ -482,6 +614,17 @@ pub fn paginate_sections(
         prev_bottom = prev_bottom.max(col_y).max(if fh > 0.0 { top + fh } else { f32::NEG_INFINITY });
         page_bottom = page_bottom.max(col_y);
         i = end;
+    }
+
+    // Hur långt ned varje del av ett ark är använd (för skiljelinjerna mellan spalter).
+    if boxes.iter().any(|b| b.regions.iter().any(|r| r.rule)) {
+        for pr in &g.rows {
+            let bi = page_index(&boxes, pr.pos.y);
+            let b = &mut boxes[bi];
+            let ri = b.regions.partition_point(|r| r.y0 <= pr.pos.y + 0.5).saturating_sub(1);
+            let r = &mut b.regions[ri];
+            r.used = r.used.max(pr.pos.y + pr.row.size.y);
+        }
     }
 
     // Galleriets mått: alla rader, och bredden upp till den högraste raden.
@@ -577,5 +720,44 @@ pub fn pointer_fix(
             super::tables::set_caret(ctx, id, text, from, b);
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::word::markup::DocDefaults;
+    use crate::word::sections::{Section, SectionProps};
+
+    fn geom(md_props: &str) -> Geom {
+        let d = DocDefaults::default();
+        let p = SectionProps::from_comment(md_props).unwrap();
+        Geom::for_sections(1.0, &d, &[Section::resolve(&p, &d)])
+    }
+
+    #[test]
+    fn col_sim_follows_each_columns_width() {
+        let g = geom("<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 40mm 120mm; column-rule: yes -->");
+        assert!(g.unequal_cols());
+        let (w0, w1) = (g.sec(0).col_w, g.sec(0).col_ws[1]);
+        assert!((w1 / w0 - 3.0).abs() < 0.01);
+        let mut sim = ColSim::default();
+        assert_eq!(sim.start(&g, 0, false), w0);
+        let cap = g.sec(0).page_h - g.sec(0).top - g.sec(0).bottom;
+        // Fyller första spalten nästan helt; ett stycke på flera rader hamnar sedan delvis i den breda.
+        assert_eq!(sim.place(&g, 0, [cap - 30.0]), w0);
+        assert_eq!(sim.start(&g, 0, false), w0);
+        assert_eq!(sim.place(&g, 0, [20.0, 20.0, 20.0]), w0, "första raden ryms i den smala");
+        // Nästa stycke börjar i den breda spalten.
+        assert_eq!(sim.start(&g, 0, false), w1);
+        assert_eq!(sim.place(&g, 0, [20.0, 20.0]), w1);
+        assert_eq!(sim.col, 1);
+        // Spaltbrytning går till nästa spalt, och efter sista spalten till ett nytt ark (första spalten).
+        let mut s2 = ColSim::default();
+        s2.start(&g, 0, false);
+        assert_eq!(s2.start(&g, 0, true), w1);
+        assert_eq!(s2.start(&g, 0, true), w0);
+        // Lika breda spalter ger ingen ojämn geometri.
+        assert!(!geom("<!-- kladd: avsnitt; columns: 2 -->").unequal_cols());
     }
 }

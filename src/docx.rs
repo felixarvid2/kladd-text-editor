@@ -1297,11 +1297,18 @@ struct RawSect {
     cols: usize,
     /// Mellanrum mellan spalter i pt.
     gap: Option<f32>,
+    /// Spaltbredder i pt när spalterna är olika breda (`w:equalWidth="0"`), annars tom.
+    widths: Vec<f32>,
+    /// Skiljelinje mellan spalterna (`w:sep`).
+    rule: bool,
     continuous: bool,
 }
 
 fn read_sect(sect: &str) -> RawSect {
-    let mut o = RawSect { size: None, margin: None, cols: 1, gap: None, continuous: false };
+    let mut o = RawSect { size: None, margin: None, cols: 1, gap: None, widths: Vec::new(), rule: false, continuous: false };
+    let mut unequal = false;
+    let mut col_ws: Vec<f32> = Vec::new();
+    let mut first_space: Option<f32> = None;
     let mut mar = [style::DEFAULT_MARGIN; 4];
     let mut r = Reader::from_str(sect);
     let tw = |e: &BytesStart<'_>, n: &[u8]| attr(e, n).and_then(|v| v.parse::<f32>().ok());
@@ -1328,9 +1335,17 @@ fn read_sect(sect: &str) -> RawSect {
                 b"cols" => {
                     o.cols = attr(&e, b"num").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, sections::MAX_COLUMNS);
                     o.gap = tw(&e, b"space").map(|v| v / 20.0);
+                    o.rule = matches!(attr(&e, b"sep").as_deref(), Some("1" | "true" | "on"));
+                    unequal = matches!(attr(&e, b"equalWidth").as_deref(), Some("0" | "false" | "off"));
                 }
-                // Olika breda spalter: antalet räknas, mellanrummet tas från första spalten.
+                // Olika breda spalter: bredderna samlas, mellanrummet tas från första spalten.
                 b"col" => {
+                    if let Some(w) = tw(&e, b"w").filter(|w| *w > 0.0) {
+                        col_ws.push(w / 20.0);
+                    }
+                    if col_ws.len() == 1 {
+                        first_space = tw(&e, b"space").map(|v| v / 20.0);
+                    }
                     if o.gap.is_none() {
                         o.gap = tw(&e, b"space").map(|v| v / 20.0);
                     }
@@ -1340,6 +1355,17 @@ fn read_sect(sect: &str) -> RawSect {
             },
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
+        }
+    }
+    if unequal && col_ws.len() > 1 {
+        o.cols = col_ws.len().min(sections::MAX_COLUMNS);
+        col_ws.truncate(o.cols);
+        if let Some(g) = first_space {
+            o.gap = Some(g);
+        }
+        // Lika breda i praktiken: vanliga spalter.
+        if col_ws.iter().any(|w| (w - col_ws[0]).abs() > 0.5) {
+            o.widths = col_ws;
         }
     }
     o
@@ -1355,6 +1381,8 @@ fn section_props(sect: Option<&str>, d: &DocDefaults) -> sections::SectionProps 
     if raw.cols > 1 {
         p.columns = Some(raw.cols);
         p.column_gap = raw.gap.filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
+        p.column_widths = Some(raw.widths.clone()).filter(|w| w.len() > 1);
+        p.column_rule = raw.rule;
     }
     p.continuous = raw.continuous;
     p
@@ -4866,6 +4894,39 @@ fn remove_tag(x: &str, start: &str) -> String {
     format!("{}{}", &x[..i], &x[end..])
 }
 
+/// Spaltbredderna `a` och `b` har samma proportioner (båda tomma = lika breda).
+fn same_widths(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let (sa, sb): (f32, f32) = (a.iter().sum(), b.iter().sum());
+    a.iter().zip(b).all(|(x, y)| (x / sa - y / sb).abs() < 0.01)
+}
+
+/// `w:cols` för ett avsnitt med flera spalter: antal, mellanrum, skiljelinje och olika bredder.
+fn cols_xml(sec: &sections::Section) -> String {
+    let sep = if sec.rule { " w:sep=\"1\"" } else { "" };
+    if sec.col_widths.len() != sec.columns {
+        return format!("<w:cols w:num=\"{}\" w:space=\"{}\"{sep}/>", sec.columns, twips(sec.gap));
+    }
+    // Bredderna skalas så att de med mellanrummen fyller textytan.
+    let n = sec.columns as f32;
+    let text_w = (sec.page.0 - sec.margin[1] - sec.margin[3]).max(1.0);
+    let avail = (text_w - sec.gap * (n - 1.0)).max(1.0);
+    let sum: f32 = sec.col_widths.iter().sum();
+    let mut out = format!("<w:cols w:num=\"{}\"{sep} w:equalWidth=\"0\">", sec.columns);
+    for (i, w) in sec.col_widths.iter().enumerate() {
+        let w = twips(w / sum * avail);
+        if i + 1 < sec.columns {
+            out.push_str(&format!("<w:col w:w=\"{w}\" w:space=\"{}\"/>", twips(sec.gap)));
+        } else {
+            out.push_str(&format!("<w:col w:w=\"{w}\"/>"));
+        }
+    }
+    out.push_str("</w:cols>");
+    out
+}
+
 /// Sätter sida, marginaler, spalter och avsnittstyp i en `w:sectPr` efter avsnittet `sec`. Är allt
 /// redan lika lämnas XML:en orörd (förlustfri sparning). `refs` = sidhuvud- och sidfotsreferenser att
 /// lägga först om `x` saknar egna (första avsnittet när brödtextens sectPr bär dem).
@@ -4874,7 +4935,8 @@ fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> Str
     let (w, h) = sec.page;
     let size_ok = raw.size.is_some_and(|(rw, rh)| same_pt(rw, w, 1.0) && same_pt(rh, h, 1.0));
     let mar_ok = raw.margin.is_some_and(|m| m.iter().zip(sec.margin).all(|(a, b)| same_pt(*a, b, 0.6)));
-    let cols_ok = raw.cols == sec.columns && (sec.columns == 1 || raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)));
+    let cols_ok = raw.cols == sec.columns
+        && (sec.columns == 1 || (raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)) && raw.rule == sec.rule && same_widths(&raw.widths, &sec.col_widths)));
     let type_ok = raw.continuous == sec.continuous;
     let refs_add = refs.filter(|r| !r.is_empty() && !orig.contains("headerReference") && !orig.contains("footerReference"));
     if size_ok && mar_ok && cols_ok && type_ok && refs_add.is_none() {
@@ -4911,7 +4973,7 @@ fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> Str
     if !cols_ok {
         x = remove_tag(&x, "<w:cols");
         let cols = if sec.columns > 1 {
-            format!("<w:cols w:num=\"{}\" w:space=\"{}\"/>", sec.columns, twips(sec.gap))
+            cols_xml(sec)
         } else {
             "<w:cols w:space=\"708\"/>".to_owned()
         };

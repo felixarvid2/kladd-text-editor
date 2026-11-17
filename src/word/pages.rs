@@ -177,6 +177,15 @@ pub fn sheet_shapes(p: &Palette, boxes: &[PageBox], base: f32, origin_y: f32, cl
         }
         shadows.push(Shape::rect_filled(r.translate(vec2(0.0, 2.0)).expand(1.5), 2.0, p.page_shadow));
         sheets.push(Shape::rect_filled(r, 1.0, p.page));
+        // Skiljelinje mellan spalterna: från delens överkant till det nedersta som ligger i den.
+        for (k, reg) in b.regions.iter().enumerate() {
+            let end = b.regions.get(k + 1).map_or(b.text_bottom(), |n| n.y0).min(reg.used.max(reg.y0));
+            let (y0, y1) = (origin_y + reg.y0, origin_y + end);
+            for x in reg.rule_xs() {
+                let x = base + b.text_left() + x;
+                sheets.push(Shape::line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], Stroke::new(0.75, p.muted)));
+            }
+        }
     }
     (Shape::Vec(shadows), Shape::Vec(sheets))
 }
