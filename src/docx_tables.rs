@@ -34,14 +34,24 @@ fn node_of(e: &BytesStart<'_>) -> Node {
     Node { name: local(e.name().as_ref()), attrs, kids: Vec::new() }
 }
 
+/// Hur djupt trädet byggs. Tabellformatet ligger några nivåer ner (tbl › tr › tc › tcPr › …);
+/// djupare element (t.ex. tusentals nästlade tabeller i en trasig fil) hoppas över så att
+/// trädet aldrig blir så djupt att rekursion (drop, kloning) spränger stacken.
+const MAX_DEPTH: usize = 48;
+
 /// Läser `xml` (ett element eller ett helt dokument) till ett träd. Text hoppas över.
 fn parse_tree(xml: &str) -> Option<Node> {
     let mut r = Reader::from_str(xml);
     let mut stack: Vec<Node> = vec![Node::default()];
+    // Antal öppna element som hoppas över för att de ligger djupare än MAX_DEPTH.
+    let mut skipped = 0usize;
     loop {
         match r.read_event() {
+            Ok(Event::Start(_)) if skipped > 0 || stack.len() > MAX_DEPTH => skipped += 1,
             Ok(Event::Start(e)) => stack.push(node_of(&e)),
+            Ok(Event::Empty(_)) if skipped > 0 || stack.len() > MAX_DEPTH => {}
             Ok(Event::Empty(e)) => stack.last_mut()?.kids.push(node_of(&e)),
+            Ok(Event::End(_)) if skipped > 0 => skipped -= 1,
             Ok(Event::End(_)) => {
                 let n = stack.pop()?;
                 stack.last_mut()?.kids.push(n);
@@ -719,6 +729,22 @@ mod tests {
 
     fn row(cells: usize) -> String {
         format!("<w:tr>{}</w:tr>", "<w:tc><w:tcPr/><w:p/></w:tc>".repeat(cells))
+    }
+
+    #[test]
+    fn djupt_nästlade_tabeller_spränger_inte_stacken() {
+        // En trasig fil med tusentals nästlade tabeller i en cell ska läsas utan stack overflow,
+        // även på en tråd med liten stack.
+        let n = 20_000;
+        let inner = format!("{}{}", "<w:tbl><w:tr><w:tc>".repeat(n), "</w:tc></w:tr></w:tbl>".repeat(n));
+        let xml = tbl("", &format!("<w:tr><w:tc><w:tcPr/><w:p/>{inner}</w:tc><w:tc><w:p/></w:tc></w:tr>"));
+        let t = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || read(&xml, &TableStyles::parse("")).is_some())
+            .unwrap()
+            .join()
+            .expect("stack overflow eller panik");
+        assert!(t);
     }
 
     #[test]
