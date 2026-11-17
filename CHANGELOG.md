@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.4.0] – 2026-11-17
+
 ### Nytt
 
 - **Slutnoter.** Slutnoter i `.docx` (`w:endnoteReference`, `word/endnotes.xml`) och `.odt` (`text:note-class="endnote"`) visas efter dokumentets sista text med romerska tal (i, ii …) och skiljelinje, numrerade för sig så att fotnoterna behåller sina siffror. De sparas tillbaka som riktiga slutnoter (orörda dokument byte för byte), tas med efter sista texten i PDF-exporten, och *Infoga → Slutnot* (`Ctrl+Alt+D`) lägger till nya. Slutnoter är etiketterna `[^ei]`, `[^eii]` … i Markdown-texten. Fotnoter längst ned på varje sida i dokumentläget är inte gjort än.

@@ -1,7 +1,6 @@
 //! Sidhuvud och sidfot i docx: bilder, fält, tabeller, varianter och återskrivning (påhittad XML).
 
 use super::super::*;
-use std::io::Write as _;
 
 const WNS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const PNG: [u8; 69] = [
