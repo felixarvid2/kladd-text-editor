@@ -22,6 +22,9 @@ use crate::highlight;
 use crate::theme::{self, Palette};
 
 /// Punkter till pixlar vid zoom (96 dpi).
+/// Words standardavstånd mellan tabbstopp (0,5 tum).
+pub const TAB_STOP_PT: f32 = 36.0;
+
 pub fn px(zoom: f32, pt: f32) -> f32 {
     pt * 96.0 / 72.0 * zoom
 }
@@ -1284,6 +1287,14 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
             None
         };
 
+        // Ett kodat tabbtecken (`&#9;`, se `docx::escape_line_start`): dolt, men ger luft fram till
+        // nästa tabbstopp (Words standard: var 36:e punkt, räknat från styckets början).
+        if hide && &text[r.clone()] == "&#9;" {
+            let fam = (p.font_family)(Some(a.defaults.font()), false, false);
+            bld.lead.push((r.start, px(p.zoom, TAB_STOP_PT)));
+            bld.push(r, &hidden_format(fam));
+            continue;
+        }
         // Formel: källtexten är dold och första tecknet reserverar formelns bredd och höjd.
         if let (Some(m), true) = (&pc.math, hide) {
             let _ = m;

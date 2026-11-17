@@ -554,6 +554,11 @@ fn parse(text: &str) -> Parsed {
                 }
             }
             Event::Text(t) => {
+                // Ett tabbtecken som skrivits som `&#9;` (eller ett blanksteg som `&#32;`) först i ett
+                // Word-stycke: koden är dold, layouten ritar tabben som ett tabbstopp.
+                if !in_code_block && (&*t == "\t" || &*t == " ") && text[r.clone()].starts_with("&#") {
+                    fill(&mut st, r.clone(), |s| s.markup = true);
+                }
                 if !in_code_block
                     && r.start >= 1
                     && tb[r.start - 1] == b'\\'
@@ -3850,6 +3855,13 @@ mod tests {
         // Bildtext med formatering ger fortfarande en bit.
         let t = "![**a** b](x.png)";
         assert_eq!(analyze(t).pieces.len(), 1);
+    }
+
+    #[test]
+    fn kodad_tabb_är_dold() {
+        // `docx::escape_line_start` skriver en tabb först i stycket som `&#9;`.
+        let t = "&#9;1\\. Kontor";
+        assert!(markup_str(t).starts_with("&#9;"), "{}", markup_str(t));
     }
 
     #[test]
