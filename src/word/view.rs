@@ -120,6 +120,9 @@ pub struct State {
     pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Öppen dialog "Sidhuvud och sidfot".
     pub(crate) hf_dlg: Option<super::headers::HfDialog>,
+    /// Dokument (id) vars markör fortfarande står där den sattes när filen öppnades (bytes): markupen
+    /// visas inte förrän användaren flyttat markören eller skrivit.
+    pub(crate) quiet_caret: std::collections::HashMap<u64, Range<usize>>,
     /// Öppen dialog "Ändra formatmall".
     pub(crate) styles_dlg: Option<super::stylesdlg::StylesDialog>,
     /// Öppen dialog "Spalter" (avsnitt).
@@ -298,6 +301,24 @@ impl KladdApp {
         state.store(ctx, id);
         self.focus_editor = true;
         self.find.current = None;
+    }
+
+    /// Första gången ett dokument visas har editorn ingen markör, och den hamnar då i början av texten:
+    /// på grundformatsraden (`<!-- kladd: … -->`), som då visas som rå markup. Lägg i stället markören
+    /// i början av första riktiga stycket.
+    fn word_initial_caret(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let id = editor_id(doc.id);
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        if state.cursor.char_range().is_some() {
+            return;
+        }
+        let at = content_start(&doc.text);
+        let c = byte_to_char(&doc.text, at);
+        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(c))));
+        state.store(ctx, id);
+        let doc_id = doc.id;
+        self.wv.quiet_caret.insert(doc_id, at..at);
     }
 
     pub(crate) fn word_undo(&mut self, ctx: &egui::Context, redo: bool) {
@@ -901,6 +922,7 @@ impl KladdApp {
 
     /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
+        self.word_initial_caret(ui.ctx());
         let paper = if self.settings.white_paper { p.paper() } else { *p };
         let p = &paper;
         CentralPanel::default().frame(Frame::NONE.fill(p.desk)).show(ui, |ui| {
@@ -1064,7 +1086,17 @@ impl KladdApp {
             // Markupen visas bara på markörens rader när editorn har fokus.
             let focused = ctx.memory(|m| m.has_focus(id));
             let sel_now = self.word_selection(&ctx);
-            let reveal = if focused { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
+            // Direkt efter öppning står markören där Kladd satte den; visa inte stycket som rå markup
+            // förrän användaren flyttat den eller ändrat texten.
+            let quiet = match self.wv.quiet_caret.get(&doc_id) {
+                Some(r) if *r == sel_now && !self.docs[self.active].dirty => true,
+                Some(_) => {
+                    self.wv.quiet_caret.remove(&doc_id);
+                    false
+                }
+                None => false,
+            };
+            let reveal = if focused && !quiet { tables::reveal_range(&self.docs[self.active].text, sel_now.clone()) } else { 0..0 };
             let heads = self.word.headings(doc_id, &self.docs[self.active].text);
             let mut toc_click: Option<usize> = None;
 
@@ -2057,4 +2089,29 @@ mod tests {
 /// Är sidan vit trots mörkt tema?
 fn paper_differs(p: &Palette, dark_theme: bool) -> bool {
     dark_theme && !p.dark
+}
+
+/// Byteposition för första riktiga stycket: efter inledande `<!-- kladd: … -->`-rader och tomma rader.
+fn content_start(text: &str) -> usize {
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.is_empty() || (t.starts_with("<!-- kladd:") && t.ends_with("-->")) {
+            pos += line.len();
+        } else {
+            break;
+        }
+    }
+    pos.min(text.len())
+}
+
+#[cfg(test)]
+mod initial_caret_tests {
+    #[test]
+    fn caret_skips_defaults_line() {
+        let t = "<!-- kladd: font-family: \"Calibri\" -->\n\n# Titel\n";
+        assert_eq!(&t[super::content_start(t)..], "# Titel\n");
+        assert_eq!(super::content_start("Text"), 0);
+        assert_eq!(super::content_start(""), 0);
+    }
 }
