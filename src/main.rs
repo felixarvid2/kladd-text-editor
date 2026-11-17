@@ -12,6 +12,7 @@ mod bigfiles;
 mod bigtext;
 mod doc;
 mod docx;
+mod docx_para;
 mod docx_styles;
 mod export;
 mod grammar;

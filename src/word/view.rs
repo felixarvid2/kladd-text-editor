@@ -1161,6 +1161,8 @@ impl KladdApp {
                 let page_top = origin.y + GAP;
                 let shadow_slot = ui.painter().add(Shape::Noop);
                 let page_slot = ui.painter().add(Shape::Noop);
+                // Styckenas rutor (skuggning och ramar) ligger över arket och under texten.
+                let pbox_slot = ui.painter().add(Shape::Noop);
                 // Bilder bakom texten ritas före texten (platsen fylls när bilderna är placerade).
                 let behind_slot = ui.painter().add(Shape::Noop);
                 let mut behind_shapes: Vec<Shape> = Vec::new();
@@ -1344,6 +1346,28 @@ impl KladdApp {
                 let (shadows, sheets) = pages::sheet_shapes(p, &boxes, page_left, origin_y, clip);
                 ui.painter().set(shadow_slot, shadows);
                 ui.painter().set(page_slot, sheets);
+                if !edited {
+                    let pb = word.para_boxes(doc_id, text);
+                    if !pb.1.is_empty() {
+                        let vis = {
+                            let lo = galley.cursor_from_pos(vec2(0.0, clip.top() - gpos.y - 300.0)).index.0;
+                            let hi = galley.cursor_from_pos(vec2(0.0, clip.bottom() - gpos.y + 300.0)).index.0;
+                            char_to_byte(text, lo)..char_to_byte(text, hi)
+                        };
+                        let env = super::pboxui::Env {
+                            galley: &galley,
+                            gpos: gpos.to_vec2(),
+                            text,
+                            boxes: &boxes,
+                            col_at: &col_at,
+                            zoom: z,
+                            palette: p,
+                            clip,
+                            vis,
+                        };
+                        ui.painter().set(pbox_slot, Shape::Vec(super::pboxui::shapes(&env, &pb.0, &pb.1)));
+                    }
+                }
                 let last_bottom = boxes[total - 1].rect(page_left, origin_y).bottom();
                 ui.allocate_rect(
                     Rect::from_min_max(origin, pos2(origin.x + area_w, last_bottom.max(te_rect.bottom()) + GAP)),

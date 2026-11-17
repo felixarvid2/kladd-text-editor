@@ -17,6 +17,7 @@ use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 use super::anchor::{self, Anchor, PageCtx, VAt, Wrap};
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
+use super::pbox::{self, LineRule, PPr};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
@@ -111,6 +112,8 @@ struct DocState {
     tables: Option<Arc<Vec<Table>>>,
     images: Option<Arc<Vec<markup::ImageRef>>>,
     headings: Option<Arc<Vec<super::nav::Heading>>>,
+    /// Stycken med styckeutseende (`<!--k:pp …-->`) och rutorna de bildar, se `pbox`.
+    pspecs: Option<Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)>>,
     fonts: Option<Arc<BTreeSet<(String, bool, bool)>>>,
     /// Hela galleriet för förra bildrutan, med nyckeln det byggdes med.
     frame: Option<(u64, Arc<Galley>)>,
@@ -154,6 +157,7 @@ impl Cache {
             tables: None,
             images: None,
             headings: None,
+            pspecs: None,
             fonts: None,
             frame: None,
             units: HashMap::new(),
@@ -192,6 +196,7 @@ impl Cache {
                 }
             }
             st.headings = None;
+            st.pspecs = None;
         }
         st
     }
@@ -237,6 +242,19 @@ impl Cache {
     pub fn float_side(&mut self, doc_id: u64, text: &str, byte: usize) -> Option<(Float, usize)> {
         let st = self.state(doc_id, text);
         st.float_starts.iter().find(|f| f.0 == byte).map(|f| (f.1, f.2))
+    }
+
+    /// Stycken med styckeutseende och deras rutor (räknas om bara när texten ändrats).
+    pub fn para_boxes(&mut self, doc_id: u64, text: &str) -> Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)> {
+        let st = self.state(doc_id, text);
+        let t = &st.text;
+        st.pspecs
+            .get_or_insert_with(|| {
+                let specs = if t.contains(pbox::MARK) { pbox::scan(t) } else { Vec::new() };
+                let runs = pbox::box_runs(t, &specs);
+                Arc::new((specs, runs))
+            })
+            .clone()
     }
 
     /// Rubrikerna i ordning (räknas om bara när texten ändrats).
@@ -368,6 +386,15 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         para.reserve.map(f32::to_bits).hash(&mut h);
         para.toc_h.to_bits().hash(&mut h);
         (para.space_before.to_bits(), para.first_indent.to_bits()).hash(&mut h);
+        para.gap.map(f32::to_bits).hash(&mut h);
+        match para.line {
+            Some(LineRule::Auto(v)) => (1u8, v.to_bits()).hash(&mut h),
+            Some(LineRule::Exact(v)) => (2u8, v.to_bits()).hash(&mut h),
+            Some(LineRule::AtLeast(v)) => (3u8, v.to_bits()).hash(&mut h),
+            None => 0u8.hash(&mut h),
+        }
+        (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
+        para.empty_h.map(f32::to_bits).hash(&mut h);
     }
     // Markörens rader i förhållande till fönstret.
     if intersects(&p.reveal, w) {
@@ -1387,6 +1414,18 @@ struct Para {
     first_indent: f32,
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     col_break: bool,
+    /// Styckeutseende ur markören `<!--k:pp …-->` (`pbox`): avstånd, indrag, ram och skuggning.
+    look: Option<Arc<PPr>>,
+    /// Höjd (px) på den tomma raden mellan två stycken när avståndet kommer från `look`.
+    gap: Option<f32>,
+    /// Radavstånd ur `look` (exakt och minst i px).
+    line: Option<LineRule>,
+    /// Indrag från vänster, höger (px) och hängande första rad (px, positivt tal).
+    ind_left: f32,
+    ind_right: f32,
+    hang: f32,
+    /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
+    empty_h: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1433,7 +1472,23 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let body = |pc: &Piece| &text[pc.range.start.max(s)..pc.range.end.min(e)];
 
         let t = text[range.clone()].trim();
-        let is_tag = (t.starts_with("<div") || t.starts_with("</div") || t.starts_with("<!--"))
+        // Tomt Word-stycke: ett eget stycke med ett styckes höjd (inte en dold taggrad).
+        let ep = if intersects(&range, &p.reveal) {
+            None
+        } else {
+            pbox::parse_empty(t).map(|(pp, sz)| {
+                let size = px(p.zoom, sz.unwrap_or_else(|| a.defaults.size()));
+                let h = match pp.line {
+                    Some(LineRule::Auto(m)) => size * 1.22 * m,
+                    Some(LineRule::Exact(v)) => px(p.zoom, v),
+                    Some(LineRule::AtLeast(v)) => (size * 1.22).max(px(p.zoom, v)),
+                    None => size * 1.4,
+                };
+                (pp, h)
+            })
+        };
+        let is_tag = ep.is_none()
+            && (t.starts_with("<div") || t.starts_with("</div") || t.starts_with("<!--"))
             && ps.iter().all(|pc| pc.markup || body(pc).trim().is_empty());
         tag.push(if !is_tag || intersects(&range, &p.reveal) {
             0
@@ -1516,12 +1571,20 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             space_before,
             first_indent,
             col_break,
+            look: None,
+            gap: None,
+            line: None,
+            ind_left: 0.0,
+            ind_right: 0.0,
+            hang: 0.0,
+            empty_h: ep.as_ref().map(|(_, h)| *h),
         });
         if e >= text.len() {
             break;
         }
         s = e + 1;
     }
+    let before0: Vec<f32> = out.iter().map(|q| q.space_before).collect();
     let mut carry = 0.0;
     for (para, a) in out.iter_mut().zip(&after) {
         if para.collapse {
@@ -1540,7 +1603,84 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let before_close = tag.get(i + 1) == Some(&2);
         out[i].collapse = after_open || before_close;
     }
+    empty_looks(text, &mut out);
+    apply_looks(text, &mut out, &before0, &after, p.zoom);
     out
+}
+
+/// `Para::look` för tomma stycken kommer ur deras egen markör.
+fn empty_looks(text: &str, out: &mut [Para]) {
+    for q in out.iter_mut().filter(|q| q.empty_h.is_some()) {
+        if let Some((pp, _)) = pbox::parse_empty(text[q.range.clone()].trim()) {
+            if pp.has_spacing() {
+                q.look = Some(Arc::new(pp));
+            }
+        }
+    }
+}
+
+/// Styckeutseendet (`pbox`): avstånd mellan stycken, radavstånd och indrag från markörerna
+/// `<!--k:pp …-->`. Avståndet läggs på den tomma raden mellan två stycken (`Para::gap`) och blir
+/// största av "efter" och "före" plus rutans luft; `before0`/`after` är formatmallarnas luft (px).
+fn apply_looks(text: &str, out: &mut [Para], before0: &[f32], after: &[f32], zoom: f32) {
+    if !text.contains(pbox::MARK) && !text.contains(pbox::EMPTY) {
+        return;
+    }
+    let ppx = px(zoom, 1.0);
+    for spec in pbox::scan(text) {
+        let mut i = out.partition_point(|q| q.range.start < spec.range.start);
+        while i < out.len() && out[i].range.end <= spec.range.end {
+            let q = &mut out[i];
+            i += 1;
+            if q.collapse || q.range.is_empty() || q.list.is_some() {
+                continue;
+            }
+            q.look = Some(spec.pp.clone());
+        }
+    }
+    // Indrag och radavstånd per stycke.
+    for q in out.iter_mut() {
+        let Some(l) = q.look.clone() else { continue };
+        q.ind_left = l.left.unwrap_or(0.0).max(0.0) * ppx;
+        q.ind_right = l.right.unwrap_or(0.0).max(0.0) * ppx;
+        match l.first {
+            Some(f) if f < 0.0 => {
+                q.hang = -f * ppx;
+                q.first_indent = 0.0;
+            }
+            Some(f) => q.first_indent = f * ppx,
+            None => {}
+        }
+        q.line = l.line.map(|r| match r {
+            LineRule::Auto(m) => LineRule::Auto(m),
+            LineRule::Exact(v) => LineRule::Exact(v * ppx),
+            LineRule::AtLeast(v) => LineRule::AtLeast(v * ppx),
+        });
+    }
+    // Avståndet: för varje par av innehållsstycken med minst en tom rad emellan.
+    let content: Vec<usize> = (0..out.len()).filter(|&i| !out[i].collapse && !out[i].range.is_empty()).collect();
+    if let Some(&f) = content.first() {
+        if let Some(l) = out[f].look.clone() {
+            let pad = if l.has_box() { l.pad_top() } else { 0.0 };
+            out[f].space_before = (l.before.unwrap_or(0.0) + pad) * ppx;
+        }
+    }
+    for w in content.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if out[a].look.is_none() && out[b].look.is_none() {
+            continue;
+        }
+        // Första tomma raden mellan dem (utan att något annat än tomma rader och dolda taggar ligger emellan).
+        let Some(k) = (a + 1..b).find(|&k| out[k].range.is_empty() && !out[k].collapse) else { continue };
+        let la = out[a].look.clone();
+        let lb = out[b].look.clone();
+        // Utan eget avstånd: tomma raden (8 pt) plus formatmallens luft.
+        let a_after = pbox::BASE_AFTER + after[a] / ppx;
+        let b_before = before0[b] / ppx;
+        let gap = pbox::gap_pt(la.as_deref(), lb.as_deref(), a_after, b_before);
+        out[k].gap = Some(gap * ppx);
+        out[b].space_before = 0.0;
+    }
 }
 
 /// Utsnitt av `full` för byteintervallet `r`, med sektionerna omräknade till 0. Ett tomt
@@ -1866,11 +2006,34 @@ fn layout_piece(
         for s in &mut pj.sections {
             s.format.line_height = Some(h);
         }
+    } else if let Some(h) = para.empty_h {
+        for s in &mut pj.sections {
+            s.format.line_height = Some(h);
+        }
+    } else if let (Some(g), true) = (para.gap, para.range.is_empty()) {
+        for s in &mut pj.sections {
+            s.format.line_height = Some(g.max(HIDDEN_PX));
+        }
+    } else if let Some(rule) = para.line {
+        // Radavstånd ur styckeutseendet: bara textrader (inte bilder med egen höjd).
+        for s in &mut pj.sections {
+            let size = s.format.font_id.size;
+            if let Some(_) = s.format.line_height.filter(|h| *h <= size * 2.0 && size > 1.0) {
+                let single = size * 1.22;
+                s.format.line_height = Some(match rule {
+                    LineRule::Auto(m) => single * m,
+                    LineRule::Exact(v) => v,
+                    LineRule::AtLeast(v) => single.max(v),
+                });
+            }
+        }
     }
     let list = para.list;
+    // Indrag från vänster och höger (listor har sitt eget).
+    let (ind_l, ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
     let wrap_w = match list {
         Some(l) => (avail - l.text_x).max(24.0),
-        None => avail,
+        None => (avail - ind_l - ind_r).max(24.0).min(avail),
     };
     pj.wrap.max_width = wrap_w;
     if para.first_indent > 0.0 && !cont && list.is_none() && !para.collapse {
@@ -1898,7 +2061,7 @@ fn layout_piece(
     }
 
     let finite = avail.is_finite();
-    let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0);
+    let shifts = finite && (list.is_some() || para.align != Align::Left || x0 != 0.0 || ind_l != 0.0 || ind_r != 0.0 || para.hang != 0.0);
     // Formatmallens luft: ovanför första delen.
     let before = if cont { 0.0 } else { para.space_before };
     if !shifts {
@@ -1918,9 +2081,10 @@ fn layout_piece(
                 (l.text_x - prefix).max(0.0)
             }
             Some(l) => l.text_x,
-            None => 0.0,
+            None if i == 0 && !cont => ind_l - para.hang,
+            None => ind_l,
         };
-        let target = (avail - left).max(1.0);
+        let target = (avail - ind_r - left).max(1.0);
         let mut x = left;
         match para.align {
             Align::Center if list.is_none() => x += ((target - end.max(para.image_w)) / 2.0).max(0.0),
@@ -2022,6 +2186,10 @@ pub fn layout_galley_full(
     }
     (g, geoms)
 }
+
+#[cfg(test)]
+#[path = "pbox_layout_tests.rs"]
+mod pbox_layout_tests;
 
 #[cfg(test)]
 mod tests {

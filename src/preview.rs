@@ -120,6 +120,9 @@ fn replace_tag(tag: &str) -> Option<String> {
     if tag.starts_with("<!--k:") && tag.ends_with("-->") && tag.len() > 9 && tag[6..tag.len() - 3].bytes().all(|c| c.is_ascii_digit()) {
         return Some(String::new());
     }
+    if crate::word::pbox::is_marker(tag) {
+        return Some(String::new());
+    }
     let inner = tag.strip_prefix('<')?.strip_suffix('>')?;
     let inner = inner.strip_suffix('/').unwrap_or(inner).trim_end();
     let name_end = inner.find(|c: char| c.is_whitespace()).unwrap_or(inner.len());

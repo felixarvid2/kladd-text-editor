@@ -153,7 +153,7 @@ fn strip_markers(s: &str) -> String {
     while let Some(i) = rest.find("<!--k:") {
         let after = &rest[i + 6..];
         match after.find("-->") {
-            Some(j) if after[..j].chars().all(|c| c.is_ascii_digit()) => {
+            Some(j) if after[..j].chars().all(|c| c.is_ascii_digit()) || crate::word::pbox::is_marker(&rest[i..i + 6 + j + 3]) => {
                 out.push_str(&rest[..i]);
                 rest = &after[j + 3..];
             }

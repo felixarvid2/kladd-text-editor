@@ -209,7 +209,9 @@ fn same_body(a: &str, b: &str) -> bool {
 /// tomma rader ihopdragna, utan grundformatsraden.
 fn without_added(md: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
-    for l in body(md).lines().filter(|l| !l.contains(ADDED)) {
+    // Tomma stycken (`<!--k:ep-->`) som före ändringen var sist (Words slutstycke) hamnar före den tillagda
+    // texten och syns därför först efteråt: de räknas inte.
+    for l in body(md).lines().filter(|l| !l.contains(ADDED) && !l.starts_with("<!--k:ep")) {
         if !(l.trim().is_empty() && out.last().is_none_or(|p| p.trim().is_empty())) {
             out.push(l);
         }

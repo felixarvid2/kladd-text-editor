@@ -721,3 +721,38 @@ teckenavstånd, versaler och `pBdr/bottom`.
 `Settings::white_paper` (på som standard). `Palette::paper()` (`theme.rs`) ger sidans färger från det ljusa temat med svart
 automatisk textfärg och `dark: false`, så att `adapt_text_color`/`adapt_background` inte ändrar dokumentets färger.
 `word_page` byter palett och sätter markeringsfärg och markör för vit botten; skrivbordet och fälten förblir mörka.
+
+## Styckeutseende: ramar, skuggning, avstånd, indrag (`word::pbox`)
+
+Moduler: `src/word/pbox.rs` (modell, markör, ihopslagning till rutor, avståndsregler), `src/docx_para.rs`
+(läsa `w:pPr` ur stycke, formatmall och `docDefaults`; skriva `w:pBdr`/`w:shd`/`w:spacing`/`w:ind`),
+`src/word/pboxui.rs` (ritar rutorna), `layout::apply_looks` (avstånd, radavstånd, indrag).
+
+**Dialekten** är en dold markör sist på styckets sista rad (`markup: true`, som `<!--k:N-->`):
+
+```text
+Text i rutan<!--k:pp bdr="t=single:8:4:6E4BAA l=single:8:4:6E4BAA" shd="EDE7F6" sp="b=0 a=0 l=exact:14 c=1" ind="l=36 r=0 f=-18"-->
+```
+
+- `bdr`: sidorna `t l b r` och `w` (mellan stycken i samma ruta), var och en `stil:sz:space:färg`
+  (`single|double|dashed|dotted|thick`; `sz` i åttondels punkter; `space` i punkter; `RRGGBB` eller `auto`).
+- `shd`: fyllnadsfärg. `sp`: `b=` före, `a=` efter (punkter), `l=` radavstånd (`1.15` gånger enkelt,
+  `exact:14`, `least:14`), `c=1` = `contextualSpacing`. `ind`: `l= r= f=` (punkter, `f` negativt = hängande).
+- Markören skrivs bara när Word-stycket avviker från det layouten själv utgår från (8 pt efter, 0 före,
+  radavstånd ≈ 1,15): ram och skuggning alltid, avstånd och indrag för vanliga brödtextstycken. Rubriker,
+  listor, citat (Kladd ritar egen vänsterlinje) och kod får bara ram och skuggning. Spårade stycketecken (`k:pm`)
+  går före: stycken med sådana får ingen `k:pp`.
+- Avstånd mellan två stycken = största av "efter" och "före" (Word/LibreOffice) plus rutans luft, `contextualSpacing`
+  tar bort det mellan två stycken med den; det läggs som höjd på den tomma raden mellan dem
+  (`Para::gap`). Ett stycke utan egen markör räknas som 8 pt efter, 0 före.
+- Rutor: stycken med lika `bdr`, `shd` och sidindrag och bara tomma rader emellan (`pbox::box_runs`). Rutan sträcker
+  sig `space + linje` utanför texten åt sidorna (som Word); luften upptill och nedtill ligger i avståndet.
+  Går rutan över en sidbrytning delas den utan kant där den bryts (`pboxui::segments`).
+- Skrivning: `docx::Writer::apply_para_look` lägger `w:pBdr, w:shd, w:spacing, w:ind, w:contextualSpacing` i schemaordning
+  (`docx_para::merge_ppr`). Omskrivna stycken behåller originalets `w:pPr` som förut (`with_orig_ppr`), orörda
+  stycken originalets XML.
+
+**Tomma stycken**: `<!--k:ep sz="11" sp="b=0 a=8"-->` är ett eget block (enhetsslag `e`, så att det aldrig paras ihop
+med ett textstycke). `sz` = stycketeckens storlek (`w:pPr/w:rPr/w:sz`), övrigt som `k:pp`. Layouten ger raden
+styckets höjd (`Para::empty_h`); skrivs som `<w:p><w:pPr>…</w:pPr></w:p>`. `<w:p/>` på toppnivå läses också. Stycken som
+bär `w:sectPr` eller spaltbrytning och Words slutstycke efter en avslutande tabell ger ingen rad.

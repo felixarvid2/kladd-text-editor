@@ -807,11 +807,15 @@ struct Para {
     direct_align: Option<Align>,
     /// Indexet i `BodyInfo::elems` för toppnivåelementet stycket kommer från.
     origin: usize,
+    /// Ram, skuggning, avstånd och indrag som hamnar i dialektens markör (`word::pbox`).
+    ppr: crate::word::pbox::PPr,
+    /// Teckenstorlek (pt) på stycketecknet i ett tomt stycke, om stycket anger den.
+    mark_sz: Option<f32>,
 }
 
 impl Para {
     fn new() -> Para {
-        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None, origin: usize::MAX }
+        Para { style: None, kind: ParaKind::Normal, list: None, runs: Vec::new(), align: Align::Left, direct_align: None, origin: usize::MAX, ppr: Default::default(), mark_sz: None }
     }
 }
 
@@ -918,10 +922,12 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let theme_part = find_part("/theme").unwrap_or_else(|| "word/theme/theme1.xml".to_owned());
     let theme = pkg.part(&theme_part)?.map(|x| parse_theme(&x)).unwrap_or_default();
     let mut style_set = style::StyleSet::default();
+    let mut para_styles = crate::docx_para::ParaStyles::default();
     let styles = match find_part("/styles") {
         Some(p) => pkg
             .part(&p)?
             .map(|x| {
+                para_styles = crate::docx_para::ParaStyles::parse(&x);
                 let kladd = format!("<w:styles>{}</w:styles>", kladd_styles());
                 let th = crate::docx_styles::Theme { font: &|t| theme.font(t), color: &|n| theme.color(n) };
                 style_set = crate::docx_styles::read_relative(&x, &th, &kladd);
@@ -971,6 +977,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let m = page.margins();
         Some(((w - m[1] - m[3]) * 20.0) as f64)
     };
+    fill_para_looks(&mut blocks, &info.elems, &para_styles);
     let (mut markdown, units) = to_markdown_units(&blocks, &numbering, text_w);
     let mut keys: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
     // Grundformatet (typsnitt, storlek och sida) står först när det avviker från standard.
@@ -2302,6 +2309,14 @@ fn parse_body(
                             skip = 1;
                         }
                     }
+                    b"p" if empty => {
+                        // `<w:p/>` på toppnivå: ett tomt stycke (utan egen stängningstagg).
+                        if tables.is_empty() && info.body_depth == Some(depth) {
+                            let mut p = Para::new();
+                            p.origin = info.elems.len().wrapping_sub(1);
+                            blocks.push(Block::Para(p));
+                        }
+                    }
                     b"p" => {
                         para = Some(Para::new());
                         para_marks.clear();
@@ -2618,6 +2633,10 @@ fn parse_body(
                                 p.origin = info.elems.len().wrapping_sub(1);
                                 // Spaltbrytning före stycket (eller ensam), avsnittsrad efter det.
                                 let origin = p.origin;
+                                // Stycket som bär en avsnitts- eller spaltbrytning är ingen blankrad.
+                                if (para_sect.is_some() || para_col_break) && is_blank_para(&p) {
+                                    p.runs.push(Run { text: String::new(), fmt: Fmt::default(), link: None, raw: true });
+                                }
                                 if std::mem::take(&mut para_col_break) {
                                     blocks.push(Block::Para(raw_para(sections::COLUMN_BREAK_LINE.to_owned(), origin)));
                                 }
@@ -2809,6 +2828,32 @@ fn inline_md(run: &Run) -> String {
     parts.concat()
 }
 
+/// Styckeutseendet (ram, skuggning, avstånd, indrag) ur stycket, dess mall och docDefaults, för
+/// de stycken som kommer från ett toppnivåelement i brödtexten (`word::pbox`, markören `k:pp`).
+/// Ett tomt stycke (bara blanktecken, inga objekt): används som lodrätt avstånd i Word.
+fn is_blank_para(p: &Para) -> bool {
+    p.kind == ParaKind::Normal && p.list.is_none() && p.origin != usize::MAX && p.runs.iter().all(|r| !r.raw && r.link.is_none() && r.text.trim().is_empty())
+}
+
+fn fill_para_looks(blocks: &mut [Block], elems: &[String], ps: &crate::docx_para::ParaStyles) {
+    for b in blocks.iter_mut() {
+        let Block::Para(p) = b else { continue };
+        let Some(xml) = elems.get(p.origin).filter(|x| x.starts_with("<w:p>") || x.starts_with("<w:p ")) else { continue };
+        if p.runs.iter().any(|r| r.raw && r.text.starts_with("<!-- kladd:")) || matches!(p.kind, ParaKind::Code | ParaKind::Quote) || p.list.is_some() {
+            continue;
+        }
+        let direct = crate::docx_para::direct_ppr(xml);
+        let plain = p.kind == ParaKind::Normal;
+        // Rubriker, Titel och Underrubrik: deras mallar (med ram och skuggning) ligger redan i
+        // grundformatets formatmallar (`StyleSet`); bara stycket eget utseende blir en markör.
+        let eff = if plain { ps.resolve(p.style.as_deref(), &direct) } else { direct.clone().finish() };
+        p.ppr = crate::docx_para::for_marker(&eff, plain);
+        if is_blank_para(p) {
+            p.mark_sz = crate::docx_para::mark_size(xml);
+        }
+    }
+}
+
 fn para_md(p: &Para) -> String {
     let mut s: String = p.runs.iter().map(inline_md).collect();
     // Ta bort mellanslag i slutet av varje rad (de syns inte och blir "hårda radbrytningar").
@@ -2899,12 +2944,32 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
     let mut counters: HashMap<(String, usize), u64> = HashMap::new();
     // Justeringen hos den `<div>` som är öppen just nu (`Left` = ingen).
     let mut cur_align = Align::Left;
-    for b in blocks {
+    // Ett dokument som bara består av ett tomt stycke (som `write` själv lägger dit) ger ingen rad.
+    let only_blank = matches!(blocks, [Block::Para(p)] if is_blank_para(p) && para_md(p).trim().is_empty());
+    // Words obligatoriska tomma slutstycke efter en avslutande tabell (som `write` också lägger dit) ger ingen rad.
+    let after_table_end = matches!(blocks, [.., Block::Table(..), Block::Para(p)] if is_blank_para(p) && para_md(p).trim().is_empty());
+    let last_content = if only_blank {
+        0
+    } else if after_table_end {
+        blocks.len() - 1
+    } else {
+        blocks.len()
+    };
+    for (bi, b) in blocks.iter().enumerate() {
         match b {
             Block::Para(p) => {
-                let text = para_md(p);
-                if without_tokens(&text).trim().is_empty() {
+                let mut text = para_md(p);
+                // Tomt stycke: en egen rad `<!--k:ep-->` med stycketeckens storlek och avstånd.
+                let blank = is_blank_para(p) && text.trim().is_empty() && bi < last_content;
+                if blank {
+                    text = crate::word::pbox::empty_marker(&p.ppr, p.mark_sz);
+                } else if without_tokens(&text).trim().is_empty() {
                     continue;
+                }
+                // Ram, skuggning, avstånd och indrag: dold markör sist i stycket (spårade stycketecken
+                // `k:pm` ska stå sist, så de stycken får ingen).
+                if !blank && !p.ppr.is_empty() && !text.contains("<!--k:pm ") && !text.trim_start().starts_with("<!--") && !text.starts_with("&#8203;") && !text.trim_start().starts_with('\u{e000}') {
+                    text.push_str(&p.ppr.marker());
                 }
                 // Kodblock justeras inte; Kladds egna markörrader följer omgivningen.
                 let is_marker = matches!(p.runs.as_slice(), [r] if r.raw && r.text.starts_with("<!-- kladd:"));
@@ -2987,6 +3052,10 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                         let code = format!("{fence}\n{}\n{fence}", raw.trim_matches('\n'));
                         units.push(MdUnit { origin: p.origin, desc: format!("c|{}", align.as_attr()), key: norm(&code) });
                         out.push_str(&code);
+                    }
+                    (ParaKind::Normal, None) if blank => {
+                        units.push(MdUnit { origin: p.origin, desc: format!("e|{}", align.as_attr()), key: norm(&text) });
+                        out.push_str(&text);
                     }
                     (ParaKind::Normal, None) => {
                         let lines: Vec<String> = text.lines().map(escape_line_start).collect();
@@ -3161,6 +3230,8 @@ struct Writer<'a> {
     pending_pm: Vec<(RevKind, u32)>,
     /// Var det öppna stycket börjar i `body`.
     para_at: usize,
+    /// Styckeutseende (`<!--k:pp …-->`) som väntar på styckets slut.
+    pending_pp: Option<crate::word::pbox::PPr>,
     /// Nästa `w:id` för en skriven ändring.
     rev_next: u32,
     /// Kommentarsområden som redan skrivits (ett område får bara finnas en gång).
@@ -3206,6 +3277,7 @@ impl<'a> Writer<'a> {
             ordered_nums: Vec::new(),
             para_open: false,
             ppr: String::new(),
+            pending_pp: None,
             fmt: WFmt::default(),
             lists: Vec::new(),
             item_first_para: false,
@@ -3434,11 +3506,13 @@ impl<'a> Writer<'a> {
 
     fn close_para(&mut self) {
         if self.para_open {
+            self.apply_para_look();
             self.apply_para_marks();
             self.body.push_str("</w:p>");
             self.para_open = false;
         }
         self.pending_pm.clear();
+        self.pending_pp = None;
         self.fchange_para = None;
     }
 
@@ -3451,6 +3525,23 @@ impl<'a> Writer<'a> {
         let date = if d.is_empty() { String::new() } else { format!(" w:date=\"{d}\"") };
         self.rev_next += 1;
         format!("w:id=\"{}\" w:author=\"{a}\"{date}", self.rev_next)
+    }
+
+    /// Ram, skuggning, avstånd och indrag ur markören `<!--k:pp …-->` skrivs in i styckets `w:pPr`
+    /// (i schemaordning). Orörda och omskrivna stycken får sin ursprungliga `w:pPr` tillbaka senare.
+    fn apply_para_look(&mut self) {
+        let Some(pp) = self.pending_pp.take() else { return };
+        let head = self.para_at;
+        if !self.body[head..].starts_with("<w:p>") {
+            return;
+        }
+        let old_len = if self.ppr.is_empty() { 0 } else { 7 + self.ppr.len() + 8 };
+        let merged = crate::docx_para::merge_ppr(&self.ppr, &pp);
+        if merged.is_empty() || !self.body.is_char_boundary(head + 5 + old_len) {
+            return;
+        }
+        self.body.replace_range(head + 5..head + 5 + old_len, &format!("<w:pPr>{merged}</w:pPr>"));
+        self.ppr = merged;
     }
 
     /// Spårade stycketecken (`w:rPr/w:ins|w:del`) och styckeformatering (`w:pPrChange`) läggs i styckets
@@ -3884,6 +3975,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 {
                     w.close_para();
                     let kind = match tag {
+                        Tag::HtmlBlock if crate::word::pbox::parse_empty(md.get(range.clone()).unwrap_or("").trim()).is_some() => "e".to_owned(),
                         Tag::Paragraph | Tag::HtmlBlock => "p".to_owned(),
                         Tag::Heading { level, classes, .. } => match titles::kind(classes) {
                             Some(k) => k.class().to_owned(),
@@ -4155,6 +4247,22 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     }
                 } else if let Some((start, id)) = review::parse_marker(s.trim()) {
                     w.comment_marker(start, id);
+                } else if let (Some((pp, sz)), true) = (crate::word::pbox::parse_empty(s.trim()), w.table.is_none() && w.quote == 0) {
+                    // Tomt stycke med stycketecknets storlek och avstånd.
+                    w.close_para();
+                    let mut inner = w.para_props();
+                    if let Some(sz) = sz {
+                        let half = (sz * 2.0).round() as i64;
+                        inner.push_str(&format!("<w:rPr><w:sz w:val=\"{half}\"/><w:szCs w:val=\"{half}\"/></w:rPr>"));
+                    }
+                    let inner = crate::docx_para::merge_ppr(&inner, &pp);
+                    if inner.is_empty() {
+                        w.body.push_str("<w:p/>");
+                    } else {
+                        w.body.push_str(&format!("<w:p><w:pPr>{inner}</w:pPr></w:p>"));
+                    }
+                } else if let Some(pp) = crate::word::pbox::PPr::parse_marker(s.trim()) {
+                    w.pending_pp = Some(pp);
                 } else if let Some((kind, id)) = review::parse_pmark_exact(s.trim()) {
                     if kind == RevKind::Fmt {
                         w.fchange_para = Some(id);
@@ -4247,7 +4355,8 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                             || (key.to_ascii_lowercase().starts_with("<img") && !key.contains('\n'))
                             || key == crate::word::nav::TOC_LINE
                             || sections::SectionProps::from_comment(&key).is_some()
-                            || sections::is_column_break(&key);
+                            || sections::is_column_break(&key)
+                            || crate::word::pbox::parse_empty(&key).is_some();
                         if ok && !key.is_empty() {
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
                         }
@@ -6332,13 +6441,13 @@ vanlig <span style=\"font-size: 14pt; color: #C00000; background-color: #FFFF00\
 
 <div align=\"center\">
 
-Mitt
+Mitt<!--k:pp shd=\"EEEEEE\"-->
 
-<span style=\"font-family: Verdana; color: #0000FF\">Blå mitt</span>
+<span style=\"font-family: Verdana; color: #0000FF\">Blå mitt</span><!--k:pp shd=\"EEEEEE\"-->
 
 </div>
 
-Vänster
+Vänster<!--k:pp shd=\"EEEEEE\"-->
 
 <div align=\"right\">
 
@@ -7206,6 +7315,9 @@ mod review_xml;
 #[path = "docx_section_tests.rs"]
 mod section_tests;
 
+#[cfg(test)]
+#[path = "docx_para_tests.rs"]
+mod para_tests;
 #[cfg(test)]
 #[path = "docx_track2_tests.rs"]
 mod track2_tests;

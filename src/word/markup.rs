@@ -471,6 +471,9 @@ fn parse(text: &str) -> Parsed {
                         s.object = Some(n);
                         s.markup = true;
                     });
+                } else if super::pbox::is_marker(t) {
+                    // Styckeutseende (`<!--k:pp …-->`): dold markup, se `pbox`.
+                    fill(&mut st, r.clone(), |s| s.markup = true);
                 } else if is_br_tag(t) && st.get(r.start).is_some_and(|x| x.block == Block::Table) {
                     // Radbrytning i en tabellcell: dold markup, själva brytningen görs av layouten.
                     fill(&mut st, r.clone(), |s| s.markup = true);
@@ -532,6 +535,9 @@ fn parse(text: &str) -> Parsed {
                                 }),
                             }
                         }
+                    } else if super::pbox::parse_empty(t).is_some() {
+                        // Tomt stycke (`<!--k:ep-->`): dold rad med ett styckes höjd, se `pbox`.
+                        fill(&mut st, tr, |s| s.markup = true);
                     } else if t == super::nav::TOC_LINE {
                         // Innehållsförteckningen: en dold rad som dokumentläget ersätter med rubrikerna.
                         fill(&mut st, tr, |s| s.markup = true);
