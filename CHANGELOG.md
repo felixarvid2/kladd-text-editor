@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **Fler testdokument.** Testkorpusen har ett nyhetsbrev (spalter, textruta, bild) och en skolrapport (sidhuvud med logga, sidfot, fotnoter, innehållsförteckning), både i Word 365-stil och som LibreOffice skapar dem.
+
 ## [2.3.0] – 2026-11-17
 
 ### Ändrat
