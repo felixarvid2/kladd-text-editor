@@ -1,4 +1,4 @@
-//! LaTeX-matematik (delmängden i `README.md`) till syntaxträd.
+//! LaTeX-matematik (delmängden i `docs/handbok.md`) till syntaxträd.
 
 use super::ast::*;
 use super::symbols;

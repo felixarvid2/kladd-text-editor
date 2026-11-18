@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Ändrat
+
+- README är nu en kort översikt med en tabell över filformaten Kladd öppnar, sparar och exporterar. Hela beskrivningen av funktionerna finns i `docs/handbok.md`.
+
 ## [2.4.0] – 2026-11-17
 
 ### Nytt
