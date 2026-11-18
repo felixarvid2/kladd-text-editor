@@ -5,343 +5,73 @@
 <h1 align="center">Kladd</h1>
 
 <p align="center">
-  <strong>En lugn och snygg texteditor för Linux.</strong><br>
-  För anteckningar, Markdown och kod – utan krångel.
+  <strong>En lugn och snygg texteditor för Linux, Windows och macOS.</strong><br>
+  För anteckningar, Markdown, Word-dokument, PDF och kod.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/plattform-Linux-4c6ef5" alt="Linux">
+  <img src="https://img.shields.io/badge/plattform-Linux%20%7C%20Windows%20%7C%20macOS-4c6ef5" alt="Linux, Windows, macOS">
   <img src="https://img.shields.io/badge/licens-MIT-2f9e44" alt="MIT">
 </p>
 
-Kladd är en snabb och ren texteditor med flikar, syntaxfärgning, sök och ersätt och en förhandsvisning av Markdown. Den finns i ett mörkt och ett ljust tema och är gjord för att kännas lika hemma i en anteckningsfil som i ett kodprojekt.
-
 | Mörkt tema | Ljust tema |
 |---|---|
-| ![Kladd i mörkt tema med Markdown-förhandsvisning](docs/markdown-morkt.png) | ![Kladd i ljust tema med sök och ersätt](docs/sok-ljust.png) |
-
-## Funktioner
-
-- **Flikar** – öppna flera filer samtidigt. `Ctrl+T` skapar en ny flik.
-- **Säkerhetskopia och återställning** – osparade flikar sparas undan var 30:e sekund; efter en krasch erbjuder Kladd att återställa dem vid nästa start. Kan stängas av i *Inställningar → Allmänt*.
-- **Spara automatiskt** – slå på i *Inställningar → Allmänt*: ändrade filer sparas två sekunder efter att du slutat skriva och när fönstret tappar fokus. Rör aldrig namnlösa flikar, PDF:er eller filer där sparning skulle tappa innehåll, och skriver inte över en fil som ändrats på disk.
-- **Versionshistorik** – varje sparning lagrar en version (gallras automatiskt). *Arkiv → Versionshistorik…* jämför med aktuell text och kan återställa en version eller öppna den i en ny flik.
-- **Mallar** – *Ny från mall…* (`Ctrl+Shift+N`) visar ett galleri med brev, rapport, mötesprotokoll, dagordning, CV, faktura, uppsats, anteckningar, README och tomma sidor, på svenska eller engelska. `{{platshållare}}` som namn och datum fylls i i ett formulär. *Spara som mall…* gör det aktuella dokumentet till en egen mall (under *Mina mallar*, i datakatalogens `mallar/`), och en .docx eller .odt kan importeras som mall. De inbyggda ligger som filer i `assets/templates/`.
-- **Säkerhetskopia och återställning** – osparade flikar sparas undan var 30:e sekund; efter en krasch erbjuder Kladd att återställa dem vid nästa start. Kan stängas av i huvudmenyn.
-- **Vim-läge** – *Vim-läge* i huvudmenyn ger Vim-tangentbindningar i textläget (av som standard; inte i dokumentläget eller PDF). Lägena normal, infoga, markera (tecken, rad, block), ersätt och kommandorad (`:`), med antal, operatorer (`d c y > < gu gU ~`) och rörelser, textobjekt (`iw aw ip ap i" a" i( a( i[ i{ it` m.fl.), register (`"a`–`"z`, `"+` för urklipp), markeringar, `.`, ångra/gör om, sökning (`/ ? n N * #`) och makron (`q`/`@`). Kommandoraden har `:w :q :wq :x :q! :e fil`, `:s` och `:%s` med Rusts reguljära uttryck, `:<rad>`, `:set nu/nonu/wrap/nowrap`, `:noh` och `:sp`/`:vs` (delad vy). Blockmarkör i normalläget, läget och väntande kommando visas i statusraden. Kladds Ctrl-genvägar fungerar som vanligt utom de Vim använder i normalläget (`Ctrl+d`, `u`, `r`, `v`, `o`). Flera markörer är avstängda medan Vim-läget är på.
-- **Spara automatiskt** – slå på i huvudmenyn: ändrade filer sparas två sekunder efter att du slutat skriva och när fönstret tappar fokus. Rör aldrig namnlösa flikar, PDF:er eller filer där sparning skulle tappa innehåll, och skriver inte över en fil som ändrats på disk.
-- **Versionshistorik** – varje sparning lagrar en version (gallras automatiskt). *Versionshistorik…* i huvudmenyn jämför med aktuell text och kan återställa en version eller öppna den i en ny flik.
-- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), många kodformat och PDF. PDF:er visas i en PDF-visare, se [PDF](#pdf).
-- **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
-- **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
-- **Förlustfri Word-sparning** – Word-filer sparas med alla sina delar kvar, se [Word-dokument](#word-dokument).
-- **Syntaxfärgning** och radnummer.
-- **Språkservrar (LSP)** för kodfiler i textläget: felmarkeringar med krumelurer, ikon i marginalen och hovertext, panelen *Problem* (klicka för att hoppa dit), komplettering (efter `.`, `::` m.fl. eller `Ctrl+Space`; pilar, `Enter`/`Tab`), hover, gå till definition (`F12` eller `Ctrl+klick`), referenser (`Skift+F12`), byt namn (`F2`), formatera dokumentet (`Skift+Alt+F`) och signaturhjälp. Kladd startar rust-analyzer, pyright-langserver (eller pylsp), typescript-language-server, gopls och clangd när de finns på PATH, första gången en fil av språket öppnas, med projektets rot (arbetsmappen eller närmaste `Cargo.toml`, `pyproject.toml`, `package.json`, `go.mod`, `.git`). Statusraden visar serverns läge, t.ex. *rust-analyzer: indexerar…*. Egna kommandon och av/på ställs in under *Språkservrar…* i menyn.
-- **Stora filer** – textfiler från 5 MB eller 200 000 rader (loggar, 100 MB-filer, kodfiler med en miljon rader) öppnas i en egen snabb vy som bara ritar de synliga raderna: filer över 20 MB läses in i bakgrunden med förlopp, radbrytning och färgning är avstängda, sökning går i bitar (högst 50 000 träffar visas) och ångra, radnummer, markering och sök fungerar som vanligt. Se `docs/dev/prestanda.md`.
-- **Sök och ersätt** med `Ctrl+F` och `Ctrl+H`, med alternativ för versaler, hela ord och reguljära uttryck (`$1` och `${namn}` fungerar i ersättningen). I dokumentläget söker Kladd i den synliga texten, så "fet text" hittar `**fet** text`. Du kan också söka på formatering (fetstil, kursiv, färg, markering, rubrik) och låta *Ersätt* lägga på eller ta bort formatering på träffarna.
-- **Tabellvy för csv och tsv** – `.csv`, `.tsv` (och annan avgränsad text, via *Tabell | Text* i statusraden) visas som ett rutnät med rubrikrad och radnummer som ligger kvar vid rullning, och klarar hundratusentals rader. Kladd gissar avgränsare (`,` `;` tabb `|`), citattecken och om första raden är rubrik; båda går att ändra i verktygsraden. Dubbelklicka, `F2` eller skriv för att redigera en cell (Enter, Tab och piltangenter flyttar), markera med Skift/Ctrl, kopiera och klistra in rektanglar som TSV (Excel och LibreOffice), infoga och ta bort rader och kolumner i högerklicksmenyn, sortera på en kolumn (tal, naturlig ordning eller text med svensk ordning), filtrera rader och sök med `Ctrl+F` (träffarna markeras i cellerna). Statusraden visar antal, summa, medel, min och max för markeringen, även för `1 234,5`. Allt är ändringar i dokumentets text (`Ctrl+Z` och `Ctrl+Y` ångrar), och orörda rader, avgränsare, citat, radslut och avslutande radbrytning bevaras byte för byte.
-- **Läsläge för Markdown** – en öppnad `.md`-fil visas färdig i hela fönstret, med ekvationer (se *Ekvationer* nedan). *Redigera* uppe till höger (eller `Ctrl+Shift+M`) byter till texten, och sidknappen i namnlisten eller `Ctrl+Shift+M` går tillbaka. Sök och hopp öppnar redigeraren. Vill du hellre ha förhandsvisningen bredvid texten när du redigerar slår du på *Visa → Förhandsvisning bredvid texten*.
-- **Delad vy** – `Ctrl+\` delar fönstret i två rutor bredvid varandra, `Ctrl+Shift+\` över varandra (eller *Dela vyn* / *Dela vågrätt* i menyn). Välj flik per ruta i rutans egen väljare, eller visa samma dokument två gånger med egen rullning. Dra skiljelinjen för att ändra storleken; `F6` byter aktiv ruta.
-- **Arbetsmapp** (`Ctrl+Shift+E`): filträd i en sidopanel med nytt, byt namn och ta bort (till papperskorgen), **snabböppna** (`Ctrl+E`) med suddig filnamnssökning och **sök i filer** (`Ctrl+Shift+F`) i mappen eller alla flikar, med ersättning över flera filer.
-- **Git** – är arbetsmappen ett git-arkiv (och finns `git` på datorn) visar filträdet status per fil (`M` ändrad, `A` ny och köad, `U` ospårad, `D` borttagen, `!` konflikt; mappar med ändringar får en punkt) och statusraden grenen med `↑`/`↓` för skillnad mot fjärrgrenen. I textläget visar marginalen tillagda (grön), ändrade (blå) och borttagna rader (röd triangel) mot HEAD; ett klick på en markör visar de gamla raderna med *Återställ ändringen*. *Arkiv → Jämför med HEAD…* visar en diff, *Visa blame* skriver författare, ålder och incheckningsmeddelande per rad i marginalen. **Källkontroll** (`Ctrl+Shift+G`, eller *Källkontroll* i panelen) listar köade och ändrade filer med köa, ta ur kön, förkasta (med bekräftelse) och jämför, en ruta för incheckningsmeddelande med *Checka in* (`Ctrl+Enter`) och *Checka in och pusha*, hämta, pulla och pusha, byte och skapande av gren samt de 50 senaste incheckningarna. Fel från git visas som notiser med git:s eget meddelande. Allt körs med programmet `git` i bakgrunden; saknas det döljs alla Git-funktioner.
-- **Navigeringsfönster** med rubrikerna som ett träd (`Ctrl+Shift+O`) och **innehållsförteckning** med sidnummer i dokument, se [Navigering och innehållsförteckning](#navigering-och-innehållsförteckning).
-- **Två teman** – *Gryning* och *Skymning*.
-- **Svenska och engelska** – välj *Språk / Language* i *Inställningar → Allmänt*; Automatiskt följer systemets språk. Hela gränssnittet finns på båda språken.
-- **Teckenkodning** – UTF-8, UTF-16 och Windows-1252, med bevarade radslut.
-- **Dra och släpp** filer direkt i fönstret.
-- **Ett fönster** – filer som öppnas från filhanteraren eller terminalen läggs som nya flikar i det Kladd-fönster som redan är öppet. Använd `kladd --new-window` för ett separat fönster.
-- **Dokumentläge** – Word- och OpenDocument-dokument visas som ett dokument med riktiga sidor, formateringsfält och sidnummer. Se [Word-dokument](#word-dokument).
-- **Stavningskontroll** i dokumentläget, med svenska och engelska ordlistor från systemet, eller hämtade i Kladd på Windows och macOS.
-- **Uppdateringar** – Kladd kollar högst en gång per dygn på GitHub om det finns en nyare version och visar då ett diskret fält med *Visa nyheter*, *Hämta och installera*, *Senare* och *Hoppa över*. Installationsfilen hämtas för ditt system (Windows-installationsprogram, macOS-skivavbild, .deb eller AppImage) och inget körs förrän du klickar. Kontrollen kan stängas av i *Inställningar → Allmänt*, och *Hjälp → Sök efter uppdateringar* kontrollerar direkt.
-
-- **Menyrad, kommandopalett och inställningar** – menyraden *Arkiv · Redigera · Visa · Infoga · Verktyg · Hjälp* (och *Format* i dokumentläget) ligger i övre raden; i ett smalt fönster samlas menyerna under hamburgerknappen som undermenyer. Menyerna visar bara det som hör till läget (text, dokument eller PDF). `Ctrl+Shift+P` öppnar kommandopaletten: skriv några bokstäver av ett kommando (på svenska eller engelska) så visas det med kategori och kortkommando, senast använda överst; Enter kör det. `Ctrl+,` öppnar *Inställningar* med sektionerna Allmänt (språk, tema, textstorlek, uppdateringar, spara automatiskt, säkerhetskopior), Redigerare, Dokument (författarnamn, stavning, grammatik och server), PDF och Avancerat.
-
-## Kom igång
-
-Ladda ner det senaste paketet för ditt system från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest).
-
-**Linux (Ubuntu/Debian)** – installera `.deb`-paketet:
-
-```bash
-sudo apt install ./kladd_*.deb
-```
-
-**Linux (alla distributioner)** – hämta `Kladd-<version>-x86_64.AppImage`, gör den körbar och starta den:
-
-```bash
-chmod +x Kladd-*-x86_64.AppImage
-./Kladd-*-x86_64.AppImage
-```
-
-(Saknar systemet FUSE kan du köra `./Kladd-*-x86_64.AppImage --appimage-extract-and-run`.)
-
-**Windows** – kör `Kladd-<version>-windows-x64-setup.exe`. Installationen sker för din användare och kräver inte administratör (dialogen låter dig välja installation för alla). Du kan lägga till en genväg på skrivbordet och låta Kladd synas under *Öppna med* för `.docx`, `.odt`, `.md` och `.txt`. Vill du slippa installera finns även `Kladd-<version>-windows-x64.zip`: packa upp och kör `kladd.exe`. Programmet är inte signerat, så Windows SmartScreen varnar vid första starten: välj *Mer information* och sedan *Kör ändå*.
-
-**macOS** (11 eller nyare, Apple Silicon och Intel) – öppna `Kladd-<version>-macos-universal.dmg` och dra Kladd till mappen Program. Programmet är inte notariserat, så första gången måste du högerklicka på Kladd och välja *Öppna* (och bekräfta). Alternativt tar du bort karantänmärkningen i Terminalen:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Kladd.app
-```
-
-På macOS öppnas filer från Finder i Kladd: *Öppna med*, dubbelklick (efter *Hämta info* → *Öppna med* → *Ändra alla…*) och att dra filer till ikonen i Dock. De läggs som nya flikar i det öppna fönstret. Kladd är bara ett alternativ i *Öppna med* och tar inte över någon filtyp av sig själv.
-
-**Signering:** just nu är varken Windows- eller macOS-paketen signerade (därav varningarna ovan) och AppImagen är osignerad. Release-workflowen kan signera och notarisera så fort certifikat finns, se [docs/dev/signering.md](docs/dev/signering.md).
-
-Nyheter i varje version står i [CHANGELOG.md](CHANGELOG.md).
-
-Du kan också bygga Kladd från källkoden:
-
-```bash
-cargo build --release
-./target/release/kladd
-```
-
-<details>
-<summary>Bygg ett .deb-paket</summary>
-
-```bash
-cargo install cargo-deb --locked   # en gång
-cargo deb                          # skapar paketet i target/debian/
-```
-
-Avinstallera med `sudo apt remove kladd`.
-
-En ny release skapas automatiskt när en versionstagg pushas. Höj först `version` i `Cargo.toml`, och tagga sedan samma version:
-
-```bash
-git tag v1.4.0
-git push origin v1.4.0
-```
-
-Det går också att köra workflowen *Release* för hand under Actions och kryssa i *Publicera release*. Då skapas taggen från versionen i `Cargo.toml`.
-
-Release-anteckningarna hämtas från avsnittet för versionen i `CHANGELOG.md`; finns inget avsnitt skapas anteckningarna automatiskt. Skriv anteckningarna i `CHANGELOG.md` innan du taggar. För en redan publicerad release: kör workflowen för hand, fyll i *update_notes* med taggen (till exempel `v1.5.0`) och lämna *Publicera release* ikryssad av. Då byts bara anteckningarna ut.
-
-</details>
-
-## Word-dokument
-
-Kladd öppnar `.docx` och `.odt` (LibreOffice) i dokumentläge, som liknar ett Word-dokument. När du sparar som `.docx` blir det ett riktigt Word-dokument som öppnas i Word, LibreOffice och Google Dokument. `.odt` sparas som OpenDocument-text. Med *Spara som* kan vilken flik som helst sparas som `.docx`.
-
-### Dokumentläge
-
-![Ett Word-dokument i Kladds dokumentläge](docs/dokumentlage-ljust.png)
-
-Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och marginaler från dokumentet och typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Styckeramar och skuggade rutor (även ihopslagna över flera stycken), exakt avstånd mellan stycken, indrag och tomma stycken visas som i Word. Listor dras in med hängande indrag, tabeller ritas som rutnät med celler som bryter långa rader, `Enter` för radbrytning i cellen, sammanfogade celler och kolumnbredder som du ändrar genom att dra i kanten, och bilder visas i texten. Markdown-koden är dold; den visas nedtonad bara på raden där markören står. Fotnoter visas som små upphöjda siffror med texten under en skiljelinje sist i dokumentet: *Infoga fotnot* i verktygsraden (`Ctrl+Alt+F`) lägger till en och numrerar om, Ctrl+klick på ett nummer hoppar mellan referensen och fotnoten, och fotnoterna följer med som riktiga fotnoter när du sparar som `.docx` eller `.odt` och hamnar längst ned på sidan i PDF. Slutnoter (`Ctrl+Alt+D`, *Infoga → Slutnot*) visas med romerska tal efter dokumentets sista text och följer med som riktiga slutnoter i `.docx` och `.odt` och efter sista texten i PDF. Spårade ändringar och kommentarer i `.docx` och `.odt` visas också: infogad text är understruken och raderad text struken i författarens färg, kommentarerna ligger i ett fält till höger om sidan, och menyn *Granska* (spåra ändringar `Ctrl+Skift+E`, godkänn och avvisa, nästa och föregående ändring, ny kommentar `Ctrl+Alt+M`, svara, ta bort, visa/dölj och *Ditt namn…*) redigerar dem. De sparas som riktiga Word-ändringar och kommentarer, och i `.odt` som LibreOffice-ändringar och kommentarer; PDF och HTML får den godkända texten.
-
-Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och marginaler från dokumentet och typografi som liknar Word. Dokumentets typsnitt, storlekar, färger, markeringar och styckejustering (vänster, centrerat, höger och marginaljustering) visas som i Word. Typsnitten hämtas från systemet precis som i LibreOffice, så Arial visas med Liberation Sans och Times New Roman med Liberation Serif. Calibri visas med Carlito, som har samma mått. Listor dras in med hängande indrag, tabeller ritas som rutnät med celler som bryter långa rader, `Enter` för radbrytning i cellen, sammanfogade celler och kolumnbredder som du ändrar genom att dra i kanten, och bilder visas i texten. Markdown-koden är dold; den visas nedtonad bara på raden där markören står. Fotnoter visas som små upphöjda siffror med texten under en skiljelinje sist i dokumentet: *Infoga fotnot* i verktygsraden (`Ctrl+Alt+F`) lägger till en och numrerar om, Ctrl+klick på ett nummer hoppar mellan referensen och fotnoten, och fotnoterna följer med som riktiga fotnoter när du sparar som `.docx` eller `.odt` och hamnar längst ned på sidan i PDF. Slutnoter (`Ctrl+Alt+D`, *Infoga → Slutnot*) visas med romerska tal efter dokumentets sista text och följer med som riktiga slutnoter i `.docx` och `.odt` och efter sista texten i PDF. Spårade ändringar och kommentarer i `.docx` visas också: infogad text är understruken och raderad text struken i författarens färg (infogade och raderade stycketecken ritas som ¶ respektive genomstruket ¶, och formateringsändringar får ett streck i marginalen och en prickad understrykning med verktygstipset *Formaterat: Fet*; med spårning på spåras även Enter, hopslagning av stycken och all formatering), kommentarerna ligger i ett fält till höger om sidan, och menyn *Granska* (spåra ändringar `Ctrl+Skift+E`, godkänn och avvisa, nästa och föregående ändring, ny kommentar `Ctrl+Alt+M`, svara, ta bort, visa/dölj och *Ditt namn…*) redigerar dem. De sparas som riktiga Word-ändringar och kommentarer; i `.odt` godkänns ändringarna och kommentarerna utelämnas, och PDF och HTML får den godkända texten.
-
-Formateringsfältet ovanför texten har stilval (Brödtext, Titel, Underrubrik, Rubrik 1–6, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, menyn *Infoga* (bild, tabell, fotnot, innehållsförteckning, avsnittsbrytning, liggande sidor och spalter), ångra och gör om, sidinställningar samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
-
-### Förlustfri sparning
-
-Kladd behåller alla delar av originalfilen, som sidhuvud, sidfot, fotnoter, kommentarer, teman och inställningar. Vid sparning skrivs bara de stycken om som du har ändrat; oförändrade stycken sparas exakt som de var. Objekt som Kladd inte kan visa, till exempel fotnotsreferenser, fält och textrutor, blir osynliga markörer `<!--k:N-->` i Markdown-texten och skrivs tillbaka när du sparar. Spårade ändringar och kommentarer blir `<ins>`, `<del>`, `<fmt>`, stycketeckensmarkörer och kommentarsmarkörer som följer med när du ändrar stycket.
-
-### Navigering och innehållsförteckning
-
-Navigeringsfönstret (`Ctrl+Shift+O`, knappen längst upp till höger eller *Navigeringsfönster* i menyn) visar rubrikerna i Word-, ODT-, PDF- och Markdown-flikar, i både dokumentläge och textläge. Klicka på en rubrik för att flytta markören dit; pilen fäller ihop underrubriker och fältet *Sök i rubriker* filtrerar listan.
-
-*Infoga → Innehållsförteckning* (i formateringsfältet eller menyraden) sätter in raden `<!-- kladd: toc -->` vid markören. I dokumentläget visas rubrikerna H1–H3 med sidnummer; klicka på en post för att hoppa dit. Står markören på raden visas själva kommentaren. Sparas dokumentet som `.docx` blir det ett innehållsförteckningsfält som Word uppdaterar när filen öppnas (Word frågar då om fälten ska uppdateras), som `.odt` en `text:table-of-content` och som PDF en förteckning med riktiga sidnummer och länkar. Förteckningar som redan finns i ett öppnat Word- eller OpenDocument-dokument visas som samma rad.
-
-### Sidor och utskrift
-
-Knappen *Sidinställningar* (eller dubbelklick på sidhuvud eller sidfot) öppnar en dialog för sidstorlek (A4, A5, A3, Letter, Legal), stående eller liggande, marginaler, sidhuvud och sidfot. I sidhuvud och sidfot betyder `{sida}` och `{sidor}` sidnummer och antal sidor, `{datum}` dagens datum (ÅÅÅÅ-MM-DD), `{titel}` filnamnet utan ändelse och `{fil}` hela filnamnet. Med `|` delas texten i vänster, mitten och höger (`header: "Rapport|{titel}|{sida}"`), och `header-first`/`footer-first` ger första sidan eget sidhuvud och sidfot (`""` = tom). Dubbelklick på sidhuvudet eller sidfoten på en sida öppnar *Sidhuvud och sidfot* med tre fält, knappar som infogar fält och rutan *Annorlunda första sida*. Fälten följer med till PDF, utskrift, `.docx` (PAGE, NUMPAGES, DATE, TITLE, FILENAME) och `.odt`, och läses från Word- och LibreOffice-dokument med vänster/mitten/höger-layout (tabbstopp eller en tabell utan ramar). Loggor i sidhuvud och sidfot (`{bild:logo.png 80x30}`) visas och sparas, sidnummer kan ha format (`{sida:roman}`) och börja om per avsnitt (`page-start`), `{avsnittssidor}` är antalet sidor i avsnittet, och annorlunda första sida, olika udda/jämna sidor (`header-even`) och egna sidhuvuden per avsnitt (på avsnittsraden, med arv från föregående avsnitt) följer med som i Word. Inställningarna sparas i grundformatskommentaren:
-
-```
-<!-- kladd: page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"; footer-align: center -->
-```
-
-### Formatmallar
-
-*Ändra formatmall…* bredvid stilvalet (eller högerklick på stilvalet) öppnar en dialog där du ändrar utseendet på Brödtext, Titel, Underrubrik, Rubrik 1–6 och Citat: typsnitt, storlek, fet, kursiv, färg, justering, luft före och efter, radavstånd och indrag av första raden. Dialogen har en förhandsvisning, och ändringarna gäller hela dokumentet direkt. *Uppdatera från markering* tar utseendet på texten vid markören och *Återställ* tar bort ändringarna i den valda formatmallen. De sparas i grundformatskommentaren, en rad per formatmall, och dokument utan sådana rader ser ut som förut:
-
-```
-<!-- kladd: h1: "Calibri Light" 16pt bold #2F5496 space-before 12pt space-after 6pt; body: justify line-spacing 1.15 -->
-```
-
-Word-dokumentets Normal, Title, Subtitle, Rubrik 1–6 och Citat läses in (med docDefaults, temafärger och typsnitt, teckenavstånd, versaler och linjen under stycket), och när du ändrar en formatmall skrivs ändringen tillbaka till formatmallen i `.docx`-filen (oförändrade dokument sparas som förut). `.odt` fungerar likadant, och PDF, HTML och EPUB följer formatmallarna (PDF har alltid sina inbäddade typsnitt).
-
-### Avsnitt: liggande sidor och spalter
-
-Som i Word kan en del av dokumentet ha egna sidor eller flera spalter. Öppna *Infoga* i formateringsfältet:
-
-- **Avsnittsbrytning (ny sida)** börjar ett nytt avsnitt på en ny sida. Avsnittet börjar som det förra.
-- **Sidbrytning** börjar en ny sida utan att ändra sidformat. Sidbrytningar i Word- och LibreOffice-dokument visas på samma sätt.
-- **Liggande sidor härifrån** (och *Stående sidor härifrån*) vänder sidorna från markören och framåt. Står markören först i dokumentet gäller det hela första avsnittet.
-- **Spalter…** ger avsnittet som markören står i 1, 2 eller 3 spalter med valfritt mellanrum. Texten flyter uppifrån och ned i första spalten, sedan i nästa och sedan på nästa sida.
-- **Spaltbrytning** flyttar texten efter markören till nästa spalt.
-
-Avsnittet börjar vid en egen rad som visas bara när markören står på den. Egenskaper som saknas ärver dokumentets grundformat (inte föregående avsnitt):
-
-```
-<!-- kladd: avsnitt; page: A4 landscape; page-margin: 20mm; columns: 2; column-gap: 12mm -->
-```
-
-`column-widths: 40mm 120mm` ger olika breda spalter och `column-rule: yes` en skiljelinje mellan spalterna (båda följer med till `.docx`, `.odt` och PDF, och läses från Word och LibreOffice). *Spalter…* nollställer bredderna och linjen när du byter antal spalter.
-
-Med `type: continuous` börjar avsnittet på samma sida (för att byta antal spalter mitt på en sida; spalterna i avsnittet före jämnas ut). Bilder och tabeller anpassas till spaltens bredd, sidnumren löper över avsnitten (om inte ett avsnitt börjar om med `page-start`) och sidhuvud och sidfot ärvs från föregående avsnitt tills ett avsnitt har egna. Avsnitten följer med till `.docx` (`w:sectPr`: sidstorlek, orientering, marginaler, spalter och typ), `.odt` (sidmallar, och `text:section` för spalter) och PDF.
-
-### Ekvationer
-
-Matematik skrivs med LaTeX-syntax: `$x^2$` mitt i en mening och `$$\int_0^1 f(x)\,dx$$` på en egen rad. I dokumentläget och Markdown-förhandsvisningen ritas formlerna som satt matematik (STIX Two Math; egen utläggning efter TeX:s regler), i dokumentläget i textflödet med källan dold utom på raden där markören står. *Infoga → Ekvation* lägger in `$$ $$` med markören inuti, och posterna under (bråk, kvadratrot, upphöjt, nedsänkt, summa, integral, gräns, parenteser, matris, grekiska) sätter in färdiga strukturer, i formeln om markören står i en. Stöd: upphöjt/nedsänkt och primtecken, `\frac` `\dfrac` `\binom`, `\sqrt[n]{}`, `\sum` `\int` `\prod` `\lim` med gränser (`\limits`), `\left`…`\right` och `\big`, grekiska och vanliga symboler och operatorer, `\text`, `\mathrm` `\mathbf` `\mathit` `\mathbb` `\mathcal` `\mathfrak`, `pmatrix`/`bmatrix`/`vmatrix`/`cases`/`aligned`/`array`, accenter (`\hat` `\bar` `\vec` `\dot` `\widehat` …), `\overline` `\underbrace` `\overset` och mellanrum (`\,` `\quad`). En formel som inte går att tolka visas som vanlig text. Tecknen `$` i vanlig text (`5 $ och 6 $`) och i kod räknas inte som matematik.
-
-I `.docx` sparas formlerna som Office Math (`m:oMath`) och formler i Word-dokument läses som LaTeX; formler Kladd inte kan uttrycka bevaras som de var. `.odt` får ett formelobjekt (MathML) med ersättningsbild, PDF ritar formlerna som konturer och HTML och EPUB får MathML.
-
-### Tabeller, bilder och inklistring
-
-Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. Skuggning, ramar, bredd, justering, cellmarginaler och radhöjd från Word och LibreOffice visas som i originalet (tabeller utan ramar visas utan linjer) och följer med när du sparar; *Skugga celler* och *Ramar runt alla celler* / *Inga ramar* finns i högerklicksmenyn. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.
-
-Klicka på en bild för att markera den. Dra i hörnen för att ändra storlek (håll Skift för fri proportion) eller dra i själva bilden för att flytta den: en linje visar var den hamnar, och Esc avbryter. En liten verktygsrad vid bilden justerar läget (vänster, centrerat eller höger), väljer radbrytning (*I texten*, eller *Vänster*/*Höger* så att texten flyter runt bilden), återställer originalstorleken eller tar bort bilden. Delete tar bort en markerad bild. Flytande bilder sparas som förankrade bilder med textomflöde i Word och LibreOffice. Bilder från Word och LibreOffice behåller sitt läge (mot sidan, marginalen, spalten eller stycket), omflöde (runt, över och under, bakom eller framför texten), avstånd och beskärning; drar du en sådan bild sparas det nya läget.
-
-Ctrl+V klistrar in formaterad text med rubriker, fetstil, kursiv, understrykning, färger, typsnitt, storlekar, justering, listor, tabeller, länkar och inbäddade bilder. Ctrl+Shift+V klistrar in oformaterad text.
-
-Vill du se dokumentet som vanlig Markdown-text klickar du på *Markdown* i formateringsfältet. Klicka på *Visa som dokument* i statusfältet för att gå tillbaka.
-
-### Stavningskontroll
-
-I dokumentläget markeras felstavade ord med ett rött vågigt understreck medan du skriver. Högerklicka på ett ord för att se förslag, välja *Ignorera alla* eller *Lägg till i ordlistan*. Tillagda ord sparas i `~/.config/kladd/ordlista.txt` (på Windows och macOS i `ordlista.txt` i Kladds mapp, se nedan).
-
-Kladd använder Hunspell-ordlistor (`.aff` och `.dic`). Språk och på/av väljer du genom att klicka på språket i statusfältet. Standardspråket är svenska när det är installerat, annars systemets språk (`$LANG` eller operativsystemets inställning).
-
-- **Linux:** ordlistorna i `/usr/share/hunspell`, samma som LibreOffice använder på Ubuntu. Installera svenska med `sudo apt install hunspell-sv`; .deb-paketet föreslår `hunspell-sv` och `hunspell-en-us`.
-- **Windows och macOS:** det finns inga ordlistor i systemet, så Kladd erbjuder att hämta dem. Finns ingen ordlista visar statusfältet *Ingen ordlista*; klicka där och välj *Hämta svensk ordlista* (eller *Hämta fler språk…* för engelska, norska, danska, tyska, franska och spanska). Kladd hämtar `.aff`- och `.dic`-filerna från [LibreOffices ordlistearkiv](https://github.com/LibreOffice/dictionaries) i bakgrunden och väljer språket när det är klart. Ordlistan har egen licens (LGPL/MPL …); licenstexten sparas bredvid den. Hämtningen följer `HTTPS_PROXY`. Ordlistorna hamnar i `~/Library/Application Support/Kladd/ordlistor` (macOS) respektive `%APPDATA%\Kladd\ordlistor` (Windows). Är LibreOffice installerat används dess ordlistor också, liksom `/Library/Spelling` och `~/Library/Spelling` på macOS.
-
-Ordlistor i mappen som `$DICPATH` pekar på hittas på alla system.
-
-### Autokorrigering
-
-Kladd rättar texten medan du skriver, när du avslutar ett ord eller en mening med mellanslag, skiljetecken eller Enter. Det gäller i dokumentläget; i *Autokorrigering…* (huvudmenyn) kan du också slå på det för Markdown och vanlig text (aldrig kodfiler) och slå av varje regel för sig:
-
-- typografiska citattecken efter språk: svenska ”…” och ’, engelska “…” och ‘…’
-- `--` blir – och `---` blir —, `...` blir …, `(c)` blir ©, `(r)` blir ® och `(tm)` blir ™
-- stor bokstav i början av meningar och stycken, men inte efter förkortningar (t.ex., bl.a., e.g.), i tal som 3.5, i webbadresser eller i ord som iPhone
-- två inledande versaler rättas (SVerige blir Sverige)
-- en liten inbyggd lista med vanliga svenska och engelska stavfel
-- egna ersättningar, till exempel `mvh` till *Med vänliga hälsningar* (versal i början följer med: `Mvh`)
-
-Språket följer stavningskontrollen (eller väljs i dialogen). Markdown-syntax, kodspann och kodstaket, länkar, HTML och kommentarer lämnas orörda. Ctrl+Z direkt efter en rättelse tar bara tillbaka rättelsen, som i Word. Autokorrigeringen är av medan ändringar spåras.
-
-### Grammatik och stil
-
-Grammatikkontrollen använder [LanguageTool](https://languagetool.org/http-api/) och är **av som standard**. Klicka på *Grammatik* i statusfältet (eller *Verktyg → Grammatikkontroll*, eller sektionen *Dokument* i *Inställningar*) för att slå på den och välja server: *LanguageTools server (api.languagetool.org)* eller en egen adress, till exempel `http://localhost:8081` för en lokalt installerad LanguageTool. Med den publika servern skickas texten du skriver över internet; det förklaras en gång innan funktionen slås på. Språket följer stavningsspråket (annars väljer servern automatiskt).
-
-Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, ungefär 1,5 sekunder efter att du slutat skriva. Kladd håller sig inom den publika serverns gränser (20 anrop per minut, 20 kB per anrop). Grammatikfel markeras med blått och stilråd med bärnstensgult vågigt understreck. Håll pekaren över ett understreck för förklaringen, eller högerklicka för upp till fem förslag, *Ignorera* och *Ignorera regeln* (gäller sessionen). Statusfältet visar antalet träffar. Stavning kontrolleras fortfarande av Hunspell.
-
-| I Word | I Kladd |
-|---|---|
-| Rubriker och titel | `#` … `######` |
-| Fetstil, kursiv, understruken, genomstruken | `**fet**`, `*kursiv*`, `<u>understruken</u>`, `~~struken~~` |
-| Typsnitt, storlek, textfärg, markering | `<span style="font-family: Arial; font-size: 14pt; color: #C00000; background-color: #FFFF00">…</span>` |
-| Centrerat, högerjusterat, marginaljusterat | `<div align="center">` … `</div>` |
-| Dokumentets grundtypsnitt | `<!-- kladd: font-family: "Times New Roman"; font-size: 12pt -->` på första raden |
-| Sidstorlek, marginaler, sidhuvud och sidfot | Samma kommentar: `page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"` |
-| Formatmallar (Brödtext, Rubrik 1–6, Citat) | Samma kommentar: `h1: "Calibri Light" 16pt bold #2F5496 space-before 12pt; body: justify line-spacing 1.15; quote: italic` |
-| Fotnoter, fält m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
-| Textruta | `<!--k:tb N-->` … `<!--k:/tb-->` före stycket (innehållet är vanliga stycken med `<!--k:pp …-->` för fyllning och ram) |
-| Spårad infogning och radering | `<ins data-k="3">text</ins>`, `<del data-k="4">text</del>` (författare och datum i en postrad sist) |
-| Spårat stycketecken | `<!--k:pm ins 5-->` / `<!--k:pm del 5-->` sist på raden, före radbrytningen |
-| Spårad formatering | `<fmt data-k="6">text</fmt>` (teckenformat) och `<!--k:pm fmt 7-->` (styckeformat); det gamla formatet står i postradens `old` |
-| Kommentar | `<!--k:c:1-->text<!--k:/c:1-->` och en postrad `<!--k:c id="1" …-->` sist |
-| Liggande sidor, andra marginaler, spalter | `<!-- kladd: avsnitt; page: A4 landscape; columns: 2 -->` på en egen rad (börjar ett avsnitt), `<!-- kladd: spaltbrytning -->`; `<!-- kladd: sidbrytning -->` på en egen rad ger en ny sida |
-| Punktlistor och numrerade listor | `-` och `1.` |
-| Citat | `>` |
-| Tabeller | `\| kolumn \| kolumn \|` |
-| Länkar | `[text](https://…)` |
-| Kod | `` `kod` `` och kodblock |
-| Bilder (PNG, JPEG, GIF, BMP) | `![text](bild:image1.png)` |
-| Bildstorlek | `<img src="…" alt="…" width="240">` |
-
-Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
-
-Textrutor visas som stycken med rutans fyllning, ram, bredd och läge före stycket de sitter i (texten kan ändras och *Infoga → Textruta* lägger till en ny, men text flödar inte runt rutan). Diagram, former och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
-
-Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
-
-## PDF
-
-En PDF öppnas i en PDF-visare som visar sidorna som de ser ut. Sidorna renderas med [hayro](https://github.com/LaurenzV/hayro) i bakgrundstrådar, så gränssnittet inte fryser, och de är skarpa på HiDPI-skärmar. Sidorna ligger på vita ark mot en grå bakgrund med kontinuerlig rullning. Zoomen har lägena Automatisk, Verklig storlek, Hel sida och Sidbredd, och går från 10 till 2500 %. Du kan visa en sida eller två sidor åt gången, rotera sidorna och välja färgläge (normala, inverterade eller sepia). Sida, zoom och rotation sparas per fil. PDF:er som visaren inte kan läsa öppnas som text, som förut.
+| ![Kladd i mörkt tema med Markdown](docs/markdown-morkt.png) | ![Kladd i ljust tema med sök och ersätt](docs/sok-ljust.png) |
+
+Kladd har flikar, syntaxfärgning, sök och ersätt, delad vy, Git, språkservrar och ett Vim-läge för kod. Word- och
+LibreOffice-dokument visas med riktiga sidor i ett dokumentläge, och PDF:er i en egen visare. Gränssnittet finns på
+svenska och engelska. Allt beskrivs i [handboken](docs/handbok.md).
+
+## Filformat
+
+| Format | Filändelser | Öppna | Spara | Så visas filen |
+|---|---|:-:|:-:|---|
+| Text | `.txt`, `.log` m.fl. | ✓ | ✓ | Textredigerare |
+| Markdown | `.md`, `.markdown` | ✓ | ✓ | Läsläge, *Redigera* byter till texten |
+| Word | `.docx` | ✓ | ✓ | Dokumentläge med sidor |
+| Word-mallar och makrofiler | `.dotx`, `.docm`, `.dotm` | ✓ | som `.docx` | Dokumentläge |
+| OpenDocument-text (LibreOffice) | `.odt` | ✓ | ✓ | Dokumentläge med sidor |
+| OpenDocument-mall | `.ott` | ✓ | som `.odt` | Dokumentläge |
+| PDF | `.pdf` | ✓ | ✓ | PDF-visare; *Redigera* gör om den till ett dokument |
+| CSV och TSV | `.csv`, `.tsv` | ✓ | ✓ | Tabellvy |
+| Kod och konfiguration | `.rs`, `.py`, `.js`, `.ts`, `.go`, `.c`, `.cpp`, `.java`, `.html`, `.css`, `.json`, `.toml`, `.yaml`, `.xml`, `.sh`, `.sql` m.fl. | ✓ | ✓ | Textredigerare med färgning |
+| Webbsida | `.html` | | export | Från Markdown och dokument |
+| E-bok | `.epub` | | export | Från Markdown och dokument |
+
+- **Word och OpenDocument** sparas förlustfritt: det Kladd inte ändrat skrivs tillbaka som det var. Formatmallar,
+  tabeller, bilder, spalter, textrutor, sidhuvud och sidfot, fotnoter, slutnoter, kommentarer och spårade
+  ändringar följer med.
+- **PDF**: sidor kan ordnas, roteras och slås ihop, formulär fyllas i och anteckningar läggas till. Sparningen ändrar
+  inte resten av filen.
+- **Det gamla `.doc`-formatet stöds inte.** Spara om filen som `.docx` i Word eller LibreOffice.
+- **Teckenkodning**: UTF-8, UTF-16 och Windows-1252. Radsluten (LF eller CRLF) bevaras.
+- **Bilder** (`.png`, `.jpg`, `.gif`, `.bmp`) kan infogas i dokument.
+
+## Installera
+
+Hämta paketet för ditt system från [Releases](https://github.com/felixarvid2/kladd-text-editor/releases/latest):
+
+- **Linux**: `sudo apt install ./kladd_*.deb`, eller kör AppImagen efter `chmod +x Kladd-*-x86_64.AppImage`.
+- **Windows**: kör `Kladd-<version>-windows-x64-setup.exe`, eller packa upp zip-filen. SmartScreen varnar eftersom
+  programmet inte är signerat: välj *Mer information* och *Kör ändå*.
+- **macOS 11+**: öppna dmg-filen och dra Kladd till Program. Första gången: högerklicka på Kladd och välj *Öppna*.
+
+Bygg från källkoden med `cargo build --release`. Nyheterna står i [CHANGELOG.md](CHANGELOG.md).
+
+## Vanliga kortkommandon
+
+På Mac används ⌘ i stället för Ctrl. `Ctrl+Shift+P` öppnar kommandopaletten, där alla kommandon finns. Hela listan
+står i [handboken](docs/handbok.md#kortkommandon).
 
 | Kommando | Funktion |
 |---|---|
-| `F4` | Sidopanel med miniatyrer och innehållsförteckning |
-| `Ctrl+F` | Sök i hela dokumentet |
-| `Ctrl+G` | Gå till sida |
-| `F5` | Presentationsläge (Esc avslutar) |
-| `R` / `Shift+R` | Rotera |
-| `H` | Handverktyg |
-| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zooma in / ut / 100 % |
-| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Verklig storlek / sidbredd / hel sida |
-| `Alt+Vänster` / `Alt+Höger` | Bakåt / framåt i historiken efter länkar och hopp |
-
-**Ordna sidor.** Klicka, Ctrl+klicka eller Skift+klicka på miniatyrerna för att markera sidor och dra dem för att flytta (en linje visar var de hamnar). Högerklicka för *Rotera åt höger/vänster*, *Ta bort* (eller Delete), *Extrahera till ny PDF…* och *Infoga PDF före/efter…*; *Slå ihop med PDF…* i Visa-menyn lägger till en fil sist. Ändringarna görs direkt i minnet och kan ångras med `Ctrl+Z` och göras om med `Ctrl+Shift+Z`. Fliken blir ändrad; `Ctrl+S` sparar över originalet (atomiskt) och *Spara kopia…* sparar under nytt namn. Typsnitt och bilder följer med sidorna, men bokmärken i en infogad fil tas inte med och en lösenordsskyddad PDF sparas utan lösenord. Mellanslag+dra panorerar som handverktyget.
-
-**Känn igen text (OCR):** skannade sidor (sidor utan text som består av en bild) kan göras sökbara. Kladd använder kommandoradsprogrammet [Tesseract](https://github.com/tesseract-ocr/tesseract) om det finns installerat (`sudo apt install tesseract-ocr tesseract-ocr-swe`, `brew install tesseract tesseract-lang` eller installationsprogrammet från UB Mannheim på Windows). Välj *Visa → Känn igen text (OCR)* eller svara på meddelandet som visas när dokumentet har skannade sidor. Sidorna renderas i 300 dpi i bakgrunden, språken väljs bland de installerade (svenska och engelska, plus systemspråket) och förloppet visas i statusraden. Därefter fungerar sök, markering och kopiering som på andra sidor, och *Redigera* tar med den igenkända texten.
-
-**Anteckna** i verktygsraden visar anteckningsverktygen: Markera (gul, grön, blå, rosa), Understruken, Genomstruken, Anteckning, Textruta och Penna. Markera text och släpp musknappen så läggs markeringen på; Anteckning och Textruta placeras med ett klick, Penna ritas med musen. Högerklick tar bort en ny anteckning och *Ångra* den senaste. Anteckningarna sparas med `Ctrl+S` som riktiga PDF-anteckningar (`/Annots` med utseende), så de syns i alla PDF-läsare; *Spara kopia* tar med dem i kopian. Fliken är ändrad och frågar om du vill spara tills det är gjort. Sparningen läggs som en inkrementell uppdatering sist i filen, så digitala signaturer förblir giltiga (egenskapsdialogen visar *Signerad*, och att ordna sidor i en signerad PDF frågar först). En krypterad PDF sparas utan lösenordsskydd. Befintliga anteckningar visas men kan inte ändras.
-
-**Anteckna** i verktygsraden visar anteckningsverktygen: Markera (gul, grön, blå, rosa), Understruken, Genomstruken, Anteckning, Textruta och Penna. Markera text och släpp musknappen så läggs markeringen på; Anteckning och Textruta placeras med ett klick, Penna ritas med musen. Högerklick tar bort en ny anteckning och *Ångra* den senaste. Anteckningarna sparas med `Ctrl+S` som riktiga PDF-anteckningar (`/Annots` med utseende), så de syns i alla PDF-läsare; *Spara kopia* tar med dem i kopian. Fliken är ändrad och frågar om du vill spara tills det är gjort. En krypterad PDF sparas utan lösenordsskydd. Anteckningar som redan finns i filen går att ändra och ta bort: klicka på dem i Anteckna-läget för en ruta med författare, datum, kommentar, färg och *Ta bort* (Ångra och Ctrl+Z gäller även dessa), håll pekaren över en anteckning för att se vem som skrev den och vad, och fliken *Kommentarer* i sidopanelen listar alla anteckningar och hoppar dit.
-
-**Formulär.** Har PDF:en ifyllbara fält (AcroForm) visas raden *Det här dokumentet har formulärfält* med knappen *Markera fält* (ljusblå markering). Klicka på ett fält för att fylla i det: text (en eller flera rader, lösenord, rutor för ett tecken per ruta), kryssrutor, alternativknappar, rullgardinslistor och listrutor. `Tab` och `Shift+Tab` går till nästa och föregående fält, `Esc` lämnar fältet och mellanslag växlar en kryssruta. Ifyllda värden gör fliken ändrad: `Ctrl+S` sparar dem i originalfilen (atomiskt, med nya utseenden för fälten), *Spara kopia* och utskrift tar med dem, och stängning frågar om du vill spara. Krypterade PDF:er kan inte fyllas i ännu.
-
-**Redigera** gör om PDF:en till ett redigerbart dokument, som öppnas i dokumentläget. Kladd läser texten och visar den med rubriker, stycken, punkt- och numrerade listor, tabeller, fetstil, kursiv och bilder. Läsordningen följer spalterna, avstavning vid radslut tas bort, sidnummer i sidhuvud och sidfot hoppas över och stycken som fortsätter på nästa sida fogas ihop. Lösenordsskyddade PDF:er öppnas efter att du skrivit lösenordet. Originalet ändras inte förrän du sparar.
-
-Spara som `.pdf` för att få en A4-PDF med inbäddade typsnitt (IBM Plex), sökbar text, klickbara länkar, bokmärken från rubrikerna, bilder och sidnummer.
-
-En PDF är byggd för utskrift, inte för redigering. När du sparar en PDF som har gjorts om med *Redigera* skapar Kladd därför en ny PDF av texten, och originalets sidlayout och typsnitt ersätts. Kladd frågar innan originalet skrivs över. Sidor som bara består av bilder (skannade sidor) har ingen text att läsa; Kladd säger till när det gäller.
-
-Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/pdfcraft) och skrivningen på samma upplägg som [WordCraft](https://github.com/storytold/wordcraft) (båda MIT/Apache-2.0), med [lopdf](https://crates.io/crates/lopdf) och [krilla](https://crates.io/crates/krilla). Sidorna i PDF-visaren renderas med [hayro](https://github.com/LaurenzV/hayro) (MIT/Apache-2.0).
-
-## Kortkommandon
-
-På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
-
-| Kommando | Funktion |
-|---|---|
-| `Ctrl+T` / `Ctrl+N` | Ny flik |
-| `Ctrl+Shift+N` | Ny från mall… |
-| `Ctrl+O` | Öppna fil |
-| `Ctrl+S` | Spara |
-| `Ctrl+Shift+S` | Spara som |
-| `Ctrl+P` | Skriv ut (alla flikar) |
-| `Ctrl+Shift+V` | Klistra in oformaterat (endast dokumentläge) |
-| `Tab` / `Shift+Tab` | Nästa / föregående cell i tabell (endast dokumentläge) |
-| `Delete` | Ta bort markerad bild (endast dokumentläge) |
-| `Ctrl+W` | Stäng flik |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Nästa / föregående flik |
-| `Ctrl+Shift+I` | Infoga bild |
+| `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | Ny flik / öppna / spara |
 | `Ctrl+F` / `Ctrl+H` | Sök / ersätt |
-| `Ctrl+Shift+F` | Sök i filer (arbetsmappen eller alla flikar) |
-| `Ctrl+E` | Snabböppna fil i arbetsmappen (inte i dokumentläget, där är det centrera) |
-| `Ctrl+Shift+E` | Mappträd (arbetsmapp) på/av; i dokumentläget Spåra ändringar |
-| `Ctrl+Shift+G` | Källkontroll (Git) i sidopanelen |
-| `Ctrl+Enter` | Checka in (i meddelanderutan i källkontrollen) |
-| `F3` / `Shift+F3` | Nästa / föregående träff |
-| `Esc` | Stäng sökning |
-| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Textstorlek (i dokumentläge: zoom av sidan) |
-| `Ctrl+Scroll` | Zoom (endast dokumentläge) |
-| `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | Fet / kursiv / understruken (endast dokumentläge) |
-| `Ctrl+Alt+1` / `Ctrl+Alt+2` / `Ctrl+Alt+3` | Rubrik 1 / 2 / 3 (endast dokumentläge) |
-| `Ctrl+Alt+0` | Brödtext (endast dokumentläge) |
-| `Ctrl+L` / `Ctrl+E` / `Ctrl+R` / `Ctrl+J` | Vänster-, center-, höger- och marginaljustera (endast dokumentläge) |
-| `Ctrl+Shift+>` / `Ctrl+Shift+<` (eller `Ctrl+]` / `Ctrl+[`) | Större / mindre text, ett steg (endast dokumentläge) |
-| `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Byt mellan läsläge och redigering för Markdown |
-| `Ctrl+\` | Dela vyn i två rutor |
-| `Ctrl+Shift+\` | Dela vyn vågrätt |
-| `F6` | Byt aktiv ruta i delad vy |
-| `Ctrl+Shift+O` | Navigeringsfönster (rubrikträd) på/av |
-| `Ctrl+D` | Lägg till nästa förekomst av markeringen (eller ordet vid markören) som egen markör (textläge) |
-| `Ctrl+Shift+L` | Markera alla förekomster (textläge) |
-| `Alt+klick` | Lägg till en markör (textläge) |
-| `Alt+Shift+drag` eller mittenknappen | Kolumnmarkering: en markering per rad (textläge) |
-| `Esc` | Tillbaka till en markör (textläge, med flera markörer) |
-| `Ctrl+Space` / `Ctrl+Shift+Space` | Komplettering / signaturhjälp från språkservern (kodfiler) |
-| `F12` / `Ctrl+klick` / `Shift+F12` | Gå till definition / sök referenser (kodfiler) |
-| `F2` / `Shift+Alt+F` | Byt namn på symbol / formatera dokumentet (kodfiler) |
-| `Ctrl+Shift+K` | Byt tema |
-| `Ctrl+Shift+P` | Kommandopalett: sök och kör valfritt kommando |
+| `Ctrl+\` | Dela vyn |
+| `Ctrl+E` / `Ctrl+Shift+F` | Snabböppna / sök i filer |
+| `Ctrl+P` | Skriv ut |
 | `Ctrl+,` | Inställningar |
-| `Ctrl+Q` | Avsluta |
 
 ## Licens
 
