@@ -281,8 +281,17 @@ jobs:
       - name: Skapa .dmg
         run: |
           ln -s /Applications dist/dmg/Applications
-          hdiutil create -volname Kladd -srcfolder dist/dmg -ov -format UDZO \
-            "dist/Kladd-${VERSION}-macos-universal.dmg"
+          # hdiutil på GitHubs macOS-maskiner svarar ibland "Resource busy" (t.ex. medan Spotlight
+          # indexerar den nybyggda appen). Försök igen några gånger innan steget ger upp.
+          for n in 1 2 3 4 5; do
+            if hdiutil create -volname Kladd -srcfolder dist/dmg -ov -format UDZO \
+              "dist/Kladd-${VERSION}-macos-universal.dmg"; then
+              break
+            fi
+            if [ "$n" = 5 ]; then exit 1; fi
+            echo "hdiutil misslyckades (försök $n), försöker igen om 10 s"
+            sleep 10
+          done
 
       - name: Signera .dmg
         if: env.MACOS_CERT_P12_BASE64 != '' && env.MACOS_CERT_PASSWORD != '' && env.MACOS_SIGN_IDENTITY != ''
