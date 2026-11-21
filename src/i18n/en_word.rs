@@ -136,6 +136,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Ta utseendet på texten vid markören", "Take the look of the text at the cursor"),
     ("Tabell", "Table"),
     ("Tillbaka till texten", "Back to text"),
+    ("Redigera fotnot (dubbelklicka)", "Edit footnote (double-click)"),
     ("Titel", "Title"),
     ("Tre", "Three"),
     ("Två", "Two"),

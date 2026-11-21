@@ -133,6 +133,10 @@ pub struct State {
     highlight: Option<[u8; 3]>,
     /// Fotnotshopp som väntar på att musknappen släpps (layouten ändras när markören flyttas vid nedtryckning).
     fn_pending: Option<usize>,
+    /// Som `fn_pending`, men för en fotnot som ritas längst ned på sin sida: etiketten att redigera.
+    fn_open_pending: Option<String>,
+    /// Fotnoten som redigeras på sin sida just nu (se `notesui`).
+    pub(crate) fn_edit: Option<super::notesui::NoteEdit>,
     /// Granska: spårade ändringar och kommentarer.
     pub(crate) review: super::reviewui::ReviewState,
 }
@@ -368,8 +372,19 @@ impl KladdApp {
     /// Infogar en fotnot vid markören och flyttar markören till den nya definitionen.
     pub(crate) fn word_footnote(&mut self, ctx: &egui::Context) {
         self.word_edit(ctx, |t, s| markup::insert_footnote(t, s.end));
-        let b = self.word_selection(ctx).start;
+        let mut b = self.word_selection(ctx).start;
         if let Some(doc) = self.docs.get(self.active) {
+            // Definitionen står dold sist i texten och redigeras på sidan: rulla till referensen i stället.
+            if let Some(d) = markup::footnotes(&doc.text).defs.into_iter().find(|d| d.full.start <= b && b <= d.full.end) {
+                let a = self.word.analysis(doc.id, &doc.text);
+                if let Some(r) = markup::footnote_target(&doc.text, &a, &d.label, true) {
+                    b = r;
+                }
+                self.wv.fn_edit = Some(super::notesui::NoteEdit::new(&d.label));
+                // Textrutan på sidan tar fokus (inte brödtexten).
+                self.focus_editor = false;
+                ctx.request_repaint();
+            }
             self.scroll_to_char = Some(byte_to_char(&doc.text, b));
         }
     }
@@ -1185,6 +1200,10 @@ impl KladdApp {
             let mut open_hf_dlg: Option<(bool, usize)> = None;
             let mut fn_jump: Option<usize> = None;
             let mut fn_pending = self.wv.fn_pending.take();
+            let mut fn_open: Option<String> = None;
+            let mut fn_open_pending = self.wv.fn_open_pending.take();
+            let mut note_edit = self.wv.fn_edit.take();
+            let mut note_out = super::notesui::Out::default();
             let mut rstate = std::mem::take(&mut self.wv.review);
             let mut rv_before = rv.before.clone();
             let mut pane_act: Option<super::reviewui::PaneAct> = None;
@@ -1332,9 +1351,18 @@ impl KladdApp {
                 // Håller markören i tabellcellens innehåll (klick på dolda pipor och utfyllnad).
                 tables::fix_caret(ui.ctx(), id, text);
 
-                // Fotnoter: skiljelinje över definitionerna; numret är en länk mellan referens och definition.
+                // Fotnoter: skiljelinje över definitionerna som står sist (de som inte ritas längst ned på sin
+                // sida); numret är en länk mellan referens och definition.
                 if text.contains("[^") {
-                    if let Some(start) = markup::footnote_area_start(text, &analysis) {
+                    let notes = word.notes(doc_id, text);
+                    let collapsed = |b: usize| notes.iter().any(|n| n.line.start <= b && b < n.line.end.max(n.line.start + 1));
+                    let area = markup::footnote_area_start(text, &analysis).and_then(|s| {
+                        if !collapsed(s) {
+                            return Some(s);
+                        }
+                        analysis.pieces.iter().find(|pc| pc.block == Block::Footnote && pc.range.start > s && !collapsed(pc.range.start) && !text[pc.range.clone()].trim().is_empty()).map(|pc| pc.range.start)
+                    });
+                    if let Some(start) = area {
                         let r = galley.pos_from_cursor(CCursor::new(byte_to_char(text, start))).translate(gpos.to_vec2());
                         let y = (r.top() - px(z, 5.0)).round() + 0.5;
                         let (cl, cw) = col_at(r.left() - gpos.x, r.top() - gpos.y);
@@ -1347,16 +1375,34 @@ impl KladdApp {
                             let ra = galley.pos_from_cursor(CCursor::new(byte_to_char(text, lr.start))).translate(gpos.to_vec2());
                             let rb = galley.pos_from_cursor(CCursor::new(byte_to_char(text, lr.end))).translate(gpos.to_vec2());
                             let hit = Rect::from_min_max(ra.min, rb.max).expand2(vec2(3.0, 0.0));
-                            if hit.contains(q) {
+                            if hit.contains(q) && !is_def {
+                                // Fotnoten står längst ned på sidan: klick (när raden inte visar sin markup) och
+                                // dubbelklick öppnar den för redigering.
+                                let on_page = notes.iter().any(|n| n.label == label);
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                let tip = if is_def { t("Tillbaka till texten") } else { t("Gå till fotnot (Ctrl+klick)") };
+                                let tip = if on_page { t("Redigera fotnot (dubbelklicka)") } else { t("Gå till fotnot (Ctrl+klick)") };
                                 egui::Tooltip::always_open(ui.ctx().clone(), out.response.layer_id, out.response.id.with("fotnot"), egui::PopupAnchor::Pointer)
                                     .show(|ui| ui.label(tip));
-                                let (ctrl, pressed) = ui.input(|i| (i.modifiers.command, i.pointer.primary_pressed()));
+                                let (ctrl, pressed, dbl) = ui.input(|i| (i.modifiers.command, i.pointer.primary_pressed(), i.pointer.button_double_clicked(egui::PointerButton::Primary)));
+                                if on_page && dbl {
+                                    fn_open = Some(label.clone());
+                                }
                                 // Ctrl+klick hoppar alltid; ett vanligt klick hoppar bara om raden inte redan visar sin markup
                                 // (annars går det inte att redigera runt numret). Hoppet görs när knappen släpps.
                                 if pressed && (ctrl || !overlaps(&lr, &reveal)) {
-                                    fn_pending = markup::footnote_target(text, &analysis, &label, is_def);
+                                    if on_page {
+                                        fn_open_pending = Some(label.clone());
+                                    } else {
+                                        fn_pending = markup::footnote_target(text, &analysis, &label, false);
+                                    }
+                                }
+                            } else if hit.contains(q) {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                egui::Tooltip::always_open(ui.ctx().clone(), out.response.layer_id, out.response.id.with("fotnot"), egui::PopupAnchor::Pointer)
+                                    .show(|ui| ui.label(t("Tillbaka till texten")));
+                                let (ctrl, pressed) = ui.input(|i| (i.modifiers.command, i.pointer.primary_pressed()));
+                                if pressed && (ctrl || !overlaps(&lr, &reveal)) {
+                                    fn_pending = markup::footnote_target(text, &analysis, &label, true);
                                 }
                             }
                         }
@@ -1365,8 +1411,12 @@ impl KladdApp {
                 let (released, down) = ui.input(|i| (i.pointer.primary_released(), i.pointer.primary_down()));
                 if released {
                     fn_jump = fn_pending.take();
+                    if fn_open.is_none() {
+                        fn_open = fn_open_pending.take();
+                    }
                 } else if !down {
                     fn_pending = None;
+                    fn_open_pending = None;
                 }
 
                 // Kommentarsfältet till höger om sidan.
@@ -1431,6 +1481,24 @@ impl KladdApp {
                     if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, &page_hf, &analysis.defaults, hf_font.clone(), doc_id, z, &hf_imgs) {
                         open_hf_dlg = Some((footer, k));
                     }
+                }
+                // Fotnoterna längst ned på sina sidor.
+                let page_notes = word.notes(doc_id, text);
+                if !page_notes.is_empty() {
+                    let env = super::notesui::Env {
+                        palette: p,
+                        zoom: z,
+                        doc_id,
+                        text,
+                        boxes: &boxes,
+                        notes: &page_notes,
+                        page_left,
+                        origin_y,
+                        clip,
+                        defaults: &analysis.defaults,
+                        family: font_family(Some(analysis.defaults.font()), false, false),
+                    };
+                    note_out = super::notesui::show(ui, &env, &mut note_edit);
                 }
                 let painter = ui.painter().clone();
 
@@ -1883,6 +1951,9 @@ impl KladdApp {
 
             self.wv.pages = page_pos;
             self.wv.fn_pending = fn_pending;
+            self.wv.fn_open_pending = fn_open_pending;
+            self.wv.fn_edit = note_edit;
+            self.word_notes_after(&ctx, fn_open, note_out);
             self.wv.review = rstate;
             if let Some(t) = pending_track {
                 self.review_apply_tracked(&ctx, t);

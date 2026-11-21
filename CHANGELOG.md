@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **Fotnoter längst ned på sin sida i dokumentläget.** Varje fotnot ritas nu under en kort skiljelinje längst ned på sidan där referensen står, i mindre text med upphöjt nummer, som i Word och i PDF-exporten. Sidbrytningen reserverar plats för sidans fotnoter, och en rad med en referens flyttas till nästa sida om raden och noten inte ryms tillsammans (spalter fungerar också). Klicka på en fotnot, dubbelklicka referensen eller använd *Infoga → Fotnot* för att redigera noten på plats; Enter eller Esc avslutar. Definitionerna ligger kvar sist i texten (dolda i flödet), så markör, klick och markering fungerar som förut. Slutnoter står kvar sist i dokumentet.
+
 ### Ändrat
 
 - README är nu en kort översikt med en tabell över filformaten Kladd öppnar, sparar och exporterar. Hela beskrivningen av funktionerna finns i `docs/handbok.md`.

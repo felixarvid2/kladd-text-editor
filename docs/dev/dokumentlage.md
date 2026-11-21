@@ -486,8 +486,16 @@ räknar inte etiketterna.
 
 **Dokumentläget**: etiketterna ritas med 0,65 × storlek, `valign = TOP` och `line_height = None` (med egen
 radhöjd centrerar egui alltid texten, så `valign` gör annars ingenting) i länkfärg; definitionerna med
-0,85 × brödtextens storlek under en skiljelinje (en tredjedels textbredd) före den första definitionen.
-Hovrar man ett nummer visas "Gå till fotnot" (Ctrl+klick); ett klick hoppar när knappen släpps (markören
+0,85 × brödtextens storlek under en skiljelinje (en tredjedels textbredd) längst ned på referensens sida.
+Definitionsraderna ligger kvar sist i galleriet men är hopkrympta och dolda (`layout_notes::plan`, bara med
+sidläge; slutnoter och definitioner utan referens förblir synliga), så raderna fortsätter vara i stigande
+y-ordning och markörmappningen i egui:s `Galley` gäller oförändrad. Notens utseende läggs ut separat
+(`fnotes::NoteLayout`); sidbrytningen (`pages::paginate_notes`, `secpages::paginate_sections`, delad logik i
+`fnotes::NoteFlow`) reserverar noternas höjd längst ned på sidan (`PageBox::notes`/`reserved`, tak en halv sida)
+och flyttar en rad med referens till nästa sida om raden och noten inte ryms. `notesui` ritar noterna per ark,
+och ett klick öppnar en textruta ovanpå (`NoteEdit`) vars text skrivs tillbaka till definitionen (ett ångra-steg
+per redigering). Hamnar markören i en dold definition (infogad fotnot, sökträff) öppnas noten och markören går
+till referensen. Hovrar man ett nummer visas "Redigera fotnot" (dubbelklick); ett klick hoppar när knappen släpps (markören
 flyttas vid nedtryckningen och ändrar layouten, så hoppet kan inte ske vid nedtryckningen). Ett vanligt klick
 hoppar bara om raden inte redan visar sin markup, annars krävs Ctrl. Efter varje ändring numreras fotnoterna
 om om etiketterna inte längre är 1..n i ordning (`word_renumber_footnotes`). Backspace direkt efter (Delete

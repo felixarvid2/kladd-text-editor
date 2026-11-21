@@ -15,6 +15,7 @@ use egui::{
 
 use super::layout::px;
 use super::markup::{self, Align as HAlign, DocDefaults};
+use super::fnotes::{NoteFlow, NoteSpec, PageNotes};
 use super::secpages::PageBox;
 use crate::app::{KladdApp, quiet_button};
 use crate::i18n::t;
@@ -112,9 +113,25 @@ pub fn paginate(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], 
 /// Som `paginate`, men raderna i `breaks` (stigande; sidbrytningsraderna, `<!-- kladd: sidbrytning -->`)
 /// börjar alltid en ny sida om den nuvarande har innehåll.
 pub fn paginate_breaks(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, f32)], groups: &[std::ops::Range<usize>], breaks: &[usize]) {
+    paginate_notes(g, geom, ppp, floats, groups, breaks, &NoteSpec::default());
+}
+
+/// Som `paginate_breaks`, men med plats längst ned på sidorna för fotnoterna i `notes` (en rad med en
+/// referens flyttas till nästa sida om inte både raden och noten ryms). Ger fotnoterna per sida.
+#[allow(clippy::too_many_arguments)]
+pub fn paginate_notes(
+    g: &mut Galley,
+    geom: &Geom,
+    ppp: f32,
+    floats: &[(usize, f32)],
+    groups: &[std::ops::Range<usize>],
+    breaks: &[usize],
+    notes: &NoteSpec,
+) -> Vec<PageNotes> {
     if g.rows.is_empty() {
-        return;
+        return Vec::new();
     }
+    let mut flow = NoteFlow::new(notes);
     let text_h = geom.text_h();
     let stride = geom.stride();
     let eps = 0.5 / ppp;
@@ -143,14 +160,19 @@ pub fn paginate_breaks(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, 
         let top = y0 + shift;
         let page_top = page as f32 * stride;
         let forced = breaks.binary_search(&i).is_ok();
-        if forced && top > page_top + eps || top + h.max(fh) > page_top + text_h + eps && top > page_top + eps {
+        flow.enter(page);
+        let limit = page_top + text_h - flow.reserved() - flow.need(i..end).1;
+        if forced && top > page_top + eps || top + h.max(fh) > limit + eps && top > page_top + eps {
             // Nästa sida, men inte över en rad som sträcker sig förbi arket.
             page += 1;
             while (page as f32 * stride) < prev_bottom - eps {
                 page += 1;
             }
             shift = round(page as f32 * stride - y0);
+            flow.enter(page);
         }
+        let (new, extra) = flow.need(i..end);
+        flow.commit(new, extra);
         for pr in &mut g.rows[i..end] {
             pr.pos.y += shift;
         }
@@ -165,6 +187,7 @@ pub fn paginate_breaks(g: &mut Galley, geom: &Geom, ppp: f32, floats: &[(usize, 
     for pr in &g.rows {
         g.mesh_bounds |= pr.row.visuals.mesh_bounds.translate(pr.pos.to_vec2());
     }
+    flow.finish()
 }
 
 /// Antal sidor i ett paginerat galleri (minst 1).
@@ -496,6 +519,82 @@ mod tests {
             std::mem::forget(r);
         }
         out.unwrap()
+    }
+
+    /// Som `paged_breaks`, men med fotnoter (`NoteSpec`); ger också noterna per sida.
+    fn paged_notes(n: usize, breaks: &[usize], spec: &NoteSpec) -> (Arc<Galley>, Vec<PageNotes>) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut out = None;
+        for _ in 0..2 {
+            let r = ctx.run_ui(Default::default(), |ui| {
+                let mut job = LayoutJob::default();
+                for i in 0..n {
+                    job.append(
+                        &format!("rad {i}\n"),
+                        0.0,
+                        TextFormat { font_id: FontId::proportional(14.0), line_height: Some(17.0), ..Default::default() },
+                    );
+                }
+                job.wrap.max_width = 200.0;
+                let mut g = ui.ctx().fonts_mut(|f| f.layout_job(job));
+                let pn = paginate_notes(Arc::make_mut(&mut g), &geom(), 1.0, &[], &[], breaks, spec);
+                out = Some((g, pn));
+            });
+            std::mem::forget(r);
+        }
+        out.unwrap()
+    }
+
+    fn note_spec(refs: &[(usize, usize)], heights: &[f32]) -> NoteSpec {
+        NoteSpec { refs: refs.to_vec(), heights: heights.to_vec(), sep: 10.0, cap: 160.0 }
+    }
+
+    #[test]
+    fn fotnot_reserverar_plats_langst_ned_pa_sin_sida() {
+        let geom = geom();
+        // Sidan rymmer 18 rader (320 px). Noten (40 px + 10 px skiljelinje) på rad 3 tar plats från rad 15 och nedåt.
+        let (g, pn) = paged_notes(40, &[], &note_spec(&[(3, 0)], &[40.0]));
+        assert_eq!(pn.len(), 1);
+        assert_eq!(pn[0], PageNotes { notes: vec![0], reserved: 50.0 });
+        let on_first: Vec<_> = g.rows.iter().filter(|r| geom.page_of(r.pos.y) == 0).collect();
+        assert_eq!(on_first.len(), 15, "(320 - 50) / 17 = 15 rader");
+        assert!(on_first.iter().all(|r| r.pos.y + r.row.size.y <= geom.text_h() - 50.0 + 0.01));
+        // Utan noten ryms 18 rader.
+        let (g0, pn0) = paged_notes(40, &[], &NoteSpec::default());
+        assert!(pn0.is_empty());
+        assert_eq!(g0.rows.iter().filter(|r| geom.page_of(r.pos.y) == 0).count(), 18);
+    }
+
+    #[test]
+    fn rad_med_fotnot_flyttas_om_noten_inte_ryms() {
+        let geom = geom();
+        // Rad 17 är sista raden som ryms på sidan. Med en 30 px hög not (och 10 px skiljelinje) ryms den inte.
+        let (g, pn) = paged_notes(30, &[], &note_spec(&[(17, 0)], &[30.0]));
+        assert_eq!(geom.page_of(g.rows[16].pos.y), 0);
+        assert_eq!(geom.page_of(g.rows[17].pos.y), 1, "raden och dess not flyttas till nästa sida");
+        assert!(pn[0].notes.is_empty() && pn[1].notes == vec![0], "{pn:?}");
+        // En not på rad 14 ryms (ger 280 px) och raden stannar.
+        let (g, pn) = paged_notes(30, &[], &note_spec(&[(14, 0)], &[30.0]));
+        assert_eq!(geom.page_of(g.rows[14].pos.y), 0);
+        assert_eq!(pn[0].notes, vec![0]);
+        // Raderna efter flyttas inte över noten.
+        assert!(g.rows.iter().filter(|r| geom.page_of(r.pos.y) == 0).all(|r| r.pos.y + r.row.size.y <= geom.text_h() - 40.0 + 0.01));
+    }
+
+    #[test]
+    fn flera_fotnoter_och_sidbrytning() {
+        let geom = geom();
+        // Tre noter: två på första sidan (skiljelinjen räknas en gång), en efter en sidbrytning på andra.
+        let spec = note_spec(&[(2, 0), (5, 1), (9, 2)], &[20.0, 30.0, 25.0]);
+        let (g, pn) = paged_notes(20, &[8], &spec);
+        assert_eq!(pn[0], PageNotes { notes: vec![0, 1], reserved: 60.0 });
+        assert_eq!(pn[1], PageNotes { notes: vec![2], reserved: 35.0 });
+        assert_eq!(geom.page_of(g.rows[8].pos.y), 1, "brytningsraden börjar sidan");
+        // Samma not refererad två gånger placeras bara på första sidan.
+        let (_, pn) = paged_notes(40, &[], &note_spec(&[(1, 0), (25, 0)], &[20.0]));
+        assert_eq!(pn[0].notes, vec![0]);
+        assert!(pn.get(1).is_none_or(|p| p.notes.is_empty()));
     }
 
     #[test]

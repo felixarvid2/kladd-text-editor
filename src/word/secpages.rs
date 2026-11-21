@@ -15,6 +15,7 @@ use std::sync::Arc;
 use egui::epaint::text::Galley;
 use egui::Rect;
 
+use super::fnotes::{NoteFlow, NoteSpec};
 use super::layout::px;
 use super::pages::{Geom, SHEET_GAP};
 use super::sections::Section;
@@ -225,6 +226,8 @@ impl Geom {
                 margin: [self.top, self.right, self.bottom, self.left],
                 regions: vec![Region { y0: k as f32 * self.stride(), cols: 1, col_w: self.text_w(), gap: 0.0, col_ws: Vec::new(), rule: false, used: 0.0 }],
                 sec: 0,
+                notes: Vec::new(),
+                reserved: 0.0,
             })
             .collect()
     }
@@ -285,6 +288,10 @@ pub struct PageBox {
     pub regions: Vec<Region>,
     /// Avsnittet arket börjar i.
     pub sec: usize,
+    /// Fotnoterna (index i `NoteLayout`-listan) vars referenser står på arket, och höjden som
+    /// reserverats för dem längst ned i textytan (se `fnotes`).
+    pub notes: Vec<usize>,
+    pub reserved: f32,
 }
 
 impl PageBox {
@@ -294,6 +301,11 @@ impl PageBox {
 
     pub fn text_bottom(&self) -> f32 {
         self.top + self.h - self.margin[2]
+    }
+
+    /// Där fotnoternas område börjar (textytans nederkant om arket saknar fotnoter).
+    pub fn notes_top(&self) -> f32 {
+        self.text_bottom() - self.reserved
     }
 
     /// Textytans vänsterkant (samma koordinater som `left`).
@@ -457,6 +469,7 @@ pub fn paginate_sections(
     row_sec: &[u32],
     col_breaks: &[usize],
     page_breaks: &[usize],
+    notes: &NoteSpec,
 ) -> Paged {
     let n_rows = g.rows.len();
     let mut boxes: Vec<PageBox> = Vec::new();
@@ -480,6 +493,7 @@ pub fn paginate_sections(
     let mut prev_bottom = f32::NEG_INFINITY;
     let mut units: Vec<Unit> = Vec::new();
     let mut broke_page = false; // avsnittsdelen har gått över en sidgräns
+    let mut flow = NoteFlow::new(notes);
 
     fn new_sheet(boxes: &mut Vec<PageBox>, geom: &Geom, sec: usize, sg: &SecGeom) {
         let top = match boxes.last() {
@@ -494,6 +508,8 @@ pub fn paginate_sections(
             margin: [sg.top, sg.right, sg.bottom, sg.left],
             regions: vec![Region { y0: top + sg.top, cols: sg.cols, col_w: sg.col_w, gap: sg.gap, col_ws: sg.col_ws.clone(), rule: sg.rule, used: 0.0 }],
             sec,
+            notes: Vec::new(),
+            reserved: 0.0,
         });
     }
     // Ark som en tidigare hög rad sträcker sig över hoppas över (de blir tomma ark).
@@ -613,11 +629,25 @@ pub fn paginate_sections(
                 advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, true);
             }
         } else {
-            let text_bottom = boxes[boxes.len() - 1].text_bottom();
-            if col_y + h.max(fh) > text_bottom + eps && col_y > region_top + eps {
+            // Fotnoterna på raderna ska få plats längst ned på samma ark (över alla spalter).
+            let mut guard = 0;
+            loop {
+                let bi = boxes.len() - 1;
+                flow.enter(bi);
+                let extra = flow.need(i..end).1;
+                let limit = boxes[bi].text_bottom() - flow.reserved() - extra;
+                let no_room = col_y + h.max(fh) > limit + eps && col_y > region_top + eps;
+                let overlaps = extra > 0.0 && page_bottom > limit + eps && page_bottom > region_top + eps;
+                if !(no_room || overlaps) || guard >= 8 {
+                    break;
+                }
                 advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, false);
+                guard += 1;
             }
         }
+        flow.enter(boxes.len() - 1);
+        let (new, extra) = flow.need(i..end);
+        flow.commit(new, extra);
         let _ = region_page;
 
         let top = round(col_y);
@@ -657,6 +687,10 @@ pub fn paginate_sections(
     }
     g.rect.max.x = max_x.max(geom.edit_w());
     g.rect.max.y = max_y.max(prev_bottom);
+    for (b, n) in boxes.iter_mut().zip(flow.finish()) {
+        b.notes = n.notes;
+        b.reserved = n.reserved;
+    }
     Paged { boxes, dx }
 }
 

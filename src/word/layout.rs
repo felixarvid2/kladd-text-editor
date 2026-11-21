@@ -21,6 +21,9 @@ use super::pbox::{self, LineRule, PPr};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
+#[path = "layout_notes.rs"]
+mod notes;
+
 /// Punkter till pixlar vid zoom (96 dpi).
 /// Words standardavstånd mellan tabbstopp (0,5 tum).
 pub const TAB_STOP_PT: f32 = 36.0;
@@ -129,6 +132,8 @@ struct DocState {
     float_starts: Vec<(usize, Float, usize)>,
     /// Arken i senaste utläggningen (läge, mått och spalter), se `secpages`.
     page_boxes: Arc<Vec<super::secpages::PageBox>>,
+    /// Fotnoterna som ritas längst ned på sidorna i senaste utläggningen (se `fnotes`).
+    notes: Arc<Vec<super::fnotes::NoteLayout>>,
 }
 
 #[derive(Default)]
@@ -168,6 +173,7 @@ impl Cache {
             tick: 0,
             float_starts: Vec::new(),
             page_boxes: Arc::default(),
+            notes: Arc::default(),
         });
         if st.text != text {
             // Stora dokument: tolka bara om stycket med ändringen (samma resultat som `analyze`) och
@@ -212,6 +218,11 @@ impl Cache {
     /// Arken från senaste omläggningen av `text` (tom om den inte gjorts med sidbrytning).
     pub fn page_boxes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::secpages::PageBox>> {
         self.state(doc_id, text).page_boxes.clone()
+    }
+
+    /// Fotnoterna från senaste omläggningen av `text`: `PageBox::notes` pekar in i listan.
+    pub fn notes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::fnotes::NoteLayout>> {
+        self.state(doc_id, text).notes.clone()
     }
 
     pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
@@ -488,7 +499,10 @@ fn relayout(
         format!("{:?}", a.defaults).hash(&mut h);
         h.finish()
     };
-    let paras = paragraphs(text, &a, p);
+    let mut paras = paragraphs(text, &a, p);
+    // Fotnotsdefinitionerna ritas längst ned på sidan; i flödet blir de dolda rader.
+    let defs = if pages.is_some() { notes::plan(text, &a, &mut paras, p.zoom) } else { Vec::new() };
+    let mut note_layouts: Vec<super::fnotes::NoteLayout> = Vec::new();
     let groups = group_paras(text, &paras, &grid);
     let min_h = px(p.zoom, a.defaults.size()) * 1.4;
 
@@ -532,6 +546,11 @@ fn relayout(
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
+        let note_def = defs.iter().find(|d| d.para == pr.start && !table);
+        if let Some(d) = note_def {
+            note_layouts.push(notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d));
+            gp[0].collapse = true;
+        }
         let mut anchor: Option<(FloatSpec, FloatPlan)> = None;
         if let (Some(f), false) = (gp[0].float, table) {
             let ctx = match pages {
@@ -592,6 +611,9 @@ fn relayout(
             job.sections = build_sections(text, &a, p, &grid, w.clone());
             for s in &mut job.sections {
                 s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
+            }
+            if note_def.is_some() {
+                notes::hide_all(&mut job, (p.font_family)(Some(a.defaults.font()), false, false));
             }
             let relp: Vec<Para> =
                 gp.iter().map(|q| Para { range: q.range.start - w.start..q.range.end - w.start, ..q.clone() }).collect();
@@ -695,9 +717,13 @@ fn relayout(
         format: TextFormat::default(),
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
+    let spec = match pages {
+        Some(geom) if !note_layouts.is_empty() => notes::spec(&note_layouts, &g, text, &a, p.zoom, geom.text_h() * 0.5),
+        _ => super::fnotes::NoteSpec::default(),
+    };
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec);
             // Tabellernas kolumnkanter följer med raderna i sidled.
             for (t, r) in geoms.iter_mut().zip(&geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
@@ -706,12 +732,18 @@ fn relayout(
             st.page_boxes = Arc::new(paged.boxes);
         }
         Some(geom) => {
-            super::pages::paginate_breaks(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks);
-            st.page_boxes = Arc::new(geom.uniform_boxes(super::pages::page_count(&g, geom)));
+            let pn = super::pages::paginate_notes(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks, &spec);
+            let mut boxes = geom.uniform_boxes(super::pages::page_count(&g, geom));
+            for (b, n) in boxes.iter_mut().zip(pn) {
+                b.notes = n.notes;
+                b.reserved = n.reserved;
+            }
+            st.page_boxes = Arc::new(boxes);
         }
         None => st.page_boxes = Arc::default(),
     }
     st.geoms = Arc::new(geoms);
+    st.notes = Arc::new(note_layouts);
     g
 }
 
