@@ -162,9 +162,9 @@ Avsnittet börjar vid en egen rad som visas bara när markören står på den. E
 <!-- kladd: avsnitt; page: A4 landscape; page-margin: 20mm; columns: 2; column-gap: 12mm -->
 ```
 
-`column-widths: 40mm 120mm` ger olika breda spalter och `column-rule: yes` en skiljelinje mellan spalterna (båda följer med till `.docx`, `.odt` och PDF, och läses från Word och LibreOffice). Ett stycke som fortsätter från en bredare spalt in i en smalare bryts i respektive spalts bredd. *Spalter…* nollställer bredderna och linjen när du byter antal spalter.
+`column-widths: 40mm 120mm` ger olika breda spalter och `column-rule: yes` en skiljelinje mellan spalterna (båda följer med till `.docx`, `.odt` och PDF, och läses från Word och LibreOffice). Ett stycke som fortsätter från en bredare spalt in i en smalare bryts i respektive spalts bredd. *Spalter…* nollställer bredderna och linjen när du byter antal spalter. `column-balance: no` på avsnittsraden stänger av utjämningen av avsnittets sista sida (`.odt`: `text:dont-balance-text-columns`).
 
-Med `type: continuous` börjar avsnittet på samma sida (för att byta antal spalter mitt på en sida; spalterna i avsnittet före jämnas ut, också när de har olika bredd; i PDF jämnas de inte ut). Bilder och tabeller anpassas till spaltens bredd, sidnumren löper över avsnitten (om inte ett avsnitt börjar om med `page-start`) och sidhuvud och sidfot ärvs från föregående avsnitt tills ett avsnitt har egna. Avsnitten följer med till `.docx` (`w:sectPr`: sidstorlek, orientering, marginaler, spalter och typ), `.odt` (sidmallar, och `text:section` för spalter) och PDF.
+Med `type: continuous` börjar avsnittet på samma sida (för att byta antal spalter mitt på en sida; spalterna i avsnittet före jämnas ut, också när de har olika bredd, och likadant i PDF; en manuell spaltbrytning på sidan stänger av utjämningen). Bilder och tabeller anpassas till spaltens bredd, sidnumren löper över avsnitten (om inte ett avsnitt börjar om med `page-start`) och sidhuvud och sidfot ärvs från föregående avsnitt tills ett avsnitt har egna. Avsnitten följer med till `.docx` (`w:sectPr`: sidstorlek, orientering, marginaler, spalter och typ), `.odt` (sidmallar, och `text:section` för spalter) och PDF.
 
 ### Ekvationer
 

@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **PDF-exporten jämnar ut spalterna** på avsnittets sista sida före ett löpande avsnittsbyte, för lika och olika breda spalter, så att nästa avsnitt börjar under den högsta spalten och skiljelinjerna följer den utjämnade höjden. Ett avsnitt med manuell spaltbrytning jämnas inte ut, och inte heller det sista avsnittet i dokumentet. Fotnoter fungerar som förut. Ett `text:section` med spalter i en `.odt` (LibreOffice) jämnas ut också när det står sist i dokumentet, i PDF och dokumentläget; spalter från sidmallen och i `.docx` jämnas inte ut sist. `text:dont-balance-text-columns="true"` läses som `column-balance: no` (avsnittet jämnas inte ut, varken i PDF eller dokumentläget) och skrivs bara tillbaka för det; olika breda spalter skrivs inte längre som obalanserade.
+
 ## [2.5.0] – 2026-11-21
 
 ### Nytt

@@ -40,6 +40,8 @@ pub struct SecGeom {
     pub rule: bool,
     /// Börjar på samma sida som föregående avsnitt (om sidorna är lika stora).
     pub continuous: bool,
+    /// Spalterna jämnas inte ut på avsnittets sista ark.
+    pub no_balance: bool,
 }
 
 impl SecGeom {
@@ -76,6 +78,7 @@ impl SecGeom {
             col_ws,
             rule: s.rule,
             continuous: s.continuous,
+            no_balance: s.no_balance,
         }
     }
 
@@ -100,6 +103,7 @@ impl SecGeom {
             w.to_bits().hash(h);
         }
         self.continuous.hash(h);
+        self.no_balance.hash(h);
     }
 }
 
@@ -168,6 +172,7 @@ impl Geom {
                 col_ws: Vec::new(),
                 rule: false,
                 continuous: false,
+                no_balance: false,
             },
         }
     }
@@ -186,7 +191,7 @@ impl Geom {
     /// spalterna ut på avsnittets sista ark (se `layout::relayout`).
     pub fn balance_candidate(&self, i: usize) -> bool {
         let (a, b) = (self.sec(i), self.secs.get(i + 1));
-        !a.col_ws.is_empty() && b.is_some_and(|b| b.continuous && b.same_sheet(&a))
+        !a.no_balance && !a.col_ws.is_empty() && b.is_some_and(|b| b.continuous && b.same_sheet(&a))
     }
 
     /// Bredaste arket.
@@ -647,13 +652,13 @@ pub fn paginate_sections(
         if sec != cur_sec {
             let ng = geom.sec(sec);
             let same = boxes.last().is_some_and(|b| {
-                let cmp = SecGeom { cols: 1, col_w: 0.0, gap: 0.0, col_ws: Vec::new(), rule: false, continuous: false, page_w: b.w, page_h: b.h, top: b.margin[0], right: b.margin[1], bottom: b.margin[2], left: b.margin[3] };
+                let cmp = SecGeom { cols: 1, col_w: 0.0, gap: 0.0, col_ws: Vec::new(), rule: false, continuous: false, no_balance: false, page_w: b.w, page_h: b.h, top: b.margin[0], right: b.margin[1], bottom: b.margin[2], left: b.margin[3] };
                 ng.same_sheet(&cmp)
             });
             if ng.continuous && same && cur_sec != usize::MAX {
                 // Föregående avsnitts spalter jämnas ut på sista sidan (som Word och LibreOffice gör vid ett
                 // löpande avsnittsbyte); `units` innehåller bara den sidans stycken.
-                if sg.cols > 1 && sg.col_ws.is_empty() && !units.is_empty() {
+                if sg.cols > 1 && sg.col_ws.is_empty() && !sg.no_balance && !units.is_empty() {
                     let hs: Vec<f32> = units.iter().map(|u| u.h).collect();
                     let cap = balanced_height(&hs, sg.cols);
                     let (mut c, mut y) = (0usize, region_top);

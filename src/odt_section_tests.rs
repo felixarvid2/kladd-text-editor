@@ -126,3 +126,71 @@ fn reads_libreoffice_style_columns() {
     let c = columns_of(&eq).unwrap();
     assert!(c.widths(453.5).is_empty() && !c.rule);
 }
+
+/// Ett minimalt `.odt` med givet innehåll och sidmallens spalter (`page_cols`).
+fn odt_with(body: &str, page_cols: &str) -> Vec<u8> {
+    odt_balance(body, page_cols, "false")
+}
+
+fn odt_balance(body: &str, page_cols: &str, dont_balance: &str) -> Vec<u8> {
+    let ns = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3""#;
+    let content = format!(
+        r#"<?xml version="1.0"?><office:document-content {ns}><office:automatic-styles><style:style style:name="Sect1" style:family="section"><style:section-properties text:dont-balance-text-columns="{dont_balance}"><style:columns fo:column-count="2" fo:column-gap="1cm"/></style:section-properties></style:style></office:automatic-styles><office:body><office:text>{body}</office:text></office:body></office:document-content>"#
+    );
+    let styles = format!(
+        r##"<?xml version="1.0"?><office:document-styles {ns}><office:styles><style:style style:name="Standard" style:family="paragraph"/></office:styles><office:automatic-styles><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" fo:margin-top="2cm" fo:margin-bottom="2cm" fo:margin-left="2cm" fo:margin-right="2cm">{page_cols}</style:page-layout-properties></style:page-layout></office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1"/></office:master-styles></office:document-styles>"##
+    );
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        z.start_file("mimetype", o).unwrap();
+        z.write_all(MIME.as_bytes()).unwrap();
+        for (n, b) in [("content.xml", content.as_bytes()), ("styles.xml", styles.as_bytes())] {
+            z.start_file(n, o).unwrap();
+            z.write_all(b).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+#[test]
+fn last_text_section_gets_a_closing_continuous_row_but_page_columns_do_not() {
+    let sect = odt_with(r#"<text:p>Före</text:p><text:section text:style-name="Sect1" text:name="S"><text:p>Ett</text:p><text:p>Två</text:p></text:section>"#, "");
+    let m = read(&sect).unwrap().markdown;
+    let rows = marks(&m);
+    assert_eq!(rows.len(), 2, "{m}");
+    assert_eq!(rows[0].columns, Some(2));
+    assert!(rows[0].continuous && rows[1].continuous && rows[1].columns.is_none(), "{m}");
+    assert!(m.trim_end().ends_with("-->"), "raden som stänger står sist: {m}");
+    // Tur och retur bevarar `text:section`, också när det står sist.
+    let back = write(&m, "T", &|_| None).unwrap();
+    let content = part(&back.bytes, "content.xml");
+    assert_eq!(content.matches("<text:section ").count(), 1, "{content}");
+    assert_eq!(marks(&read(&back.bytes).unwrap().markdown).len(), 2);
+    // Spalter i sidmallen ger inget avsnitt och ingen löpande rad: inget jämnas ut sist.
+    let page = odt_with(r#"<text:p>Ett</text:p><text:p>Två</text:p>"#, r#"<style:columns fo:column-count="2" fo:column-gap="1cm"/>"#);
+    let m = read(&page).unwrap().markdown;
+    assert!(marks(&m).iter().all(|r| !r.continuous), "{m}");
+}
+
+#[test]
+fn dont_balance_text_columns_is_read_written_and_round_trips() {
+    let body = r#"<text:p>Före</text:p><text:section text:style-name="Sect1" text:name="S"><text:p>Ett</text:p></text:section>"#;
+    // Läsning: `true` ger markören, `false` ger ingen.
+    let m = read(&odt_balance(body, "", "true")).unwrap().markdown;
+    assert!(marks(&m)[0].no_balance && m.contains("column-balance: no"), "{m}");
+    assert!(!marks(&read(&odt_balance(body, "", "false")).unwrap().markdown)[0].no_balance);
+    // Skrivning: bara avsnitt med markören får `dont-balance`, också olika breda spalter jämnas annars ut.
+    let md = "Rubrik\n\n<!-- kladd: avsnitt; columns: 2; column-widths: 40mm 100mm; type: continuous -->\n\nEtt\n\n<!-- kladd: avsnitt; type: continuous -->\n";
+    let w = write(md, "T", &|_| None).unwrap();
+    assert!(part(&w.bytes, "content.xml").contains(r#"text:dont-balance-text-columns="false""#));
+    let no = md.replace("type: continuous -->\n\nEtt", "type: continuous; column-balance: no -->\n\nEtt");
+    let w = write(&no, "T", &|_| None).unwrap();
+    assert!(part(&w.bytes, "content.xml").contains(r#"text:dont-balance-text-columns="true""#));
+    // Tur och retur.
+    let back = read(&w.bytes).unwrap().markdown;
+    assert!(marks(&back)[0].no_balance, "{back}");
+    assert!(!marks(&back)[1].no_balance);
+}
