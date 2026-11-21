@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley};
@@ -19,8 +19,24 @@ use crate::theme::{self, Palette};
 /// Filer större än så här färgas inte (för att editorn ska förbli snabb).
 const MAX_HIGHLIGHT_BYTES: usize = 400_000;
 
+static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
+
+/// Syntax-uppsättningen. Första anropet läser in den (tiotals ms i debugbygge); den som
+/// kommer under tiden väntar tills den är klar.
+fn syntaxes() -> &'static SyntaxSet {
+    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+/// Läser in syntaxerna i en bakgrundstråd, så att de är klara när första kodfilen ska färgas
+/// och inte fördröjer första bilden.
+pub fn preload() {
+    let _ = std::thread::Builder::new().name("syntax".into()).spawn(|| {
+        syntaxes();
+        crate::timing::mark("syntaxer inlästa (bakgrundstråd)");
+    });
+}
+
 pub struct Highlighter {
-    syntaxes: SyntaxSet,
     dark: Theme,
     light: Theme,
     docs: HashMap<u64, DocHl>,
@@ -157,7 +173,6 @@ pub(crate) fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(u
 impl Highlighter {
     pub fn new() -> Self {
         Self {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
             dark: build_theme(&theme::skymning()),
             light: build_theme(&theme::gryning()),
             docs: HashMap::new(),
@@ -168,19 +183,18 @@ impl Highlighter {
         self.docs.remove(&doc_id);
     }
 
-    fn syntax_for(&self, hint: &str, text: &str) -> Option<&SyntaxReference> {
+    fn syntax_for(&self, hint: &str, text: &str) -> Option<&'static SyntaxReference> {
         if !hint.is_empty() {
-            if let Some(s) = self
-                .syntaxes
+            if let Some(s) = syntaxes()
                 .find_syntax_by_extension(hint)
-                .or_else(|| self.syntaxes.find_syntax_by_name(hint))
+                .or_else(|| syntaxes().find_syntax_by_name(hint))
             {
                 return Some(s);
             }
         }
         let first_line = text.lines().next().unwrap_or("");
         if first_line.starts_with("#!") {
-            return self.syntaxes.find_syntax_by_first_line(first_line);
+            return syntaxes().find_syntax_by_first_line(first_line);
         }
         None
     }
@@ -282,7 +296,7 @@ impl Highlighter {
             }
             let end = text[pos..].find('\n').map_or(text.len(), |i| pos + i + 1);
             let line = &text[pos..end];
-            let ops = ps.parse_line(line, &self.syntaxes).ok()?;
+            let ops = ps.parse_line(line, syntaxes()).ok()?;
             let base = line.as_ptr() as usize;
             for (style, piece) in HighlightIterator::new(&mut hs, &ops, line, &hl) {
                 if piece.is_empty() {
@@ -464,6 +478,15 @@ pub(crate) fn apply_backgrounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntaxer_laddas_i_bakgrunden_och_hittas() {
+        preload();
+        let h = Highlighter::new();
+        assert_eq!(h.syntax_for("rs", "").map(|s| s.name.as_str()), Some("Rust"));
+        assert!(h.syntax_for("", "#!/bin/sh\necho\n").is_some());
+        assert!(h.syntax_for("", "vanlig text").is_none());
+    }
 
     #[test]
     fn finds_case_insensitive() {

@@ -51,11 +51,70 @@ enum Face {
     SansSemi,
     Mono,
     MonoMedium,
+    /// Carlito (Calibri) och Caladea (Cambria): används när dokumentet ber om dem, se `word::fontmap`.
+    Carlito,
+    CarlitoBold,
+    Serif,
+    SerifBold,
 }
 
+const FACES: [Face; 9] = [
+    Face::Sans,
+    Face::SansMedium,
+    Face::SansSemi,
+    Face::Mono,
+    Face::MonoMedium,
+    Face::Carlito,
+    Face::CarlitoBold,
+    Face::Serif,
+    Face::SerifBold,
+];
+
 impl Face {
+    /// Fet variant av en löptextsnitt (mono har ingen: den behåller sin).
+    fn strong(self) -> Face {
+        match self {
+            Face::Sans => Face::SansSemi,
+            Face::Carlito => Face::CarlitoBold,
+            Face::Serif => Face::SerifBold,
+            f => f,
+        }
+    }
+
+    /// Normal vikt av en fet variant.
+    fn plain(self) -> Face {
+        match self {
+            Face::SansSemi => Face::Sans,
+            Face::CarlitoBold => Face::Carlito,
+            Face::SerifBold => Face::Serif,
+            f => f,
+        }
+    }
+
+    fn is_mono(self) -> bool {
+        matches!(self, Face::Mono | Face::MonoMedium)
+    }
+
+    /// Löptextsnittet för ett typsnittsnamn: Calibri blir Carlito, serif (Cambria, Times,
+    /// Georgia...) Caladea, mono Plex Mono och allt annat Plex Sans.
+    fn for_family(name: &str) -> Face {
+        match crate::word::fontmap::bundled(name) {
+            Some(crate::word::fontmap::Bundled::Carlito) => Face::Carlito,
+            Some(crate::word::fontmap::Bundled::Caladea) => Face::Serif,
+            None => match classify_family(name) {
+                Family::Mono => Face::Mono,
+                Family::Serif => Face::Serif,
+                Family::Sans => Face::Sans,
+            },
+        }
+    }
+
     fn data(self) -> &'static [u8] {
         match self {
+            Face::Carlito => theme::CARLITO,
+            Face::CarlitoBold => theme::CARLITO_BOLD,
+            Face::Serif => crate::word::fontmap::CALADEA,
+            Face::SerifBold => crate::word::fontmap::CALADEA_BOLD,
             Face::Sans => theme::PLEX_SANS,
             Face::SansMedium => theme::PLEX_SANS_MEDIUM,
             Face::SansSemi => theme::PLEX_SANS_SEMIBOLD,
@@ -74,7 +133,7 @@ struct Measurer {
 impl Measurer {
     fn new() -> Self {
         let mut faces = HashMap::new();
-        for f in [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium] {
+        for f in FACES {
             faces.insert(f, rustybuzz::Face::from_slice(f.data(), 0).expect("inbyggt typsnitt"));
         }
         Self { faces, cache: HashMap::new() }
@@ -739,7 +798,7 @@ enum Family {
     Mono,
 }
 
-/// Grov klassning på namnet: Kladd bäddar bara in IBM Plex Sans och Mono.
+/// Grov klassning på namnet (Plex Sans/Mono och Caladea är inbäddade, se `Face::for_family`).
 fn classify_family(name: &str) -> Family {
     let n = name.to_ascii_lowercase();
     const MONO: [&str; 8] = ["courier", "consolas", "mono", "menlo", "monaco", "lucida console", "typewriter", "fixed"];
@@ -771,22 +830,13 @@ struct Piece {
 }
 
 fn face_for(style: &Style, base: Face) -> Face {
-    let base_mono = matches!(base, Face::Mono | Face::MonoMedium);
-    let mono = style.code
-        || match style.span.font_family.as_deref().map(classify_family) {
-            Some(Family::Mono) => true,
-            Some(_) => false,
-            None => base_mono,
-        };
-    if mono {
+    // Spannens eget typsnitt, annars styckets.
+    let own = style.span.font_family.as_deref().map(Face::for_family);
+    let face = if style.code { Face::Mono } else { own.unwrap_or(base) };
+    if face.is_mono() {
         return if style.bold { Face::MonoMedium } else { Face::Mono };
     }
-    // Ingen serif är inbäddad: serif-namn behåller sans.
-    let base = if base_mono { Face::Sans } else { base };
-    match (style.bold, base) {
-        (true, Face::Sans) => Face::SansSemi,
-        _ => base,
-    }
+    if style.bold { face.strong() } else { face }
 }
 
 /// Fördelar överskottet till `width` på mellanrummen i raden (marginaljustering).
@@ -817,12 +867,14 @@ struct ImgSize {
 }
 
 impl<'a> Layout<'a> {
+    /// Rubrikernas typsnitt (normal vikt): dokumentets eget, utom mono som får Plex Sans.
+    fn head_face(&self) -> Face {
+        if self.base.is_mono() { Face::Sans } else { self.base.plain() }
+    }
+
     fn new(resolve: &'a dyn Fn(&str) -> Option<DocImage>, defaults: &DocDefaults) -> Self {
         let body = defaults.size();
-        let base = match defaults.font_family.as_deref().map(classify_family) {
-            Some(Family::Mono) => Face::Mono,
-            _ => Face::Sans,
-        };
+        let base = defaults.font_family.as_deref().map_or(Face::Sans, Face::for_family);
         let (pw, ph) = defaults.page();
         let [mt, mr, mb, ml] = defaults.layout_margins();
         // Orimliga marginaler (större än sidan) ger ändå en användbar textyta.
@@ -880,7 +932,7 @@ impl<'a> Layout<'a> {
         self.ensure(size * LINE + self.body * LINE * 3.0);
         let (ml, cw, body) = (self.ml, self.cw, self.body);
         let title = vec![Span { text: "Innehåll".to_owned(), style: Style::default() }];
-        self.text_block(&title, ml, cw, Face::SansSemi, size, INK, false, None);
+        self.text_block(&title, ml, cw, self.head_face().strong(), size, INK, false, None);
         self.y += 6.0;
         let face = self.base;
         let line_h = body * LINE;
@@ -980,7 +1032,7 @@ impl<'a> Layout<'a> {
                     loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
                 }
             }
-            let base_face = if st.bold && self.base == Face::Sans { Face::SansSemi } else { self.base };
+            let base_face = if st.bold { self.base.strong() } else { self.base };
             let m = std::cell::RefCell::new(&mut self.m);
             let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
             let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
@@ -1727,7 +1779,7 @@ impl<'a> Layout<'a> {
             out
         };
         for (ri, r) in rows.iter().enumerate() {
-            let face = if ri == 0 && fmt.is_none_or(|f| f.header_bold) { Face::SansSemi } else { self.base };
+            let face = if ri == 0 && fmt.is_none_or(|f| f.header_bold) { self.head_face().strong() } else { self.base };
             let layout = cells_of(ri, r.len());
             // Mät radens höjd genom att lägga ut cellerna på en provsida.
             let mut heights = Vec::new();
@@ -1903,13 +1955,14 @@ impl<'a> Layout<'a> {
             match b {
                 Block::Heading(level, spans, align) => {
                     self.align = *align;
+                    let hb = self.head_face();
                     let (size, face, before) = match *level {
-                        TITLE_LEVEL => (26.0, Face::Sans, 0.0),
-                        SUBTITLE_LEVEL => (14.0, Face::Sans, 0.0),
-                        1 => (22.0, Face::SansSemi, 14.0),
-                        2 => (16.5, Face::SansSemi, 14.0),
-                        3 => (13.5, Face::SansSemi, 10.0),
-                        _ => (11.5, Face::SansSemi, 8.0),
+                        TITLE_LEVEL => (26.0, hb, 0.0),
+                        SUBTITLE_LEVEL => (14.0, hb, 0.0),
+                        1 => (22.0, hb.strong(), 14.0),
+                        2 => (16.5, hb.strong(), 14.0),
+                        3 => (13.5, hb.strong(), 10.0),
+                        _ => (11.5, hb.strong(), 8.0),
                     };
                     let size = size * self.scale;
                     // Formatmallens utseende (typsnittet är alltid det inbäddade).
@@ -1921,8 +1974,8 @@ impl<'a> Layout<'a> {
                     let st = self.styles.get(id).clone();
                     let size = st.size.unwrap_or(size);
                     let face = match (st.bold, *level >= TITLE_LEVEL) {
-                        (Some(false), _) | (None, true) => Face::Sans,
-                        (Some(true), true) => Face::SansSemi,
+                        (Some(false), _) | (None, true) => hb,
+                        (Some(true), true) => hb.strong(),
                         _ => face,
                     };
                     let ink = st.color.map_or(if *level == SUBTITLE_LEVEL { MUTED } else { INK }, |c| (c[0], c[1], c[2]));
@@ -1966,7 +2019,7 @@ impl<'a> Layout<'a> {
                     let st = self.styles.get(if *quote > 0 { style::StyleId::Quote } else { style::StyleId::Body }).clone();
                     let (color, italic) = (st.color.map_or(color, |c| (c[0], c[1], c[2])), st.italic.unwrap_or(italic));
                     let size = st.size.unwrap_or(self.body);
-                    let face = if st.bold == Some(true) && self.base == Face::Sans { Face::SansSemi } else { self.base };
+                    let face = if st.bold == Some(true) { self.base.strong() } else { self.base };
                     if *align == Align::Left {
                         self.align = st.align.unwrap_or(Align::Left);
                     }
@@ -2205,7 +2258,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let defaults = doc_defaults(markdown);
     let mut lay = lay_out(&blocks, &notes, &defaults, resolve);
 
-    let fonts: HashMap<Face, Font> = [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium]
+    let fonts: HashMap<Face, Font> = FACES
         .into_iter()
         .map(|f| (f, Font::new(krilla::Data::from(f.data()), 0).expect("inbyggt typsnitt")))
         .collect();
@@ -2604,8 +2657,33 @@ mod tests {
         let mut st = Style::default();
         st.span.font_family = Some("Courier New".into());
         assert_eq!(face_for(&st, Face::Sans), Face::Mono);
+        // Serif blir inbäddade Caladea, Calibri Carlito; fet ger fet variant av samma typsnitt.
         st.span.font_family = Some("Georgia".into());
-        assert_eq!(face_for(&st, Face::Sans), Face::Sans);
+        assert_eq!(face_for(&st, Face::Sans), Face::Serif);
+        st.span.font_family = Some("Cambria".into());
+        st.bold = true;
+        assert_eq!(face_for(&st, Face::Sans), Face::SerifBold);
+        st.span.font_family = Some("Calibri Light".into());
+        assert_eq!(face_for(&st, Face::Sans), Face::CarlitoBold);
+        st.span.font_family = None;
+        st.bold = false;
+        assert_eq!(face_for(&st, Face::Carlito), Face::Carlito);
+        assert_eq!(Face::for_family("Arial"), Face::Sans);
+        assert_eq!(Face::for_family("Calibri"), Face::Carlito);
+        assert_eq!(Face::for_family("Times New Roman"), Face::Serif);
+    }
+
+    /// PDF med Cambria och Calibri bäddar in Caladea respektive Carlito.
+    #[test]
+    fn pdf_med_cambria_och_calibri() {
+        for fam in ["Cambria", "Calibri"] {
+            let md = format!("<!-- kladd: font-family: \"{fam}\"; font-size: 11pt -->\n\n# Rubrik åäö\n\nBrödtext med **fet** och *kursiv*.\n");
+            let w = write(&md, "T", &|_| None).unwrap();
+            assert!(w.bytes.starts_with(b"%PDF"));
+            let hay = String::from_utf8_lossy(&w.bytes);
+            let want = if fam == "Cambria" { "Caladea" } else { "Carlito" };
+            assert!(hay.contains(want), "{fam}: {want} saknas i PDF:en");
+        }
     }
 
     #[test]

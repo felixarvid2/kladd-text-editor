@@ -756,15 +756,15 @@ impl CodeBlock {
         text: &str,
     ) -> egui::text::LayoutJob {
         let syntax = cache
-            .ps
+            .ps()
             .find_syntax_by_token(extension)
-            .unwrap_or_else(|| cache.ps.find_syntax_plain_text());
+            .unwrap_or_else(|| cache.ps().find_syntax_plain_text());
 
         let mut job = egui::text::LayoutJob::default();
         let mut h = HighlightLines::new(syntax, cache.curr_theme(ui, options));
 
         for line in LinesWithEndings::from(text) {
-            let ranges = h.highlight_line(line, &cache.ps).unwrap();
+            let ranges = h.highlight_line(line, cache.ps()).unwrap();
             for v in ranges {
                 let front = v.0.foreground;
                 job.append(
@@ -834,11 +834,13 @@ bitflags! {
 pub struct CommonMarkCache {
     // Everything stored in `CommonMarkCache` must take into account that
     // the cache is for multiple `CommonMarkviewer`s with different source_ids.
+    // Kladd: syntax- och temauppsättningarna läses först när ett kodblock ritas (att bygga dem
+    // tar tiotals millisekunder per cache och cachen skapas redan vid start).
     #[cfg(feature = "better_syntax_highlighting")]
-    ps: SyntaxSet,
+    ps: std::sync::OnceLock<SyntaxSet>,
 
     #[cfg(feature = "better_syntax_highlighting")]
-    ts: ThemeSet,
+    ts: std::sync::OnceLock<ThemeSet>,
 
     link_hooks: HashMap<String, bool>,
     viewers: HashMap<Id, ViewerCache>,
@@ -850,9 +852,9 @@ impl Default for CommonMarkCache {
     fn default() -> Self {
         Self {
             #[cfg(feature = "better_syntax_highlighting")]
-            ps: SyntaxSet::load_defaults_newlines(),
+            ps: std::sync::OnceLock::new(),
             #[cfg(feature = "better_syntax_highlighting")]
-            ts: ThemeSet::load_defaults(),
+            ts: std::sync::OnceLock::new(),
             link_hooks: HashMap::new(),
             viewers: HashMap::default(),
             has_installed_loaders: false,
@@ -862,10 +864,32 @@ impl Default for CommonMarkCache {
 
 impl CommonMarkCache {
     #[cfg(feature = "better_syntax_highlighting")]
+    fn ps(&self) -> &SyntaxSet {
+        self.ps.get_or_init(SyntaxSet::load_defaults_newlines)
+    }
+
+    #[cfg(feature = "better_syntax_highlighting")]
+    fn ps_mut(&mut self) -> &mut SyntaxSet {
+        self.ps();
+        self.ps.get_mut().expect("nyss initierad")
+    }
+
+    #[cfg(feature = "better_syntax_highlighting")]
+    fn ts(&self) -> &ThemeSet {
+        self.ts.get_or_init(ThemeSet::load_defaults)
+    }
+
+    #[cfg(feature = "better_syntax_highlighting")]
+    fn ts_mut(&mut self) -> &mut ThemeSet {
+        self.ts();
+        self.ts.get_mut().expect("nyss initierad")
+    }
+
+    #[cfg(feature = "better_syntax_highlighting")]
     pub fn add_syntax_from_folder(&mut self, path: &str) {
-        let mut builder = self.ps.clone().into_builder();
+        let mut builder = self.ps().clone().into_builder();
         let _ = builder.add_from_folder(path, true);
-        self.ps = builder.build();
+        *self.ps_mut() = builder.build();
     }
 
     #[cfg(feature = "better_syntax_highlighting")]
@@ -874,9 +898,9 @@ impl CommonMarkCache {
         s: &str,
         fallback_name: Option<&str>,
     ) -> Result<(), syntect::parsing::ParseSyntaxError> {
-        let mut builder = self.ps.clone().into_builder();
+        let mut builder = self.ps().clone().into_builder();
         SyntaxDefinition::load_from_str(s, true, fallback_name).map(|d| builder.add(d))?;
-        self.ps = builder.build();
+        *self.ps_mut() = builder.build();
         Ok(())
     }
 
@@ -888,7 +912,7 @@ impl CommonMarkCache {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), syntect::LoadingError> {
-        self.ts.add_from_folder(path)
+        self.ts_mut().add_from_folder(path)
     }
 
     #[cfg(feature = "better_syntax_highlighting")]
@@ -901,7 +925,7 @@ impl CommonMarkCache {
         bytes: &[u8],
     ) -> Result<(), syntect::LoadingError> {
         let mut cursor = std::io::Cursor::new(bytes);
-        self.ts
+        self.ts_mut()
             .themes
             .insert(name.into(), ThemeSet::load_from_reader(&mut cursor)?);
         Ok(())
@@ -992,11 +1016,11 @@ impl CommonMarkCache {
 
     #[cfg(feature = "better_syntax_highlighting")]
     fn curr_theme(&self, ui: &Ui, options: &CommonMarkOptions) -> &Theme {
-        self.ts
+        self.ts()
             .themes
             .get(options.curr_theme(ui))
             // Since we have called load_defaults, the default theme *should* always be available..
-            .unwrap_or_else(|| &self.ts.themes[default_theme(ui)])
+            .unwrap_or_else(|| &self.ts().themes[default_theme(ui)])
     }
 
     /// Handles keyboard scrolling input and updates cache delta.

@@ -78,4 +78,4 @@ står i [handboken](docs/handbok.md#kortkommandon).
 
 Kladd är licensierat under MIT, se [LICENSE](LICENSE). Typsnitten IBM Plex Sans och IBM Plex Mono används under SIL Open Font License.
 
-Typsnittet Carlito (metriskt lika Calibri) används för dokumentläget under SIL Open Font License.
+Typsnitten Carlito (metriskt lika Calibri) och Caladea (metriskt lika Cambria) används för dokumentläget och PDF-exporten under SIL Open Font License; licenserna ligger i `assets/fonts`.

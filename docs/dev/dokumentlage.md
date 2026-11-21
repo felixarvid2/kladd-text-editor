@@ -204,7 +204,11 @@ GitHub. Allt tolkas och skrivs med `src/style.rs`:
   när dokumentets standardtypsnitt (docDefaults + formatmallen Normal) inte är Calibri 11 pt.
 - Typsnitt hämtas från systemet med fontconfig (`fc-match`), så Arial blir Liberation Sans och
   Times New Roman Liberation Serif på Ubuntu precis som i LibreOffice. Hittas inget används
-  Carlito (sans) eller systemets serif/monospace efter namnet.
+  Carlito (sans) eller systemets serif/monospace efter namnet. Ersättningstabellen (`word/fontmap.rs`)
+  delas med PDF-exporten. Calibri/Calibri Light (Carlito) och Cambria (Caladea) är inbyggda och
+  används även om fontconfig svarar något annat; ett riktigt Cambria på systemet går före. Liberation
+  och Gelasio buntas inte: Windows/macOS har originalen och Linux nästan alltid Liberation.
+  Caladea är beskuren till samma teckenuppsättning som Carlito (4 filer, ca 255 kB).
 - Mörkt tema: dokumentfärger med för låg kontrast mot sidan ljusas upp (som Words mörka läge).
 
 Dokumentläget lägger ut varje stycke för sig (egen radbredd, justering och hängande indrag)

@@ -387,9 +387,12 @@ fn pretty_dir(path: &Path) -> String {
 impl KladdApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>, single_instance: bool) -> Self {
         let ctx = &cc.egui_ctx;
+        crate::timing::mark("KladdApp::new börjar");
         theme::install_fonts(ctx);
+        crate::timing::mark("install_fonts");
         theme::install_styles(ctx);
         egui_extras::install_image_loaders(ctx);
+        crate::timing::mark("install_styles, bildinläsare");
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
         let settings: Settings = cc
@@ -399,8 +402,10 @@ impl KladdApp {
         theme::set_dark(ctx, settings.dark);
         crate::i18n::set_lang(settings.lang.resolve());
 
+        crate::timing::mark("inställningar lästa");
         let recovery = crate::recovery::Recovery::new();
         let orphans = crate::recovery::find_orphans(recovery.dir(), &crate::recovery::pid_alive);
+        crate::timing::mark("återställning kontrollerad");
         let mut app = Self {
             recovery,
             recovery_prompt: crate::recovery::Prompt::new(orphans),
@@ -409,7 +414,11 @@ impl KladdApp {
             next_id: 1,
             untitled_counter: 0,
             settings,
-            hl: Highlighter::new(),
+            hl: {
+                let h = Highlighter::new();
+                crate::timing::mark("Highlighter::new (syntect)");
+                h
+            },
             big: Default::default(),
             legacy: Default::default(),
             md_cache: CommonMarkCache::default(),
@@ -466,9 +475,11 @@ impl KladdApp {
         if app.owns_socket || cfg!(target_os = "macos") {
             app.incoming = Some(rx);
         }
+        crate::timing::mark("KladdApp-struct klar");
         for f in files {
             app.open_path(ctx, &f);
         }
+        crate::timing::mark("KladdApp::new klar (filer öppnade)");
         app
     }
 
@@ -3839,6 +3850,8 @@ fn welcome_row(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, detail: Op
 
 impl eframe::App for KladdApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::timing::mark_once(&FIRST, "första logic()");
         // Körs även när fönstret är minimerat, så att osparade ändringar aldrig tappas.
         self.handle_exit(ctx);
         self.handle_incoming(ctx);
@@ -3860,6 +3873,8 @@ impl eframe::App for KladdApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::timing::mark_once(&FIRST, "första ui() börjar");
         let ctx = ui.ctx().clone();
         let p = self.palette();
 
@@ -3915,6 +3930,8 @@ impl eframe::App for KladdApp {
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::timing::mark_once(&DONE, "första ui() klar (första bilden)");
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

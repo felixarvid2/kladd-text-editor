@@ -12,6 +12,7 @@ use std::sync::{Arc, Once, OnceLock};
 use egui::{FontData, FontDefinitions, FontFamily};
 
 use crate::theme;
+use super::fontmap::{self, Bundled};
 
 /// Vad fontconfig svarade för ett typsnitt.
 #[derive(Clone, Debug, PartialEq)]
@@ -79,7 +80,7 @@ impl DocFonts {
             return fallback;
         };
         // På Windows/macOS finns ofta det riktiga Calibri (Office): använd det före Carlito.
-        let real_calibri = prefer_real_calibri() && normalize(name) == "calibri";
+        let real_calibri = prefer_real_calibri() && matches!(normalize(name).as_str(), "calibri" | "calibrilight");
         if is_bundled(name) && !real_calibri {
             return fallback;
         }
@@ -104,8 +105,15 @@ impl DocFonts {
             }
             None => {}
         }
+        let serif = fontmap::bundled(name) == Some(Bundled::Caladea);
         let entry = match resolve(name, bold, italic) {
+            // Ett annat typsnitt än det efterfrågade (t.ex. systemets Caladea eller en generisk
+            // serif) ersätts av det inbyggda Caladea, så att Cambria ser likadant ut överallt.
+            Resolved::Found(m) if serif && normalize(&m.family) != normalize(name) => {
+                self.register_bundled(ctx, name, bold, italic, Bundled::Caladea)
+            }
             Resolved::Found(m) => self.register(ctx, name, bold, italic, m),
+            Resolved::None if serif => self.register_bundled(ctx, name, bold, italic, Bundled::Caladea),
             Resolved::None => Entry::Fallback,
             Resolved::Wait => {
                 // Inte cachat: vi frågar igen när databasen är klar.
@@ -125,12 +133,25 @@ impl DocFonts {
         }
         self.installed.get_or_insert_with(|| {
             let mut v = list_installed();
-            v.retain(|n| !is_bundled(n));
+            v.retain(|n| !is_bundled(n) && normalize(n) != "caladea");
             v.push("Calibri".to_owned());
+            v.push("Cambria".to_owned());
             v.sort_by_key(|s| s.to_lowercase());
             v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
             v
         })
+    }
+
+    /// Som `register`, men med ett typsnitt som följer med i binären.
+    fn register_bundled(&mut self, ctx: &egui::Context, name: &str, bold: bool, italic: bool, b: Bundled) -> Entry {
+        let data_name = format!("doc-bundled:{b:?}:{}{}", u8::from(bold), u8::from(italic));
+        let defs = self
+            .defs
+            .get_or_insert_with(|| ctx.fonts(|f| f.definitions().clone()));
+        defs.font_data
+            .entry(data_name.clone())
+            .or_insert_with(|| Arc::new(FontData::from_static(b.data(bold, italic))));
+        self.add_family(ctx, name, bold, italic, data_name)
     }
 
     /// Lägger filen i egui:s definitioner och en familj `doc:<namn>:<b|r><i|r>`.
@@ -153,6 +174,10 @@ impl DocFonts {
                 n
             }
         };
+        self.add_family(ctx, name, bold, italic, data_name)
+    }
+
+    fn add_family(&mut self, ctx: &egui::Context, name: &str, bold: bool, italic: bool, data_name: String) -> Entry {
         let defs = self
             .defs
             .get_or_insert_with(|| ctx.fonts(|f| f.definitions().clone()));
@@ -225,15 +250,15 @@ fn normalize(s: &str) -> String {
         .collect()
 }
 
-/// Calibri/Carlito finns inbyggt.
+/// Calibri/Carlito finns inbyggt (Calibri Light också: se `fontmap`).
 fn is_bundled(name: &str) -> bool {
-    matches!(normalize(name).as_str(), "calibri" | "carlito")
+    matches!(normalize(name).as_str(), "calibri" | "calibrilight" | "carlito")
 }
 
 /// Metriskt kompatibla ersättare som fontconfig får välja (DejaVu räknas inte).
 fn is_metric_alias(family: &str) -> bool {
     let n = normalize(family);
-    n.starts_with("liberation") || n == "carlito" || n == "caladea"
+    n.starts_with("liberation") || matches!(n.as_str(), "carlito" | "caladea" | "gelasio")
 }
 
 /// Godtas fontconfigs svar `got` för det begärda namnet `wanted`?
@@ -320,7 +345,9 @@ enum Resolved {
 /// Slår upp namnet enligt reglerna i dokumentationen.
 fn resolve(name: &str, bold: bool, italic: bool) -> Resolved {
     if use_fontconfig() {
-        return match resolve_fc(name, bold, italic) {
+        let r = resolve_fc(name, bold, italic);
+        crate::timing::mark(&format!("fontconfig: {name} {}{}", u8::from(bold), u8::from(italic)));
+        return match r {
             Some(m) => Resolved::Found(m),
             None => Resolved::None,
         };
@@ -403,13 +430,7 @@ fn generic_candidates(class: Class) -> &'static [&'static str] {
 
 /// Metriskt kompatibla ersättare om originalet saknas (som fontconfigs alias).
 fn metric_alias(name: &str) -> Option<&'static str> {
-    match normalize(name).as_str() {
-        "arial" => Some("Liberation Sans"),
-        "timesnewroman" => Some("Liberation Serif"),
-        "couriernew" => Some("Liberation Mono"),
-        "cambria" => Some("Caladea"),
-        _ => None,
-    }
+    fontmap::substitute(name)
 }
 
 /// Exakt familjenamn + vikt + stil -> fil och face-index. Bara ttf/otf/ttc från fil.
@@ -474,6 +495,14 @@ fn resolve_fc(name: &str, bold: bool, italic: bool) -> Option<Match> {
     if let Some(m) = fc_match(&format!("{}{style}", escape_pattern(name))) {
         if accepts(name, &m.family) {
             return usable(&m).then_some(m);
+        }
+    }
+    // Fontconfig kan sakna aliasregeln: pröva ersättaren i tabellen direkt.
+    if let Some(alias) = fontmap::substitute(name) {
+        if let Some(m) = fc_match(&format!("{}{style}", escape_pattern(alias))) {
+            if normalize(&m.family) == normalize(alias) && usable(&m) {
+                return Some(m);
+            }
         }
     }
     let generic = match classify(name) {
@@ -601,6 +630,31 @@ mod tests {
         assert!((w - c).abs() > 0.5, "{w} {c}");
         assert_eq!(df.family(&ctx, None, false, false), theme::doc_font(false, false));
         assert_eq!(df.family(&ctx, Some("Calibri"), true, false), theme::doc_font(true, false));
+    }
+
+    /// Cambria ersätts alltid av det inbyggda Caladea, även utan systemtypsnitt.
+    #[test]
+    fn cambria_blir_inbyggt_caladea() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut df = DocFonts::new();
+        let (_, fam) = run_family(&ctx, &mut df, "Cambria");
+        let FontFamily::Name(n) = &fam else {
+            panic!("Cambria blev aldrig aktivt: {fam:?}");
+        };
+        assert!(n.starts_with("doc:Cambria"), "{n}");
+        let w = width(&ctx, fam);
+        let c = width(&ctx, theme::doc_font(false, false));
+        assert!((w - c).abs() > 0.5, "Caladea ska ha andra mått än Carlito: {w} {c}");
+        // Fet och kursiv har egna filer.
+        let mut bi = None;
+        for _ in 0..4 {
+            let out = ctx.run_ui(Default::default(), |_| {});
+            std::mem::forget(out);
+            bi = Some(df.family(&ctx, Some("Cambria"), true, true));
+        }
+        assert!(matches!(bi, Some(FontFamily::Name(_))));
+        assert!(df.installed().iter().any(|s| s == "Cambria"));
     }
 
     #[test]

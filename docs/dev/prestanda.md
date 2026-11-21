@@ -67,6 +67,32 @@ större filer använder en egen vy:
 Kända begränsningar: kopiering och säkerhetskopiering av en dirty 100 MB-flik klonar texten på UI-tråden
 (~30 ms, var 30:e sekund); ångra efter *Ersätt alla* finns inte i den stora vyn.
 
+## Starttid
+
+`KLADD_TIMING=1 kladd` skriver tiden sedan processstart till stderr vid varje steg fram till första bilden
+(`src/timing.rs`, `timing::mark`). Mätt i debugbygge (inte `--release`), Xvfb med programvaru-GL, median av 7
+(5 för docx) omväxlande körningar av före- och efterbygget, `--new-window` med tom miljö:
+
+| Fall | Före | Efter |
+|---|---|---|
+| Utan fil: första bilden | 314 ms | 182 ms |
+| Markdown-fil: första bilden | 291 ms | 148 ms |
+| `gen-skolrapport.docx`: första bilden | 785 ms | 666 ms |
+| `KladdApp::new` (utan fil) | ca 140 ms | ca 1 ms |
+
+Vad som tog tid i `KladdApp::new` (debug): Markdown-cachen `CommonMarkCache` byggde en hel syntect-uppsättning
+(syntaxer och teman) i sin `Default`, och det finns tre (appen, uppdateringsrutan, språkservern): ca 30–40 ms
+var. Det är nu lat i den vendrade `egui_commonmark_backend` (`OnceLock`, läses vid första kodblocket).
+Editorns egna `Highlighter` läste syntaxerna (ca 25 ms); de läses nu i en bakgrundstråd (`highlight::preload`)
+som startas innan fönstret skapas och är klara när en kodfil ska färgas.
+
+Det som är kvar ligger utanför Kladds kod eller är nödvändigt för bilden: ca 80–100 ms innan `KladdApp::new`
+körs (winit, GL-kontext och eframe), och i första bildrutan själva layouten (för en `.docx` ca 0,5 s i debug,
+där dokumentet tolkas och läggs ut). Typsnitt för dokumentläget läses inte vid start: `fc-match` körs och
+fontdb skannar systemtypsnitten först när ett dokument använder ett typsnitt som inte är inbyggt. Stavningsordlistor
+(`speller`) och uppdateringskontrollen (egen tråd) var redan uppskjutna. Release-bygget är snabbare i alla steg
+men mättes inte (disken räckte inte till ett `--release`-bygge).
+
 ## Dokumentläge
 
 `word::incr` (`analyze_incremental`) tolkar efter en liten ändring (högst 4 kB, i dokument över 200 kB)
