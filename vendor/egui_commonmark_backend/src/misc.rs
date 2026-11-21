@@ -1253,6 +1253,12 @@ impl CommonMarkCache {
         search_cache.search_scroll_protection = 30;
     }
 
+    /// Kladd: (källbyte, virtuellt y) för varje blockstart i senaste ritningen, se
+    /// [`ViewerCache::line_points`](crate::pulldown::ViewerCache::line_points).
+    pub fn line_points(&self, id: &Id) -> &[(usize, f32)] {
+        self.viewers.get(id).map(|vc| vc.line_points.as_slice()).unwrap_or_default()
+    }
+
     #[cfg(feature = "regex")]
     pub fn search_cache_mut(&mut self, id: &Id) -> &mut crate::pulldown::SearchCache {
         &mut viewer_cache(self, id).search_cache

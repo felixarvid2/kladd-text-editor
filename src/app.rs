@@ -276,6 +276,8 @@ pub struct KladdApp {
     pub(crate) preview_images: std::collections::HashSet<String>,
     /// Markdown-flikar (id) som visas i läsläget: färdigritade i hela fönstret med en Redigera-knapp.
     pub(crate) md_reading: std::collections::HashSet<u64>,
+    /// Läsläget: sökning, rullning och kryssrutor (se `mdread`).
+    pub(crate) md: crate::mdread::MdState,
     owns_socket: bool,
     pub(crate) word: crate::word::layout::Cache,
     /// Typsnitt som Word-dokumenten använder, hämtade från systemet.
@@ -432,6 +434,7 @@ impl KladdApp {
             incoming: None,
             preview_images: std::collections::HashSet::new(),
             md_reading: std::collections::HashSet::new(),
+            md: Default::default(),
             owns_socket: false,
             word: Default::default(),
             doc_fonts: crate::word::fonts::DocFonts::new(),
@@ -1047,9 +1050,14 @@ impl KladdApp {
             tab.open_find();
             return;
         }
+        // Sök fungerar i läsläget; ersätt kräver redigeraren.
+        if replace && self.md_read_mode() {
+            self.md_leave_reading();
+        }
+        let reading = self.md_read_mode();
         // Förifyll med markerad text om den är kort och på en rad.
         let doc = &self.docs[self.active];
-        if let Some(state) = TextEditState::load(ctx, editor_id(doc.id)) {
+        if let Some(state) = TextEditState::load(ctx, editor_id(doc.id)).filter(|_| !reading) {
             if let Some(r) = state.cursor.char_range() {
                 let [a, b] = r.sorted_cursors();
                 if a.index != b.index {
@@ -1082,7 +1090,7 @@ impl KladdApp {
     /// texten eller sökinställningarna ändras.
     pub(crate) fn search_results(&mut self) -> Arc<Results> {
         use std::hash::{Hash, Hasher};
-        if !self.find.open {
+        if !self.find.open || self.md_read_mode() {
             return Arc::default();
         }
         let Some(doc) = self.docs.get(self.active) else { return Arc::default() };
@@ -1143,6 +1151,16 @@ impl KladdApp {
     }
 
     fn seek(&mut self, ctx: &egui::Context, how: Seek) {
+        // Läsläget markerar träffarna i den ritade texten och rullar dit.
+        if self.md_read_mode() {
+            match how {
+                Seek::Next => self.md_seek(1),
+                Seek::Prev => self.md_seek(-1),
+                Seek::FromSelectionStart => {}
+            }
+            ctx.request_repaint();
+            return;
+        }
         let results = self.search_results();
         let matches = &results.matches;
         let Some(doc) = self.docs.get(self.active) else { return };
@@ -1576,6 +1594,9 @@ impl KladdApp {
         if hit(ctrl, Key::H) && !pdf {
             self.open_find(ctx, true);
         }
+        if !pdf && self.md_read_mode() {
+            self.md_shortcuts(ctx);
+        }
         if pdf {
             self.pdf_shortcuts(ctx);
         } else if self.find.open {
@@ -1999,6 +2020,7 @@ impl KladdApp {
             return;
         }
         let width = ui.available_width();
+        let mut toggled = None;
         Panel::right("kladd-preview")
             .resizable(true)
             .default_size(width * 0.46)
@@ -2011,10 +2033,20 @@ impl KladdApp {
                     .show(ui, |ui| {
                         ui.add_space(22.0);
                         ui.set_max_width(680.0f32.min(ui.available_width()));
-                        crate::mdread::render(ui, p, doc, &mut self.preview_images, &mut self.md_cache);
+                        let opts = crate::mdread::Opts {
+                            id: Id::unique(("kladd-md-prev", doc.id)),
+                            search: None,
+                            boxes: true,
+                            reading: false,
+                        };
+                        toggled = crate::mdread::render(ui, p, doc, &mut self.preview_images, &mut self.md_cache, &mut self.md, &opts).toggled;
                         ui.add_space(40.0);
                     });
             });
+        if let Some(n) = toggled {
+            let ctx = ui.ctx().clone();
+            self.md_toggle_task(&ctx, n);
+        }
     }
 
     fn editor(&mut self, ui: &mut Ui, p: &Palette) {
@@ -2228,6 +2260,7 @@ impl KladdApp {
                         .inner
                     });
                 self.cursor = result.inner;
+                self.md.note_editor_scroll(result.state.clamped_offset().y, result.content_size.y, result.inner_rect.height());
                 if let (Some(g), Some((idx, anchor))) = (&git_gutter, git_hunk) {
                     self.git_open_hunk(g, idx, anchor);
                 }
@@ -2487,7 +2520,17 @@ impl KladdApp {
         let results = self.search_results();
         let matches = &results.matches;
         let has_search = !self.find.query.is_empty() || (word && !self.find.fmt.is_empty());
-        let current_idx = self.find.current.and_then(|c| matches.iter().position(|m| m.start == c));
+        // Läsläget söker i den ritade texten (träffarna räknas av visningen).
+        let reading = self.md_read_mode();
+        let (n_matches, current_idx, err) = if reading {
+            (self.md.count, self.md.current, self.md.error.clone())
+        } else {
+            (
+                matches.len(),
+                self.find.current.and_then(|c| matches.iter().position(|m| m.start == c)),
+                results.error.clone(),
+            )
+        };
 
         egui::Area::new(Id::unique("kladd-find"))
             .order(Order::Foreground)
@@ -2507,6 +2550,10 @@ impl KladdApp {
                             let chevron = if self.find.replace { Icon::ChevronUp } else { Icon::ChevronDown };
                             if icons::button(ui, p, chevron, 26.0, false, t("Visa ersätt"), p.surface).clicked() {
                                 self.find.replace = !self.find.replace;
+                                // Ersätt kräver redigeraren.
+                                if self.find.replace && reading {
+                                    self.md_leave_reading();
+                                }
                             }
                             let field_w = ui.available_width() - 26.0 * 6.0 - 84.0 - 4.0 * 8.0;
                             let q = ui.add(
@@ -2516,7 +2563,7 @@ impl KladdApp {
                                     .desired_width(field_w)
                                     .margin(Margin::symmetric(8, 5)),
                             );
-                            if let Some(err) = &results.error {
+                            if let Some(err) = &err {
                                 ui.painter().rect_stroke(q.rect, 4.0, Stroke::new(1.5, p.error), egui::StrokeKind::Inside);
                                 q.clone().on_hover_text(tf!("Ogiltigt reguljärt uttryck: {err}", err = err));
                             }
@@ -2533,22 +2580,22 @@ impl KladdApp {
                                 seek = Some(if back { Seek::Prev } else { Seek::Next });
                                 self.find.focus_query = true;
                             }
-                            let count = if results.error.is_some() {
+                            let count = if err.is_some() {
                                 t("Ogiltigt").to_owned()
                             } else if !has_search {
                                 String::new()
-                            } else if matches.is_empty() {
+                            } else if n_matches == 0 {
                                 t("Inga träffar").to_owned()
                             } else if let Some(i) = current_idx {
-                                tf!("{i} av {n}", i = i + 1, n = matches.len())
+                                tf!("{i} av {n}", i = i + 1, n = n_matches)
                             } else if results.partial {
                                 // Stor fil: sökningen pågår eller stannade vid taket.
-                                tf!("{n}+ träffar", n = matches.len())
+                                tf!("{n}+ träffar", n = n_matches)
                             } else {
-                                tf!("{n} träffar", n = matches.len())
+                                tf!("{n} träffar", n = n_matches)
                             };
                             let (cr, _) = ui.allocate_exact_size(vec2(84.0, 26.0), Sense::hover());
-                            let bad = results.error.is_some() || (matches.is_empty() && has_search);
+                            let bad = err.is_some() || (n_matches == 0 && has_search);
                             let color = if bad { p.error } else { p.muted };
                             ui.painter().text(cr.center(), Align2::CENTER_CENTER, count, FontId::new(12.0, FontFamily::Proportional), color);
 

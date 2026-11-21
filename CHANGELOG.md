@@ -10,6 +10,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - **Dialogen för sidhuvud och sidfot** visar en logga som miniatyr med namn och bredd (en bricka `[Logga 1]` i fältet) i stället för bildmärket `{bild:…}`, har knapparna *Infoga sidnummer*, *Antal sidor*, *Logga…* (välj en bildfil), *Ta bort logga*, *Lägg till rad* och valet *Sidnummerformat* (1, i, I, a, A), och kan ändra loggans bredd.
 - **Sidhuvud med flera stycken** behåller varje stycke som en egen rad (`\n` i mallen) vid läsning av `.docx` och `.odt`, i dokumentläget, i PDF och vid skrivning, och dialogen kan lägga till och ta bort rader.
 - **Fet, kursiv och understruken text i sidhuvud och sidfot** (`header-style: "bold italic underline"`) ritas nu också i dokumentläget, och fetstil och understrykning i PDF-exporten. Understrykning läses och skrivs i `.docx` och `.odt`.
+- **Läsläget för Markdown blir användbart.** `Ctrl+F` söker i den ritade texten och markerar träffarna (F3 och Skift+F3 hoppar och rullar dit) utan att byta till redigeraren; `Ctrl+H` byter till redigeraren. Rubrikerna i navigeringsfönstret rullar läsvyn. Kryssrutor (`- [ ]`/`- [x]`) bockas av med ett klick (bara tecknet i hakparentesen ändras, fliken blir ändrad, `Ctrl+Z` och `Ctrl+Y` fungerar i läsläget). Dubbelklick på ett stycke, en rubrik, en listpunkt eller en tabellrad öppnar redigeraren med markören där, och rullningsläget följer med när man växlar. Kryssrutorna går också att klicka i förhandsvisningen bredvid texten.
+- **Snyggare länkar och tabeller i läsläget och förhandsvisningen.** Länkar har länkfärg, och tabeller har linjer, färgad och fet rubrikrad, luft i cellerna och radbrytning.
 
 ### Rättat
 
