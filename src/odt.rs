@@ -4443,6 +4443,27 @@ Slut.
     }
 
     #[test]
+    fn dragged_text_box_roundtrip() {
+        use crate::word::{anchor::Pos, tboxui};
+        let pp = "<!--k:pp bdr=\"t=single:6:6:112233 l=single:6:6:112233 b=single:6:6:112233 r=single:6:6:112233\" shd=\"FFF2CC\" fr=\"w=112.5 x=end pl=6.75 pr=6.75\"-->";
+        let md = format!("Före\n\n<!--k:tb 0 w=\"150\" h=\"90\" x=\"right\" y=\"0\"-->\n\n**Faktaruta**{pp}\n\n<!--k:/tb-->\n\nEfter\n");
+        let o = md.find("<!--k:tb").unwrap();
+        let open = o..md[o..].find("-->").unwrap() + o + 3;
+        let mut head = crate::docx_tbox::parse_head(&md[open.clone()]).unwrap().1;
+        let mut a = head.anchor.unwrap();
+        (a.h, a.v) = (Pos::Off(73.5), Pos::Off(21.0));
+        head.anchor = Some(a);
+        let md = tboxui::apply(&md, &tboxui::Change { open, head, x_pt: Some(73.5 * 0.75) }).unwrap();
+        let w = write(&md, "T", &resolver()).unwrap();
+        let back = read(&w.bytes).unwrap().markdown;
+        let o = back.find("<!--k:tb").unwrap();
+        let h = crate::docx_tbox::parse_head(&back[o..o + back[o..].find("-->").unwrap() + 3]).unwrap().1;
+        let a = h.anchor.unwrap();
+        assert_eq!((a.h, a.v), (Pos::Off(73.5), Pos::Off(21.0)), "{back}");
+        assert!((h.w - 150.0).abs() < 0.6 && (h.h - 90.0).abs() < 0.6, "{back}");
+    }
+
+    #[test]
     fn frame_crop_and_page_anchor_are_read() {
         let c = LO_CONTENT.replace("svg:width=\"0.0265cm\" svg:height=\"0.0265cm\"", "svg:width=\"6.35cm\" svg:height=\"6.35cm\" svg:x=\"1cm\" svg:y=\"2cm\"");
         let c = c.replace("<draw:frame draw:name=\"Bild1\" text:anchor-type=\"as-char\"", "<draw:frame draw:style-name=\"fr9\" draw:name=\"Bild1\" text:anchor-type=\"page\"");

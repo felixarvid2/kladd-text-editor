@@ -2208,7 +2208,9 @@ fn layout_para_floats(
     ppp: f32,
     floats: &[ActiveFloat],
 ) -> Arc<Galley> {
-    if floats.is_empty() || para.range.is_empty() || !avail.is_finite() {
+    // Dolda taggrader (`<div>`, `<!--k:/tb-->` …) är nästan höjdlösa: de släpper förbi en ruta/bild över hela
+    // bredden utan att ta dess "hoppa förbi"-avstånd, annars förbrukas hoppet av raden och texten ritas över rutan.
+    if floats.is_empty() || para.range.is_empty() || para.collapse || !avail.is_finite() {
         return layout_para(fonts, full, para, avail, ppp);
     }
     let mut pieces: Vec<Arc<Galley>> = Vec::new();

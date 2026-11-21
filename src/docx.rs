@@ -6127,7 +6127,7 @@ fn add_new_boxes(new: &[docx_tbox::Found], tokens: &mut Vec<Opaque>, resolve: &d
         let (inner, _) = resolve_markers(&[(false, bw.body)], tokens, &mut std::collections::HashSet::new());
         let inner = if inner.is_empty() { "<w:p/>".to_owned() } else { inner };
         let lines = md.lines().filter(|l| !l.trim().is_empty()).count().max(1);
-        tokens.push(Opaque { xml: docx_tbox::new_box_run(&inner, &pp, *doc_pr, text_w_pt, lines), fld: 0 });
+        tokens.push(Opaque { xml: docx_tbox::new_box_run(&inner, &pp, &f.head, *doc_pr, text_w_pt, lines), fld: 0 });
         *doc_pr += 1;
     }
 }

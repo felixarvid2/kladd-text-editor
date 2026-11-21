@@ -621,6 +621,9 @@ pub fn paginate_sections(
     // Rutor med omflöde (`overlay`): raderna ligger ovanpå texten och tar ingen plats; de placeras när raden
     // efter dem (`pending.end`) har fått sitt läge, med samma avstånd till den som de hade i layouten.
     let mut pending: Option<Range<usize>> = None;
+    // Underkanten (i layoutens egna koordinater) på raden/gruppen som placerades senast: ett avstånd som layouten
+    // lagt in mellan två rader (en ruta eller bild över hela bredden som texten hoppar förbi) bevaras.
+    let mut prev_raw = f32::NEG_INFINITY;
     let mut i = 0;
     while i < n_rows {
         while next_ov < overlay.len() && overlay[next_ov].start < i {
@@ -645,6 +648,7 @@ pub fn paginate_sections(
             y1 = y1.max(pr.pos.y + pr.row.size.y);
         }
         let h = y1 - y0;
+        let skip = |col_y: f32, region_top: f32| if col_y > region_top + eps && prev_raw.is_finite() { (y0 - prev_raw).max(0.0) } else { 0.0 };
         let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
         let sec = row_sec.get(i).map_or(0, |s| *s as usize);
 
@@ -749,7 +753,7 @@ pub fn paginate_sections(
                     }
                 }
                 let limit = text_bottom - flow.reserved() - extra;
-                let no_room = col_y + h.max(fh) > limit + eps && col_y > region_top + eps;
+                let no_room = col_y + skip(col_y, region_top) + h.max(fh) > limit + eps && col_y > region_top + eps;
                 let overlaps = extra > 0.0 && page_bottom > limit + eps && page_bottom > region_top + eps;
                 if !(no_room || overlaps) || guard >= 8 {
                     break;
@@ -763,7 +767,7 @@ pub fn paginate_sections(
         flow.commit(new, extra);
         let _ = region_page;
 
-        let top = round(col_y);
+        let top = round(col_y + skip(col_y, region_top));
         let dy = top - y0;
         let cx = col_x(&boxes, &sg, col);
         if let Some(ov) = pending.take().filter(|o| o.end == i) {
@@ -780,6 +784,7 @@ pub fn paginate_sections(
             dx[i + k] = cx;
         }
         units.push(Unit { rows: i..end, top, col, h });
+        prev_raw = y1;
         col_y = top + h;
         prev_bottom = prev_bottom.max(col_y).max(if fh > 0.0 { top + fh } else { f32::NEG_INFINITY });
         page_bottom = page_bottom.max(col_y);
