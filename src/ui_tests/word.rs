@@ -114,3 +114,15 @@ fn docx_tracked_changes_then_accept_all() {
     assert!(!xml.contains("<w:ins "), "inga spårade infogningar kvar");
     assert!(!xml.contains("<w:del "), "inga spårade borttagningar kvar");
 }
+
+#[test]
+fn ctrl_alt_f_inserts_footnote_not_search() {
+    // Ctrl+F (sök) fick tidigare Ctrl+Alt+F (fotnot) eftersom egui ignorerar Alt vid matchning.
+    let mut ui = Ui::new();
+    let file = make_docx(&ui, "fot.docx");
+    open_in_document_mode(&mut ui, &file);
+    ui.focus_editor();
+    ui.key(CTRL | Modifiers::ALT, Key::F);
+    assert!(!ui.app().find.open, "sökfältet öppnas inte");
+    assert!(ui.text().contains("[^1]"), "en fotnot är infogad: {:?}", ui.text());
+}

@@ -153,3 +153,25 @@ fn unequal_columns_get_own_x_and_width_and_a_rule() {
     let right = texts(&l.pages[0].ops).into_iter().find(|t| t.2.contains("Höger")).map(|t| t.0);
     assert!((right.expect("text") - (l.text_l + w0 + l.gap)).abs() < 0.5);
 }
+
+#[test]
+fn paragraph_flowing_into_a_narrower_column_wraps_at_that_columns_width() {
+    let long = "Ord som fyller raderna med flera ord på varje rad och fortsätter. ".repeat(160);
+    let md = format!("<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 120mm 40mm -->\n\n{long}\n");
+    let l = lay(&md);
+    let (w0, w1) = (l.col_width(0), l.col_width(1));
+    let right_x = l.text_l + w0 + l.gap - 1.0;
+    let mut chars = (0usize, 0usize);
+    for t in texts(&l.pages[0].ops) {
+        let c = t.2.chars().count();
+        if t.0 < right_x {
+            chars.0 = chars.0.max(c);
+        } else {
+            chars.1 = chars.1.max(c);
+        }
+    }
+    // Raderna i den smala spalten är kortare i förhållande till spaltens bredd: ingen rad går utanför sidan.
+    assert!(chars.0 > 0 && chars.1 > 0, "{chars:?}");
+    assert!((chars.1 as f32) < chars.0 as f32 * (w1 / w0) * 1.4, "{chars:?} {w0} {w1}");
+    assert!(chars.0 as f32 > (w1 / 0.5) * 0.0 + 60.0, "{chars:?}");
+}

@@ -20,6 +20,8 @@ mod export;
 mod grammar;
 mod grammar_ui;
 mod hf;
+mod imgfmt;
+mod legacy;
 mod ocr;
 mod odt;
 mod pdf_read;
@@ -55,6 +57,7 @@ mod style;
 mod templates;
 mod templates_ui;
 mod theme;
+mod timing;
 mod update;
 mod word;
 mod workspace;
@@ -69,6 +72,7 @@ mod brk_tests;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
+    timing::init();
     let mut files = Vec::new();
     let mut new_window = false;
     for arg in std::env::args_os().skip(1) {
@@ -131,6 +135,9 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // Syntaxerna läses medan fönstret skapas, så att de är klara när de behövs.
+    highlight::preload();
+    timing::mark("fönster och inställningar klara, run_native");
     eframe::run_native(
         "kladd",
         options,

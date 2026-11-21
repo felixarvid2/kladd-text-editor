@@ -204,7 +204,11 @@ GitHub. Allt tolkas och skrivs med `src/style.rs`:
   när dokumentets standardtypsnitt (docDefaults + formatmallen Normal) inte är Calibri 11 pt.
 - Typsnitt hämtas från systemet med fontconfig (`fc-match`), så Arial blir Liberation Sans och
   Times New Roman Liberation Serif på Ubuntu precis som i LibreOffice. Hittas inget används
-  Carlito (sans) eller systemets serif/monospace efter namnet.
+  Carlito (sans) eller systemets serif/monospace efter namnet. Ersättningstabellen (`word/fontmap.rs`)
+  delas med PDF-exporten. Calibri/Calibri Light (Carlito) och Cambria (Caladea) är inbyggda och
+  används även om fontconfig svarar något annat; ett riktigt Cambria på systemet går före. Liberation
+  och Gelasio buntas inte: Windows/macOS har originalen och Linux nästan alltid Liberation.
+  Caladea är beskuren till samma teckenuppsättning som Carlito (4 filer, ca 255 kB).
 - Mörkt tema: dokumentfärger med för låg kontrast mot sidan ljusas upp (som Words mörka läge).
 
 Dokumentläget lägger ut varje stycke för sig (egen radbredd, justering och hängande indrag)
@@ -243,8 +247,15 @@ Gemensamma format (alla moduler ska använda dessa):
   referens) om, med fält, bilder och linje. Sektioner som skrivs om från grunden får originalets referenser (`seed_hf`).
   odt: `style:header-left` är jämna sidor, tabbstoppens typer avgör vänster/höger, `text:page-number` följer
   `style:num-format`, och sidmallens övre/nedre marginal är avståndet till sidhuvudet (marginalen i Kladd är avståndet plus
-  sidhuvudets minsta höjd och mellanrum). Begränsningar: ett sidhuvud med flera rader slås ihop till en rad, text i
-  tabellceller placeras efter kolumnens ordning (inte dess bredd) och odt-sidnumrering som börjar om per avsnitt läses inte.
+  sidhuvudets minsta höjd och mellanrum). Flera rader (stycken): mallen har
+  `\n` mellan raderna (`hf::rows`, `hf::filled_rows`, `hf::layout_rows`), var och en med egna delar (`vänster|mitten|höger`
+  eller ett enkelt värde med mallens justering; en rad med annan justering skrivs `|text|` eller `||text`). I grundformatskommentaren
+  skrivs radbrytningen `\n` (`style::quote`/`unquote`). `docx_hf` gör varje stycke eller tabellrad till en rad, odt varje `text:p`;
+  `Plan::reserve` summerar radhöjderna. Tabellceller placeras efter bredd (`docx_hf::table_zones`: cellens mitt i första/sista
+  tredjedelen eller en bred cells justering, bredden ur `w:tcW`, `w:gridSpan` och `w:tblGrid`). `header-style` har även
+  `underline` (fet/kursiv/understruken ritas i dokumentläget, PDF och vid skrivning). odt: `style:page-number` på ett stycke med
+  sidmall och `style:first-page-number` på sidmallen blir `page-start` (och skrivs tillbaka). Dialogen (`word/headers.rs`) visar en
+  logga som brickan `[Logga n]` i fältet (`hide_logos`/`show_logos`) med miniatyr, och en vald bildfil läggs i dokumentets bilder vid OK.
 - **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
   grundformatskommentaren, `h1`–`h6`, `body`, `quote`, `title`, `subtitle`, med ord i valfri ordning: `"Typsnitt"`,
   `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
@@ -271,9 +282,31 @@ Gemensamma format (alla moduler ska använda dessa):
   (rutans stycken är inga egna element). ODT: `draw:text-box` läses till samma block (`Rd::text_box`, nummer 0) och
   block skrivs som en `draw:frame` med `draw:text-box` i ett eget stycke (`W::finish_box`). PDF: `Block::Para::look`
   ritar fyllning (bakom texten) och kanter (`Layout::paint_box`), också för vanliga stycke-ramar. Begränsningar: rutan
-  ritas i flödet (text flödar inte runt den, ingen fast höjd), rutor i tabeller/rubriker/listor, med bilder eller
-  fotnoter, och rutor i rutor visas inte (bevaras i docx), läge relativt sidans högerkant räknas inte om, och en
-  ruta bredare än textytan krymps vid ODT-sparning.
+  ritas i flödet utan omflöde när den är inline eller `wrapTopAndBottom`; rutor i rutor visas inte (bevaras i docx),
+  och en ruta bredare än textytan krymps vid ODT-sparning.
+  - **Förankrade rutor** (`wp:anchor`/`draw:frame` med läge): öppningsraden bär måtten och ankaret,
+    `<!--k:tb N w="px" h="px" hrel= x= vrel= y= wrap= dist=-->` (samma attribut som `<img>`, se `word::anchor`;
+    `docx_tbox::Head`, `parse_head`, `open_tag_head`). `fr=` på styckena har rutans bredd, vågräta läge i spalten
+    (`pbox::Frame`, räknat ur ankaret med sidans mått vid läsning) och fasta höjd (`h=`, pt). Bara `wrap` fyrkant,
+    bakom och framför flyter (`wrap="top"` och rutor utan ankare ligger i flödet).
+  - Layout (`layout::relayout`): öppnings- och slutradens stycken (`Para::tbox`, `tbox_end`) omger rutans stycken;
+    dessa läggs ut som vanligt men tar ingen höjd (`y`), efter slutraden dras alla rader uppåt så att texten efter
+    rutan börjar vid ankarstyckets överkant (`apply_pulls`: `pulls`) och rutans rader flyttas till sitt lodräta läge
+    (`shifts`). Rutan registreras som flytande objekt (`ActiveFloat`) med samma regler som bilder (`plan_float`:
+    den bredare sidan, `FLOAT_MIN_ROOM`), och raden som delvis ligger över rutans överkant flyter också runt den.
+    Sidbrytning: `pages::paginate` får rutans rader som radgrupp, `secpages::paginate_sections` lägger dem
+    ovanpå (`overlay`) utan att de tar plats. Blankraden efter slutraden kollapsar.
+  - Ritning (`pboxui::shapes_rects`): rader bredvid rutan hör inte till den (filtreras på rutans x-intervall) och
+    fast höjd gör rutan minst så hög. Dra/ändra storlek: `word::tboxui` (kanten är träffytan så att klick inne i
+    rutan flyttar textmarkören; läget skrivs som `hrel` kolumn och `vrel` stycke med förskjutningar, storlek som
+    `w`/`h`, och `fr=` på alla stycken i rutan uppdateras).
+  - Docx: `docx_tbox::set_geometry` skriver ny storlek och nytt läge i originalkörningen (`wp:extent`, `a:ext`,
+    `wp:positionH/V`, VML-`style`) när öppningsraden ändrats; orörd ruta sparas byte för byte (huvudet jämförs
+    avrundat, `Head::rounded`). Rutor i tabellceller visas ovanför tabellen och i flödet; rutor i rubriker/listor
+    och med bilder visas; fotnotsreferenser i rutan tas bort ur visningen (originalet bevaras). ODT: `draw:frame`
+    läses med `frame_place` till samma huvud och skrivs med `style:wrap`, `vertical-pos/-rel`, `svg:x/y`,
+    `fo:min-height` och `fo:margin-*`. PDF: `Block::TBoxOpen/TBoxClose`, `Layout::tbox` ritar stycknen på rutans läge och
+    registrerar en `FloatBox` som förankrade bilder.
 - **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda
@@ -486,8 +519,16 @@ räknar inte etiketterna.
 
 **Dokumentläget**: etiketterna ritas med 0,65 × storlek, `valign = TOP` och `line_height = None` (med egen
 radhöjd centrerar egui alltid texten, så `valign` gör annars ingenting) i länkfärg; definitionerna med
-0,85 × brödtextens storlek under en skiljelinje (en tredjedels textbredd) före den första definitionen.
-Hovrar man ett nummer visas "Gå till fotnot" (Ctrl+klick); ett klick hoppar när knappen släpps (markören
+0,85 × brödtextens storlek under en skiljelinje (en tredjedels textbredd) längst ned på referensens sida.
+Definitionsraderna ligger kvar sist i galleriet men är hopkrympta och dolda (`layout_notes::plan`, bara med
+sidläge; slutnoter och definitioner utan referens förblir synliga), så raderna fortsätter vara i stigande
+y-ordning och markörmappningen i egui:s `Galley` gäller oförändrad. Notens utseende läggs ut separat
+(`fnotes::NoteLayout`); sidbrytningen (`pages::paginate_notes`, `secpages::paginate_sections`, delad logik i
+`fnotes::NoteFlow`) reserverar noternas höjd längst ned på sidan (`PageBox::notes`/`reserved`, tak en halv sida)
+och flyttar en rad med referens till nästa sida om raden och noten inte ryms. `notesui` ritar noterna per ark,
+och ett klick öppnar en textruta ovanpå (`NoteEdit`) vars text skrivs tillbaka till definitionen (ett ångra-steg
+per redigering). Hamnar markören i en dold definition (infogad fotnot, sökträff) öppnas noten och markören går
+till referensen. Hovrar man ett nummer visas "Redigera fotnot" (dubbelklick); ett klick hoppar när knappen släpps (markören
 flyttas vid nedtryckningen och ändrar layouten, så hoppet kan inte ske vid nedtryckningen). Ett vanligt klick
 hoppar bara om raden inte redan visar sin markup, annars krävs Ctrl. Efter varje ändring numreras fotnoterna
 om om etiketterna inte längre är 1..n i ordning (`word_renumber_footnotes`). Backspace direkt efter (Delete
@@ -730,7 +771,10 @@ avsnittet (`row_sec`) och spaltbrytningarna. `secpages::paginate_sections` flytt
 - ett nytt avsnitt börjar på ett nytt ark med avsnittets storlek och marginaler. Ett **löpande** avsnitt
   (`type: continuous`) med samma sidstorlek och marginaler fortsätter på samma ark under det förra
   (`PageBox::regions`: en del per spaltindelning); spalterna i avsnittet före ett löpande byte **jämnas ut**
-  (`balanced_height`) om det ryms på sidan;
+  (`balanced_height`) om det ryms på sidan. Olika breda spalter: ett stycke som fortsätter i en smalare spalt delas vid
+  spaltgränsen (`layout::layout_para_cols`, spaltfyllnaden följs av `ColSim::probe`) så att raderna bryts i sin spalts bredd.
+  Jämna ut går inte genom att flytta stycken, så `layout::relayout` söker lägsta spalthöjd som ryms (`Balance`, några
+  omläggningar ur styckecachen) och `paginate_sections` fyller sista arkets spalter bara till den höjden;
 - ark med olika storlek centreras på skrivbordet (`Geom::sheet_left`). Galleriets x = 0 ligger vid den
   vänstraste textkanten (`Geom::origin_x`), så alla rader har x ≥ 0 och TextEdits yta (`Geom::edit_w`) täcker allt;
 - resultatet är `Paged { boxes: Vec<PageBox>, dx }`; `Cache::page_boxes` ger arken till vyn (ritning av ark,
@@ -753,7 +797,7 @@ fotnoterna hamnar sist i dokumentet (som förut).
 
 Läsning: ett toppnivåstycke med `w:pPr/w:sectPr` slutar ett avsnitt; stycket läses som vanligt och följs av
 en avsnittsrad med **nästa** avsnitts egenskaper (sista avsnittets kommer från brödtextens `w:sectPr`). Egenskaperna
-är `w:pgSz` (w, h, orient), `w:pgMar`, `w:cols` (num, space; olika breda spalter räknas som lika breda) och
+är `w:pgSz` (w, h, orient), `w:pgMar`, `w:cols` (num, space, `w:col` för olika breda spalter) och
 `w:type` (`continuous`; övriga typer blir ny sida) och skrivs bara om de skiljer sig från grundformatet. **Grundformatet
 (sida, sidhuvud, sidfot) läses ur första avsnittets `sectPr`**, inte det sista. `w:br w:type="column"` blir
 `<!-- kladd: spaltbrytning -->`.
@@ -783,7 +827,8 @@ ODT sparas inte förlustfritt, så markören följer med bara så långt `render
 `Block::SectionBreak`/`ColumnBreak`; varje sida bär sina mått (`PageOps::geom`) och PDF-sidorna skapas med
 rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_page` går till nästa spalt innan en
 ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
-ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Skillnad mot dokumentläget:
+ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Texten bryts i bredden för
+spalten den hamnar i (`text_block` räknar om bredden när den går till nästa spalt). Skillnad mot dokumentläget:
 spalterna före ett löpande byte jämnas **inte** ut i PDF:en.
 
 ## Ekvationer (`src/math/`)

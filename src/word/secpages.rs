@@ -8,6 +8,7 @@
 //! den vänstraste textytan (`Geom::origin_x`), så att alla rader har x ≥ 0 och TextEdits yta täcker
 //! allt.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use egui::epaint::text::Galley;
 use egui::Rect;
 
+use super::fnotes::{NoteFlow, NoteSpec};
 use super::layout::px;
 use super::pages::{Geom, SHEET_GAP};
 use super::sections::Section;
@@ -180,6 +182,13 @@ impl Geom {
         self.secs.iter().any(|s| !s.col_ws.is_empty())
     }
 
+    /// Avsnitt `i` har olika breda spalter och följs av ett löpande avsnitt på samma ark: då jämnas
+    /// spalterna ut på avsnittets sista ark (se `layout::relayout`).
+    pub fn balance_candidate(&self, i: usize) -> bool {
+        let (a, b) = (self.sec(i), self.secs.get(i + 1));
+        !a.col_ws.is_empty() && b.is_some_and(|b| b.continuous && b.same_sheet(&a))
+    }
+
     /// Bredaste arket.
     pub fn max_page_w(&self) -> f32 {
         self.secs.iter().map(|s| s.page_w).fold(self.page_w, f32::max)
@@ -225,6 +234,8 @@ impl Geom {
                 margin: [self.top, self.right, self.bottom, self.left],
                 regions: vec![Region { y0: k as f32 * self.stride(), cols: 1, col_w: self.text_w(), gap: 0.0, col_ws: Vec::new(), rule: false, used: 0.0 }],
                 sec: 0,
+                notes: Vec::new(),
+                reserved: 0.0,
             })
             .collect()
     }
@@ -285,6 +296,10 @@ pub struct PageBox {
     pub regions: Vec<Region>,
     /// Avsnittet arket börjar i.
     pub sec: usize,
+    /// Fotnoterna (index i `NoteLayout`-listan) vars referenser står på arket, och höjden som
+    /// reserverats för dem längst ned i textytan (se `fnotes`).
+    pub notes: Vec<usize>,
+    pub reserved: f32,
 }
 
 impl PageBox {
@@ -294,6 +309,11 @@ impl PageBox {
 
     pub fn text_bottom(&self) -> f32 {
         self.top + self.h - self.margin[2]
+    }
+
+    /// Där fotnoternas område börjar (textytans nederkant om arket saknar fotnoter).
+    pub fn notes_top(&self) -> f32 {
+        self.text_bottom() - self.reserved
     }
 
     /// Textytans vänsterkant (samma koordinater som `left`).
@@ -344,9 +364,39 @@ pub struct ColSim {
     max_y: f32,
     /// Textytans höjd.
     cap: f32,
+    /// Antal gånger spalterna i avsnittet gått över till ett nytt ark, och hur högt sista arkets del är använd.
+    sheets: usize,
+    /// Avsnitt med utjämnade spalter: (ark där utjämningen gäller, spalthöjd); se `Balance`.
+    balance: Balance,
+    /// Resultat per avsnitt (arkens antal och sista arkets höjd) när utläggningen är klar.
+    pub runs: HashMap<usize, SecRun>,
+}
+
+/// Avsnitt vars spalter ska jämnas ut på sista arket: avsnitt → (sista arkets nummer i avsnittet,
+/// högsta spalthöjd i px från delens överkant).
+pub type Balance = HashMap<usize, (usize, f32)>;
+
+/// Hur ett avsnitt med olika breda spalter fyllde sina ark.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SecRun {
+    /// Antal gånger spalterna gått över till nästa ark (0 = allt på första arket).
+    pub sheets: usize,
+    /// Höjden (från delens överkant) som sista arkets spalter använder, den högsta.
+    pub used: f32,
 }
 
 impl ColSim {
+    pub fn with_balance(balance: Balance) -> ColSim {
+        ColSim { balance, ..Default::default() }
+    }
+
+    /// Nyckel till styckecachen: spalten och fyllnaden där ett stycke börjar, och spalthöjden som gäller
+    /// avsnittet om dess spalter jämnas ut.
+    pub fn state_key(&self) -> [u32; 7] {
+        let (sheet, cap) = self.sec.and_then(|s| self.balance.get(&s)).map_or((u32::MAX, 0), |(sh, h)| (*sh as u32, h.to_bits()));
+        [self.col as u32, self.y.to_bits(), self.region_y.to_bits(), self.max_y.to_bits(), self.sheets as u32, sheet, cap]
+    }
+
     fn width(sg: &SecGeom, col: usize) -> f32 {
         sg.col_ws.get(col).copied().unwrap_or(sg.col_w)
     }
@@ -358,8 +408,27 @@ impl ColSim {
             self.col = 0;
             self.region_y = 0.0;
             self.max_y = 0.0;
+            self.sheets += 1;
         }
         self.y = 0.0;
+    }
+
+    /// Högsta spalthöjd just nu: textytans, eller den utjämnade på avsnittets sista ark.
+    fn limit(&self) -> f32 {
+        match self.sec.and_then(|s| self.balance.get(&s)) {
+            Some((sheet, h)) if *sheet == self.sheets => self.cap.min(self.region_y + h),
+            _ => self.cap,
+        }
+    }
+
+    fn overflows(&self, h: f32) -> bool {
+        self.y > 0.0 && self.region_y + self.y + h > self.limit() + 0.5
+    }
+
+    fn note(&mut self) {
+        if let Some(s) = self.sec {
+            self.runs.insert(s, SecRun { sheets: self.sheets, used: (self.max_y - self.region_y).max(0.0) });
+        }
     }
 
     /// Börjar ett stycke i avsnitt `sec` (`brk` = spaltbrytning före det): bredden där det börjar.
@@ -373,6 +442,7 @@ impl ColSim {
             }
             self.col = 0;
             self.y = 0.0;
+            self.sheets = 0;
             self.cap = (sg.page_h - sg.top - sg.bottom).max(1.0);
             self.sec = Some(sec);
         }
@@ -382,19 +452,43 @@ impl ColSim {
         Self::width(&sg, self.col)
     }
 
-    /// Placerar enheter med höjderna `hs`; ger den smalaste spaltbredden de når.
+    /// Placerar enheter med höjderna `hs`; ger den smalaste spaltbredd de når.
     pub fn place(&mut self, geom: &Geom, sec: usize, hs: impl IntoIterator<Item = f32>) -> f32 {
         let sg = geom.sec(sec);
         let mut min_w = Self::width(&sg, self.col);
         for h in hs {
-            if self.y > 0.0 && self.region_y + self.y + h > self.cap + 0.5 {
+            if self.overflows(h) {
                 self.next_col(&sg);
                 min_w = min_w.min(Self::width(&sg, self.col));
             }
             self.y += h;
             self.max_y = self.max_y.max(self.region_y + self.y);
         }
+        self.note();
         min_w
+    }
+
+    /// Var en rad av höjderna `hs` skulle byta spalt om de placerades nu: radens index och bredden på
+    /// spalten den hamnar i (ändrar inget).
+    pub fn probe(&self, geom: &Geom, sec: usize, hs: &[f32]) -> Option<(usize, f32)> {
+        let sg = geom.sec(sec);
+        let mut t = self.clone();
+        for (i, h) in hs.iter().enumerate() {
+            if t.overflows(*h) {
+                t.next_col(&sg);
+                return Some((i, Self::width(&sg, t.col)));
+            }
+            t.y += h;
+            t.max_y = t.max_y.max(t.region_y + t.y);
+        }
+        None
+    }
+
+    /// Går till nästa spalt (eller ark); ger dess bredd.
+    pub fn advance(&mut self, geom: &Geom, sec: usize) -> f32 {
+        let sg = geom.sec(sec);
+        self.next_col(&sg);
+        Self::width(&sg, self.col)
     }
 }
 
@@ -457,6 +551,9 @@ pub fn paginate_sections(
     row_sec: &[u32],
     col_breaks: &[usize],
     page_breaks: &[usize],
+    notes: &NoteSpec,
+    balance: &Balance,
+    overlay: &[Range<usize>],
 ) -> Paged {
     let n_rows = g.rows.len();
     let mut boxes: Vec<PageBox> = Vec::new();
@@ -480,6 +577,9 @@ pub fn paginate_sections(
     let mut prev_bottom = f32::NEG_INFINITY;
     let mut units: Vec<Unit> = Vec::new();
     let mut broke_page = false; // avsnittsdelen har gått över en sidgräns
+    let mut flow = NoteFlow::new(notes);
+    // Antal ark avsnittet gått över till; med utjämnade spalter (`balance`) fylls sista arket bara till spalthöjden.
+    let mut sec_sheets = 0usize;
 
     fn new_sheet(boxes: &mut Vec<PageBox>, geom: &Geom, sec: usize, sg: &SecGeom) {
         let top = match boxes.last() {
@@ -494,6 +594,8 @@ pub fn paginate_sections(
             margin: [sg.top, sg.right, sg.bottom, sg.left],
             regions: vec![Region { y0: top + sg.top, cols: sg.cols, col_w: sg.col_w, gap: sg.gap, col_ws: sg.col_ws.clone(), rule: sg.rule, used: 0.0 }],
             sec,
+            notes: Vec::new(),
+            reserved: 0.0,
         });
     }
     // Ark som en tidigare hög rad sträcker sig över hoppas över (de blir tomma ark).
@@ -510,8 +612,21 @@ pub fn paginate_sections(
     };
 
     let mut next_group = 0;
+    let mut next_ov = 0;
+    // Rutor med omflöde (`overlay`): raderna ligger ovanpå texten och tar ingen plats; de placeras när raden
+    // efter dem (`pending.end`) har fått sitt läge, med samma avstånd till den som de hade i layouten.
+    let mut pending: Option<Range<usize>> = None;
     let mut i = 0;
     while i < n_rows {
+        while next_ov < overlay.len() && overlay[next_ov].start < i {
+            next_ov += 1;
+        }
+        if let Some(ov) = overlay.get(next_ov).filter(|o| o.start == i && o.end > i && o.end < n_rows) {
+            pending = Some(ov.clone());
+            i = ov.end;
+            next_ov += 1;
+            continue;
+        }
         while next_group < groups.len() && groups[next_group].start < i {
             next_group += 1;
         }
@@ -577,6 +692,7 @@ pub fn paginate_sections(
             }
             sg = ng;
             cur_sec = sec;
+            sec_sheets = 0;
             col = 0;
             col_y = region_top;
             page_bottom = region_top;
@@ -587,7 +703,7 @@ pub fn paginate_sections(
         // Spaltbrytning: nästa spalt (eller sida) innan raden placeras.
         let is_break = col_breaks.binary_search(&i).is_ok();
         let is_page_break = page_breaks.binary_search(&i).is_ok();
-        let advance = |boxes: &mut Vec<PageBox>, col: &mut usize, col_y: &mut f32, region_top: &mut f32, region_page: &mut usize, page_bottom: &mut f32, broke: &mut bool, units: &mut Vec<Unit>, force_page: bool| {
+        let advance = |boxes: &mut Vec<PageBox>, col: &mut usize, col_y: &mut f32, region_top: &mut f32, region_page: &mut usize, page_bottom: &mut f32, broke: &mut bool, units: &mut Vec<Unit>, sheets: &mut usize, force_page: bool| {
             if !force_page && *col + 1 < sg.cols {
                 *col += 1;
                 *col_y = *region_top;
@@ -602,27 +718,57 @@ pub fn paginate_sections(
                 *col_y = *region_top;
                 *page_bottom = *region_top;
                 *broke = true;
+                *sheets += 1;
                 units.clear();
             }
         };
         if is_break {
-            advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, false);
+            advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, &mut sec_sheets, false);
         } else if is_page_break {
             // Sidbrytning: ny sida om den nuvarande har innehåll (i någon spalt).
             if col > 0 || col_y > region_top + eps || page_bottom > region_top + eps {
-                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, true);
+                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, &mut sec_sheets, true);
             }
         } else {
-            let text_bottom = boxes[boxes.len() - 1].text_bottom();
-            if col_y + h.max(fh) > text_bottom + eps && col_y > region_top + eps {
-                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, false);
+            // Fotnoterna på raderna ska få plats längst ned på samma ark (över alla spalter), och med
+            // utjämnade spalter (`balance`) fylls avsnittets sista ark bara till spalthöjden.
+            let mut guard = 0;
+            loop {
+                let bi = boxes.len() - 1;
+                flow.enter(bi);
+                let extra = flow.need(i..end).1;
+                let mut text_bottom = boxes[bi].text_bottom();
+                if let Some((sheet, cap)) = balance.get(&cur_sec) {
+                    if *sheet == sec_sheets {
+                        text_bottom = text_bottom.min(region_top + cap);
+                    }
+                }
+                let limit = text_bottom - flow.reserved() - extra;
+                let no_room = col_y + h.max(fh) > limit + eps && col_y > region_top + eps;
+                let overlaps = extra > 0.0 && page_bottom > limit + eps && page_bottom > region_top + eps;
+                if !(no_room || overlaps) || guard >= 8 {
+                    break;
+                }
+                advance(&mut boxes, &mut col, &mut col_y, &mut region_top, &mut region_page, &mut page_bottom, &mut broke_page, &mut units, &mut sec_sheets, false);
+                guard += 1;
             }
         }
+        flow.enter(boxes.len() - 1);
+        let (new, extra) = flow.need(i..end);
+        flow.commit(new, extra);
         let _ = region_page;
 
         let top = round(col_y);
         let dy = top - y0;
         let cx = col_x(&boxes, &sg, col);
+        if let Some(ov) = pending.take().filter(|o| o.end == i) {
+            for r in ov {
+                let pr = &mut g.rows[r];
+                pr.pos.y = round(top + (pr.pos.y - y0));
+                pr.pos.x += cx;
+                dx[r] = cx;
+            }
+        }
         for (k, pr) in g.rows[i..end].iter_mut().enumerate() {
             pr.pos.y += dy;
             pr.pos.x += cx;
@@ -657,6 +803,10 @@ pub fn paginate_sections(
     }
     g.rect.max.x = max_x.max(geom.edit_w());
     g.rect.max.y = max_y.max(prev_bottom);
+    for (b, n) in boxes.iter_mut().zip(flow.finish()) {
+        b.notes = n.notes;
+        b.reserved = n.reserved;
+    }
     Paged { boxes, dx }
 }
 

@@ -144,6 +144,7 @@ impl Styles {
         s.color = tp.color.filter(|c| *c != [0, 0, 0]);
         s.bold = tp.bold == Some(true);
         s.italic = tp.italic == Some(true);
+        s.underline = tp.underline == Some(true);
         let border = self.chain("paragraph", n).iter().rev().find_map(|d| if header { d.border_bottom.clone() } else { d.border_top.clone() });
         if let Some(b) = border.filter(|b| !b.trim().starts_with("none")) {
             let mut w = 0.5;
@@ -162,10 +163,12 @@ impl Styles {
 }
 
 /// Mallen för en del (`style:header`, `style:footer`, `…-left`, `…-first`). Ett enda stycke med
-/// flikar blir vänster|mitten|höger efter tabbstoppen; flera stycken slås ihop med mellanslag.
+/// flikar blir vänster|mitten|höger efter tabbstoppen; flera stycken blir flera rader i mallen
+/// (`\n`), var och en med egna delar.
 pub(super) fn slot(st: &Styles, n: &Node, header: bool, ctx: &mut HfCtx<'_, '_>) -> Option<HfSlot> {
     let mut parts: Vec<String> = Vec::new();
     let mut layout: Vec<Vec<String>> = Vec::new();
+    let mut aligns: Vec<Align> = Vec::new();
     let mut align = None;
     let mut style = HfStyle::default();
     for p in n.els().filter(|p| matches!(p.name.as_str(), "text:p" | "text:h")) {
@@ -177,10 +180,12 @@ pub(super) fn slot(st: &Styles, n: &Node, header: bool, ctx: &mut HfCtx<'_, '_>)
             continue;
         }
         let sname = p.attr("text:style-name");
+        let al = st.align(sname);
         if align.is_none() {
-            align = Some(st.align(sname));
+            align = Some(al);
             style = st.hf_look(sname, header);
         }
+        aligns.push(al);
         parts.push(s);
         let tabs = st.tab_types(sname);
         layout.push(match segs.len() {
@@ -195,19 +200,56 @@ pub(super) fn slot(st: &Styles, n: &Node, header: bool, ctx: &mut HfCtx<'_, '_>)
             return Some(HfSlot { text: l.join("|"), align: Align::Left, style });
         }
     }
+    if layout.len() > 1 {
+        // Varje stycke en rad; ett stycke med en enda del och samma justering som det första är vanlig
+        // text, annars (flikar eller annan justering) skrivs delarna ut.
+        let first = align.unwrap_or(Align::Left);
+        let idx = |a: Align| match a {
+            Align::Center => 1,
+            Align::Right => 2,
+            _ => 0,
+        };
+        let rows: Vec<String> = layout
+            .iter()
+            .zip(&aligns)
+            .zip(&parts)
+            .map(|((l, a), merged)| match l.len() {
+                1 if *a == first => merged.clone(),
+                1 => {
+                    let mut z: [String; 3] = Default::default();
+                    z[idx(*a)] = merged.clone();
+                    z.join("|")
+                }
+                // Delar med bara ett värde, i samma del som det första styckets justering: vanlig text.
+                3 if l.iter().filter(|z| !z.is_empty()).count() == 1 && !l[idx(first)].is_empty() => l[idx(first)].clone(),
+                3 => l.join("|"),
+                _ => {
+                    let mut z: [String; 3] = Default::default();
+                    z[0] = l[0].clone();
+                    z[2] = l[l.len() - 1].clone();
+                    z[1] = l[1..l.len() - 1].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
+                    z.join("|")
+                }
+            })
+            .collect();
+        return Some(HfSlot { text: rows.join("\n"), align: first, style });
+    }
     (!parts.is_empty()).then(|| HfSlot { text: parts.join(" "), align: align.unwrap_or(Align::Left), style })
 }
 
 /// Ett enkelt värde med justering som uttrycklig mall (`||text`), för delar utan egen justering.
 fn explicit(t: HfSlot) -> String {
-    if style::split_parts(&t.text).is_some() {
-        return t.text;
-    }
-    match t.align {
-        Align::Center => format!("|{}|", t.text),
-        Align::Right => format!("||{}", t.text),
-        _ => t.text,
-    }
+    let one = |row: &str| {
+        if style::split_parts(row).is_some() {
+            return row.to_owned();
+        }
+        match t.align {
+            Align::Center => format!("|{row}|"),
+            Align::Right => format!("||{row}"),
+            _ => row.to_owned(),
+        }
+    };
+    crate::hf::rows(&t.text).into_iter().map(one).collect::<Vec<_>>().join("\n")
 }
 
 /// Sidmallens (`Standard`) sidhuvud och sidfot som grundformat: varianter, utseende, avstånd och sidnummerformat.
@@ -521,6 +563,71 @@ mod tests {
         assert_eq!(d.page_format, Some(crate::hf::NumFmt::LowerRoman));
         // Marginalen överlever en sparning.
         assert!((d.margins()[0] - 85.04).abs() < 0.3, "{:?}", d.margins());
+    }
+
+    #[test]
+    fn several_header_paragraphs_stay_lines_and_underline_is_read() {
+        let m = r#"<style:header><text:p text:style-name="Standard">Rad ett</text:p><text:p text:style-name="Hdr">Vänster<text:tab/>Höger</text:p><text:p text:style-name="Standard">Rad tre</text:p></style:header>"#;
+        let l = crate::odt::read(&odt(m)).unwrap();
+        let d = head(&l.markdown);
+        assert_eq!(d.header.as_deref(), Some("Rad ett\nVänster||Höger\nRad tre"), "{}", l.markdown);
+        // Skrivs som tre stycken i sidhuvudet och läses tillbaka lika.
+        let out = crate::odt::write(&l.markdown, "t", &|_| None).unwrap().bytes;
+        let mut z = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let mut styles = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("styles.xml").unwrap(), &mut styles).unwrap();
+        let hdr = &styles[styles.find("<style:header>").unwrap()..styles.find("</style:header>").unwrap()];
+        assert_eq!(hdr.matches("<text:p ").count(), 3, "{hdr}");
+        let back = head(&crate::odt::read(&out).unwrap().markdown);
+        assert_eq!(back.header.as_deref(), d.header.as_deref());
+        // Fet, kursiv och understruken skrivs i styckeformatet.
+        let md = "<!-- kladd: header: \"Rapport\"; header-style: \"bold italic underline\" -->\n\nText\n";
+        let out = crate::odt::write(md, "t", &|_| None).unwrap().bytes;
+        let mut z = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let mut styles = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("styles.xml").unwrap(), &mut styles).unwrap();
+        assert!(styles.contains("style:text-underline-style=\"solid\"") && styles.contains("fo:font-weight=\"bold\""), "{styles}");
+        let d = head(&crate::odt::read(&out).unwrap().markdown);
+        assert!(d.header_style.bold && d.header_style.italic && d.header_style.underline, "{:?}", d.header_style);
+    }
+
+    #[test]
+    fn page_number_restart_per_section_is_read_and_written() {
+        let ns = NS;
+        let content = format!(
+            r#"<?xml version="1.0"?><office:document-content {ns}><office:automatic-styles><style:style style:name="P1" style:family="paragraph" style:parent-style-name="Standard" style:master-page-name="Standard"><style:paragraph-properties style:page-number="1" fo:break-before="page"/></style:style></office:automatic-styles><office:body><office:text><text:p text:style-name="Standard">Förord</text:p><text:p text:style-name="Standard">mer</text:p><text:p text:style-name="P1">Kapitel ett</text:p></office:text></office:body></office:document-content>"#
+        );
+        let styles = format!(
+            r##"<?xml version="1.0"?><office:document-styles {ns}><office:styles><style:style style:name="Standard" style:family="paragraph"/></office:styles><office:automatic-styles><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" style:first-page-number="3" fo:margin-top="2cm" fo:margin-bottom="2cm" fo:margin-left="2cm" fo:margin-right="2cm"/></style:page-layout></office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1"><style:footer><text:p text:style-name="Standard"><text:page-number>1</text:page-number></text:p></style:footer></style:master-page></office:master-styles></office:document-styles>"##
+        );
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            z.start_file("mimetype", o).unwrap();
+            z.write_all(MIME.as_bytes()).unwrap();
+            for (n, b) in [("content.xml", content.as_bytes()), ("styles.xml", styles.as_bytes())] {
+                z.start_file(n, o).unwrap();
+                z.write_all(b).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let l = crate::odt::read(&bytes).unwrap();
+        // Sidmallens första sidnummer och styckets omstart (samma sidmall) blir `page-start`.
+        assert_eq!(head(&l.markdown).page_start, Some(3), "{}", l.markdown);
+        let row = l.markdown.lines().find(|x| x.starts_with("<!-- kladd: avsnitt")).unwrap_or_else(|| panic!("{}", l.markdown));
+        assert!(row.contains("page-start: 1"), "{row}");
+        // Skrivs tillbaka som `style:page-number` på styckets format.
+        let out = crate::odt::write(&l.markdown, "t", &|_| None).unwrap().bytes;
+        let mut z = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let (mut c, mut s) = (String::new(), String::new());
+        std::io::Read::read_to_string(&mut z.by_name("content.xml").unwrap(), &mut c).unwrap();
+        std::io::Read::read_to_string(&mut z.by_name("styles.xml").unwrap(), &mut s).unwrap();
+        assert!(c.contains("style:page-number=\"1\""), "{c}");
+        assert!(s.contains("style:first-page-number=\"3\""), "{s}");
+        let back = crate::odt::read(&out).unwrap();
+        assert!(back.markdown.contains("page-start: 1") && back.markdown.contains("page-start: 3"), "{}", back.markdown);
     }
 }
 

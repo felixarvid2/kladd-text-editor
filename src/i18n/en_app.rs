@@ -52,7 +52,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Filen är redan öppen i en annan flik. Stäng den först eller välj ett annat namn.", "The file is already open in another tab. Close it first or choose a different name."),
     ("Välj ett annat namn än originalfilens.", "Choose a different name than the original file."),
     // Notiser
-    ("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF eller BMP).", "{name} is not an image that can be embedded (PNG, JPEG, GIF or BMP)."),
+    ("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF, BMP, WebP eller SVG).", "{name} is not an image that can be embedded (PNG, JPEG, GIF, BMP, WebP or SVG)."),
     ("Sparat automatiskt", "Saved automatically"),
     ("Automatisk sparning misslyckades: {e}", "Autosave failed: {e}"),
     ("Spara filen först, så börjar historiken.", "Save the file first to start its history."),

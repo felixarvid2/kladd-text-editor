@@ -20,12 +20,12 @@ use crate::panes::{self, Orient};
 use crate::tf;
 use crate::doc::{Document, LineEnding, LoadError, TEXT_EXTENSIONS, TextEncoding, join_sv};
 
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
+const IMAGE_EXTENSIONS: &[&str] = crate::imgfmt::EXTENSIONS;
 
 fn is_image_path(p: &Path) -> bool {
     p.extension()
         .map(|e| e.to_string_lossy().to_lowercase())
-        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()) || e == "webp")
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 use crate::highlight::{Highlighter, Params};
 use crate::pdfview::chrome::{self as pdfui, Action as PdfAction};
@@ -255,6 +255,8 @@ pub struct KladdApp {
     hl: Highlighter,
     /// Stora textfiler: virtualiserad vy, bakgrundsinläsning, sökning i bitar (`bigfiles`).
     pub(crate) big: crate::bigfiles::State,
+    /// .doc/.rtf som konverteras med LibreOffice i bakgrunden (`legacy`).
+    legacy: crate::legacy::State,
     pub(crate) md_cache: CommonMarkCache,
     pub(crate) find: Find,
     dialog: Option<Receiver<DialogResult>>,
@@ -276,6 +278,8 @@ pub struct KladdApp {
     pub(crate) preview_images: std::collections::HashSet<String>,
     /// Markdown-flikar (id) som visas i läsläget: färdigritade i hela fönstret med en Redigera-knapp.
     pub(crate) md_reading: std::collections::HashSet<u64>,
+    /// Läsläget: sökning, rullning och kryssrutor (se `mdread`).
+    pub(crate) md: crate::mdread::MdState,
     owns_socket: bool,
     pub(crate) word: crate::word::layout::Cache,
     /// Typsnitt som Word-dokumenten använder, hämtade från systemet.
@@ -383,9 +387,12 @@ fn pretty_dir(path: &Path) -> String {
 impl KladdApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>, single_instance: bool) -> Self {
         let ctx = &cc.egui_ctx;
+        crate::timing::mark("KladdApp::new börjar");
         theme::install_fonts(ctx);
+        crate::timing::mark("install_fonts");
         theme::install_styles(ctx);
         egui_extras::install_image_loaders(ctx);
+        crate::timing::mark("install_styles, bildinläsare");
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
         let settings: Settings = cc
@@ -395,8 +402,10 @@ impl KladdApp {
         theme::set_dark(ctx, settings.dark);
         crate::i18n::set_lang(settings.lang.resolve());
 
+        crate::timing::mark("inställningar lästa");
         let recovery = crate::recovery::Recovery::new();
         let orphans = crate::recovery::find_orphans(recovery.dir(), &crate::recovery::pid_alive);
+        crate::timing::mark("återställning kontrollerad");
         let mut app = Self {
             recovery,
             recovery_prompt: crate::recovery::Prompt::new(orphans),
@@ -405,8 +414,13 @@ impl KladdApp {
             next_id: 1,
             untitled_counter: 0,
             settings,
-            hl: Highlighter::new(),
+            hl: {
+                let h = Highlighter::new();
+                crate::timing::mark("Highlighter::new (syntect)");
+                h
+            },
             big: Default::default(),
+            legacy: Default::default(),
             md_cache: CommonMarkCache::default(),
             find: Find::default(),
             dialog: None,
@@ -432,6 +446,7 @@ impl KladdApp {
             incoming: None,
             preview_images: std::collections::HashSet::new(),
             md_reading: std::collections::HashSet::new(),
+            md: Default::default(),
             owns_socket: false,
             word: Default::default(),
             doc_fonts: crate::word::fonts::DocFonts::new(),
@@ -460,9 +475,11 @@ impl KladdApp {
         if app.owns_socket || cfg!(target_os = "macos") {
             app.incoming = Some(rx);
         }
+        crate::timing::mark("KladdApp-struct klar");
         for f in files {
             app.open_path(ctx, &f);
         }
+        crate::timing::mark("KladdApp::new klar (filer öppnade)");
         app
     }
 
@@ -611,6 +628,10 @@ impl KladdApp {
             self.open_pdf_tab(ctx, &canonical, password);
             return;
         }
+        if crate::legacy::needs_conversion(&canonical) {
+            self.open_legacy(ctx, &canonical);
+            return;
+        }
         // Stora filer läses in i en bakgrundstråd med förloppsvisning.
         if crate::bigfiles::wants_background(&canonical) {
             if !self.big.is_loading(&canonical) {
@@ -673,6 +694,42 @@ impl KladdApp {
         }
     }
 
+    /// .doc/.rtf/.wpd/.wps: konverteras med LibreOffice i en bakgrundstråd. Utan LibreOffice läses
+    /// .rtf med den enkla inbyggda läsaren och övriga ger ett fel.
+    fn open_legacy(&mut self, ctx: &egui::Context, path: &Path) {
+        if self.legacy.is_converting(path) {
+            return;
+        }
+        if let Some(soffice) = crate::legacy::find_soffice() {
+            self.legacy.spawn(ctx, soffice, path);
+            return;
+        }
+        let rtf = std::fs::read(path).ok().and_then(|b| Document::from_rtf_text(self.next_id, path, &b));
+        match rtf {
+            Some(doc) => self.install_doc(ctx, doc, path),
+            None => {
+                self.settings.recent.retain(|p| p != path);
+                self.notify(ctx, crate::legacy::missing_message(path), true);
+            }
+        }
+    }
+
+    /// Tar emot filer som LibreOffice har konverterat.
+    fn poll_legacy(&mut self, ctx: &egui::Context) {
+        for (path, result) in self.legacy.poll(ctx) {
+            if self.docs.iter().any(|d| d.path.as_deref() == Some(&path)) {
+                continue;
+            }
+            match result.and_then(|bytes| Document::from_converted(self.next_id, &path, bytes)) {
+                Ok(doc) => self.install_doc(ctx, doc, &path),
+                Err(e) => {
+                    self.settings.recent.retain(|p| p != &path);
+                    self.notify(ctx, e, true);
+                }
+            }
+        }
+    }
+
     /// Tar emot stora filer som lästs in i bakgrunden.
     fn poll_big_loads(&mut self, ctx: &egui::Context) {
         for (path, result) in self.big.poll_loads(ctx) {
@@ -722,6 +779,7 @@ impl KladdApp {
                 .add_filter(t("Text och Word"), TEXT_EXTENSIONS)
                 .add_filter(t("Word-dokument"), &["docx", "docm", "dotx"])
                 .add_filter(t("OpenDocument-text"), &["odt", "ott"])
+                .add_filter(t("Äldre dokument (via LibreOffice)"), crate::legacy::EXTENSIONS)
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -805,11 +863,14 @@ impl KladdApp {
     /// Lägger in `![namn](sökväg)` vid markören i den aktiva fliken.
     fn insert_image(&mut self, ctx: &egui::Context, path: &Path) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
-        if std::fs::read(path).ok().and_then(|b| crate::docx::image_ext(&b)).is_none() {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        if !crate::imgfmt::insertable(&bytes) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            self.notify(ctx, tf!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF eller BMP).", name = name), true);
+            self.notify(ctx, tf!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF, BMP, WebP eller SVG).", name = name), true);
             return;
         }
+        // En SVG rasteriseras i dubbel upplösning: bredden i texten ger den ursprungliga storleken.
+        let svg_width = crate::imgfmt::is_svg(&bytes).then(|| crate::imgfmt::svg_size(&bytes)).flatten().map(|(w, _)| w.round().max(1.0) as u32);
         // Relativ sökväg om bilden ligger i dokumentets mapp, annars absolut.
         let src = match doc.base_dir().and_then(|b| path.strip_prefix(&b).ok().map(Path::to_path_buf)) {
             Some(rel) => rel,
@@ -829,7 +890,10 @@ impl KladdApp {
         } else {
             "\n\n"
         };
-        let snippet = format!("{lead}![{}]({src})\n", alt.replace(['[', ']'], ""));
+        let snippet = match svg_width {
+            Some(w) => format!("{lead}<img src=\"{src}\" alt=\"{}\" width=\"{w}\">\n", alt.replace(['"', '<', '>'], "'")),
+            None => format!("{lead}![{}]({src})\n", alt.replace(['[', ']'], "")),
+        };
         doc.text.insert_str(at, &snippet);
         doc.on_edited();
         let after = byte_to_char(&doc.text, at + snippet.len());
@@ -1047,9 +1111,14 @@ impl KladdApp {
             tab.open_find();
             return;
         }
+        // Sök fungerar i läsläget; ersätt kräver redigeraren.
+        if replace && self.md_read_mode() {
+            self.md_leave_reading();
+        }
+        let reading = self.md_read_mode();
         // Förifyll med markerad text om den är kort och på en rad.
         let doc = &self.docs[self.active];
-        if let Some(state) = TextEditState::load(ctx, editor_id(doc.id)) {
+        if let Some(state) = TextEditState::load(ctx, editor_id(doc.id)).filter(|_| !reading) {
             if let Some(r) = state.cursor.char_range() {
                 let [a, b] = r.sorted_cursors();
                 if a.index != b.index {
@@ -1082,7 +1151,7 @@ impl KladdApp {
     /// texten eller sökinställningarna ändras.
     pub(crate) fn search_results(&mut self) -> Arc<Results> {
         use std::hash::{Hash, Hasher};
-        if !self.find.open {
+        if !self.find.open || self.md_read_mode() {
             return Arc::default();
         }
         let Some(doc) = self.docs.get(self.active) else { return Arc::default() };
@@ -1143,6 +1212,16 @@ impl KladdApp {
     }
 
     fn seek(&mut self, ctx: &egui::Context, how: Seek) {
+        // Läsläget markerar träffarna i den ritade texten och rullar dit.
+        if self.md_read_mode() {
+            match how {
+                Seek::Next => self.md_seek(1),
+                Seek::Prev => self.md_seek(-1),
+                Seek::FromSelectionStart => {}
+            }
+            ctx.request_repaint();
+            return;
+        }
         let results = self.search_results();
         let matches = &results.matches;
         let Some(doc) = self.docs.get(self.active) else { return };
@@ -1369,7 +1448,9 @@ impl KladdApp {
             if p.as_os_str().is_empty() {
                 continue;
             }
-            if is_image_path(&p) && !self.docs.is_empty() && !self.pdf_mode() {
+            // En SVG-fil är också text (XML): den infogas bara i ett dokument med bilder, annars öppnas den.
+            let svg_as_text = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) && !self.docs.get(self.active).is_some_and(|d| d.is_markdown());
+            if is_image_path(&p) && !svg_as_text && !self.docs.is_empty() && !self.pdf_mode() {
                 self.insert_image(ctx, &p);
             } else {
                 self.open_path(ctx, &p);
@@ -1490,8 +1571,12 @@ impl KladdApp {
         // Flikbyte med Ctrl+Tab är Ctrl även på Mac.
         let tab_ctrl = Modifiers::CTRL;
         let tab_ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        // egui:s `consume_shortcut` bryr sig inte om Alt. Utan kontrollen tog Ctrl+F (sök)
+        // Ctrl+Alt+F (fotnot i dokumentläget) innan dokumentläget hann se den, och AltGr-tecken
+        // (Ctrl+Alt på Windows) kunde starta kommandon.
+        let alt = ctx.input(|i| i.modifiers.alt);
         let hit = |m: Modifiers, k: Key| {
-            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
+            (m.alt || !alt) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
         };
         // I presentationsläget är det bara visaren som får tangenter.
         if self.pdf_presenting() {
@@ -1571,6 +1656,9 @@ impl KladdApp {
         }
         if hit(ctrl, Key::H) && !pdf {
             self.open_find(ctx, true);
+        }
+        if !pdf && self.md_read_mode() {
+            self.md_shortcuts(ctx);
         }
         if pdf {
             self.pdf_shortcuts(ctx);
@@ -1995,6 +2083,7 @@ impl KladdApp {
             return;
         }
         let width = ui.available_width();
+        let mut toggled = None;
         Panel::right("kladd-preview")
             .resizable(true)
             .default_size(width * 0.46)
@@ -2007,10 +2096,20 @@ impl KladdApp {
                     .show(ui, |ui| {
                         ui.add_space(22.0);
                         ui.set_max_width(680.0f32.min(ui.available_width()));
-                        crate::mdread::render(ui, p, doc, &mut self.preview_images, &mut self.md_cache);
+                        let opts = crate::mdread::Opts {
+                            id: Id::unique(("kladd-md-prev", doc.id)),
+                            search: None,
+                            boxes: true,
+                            reading: false,
+                        };
+                        toggled = crate::mdread::render(ui, p, doc, &mut self.preview_images, &mut self.md_cache, &mut self.md, &opts).toggled;
                         ui.add_space(40.0);
                     });
             });
+        if let Some(n) = toggled {
+            let ctx = ui.ctx().clone();
+            self.md_toggle_task(&ctx, n);
+        }
     }
 
     fn editor(&mut self, ui: &mut Ui, p: &Palette) {
@@ -2224,6 +2323,7 @@ impl KladdApp {
                         .inner
                     });
                 self.cursor = result.inner;
+                self.md.note_editor_scroll(result.state.clamped_offset().y, result.content_size.y, result.inner_rect.height());
                 if let (Some(g), Some((idx, anchor))) = (&git_gutter, git_hunk) {
                     self.git_open_hunk(g, idx, anchor);
                 }
@@ -2483,7 +2583,17 @@ impl KladdApp {
         let results = self.search_results();
         let matches = &results.matches;
         let has_search = !self.find.query.is_empty() || (word && !self.find.fmt.is_empty());
-        let current_idx = self.find.current.and_then(|c| matches.iter().position(|m| m.start == c));
+        // Läsläget söker i den ritade texten (träffarna räknas av visningen).
+        let reading = self.md_read_mode();
+        let (n_matches, current_idx, err) = if reading {
+            (self.md.count, self.md.current, self.md.error.clone())
+        } else {
+            (
+                matches.len(),
+                self.find.current.and_then(|c| matches.iter().position(|m| m.start == c)),
+                results.error.clone(),
+            )
+        };
 
         egui::Area::new(Id::unique("kladd-find"))
             .order(Order::Foreground)
@@ -2503,6 +2613,10 @@ impl KladdApp {
                             let chevron = if self.find.replace { Icon::ChevronUp } else { Icon::ChevronDown };
                             if icons::button(ui, p, chevron, 26.0, false, t("Visa ersätt"), p.surface).clicked() {
                                 self.find.replace = !self.find.replace;
+                                // Ersätt kräver redigeraren.
+                                if self.find.replace && reading {
+                                    self.md_leave_reading();
+                                }
                             }
                             let field_w = ui.available_width() - 26.0 * 6.0 - 84.0 - 4.0 * 8.0;
                             let q = ui.add(
@@ -2512,7 +2626,7 @@ impl KladdApp {
                                     .desired_width(field_w)
                                     .margin(Margin::symmetric(8, 5)),
                             );
-                            if let Some(err) = &results.error {
+                            if let Some(err) = &err {
                                 ui.painter().rect_stroke(q.rect, 4.0, Stroke::new(1.5, p.error), egui::StrokeKind::Inside);
                                 q.clone().on_hover_text(tf!("Ogiltigt reguljärt uttryck: {err}", err = err));
                             }
@@ -2529,22 +2643,22 @@ impl KladdApp {
                                 seek = Some(if back { Seek::Prev } else { Seek::Next });
                                 self.find.focus_query = true;
                             }
-                            let count = if results.error.is_some() {
+                            let count = if err.is_some() {
                                 t("Ogiltigt").to_owned()
                             } else if !has_search {
                                 String::new()
-                            } else if matches.is_empty() {
+                            } else if n_matches == 0 {
                                 t("Inga träffar").to_owned()
                             } else if let Some(i) = current_idx {
-                                tf!("{i} av {n}", i = i + 1, n = matches.len())
+                                tf!("{i} av {n}", i = i + 1, n = n_matches)
                             } else if results.partial {
                                 // Stor fil: sökningen pågår eller stannade vid taket.
-                                tf!("{n}+ träffar", n = matches.len())
+                                tf!("{n}+ träffar", n = n_matches)
                             } else {
-                                tf!("{n} träffar", n = matches.len())
+                                tf!("{n} träffar", n = n_matches)
                             };
                             let (cr, _) = ui.allocate_exact_size(vec2(84.0, 26.0), Sense::hover());
-                            let bad = results.error.is_some() || (matches.is_empty() && has_search);
+                            let bad = err.is_some() || (n_matches == 0 && has_search);
                             let color = if bad { p.error } else { p.muted };
                             ui.painter().text(cr.center(), Align2::CENTER_CENTER, count, FontId::new(12.0, FontFamily::Proportional), color);
 
@@ -3736,12 +3850,15 @@ fn welcome_row(ui: &mut Ui, p: &Palette, label: &str, shortcut: &str, detail: Op
 
 impl eframe::App for KladdApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::timing::mark_once(&FIRST, "första logic()");
         // Körs även när fönstret är minimerat, så att osparade ändringar aldrig tappas.
         self.handle_exit(ctx);
         self.handle_incoming(ctx);
         self.update.tick(ctx, &mut self.settings);
         self.update_outs(ctx);
         self.poll_big_loads(ctx);
+        self.poll_legacy(ctx);
         if self.big.scanning() {
             ctx.request_repaint();
         }
@@ -3756,12 +3873,15 @@ impl eframe::App for KladdApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::timing::mark_once(&FIRST, "första ui() börjar");
         let ctx = ui.ctx().clone();
         let p = self.palette();
 
         self.sync_panes();
         self.handle_dialogs(&ctx);
         self.big.show_progress(&ctx, &p);
+        self.legacy.show_progress(&ctx, &p);
         self.handle_drops(&ctx);
         self.handle_shortcuts(&ctx);
         self.pdf_sync_fullscreen(&ctx);
@@ -3810,6 +3930,8 @@ impl eframe::App for KladdApp {
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
         self.update_title(&ctx);
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::timing::mark_once(&DONE, "första ui() klar (första bilden)");
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

@@ -30,6 +30,7 @@ svenska och engelska. Allt beskrivs i [handboken](docs/handbok.md).
 | Markdown | `.md`, `.markdown` | ✓ | ✓ | Läsläge, *Redigera* byter till texten |
 | Word | `.docx` | ✓ | ✓ | Dokumentläge med sidor |
 | Word-mallar och makrofiler | `.dotx`, `.docm`, `.dotm` | ✓ | som `.docx` | Dokumentläge |
+| Äldre dokument | `.doc`, `.rtf`, `.wpd`, `.wps` | ✓ via LibreOffice | *Spara som* `.docx` | Konverteras vid öppning, sedan dokumentläge |
 | OpenDocument-text (LibreOffice) | `.odt` | ✓ | ✓ | Dokumentläge med sidor |
 | OpenDocument-mall | `.ott` | ✓ | som `.odt` | Dokumentläge |
 | PDF | `.pdf` | ✓ | ✓ | PDF-visare; *Redigera* gör om den till ett dokument |
@@ -43,9 +44,9 @@ svenska och engelska. Allt beskrivs i [handboken](docs/handbok.md).
   ändringar följer med.
 - **PDF**: sidor kan ordnas, roteras och slås ihop, formulär fyllas i och anteckningar läggas till. Sparningen ändrar
   inte resten av filen.
-- **Det gamla `.doc`-formatet stöds inte.** Spara om filen som `.docx` i Word eller LibreOffice.
+- **`.doc`, `.rtf`, `.wpd` och `.wps`** konverteras till `.docx` med LibreOffice när du öppnar dem (LibreOffice måste vara installerat). Originalet skrivs aldrig över: *Spara* frågar efter ett nytt `.docx`-namn. Utan LibreOffice öppnas `.rtf` med en enkel inbyggd läsare (text, fet, kursiv, stycken); övriga ger ett felmeddelande.
 - **Teckenkodning**: UTF-8, UTF-16 och Windows-1252. Radsluten (LF eller CRLF) bevaras.
-- **Bilder** (`.png`, `.jpg`, `.gif`, `.bmp`) kan infogas i dokument.
+- **Bilder** (`.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.svg`) kan infogas i dokument. WebP och SVG sparas som PNG i `.docx`, `.odt` och PDF.
 
 ## Installera
 
@@ -77,4 +78,4 @@ står i [handboken](docs/handbok.md#kortkommandon).
 
 Kladd är licensierat under MIT, se [LICENSE](LICENSE). Typsnitten IBM Plex Sans och IBM Plex Mono används under SIL Open Font License.
 
-Typsnittet Carlito (metriskt lika Calibri) används för dokumentläget under SIL Open Font License.
+Typsnitten Carlito (metriskt lika Calibri) och Caladea (metriskt lika Cambria) används för dokumentläget och PDF-exporten under SIL Open Font License; licenserna ligger i `assets/fonts`.

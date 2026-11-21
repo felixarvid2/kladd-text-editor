@@ -71,6 +71,10 @@ impl KladdApp {
     /// Markörens byteposition i den aktiva fliken.
     fn nav_caret(&self, ctx: &egui::Context) -> usize {
         let Some(doc) = self.docs.get(self.active) else { return 0 };
+        // Läsläget: rubriken som står överst i läsvyn.
+        if self.md_read_mode() {
+            return self.md.top_byte;
+        }
         if let Some(head) = self.big.caret(doc.id) {
             return head;
         }
@@ -82,6 +86,12 @@ impl KladdApp {
     /// Flyttar markören till `byte` och rullar dit (dokumentläget: till sidpositionen, textläget: till raden).
     pub(crate) fn goto_byte(&mut self, ctx: &egui::Context, byte: usize) {
         let Some(doc) = self.docs.get(self.active) else { return };
+        // Läsläget rullar läsvyn till rubriken i stället för att byta till redigeraren.
+        if self.md_read_mode() {
+            self.md.scroll_to = Some(byte);
+            ctx.request_repaint();
+            return;
+        }
         if let Some(v) = self.big.view(doc.id) {
             v.select(byte, byte);
             self.focus_editor = true;

@@ -4,9 +4,33 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.5.0] – 2026-11-21
+
+### Nytt
+
+- **Textrutor med omflöde, överallt och som går att dra.** En förankrad textruta (`wp:anchor` i Word, `draw:frame` i LibreOffice) ritas på sitt läge mot kolumn, marginal, sida eller stycke med den fasta höjd dokumentet anger (`a:ext`), och texten flyter runt den som runt förankrade bilder (fyrkantigt på den bredare sidan, över och under, bakom och framför), i dokumentläget och i PDF-exporten. Rutor i tabellceller, rubriker och listor, rutor med bilder och rutor med fotnotsreferenser (texten visas) visas nu också. Klicka på rutans kant för att markera den, dra i kanten för att flytta den och i handtagen för att ändra storlek; nytt läge och ny storlek skrivs som `wp:positionH/V`, `wp:extent`, `a:ext` och VML-`style` i `.docx` och som `draw:frame` i `.odt`. Orörda rutor sparas byte för byte som förut.
+- **Öppna `.doc`, `.rtf`, `.wpd` och `.wps`.** Kladd konverterar filen till `.docx` med LibreOffice (`soffice --headless`, egen tillfällig profil, tidsgräns 2 minuter) i en bakgrundstråd med *Konverterar …* i hörnet och öppnar resultatet i dokumentläget. Fliken kan bara sparas med *Spara som* (förvalt `.docx` bredvid originalet), så originalet skrivs aldrig över i fel format. Utan LibreOffice visas ett tydligt fel; `.rtf` läses då med en enkel inbyggd läsare (text, fet, kursiv, stycken). Filerna finns i filväljaren som *Äldre dokument*.
+- **WebP och SVG som bilder.** *Infoga bild…*, dra och släpp, inklistring (`data:`-bilder) och loggaväljaren tar nu emot `.webp` och `.svg` (SVG ritas med `resvg`). I dokumentläget, förhandsvisningen och exporten (`.docx`, `.odt`, PDF, HTML, EPUB) används en PNG-version, eftersom äldre Word och PDF inte kan formaten.
+- **Typsnitt som matchar Office.** En gemensam ersättningstabell (`src/word/fontmap.rs`) används av dokumentläget och PDF-exporten när originalet saknas: Calibri och Calibri Light blir Carlito, Cambria blir Caladea, Arial Liberation Sans, Arial Narrow Liberation Sans Narrow, Times New Roman Liberation Serif, Courier New Liberation Mono och Georgia Gelasio. Caladea (SIL OFL, metriskt lika Cambria) följer nu med i appen, så text i Cambria bryts på samma ställen som i Word på alla plattformar och blir inte längre en sans-serif på system utan Caladea; ett riktigt installerat Cambria används före det. PDF-exporten bäddar in Carlito och Caladea när dokumentet använder Calibri respektive Cambria eller ett annat serif-typsnitt (förut alltid IBM Plex). Calibri Light saknar fri motsvarighet och visas i Carlito. Typsnittslistan i dokumentläget tar med Cambria.
+- **Snabbare start.** Tiden till första bilden i ett debugbygge föll från ca 310 till ca 180 ms utan fil och från ca 290 till ca 150 ms med en Markdown-fil: Markdown-förhandsvisningens kodfärgning läses nu först när ett kodblock ritas (den lästes förut tre gånger vid start) och editorns syntaxer läses i en bakgrundstråd medan fönstret skapas. `KLADD_TIMING=1` skriver starttiderna till stderr; se `docs/dev/prestanda.md`.
+- **Fotnoter längst ned på sin sida i dokumentläget.** Varje fotnot ritas nu under en kort skiljelinje längst ned på sidan där referensen står, i mindre text med upphöjt nummer, som i Word och i PDF-exporten. Sidbrytningen reserverar plats för sidans fotnoter, och en rad med en referens flyttas till nästa sida om raden och noten inte ryms tillsammans (spalter fungerar också). Klicka på en fotnot, dubbelklicka referensen eller använd *Infoga → Fotnot* för att redigera noten på plats; Enter eller Esc avslutar. Definitionerna ligger kvar sist i texten (dolda i flödet), så markör, klick och markering fungerar som förut. Slutnoter står kvar sist i dokumentet.
+- **Dialogen för sidhuvud och sidfot** visar en logga som miniatyr med namn och bredd (en bricka `[Logga 1]` i fältet) i stället för bildmärket `{bild:…}`, har knapparna *Infoga sidnummer*, *Antal sidor*, *Logga…* (välj en bildfil), *Ta bort logga*, *Lägg till rad* och valet *Sidnummerformat* (1, i, I, a, A), och kan ändra loggans bredd.
+- **Sidhuvud med flera stycken** behåller varje stycke som en egen rad (`\n` i mallen) vid läsning av `.docx` och `.odt`, i dokumentläget, i PDF och vid skrivning, och dialogen kan lägga till och ta bort rader.
+- **Fet, kursiv och understruken text i sidhuvud och sidfot** (`header-style: "bold italic underline"`) ritas nu också i dokumentläget, och fetstil och understrykning i PDF-exporten. Understrykning läses och skrivs i `.docx` och `.odt`.
+- **Läsläget för Markdown blir användbart.** `Ctrl+F` söker i den ritade texten och markerar träffarna (F3 och Skift+F3 hoppar och rullar dit) utan att byta till redigeraren; `Ctrl+H` byter till redigeraren. Rubrikerna i navigeringsfönstret rullar läsvyn. Kryssrutor (`- [ ]`/`- [x]`) bockas av med ett klick (bara tecknet i hakparentesen ändras, fliken blir ändrad, `Ctrl+Z` och `Ctrl+Y` fungerar i läsläget). Dubbelklick på ett stycke, en rubrik, en listpunkt eller en tabellrad öppnar redigeraren med markören där, och rullningsläget följer med när man växlar. Kryssrutorna går också att klicka i förhandsvisningen bredvid texten.
+- **Snyggare länkar och tabeller i läsläget och förhandsvisningen.** Länkar har länkfärg, och tabeller har linjer, färgad och fet rubrikrad, luft i cellerna och radbrytning.
+
 ### Ändrat
 
 - README är nu en kort översikt med en tabell över filformaten Kladd öppnar, sparar och exporterar. Hela beskrivningen av funktionerna finns i `docs/handbok.md`.
+
+### Rättat
+
+- Text i tabellceller i ett sidhuvud placeras efter cellernas bredd (`w:tcW`, `w:gridSpan`, `w:tblGrid`) i stället för efter kolumnernas ordning: en smal logga till vänster och en bred titel hamnar vänster och mitten.
+- Sidnumrering som börjar om per avsnitt läses nu också från `.odt` (`style:page-number` på stycket och `style:first-page-number` på sidmallen) och skrivs tillbaka.
+- Ett stycke som fortsätter från en bredare spalt in i en smalare delas vid spaltgränsen: raderna bryts i respektive spalts bredd i dokumentläget och i PDF (förut fick hela stycket den smalaste bredden i vyn och den breda spaltens bredd i PDF).
+- Spalter med olika bredd jämnas nu ut på avsnittets sista sida före ett löpande avsnittsbyte i dokumentläget (som Word och LibreOffice). I PDF jämnas spalter fortfarande inte ut.
+- Kortkommandon med Alt tas inte längre av samma kommando utan Alt: `Ctrl+Alt+F` (fotnot) öppnade sökfältet i stället för att infoga en fotnot, och AltGr-tecken (Ctrl+Alt på Windows) kunde starta kommandon.
 
 ## [2.4.0] – 2026-11-17
 

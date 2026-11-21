@@ -51,11 +51,70 @@ enum Face {
     SansSemi,
     Mono,
     MonoMedium,
+    /// Carlito (Calibri) och Caladea (Cambria): används när dokumentet ber om dem, se `word::fontmap`.
+    Carlito,
+    CarlitoBold,
+    Serif,
+    SerifBold,
 }
 
+const FACES: [Face; 9] = [
+    Face::Sans,
+    Face::SansMedium,
+    Face::SansSemi,
+    Face::Mono,
+    Face::MonoMedium,
+    Face::Carlito,
+    Face::CarlitoBold,
+    Face::Serif,
+    Face::SerifBold,
+];
+
 impl Face {
+    /// Fet variant av en löptextsnitt (mono har ingen: den behåller sin).
+    fn strong(self) -> Face {
+        match self {
+            Face::Sans => Face::SansSemi,
+            Face::Carlito => Face::CarlitoBold,
+            Face::Serif => Face::SerifBold,
+            f => f,
+        }
+    }
+
+    /// Normal vikt av en fet variant.
+    fn plain(self) -> Face {
+        match self {
+            Face::SansSemi => Face::Sans,
+            Face::CarlitoBold => Face::Carlito,
+            Face::SerifBold => Face::Serif,
+            f => f,
+        }
+    }
+
+    fn is_mono(self) -> bool {
+        matches!(self, Face::Mono | Face::MonoMedium)
+    }
+
+    /// Löptextsnittet för ett typsnittsnamn: Calibri blir Carlito, serif (Cambria, Times,
+    /// Georgia...) Caladea, mono Plex Mono och allt annat Plex Sans.
+    fn for_family(name: &str) -> Face {
+        match crate::word::fontmap::bundled(name) {
+            Some(crate::word::fontmap::Bundled::Carlito) => Face::Carlito,
+            Some(crate::word::fontmap::Bundled::Caladea) => Face::Serif,
+            None => match classify_family(name) {
+                Family::Mono => Face::Mono,
+                Family::Serif => Face::Serif,
+                Family::Sans => Face::Sans,
+            },
+        }
+    }
+
     fn data(self) -> &'static [u8] {
         match self {
+            Face::Carlito => theme::CARLITO,
+            Face::CarlitoBold => theme::CARLITO_BOLD,
+            Face::Serif => crate::word::fontmap::CALADEA,
+            Face::SerifBold => crate::word::fontmap::CALADEA_BOLD,
             Face::Sans => theme::PLEX_SANS,
             Face::SansMedium => theme::PLEX_SANS_MEDIUM,
             Face::SansSemi => theme::PLEX_SANS_SEMIBOLD,
@@ -74,7 +133,7 @@ struct Measurer {
 impl Measurer {
     fn new() -> Self {
         let mut faces = HashMap::new();
-        for f in [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium] {
+        for f in FACES {
             faces.insert(f, rustybuzz::Face::from_slice(f.data(), 0).expect("inbyggt typsnitt"));
         }
         Self { faces, cache: HashMap::new() }
@@ -148,6 +207,9 @@ enum Block {
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     ColumnBreak,
     PageBreak,
+    /// Förankrad textruta med omflöde (`<!--k:tb N …-->`) och dess slut: stycken däremellan ritas på rutans läge.
+    TBoxOpen(crate::docx_tbox::Head),
+    TBoxClose,
 }
 
 /// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
@@ -494,6 +556,12 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 for line in t.split('\n') {
                     if let Some(pp) = crate::word::pbox::PPr::parse_marker(line.trim()) {
                         *look_cell.borrow_mut() = Some(pp);
+                    } else if let Some((_, head)) = crate::docx_tbox::parse_head(line.trim()).filter(|(_, h)| h.anchor.is_some_and(|a| a.wrap != Wrap::TopBottom)) {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::TBoxOpen(head));
+                    } else if line.trim() == crate::docx_tbox::CLOSE {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::TBoxClose);
                     }
                 }
                 let t = strip_markers(&t);
@@ -616,6 +684,19 @@ enum Op {
     Goto { x: f32, y: f32, w: f32, h: f32, page: usize, to_y: f32 },
 }
 
+impl Op {
+    /// Flyttar operationen `dy` pt nedåt (en textruta som läggs på sitt läge).
+    fn shift_y(&mut self, dy: f32) {
+        match self {
+            Op::Text { y, .. } | Op::Rect { y, .. } | Op::Math { y, .. } | Op::Image { y, .. } | Op::Link { y, .. } | Op::Goto { y, .. } => *y += dy,
+            Op::Line { y1, y2, .. } => {
+                *y1 += dy;
+                *y2 += dy;
+            }
+        }
+    }
+}
+
 /// Sidans mått (pt): bredd, höjd, marginaler och textytans vänsterkant och bredd (alla spalter).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PageGeom {
@@ -702,6 +783,8 @@ struct Layout<'a> {
     in_notes: bool,
     /// Flytande bilder som texten flyter runt just nu.
     floats: Vec<FloatBox>,
+    /// Rutans fasta underkant (pt) medan en textruta med fast höjd ritas.
+    box_min: Option<f32>,
     /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
     /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
     toc_entries: Vec<(u8, String)>,
@@ -739,7 +822,7 @@ enum Family {
     Mono,
 }
 
-/// Grov klassning på namnet: Kladd bäddar bara in IBM Plex Sans och Mono.
+/// Grov klassning på namnet (Plex Sans/Mono och Caladea är inbäddade, se `Face::for_family`).
 fn classify_family(name: &str) -> Family {
     let n = name.to_ascii_lowercase();
     const MONO: [&str; 8] = ["courier", "consolas", "mono", "menlo", "monaco", "lucida console", "typewriter", "fixed"];
@@ -771,22 +854,13 @@ struct Piece {
 }
 
 fn face_for(style: &Style, base: Face) -> Face {
-    let base_mono = matches!(base, Face::Mono | Face::MonoMedium);
-    let mono = style.code
-        || match style.span.font_family.as_deref().map(classify_family) {
-            Some(Family::Mono) => true,
-            Some(_) => false,
-            None => base_mono,
-        };
-    if mono {
+    // Spannens eget typsnitt, annars styckets.
+    let own = style.span.font_family.as_deref().map(Face::for_family);
+    let face = if style.code { Face::Mono } else { own.unwrap_or(base) };
+    if face.is_mono() {
         return if style.bold { Face::MonoMedium } else { Face::Mono };
     }
-    // Ingen serif är inbäddad: serif-namn behåller sans.
-    let base = if base_mono { Face::Sans } else { base };
-    match (style.bold, base) {
-        (true, Face::Sans) => Face::SansSemi,
-        _ => base,
-    }
+    if style.bold { face.strong() } else { face }
 }
 
 /// Fördelar överskottet till `width` på mellanrummen i raden (marginaljustering).
@@ -817,12 +891,14 @@ struct ImgSize {
 }
 
 impl<'a> Layout<'a> {
+    /// Rubrikernas typsnitt (normal vikt): dokumentets eget, utom mono som får Plex Sans.
+    fn head_face(&self) -> Face {
+        if self.base.is_mono() { Face::Sans } else { self.base.plain() }
+    }
+
     fn new(resolve: &'a dyn Fn(&str) -> Option<DocImage>, defaults: &DocDefaults) -> Self {
         let body = defaults.size();
-        let base = match defaults.font_family.as_deref().map(classify_family) {
-            Some(Family::Mono) => Face::Mono,
-            _ => Face::Sans,
-        };
+        let base = defaults.font_family.as_deref().map_or(Face::Sans, Face::for_family);
         let (pw, ph) = defaults.page();
         let [mt, mr, mb, ml] = defaults.layout_margins();
         // Orimliga marginaler (större än sidan) ger ändå en användbar textyta.
@@ -868,6 +944,7 @@ impl<'a> Layout<'a> {
             reserved: 0.0,
             in_notes: false,
             floats: Vec::new(),
+            box_min: None,
             toc_entries: Vec::new(),
             toc_pos: Vec::new(),
         }
@@ -880,7 +957,7 @@ impl<'a> Layout<'a> {
         self.ensure(size * LINE + self.body * LINE * 3.0);
         let (ml, cw, body) = (self.ml, self.cw, self.body);
         let title = vec![Span { text: "Innehåll".to_owned(), style: Style::default() }];
-        self.text_block(&title, ml, cw, Face::SansSemi, size, INK, false, None);
+        self.text_block(&title, ml, cw, self.head_face().strong(), size, INK, false, None);
         self.y += 6.0;
         let face = self.base;
         let line_h = body * LINE;
@@ -965,12 +1042,12 @@ impl<'a> Layout<'a> {
         let mut out = Vec::new();
         for (footer, tpl, align, st, dist) in items {
             let Some(tpl) = tpl else { continue };
-            let parts = hf::filled_parts(&tpl, align, f);
+            let rows = hf::filled_rows(&tpl, align, f);
             let size = st.size.unwrap_or(self.body * 0.9);
             let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
             // Bilderna först: de behöver sin egen storlek för uppställningen.
             let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
-            for src in parts.iter().flat_map(|p| hf::image_srcs(p)) {
+            for src in rows.iter().flatten().flat_map(|p| hf::image_srcs(p)) {
                 if loaded.contains_key(&src) {
                     continue;
                 }
@@ -980,17 +1057,23 @@ impl<'a> Layout<'a> {
                     loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
                 }
             }
-            let base_face = self.base;
+            let base_face = if st.bold { self.base.strong() } else { self.base };
             let m = std::cell::RefCell::new(&mut self.m);
             let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
             let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
-            let zn = hf::layout_zone(&parts, size, 1.0, g.cw, &measure, &natural);
+            let zn = hf::layout_rows(&rows, size, 1.0, g.cw, &measure, &natural);
             let edge = dist.unwrap_or(hf::DEFAULT_DIST);
             let top = if footer { g.ph - edge - zn.height } else { edge };
             for it in &zn.items {
                 match it {
                     Placed::Text { x, y, text, size } => {
-                        out.push(Op::Text { x: g.ml + x, y: top + y + size * 0.95, face: self.base, size: *size, text: text.clone(), color, italic: st.italic });
+                        let base_y = top + y + size * 0.95;
+                        out.push(Op::Text { x: g.ml + x, y: base_y, face: base_face, size: *size, text: text.clone(), color, italic: st.italic });
+                        if st.underline {
+                            let w = m.borrow_mut().width(base_face, *size, text);
+                            let uy = base_y + size * 0.12;
+                            out.push(Op::Line { x1: g.ml + x, y1: uy, x2: g.ml + x + w, y2: uy, width: (size * 0.06).max(0.4), color });
+                        }
                     }
                     Placed::Image { x, y, w, h, src, anchored } => {
                         let Some((index, ..)) = loaded.get(src) else { continue };
@@ -1368,8 +1451,11 @@ impl<'a> Layout<'a> {
         let pieces = self.pieces(spans, base, size);
         let pieces: Vec<Piece> = pieces.into_iter().flat_map(|p| self.split_long(p, width)).collect();
         let (mut next, mut i) = (0usize, 0usize);
-        let ml_entry = self.ml;
+        let (ml_entry, cw_entry) = (self.ml, self.cw);
+        let width0 = width;
         loop {
+            // Texten följer med till nästa spalt och bryts i dess bredd (spalterna kan vara olika breda).
+            let mut width = width0 + (self.cw - cw_entry);
             // Flytande bilder gör raden smalare (och förskjuter den vid vänsterbilder).
             let (mut fx, mut fw) = self.float_room();
             let ind0 = if i == 0 { self.first_indent } else { 0.0 };
@@ -1393,6 +1479,7 @@ impl<'a> Layout<'a> {
             // Texten följer med till nästa spalt.
             let x = x + (self.ml - ml_entry);
             if self.breaks != page_before {
+                width = width0 + (self.cw - cw_entry);
                 (fx, fw) = self.float_room();
                 (line, after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0) - ind0).max(1.0));
                 refs = refs_of(self, &line);
@@ -1635,6 +1722,60 @@ impl<'a> Layout<'a> {
         self.floats.push(FloatBox { side, full, w: rw, page, top, bottom });
     }
 
+    /// Förankrad textruta: stycknen ritas som vanliga ramstycken, flyttas till rutans läge (som en förankrad bild)
+    /// och texten efter dem flyter runt rutan. `inner` är blocken mellan rutans öppnings- och slutrad.
+    fn tbox(&mut self, head: &crate::docx_tbox::Head, inner: &[Block]) {
+        let Some(an) = head.anchor else { return self.run(inner) };
+        let a = an.scaled(0.75);
+        let (w, h) = (head.w * 0.75, head.h * 0.75);
+        let ctx = PageCtx {
+            page_w: self.pw,
+            page_h: self.ph,
+            margin: [self.mt, (self.pw - self.text_l - self.text_w).max(0.0), self.mb, self.text_l],
+            col_left: self.ml,
+            col_w: self.cw,
+        };
+        if a.wrap.affects_text() && matches!(a.y_at(h, &ctx), VAt::Para(_)) {
+            self.ensure(h.min(self.ph * 0.5).max(self.body * 2.0));
+        }
+        let (y0, page, at) = (self.y, self.pages.len() - 1, self.page().ops.len());
+        self.box_min = (h > 1.0).then_some(y0 + h);
+        self.run(inner);
+        self.box_min = None;
+        let same_page = self.pages.len() - 1 == page;
+        let used = if same_page { (self.y - y0).max(0.0) } else { h };
+        let full_h = h.max(used);
+        let top = match a.y_at(full_h, &ctx) {
+            VAt::Para(o) => y0 + o.max(0.0),
+            VAt::Page(py) => py,
+        };
+        if same_page {
+            let behind = a.wrap == Wrap::Behind;
+            let ops = &mut self.pages[page].ops;
+            let mut moved: Vec<Op> = ops.drain(at.min(ops.len())..).collect();
+            moved.iter_mut().for_each(|o| o.shift_y(top - y0));
+            if behind {
+                ops.splice(0..0, moved);
+            } else {
+                ops.extend(moved);
+            }
+        }
+        self.y = y0;
+        if !a.wrap.affects_text() {
+            return;
+        }
+        let x = self.ml + a.x_in_column(w, &ctx);
+        let (side, rw, full) = match crate::word::anchor::reserve(&a, x - self.ml, w, self.cw) {
+            Reserve::Left(r) => (Float::Left, r, false),
+            Reserve::Right(r) => (Float::Right, r, false),
+            Reserve::Full => (Float::Left, 0.0, true),
+        };
+        let full = full || self.cw - rw < FLOAT_MIN_ROOM;
+        // Raden som delvis ligger över rutans överkant flyter också runt den.
+        let ftop = top - a.dist[0] - self.body * 1.1;
+        self.floats.push(FloatBox { side, full, w: rw, page, top: ftop, bottom: top + full_h + a.dist[2] });
+    }
+
     fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>, fmt: Option<&crate::word::tablefmt::TableFmt>) {
         use crate::word::tablefmt::{BOTTOM, LEFT, RIGHT, TAlign, TOP, VAlign, Width};
         self.clear_floats();
@@ -1717,7 +1858,7 @@ impl<'a> Layout<'a> {
             out
         };
         for (ri, r) in rows.iter().enumerate() {
-            let face = if ri == 0 && fmt.is_none_or(|f| f.header_bold) { Face::SansSemi } else { self.base };
+            let face = if ri == 0 && fmt.is_none_or(|f| f.header_bold) { self.head_face().strong() } else { self.base };
             let layout = cells_of(ri, r.len());
             // Mät radens höjd genom att lägga ut cellerna på en provsida.
             let mut heights = Vec::new();
@@ -1851,6 +1992,7 @@ impl<'a> Layout<'a> {
     fn paint_box(&mut self, l: &crate::word::pbox::PPr, x: f32, w: f32, ops_at: Option<usize>, top: f32, first: bool, last: bool, same_page: bool) {
         // Luften under sista stycket, och avståndet fram till nästa stycke i samma ruta fylls också.
         let bottom = self.y + if last { l.pad_bottom() } else { PARA_GAP };
+        let bottom = if last { bottom.max(self.box_min.unwrap_or(0.0)) } else { bottom };
         let start = if same_page { top - if first { l.pad_top() } else { 0.0 } } else { self.rt };
         let h = (bottom - start).max(1.0);
         let col = |c: Option<[u8; 3]>| c.map_or(INK, |c| (c[0], c[1], c[2]));
@@ -1888,18 +2030,29 @@ impl<'a> Layout<'a> {
     }
 
     fn run(&mut self, blocks: &[Block]) {
+        let mut skip_to = 0;
         for (bi, b) in blocks.iter().enumerate() {
+            if bi < skip_to {
+                continue;
+            }
             self.align = Align::Left;
             match b {
+                Block::TBoxOpen(head) => {
+                    let end = blocks[bi + 1..].iter().position(|b| matches!(b, Block::TBoxClose)).map_or(blocks.len(), |i| bi + 1 + i);
+                    self.tbox(head, &blocks[bi + 1..end]);
+                    skip_to = end + 1;
+                }
+                Block::TBoxClose => {}
                 Block::Heading(level, spans, align) => {
                     self.align = *align;
+                    let hb = self.head_face();
                     let (size, face, before) = match *level {
-                        TITLE_LEVEL => (26.0, Face::Sans, 0.0),
-                        SUBTITLE_LEVEL => (14.0, Face::Sans, 0.0),
-                        1 => (22.0, Face::SansSemi, 14.0),
-                        2 => (16.5, Face::SansSemi, 14.0),
-                        3 => (13.5, Face::SansSemi, 10.0),
-                        _ => (11.5, Face::SansSemi, 8.0),
+                        TITLE_LEVEL => (26.0, hb, 0.0),
+                        SUBTITLE_LEVEL => (14.0, hb, 0.0),
+                        1 => (22.0, hb.strong(), 14.0),
+                        2 => (16.5, hb.strong(), 14.0),
+                        3 => (13.5, hb.strong(), 10.0),
+                        _ => (11.5, hb.strong(), 8.0),
                     };
                     let size = size * self.scale;
                     // Formatmallens utseende (typsnittet är alltid det inbäddade).
@@ -1911,8 +2064,8 @@ impl<'a> Layout<'a> {
                     let st = self.styles.get(id).clone();
                     let size = st.size.unwrap_or(size);
                     let face = match (st.bold, *level >= TITLE_LEVEL) {
-                        (Some(false), _) | (None, true) => Face::Sans,
-                        (Some(true), true) => Face::SansSemi,
+                        (Some(false), _) | (None, true) => hb,
+                        (Some(true), true) => hb.strong(),
                         _ => face,
                     };
                     let ink = st.color.map_or(if *level == SUBTITLE_LEVEL { MUTED } else { INK }, |c| (c[0], c[1], c[2]));
@@ -1956,7 +2109,7 @@ impl<'a> Layout<'a> {
                     let st = self.styles.get(if *quote > 0 { style::StyleId::Quote } else { style::StyleId::Body }).clone();
                     let (color, italic) = (st.color.map_or(color, |c| (c[0], c[1], c[2])), st.italic.unwrap_or(italic));
                     let size = st.size.unwrap_or(self.body);
-                    let face = if st.bold == Some(true) && self.base == Face::Sans { Face::SansSemi } else { self.base };
+                    let face = if st.bold == Some(true) { self.base.strong() } else { self.base };
                     if *align == Align::Left {
                         self.align = st.align.unwrap_or(Align::Left);
                     }
@@ -2195,7 +2348,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let defaults = doc_defaults(markdown);
     let mut lay = lay_out(&blocks, &notes, &defaults, resolve);
 
-    let fonts: HashMap<Face, Font> = [Face::Sans, Face::SansMedium, Face::SansSemi, Face::Mono, Face::MonoMedium]
+    let fonts: HashMap<Face, Font> = FACES
         .into_iter()
         .map(|f| (f, Font::new(krilla::Data::from(f.data()), 0).expect("inbyggt typsnitt")))
         .collect();
@@ -2400,6 +2553,26 @@ mod tests {
     }
 
     #[test]
+    fn anchored_text_box_floats_and_text_wraps_around_it() {
+        let pp = "<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\" fr=\"w=120 x=end pl=8 pr=8 h=100\"-->";
+        let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam.";
+        let md = format!("Före\n\n<!--k:tb 1 w=\"160\" h=\"133.3\" x=\"right\" y=\"0\"-->\n\nRutan{pp}\n\n<!--k:/tb-->\n\n{lorem}\n\n{lorem}\n");
+        let (lay, _) = laid_out(&md, &|_| None);
+        let ops = &lay.pages[0].ops;
+        let t = texts(ops);
+        let (bx, by, _) = t.iter().find(|(_, _, s)| s.contains("Rutan")).unwrap().clone();
+        let (_, ly, _) = t.iter().find(|(_, _, s)| s.contains("Lorem")).unwrap().clone();
+        // Rutans text ligger vid högerkanten, på höjd med första textraden (inte under den).
+        assert!(bx > lay.ml + lay.cw - 130.0, "{bx}");
+        assert!((by - ly).abs() < 30.0, "{by} {ly}");
+        // Texten bredvid slutar före rutan (120 pt + luft); fyllningen har den fasta höjden 100 pt.
+        let near: Vec<_> = t.iter().filter(|(x, y, _)| *y < by + 60.0 && *y > ly - 1.0 && *x < lay.ml + 5.0).collect();
+        assert!(!near.is_empty());
+        let fill = ops.iter().find_map(|o| if let Op::Rect { h, color: (0xFF, 0xF2, 0xCC), .. } = o { Some(*h) } else { None }).unwrap();
+        assert!(fill >= 99.0, "{fill}");
+    }
+
+    #[test]
     fn table_format_gives_fills_borders_and_no_comment_text() {
         use crate::word::tablefmt::{TableFmt, Width};
         let mut f = TableFmt::word_base();
@@ -2594,8 +2767,33 @@ mod tests {
         let mut st = Style::default();
         st.span.font_family = Some("Courier New".into());
         assert_eq!(face_for(&st, Face::Sans), Face::Mono);
+        // Serif blir inbäddade Caladea, Calibri Carlito; fet ger fet variant av samma typsnitt.
         st.span.font_family = Some("Georgia".into());
-        assert_eq!(face_for(&st, Face::Sans), Face::Sans);
+        assert_eq!(face_for(&st, Face::Sans), Face::Serif);
+        st.span.font_family = Some("Cambria".into());
+        st.bold = true;
+        assert_eq!(face_for(&st, Face::Sans), Face::SerifBold);
+        st.span.font_family = Some("Calibri Light".into());
+        assert_eq!(face_for(&st, Face::Sans), Face::CarlitoBold);
+        st.span.font_family = None;
+        st.bold = false;
+        assert_eq!(face_for(&st, Face::Carlito), Face::Carlito);
+        assert_eq!(Face::for_family("Arial"), Face::Sans);
+        assert_eq!(Face::for_family("Calibri"), Face::Carlito);
+        assert_eq!(Face::for_family("Times New Roman"), Face::Serif);
+    }
+
+    /// PDF med Cambria och Calibri bäddar in Caladea respektive Carlito.
+    #[test]
+    fn pdf_med_cambria_och_calibri() {
+        for fam in ["Cambria", "Calibri"] {
+            let md = format!("<!-- kladd: font-family: \"{fam}\"; font-size: 11pt -->\n\n# Rubrik åäö\n\nBrödtext med **fet** och *kursiv*.\n");
+            let w = write(&md, "T", &|_| None).unwrap();
+            assert!(w.bytes.starts_with(b"%PDF"));
+            let hay = String::from_utf8_lossy(&w.bytes);
+            let want = if fam == "Cambria" { "Caladea" } else { "Carlito" };
+            assert!(hay.contains(want), "{fam}: {want} saknas i PDF:en");
+        }
     }
 
     #[test]

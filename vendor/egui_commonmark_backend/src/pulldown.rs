@@ -331,6 +331,10 @@ pub struct ViewerCache {
     /// Populated during the full render; used by the viewport path to
     /// scroll to headings outside the currently rendered slice.
     pub heading_y_positions: HashMap<String, f32>,
+    /// Kladd: (källbyte, virtuellt y) för starten av varje stycke, rubrik, kodblock, listpunkt och
+    /// tabellrad, i ritordning; görs om vid varje ritning. Ger "vilken källrad ligger vid y" för
+    /// dubbelklick och rullningssynk, även inne i listor och tabeller (som `split_points` hoppar över).
+    pub line_points: Vec<(usize, f32)>,
     /// Keyboard / programmatic scroll delta applied inside the next
     /// `show_scrollable` call and then cleared.
     pub pending_scroll_delta: egui::Vec2,

@@ -21,6 +21,9 @@ use super::pbox::{self, LineRule, PPr};
 use crate::highlight;
 use crate::theme::{self, Palette};
 
+#[path = "layout_notes.rs"]
+mod notes;
+
 /// Punkter till pixlar vid zoom (96 dpi).
 /// Words standardavstånd mellan tabbstopp (0,5 tum).
 pub const TAB_STOP_PT: f32 = 36.0;
@@ -129,6 +132,8 @@ struct DocState {
     float_starts: Vec<(usize, Float, usize)>,
     /// Arken i senaste utläggningen (läge, mått och spalter), se `secpages`.
     page_boxes: Arc<Vec<super::secpages::PageBox>>,
+    /// Fotnoterna som ritas längst ned på sidorna i senaste utläggningen (se `fnotes`).
+    notes: Arc<Vec<super::fnotes::NoteLayout>>,
 }
 
 #[derive(Default)]
@@ -168,6 +173,7 @@ impl Cache {
             tick: 0,
             float_starts: Vec::new(),
             page_boxes: Arc::default(),
+            notes: Arc::default(),
         });
         if st.text != text {
             // Stora dokument: tolka bara om stycket med ändringen (samma resultat som `analyze`) och
@@ -212,6 +218,11 @@ impl Cache {
     /// Arken från senaste omläggningen av `text` (tom om den inte gjorts med sidbrytning).
     pub fn page_boxes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::secpages::PageBox>> {
         self.state(doc_id, text).page_boxes.clone()
+    }
+
+    /// Fotnoterna från senaste omläggningen av `text`: `PageBox::notes` pekar in i listan.
+    pub fn notes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::fnotes::NoteLayout>> {
+        self.state(doc_id, text).notes.clone()
     }
 
     pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
@@ -468,6 +479,11 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
 
 /// Lägger ut dokumentet från styckecachen och fogar ihop det. `env` = hash av parametrarna
 /// som gäller alla stycken.
+///
+/// Avsnitt med olika breda spalter som följs av ett löpande avsnitt på samma ark jämnas ut på sista
+/// arket (som Word och LibreOffice): stycken kan inte flyttas mellan spalter utan att brytas om, så
+/// den lägsta spalthöjden som ryms i avsnittets spalter söks genom att lägga ut om dokumentet med
+/// olika höjder (utläggningen av oförändrade stycken kommer ur styckecachen).
 #[allow(clippy::too_many_arguments)]
 fn relayout(
     st: &mut DocState,
@@ -479,6 +495,50 @@ fn relayout(
     env: u64,
     pages: Option<&super::pages::Geom>,
 ) -> Galley {
+    use super::secpages::Balance;
+    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new());
+    let Some(geom) = pages.filter(|g| g.multi() && g.unequal_cols()) else { return g };
+    let cands: Vec<(usize, super::secpages::SecRun)> = runs.iter().filter(|(s, _)| geom.balance_candidate(**s)).map(|(s, r)| (*s, *r)).collect();
+    if cands.is_empty() {
+        return g;
+    }
+    // Minsta höjd: lika fördelat; största: som den är nu.
+    let mut lo: HashMap<usize, f32> = cands.iter().map(|(s, r)| (*s, r.used / geom.sec(*s).cols as f32)).collect();
+    let mut hi: HashMap<usize, f32> = cands.iter().map(|(s, r)| (*s, r.used)).collect();
+    for _ in 0..8 {
+        if cands.iter().all(|(s, _)| hi[s] - lo[s] < 2.0) {
+            break;
+        }
+        let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, (lo[s] + hi[s]) / 2.0))).collect();
+        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal);
+        for (s, r) in &cands {
+            let mid = (lo[s] + hi[s]) / 2.0;
+            // Ryms allt på sista arket (inga fler arkbyten)?
+            if run.get(s).is_some_and(|x| x.sheets == r.sheets) {
+                hi.insert(*s, mid);
+            } else {
+                lo.insert(*s, mid);
+            }
+        }
+    }
+    // Några px marginal: sidbrytningen avrundar raderna något annorlunda än uppskattningen.
+    let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, hi[s] + 2.0))).collect();
+    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal).0
+}
+
+/// Ett utläggningsvarv (se `relayout`); ger också hur varje avsnitt med olika breda spalter fyllde arken.
+#[allow(clippy::too_many_arguments)]
+fn relayout_pass(
+    st: &mut DocState,
+    ctx: &egui::Context,
+    text: &str,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    env: u64,
+    pages: Option<&super::pages::Geom>,
+    balance: &super::secpages::Balance,
+) -> (Galley, HashMap<usize, super::secpages::SecRun>) {
     st.tick += 1;
     let tick = st.tick;
     let a = st.analysis.clone();
@@ -488,7 +548,10 @@ fn relayout(
         format!("{:?}", a.defaults).hash(&mut h);
         h.finish()
     };
-    let paras = paragraphs(text, &a, p);
+    let mut paras = paragraphs(text, &a, p);
+    // Fotnotsdefinitionerna ritas längst ned på sidan; i flödet blir de dolda rader.
+    let defs = if pages.is_some() { notes::plan(text, &a, &mut paras, p.zoom) } else { Vec::new() };
+    let mut note_layouts: Vec<super::fnotes::NoteLayout> = Vec::new();
     let groups = group_paras(text, &paras, &grid);
     let min_h = px(p.zoom, a.defaults.size()) * 1.4;
 
@@ -501,6 +564,18 @@ fn relayout(
         bottom: f32,
     }
     let mut active: Vec<FloatBox> = Vec::new();
+    // Förankrade textrutor med omflöde: stycken i rutan tar ingen höjd (`y`), efter rutan dras texten upp
+    // till rutans överkant (`pulls`: första raden som dras upp, höjd) och rutans rader flyttas till sitt läge
+    // (`shifts`: rader, förskjutning). Se `apply_pulls`.
+    struct BoxSt {
+        tb: TBox,
+        content_h: f32,
+        first_row: usize,
+    }
+    let mut boxst: Option<BoxSt> = None;
+    let mut pulls: Vec<(usize, f32)> = Vec::new();
+    let mut shifts: Vec<(Range<usize>, f32)> = Vec::new();
+    let mut box_rows: Vec<Range<usize>> = Vec::new();
     let mut y = 0.0f32;
     let mut row_no = 0usize;
     let mut anchors: Vec<(usize, f32)> = Vec::new();
@@ -520,7 +595,7 @@ fn relayout(
     let mut sim = pages.filter(|_| !multi).map(PageSim::new);
     // Olika breda spalter: spaltfyllnaden följs i förväg så att varje stycke får sin spalts bredd.
     let unequal = multi && pages.is_some_and(|g| g.unequal_cols());
-    let mut csim = super::secpages::ColSim::default();
+    let mut csim = super::secpages::ColSim::with_balance(balance.clone());
     for (pr, w, tbl) in groups.iter() {
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
@@ -531,7 +606,18 @@ fn relayout(
         };
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
+        let opened = !table && paras[pr.start].tbox.is_some();
+        if let (true, Some(tb)) = (opened, paras[pr.start].tbox) {
+            boxst = Some(BoxSt { tb, content_h: 0.0, first_row: usize::MAX });
+        }
+        let closing = !table && paras[pr.start].tbox_end && boxst.is_some();
+        let in_box = !table && !opened && !closing && boxst.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
+        let note_def = defs.iter().find(|d| d.para == pr.start && !table);
+        if let Some(d) = note_def {
+            note_layouts.push(notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d));
+            gp[0].collapse = true;
+        }
         let mut anchor: Option<(FloatSpec, FloatPlan)> = None;
         if let (Some(f), false) = (gp[0].float, table) {
             let ctx = match pages {
@@ -575,10 +661,15 @@ fn relayout(
                 .collect()
         };
         let mut retry = false;
+        // Stycket delas vid spaltgränsen när det går in i en smalare spalt (raderna bryts i sin spalts bredd).
+        let mut by_cols = false;
         let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = loop {
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
             wrap_width.to_bits().hash(&mut h);
+            if by_cols {
+                csim.state_key().hash(&mut h);
+            }
             for f in &rel {
                 (f.side, f.w.to_bits(), f.top.to_bits(), f.bottom.to_bits()).hash(&mut h);
             }
@@ -593,6 +684,9 @@ fn relayout(
             for s in &mut job.sections {
                 s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
             }
+            if note_def.is_some() {
+                notes::hide_all(&mut job, (p.font_family)(Some(a.defaults.font()), false, false));
+            }
             let relp: Vec<Para> =
                 gp.iter().map(|q| Para { range: q.range.start - w.start..q.range.end - w.start, ..q.clone() }).collect();
             // Kolumnbredder mäts före `fonts_mut` (måttet tar själv fontlåset).
@@ -600,9 +694,13 @@ fn relayout(
                 let lines: Vec<Range<usize>> = paras[pr.clone()].iter().map(|q| q.range.clone()).collect();
                 Arc::new(grid::plan(text, &a, &lines, p, wrap_width).rel(w.start))
             });
-            let laid: Vec<Arc<Galley>> = ctx.fonts_mut(|f| match &geom {
-                Some(g) => layout_table_lines(f, &job, &relp, g, p, wrap_width, ppp, min_h),
-                None => relp.iter().map(|q| layout_para_floats(f, &job, q, wrap_width, ppp, &rel)).collect(),
+            let laid: Vec<Arc<Galley>> = ctx.fonts_mut(|f| match (&geom, pages) {
+                (Some(g), _) => layout_table_lines(f, &job, &relp, g, p, wrap_width, ppp, min_h),
+                (None, Some(pg)) if by_cols => {
+                    let mut sim = csim.clone();
+                    relp.iter().map(|q| layout_para_cols(f, &job, q, wrap_width, ppp, &mut sim, pg, sec)).collect()
+                }
+                (None, _) => relp.iter().map(|q| layout_para_floats(f, &job, q, wrap_width, ppp, &rel)).collect(),
             });
             let gs = Arc::new(laid);
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
@@ -614,14 +712,19 @@ fn relayout(
             let hs: Vec<f32> = laid_out.0.iter().flat_map(|lg| lg.rows.iter().map(|r| r.row.size.y)).collect();
             let min_w = t.place(g, sec, hs);
             if min_w < wrap_width - 0.5 {
-                wrap_width = min_w;
+                // Utan flytande bilder delas stycket vid spaltgränsen; annars får hela stycket den smalaste bredden.
+                if rel.is_empty() {
+                    by_cols = true;
+                } else {
+                    wrap_width = min_w;
+                }
                 retry = true;
                 continue;
             }
         }
         break laid_out;
         };
-        if let (true, Some(g)) = (unequal, pages) {
+        if let (true, Some(g), false) = (unequal, pages, in_box) {
             let hs: Vec<f32> = if table {
                 vec![galleys.iter().map(|lg| lg.rect.height()).sum()]
             } else {
@@ -671,17 +774,63 @@ fn relayout(
                 active.push(FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom });
             }
         }
-        row_no += galleys.iter().map(|g| g.rows.len()).sum::<usize>();
-        if let Some(sm) = sim.as_mut() {
-            let mut gy = y;
-            for g in galleys.iter() {
-                for r in &g.rows {
-                    sm.place(gy + r.pos.y, r.row.size.y);
+        let gh: f32 = galleys.iter().map(|g| g.rect.height()).sum();
+        let close_rows: usize = galleys.iter().map(|g| g.rows.len()).sum();
+        if let Some(b) = boxst.take_if(|_| closing) {
+            // Rutan är klar: texten efter den dras upp till rutans överkant och flyter runt den.
+            let ctx = match pages {
+                Some(g) => PageCtx { page_w: g.page_w, page_h: g.page_h, margin: [g.top, g.right, g.bottom, g.left], col_left: g.left, col_w: wrap_width },
+                None => PageCtx::column_only(wrap_width),
+            };
+            let z = p.zoom;
+            let w_z = if b.tb.w > 0.0 { b.tb.w * z } else { wrap_width * 0.5 };
+            let h_z = (b.tb.h * z).max(b.content_h);
+            let page_y = sim.as_ref().map(|s| s.sheet_y(y));
+            let spec = FloatSpec { side: Float::Right, anchor: Some(b.tb.anchor), size: egui::vec2(w_z, h_z), alone: false };
+            let mut plan = plan_float(&spec, z, wrap_width, &ctx, page_y, min_h);
+            let a = b.tb.anchor.scaled(z);
+            let top = match a.y_at(h_z, &ctx) {
+                VAt::Para(o) => o,
+                VAt::Page(py) => page_y.map_or(0.0, |s| py - s),
+            }
+            .max(0.0);
+            if plan.side.is_some_and(|s| s != Side::Full) && wrap_width - plan.w < FLOAT_MIN_ROOM * z {
+                plan.side = Some(Side::Full);
+            }
+            if let Some(side) = plan.side {
+                // Raden som delvis ligger över rutans överkant flyter också runt den.
+                active.push(FloatBox { side, w: plan.w, top: y + top - a.dist[0] - (min_h - 1.0).max(0.0), bottom: y + top + h_z + a.dist[2] });
+            }
+            if b.first_row <= row_no {
+                pulls.push((row_no, b.content_h));
+                shifts.push((b.first_row..row_no, top));
+                if multi {
+                    box_rows.push(b.first_row..row_no);
+                } else if b.first_row < row_no {
+                    row_groups.push(b.first_row..row_no);
                 }
-                gy += g.rect.height();
+            }
+            anchors.push((row_no + close_rows, h_z + top));
+        }
+        row_no += close_rows;
+        if let (true, Some(b)) = (opened, boxst.as_mut()) {
+            b.first_row = row_no;
+        }
+        match boxst.as_mut() {
+            Some(b) if in_box => b.content_h += gh,
+            _ => {
+                if let Some(sm) = sim.as_mut() {
+                    let mut gy = y;
+                    for g in galleys.iter() {
+                        for r in &g.rows {
+                            sm.place(gy + r.pos.y, r.row.size.y);
+                        }
+                        gy += g.rect.height();
+                    }
+                }
+                y += gh;
             }
         }
-        y += galleys.iter().map(|g| g.rect.height()).sum::<f32>();
         all.extend(galleys.iter().cloned());
     }
     st.units.retain(|_, u| u.used == tick);
@@ -695,9 +844,14 @@ fn relayout(
         format: TextFormat::default(),
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
+    apply_pulls(&mut g, &pulls, &shifts, ppp);
+    let spec = match pages {
+        Some(geom) if !note_layouts.is_empty() => notes::spec(&note_layouts, &g, text, &a, p.zoom, geom.text_h() * 0.5),
+        _ => super::fnotes::NoteSpec::default(),
+    };
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec, balance, &box_rows);
             // Tabellernas kolumnkanter följer med raderna i sidled.
             for (t, r) in geoms.iter_mut().zip(&geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
@@ -706,13 +860,45 @@ fn relayout(
             st.page_boxes = Arc::new(paged.boxes);
         }
         Some(geom) => {
-            super::pages::paginate_breaks(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks);
-            st.page_boxes = Arc::new(geom.uniform_boxes(super::pages::page_count(&g, geom)));
+            let pn = super::pages::paginate_notes(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks, &spec);
+            let mut boxes = geom.uniform_boxes(super::pages::page_count(&g, geom));
+            for (b, n) in boxes.iter_mut().zip(pn) {
+                b.notes = n.notes;
+                b.reserved = n.reserved;
+            }
+            st.page_boxes = Arc::new(boxes);
         }
         None => st.page_boxes = Arc::default(),
     }
     st.geoms = Arc::new(geoms);
-    g
+    st.notes = Arc::new(note_layouts);
+    (g, csim.runs)
+}
+
+/// Textrutornas omflöde: rader från `pulls` (första raden, höjd) och framåt flyttas uppåt så att texten efter
+/// en ruta börjar vid rutans överkant, och rutans egna rader (`shifts`) flyttas ned till sitt läge.
+fn apply_pulls(g: &mut Galley, pulls: &[(usize, f32)], shifts: &[(Range<usize>, f32)], ppp: f32) {
+    if pulls.is_empty() {
+        return;
+    }
+    let round = |v: f32| (v * ppp).round() / ppp;
+    let mut cum = 0.0f32;
+    let mut next = 0;
+    for (i, r) in g.rows.iter_mut().enumerate() {
+        while next < pulls.len() && pulls[next].0 <= i {
+            cum += pulls[next].1;
+            next += 1;
+        }
+        let dy = shifts.iter().find(|(rg, _)| rg.contains(&i)).map_or(0.0, |(_, d)| *d);
+        r.pos.y = round(r.pos.y - cum + dy);
+    }
+    let mut rect = Rect::ZERO;
+    g.mesh_bounds = Rect::NOTHING;
+    for r in &g.rows {
+        rect |= Rect::from_min_size(r.pos, r.row.size);
+        g.mesh_bounds |= r.row.visuals.mesh_bounds.translate(r.pos.to_vec2());
+    }
+    g.rect = rect;
 }
 
 /// Stycken som läggs ut tillsammans: ett vanligt stycke, eller alla rader i en tabell.
@@ -1484,6 +1670,19 @@ struct Para {
     ppx: f32,
     /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
     empty_h: Option<f32>,
+    /// Öppningsraden till en förankrad textruta med omflöde (`<!--k:tb N …-->`): rutans stycken ligger ovanpå
+    /// texten bredvid (`relayout`).
+    tbox: Option<TBox>,
+    /// Stängningsraden till en sådan ruta.
+    tbox_end: bool,
+}
+
+/// En förankrad textruta ur öppningsraden: ankare, bredd och fast höjd (px vid 100 %).
+#[derive(Debug, Clone, Copy)]
+struct TBox {
+    anchor: Anchor,
+    w: f32,
+    h: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1548,6 +1747,13 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let is_tag = ep.is_none()
             && (t.starts_with("<div") || t.starts_with("</div") || t.starts_with("<!--"))
             && ps.iter().all(|pc| pc.markup || body(pc).trim().is_empty());
+        let shown_tag = is_tag && !intersects(&range, &p.reveal);
+        let tbox = if shown_tag {
+            crate::docx_tbox::parse_head(t).and_then(|(_, h)| h.anchor.filter(|a| a.wrap != Wrap::TopBottom).map(|anchor| TBox { anchor, w: h.w, h: h.h }))
+        } else {
+            None
+        };
+        let tbox_end = shown_tag && t == crate::docx_tbox::CLOSE;
         tag.push(if !is_tag || intersects(&range, &p.reveal) {
             0
         } else if t.starts_with("</div") || t == crate::docx_tbox::CLOSE {
@@ -1639,6 +1845,8 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             hang: 0.0,
             ppx: 0.0,
             empty_h: ep.as_ref().map(|(_, h)| *h),
+            tbox,
+            tbox_end,
         });
         if e >= text.len() {
             break;
@@ -1663,6 +1871,25 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let after_open = i > 0 && tag[i - 1] == 1;
         let before_close = tag.get(i + 1) == Some(&2);
         out[i].collapse = after_open || before_close;
+    }
+    // En ruta utan stängningsrad är vanlig text.
+    let mut open: Option<usize> = None;
+    for i in 0..out.len() {
+        if out[i].tbox.is_some() {
+            if let Some(o) = open.replace(i) {
+                out[o].tbox = None;
+            }
+        } else if out[i].tbox_end {
+            if open.take().is_none() {
+                out[i].tbox_end = false;
+            } else if let Some(next) = out.get_mut(i + 1).filter(|q| q.range.is_empty()) {
+                // Blankraden efter en flytande ruta: rutan tar ingen plats i flödet, så den behövs inte.
+                next.collapse = true;
+            }
+        }
+    }
+    if let Some(o) = open {
+        out[o].tbox = None;
     }
     empty_looks(text, &mut out);
     apply_looks(text, &mut out, &before0, &after, p.zoom);
@@ -2028,6 +2255,85 @@ fn layout_para_floats(
     let whole = Arc::new(clip_job(full, para.range.clone()));
     let mut g = Galley::concat(whole, &pieces, ppp);
     // Delningen är ingen radbrytning i texten.
+    let mut at = 0;
+    for pc in &pieces[..pieces.len() - 1] {
+        at += pc.rows.len();
+        g.rows[at - 1].ends_with_newline = false;
+    }
+    Arc::new(g)
+}
+
+/// Lägger ut ett stycke som går över flera spalter med olika bredd: raderna i varje spalt bryts i den
+/// spaltens bredd (stycket delas vid spaltgränsen, som i Word och LibreOffice). `sim` är spaltfyllnaden
+/// där stycket börjar och följer med genom stycket; `first_w` är bredden på spalten stycket börjar i.
+#[allow(clippy::too_many_arguments)]
+fn layout_para_cols(
+    fonts: &mut FontsView<'_>,
+    full: &LayoutJob,
+    para: &Para,
+    first_w: f32,
+    ppp: f32,
+    sim: &mut super::secpages::ColSim,
+    geom: &super::pages::Geom,
+    sec: usize,
+) -> Arc<Galley> {
+    if para.range.is_empty() || !first_w.is_finite() {
+        return layout_para(fonts, full, para, first_w, ppp);
+    }
+    let mut pieces: Vec<Arc<Galley>> = Vec::new();
+    let mut cur = para.clone();
+    let mut width = first_w;
+    // Varje varv går vidare en spalt eller lägger ut resten av stycket; taket skyddar mot oändlig slinga.
+    for _ in 0..2000 {
+        let cont = !pieces.is_empty();
+        let (g, _) = layout_piece(fonts, full, &cur, width, 0.0, ppp, None, cont, true);
+        let hs: Vec<f32> = g.rows.iter().map(|r| r.row.size.y).collect();
+        match sim.probe(geom, sec, &hs) {
+            // Hela resten går till nästa spalt: lägg ut den i den spaltens bredd.
+            Some((0, w2)) => {
+                sim.advance(geom, sec);
+                if (w2 - width).abs() < 0.5 {
+                    // Samma bredd: utläggningen gäller redan.
+                    sim.place(geom, sec, hs.iter().copied());
+                    pieces.push(g);
+                    break;
+                }
+                width = w2;
+            }
+            // Raderna före `k` ryms i spalten; resten läggs ut i nästa spalts bredd.
+            Some((k, w2)) => {
+                let before = if cont { 0.0 } else { para.space_before };
+                let cut_y = g.rows[k].pos.y - before;
+                let (g1, consumed) = layout_piece(fonts, full, &cur, width, 0.0, ppp, Some(cut_y), cont, false);
+                sim.place(geom, sec, g1.rows.iter().map(|r| r.row.size.y));
+                pieces.push(g1);
+                let Some(n) = consumed else { break };
+                let text = &full.text[cur.range.clone()];
+                let Some((off, _)) = text.char_indices().nth(n) else { break };
+                cur.range.start += off;
+                cur.list = cur.list.map(|l| ListGeom { marker_chars: 0, ..l });
+                sim.advance(geom, sec);
+                width = w2;
+                if cur.range.is_empty() {
+                    break;
+                }
+            }
+            None => {
+                sim.place(geom, sec, hs.iter().copied());
+                pieces.push(g);
+                break;
+            }
+        }
+    }
+    if pieces.is_empty() {
+        return layout_para(fonts, full, para, first_w, ppp);
+    }
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_else(|| unreachable!());
+    }
+    let whole = Arc::new(clip_job(full, para.range.clone()));
+    let mut g = Galley::concat(whole, &pieces, ppp);
+    // Delningen vid spaltgränsen är ingen radbrytning i texten.
     let mut at = 0;
     for pc in &pieces[..pieces.len() - 1] {
         at += pc.rows.len();

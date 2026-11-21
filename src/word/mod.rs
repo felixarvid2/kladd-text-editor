@@ -1,4 +1,5 @@
 pub mod anchor;
+pub mod fontmap;
 pub mod fonts;
 pub mod grid;
 pub mod headers;
@@ -7,13 +8,16 @@ pub mod images;
 pub mod layout;
 pub mod markup;
 pub mod nav;
+pub mod notesui;
 pub mod pbox;
 pub mod pboxui;
+pub mod tboxui;
 pub mod navui;
 pub mod tables;
 pub mod tablefmt;
 pub mod tablepaint;
 pub mod tableops;
+pub mod fnotes;
 pub mod pages;
 pub mod stylesdlg;
 pub mod reviewui;
@@ -26,6 +30,8 @@ pub mod bench;
 #[cfg(test)]
 mod fn_tests;
 #[cfg(test)]
+mod fn_page_tests;
+#[cfg(test)]
 mod en_tests;
 #[cfg(test)]
 mod float_tests;
@@ -33,3 +39,5 @@ mod float_tests;
 mod float_layout_tests;
 #[cfg(test)]
 mod section_tests;
+#[cfg(test)]
+mod tbox_layout_tests;

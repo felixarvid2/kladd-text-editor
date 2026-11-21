@@ -239,6 +239,10 @@ fn read_part(
     let mut tbl_depth = 0usize;
     let mut cells: Vec<String> = Vec::new();
     let mut cell_align: Vec<Option<Align>> = Vec::new();
+    // Kolumnbredder (`w:gridCol`) och cellernas egna mått (`w:tcW`, `w:gridSpan`) i twips.
+    let mut grid: Vec<f32> = Vec::new();
+    let mut cell_w: Vec<Option<f32>> = Vec::new();
+    let mut cell_span: Vec<usize> = Vec::new();
     let mut in_cell_depth = 0usize;
     // Hoppar över (textrutor, `mc:Fallback`).
     let mut skip = 0usize;
@@ -348,15 +352,33 @@ fn read_part(
                     }
                     b"tbl" => {
                         tbl_depth += 1;
+                        if tbl_depth == 1 {
+                            grid.clear();
+                        }
                     }
+                    b"gridCol" if tbl_depth == 1 => grid.push(attr(e, b"w").and_then(|v| v.parse().ok()).unwrap_or(0.0)),
                     b"tr" if tbl_depth == 1 => {
                         cells.clear();
                         cell_align.clear();
+                        cell_w.clear();
+                        cell_span.clear();
                     }
                     b"tc" if tbl_depth == 1 && !empty => {
                         in_cell_depth += 1;
                         cells.push(String::new());
                         cell_align.push(None);
+                        cell_w.push(None);
+                        cell_span.push(1);
+                    }
+                    b"tcW" if tbl_depth == 1 && in_cell_depth > 0 => {
+                        if let Some(w) = cell_w.last_mut() {
+                            *w = attr(e, b"w").and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0 && attr(e, b"type").is_none_or(|t| t == "dxa"));
+                        }
+                    }
+                    b"gridSpan" if tbl_depth == 1 && in_cell_depth > 0 => {
+                        if let Some(sp) = cell_span.last_mut() {
+                            *sp = attr(e, b"val").and_then(|v| v.parse().ok()).filter(|v| *v >= 1).unwrap_or(1);
+                        }
                     }
                     b"p" if !empty => {
                         in_p = true;
@@ -387,6 +409,7 @@ fn read_part(
                     }
                     b"b" if in_rpr => p_style.bold = on_off(e),
                     b"i" if in_rpr => p_style.italic = on_off(e),
+                    b"u" if in_rpr => p_style.underline = attr(e, b"val").is_none_or(|v| v != "none"),
                     b"t" => in_t = !empty,
                     b"instrText" => in_instr = !empty,
                     b"tab" if in_p && !in_ppr && !in_rpr => segs.push(std::mem::take(&mut cur)),
@@ -462,7 +485,8 @@ fn read_part(
                         let parts: Vec<String> = cells.iter().map(|c| c.trim().replace('|', "\\|")).collect();
                         if parts.iter().any(|p| !p.is_empty()) {
                             any_content = true;
-                            lines.push(Line { parts: table_zones(parts), right_only: false, align: cell_align.iter().flatten().next().copied() });
+                            let widths = cell_widths(&cell_w, &cell_span, &grid);
+                            lines.push(Line { parts: table_zones(parts, &widths, &cell_align), right_only: false, align: cell_align.iter().flatten().next().copied() });
                         }
                     }
                     b"tbl" => tbl_depth = tbl_depth.saturating_sub(1),
@@ -534,17 +558,34 @@ fn read_part(
     if !any_content {
         return None;
     }
-    // Delarna: flera stycken eller rader slås ihop per del; en rad med en enda del följer den
-    // första radens justering (som ett enda värde med `-align`).
+    // Delarna: ett stycke eller en tabellrad är en rad i mallen (`\n` skiljer raderna åt); en rad med
+    // en enda del följer den första radens justering (som ett enda värde med `-align`).
     let first_idx = match lines.first().and_then(|l| l.align) {
         Some(Align::Center) => 1,
         Some(Align::Right) => 2,
         _ => 0,
     };
-    let multi_line = lines.len() > 1;
+    if lines.len() > 1 {
+        let rows: Vec<String> = lines
+            .iter()
+            .filter_map(|l| {
+                let z = line_zones(l, None);
+                let filled: Vec<usize> = (0..3).filter(|&i| !z[i].is_empty()).collect();
+                match filled.as_slice() {
+                    [] => None,
+                    [i] if *i == first_idx && l.parts.len() < 2 => Some(z[*i].clone()),
+                    _ => Some(z.join("|")),
+                }
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        return Some(HfRead { template: rows.join("\n"), align: [Align::Left, Align::Center, Align::Right][first_idx], style });
+    }
     let mut zones: [Vec<String>; 3] = Default::default();
     for l in &lines {
-        for (z, t) in zones.iter_mut().zip(line_zones(l, multi_line.then_some(first_idx))) {
+        for (z, t) in zones.iter_mut().zip(line_zones(l, None)) {
             if !t.is_empty() {
                 z.push(t);
             }
@@ -562,16 +603,63 @@ fn read_part(
     Some(HfRead { template, align, style })
 }
 
-/// Cellerna i en tabellrad som vänster, mitten, höger.
-fn table_zones(p: Vec<String>) -> Vec<String> {
-    match p.len() {
-        0 | 1 => p,
-        2 => vec![p[0].clone(), String::new(), p[1].clone()],
-        n => {
-            let mid = p[1..n - 1].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
-            vec![p[0].clone(), mid, p[n - 1].clone()]
-        }
+/// Cellernas bredd (twips): egen bredd (`w:tcW`), annars kolumnernas (`w:tblGrid`) över cellens
+/// `w:gridSpan`, annars lika breda.
+fn cell_widths(own: &[Option<f32>], span: &[usize], grid: &[f32]) -> Vec<f32> {
+    let mut col = 0;
+    let mut out = Vec::with_capacity(own.len());
+    for (i, w) in own.iter().enumerate() {
+        let sp = span.get(i).copied().unwrap_or(1).max(1);
+        let from_grid: f32 = grid.iter().skip(col).take(sp).sum();
+        out.push(w.unwrap_or(from_grid));
+        col += sp;
     }
+    // Saknas måtten helt är cellerna lika breda.
+    if out.iter().any(|w| *w <= 0.0) {
+        return vec![1.0; own.len()];
+    }
+    out
+}
+
+/// Cellerna i en tabellrad som vänster, mitten, höger efter var de ligger på bredden: en cell vars
+/// mitt ligger i första tredjedelen är vänster, i sista tredjedelen höger, annars mitten. En bred
+/// cell med vänsterjusterad text börjar vid vänsterkanten, med högerjusterad text slutar den vid
+/// högerkanten. En enda cell lämnas orörd (raden följer dess justering).
+fn table_zones(p: Vec<String>, widths: &[f32], aligns: &[Option<Align>]) -> Vec<String> {
+    if p.len() <= 1 {
+        return p;
+    }
+    let total: f32 = widths.iter().sum::<f32>().max(1.0);
+    let mut out = vec![String::new(); 3];
+    let mut x = 0.0;
+    for (i, t) in p.into_iter().enumerate() {
+        let w = widths.get(i).copied().unwrap_or(0.0);
+        let (x0, x1) = (x / total, (x + w) / total);
+        x += w;
+        if t.is_empty() {
+            continue;
+        }
+        let wide = x1 - x0 > 0.34;
+        let zone = match aligns.get(i).copied().flatten() {
+            Some(Align::Right) if wide && x1 > 0.75 => 2,
+            Some(Align::Left) | None if wide && x0 < 0.25 => 0,
+            _ => {
+                let c = (x0 + x1) / 2.0;
+                if c < 0.34 {
+                    0
+                } else if c > 0.66 {
+                    2
+                } else {
+                    1
+                }
+            }
+        };
+        if !out[zone].is_empty() {
+            out[zone].push(' ');
+        }
+        out[zone].push_str(&t);
+    }
+    out
 }
 
 /// Vänster, mitten, höger för en rad. `single` = delen som en rad med bara en del ska hamna i.
@@ -768,6 +856,9 @@ fn rpr_of(st: &HfStyle) -> String {
         let hp = (s * 2.0).round() as i64;
         x.push_str(&format!("<w:sz w:val=\"{hp}\"/><w:szCs w:val=\"{hp}\"/>"));
     }
+    if st.underline {
+        x.push_str("<w:u w:val=\"single\"/>");
+    }
     if x.is_empty() { x } else { format!("<w:rPr>{x}</w:rPr>") }
 }
 
@@ -789,32 +880,38 @@ pub(super) fn write_part(
 ) -> HfWritten {
     let mut imgs = ImgOut { resolve, taken, rels: Vec::new(), media: Vec::new(), by_src: HashMap::new(), next_id: 0, page };
     let rpr = rpr_of(st);
-    let mut ppr = String::new();
+    let mut border = String::new();
     if let Some((c, w)) = st.line {
         let side = if root == "hdr" { "bottom" } else { "top" };
         let sz = ((w * 8.0).round() as i64).clamp(2, 96);
-        ppr.push_str(&format!("<w:pBdr><w:{side} w:val=\"single\" w:sz=\"{sz}\" w:space=\"4\" w:color=\"{:02X}{:02X}{:02X}\"/></w:pBdr>", c[0], c[1], c[2]));
+        border = format!("<w:pBdr><w:{side} w:val=\"single\" w:sz=\"{sz}\" w:space=\"4\" w:color=\"{:02X}{:02X}{:02X}\"/></w:pBdr>", c[0], c[1], c[2]);
     }
-    let runs = if style::split_parts(template).is_some() {
-        let p = style::parts_of(template, align);
-        // Delarna efter `parts_of` har `\|` utskrivet som `|`; fälten läses vidare i `runs_for`.
-        let tab = format!("<w:r>{rpr}<w:tab/></w:r>");
-        ppr.push_str(&format!("<w:tabs><w:tab w:val=\"center\" w:pos=\"{}\"/><w:tab w:val=\"right\" w:pos=\"{text_w}\"/></w:tabs>", text_w / 2));
-        let a = runs_for(&p[0], f, &rpr, &mut imgs);
-        let b = runs_for(&p[1], f, &rpr, &mut imgs);
-        let c = runs_for(&p[2], f, &rpr, &mut imgs);
-        format!("{a}{tab}{b}{tab}{c}")
-    } else {
-        let [l, c, r] = style::parts_of(template, align);
-        let text = [l, c, r].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
-        if align != Align::Left {
-            ppr.push_str(&format!("<w:jc w:val=\"{}\"/>", align.as_jc()));
-        }
-        runs_for(&text, f, &rpr, &mut imgs)
-    };
-    let ppr = if ppr.is_empty() { ppr } else { format!("<w:pPr>{ppr}</w:pPr>") };
+    // Ett stycke per rad i mallen; likadana ramlinjer i på varandra följande stycken ritas en gång.
+    let mut paras = String::new();
+    for row in crate::hf::rows(template) {
+        let mut ppr = border.clone();
+        let runs = if style::split_parts(row).is_some() {
+            let p = style::parts_of(row, align);
+            // Delarna efter `parts_of` har `\|` utskrivet som `|`; fälten läses vidare i `runs_for`.
+            let tab = format!("<w:r>{rpr}<w:tab/></w:r>");
+            ppr.push_str(&format!("<w:tabs><w:tab w:val=\"center\" w:pos=\"{}\"/><w:tab w:val=\"right\" w:pos=\"{text_w}\"/></w:tabs>", text_w / 2));
+            let a = runs_for(&p[0], f, &rpr, &mut imgs);
+            let b = runs_for(&p[1], f, &rpr, &mut imgs);
+            let c = runs_for(&p[2], f, &rpr, &mut imgs);
+            format!("{a}{tab}{b}{tab}{c}")
+        } else {
+            let [l, c, r] = style::parts_of(row, align);
+            let text = [l, c, r].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+            if align != Align::Left {
+                ppr.push_str(&format!("<w:jc w:val=\"{}\"/>", align.as_jc()));
+            }
+            runs_for(&text, f, &rpr, &mut imgs)
+        };
+        let ppr = if ppr.is_empty() { ppr } else { format!("<w:pPr>{ppr}</w:pPr>") };
+        paras.push_str(&format!("<w:p>{ppr}{runs}</w:p>"));
+    }
     let xml = format!(
-        "{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:wp=\"{WP_NS}\"><w:p>{ppr}{runs}</w:p></w:{root}>"
+        "{XML_DECL}\n<w:{root} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:wp=\"{WP_NS}\">{paras}</w:{root}>"
     );
     HfWritten { xml, rels: imgs.rels, media: imgs.media }
 }

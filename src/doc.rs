@@ -335,6 +335,31 @@ impl Document {
         })
     }
 
+    /// Ett .doc/.rtf/.wpd/.wps som LibreOffice har konverterat till .docx (`docx`). Fliken behåller
+    /// originalets sökväg men kan bara sparas med Spara som (`needs_save_as`).
+    pub fn from_converted(id: u64, path: &Path, docx: Vec<u8>) -> Result<Self, String> {
+        let mut doc = Self::load_bytes(id, path, docx, "docx")?;
+        let note = crate::legacy::converted_note(path);
+        doc.open_note = Some(match doc.open_note.take() {
+            Some(n) => format!("{note} {n}"),
+            None => note,
+        });
+        Ok(doc)
+    }
+
+    /// En .rtf som läses med den inbyggda läsaren (utan LibreOffice): Markdown i dokumentläget.
+    pub fn from_rtf_text(id: u64, path: &Path, bytes: &[u8]) -> Option<Self> {
+        let md = crate::legacy::rtf_to_markdown(bytes)?;
+        let mut doc = Self::new_untitled(id, 0);
+        doc.path = Some(path.to_path_buf());
+        doc.saved_hash = hash_text(&md);
+        doc.text = md;
+        doc.docx = true;
+        doc.word_view = true;
+        doc.open_note = Some(crate::i18n::t("Enkel läsning av RTF utan LibreOffice: bara text, fet, kursiv och stycken. Installera LibreOffice för full återgivning. Spara som skapar en .docx.").to_owned());
+        Some(doc)
+    }
+
     /// En flik i PDF-visaren: ingen text, aldrig ändrad.
     pub fn pdf_tab(id: u64, path: &Path, tab: crate::pdfview::chrome::PdfTab) -> Self {
         let mut d = Self::new_untitled(id, 0);
@@ -400,7 +425,7 @@ impl Document {
             });
         }
         if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
-            return Err(crate::i18n::t("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.").into());
+            return Err(crate::legacy::missing_message(path));
         }
         let (mut text, encoding) = decode_owned(bytes)?;
         let crlf = text.as_bytes().windows(2).filter(|w| w == b"\r\n").count();
@@ -583,7 +608,7 @@ impl Document {
 
     /// Word-filer som inte kan sparas tillbaka i samma format (makron, mallar).
     pub fn needs_save_as(&self) -> bool {
-        self.docx && matches!(self.extension().as_str(), "docm" | "dotx" | "dotm" | "doc" | "ott")
+        self.docx && matches!(self.extension().as_str(), "docm" | "dotx" | "dotm" | "ott" | "doc" | "rtf" | "wpd" | "wps")
     }
 
     pub fn language(&self) -> String {
@@ -674,6 +699,8 @@ pub fn resolve_image(src: &str, base: &Path, images: &[(String, crate::docx::Ima
         return None;
     }
     let bytes = std::fs::read(&path).ok()?;
+    // WebP och SVG görs om till PNG så att Word, OpenDocument och PDF kan bädda in dem.
+    let bytes = crate::imgfmt::to_supported(bytes)?;
     Some(crate::docx::Image { bytes, extent: None })
 }
 

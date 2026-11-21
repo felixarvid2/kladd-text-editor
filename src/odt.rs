@@ -322,6 +322,8 @@ struct StyleDef {
     /// `fo:break-before` och `fo:break-after` (`page` = true, `auto` = false) i styckeformatet.
     break_before: Option<bool>,
     break_after: Option<bool>,
+    /// `style:page-number`: sidnumret börjar om på detta tal (`auto` = fortsätter).
+    page_number: Option<u32>,
     /// Tabbstoppens typer (`left`, `center`, `right`) och ramlinjerna över/under stycket (för sidhuvud och sidfot).
     tabs: Option<Vec<String>>,
     border_top: Option<String>,
@@ -495,6 +497,7 @@ impl Styles {
                     };
                     d.break_before = c.attr("fo:break-before").and_then(brk);
                     d.break_after = c.attr("fo:break-after").and_then(brk);
+                    d.page_number = c.attr("style:page-number").and_then(|v| v.trim().parse().ok());
                     d.tabs = c
                         .child("style:tab-stops")
                         .map(|t| t.els().filter(|k| k.name == "style:tab-stop").map(|k| k.attr("style:type").unwrap_or("left").to_owned()).collect());
@@ -680,6 +683,11 @@ impl Styles {
     /// Sidmallen som ett stycke byter till (`style:master-page-name`), direkt eller ärvd.
     fn master_of(&self, style: &str) -> Option<&str> {
         self.chain("paragraph", style).iter().rev().find_map(|d| d.master.as_deref())
+    }
+
+    /// Sidnumret ett stycke börjar om på (`style:page-number`), direkt eller ärvt; `auto` ger `None`.
+    fn page_number_of(&self, style: &str) -> Option<u32> {
+        self.chain("paragraph", style).iter().rev().find_map(|d| d.page_number)
     }
 
     /// Sidbrytning före och efter ett stycke (`fo:break-before`/`fo:break-after`), direkt eller ärvd.
@@ -920,7 +928,7 @@ struct Rd<'s, 'b> {
     /// Sant medan en fotnots stycken läses.
     in_note: bool,
     /// Textrutor som lästs i stycket som byggs: läggs före stycket (`docx_tbox`), och sant medan en ruta läses.
-    pending_boxes: Vec<Vec<Block>>,
+    pending_boxes: Vec<(Vec<Block>, crate::docx_tbox::Head)>,
     in_box: bool,
     /// Sidmallarnas sida och spalter, sidmallen som gäller just nu och dess egenskaper (avsnitt).
     masters: HashMap<String, sections::SectionProps>,
@@ -1380,8 +1388,8 @@ impl<'s, 'b> Rd<'s, 'b> {
         if self.in_box {
             return;
         }
-        for inner in std::mem::take(&mut self.pending_boxes) {
-            self.blocks.push(Block::Raw(crate::docx_tbox::open_tag(0)));
+        for (inner, head) in std::mem::take(&mut self.pending_boxes) {
+            self.blocks.push(Block::Raw(crate::docx_tbox::open_tag_head(0, &head)));
             self.blocks.extend(inner);
             self.blocks.push(Block::Raw(crate::docx_tbox::CLOSE.to_owned()));
         }
@@ -1421,12 +1429,19 @@ impl<'s, 'b> Rd<'s, 'b> {
         let shape = self.box_shape(name);
         let width = e.attr("svg:width").and_then(style::parse_length).unwrap_or(0.0);
         let place = self.st.frame_place(e, name);
+        // `fo:min-height` på 0,5 cm skriver Kladd själv när rutan saknar höjd: ingen fast höjd.
+        let height = e
+            .attr("svg:height")
+            .and_then(style::parse_length)
+            .or_else(|| e.attr("fo:min-height").and_then(style::parse_length).filter(|h| (*h - 14.173).abs() > 0.01))
+            .unwrap_or(0.0);
+        let head = crate::docx_tbox::Head { w: width * 96.0 / 72.0, h: height * 96.0 / 72.0, anchor: place };
         // Läget från sidans kant räknas om till spaltens vänsterkant.
         let from_page = place.as_ref().is_some_and(|a| a.hrel == HRel::Page);
         let x = match place.map(|a| a.h) {
             Some(Pos::Center) => FrameX::Center,
             Some(Pos::End) => FrameX::End,
-            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3] } else { 0.0 }).max(0.0) * 10.0).round() / 10.0),
+            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3].round() } else { 0.0 }).max(0.0) * 2.0).round() / 2.0),
             _ => FrameX::Start,
         };
         let saved = std::mem::take(&mut self.blocks);
@@ -1442,7 +1457,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             Block::Table(_) | Block::Raw(_) => true,
             Block::Rule => false,
         });
-        let pp = crate::docx_tbox::frame(&shape, x, width);
+        let pp = crate::docx_tbox::frame(&shape, x, width, height);
         for b in inner.iter_mut() {
             if let Block::Para(p) = b {
                 if p.list.is_none() && p.kind != Kind::Code && !pp.is_empty() {
@@ -1451,7 +1466,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             }
         }
         if has_text {
-            self.pending_boxes.push(inner);
+            self.pending_boxes.push((inner, head));
         }
     }
 
@@ -1512,10 +1527,15 @@ impl<'s, 'b> Rd<'s, 'b> {
     /// Byter stycket sidmall börjar en ny sida med nya mått: en avsnittsrad.
     fn check_master(&mut self, n: &Node) {
         let Some(m) = n.attr("text:style-name").and_then(|s| self.st.master_of(s)) else { return };
-        if self.cur_master.as_deref() == Some(m) {
+        // Sidnumret kan börja om också med samma sidmall (`style:page-number` på stycket).
+        let restart = n.attr("text:style-name").and_then(|s| self.st.page_number_of(s));
+        if self.cur_master.as_deref() == Some(m) && (restart.is_none() || self.blocks.is_empty()) {
             return;
         }
-        let Some(props) = self.masters.get(m).cloned() else { return };
+        let Some(mut props) = self.masters.get(m).cloned() else { return };
+        if restart.is_some() {
+            props.hf.page_start = restart;
+        }
         self.cur_master = Some(m.to_owned());
         self.cur_page = props.clone();
         self.section_row(&props);
@@ -2016,6 +2036,7 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults, ctx: &mut hf:
                 if let (Some(w), Some(h)) = (len("fo:page-width"), len("fo:page-height")) {
                     d.page_size = Some((w, h));
                 }
+                d.page_start = pp.attr("style:first-page-number").and_then(|v| v.trim().parse().ok());
                 d.page_format = pp.attr("style:num-format").and_then(crate::hf::NumFmt::from_name).filter(|f| *f != crate::hf::NumFmt::Decimal);
                 let all_m = len("fo:margin");
                 let m = [
@@ -2441,8 +2462,10 @@ struct W<'a> {
     section_open: bool,
     n_sect: usize,
     pending_break: Option<String>,
+    /// Sidnumret som avsnittet efter brytningen börjar om på (`style:page-number`).
+    pending_start: Option<u32>,
     /// Öppna textrutor (`<!--k:tb N-->`): var rutans innehåll börjar i brödtexten och ramen (första `k:pp`).
-    boxes: Vec<(usize, Option<crate::word::pbox::PPr>)>,
+    boxes: Vec<(usize, Option<crate::word::pbox::PPr>, crate::docx_tbox::Head)>,
     review: ReviewWr,
 }
 
@@ -2552,6 +2575,7 @@ impl<'a> W<'a> {
             section_open: false,
             n_sect: 0,
             pending_break: None,
+            pending_start: None,
             boxes: Vec::new(),
             review: ReviewWr::default(),
         }
@@ -2682,7 +2706,10 @@ impl<'a> W<'a> {
         let name = format!("P{}", self.n_para);
         let (attrs, props) = match brk {
             "column" | "page" => (String::new(), format!("<style:paragraph-properties fo:break-before=\"{brk}\"/>")),
-            m => (format!(" style:master-page-name=\"{m}\""), String::new()),
+            m => {
+                let start = self.pending_start.take().map_or(String::new(), |n| format!("<style:paragraph-properties style:page-number=\"{n}\"/>"));
+                (format!(" style:master-page-name=\"{m}\""), start)
+            }
         };
         self.auto.push_str(&format!(
             "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{base}\"{attrs}>{props}</style:style>"
@@ -2744,6 +2771,7 @@ impl<'a> W<'a> {
         self.masters.push(sec.clone());
         let name = format!("M{}", self.masters.len());
         self.cur = sec.clone();
+        self.pending_start = sec.props.hf.page_start;
         if sec.columns > 1 {
             // Spalter ligger i ett avsnitt, som inte får börja med sidbrytningen.
             self.pending_break = Some(name);
@@ -3202,7 +3230,7 @@ impl<'a> W<'a> {
     /// i ett eget stycke, med rutans fyllning, kant, bredd och läge ur ramens markör.
     fn finish_box(&mut self) {
         use crate::word::pbox::FrameX;
-        let Some((start, pp)) = self.boxes.pop() else { return };
+        let Some((start, pp, head)) = self.boxes.pop() else { return };
         let inner = self.body.split_off(start.min(self.body.len()));
         if inner.trim().is_empty() {
             return;
@@ -3212,11 +3240,27 @@ impl<'a> W<'a> {
         let bd = &pp.borders;
         let pt = |v: f32| format!("{:.3}pt", v);
         let hex = |c: [u8; 3]| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
-        let (hpos, x) = match frame.map(|f| f.x) {
-            Some(FrameX::Center) => ("center", None),
-            Some(FrameX::End) => ("right", None),
-            Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v)),
-            _ => ("left", None),
+        // Vågrätt läge: ankaret i öppningsraden (relativt kolumn, marginal eller sida), annars ramens läge i spalten.
+        let (hpos, x, hrel) = match head.anchor {
+            Some(a) => {
+                let rel = match a.hrel {
+                    HRel::Column => "paragraph",
+                    HRel::Margin => "page-content",
+                    HRel::Page => "page",
+                };
+                match a.h {
+                    Pos::Off(px) => ("from-left", Some(px * 0.75), rel),
+                    Pos::Start => ("left", None, rel),
+                    Pos::Center => ("center", None, rel),
+                    Pos::End => ("right", None, rel),
+                }
+            }
+            None => match frame.map(|f| f.x) {
+                Some(FrameX::Center) => ("center", None, "paragraph"),
+                Some(FrameX::End) => ("right", None, "paragraph"),
+                Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v), "paragraph"),
+                _ => ("left", None, "paragraph"),
+            },
         };
         let width = frame.map(|f| f.w).filter(|w| *w < 5000.0).unwrap_or(self.text_w).min(self.text_w.max(36.0));
         let border = match (bd.left, bd.left.and_then(|b| b.color)) {
@@ -3228,14 +3272,47 @@ impl<'a> W<'a> {
         let fill = pp.shd.map_or("draw:fill=\"none\"".to_owned(), |c| format!("draw:fill=\"solid\" draw:fill-color=\"{}\"", hex(c)));
         self.n_frame += 1;
         let name = format!("tb{}", self.n_frame);
+        // Omflöde, lodrätt läge och avstånd till texten ur öppningsradens ankare (`docx_tbox::Head`); en ruta i
+        // flödet ligger vid stycket utan omflöde.
+        let anchor = head.anchor;
+        let wrap = match anchor.map(|a| a.wrap) {
+            Some(Wrap::Square) => "parallel",
+            Some(Wrap::Behind | Wrap::Front) => "run-through",
+            _ => "none",
+        };
+        let run_through = if anchor.is_some_and(|a| a.wrap == Wrap::Behind) { "background" } else { "foreground" };
+        let (vpos, vrel, svg_y) = match anchor {
+            Some(a) => {
+                let rel = match a.vrel {
+                    VRel::Paragraph => "paragraph",
+                    VRel::Margin => "page-content",
+                    VRel::Page => "page",
+                };
+                match a.v {
+                    Pos::Off(y) => ("from-top", rel, Some(y * 0.75)),
+                    Pos::Start => ("top", rel, None),
+                    Pos::Center => ("middle", rel, None),
+                    Pos::End => ("bottom", rel, None),
+                }
+            }
+            None => ("top", "paragraph", None),
+        };
+        let [mt, mr, mb, ml] = anchor.map_or([0.0, 0.0, 5.67, 0.0], |a| [a.dist[0] * 0.75, a.dist[1] * 0.75, a.dist[2] * 0.75, a.dist[3] * 0.75]);
         self.auto.push_str(&format!(
-            "<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:wrap=\"none\" style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\" style:horizontal-pos=\"{hpos}\" style:horizontal-rel=\"paragraph\" style:run-through=\"foreground\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.2cm\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:padding=\"{}\" fo:border=\"{border}\" {fill} draw:auto-grow-height=\"true\" draw:textarea-vertical-align=\"top\"/></style:style>",
+            "<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:wrap=\"{wrap}\" style:vertical-pos=\"{vpos}\" style:vertical-rel=\"{vrel}\" style:horizontal-pos=\"{hpos}\" style:horizontal-rel=\"{hrel}\" style:run-through=\"{run_through}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" fo:padding=\"{}\" fo:border=\"{border}\" {fill} draw:auto-grow-height=\"true\" draw:textarea-vertical-align=\"top\"/></style:style>",
+            pt(mt),
+            pt(mb),
+            pt(ml),
+            pt(mr),
             pt(pad)
         ));
-        let svg_x = x.map_or(String::new(), |v| format!(" svg:x=\"{}\"", pt(v)));
+        let svg_x = x.map_or(String::new(), |v| format!(" svg:x=\"{:.5}pt\"", v));
+        let svg_y = svg_y.map_or(String::new(), |v| format!(" svg:y=\"{}\"", pt(v)));
+        let fh = frame.map_or(0.0, |f| f.h);
+        let min_h = if fh > 0.0 { pt(fh) } else if head.h > 0.0 { pt(head.h * 0.75) } else { "0.5cm".to_owned() };
         self.open_para();
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"{name}\" draw:name=\"Textruta{}\" text:anchor-type=\"paragraph\"{svg_x} svg:width=\"{}\" fo:min-height=\"0.5cm\"><draw:text-box>{inner}</draw:text-box></draw:frame>",
+            "<draw:frame draw:style-name=\"{name}\" draw:name=\"Textruta{}\" text:anchor-type=\"paragraph\"{svg_x}{svg_y} svg:width=\"{}\" fo:min-height=\"{min_h}\"><draw:text-box>{inner}</draw:text-box></draw:frame>",
             self.n_frame,
             pt(width)
         ));
@@ -3272,9 +3349,9 @@ impl<'a> W<'a> {
                     self.flush_break();
                 }
             }
-        } else if crate::docx_tbox::parse_open(t).is_some() && self.table.is_none() {
+        } else if let (Some((_, head)), true) = (crate::docx_tbox::parse_head(t), self.table.is_none()) {
             self.close_para();
-            self.boxes.push((self.body.len(), None));
+            self.boxes.push((self.body.len(), None, head));
         } else if t == crate::docx_tbox::CLOSE && !self.boxes.is_empty() {
             self.close_para();
             self.finish_box();
@@ -3723,14 +3800,21 @@ fn hf_inline(text: &str, f: &style::Fields, out: &mut hf::HfOut<'_>) -> String {
 /// Sidhuvudets eller sidfotens stycke. En mall med `|` blir vänster, mitten och höger skilda av
 /// flikar (stycketypen har tabbstopp mitt och längst till höger).
 fn hf_paragraph(template: &str, style: &str, align: Align, f: &style::Fields, out: &mut hf::HfOut<'_>) -> String {
-    let inner = if style::split_parts(template).is_some() {
-        let p = style::parts_of(template, align);
-        format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f, out), hf_inline(&p[1], f, out), hf_inline(&p[2], f, out))
-    } else {
-        let text = style::parts_of(template, align).into_iter().find(|t| !t.is_empty()).unwrap_or_default();
-        hf_inline(&text, f, out)
-    };
-    format!("<text:p text:style-name=\"{style}\">{inner}</text:p>")
+    let rows = crate::hf::rows(template);
+    // Flera rader (stycken) skrivs alla med flikar, så att varje rads delar hamnar rätt.
+    let tabbed = rows.len() > 1;
+    let mut xml = String::new();
+    for row in rows {
+        let inner = if tabbed || style::split_parts(row).is_some() {
+            let p = style::parts_of(row, align);
+            format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f, out), hf_inline(&p[1], f, out), hf_inline(&p[2], f, out))
+        } else {
+            let text = style::parts_of(row, align).into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+            hf_inline(&text, f, out)
+        };
+        xml.push_str(&format!("<text:p text:style-name=\"{style}\">{inner}</text:p>"));
+    }
+    xml
 }
 
 fn hf_text(t: &str) -> String {
@@ -3804,12 +3888,13 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
                     has_f = true;
                 }
             }
-            let tabs = if style::split_parts(&t).is_some() {
+            let split = style::split_parts(&t).is_some() || crate::hf::rows(&t).len() > 1;
+            let tabs = if split {
                 format!("<style:tab-stops><style:tab-stop style:position=\"{half_w}\" style:type=\"center\"/><style:tab-stop style:position=\"{text_w}\" style:type=\"right\"/></style:tab-stops>")
             } else {
                 String::new()
             };
-            let al = if style::split_parts(&t).is_some() { "start" } else { align_attr(align) };
+            let al = if split { "start" } else { align_attr(align) };
             let name = format!("{auto_name}{sfx}");
             let st = if header { &d.header_style } else { &d.footer_style };
             let border = st.line.map_or(String::new(), |(c, w)| {
@@ -3829,6 +3914,9 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
             if st.italic {
                 tp.push_str(" fo:font-style=\"italic\"");
             }
+            if st.underline {
+                tp.push_str(" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"");
+            }
             let tp = if tp.is_empty() { String::new() } else { format!("<style:text-properties{tp}/>") };
             auto.push_str(&format!(
                 "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\"{border}>{tabs}</style:paragraph-properties>{tp}</style:style>"
@@ -3839,12 +3927,13 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
     };
     // Sidmallens sidformat: `style:num-format` är sidnumrets format (`page-format`).
     let num_fmt = d.page_format.map_or("1", |f| f.odf());
+    let first_no = d.page_start.map_or(String::new(), |n| format!(" style:first-page-number=\"{n}\""));
     let mut hf_auto = String::new();
     let (master_inner, has_h, has_f) = hf_parts(pw - m[1] - m[3], "", 0, &mut hf_auto, env);
     let (top0, hs) = hf_style("header", m[0], has_h);
     let (bot0, fs) = hf_style("footer", m[2], has_f);
     let mut auto = format!(
-        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"{num_fmt}\" style:print-orientation=\"{orient}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>",
+        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"{num_fmt}\"{first_no} style:print-orientation=\"{orient}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>",
         cm(pw),
         cm(ph),
         cm(top0),
@@ -4340,8 +4429,8 @@ Slut.
         let back = read(&w.bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
         let m = back.markdown;
-        assert!(m.contains("<!--k:tb 0-->") && m.contains("<!--k:/tb-->"), "{m}");
-        let block = m.split("<!--k:tb 0-->").nth(1).unwrap().split("<!--k:/tb-->").next().unwrap();
+        assert!(m.contains("<!--k:tb 0 ") && m.contains("<!--k:/tb-->"), "{m}");
+        let block = m.split("<!--k:tb 0 ").nth(1).unwrap().split("<!--k:/tb-->").next().unwrap();
         assert!(block.contains("**Faktaruta**") && block.contains("Text i rutan") && block.contains("shd=\"FFF2CC\""), "{m}");
         assert!(block.contains("x=end") && block.contains("w=200"), "{m}");
         assert!(m.find("Före").unwrap() < m.find("k:tb").unwrap() && m.find("k:/tb").unwrap() < m.find("Efter").unwrap(), "{m}");
