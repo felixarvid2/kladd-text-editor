@@ -7,6 +7,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Nytt
 
 - **PDF-exporten jämnar ut spalterna** på avsnittets sista sida före ett löpande avsnittsbyte, för lika och olika breda spalter, så att nästa avsnitt börjar under den högsta spalten och skiljelinjerna följer den utjämnade höjden. Ett avsnitt med manuell spaltbrytning jämnas inte ut, och inte heller det sista avsnittet i dokumentet. Fotnoter fungerar som förut. Ett `text:section` med spalter i en `.odt` (LibreOffice) jämnas ut också när det står sist i dokumentet, i PDF och dokumentläget; spalter från sidmallen och i `.docx` jämnas inte ut sist. `text:dont-balance-text-columns="true"` läses som `column-balance: no` (avsnittet jämnas inte ut, varken i PDF eller dokumentläget) och skrivs bara tillbaka för det; olika breda spalter skrivs inte längre som obalanserade.
+
 ### Rättat
 
 - **Text flyter nu alltid runt (eller hoppar förbi) en dragen textruta.** Dras en ruta in mot mitten av en spalt, där det inte finns plats bredvid den på någon sida, ritades texten förut över rutan i dokumentläget: hoppet förbi rutan förbrukades av den dolda taggraden (`<div>`) före stycket och gick förlorat vid spaltindelningen. Hoppet läggs nu på första synliga stycket och bevaras av sidbrytningen i dokument med spalter. En ruta som dragits (`x`, `y`, ny storlek) och sparas i ett nytt `.docx` behåller dessutom läge, omflöde och avstånd (förut föll `y` och omflödet bort).
