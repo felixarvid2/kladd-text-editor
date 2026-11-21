@@ -1011,7 +1011,8 @@ impl Conv<'_> {
             && head.contains("base64")
         {
             let bytes = base64_decode(body);
-            // Bara de format Word kan visa.
+            // WebP och SVG görs om till PNG; sedan bara de format Word kan visa.
+            let bytes = crate::imgfmt::to_supported(bytes).unwrap_or_default();
             if let Some(ext) = docx::image_ext(&bytes).filter(|e| matches!(*e, "png" | "jpeg" | "gif" | "bmp")) {
                 let name = format!("inklistrad-{}.{ext}", self.images.len() + 1);
                 let width = img_width(el);

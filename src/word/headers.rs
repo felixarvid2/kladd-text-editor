@@ -104,7 +104,7 @@ pub fn header_footer(
 type Row = [String; 3];
 
 /// Bilder som dialogen känner till: dokumentets egna och de som valts medan den är öppen.
-const LOGO_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
+const LOGO_EXTENSIONS: &[&str] = crate::imgfmt::EXTENSIONS;
 
 /// Standardhöjd (pt) på en nyinsatt logga.
 const LOGO_HEIGHT: f32 = 30.0;
@@ -312,6 +312,7 @@ impl HfDialog {
     /// En vald bildfil som logga: läggs i dialogens bilder och infogas i fältet med markören.
     fn add_logo(&mut self, path: &std::path::Path) -> Result<(), ()> {
         let bytes = std::fs::read(path).map_err(|_| ())?;
+        let bytes = crate::imgfmt::to_supported(bytes).ok_or(())?;
         crate::docx::image_ext(&bytes).ok_or(())?;
         let base: String = path
             .file_name()

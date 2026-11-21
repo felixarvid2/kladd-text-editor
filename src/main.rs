@@ -20,6 +20,8 @@ mod export;
 mod grammar;
 mod grammar_ui;
 mod hf;
+mod imgfmt;
+mod legacy;
 mod ocr;
 mod odt;
 mod pdf_read;

@@ -20,12 +20,12 @@ use crate::panes::{self, Orient};
 use crate::tf;
 use crate::doc::{Document, LineEnding, LoadError, TEXT_EXTENSIONS, TextEncoding, join_sv};
 
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
+const IMAGE_EXTENSIONS: &[&str] = crate::imgfmt::EXTENSIONS;
 
 fn is_image_path(p: &Path) -> bool {
     p.extension()
         .map(|e| e.to_string_lossy().to_lowercase())
-        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()) || e == "webp")
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 use crate::highlight::{Highlighter, Params};
 use crate::pdfview::chrome::{self as pdfui, Action as PdfAction};
@@ -255,6 +255,8 @@ pub struct KladdApp {
     hl: Highlighter,
     /// Stora textfiler: virtualiserad vy, bakgrundsinläsning, sökning i bitar (`bigfiles`).
     pub(crate) big: crate::bigfiles::State,
+    /// .doc/.rtf som konverteras med LibreOffice i bakgrunden (`legacy`).
+    legacy: crate::legacy::State,
     pub(crate) md_cache: CommonMarkCache,
     pub(crate) find: Find,
     dialog: Option<Receiver<DialogResult>>,
@@ -409,6 +411,7 @@ impl KladdApp {
             settings,
             hl: Highlighter::new(),
             big: Default::default(),
+            legacy: Default::default(),
             md_cache: CommonMarkCache::default(),
             find: Find::default(),
             dialog: None,
@@ -614,6 +617,10 @@ impl KladdApp {
             self.open_pdf_tab(ctx, &canonical, password);
             return;
         }
+        if crate::legacy::needs_conversion(&canonical) {
+            self.open_legacy(ctx, &canonical);
+            return;
+        }
         // Stora filer läses in i en bakgrundstråd med förloppsvisning.
         if crate::bigfiles::wants_background(&canonical) {
             if !self.big.is_loading(&canonical) {
@@ -676,6 +683,42 @@ impl KladdApp {
         }
     }
 
+    /// .doc/.rtf/.wpd/.wps: konverteras med LibreOffice i en bakgrundstråd. Utan LibreOffice läses
+    /// .rtf med den enkla inbyggda läsaren och övriga ger ett fel.
+    fn open_legacy(&mut self, ctx: &egui::Context, path: &Path) {
+        if self.legacy.is_converting(path) {
+            return;
+        }
+        if let Some(soffice) = crate::legacy::find_soffice() {
+            self.legacy.spawn(ctx, soffice, path);
+            return;
+        }
+        let rtf = std::fs::read(path).ok().and_then(|b| Document::from_rtf_text(self.next_id, path, &b));
+        match rtf {
+            Some(doc) => self.install_doc(ctx, doc, path),
+            None => {
+                self.settings.recent.retain(|p| p != path);
+                self.notify(ctx, crate::legacy::missing_message(path), true);
+            }
+        }
+    }
+
+    /// Tar emot filer som LibreOffice har konverterat.
+    fn poll_legacy(&mut self, ctx: &egui::Context) {
+        for (path, result) in self.legacy.poll(ctx) {
+            if self.docs.iter().any(|d| d.path.as_deref() == Some(&path)) {
+                continue;
+            }
+            match result.and_then(|bytes| Document::from_converted(self.next_id, &path, bytes)) {
+                Ok(doc) => self.install_doc(ctx, doc, &path),
+                Err(e) => {
+                    self.settings.recent.retain(|p| p != &path);
+                    self.notify(ctx, e, true);
+                }
+            }
+        }
+    }
+
     /// Tar emot stora filer som lästs in i bakgrunden.
     fn poll_big_loads(&mut self, ctx: &egui::Context) {
         for (path, result) in self.big.poll_loads(ctx) {
@@ -725,6 +768,7 @@ impl KladdApp {
                 .add_filter(t("Text och Word"), TEXT_EXTENSIONS)
                 .add_filter(t("Word-dokument"), &["docx", "docm", "dotx"])
                 .add_filter(t("OpenDocument-text"), &["odt", "ott"])
+                .add_filter(t("Äldre dokument (via LibreOffice)"), crate::legacy::EXTENSIONS)
                 .add_filter("PDF", &["pdf"]);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
@@ -808,11 +852,14 @@ impl KladdApp {
     /// Lägger in `![namn](sökväg)` vid markören i den aktiva fliken.
     fn insert_image(&mut self, ctx: &egui::Context, path: &Path) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
-        if std::fs::read(path).ok().and_then(|b| crate::docx::image_ext(&b)).is_none() {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        if !crate::imgfmt::insertable(&bytes) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            self.notify(ctx, tf!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF eller BMP).", name = name), true);
+            self.notify(ctx, tf!("{name} är inte en bild som kan bäddas in (PNG, JPEG, GIF, BMP, WebP eller SVG).", name = name), true);
             return;
         }
+        // En SVG rasteriseras i dubbel upplösning: bredden i texten ger den ursprungliga storleken.
+        let svg_width = crate::imgfmt::is_svg(&bytes).then(|| crate::imgfmt::svg_size(&bytes)).flatten().map(|(w, _)| w.round().max(1.0) as u32);
         // Relativ sökväg om bilden ligger i dokumentets mapp, annars absolut.
         let src = match doc.base_dir().and_then(|b| path.strip_prefix(&b).ok().map(Path::to_path_buf)) {
             Some(rel) => rel,
@@ -832,7 +879,10 @@ impl KladdApp {
         } else {
             "\n\n"
         };
-        let snippet = format!("{lead}![{}]({src})\n", alt.replace(['[', ']'], ""));
+        let snippet = match svg_width {
+            Some(w) => format!("{lead}<img src=\"{src}\" alt=\"{}\" width=\"{w}\">\n", alt.replace(['"', '<', '>'], "'")),
+            None => format!("{lead}![{}]({src})\n", alt.replace(['[', ']'], "")),
+        };
         doc.text.insert_str(at, &snippet);
         doc.on_edited();
         let after = byte_to_char(&doc.text, at + snippet.len());
@@ -1387,7 +1437,9 @@ impl KladdApp {
             if p.as_os_str().is_empty() {
                 continue;
             }
-            if is_image_path(&p) && !self.docs.is_empty() && !self.pdf_mode() {
+            // En SVG-fil är också text (XML): den infogas bara i ett dokument med bilder, annars öppnas den.
+            let svg_as_text = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) && !self.docs.get(self.active).is_some_and(|d| d.is_markdown());
+            if is_image_path(&p) && !svg_as_text && !self.docs.is_empty() && !self.pdf_mode() {
                 self.insert_image(ctx, &p);
             } else {
                 self.open_path(ctx, &p);
@@ -3793,6 +3845,7 @@ impl eframe::App for KladdApp {
         self.update.tick(ctx, &mut self.settings);
         self.update_outs(ctx);
         self.poll_big_loads(ctx);
+        self.poll_legacy(ctx);
         if self.big.scanning() {
             ctx.request_repaint();
         }
@@ -3813,6 +3866,7 @@ impl eframe::App for KladdApp {
         self.sync_panes();
         self.handle_dialogs(&ctx);
         self.big.show_progress(&ctx, &p);
+        self.legacy.show_progress(&ctx, &p);
         self.handle_drops(&ctx);
         self.handle_shortcuts(&ctx);
         self.pdf_sync_fullscreen(&ctx);

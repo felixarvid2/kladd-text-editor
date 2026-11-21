@@ -112,6 +112,12 @@ Ett öppnat `.docx` visas på vita sidor mot grå bakgrund, med sidstorlek och m
 
 Formateringsfältet ovanför texten har stilval (Brödtext, Titel, Underrubrik, Rubrik 1–6, Citat), typsnitt och storlek, textfärg och markeringsfärg, vänster-, center-, höger- och marginaljustering, knapparna F, K, U och S för fet, kursiv, understruken och genomstruken, punktlista, numrerad lista, citat, menyn *Infoga* (bild, tabell, fotnot, innehållsförteckning, avsnittsbrytning, liggande sidor och spalter), ångra och gör om, sidinställningar samt zoom. Statusfältet visar "Sida x av y", antal ord, språk för stavningskontrollen och zoomnivå.
 
+### Äldre format: .doc, .rtf, .wpd och .wps
+
+Kladd öppnar de här filerna genom att låta LibreOffice konvertera dem till `.docx` i bakgrunden (`soffice --headless --convert-to docx`, med en egen tillfällig profil så att det inte krockar med en LibreOffice som redan är öppen). I nedre vänstra hörnet står *Konverterar …* medan det pågår, och efter två minuter avbryts konverteringen. Resultatet öppnas i dokumentläget med en notis.
+
+Fliken har originalets namn men skriver aldrig över originalet: *Spara* öppnar *Spara som* med `.docx` bredvid originalet som förslag, och automatisk sparning är avstängd för fliken. Kladd letar efter `soffice` eller `libreoffice` i `PATH`, och på Windows och macOS på LibreOffices vanliga installationsplats. Hittas inte LibreOffice visas ett fel som säger att det behövs (libreoffice.org). `.rtf`-filer öppnas då ändå med en enkel inbyggd läsare som tar med text, fet, kursiv och stycken.
+
 ### Förlustfri sparning
 
 Kladd behåller alla delar av originalfilen, som sidhuvud, sidfot, fotnoter, kommentarer, teman och inställningar. Vid sparning skrivs bara de stycken om som du har ändrat; oförändrade stycken sparas exakt som de var. Objekt som Kladd inte kan visa, till exempel fotnotsreferenser, fält och textrutor, blir osynliga markörer `<!--k:N-->` i Markdown-texten och skrivs tillbaka när du sparar. Spårade ändringar och kommentarer blir `<ins>`, `<del>`, `<fmt>`, stycketeckensmarkörer och kommentarsmarkörer som följer med när du ändrar stycket.
@@ -227,12 +233,12 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 | Tabeller | `\| kolumn \| kolumn \|` |
 | Länkar | `[text](https://…)` |
 | Kod | `` `kod` `` och kodblock |
-| Bilder (PNG, JPEG, GIF, BMP) | `![text](bild:image1.png)` |
+| Bilder (PNG, JPEG, GIF, BMP, WebP, SVG) | `![text](bild:image1.png)` |
 | Bildstorlek | `<img src="…" alt="…" width="240">` |
 
-Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
+Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. WebP och SVG kan infogas på samma sätt (SVG ritas upp som en bild i dubbel upplösning, text i SVG ritas med systemets typsnitt, och externa filer som SVG:n länkar till läses inte). Eftersom äldre Word och PDF inte kan WebP eller SVG sparas de som PNG i `.docx`, `.odt` och PDF; originalfilen ändras inte. En SVG-fil som du drar in öppnas som text om du inte har ett Markdown- eller Word-dokument aktivt. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
 
-Textrutor visas som stycken med rutans fyllning, ram, bredd och läge före stycket de sitter i (texten kan ändras och *Infoga → Textruta* lägger till en ny, men text flödar inte runt rutan). Diagram, former och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer och det gamla `.doc`-formatet stöds inte.
+Textrutor visas som stycken med rutans fyllning, ram, bredd och läge före stycket de sitter i (texten kan ändras och *Infoga → Textruta* lägger till en ny, men text flödar inte runt rutan). Diagram, former och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer stöds inte.
 
 Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
 

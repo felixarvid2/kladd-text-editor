@@ -42,7 +42,6 @@ pub const EN: &[(&str, &str)] = &[
     ("{name} innehåller ingen text som kan läsas (skannade sidor?)", "{name} contains no readable text (scanned pages?)"),
     ("{n} av {total} sidor i {name} saknar text (skannade sidor?)", "{n} of {total} pages in {name} have no text (scanned pages?)"),
     ("{name} innehåller {lost} som inte visas i Kladd", "{name} contains {lost} that Kladd does not show"),
-    ("Det gamla .doc-formatet stöds inte. Öppna filen i Word eller LibreOffice och spara som .docx.", "The old .doc format is not supported. Open the file in Word or LibreOffice and save it as .docx."),
     ("{name} finns inte längre.", "{name} no longer exists."),
     ("Du har inte behörighet till {name}.", "You do not have permission to access {name}."),
     ("UTF-8 med BOM", "UTF-8 with BOM"),
