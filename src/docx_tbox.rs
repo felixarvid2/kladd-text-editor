@@ -20,6 +20,7 @@
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
+use crate::word::anchor::{Anchor, HRel, Pos, VRel};
 use crate::word::pbox::{Border, Borders, Frame, FrameX, LineStyle, PPr};
 
 pub const OPEN: &str = "<!--k:tb ";
@@ -39,9 +40,74 @@ pub fn open_tag(n: usize) -> String {
     format!("{OPEN}{n}-->")
 }
 
+/// Rutans mått och läge i öppningsraden: `<!--k:tb 7 w="216" h="90" x="right" y="0" wrap="top"-->`
+/// (px, samma ankarattribut som `<img>`; se `word::anchor`). Utan ankare ligger rutan i flödet.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Head {
+    /// Bredd och fast höjd (px); 0 = okänd.
+    pub w: f32,
+    pub h: f32,
+    pub anchor: Option<Anchor>,
+}
+
+fn num(v: f32) -> String {
+    format!("{}", (v * 10.0).round() / 10.0)
+}
+
+impl Head {
+    /// Huvudet som det blir efter en tur genom texten (avrundat som i öppningsraden), så att en orörd ruta
+    /// jämförs lika med sig själv.
+    pub fn rounded(&self) -> Head {
+        parse_head(&open_tag_head(0, self)).map_or(*self, |(_, h)| h)
+    }
+}
+
+pub fn open_tag_head(n: usize, h: &Head) -> String {
+    let mut s = format!("{OPEN}{n}");
+    if h.w > 0.0 {
+        s.push_str(&format!(" w=\"{}\"", num(h.w)));
+    }
+    if h.h > 0.0 {
+        s.push_str(&format!(" h=\"{}\"", num(h.h)));
+    }
+    if let Some(a) = &h.anchor {
+        a.write_attrs(&mut s);
+    }
+    s.push_str("-->");
+    s
+}
+
+/// `nyckel="värde"`-par ur en attributsträng.
+fn kv_pairs(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = s.trim();
+    while let Some(eq) = rest.find("=\"") {
+        let key = rest[..eq].trim().to_owned();
+        let after = &rest[eq + 2..];
+        let Some(end) = after.find('"') else { break };
+        out.push((key, after[..end].to_owned()));
+        rest = after[end + 1..].trim_start();
+    }
+    out
+}
+
+/// Numret och måtten/läget ur en öppningsrad.
+pub fn parse_head(t: &str) -> Option<(usize, Head)> {
+    let body = t.trim().strip_prefix(OPEN)?.strip_suffix("-->")?.trim();
+    let (n, rest) = match body.split_once(char::is_whitespace) {
+        Some((n, r)) => (n, r),
+        None => (body, ""),
+    };
+    let n: usize = n.parse().ok()?;
+    let kv = kv_pairs(rest);
+    let get = |k: &str| kv.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+    let f = |k: &str| get(k).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    Some((n, Head { w: f("w"), h: f("h"), anchor: Anchor::from_attrs(&get) }))
+}
+
 /// Numret ur en öppningsrad.
 pub fn parse_open(t: &str) -> Option<usize> {
-    t.trim().strip_prefix(OPEN)?.strip_suffix("-->")?.trim().parse().ok()
+    parse_head(t).map(|h| h.0)
 }
 
 /// Öppnings- eller stängningsrad (dold markup).
@@ -212,8 +278,8 @@ pub fn read_shape(xml: &str, scheme: &dyn Fn(&str) -> Option<[u8; 3]>) -> Shape 
 
 /// Styckeutseendet som får rutan att se ut som en ruta: ram och fyllning runt styckena i en ram
 /// med rutans bredd och läge (`pbox::Frame`). `width` är rutans bredd (pt, 0 = hela spalten).
-pub fn frame(sh: &Shape, x: FrameX, width: f32) -> PPr {
-    if sh.fill.is_none() && sh.line.is_none() {
+pub fn frame(sh: &Shape, x: FrameX, width: f32, height: f32) -> PPr {
+    if sh.fill.is_none() && sh.line.is_none() && width <= 1.0 {
         return PPr::default();
     }
     let [il, it, ir, ib] = sh.ins.unwrap_or([7.2, 3.6, 7.2, 3.6]);
@@ -224,7 +290,7 @@ pub fn frame(sh: &Shape, x: FrameX, width: f32) -> PPr {
     let lw = sh.line.map_or(0.0, |(w, _)| w);
     let w = if width > 1.0 { width } else { 10_000.0 };
     // Rutans ytterkant ligger där Word har den; texten ligger innanför luften och linjen.
-    PPr { borders, shd: sh.fill, frame: Some(Frame { w, x, pl: il.min(31.0) + lw, pr: ir.min(31.0) + lw }), ..Default::default() }
+    PPr { borders, shd: sh.fill, frame: Some(Frame { w, x, pl: il.min(31.0) + lw, pr: ir.min(31.0) + lw, h: height.max(0.0) }), ..Default::default() }
 }
 
 /// Ett block ur Markdown-texten: rutans nummer och innehållet mellan markörerna.
@@ -232,6 +298,8 @@ pub fn frame(sh: &Shape, x: FrameX, width: f32) -> PPr {
 pub struct Found {
     pub token: usize,
     pub inner: String,
+    /// Mått och läge ur öppningsraden.
+    pub head: Head,
 }
 
 /// Numret på en ny ruta (Infoga → Textruta): ingen ruta i originalet har det.
@@ -246,35 +314,35 @@ pub fn extract(md: &str, known: &dyn Fn(usize) -> bool, next: usize) -> (String,
     }
     let mut out = String::with_capacity(md.len());
     let (mut kept, mut fresh) = (Vec::new(), Vec::new());
-    let mut cur: Option<(usize, String, usize)> = None;
+    let mut cur: Option<(usize, Head, String, usize)> = None;
     let mut skip_blank = false;
     for line in md.split_inclusive('\n') {
         let t = line.trim();
-        if let Some((n, buf, at)) = cur.as_mut() {
+        if let Some((n, head, buf, at)) = cur.as_mut() {
             if t == CLOSE {
-                let (n, inner) = (*n, buf.trim_matches(['\n', '\r']).to_owned());
+                let (n, head, inner) = (*n, *head, buf.trim_matches(['\n', '\r']).to_owned());
                 cur = None;
                 skip_blank = true;
                 if known(n) {
-                    kept.push(Found { token: n, inner });
+                    kept.push(Found { token: n, inner, head });
                 } else {
                     // Ny ruta: en bärarrad med ett nytt markörnummer tar dess plats.
                     let idx = next + fresh.len();
                     out.push_str(&format!("<!--k:{idx}-->\n\n"));
-                    fresh.push(Found { token: idx, inner });
+                    fresh.push(Found { token: idx, inner, head });
                 }
-            } else if let Some(m) = parse_open(t) {
+            } else if let Some((m, mh)) = parse_head(t) {
                 // Ett block i ett block: det första avbryts och läggs tillbaka som vanlig text.
-                out.insert_str(*at, &format!("{}\n", open_tag(*n)));
+                out.insert_str(*at, &format!("{}\n", open_tag_head(*n, head)));
                 out.push_str(buf);
-                cur = Some((m, String::new(), out.len()));
+                cur = Some((m, mh, String::new(), out.len()));
             } else {
                 buf.push_str(line);
             }
             continue;
         }
-        if let Some(n) = parse_open(t) {
-            cur = Some((n, String::new(), out.len()));
+        if let Some((n, head)) = parse_head(t) {
+            cur = Some((n, head, String::new(), out.len()));
             continue;
         }
         if skip_blank {
@@ -286,8 +354,8 @@ pub fn extract(md: &str, known: &dyn Fn(usize) -> bool, next: usize) -> (String,
         out.push_str(line);
     }
     // Ett block utan slut är vanlig text.
-    if let Some((n, buf, at)) = cur {
-        out.insert_str(at, &format!("{}\n", open_tag(n)));
+    if let Some((n, head, buf, at)) = cur {
+        out.insert_str(at, &format!("{}\n", open_tag_head(n, &head)));
         out.push_str(&buf);
     }
     (out, kept, fresh)
@@ -320,7 +388,7 @@ pub fn split_frame(inner: &str) -> (PPr, String) {
 /// Texten som Infoga → Textruta sätter in: en ruta med ram, 3 tum bred.
 pub fn new_block() -> String {
     let sh = Shape { fill: None, line: Some((0.75, [0, 0, 0])), ins: Some([5.0; 4]) };
-    let pp = frame(&sh, FrameX::Start, 216.0);
+    let pp = frame(&sh, FrameX::Start, 216.0, 0.0);
     format!("{}\n\nText{}\n\n{CLOSE}", open_tag(NEW_TOKEN), pp.marker())
 }
 
@@ -382,6 +450,148 @@ pub fn replace_content(xml: &str, inner: &str) -> Option<String> {
     (n > 0).then_some(out)
 }
 
+/// Byter `cx`/`cy` i alla taggar som börjar med `prefix` och har dem (`<wp:extent`, `<a:ext `).
+fn set_cx_cy(xml: &str, prefix: &str, cx: i64, cy: i64) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find(prefix) {
+        let Some(gt) = rest[i..].find('>').map(|g| g + i) else { break };
+        out.push_str(&rest[..i]);
+        let tag = &rest[i..gt];
+        let tag = if tag.contains("cx=\"") && tag.contains("cy=\"") { set_attr(&set_attr(tag, "cx", &cx.to_string()), "cy", &cy.to_string()) } else { tag.to_owned() };
+        out.push_str(&tag);
+        rest = &rest[gt..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byter värdet på attributet `name="…"` i en tagg (finns det inte, görs ingenting).
+fn set_attr(tag: &str, name: &str, val: &str) -> String {
+    let key = format!(" {name}=\"");
+    match tag.find(&key) {
+        Some(i) => {
+            let v0 = i + key.len();
+            match tag[v0..].find('"') {
+                Some(e) => format!("{}{}{}", &tag[..v0], val, &tag[v0 + e..]),
+                None => tag.to_owned(),
+            }
+        }
+        None => tag.to_owned(),
+    }
+}
+
+/// Byter ut elementet `wp:positionH`/`wp:positionV` mot ett nytt.
+fn set_position(xml: &str, tag: &str, rel: &str, pos: Pos, names: [&str; 3]) -> String {
+    let open = format!("<wp:{tag}");
+    let close = format!("</wp:{tag}>");
+    let inner = match pos {
+        Pos::Off(px) => format!("<wp:posOffset>{}</wp:posOffset>", (px * 9525.0).round() as i64),
+        Pos::Start => format!("<wp:align>{}</wp:align>", names[0]),
+        Pos::Center => format!("<wp:align>{}</wp:align>", names[1]),
+        Pos::End => format!("<wp:align>{}</wp:align>", names[2]),
+    };
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        let Some(e) = rest[i..].find(&close).map(|e| e + i + close.len()) else { break };
+        out.push_str(&rest[..i]);
+        out.push_str(&format!("{open} relativeFrom=\"{rel}\">{inner}{close}"));
+        rest = &rest[e..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Sätter (eller lägger till) en egenskap i ett VML-`style` (`a:1;b:2`); tomt värde tar bort den.
+fn set_prop(style: &str, key: &str, val: &str) -> String {
+    let mut props: Vec<(String, String)> = style
+        .split(';')
+        .filter_map(|kv| kv.split_once(':').map(|(a, b)| (a.trim().to_owned(), b.trim().to_owned())))
+        .collect();
+    props.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+    if !val.is_empty() {
+        props.push((key.to_owned(), val.to_owned()));
+    }
+    props.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(";")
+}
+
+/// Bearbetar varje VML-`style="…"` som har ett mått eller en förskjutning.
+fn map_vml_style(xml: &str, f: &dyn Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find(" style=\"") {
+        let v0 = i + 8;
+        let Some(e) = rest[v0..].find('"').map(|e| e + v0) else { break };
+        out.push_str(&rest[..v0]);
+        let v = &rest[v0..e];
+        if v.contains("width:") || v.contains("margin-left:") {
+            out.push_str(&f(v));
+        } else {
+            out.push_str(v);
+        }
+        rest = &rest[e..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Skriver ny storlek och nytt läge (`new`) i originalkörningen (`wp:extent`, `a:ext`, `wp:positionH/V` och
+/// VML-`style`). Det som inte ändrats (`old`) lämnas orört, och en ruta i flödet får bara ny storlek.
+pub fn set_geometry(xml: &str, old: &Head, new: &Head) -> String {
+    let mut x = xml.to_owned();
+    let emu = |px: f32| (px * 9525.0).round() as i64;
+    let (w, h) = (if new.w > 0.0 { new.w } else { old.w }, if new.h > 0.0 { new.h } else { old.h });
+    if (w - old.w).abs() > 0.4 || (h - old.h).abs() > 0.4 {
+        x = set_cx_cy(&x, "<wp:extent", emu(w), emu(h));
+        x = set_cx_cy(&x, "<a:ext ", emu(w), emu(h));
+        let (wp, hp) = (format!("{}pt", num(w * 0.75)), format!("{}pt", num(h * 0.75)));
+        x = map_vml_style(&x, &|s| set_prop(&set_prop(s, "width", &wp), "height", &hp));
+    }
+    if let (Some(o), Some(n)) = (old.anchor, new.anchor) {
+        if (o.hrel, o.h, o.vrel, o.v) != (n.hrel, n.h, n.vrel, n.v) {
+            let hrel = match n.hrel {
+                HRel::Column => "column",
+                HRel::Margin => "margin",
+                HRel::Page => "page",
+            };
+            let vrel = match n.vrel {
+                VRel::Paragraph => "paragraph",
+                VRel::Margin => "margin",
+                VRel::Page => "page",
+            };
+            x = set_position(&x, "positionH", hrel, n.h, ["left", "center", "right"]);
+            x = set_position(&x, "positionV", vrel, n.v, ["top", "center", "bottom"]);
+            x = x.replace(" simplePos=\"1\"", " simplePos=\"0\"");
+            let pt = |p: Pos| if let Pos::Off(px) = p { format!("{}pt", num(px * 0.75)) } else { "0".to_owned() };
+            let al = |p: Pos, n: [&str; 3]| match p {
+                Pos::Off(_) => String::new(),
+                Pos::Start => n[0].to_owned(),
+                Pos::Center => n[1].to_owned(),
+                Pos::End => n[2].to_owned(),
+            };
+            let (hr, vr) = (
+                match n.hrel {
+                    HRel::Column => "text",
+                    HRel::Margin => "margin",
+                    HRel::Page => "page",
+                },
+                match n.vrel {
+                    VRel::Paragraph => "text",
+                    VRel::Margin => "margin",
+                    VRel::Page => "page",
+                },
+            );
+            x = map_vml_style(&x, &|s| {
+                let s = set_prop(&set_prop(s, "margin-left", &pt(n.h)), "margin-top", &pt(n.v));
+                let s = set_prop(&set_prop(&s, "mso-position-horizontal", &al(n.h, ["left", "center", "right"])), "mso-position-vertical", &al(n.v, ["top", "center", "bottom"]));
+                set_prop(&set_prop(&s, "mso-position-horizontal-relative", hr), "mso-position-vertical-relative", vr)
+            });
+        }
+    }
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,13 +635,13 @@ mod tests {
         let md = "A\n\n<!--k:tb 3-->\n\nIn **rutan**\n\nTvå\n\n<!--k:/tb-->\n\nB\n";
         let (rest, found, fresh) = extract(md, &|n| n == 3, 100);
         assert_eq!(rest, "A\n\nB\n");
-        assert_eq!(found, vec![Found { token: 3, inner: "In **rutan**\n\nTvå".into() }]);
+        assert_eq!(found, vec![Found { token: 3, inner: "In **rutan**\n\nTvå".into(), head: Head::default() }]);
         assert!(fresh.is_empty());
         // Okänt nummer: en ny ruta, ersatt av en bärarrad med nytt nummer.
         let (rest, found, fresh) = extract(md, &|_| false, 100);
         assert_eq!(rest, "A\n\n<!--k:100-->\n\nB\n");
         assert!(found.is_empty());
-        assert_eq!(fresh, vec![Found { token: 100, inner: "In **rutan**\n\nTvå".into() }]);
+        assert_eq!(fresh, vec![Found { token: 100, inner: "In **rutan**\n\nTvå".into(), head: Head::default() }]);
         // Ett block utan slut är vanlig text.
         let (rest, found, _) = extract("x\n<!--k:tb 1-->\ny\n", &|_| true, 0);
         assert!(found.is_empty());
@@ -451,15 +661,15 @@ mod tests {
     #[test]
     fn frame_has_borders_and_geometry() {
         let sh = Shape { fill: Some([255, 255, 255]), line: Some((0.75, [0, 0, 0])), ins: None };
-        let pp = frame(&sh, FrameX::Center, 200.0);
+        let pp = frame(&sh, FrameX::Center, 200.0, 0.0);
         assert!(pp.borders.any());
         assert_eq!(pp.shd, Some([255, 255, 255]));
         let (tl, tr, l, w) = pp.frame_geom(450.0).unwrap();
         assert_eq!((l, w), (125.0, 200.0));
         assert!(tl > l && tr > 125.0);
         // Hela spalten när bredden saknas, och markören överlever en tur och retur.
-        assert_eq!(frame(&sh, FrameX::Start, 0.0).frame_geom(300.0).map(|g| g.3), Some(300.0));
+        assert_eq!(frame(&sh, FrameX::Start, 0.0, 0.0).frame_geom(300.0).map(|g| g.3), Some(300.0));
         assert_eq!(PPr::parse_marker(&pp.marker()), Some(pp));
-        assert!(frame(&Shape::default(), FrameX::Start, 100.0).is_empty());
+        assert!(frame(&Shape::default(), FrameX::Start, 0.0, 0.0).is_empty());
     }
 }

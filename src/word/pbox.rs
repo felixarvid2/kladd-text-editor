@@ -222,6 +222,8 @@ pub struct Frame {
     /// Luft mellan rutans kant och texten (vänster, höger), inklusive kantlinjen.
     pub pl: f32,
     pub pr: f32,
+    /// Rutans fasta höjd (0 = efter texten).
+    pub h: f32,
 }
 
 impl Frame {
@@ -378,7 +380,8 @@ impl PPr {
                 FrameX::Center => "center".into(),
                 FrameX::End => "end".into(),
             };
-            s.push_str(&format!(" fr=\"w={} x={x} pl={} pr={}\"", num(f.w), num(f.pl), num(f.pr)));
+            let h = if f.h > 0.0 { format!(" h={}", num(f.h)) } else { String::new() };
+            s.push_str(&format!(" fr=\"w={} x={x} pl={} pr={}{h}\"", num(f.w), num(f.pl), num(f.pr)));
         }
         s.push_str("-->");
         s
@@ -441,13 +444,14 @@ impl PPr {
                     }
                 }
                 "fr" => {
-                    let (mut w, mut x, mut pl, mut pr) = (None, FrameX::Start, 0.0, 0.0);
+                    let (mut w, mut x, mut pl, mut pr, mut h) = (None, FrameX::Start, 0.0, 0.0, 0.0);
                     for part in v.split_whitespace() {
                         let Some((k, v)) = part.split_once('=') else { continue };
                         match k {
                             "w" => w = v.parse::<f32>().ok(),
                             "pl" => pl = v.parse().unwrap_or(0.0),
                             "pr" => pr = v.parse().unwrap_or(0.0),
+                            "h" => h = v.parse().unwrap_or(0.0),
                             "x" => {
                                 x = match v {
                                     "start" => FrameX::Start,
@@ -459,7 +463,7 @@ impl PPr {
                             _ => {}
                         }
                     }
-                    pp.frame = w.filter(|w| *w > 0.0 && w.is_finite()).map(|w| Frame { w, x, pl, pr });
+                    pp.frame = w.filter(|w| *w > 0.0 && w.is_finite()).map(|w| Frame { w, x, pl, pr, h });
                 }
                 _ => {}
             }
@@ -648,7 +652,7 @@ mod tests {
             left: Some(36.0),
             right: None,
             first: Some(-18.0),
-            frame: Some(Frame { w: 200.0, x: FrameX::Off(12.5), pl: 8.0, pr: 8.0 }),
+            frame: Some(Frame { w: 200.0, x: FrameX::Off(12.5), pl: 8.0, pr: 8.0, h: 90.0 }),
         };
         let m = pp.marker();
         assert!(m.starts_with("<!--k:pp ") && m.ends_with("-->") && !m.contains("--->") && !m[4..m.len() - 3].contains("--"), "{m}");

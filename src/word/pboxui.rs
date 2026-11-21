@@ -147,9 +147,11 @@ fn thick(b: &Border, ppx: f32) -> f32 {
     (b.width_pt() * ppx).max(1.0)
 }
 
-/// Rutornas former, i skärmkoordinater (galleriets plus `gpos`).
-pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
+/// Rutornas former, i skärmkoordinater (galleriets plus `gpos`), och skärmrutan (på första arket) för varje
+/// ram med egen bredd (textruta) med styckenas byteområde.
+pub fn shapes_rects(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> (Vec<Shape>, Vec<(std::ops::Range<usize>, Rect)>) {
     let mut out = Vec::new();
+    let mut frames: Vec<(std::ops::Range<usize>, Rect)> = Vec::new();
     let ppx = super::layout::px(env.zoom, 1.0);
     let g = env.galley;
     let mut sweep = Sweep { text: env.text, b: 0, c: 0 };
@@ -170,10 +172,13 @@ pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
         // Spalten rutan börjar i. I ett avsnitt med flera spalter är radernas y inte stigande genom
         // galleriet (varje spalt börjar om), så raderna väljs efter läge och spalt, inte med bisektion.
         let (cl, cw) = (env.col_at)(ra.left(), y0);
+        // En ruta med egen bredd kan ha text bredvid sig (omflöde): bara rader i rutans egen bredd hör till den.
+        let fx = first.frame_geom(cw / ppx).map(|(_, _, l, w)| (cl + l * ppx - 1.0, cl + (l + w) * ppx));
         let rows: Vec<RowSpan> = g
             .rows
             .iter()
             .filter(|r| r.rect().max.y > y0 + 0.5 && r.pos.y < y1 - 0.01 && r.pos.x >= cl - 1.0 && r.pos.x < cl + cw + 1.0)
+            .filter(|r| fx.is_none_or(|(a, b)| r.pos.x >= a && r.pos.x < b))
             .map(|r| RowSpan {
                 top: r.pos.y,
                 bottom: r.rect().max.y,
@@ -183,7 +188,11 @@ pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
         if rows.is_empty() {
             continue;
         }
-        let segs = segments(&rows, first, last, ppx);
+        let mut segs = segments(&rows, first, last, ppx);
+        // Fast höjd (`a:ext`): rutan är minst så hög även om texten är kortare.
+        if let (Some(f), [s]) = (first.frame.filter(|f| f.h > 0.0), segs.as_mut_slice()) {
+            s.y1 = s.y1.max(s.y0 + f.h * ppx);
+        }
         let fill = first.shd.map(|c| adapt_background(c, env.palette.dark));
         let b = &first.borders;
         for s in &segs {
@@ -197,6 +206,9 @@ pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
                 }
             };
             let r = Rect::from_min_max(pos2(left, s.y0), pos2(right, s.y1)).translate(env.gpos);
+            if first.frame.is_some() && !frames.last().is_some_and(|(rg, _)| *rg == run.range) {
+                frames.push((run.range.clone(), r));
+            }
             if r.bottom() < env.clip.top() || r.top() > env.clip.bottom() {
                 continue;
             }
@@ -235,7 +247,7 @@ pub fn shapes(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> Vec<Shape> {
             }
         }
     }
-    out
+    (out, frames)
 }
 
 #[cfg(test)]

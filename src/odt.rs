@@ -928,7 +928,7 @@ struct Rd<'s, 'b> {
     /// Sant medan en fotnots stycken läses.
     in_note: bool,
     /// Textrutor som lästs i stycket som byggs: läggs före stycket (`docx_tbox`), och sant medan en ruta läses.
-    pending_boxes: Vec<Vec<Block>>,
+    pending_boxes: Vec<(Vec<Block>, crate::docx_tbox::Head)>,
     in_box: bool,
     /// Sidmallarnas sida och spalter, sidmallen som gäller just nu och dess egenskaper (avsnitt).
     masters: HashMap<String, sections::SectionProps>,
@@ -1388,8 +1388,8 @@ impl<'s, 'b> Rd<'s, 'b> {
         if self.in_box {
             return;
         }
-        for inner in std::mem::take(&mut self.pending_boxes) {
-            self.blocks.push(Block::Raw(crate::docx_tbox::open_tag(0)));
+        for (inner, head) in std::mem::take(&mut self.pending_boxes) {
+            self.blocks.push(Block::Raw(crate::docx_tbox::open_tag_head(0, &head)));
             self.blocks.extend(inner);
             self.blocks.push(Block::Raw(crate::docx_tbox::CLOSE.to_owned()));
         }
@@ -1429,12 +1429,19 @@ impl<'s, 'b> Rd<'s, 'b> {
         let shape = self.box_shape(name);
         let width = e.attr("svg:width").and_then(style::parse_length).unwrap_or(0.0);
         let place = self.st.frame_place(e, name);
+        // `fo:min-height` på 0,5 cm skriver Kladd själv när rutan saknar höjd: ingen fast höjd.
+        let height = e
+            .attr("svg:height")
+            .and_then(style::parse_length)
+            .or_else(|| e.attr("fo:min-height").and_then(style::parse_length).filter(|h| (*h - 14.173).abs() > 0.01))
+            .unwrap_or(0.0);
+        let head = crate::docx_tbox::Head { w: width * 96.0 / 72.0, h: height * 96.0 / 72.0, anchor: place };
         // Läget från sidans kant räknas om till spaltens vänsterkant.
         let from_page = place.as_ref().is_some_and(|a| a.hrel == HRel::Page);
         let x = match place.map(|a| a.h) {
             Some(Pos::Center) => FrameX::Center,
             Some(Pos::End) => FrameX::End,
-            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3] } else { 0.0 }).max(0.0) * 10.0).round() / 10.0),
+            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3].round() } else { 0.0 }).max(0.0) * 2.0).round() / 2.0),
             _ => FrameX::Start,
         };
         let saved = std::mem::take(&mut self.blocks);
@@ -1450,7 +1457,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             Block::Table(_) | Block::Raw(_) => true,
             Block::Rule => false,
         });
-        let pp = crate::docx_tbox::frame(&shape, x, width);
+        let pp = crate::docx_tbox::frame(&shape, x, width, height);
         for b in inner.iter_mut() {
             if let Block::Para(p) = b {
                 if p.list.is_none() && p.kind != Kind::Code && !pp.is_empty() {
@@ -1459,7 +1466,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             }
         }
         if has_text {
-            self.pending_boxes.push(inner);
+            self.pending_boxes.push((inner, head));
         }
     }
 
@@ -2458,7 +2465,7 @@ struct W<'a> {
     /// Sidnumret som avsnittet efter brytningen börjar om på (`style:page-number`).
     pending_start: Option<u32>,
     /// Öppna textrutor (`<!--k:tb N-->`): var rutans innehåll börjar i brödtexten och ramen (första `k:pp`).
-    boxes: Vec<(usize, Option<crate::word::pbox::PPr>)>,
+    boxes: Vec<(usize, Option<crate::word::pbox::PPr>, crate::docx_tbox::Head)>,
     review: ReviewWr,
 }
 
@@ -3223,7 +3230,7 @@ impl<'a> W<'a> {
     /// i ett eget stycke, med rutans fyllning, kant, bredd och läge ur ramens markör.
     fn finish_box(&mut self) {
         use crate::word::pbox::FrameX;
-        let Some((start, pp)) = self.boxes.pop() else { return };
+        let Some((start, pp, head)) = self.boxes.pop() else { return };
         let inner = self.body.split_off(start.min(self.body.len()));
         if inner.trim().is_empty() {
             return;
@@ -3233,11 +3240,27 @@ impl<'a> W<'a> {
         let bd = &pp.borders;
         let pt = |v: f32| format!("{:.3}pt", v);
         let hex = |c: [u8; 3]| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
-        let (hpos, x) = match frame.map(|f| f.x) {
-            Some(FrameX::Center) => ("center", None),
-            Some(FrameX::End) => ("right", None),
-            Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v)),
-            _ => ("left", None),
+        // Vågrätt läge: ankaret i öppningsraden (relativt kolumn, marginal eller sida), annars ramens läge i spalten.
+        let (hpos, x, hrel) = match head.anchor {
+            Some(a) => {
+                let rel = match a.hrel {
+                    HRel::Column => "paragraph",
+                    HRel::Margin => "page-content",
+                    HRel::Page => "page",
+                };
+                match a.h {
+                    Pos::Off(px) => ("from-left", Some(px * 0.75), rel),
+                    Pos::Start => ("left", None, rel),
+                    Pos::Center => ("center", None, rel),
+                    Pos::End => ("right", None, rel),
+                }
+            }
+            None => match frame.map(|f| f.x) {
+                Some(FrameX::Center) => ("center", None, "paragraph"),
+                Some(FrameX::End) => ("right", None, "paragraph"),
+                Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v), "paragraph"),
+                _ => ("left", None, "paragraph"),
+            },
         };
         let width = frame.map(|f| f.w).filter(|w| *w < 5000.0).unwrap_or(self.text_w).min(self.text_w.max(36.0));
         let border = match (bd.left, bd.left.and_then(|b| b.color)) {
@@ -3249,14 +3272,47 @@ impl<'a> W<'a> {
         let fill = pp.shd.map_or("draw:fill=\"none\"".to_owned(), |c| format!("draw:fill=\"solid\" draw:fill-color=\"{}\"", hex(c)));
         self.n_frame += 1;
         let name = format!("tb{}", self.n_frame);
+        // Omflöde, lodrätt läge och avstånd till texten ur öppningsradens ankare (`docx_tbox::Head`); en ruta i
+        // flödet ligger vid stycket utan omflöde.
+        let anchor = head.anchor;
+        let wrap = match anchor.map(|a| a.wrap) {
+            Some(Wrap::Square) => "parallel",
+            Some(Wrap::Behind | Wrap::Front) => "run-through",
+            _ => "none",
+        };
+        let run_through = if anchor.is_some_and(|a| a.wrap == Wrap::Behind) { "background" } else { "foreground" };
+        let (vpos, vrel, svg_y) = match anchor {
+            Some(a) => {
+                let rel = match a.vrel {
+                    VRel::Paragraph => "paragraph",
+                    VRel::Margin => "page-content",
+                    VRel::Page => "page",
+                };
+                match a.v {
+                    Pos::Off(y) => ("from-top", rel, Some(y * 0.75)),
+                    Pos::Start => ("top", rel, None),
+                    Pos::Center => ("middle", rel, None),
+                    Pos::End => ("bottom", rel, None),
+                }
+            }
+            None => ("top", "paragraph", None),
+        };
+        let [mt, mr, mb, ml] = anchor.map_or([0.0, 0.0, 5.67, 0.0], |a| [a.dist[0] * 0.75, a.dist[1] * 0.75, a.dist[2] * 0.75, a.dist[3] * 0.75]);
         self.auto.push_str(&format!(
-            "<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:wrap=\"none\" style:vertical-pos=\"top\" style:vertical-rel=\"paragraph\" style:horizontal-pos=\"{hpos}\" style:horizontal-rel=\"paragraph\" style:run-through=\"foreground\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.2cm\" fo:margin-left=\"0cm\" fo:margin-right=\"0cm\" fo:padding=\"{}\" fo:border=\"{border}\" {fill} draw:auto-grow-height=\"true\" draw:textarea-vertical-align=\"top\"/></style:style>",
+            "<style:style style:name=\"{name}\" style:family=\"graphic\" style:parent-style-name=\"Graphics\"><style:graphic-properties style:wrap=\"{wrap}\" style:vertical-pos=\"{vpos}\" style:vertical-rel=\"{vrel}\" style:horizontal-pos=\"{hpos}\" style:horizontal-rel=\"{hrel}\" style:run-through=\"{run_through}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" fo:padding=\"{}\" fo:border=\"{border}\" {fill} draw:auto-grow-height=\"true\" draw:textarea-vertical-align=\"top\"/></style:style>",
+            pt(mt),
+            pt(mb),
+            pt(ml),
+            pt(mr),
             pt(pad)
         ));
-        let svg_x = x.map_or(String::new(), |v| format!(" svg:x=\"{}\"", pt(v)));
+        let svg_x = x.map_or(String::new(), |v| format!(" svg:x=\"{:.5}pt\"", v));
+        let svg_y = svg_y.map_or(String::new(), |v| format!(" svg:y=\"{}\"", pt(v)));
+        let fh = frame.map_or(0.0, |f| f.h);
+        let min_h = if fh > 0.0 { pt(fh) } else if head.h > 0.0 { pt(head.h * 0.75) } else { "0.5cm".to_owned() };
         self.open_para();
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"{name}\" draw:name=\"Textruta{}\" text:anchor-type=\"paragraph\"{svg_x} svg:width=\"{}\" fo:min-height=\"0.5cm\"><draw:text-box>{inner}</draw:text-box></draw:frame>",
+            "<draw:frame draw:style-name=\"{name}\" draw:name=\"Textruta{}\" text:anchor-type=\"paragraph\"{svg_x}{svg_y} svg:width=\"{}\" fo:min-height=\"{min_h}\"><draw:text-box>{inner}</draw:text-box></draw:frame>",
             self.n_frame,
             pt(width)
         ));
@@ -3293,9 +3349,9 @@ impl<'a> W<'a> {
                     self.flush_break();
                 }
             }
-        } else if crate::docx_tbox::parse_open(t).is_some() && self.table.is_none() {
+        } else if let (Some((_, head)), true) = (crate::docx_tbox::parse_head(t), self.table.is_none()) {
             self.close_para();
-            self.boxes.push((self.body.len(), None));
+            self.boxes.push((self.body.len(), None, head));
         } else if t == crate::docx_tbox::CLOSE && !self.boxes.is_empty() {
             self.close_para();
             self.finish_box();
@@ -4373,8 +4429,8 @@ Slut.
         let back = read(&w.bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
         let m = back.markdown;
-        assert!(m.contains("<!--k:tb 0-->") && m.contains("<!--k:/tb-->"), "{m}");
-        let block = m.split("<!--k:tb 0-->").nth(1).unwrap().split("<!--k:/tb-->").next().unwrap();
+        assert!(m.contains("<!--k:tb 0 ") && m.contains("<!--k:/tb-->"), "{m}");
+        let block = m.split("<!--k:tb 0 ").nth(1).unwrap().split("<!--k:/tb-->").next().unwrap();
         assert!(block.contains("**Faktaruta**") && block.contains("Text i rutan") && block.contains("shd=\"FFF2CC\""), "{m}");
         assert!(block.contains("x=end") && block.contains("w=200"), "{m}");
         assert!(m.find("Före").unwrap() < m.find("k:tb").unwrap() && m.find("k:/tb").unwrap() < m.find("Efter").unwrap(), "{m}");

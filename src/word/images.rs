@@ -480,7 +480,7 @@ pub fn ui(
 }
 
 /// 1 px accentram och åtta små kvadratiska handtag.
-fn paint_selection(ui: &Ui, r: Rect, p: &Palette) {
+pub(super) fn paint_selection(ui: &Ui, r: Rect, p: &Palette) {
     let pt = ui.painter();
     pt.rect_stroke(r, 0.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Outside);
     for (_, c) in handle_points(r) {

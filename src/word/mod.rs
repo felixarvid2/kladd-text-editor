@@ -11,6 +11,7 @@ pub mod nav;
 pub mod notesui;
 pub mod pbox;
 pub mod pboxui;
+pub mod tboxui;
 pub mod navui;
 pub mod tables;
 pub mod tablefmt;
@@ -38,3 +39,5 @@ mod float_tests;
 mod float_layout_tests;
 #[cfg(test)]
 mod section_tests;
+#[cfg(test)]
+mod tbox_layout_tests;

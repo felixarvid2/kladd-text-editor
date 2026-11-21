@@ -222,7 +222,7 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 | Sidstorlek, marginaler, sidhuvud och sidfot | Samma kommentar: `page-size: A4; page-margin: 25mm; footer: "Sida {sida} av {sidor}"` |
 | Formatmallar (Brödtext, Rubrik 1–6, Citat) | Samma kommentar: `h1: "Calibri Light" 16pt bold #2F5496 space-before 12pt; body: justify line-spacing 1.15; quote: italic` |
 | Fotnoter, fält m.m. | `<!--k:N-->` (osynlig markör, skrivs tillbaka vid sparning) |
-| Textruta | `<!--k:tb N-->` … `<!--k:/tb-->` före stycket (innehållet är vanliga stycken med `<!--k:pp …-->` för fyllning och ram) |
+| Textruta | `<!--k:tb N w="…" h="…" x="…" y="…" wrap="…"-->` … `<!--k:/tb-->` före stycket (innehållet är vanliga stycken med `<!--k:pp …-->` för fyllning och ram; måtten och läget är samma attribut som för bilder) |
 | Spårad infogning och radering | `<ins data-k="3">text</ins>`, `<del data-k="4">text</del>` (författare och datum i en postrad sist) |
 | Spårat stycketecken | `<!--k:pm ins 5-->` / `<!--k:pm del 5-->` sist på raden, före radbrytningen |
 | Spårad formatering | `<fmt data-k="6">text</fmt>` (teckenformat) och `<!--k:pm fmt 7-->` (styckeformat); det gamla formatet står i postradens `old` |
@@ -238,7 +238,7 @@ Bara synlig text skickas, utan Markdown-syntax, och bara stycken som ändrats, u
 
 Bilder i dokumentet följer med när du sparar och syns i förhandsvisningen. Lägg till egna bilder med *Infoga bild…* (`Ctrl+Shift+I`), genom att dra in en bildfil i fönstret eller genom att skriva `![text](sökväg/till/bild.png)`. Sökvägen kan vara relativ till dokumentet. När dokumentet sparas som `.docx` bäddas bilderna in. WebP och SVG kan infogas på samma sätt (SVG ritas upp som en bild i dubbel upplösning, text i SVG ritas med systemets typsnitt, och externa filer som SVG:n länkar till läses inte). Eftersom äldre Word och PDF inte kan WebP eller SVG sparas de som PNG i `.docx`, `.odt` och PDF; originalfilen ändras inte. En SVG-fil som du drar in öppnas som text om du inte har ett Markdown- eller Word-dokument aktivt. Sparar du ett Word-dokument som Markdown hamnar bilderna i en mapp bredvid filen.
 
-Textrutor visas som stycken med rutans fyllning, ram, bredd och läge före stycket de sitter i (texten kan ändras och *Infoga → Textruta* lägger till en ny, men text flödar inte runt rutan). Diagram, former och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer stöds inte.
+Textrutor visas med rutans fyllning, ram, bredd, fasta höjd och läge, och texten flyter runt förankrade rutor som runt förankrade bilder (i dokumentläget och i PDF-exporten). Texten i rutan kan ändras, *Infoga → Textruta* lägger till en ny, och rutor i tabellceller, rubriker, listor och med bilder visas. Klicka på rutans kant för att markera den, dra i kanten för att flytta den och i handtagen för att ändra storlek; läget och storleken följer med till `.docx` och `.odt`. Diagram, former och sidhuvuden visas inte i texten, men de bevaras när filen sparas (se [Förlustfri sparning](#förlustfri-sparning)). Kladd frågar innan originalet skrivs över. Lösenordsskyddade filer stöds inte.
 
 Läsning och skrivning bygger på samma teknik som [WordCraft](https://github.com/storytold/wordcraft) (MIT/Apache-2.0).
 

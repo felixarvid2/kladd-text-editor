@@ -553,6 +553,7 @@ pub fn paginate_sections(
     page_breaks: &[usize],
     notes: &NoteSpec,
     balance: &Balance,
+    overlay: &[Range<usize>],
 ) -> Paged {
     let n_rows = g.rows.len();
     let mut boxes: Vec<PageBox> = Vec::new();
@@ -611,8 +612,21 @@ pub fn paginate_sections(
     };
 
     let mut next_group = 0;
+    let mut next_ov = 0;
+    // Rutor med omflöde (`overlay`): raderna ligger ovanpå texten och tar ingen plats; de placeras när raden
+    // efter dem (`pending.end`) har fått sitt läge, med samma avstånd till den som de hade i layouten.
+    let mut pending: Option<Range<usize>> = None;
     let mut i = 0;
     while i < n_rows {
+        while next_ov < overlay.len() && overlay[next_ov].start < i {
+            next_ov += 1;
+        }
+        if let Some(ov) = overlay.get(next_ov).filter(|o| o.start == i && o.end > i && o.end < n_rows) {
+            pending = Some(ov.clone());
+            i = ov.end;
+            next_ov += 1;
+            continue;
+        }
         while next_group < groups.len() && groups[next_group].start < i {
             next_group += 1;
         }
@@ -747,6 +761,14 @@ pub fn paginate_sections(
         let top = round(col_y);
         let dy = top - y0;
         let cx = col_x(&boxes, &sg, col);
+        if let Some(ov) = pending.take().filter(|o| o.end == i) {
+            for r in ov {
+                let pr = &mut g.rows[r];
+                pr.pos.y = round(top + (pr.pos.y - y0));
+                pr.pos.x += cx;
+                dx[r] = cx;
+            }
+        }
         for (k, pr) in g.rows[i..end].iter_mut().enumerate() {
             pr.pos.y += dy;
             pr.pos.x += cx;

@@ -24,6 +24,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 - Sidnumrering som börjar om per avsnitt läses nu också från `.odt` (`style:page-number` på stycket och `style:first-page-number` på sidmallen) och skrivs tillbaka.
 - Ett stycke som fortsätter från en bredare spalt in i en smalare delas vid spaltgränsen: raderna bryts i respektive spalts bredd i dokumentläget och i PDF (förut fick hela stycket den smalaste bredden i vyn och den breda spaltens bredd i PDF).
 - Spalter med olika bredd jämnas nu ut på avsnittets sista sida före ett löpande avsnittsbyte i dokumentläget (som Word och LibreOffice). I PDF jämnas spalter fortfarande inte ut.
+- **Textrutor med omflöde, överallt och som går att dra.** En förankrad textruta (`wp:anchor` i Word, `draw:frame` i LibreOffice) ritas på sitt läge mot kolumn, marginal, sida eller stycke med den fasta höjd dokumentet anger (`a:ext`), och texten flyter runt den som runt förankrade bilder (fyrkantigt på den bredare sidan, över och under, bakom och framför), i dokumentläget och i PDF-exporten. Rutor i tabellceller, rubriker och listor, rutor med bilder och rutor med fotnotsreferenser (texten visas) visas nu också. Klicka på rutans kant för att markera den, dra i kanten för att flytta den och i handtagen för att ändra storlek; nytt läge och ny storlek skrivs som `wp:positionH/V`, `wp:extent`, `a:ext` och VML-`style` i `.docx` och som `draw:frame` i `.odt`. Orörda rutor sparas byte för byte som förut.
 
 ### Ändrat
 

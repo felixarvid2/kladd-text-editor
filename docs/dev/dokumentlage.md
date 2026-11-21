@@ -282,9 +282,31 @@ Gemensamma format (alla moduler ska använda dessa):
   (rutans stycken är inga egna element). ODT: `draw:text-box` läses till samma block (`Rd::text_box`, nummer 0) och
   block skrivs som en `draw:frame` med `draw:text-box` i ett eget stycke (`W::finish_box`). PDF: `Block::Para::look`
   ritar fyllning (bakom texten) och kanter (`Layout::paint_box`), också för vanliga stycke-ramar. Begränsningar: rutan
-  ritas i flödet (text flödar inte runt den, ingen fast höjd), rutor i tabeller/rubriker/listor, med bilder eller
-  fotnoter, och rutor i rutor visas inte (bevaras i docx), läge relativt sidans högerkant räknas inte om, och en
-  ruta bredare än textytan krymps vid ODT-sparning.
+  ritas i flödet utan omflöde när den är inline eller `wrapTopAndBottom`; rutor i rutor visas inte (bevaras i docx),
+  och en ruta bredare än textytan krymps vid ODT-sparning.
+  - **Förankrade rutor** (`wp:anchor`/`draw:frame` med läge): öppningsraden bär måtten och ankaret,
+    `<!--k:tb N w="px" h="px" hrel= x= vrel= y= wrap= dist=-->` (samma attribut som `<img>`, se `word::anchor`;
+    `docx_tbox::Head`, `parse_head`, `open_tag_head`). `fr=` på styckena har rutans bredd, vågräta läge i spalten
+    (`pbox::Frame`, räknat ur ankaret med sidans mått vid läsning) och fasta höjd (`h=`, pt). Bara `wrap` fyrkant,
+    bakom och framför flyter (`wrap="top"` och rutor utan ankare ligger i flödet).
+  - Layout (`layout::relayout`): öppnings- och slutradens stycken (`Para::tbox`, `tbox_end`) omger rutans stycken;
+    dessa läggs ut som vanligt men tar ingen höjd (`y`), efter slutraden dras alla rader uppåt så att texten efter
+    rutan börjar vid ankarstyckets överkant (`apply_pulls`: `pulls`) och rutans rader flyttas till sitt lodräta läge
+    (`shifts`). Rutan registreras som flytande objekt (`ActiveFloat`) med samma regler som bilder (`plan_float`:
+    den bredare sidan, `FLOAT_MIN_ROOM`), och raden som delvis ligger över rutans överkant flyter också runt den.
+    Sidbrytning: `pages::paginate` får rutans rader som radgrupp, `secpages::paginate_sections` lägger dem
+    ovanpå (`overlay`) utan att de tar plats. Blankraden efter slutraden kollapsar.
+  - Ritning (`pboxui::shapes_rects`): rader bredvid rutan hör inte till den (filtreras på rutans x-intervall) och
+    fast höjd gör rutan minst så hög. Dra/ändra storlek: `word::tboxui` (kanten är träffytan så att klick inne i
+    rutan flyttar textmarkören; läget skrivs som `hrel` kolumn och `vrel` stycke med förskjutningar, storlek som
+    `w`/`h`, och `fr=` på alla stycken i rutan uppdateras).
+  - Docx: `docx_tbox::set_geometry` skriver ny storlek och nytt läge i originalkörningen (`wp:extent`, `a:ext`,
+    `wp:positionH/V`, VML-`style`) när öppningsraden ändrats; orörd ruta sparas byte för byte (huvudet jämförs
+    avrundat, `Head::rounded`). Rutor i tabellceller visas ovanför tabellen och i flödet; rutor i rubriker/listor
+    och med bilder visas; fotnotsreferenser i rutan tas bort ur visningen (originalet bevaras). ODT: `draw:frame`
+    läses med `frame_place` till samma huvud och skrivs med `style:wrap`, `vertical-pos/-rel`, `svg:x/y`,
+    `fo:min-height` och `fo:margin-*`. PDF: `Block::TBoxOpen/TBoxClose`, `Layout::tbox` ritar stycknen på rutans läge och
+    registrerar en `FloatBox` som förankrade bilder.
 - **Okända Word-objekt** (kommentarsankare, bokmärken, fält, textrutor,
   former, symboler) blir osynliga markörer `<!--k:N-->` i texten. N pekar på originalets XML i
   `Document`, och vid sparning skrivs originalet tillbaka. I dokumentläget är markörerna dolda

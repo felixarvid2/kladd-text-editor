@@ -112,6 +112,8 @@ pub struct State {
     spell: Option<SpellCache>,
     /// Vald bild, pågående storleksändring.
     pub(crate) img: images::State,
+    /// Vald textruta, pågående flytt eller storleksändring.
+    tbox: super::tboxui::State,
     target: Option<SpellTarget>,
     /// Grammatikträffen som högerklickats.
     gtarget: Option<crate::grammar::Match>,
@@ -1161,6 +1163,8 @@ impl KladdApp {
             let focus = std::mem::take(&mut self.focus_editor) && self.wv.img.selected.is_none();
             let mut imgs = std::mem::take(&mut self.wv.img);
             let mut img_act: Option<images::Act> = None;
+            let mut tbox_st = std::mem::take(&mut self.wv.tbox);
+            let mut tbox_act: Option<super::tboxui::Change> = None;
             let mut painted: Vec<images::Painted> = Vec::new();
             let mut img_index = 0usize;
             let secondary_target = self.wv.target.clone();
@@ -1458,7 +1462,13 @@ impl KladdApp {
                             clip,
                             vis,
                         };
-                        ui.painter().set(pbox_slot, Shape::Vec(super::pboxui::shapes(&env, &pb.0, &pb.1)));
+                        let (shp, frames) = super::pboxui::shapes_rects(&env, &pb.0, &pb.1);
+                        ui.painter().set(pbox_slot, Shape::Vec(shp));
+                        let tviews = super::tboxui::views(text, &galley, gpos, &frames, &col_at);
+                        if !tviews.is_empty() || tbox_st.selected.is_some() {
+                            let max_w = (0..geom.secs.len().max(1)).map(|i| geom.wrap_for(i)).fold(0.0, f32::max);
+                            tbox_act = super::tboxui::ui(ui, &mut tbox_st, doc_id, &tviews, z, max_w, id, p);
+                        }
                     }
                 }
                 let last_bottom = boxes[total - 1].rect(page_left, origin_y).bottom();
@@ -1971,6 +1981,25 @@ impl KladdApp {
             }
             let img_range = imgs.range.clone();
             self.wv.img = imgs;
+            self.wv.tbox = tbox_st;
+            if let Some(c) = tbox_act {
+                self.word_edit(&ctx, |t, sel| match super::tboxui::apply(t, &c) {
+                    Some(text) => {
+                        // Markören i eller före rutan hamnar före rutan (text före den ändras inte) eller i rutans första stycke.
+                        let close = t[c.open.end..].find(crate::docx_tbox::CLOSE).map_or(t.len(), |i| i + c.open.end);
+                        let at = if sel.start < c.open.start {
+                            sel.start
+                        } else if sel.start >= close {
+                            (sel.start + text.len()).saturating_sub(t.len())
+                        } else {
+                            let e = text[c.open.start..].find("-->").map_or(c.open.start, |i| c.open.start + i + 3);
+                            e + text[e..].chars().take_while(|c| *c == '\n').count()
+                        };
+                        markup::Edit { text, sel: at..at }
+                    }
+                    None => markup::Edit { text: t.to_string(), sel },
+                });
+            }
             if let (Some(act), Some(r)) = (img_act, img_range) {
                 self.word_image_act(&ctx, act, r);
             }

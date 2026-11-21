@@ -141,7 +141,7 @@ fn joined_paragraphs_form_one_box_with_padding() {
             clip: Rect::from_min_max(egui::pos2(-100.0, -100.0), egui::pos2(900.0, 900.0)),
             vis: 0..t.len(),
         };
-        let shapes = pboxui::shapes(&env, &specs, &runs);
+        let shapes = pboxui::shapes_rects(&env, &specs, &runs).0;
         let rects: Vec<Rect> = shapes
             .iter()
             .filter_map(|s| match s {

@@ -564,6 +564,18 @@ fn relayout_pass(
         bottom: f32,
     }
     let mut active: Vec<FloatBox> = Vec::new();
+    // Förankrade textrutor med omflöde: stycken i rutan tar ingen höjd (`y`), efter rutan dras texten upp
+    // till rutans överkant (`pulls`: första raden som dras upp, höjd) och rutans rader flyttas till sitt läge
+    // (`shifts`: rader, förskjutning). Se `apply_pulls`.
+    struct BoxSt {
+        tb: TBox,
+        content_h: f32,
+        first_row: usize,
+    }
+    let mut boxst: Option<BoxSt> = None;
+    let mut pulls: Vec<(usize, f32)> = Vec::new();
+    let mut shifts: Vec<(Range<usize>, f32)> = Vec::new();
+    let mut box_rows: Vec<Range<usize>> = Vec::new();
     let mut y = 0.0f32;
     let mut row_no = 0usize;
     let mut anchors: Vec<(usize, f32)> = Vec::new();
@@ -594,6 +606,12 @@ fn relayout_pass(
         };
         active.retain(|f| f.bottom > y + 0.5);
         let table = tbl.is_some();
+        let opened = !table && paras[pr.start].tbox.is_some();
+        if let (true, Some(tb)) = (opened, paras[pr.start].tbox) {
+            boxst = Some(BoxSt { tb, content_h: 0.0, first_row: usize::MAX });
+        }
+        let closing = !table && paras[pr.start].tbox_end && boxst.is_some();
+        let in_box = !table && !opened && !closing && boxst.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
         let note_def = defs.iter().find(|d| d.para == pr.start && !table);
         if let Some(d) = note_def {
@@ -706,7 +724,7 @@ fn relayout_pass(
         }
         break laid_out;
         };
-        if let (true, Some(g)) = (unequal, pages) {
+        if let (true, Some(g), false) = (unequal, pages, in_box) {
             let hs: Vec<f32> = if table {
                 vec![galleys.iter().map(|lg| lg.rect.height()).sum()]
             } else {
@@ -756,17 +774,63 @@ fn relayout_pass(
                 active.push(FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom });
             }
         }
-        row_no += galleys.iter().map(|g| g.rows.len()).sum::<usize>();
-        if let Some(sm) = sim.as_mut() {
-            let mut gy = y;
-            for g in galleys.iter() {
-                for r in &g.rows {
-                    sm.place(gy + r.pos.y, r.row.size.y);
+        let gh: f32 = galleys.iter().map(|g| g.rect.height()).sum();
+        let close_rows: usize = galleys.iter().map(|g| g.rows.len()).sum();
+        if let Some(b) = boxst.take_if(|_| closing) {
+            // Rutan är klar: texten efter den dras upp till rutans överkant och flyter runt den.
+            let ctx = match pages {
+                Some(g) => PageCtx { page_w: g.page_w, page_h: g.page_h, margin: [g.top, g.right, g.bottom, g.left], col_left: g.left, col_w: wrap_width },
+                None => PageCtx::column_only(wrap_width),
+            };
+            let z = p.zoom;
+            let w_z = if b.tb.w > 0.0 { b.tb.w * z } else { wrap_width * 0.5 };
+            let h_z = (b.tb.h * z).max(b.content_h);
+            let page_y = sim.as_ref().map(|s| s.sheet_y(y));
+            let spec = FloatSpec { side: Float::Right, anchor: Some(b.tb.anchor), size: egui::vec2(w_z, h_z), alone: false };
+            let mut plan = plan_float(&spec, z, wrap_width, &ctx, page_y, min_h);
+            let a = b.tb.anchor.scaled(z);
+            let top = match a.y_at(h_z, &ctx) {
+                VAt::Para(o) => o,
+                VAt::Page(py) => page_y.map_or(0.0, |s| py - s),
+            }
+            .max(0.0);
+            if plan.side.is_some_and(|s| s != Side::Full) && wrap_width - plan.w < FLOAT_MIN_ROOM * z {
+                plan.side = Some(Side::Full);
+            }
+            if let Some(side) = plan.side {
+                // Raden som delvis ligger över rutans överkant flyter också runt den.
+                active.push(FloatBox { side, w: plan.w, top: y + top - a.dist[0] - (min_h - 1.0).max(0.0), bottom: y + top + h_z + a.dist[2] });
+            }
+            if b.first_row <= row_no {
+                pulls.push((row_no, b.content_h));
+                shifts.push((b.first_row..row_no, top));
+                if multi {
+                    box_rows.push(b.first_row..row_no);
+                } else if b.first_row < row_no {
+                    row_groups.push(b.first_row..row_no);
                 }
-                gy += g.rect.height();
+            }
+            anchors.push((row_no + close_rows, h_z + top));
+        }
+        row_no += close_rows;
+        if let (true, Some(b)) = (opened, boxst.as_mut()) {
+            b.first_row = row_no;
+        }
+        match boxst.as_mut() {
+            Some(b) if in_box => b.content_h += gh,
+            _ => {
+                if let Some(sm) = sim.as_mut() {
+                    let mut gy = y;
+                    for g in galleys.iter() {
+                        for r in &g.rows {
+                            sm.place(gy + r.pos.y, r.row.size.y);
+                        }
+                        gy += g.rect.height();
+                    }
+                }
+                y += gh;
             }
         }
-        y += galleys.iter().map(|g| g.rect.height()).sum::<f32>();
         all.extend(galleys.iter().cloned());
     }
     st.units.retain(|_, u| u.used == tick);
@@ -780,13 +844,14 @@ fn relayout_pass(
         format: TextFormat::default(),
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
+    apply_pulls(&mut g, &pulls, &shifts, ppp);
     let spec = match pages {
         Some(geom) if !note_layouts.is_empty() => notes::spec(&note_layouts, &g, text, &a, p.zoom, geom.text_h() * 0.5),
         _ => super::fnotes::NoteSpec::default(),
     };
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec, balance);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec, balance, &box_rows);
             // Tabellernas kolumnkanter följer med raderna i sidled.
             for (t, r) in geoms.iter_mut().zip(&geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
@@ -808,6 +873,32 @@ fn relayout_pass(
     st.geoms = Arc::new(geoms);
     st.notes = Arc::new(note_layouts);
     (g, csim.runs)
+}
+
+/// Textrutornas omflöde: rader från `pulls` (första raden, höjd) och framåt flyttas uppåt så att texten efter
+/// en ruta börjar vid rutans överkant, och rutans egna rader (`shifts`) flyttas ned till sitt läge.
+fn apply_pulls(g: &mut Galley, pulls: &[(usize, f32)], shifts: &[(Range<usize>, f32)], ppp: f32) {
+    if pulls.is_empty() {
+        return;
+    }
+    let round = |v: f32| (v * ppp).round() / ppp;
+    let mut cum = 0.0f32;
+    let mut next = 0;
+    for (i, r) in g.rows.iter_mut().enumerate() {
+        while next < pulls.len() && pulls[next].0 <= i {
+            cum += pulls[next].1;
+            next += 1;
+        }
+        let dy = shifts.iter().find(|(rg, _)| rg.contains(&i)).map_or(0.0, |(_, d)| *d);
+        r.pos.y = round(r.pos.y - cum + dy);
+    }
+    let mut rect = Rect::ZERO;
+    g.mesh_bounds = Rect::NOTHING;
+    for r in &g.rows {
+        rect |= Rect::from_min_size(r.pos, r.row.size);
+        g.mesh_bounds |= r.row.visuals.mesh_bounds.translate(r.pos.to_vec2());
+    }
+    g.rect = rect;
 }
 
 /// Stycken som läggs ut tillsammans: ett vanligt stycke, eller alla rader i en tabell.
@@ -1579,6 +1670,19 @@ struct Para {
     ppx: f32,
     /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
     empty_h: Option<f32>,
+    /// Öppningsraden till en förankrad textruta med omflöde (`<!--k:tb N …-->`): rutans stycken ligger ovanpå
+    /// texten bredvid (`relayout`).
+    tbox: Option<TBox>,
+    /// Stängningsraden till en sådan ruta.
+    tbox_end: bool,
+}
+
+/// En förankrad textruta ur öppningsraden: ankare, bredd och fast höjd (px vid 100 %).
+#[derive(Debug, Clone, Copy)]
+struct TBox {
+    anchor: Anchor,
+    w: f32,
+    h: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1643,6 +1747,13 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let is_tag = ep.is_none()
             && (t.starts_with("<div") || t.starts_with("</div") || t.starts_with("<!--"))
             && ps.iter().all(|pc| pc.markup || body(pc).trim().is_empty());
+        let shown_tag = is_tag && !intersects(&range, &p.reveal);
+        let tbox = if shown_tag {
+            crate::docx_tbox::parse_head(t).and_then(|(_, h)| h.anchor.filter(|a| a.wrap != Wrap::TopBottom).map(|anchor| TBox { anchor, w: h.w, h: h.h }))
+        } else {
+            None
+        };
+        let tbox_end = shown_tag && t == crate::docx_tbox::CLOSE;
         tag.push(if !is_tag || intersects(&range, &p.reveal) {
             0
         } else if t.starts_with("</div") || t == crate::docx_tbox::CLOSE {
@@ -1734,6 +1845,8 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             hang: 0.0,
             ppx: 0.0,
             empty_h: ep.as_ref().map(|(_, h)| *h),
+            tbox,
+            tbox_end,
         });
         if e >= text.len() {
             break;
@@ -1758,6 +1871,25 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
         let after_open = i > 0 && tag[i - 1] == 1;
         let before_close = tag.get(i + 1) == Some(&2);
         out[i].collapse = after_open || before_close;
+    }
+    // En ruta utan stängningsrad är vanlig text.
+    let mut open: Option<usize> = None;
+    for i in 0..out.len() {
+        if out[i].tbox.is_some() {
+            if let Some(o) = open.replace(i) {
+                out[o].tbox = None;
+            }
+        } else if out[i].tbox_end {
+            if open.take().is_none() {
+                out[i].tbox_end = false;
+            } else if let Some(next) = out.get_mut(i + 1).filter(|q| q.range.is_empty()) {
+                // Blankraden efter en flytande ruta: rutan tar ingen plats i flödet, så den behövs inte.
+                next.collapse = true;
+            }
+        }
+    }
+    if let Some(o) = open {
+        out[o].tbox = None;
     }
     empty_looks(text, &mut out);
     apply_looks(text, &mut out, &before0, &after, p.zoom);

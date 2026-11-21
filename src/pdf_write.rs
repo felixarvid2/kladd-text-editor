@@ -207,6 +207,9 @@ enum Block {
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
     ColumnBreak,
     PageBreak,
+    /// Förankrad textruta med omflöde (`<!--k:tb N …-->`) och dess slut: stycken däremellan ritas på rutans läge.
+    TBoxOpen(crate::docx_tbox::Head),
+    TBoxClose,
 }
 
 /// Tar bort `<!--k:N-->` (ogenomskinliga Word-objekt) som aldrig ska skrivas ut.
@@ -553,6 +556,12 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 for line in t.split('\n') {
                     if let Some(pp) = crate::word::pbox::PPr::parse_marker(line.trim()) {
                         *look_cell.borrow_mut() = Some(pp);
+                    } else if let Some((_, head)) = crate::docx_tbox::parse_head(line.trim()).filter(|(_, h)| h.anchor.is_some_and(|a| a.wrap != Wrap::TopBottom)) {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::TBoxOpen(head));
+                    } else if line.trim() == crate::docx_tbox::CLOSE {
+                        flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
+                        blocks.push(Block::TBoxClose);
                     }
                 }
                 let t = strip_markers(&t);
@@ -675,6 +684,19 @@ enum Op {
     Goto { x: f32, y: f32, w: f32, h: f32, page: usize, to_y: f32 },
 }
 
+impl Op {
+    /// Flyttar operationen `dy` pt nedåt (en textruta som läggs på sitt läge).
+    fn shift_y(&mut self, dy: f32) {
+        match self {
+            Op::Text { y, .. } | Op::Rect { y, .. } | Op::Math { y, .. } | Op::Image { y, .. } | Op::Link { y, .. } | Op::Goto { y, .. } => *y += dy,
+            Op::Line { y1, y2, .. } => {
+                *y1 += dy;
+                *y2 += dy;
+            }
+        }
+    }
+}
+
 /// Sidans mått (pt): bredd, höjd, marginaler och textytans vänsterkant och bredd (alla spalter).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PageGeom {
@@ -761,6 +783,8 @@ struct Layout<'a> {
     in_notes: bool,
     /// Flytande bilder som texten flyter runt just nu.
     floats: Vec<FloatBox>,
+    /// Rutans fasta underkant (pt) medan en textruta med fast höjd ritas.
+    box_min: Option<f32>,
     /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
     /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
     toc_entries: Vec<(u8, String)>,
@@ -920,6 +944,7 @@ impl<'a> Layout<'a> {
             reserved: 0.0,
             in_notes: false,
             floats: Vec::new(),
+            box_min: None,
             toc_entries: Vec::new(),
             toc_pos: Vec::new(),
         }
@@ -1697,6 +1722,60 @@ impl<'a> Layout<'a> {
         self.floats.push(FloatBox { side, full, w: rw, page, top, bottom });
     }
 
+    /// Förankrad textruta: stycknen ritas som vanliga ramstycken, flyttas till rutans läge (som en förankrad bild)
+    /// och texten efter dem flyter runt rutan. `inner` är blocken mellan rutans öppnings- och slutrad.
+    fn tbox(&mut self, head: &crate::docx_tbox::Head, inner: &[Block]) {
+        let Some(an) = head.anchor else { return self.run(inner) };
+        let a = an.scaled(0.75);
+        let (w, h) = (head.w * 0.75, head.h * 0.75);
+        let ctx = PageCtx {
+            page_w: self.pw,
+            page_h: self.ph,
+            margin: [self.mt, (self.pw - self.text_l - self.text_w).max(0.0), self.mb, self.text_l],
+            col_left: self.ml,
+            col_w: self.cw,
+        };
+        if a.wrap.affects_text() && matches!(a.y_at(h, &ctx), VAt::Para(_)) {
+            self.ensure(h.min(self.ph * 0.5).max(self.body * 2.0));
+        }
+        let (y0, page, at) = (self.y, self.pages.len() - 1, self.page().ops.len());
+        self.box_min = (h > 1.0).then_some(y0 + h);
+        self.run(inner);
+        self.box_min = None;
+        let same_page = self.pages.len() - 1 == page;
+        let used = if same_page { (self.y - y0).max(0.0) } else { h };
+        let full_h = h.max(used);
+        let top = match a.y_at(full_h, &ctx) {
+            VAt::Para(o) => y0 + o.max(0.0),
+            VAt::Page(py) => py,
+        };
+        if same_page {
+            let behind = a.wrap == Wrap::Behind;
+            let ops = &mut self.pages[page].ops;
+            let mut moved: Vec<Op> = ops.drain(at.min(ops.len())..).collect();
+            moved.iter_mut().for_each(|o| o.shift_y(top - y0));
+            if behind {
+                ops.splice(0..0, moved);
+            } else {
+                ops.extend(moved);
+            }
+        }
+        self.y = y0;
+        if !a.wrap.affects_text() {
+            return;
+        }
+        let x = self.ml + a.x_in_column(w, &ctx);
+        let (side, rw, full) = match crate::word::anchor::reserve(&a, x - self.ml, w, self.cw) {
+            Reserve::Left(r) => (Float::Left, r, false),
+            Reserve::Right(r) => (Float::Right, r, false),
+            Reserve::Full => (Float::Left, 0.0, true),
+        };
+        let full = full || self.cw - rw < FLOAT_MIN_ROOM;
+        // Raden som delvis ligger över rutans överkant flyter också runt den.
+        let ftop = top - a.dist[0] - self.body * 1.1;
+        self.floats.push(FloatBox { side, full, w: rw, page, top: ftop, bottom: top + full_h + a.dist[2] });
+    }
+
     fn table(&mut self, rows: &[Vec<Vec<Span>>], spans: &[Vec<usize>], weights: Option<&[usize]>, fmt: Option<&crate::word::tablefmt::TableFmt>) {
         use crate::word::tablefmt::{BOTTOM, LEFT, RIGHT, TAlign, TOP, VAlign, Width};
         self.clear_floats();
@@ -1913,6 +1992,7 @@ impl<'a> Layout<'a> {
     fn paint_box(&mut self, l: &crate::word::pbox::PPr, x: f32, w: f32, ops_at: Option<usize>, top: f32, first: bool, last: bool, same_page: bool) {
         // Luften under sista stycket, och avståndet fram till nästa stycke i samma ruta fylls också.
         let bottom = self.y + if last { l.pad_bottom() } else { PARA_GAP };
+        let bottom = if last { bottom.max(self.box_min.unwrap_or(0.0)) } else { bottom };
         let start = if same_page { top - if first { l.pad_top() } else { 0.0 } } else { self.rt };
         let h = (bottom - start).max(1.0);
         let col = |c: Option<[u8; 3]>| c.map_or(INK, |c| (c[0], c[1], c[2]));
@@ -1950,9 +2030,19 @@ impl<'a> Layout<'a> {
     }
 
     fn run(&mut self, blocks: &[Block]) {
+        let mut skip_to = 0;
         for (bi, b) in blocks.iter().enumerate() {
+            if bi < skip_to {
+                continue;
+            }
             self.align = Align::Left;
             match b {
+                Block::TBoxOpen(head) => {
+                    let end = blocks[bi + 1..].iter().position(|b| matches!(b, Block::TBoxClose)).map_or(blocks.len(), |i| bi + 1 + i);
+                    self.tbox(head, &blocks[bi + 1..end]);
+                    skip_to = end + 1;
+                }
+                Block::TBoxClose => {}
                 Block::Heading(level, spans, align) => {
                     self.align = *align;
                     let hb = self.head_face();
@@ -2460,6 +2550,26 @@ mod tests {
         assert!((fills[0].1 - 200.0).abs() < 0.5);
         assert!(rects.iter().filter(|r| r.2 == (0x11, 0x22, 0x33)).count() >= 6, "{rects:?}");
         assert!(ops.iter().all(|o| !matches!(o, Op::Text { text, .. } if text.contains("k:tb") || text.contains("k:pp"))));
+    }
+
+    #[test]
+    fn anchored_text_box_floats_and_text_wraps_around_it() {
+        let pp = "<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\" fr=\"w=120 x=end pl=8 pr=8 h=100\"-->";
+        let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam.";
+        let md = format!("Före\n\n<!--k:tb 1 w=\"160\" h=\"133.3\" x=\"right\" y=\"0\"-->\n\nRutan{pp}\n\n<!--k:/tb-->\n\n{lorem}\n\n{lorem}\n");
+        let (lay, _) = laid_out(&md, &|_| None);
+        let ops = &lay.pages[0].ops;
+        let t = texts(ops);
+        let (bx, by, _) = t.iter().find(|(_, _, s)| s.contains("Rutan")).unwrap().clone();
+        let (_, ly, _) = t.iter().find(|(_, _, s)| s.contains("Lorem")).unwrap().clone();
+        // Rutans text ligger vid högerkanten, på höjd med första textraden (inte under den).
+        assert!(bx > lay.ml + lay.cw - 130.0, "{bx}");
+        assert!((by - ly).abs() < 30.0, "{by} {ly}");
+        // Texten bredvid slutar före rutan (120 pt + luft); fyllningen har den fasta höjden 100 pt.
+        let near: Vec<_> = t.iter().filter(|(x, y, _)| *y < by + 60.0 && *y > ly - 1.0 && *x < lay.ml + 5.0).collect();
+        assert!(!near.is_empty());
+        let fill = ops.iter().find_map(|o| if let Op::Rect { h, color: (0xFF, 0xF2, 0xCC), .. } = o { Some(*h) } else { None }).unwrap();
+        assert!(fill >= 99.0, "{fill}");
     }
 
     #[test]
