@@ -281,14 +281,19 @@ jobs:
       - name: Skapa .dmg
         run: |
           ln -s /Applications dist/dmg/Applications
-          # hdiutil på GitHubs macOS-maskiner svarar ibland "Resource busy" (t.ex. medan Spotlight
-          # indexerar den nybyggda appen). Försök igen några gånger innan steget ger upp.
+          # hdiutil uppskattar ibland för liten storlek för -srcfolder ("No space left on device"
+          # när programfilen kopieras in), så storleken anges: appen plus 30 % och 20 MB.
+          size_mb=$(( $(du -sm dist/dmg/Kladd.app | cut -f1) * 13 / 10 + 20 ))
+          echo "Skivavbildens storlek: ${size_mb} MB"
+          # På GitHubs macOS-maskiner svarar hdiutil också ibland "Resource busy" (t.ex. medan
+          # Spotlight indexerar den nybyggda appen). Försök igen några gånger innan steget ger upp.
           for n in 1 2 3 4 5; do
-            if hdiutil create -volname Kladd -srcfolder dist/dmg -ov -format UDZO \
+            if hdiutil create -volname Kladd -srcfolder dist/dmg -size "${size_mb}m" -ov -format UDZO \
               "dist/Kladd-${VERSION}-macos-universal.dmg"; then
               break
             fi
             if [ "$n" = 5 ]; then exit 1; fi
+            hdiutil detach /Volumes/Kladd -force 2>/dev/null || true
             echo "hdiutil misslyckades (försök $n), försöker igen om 10 s"
             sleep 10
           done
