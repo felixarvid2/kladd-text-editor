@@ -334,3 +334,27 @@ fn column_balance_no_keeps_the_columns_unbalanced_in_the_pdf() {
     let right = l.text_l + l.text_w / 2.0;
     assert!(texts(&l.pages[0].ops).iter().filter(|t| t.2 != "Slut").all(|t| t.0 < right), "bara spalt 1 fylls");
 }
+
+/// Ruta mitt i en smal spalt där inget ryms bredvid: texten hoppar förbi rutan (ritas inte över den).
+fn skipped_past_box(prefix: &str, w_px: u32, x_px: u32) {
+    let pp = format!("<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\" fr=\"w={} x={} pl=8 pr=8 h=75\"-->", w_px * 3 / 4, x_px * 3 / 4);
+    let md = format!("{prefix}Före\n\n<!--k:tb 1 w=\"{w_px}\" h=\"100\" x=\"{x_px}\" y=\"0\"-->\n\nRutan{pp}\n\n<!--k:/tb-->\n\n{}", filler(3));
+    let l = lay(&md);
+    let t = texts(&l.pages[0].ops);
+    let (bx, by, _) = t.iter().find(|t| t.2.contains("Rutan")).unwrap().clone();
+    let first = t.iter().filter(|t| t.2.starts_with("Stycke")).map(|t| t.1).fold(f32::INFINITY, f32::min);
+    // Rutan är 100 px = 75 pt hög (texten i rutan börjar vid överkanten); första brödtextraden ligger under den.
+    assert!(first > by + 60.0, "text y {first} ruta y {by} x {bx}");
+    // Ingen brödtextrad vid rutans höjd.
+    assert!(t.iter().filter(|t| t.2.starts_with("Stycke") && t.1 < by + 60.0 && t.1 > by - 10.0).count() == 0, "{t:?}");
+}
+
+#[test]
+fn text_jumps_past_a_box_in_a_narrow_column() {
+    skipped_past_box("<!-- kladd: avsnitt; columns: 2 -->\n\n", 160, 40);
+}
+
+#[test]
+fn text_jumps_past_a_box_in_a_single_column() {
+    skipped_past_box("", 480, 20);
+}

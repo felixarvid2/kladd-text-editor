@@ -187,6 +187,24 @@ fn text_flyter_runt_eller_hoppar_forbi_ruta_var_som_helst_i_spalten() {
 }
 
 #[test]
+fn ruta_dragen_ut_over_spaltens_kant_stammer_med_ritningen() {
+    // Ritningen kläms till spalten (x 0..250 för en 150 px bred ruta i 400 px); layouten gör likadant.
+    for x in [-40.0, 300.0, 400.0] {
+        let t = dragged(&doc("x=\"right\" y=\"0\""), x, 0.0);
+        let g = lay(&t, 400.0, None);
+        let boxr = &g.rows[first_row(&g, 'R')];
+        let want = x.clamp(0.0, 250.0) + 5.0;
+        assert!((boxr.pos.x - want).abs() < 1.5, "x={x}: ruta x {} väntade {want}", boxr.pos.x);
+        check_no_overlap(&g, 5.0, 150.0, 65.0, &format!("x={x}"));
+        // Till höger om rutan (x=300 kläms till 250) finns ingen plats: texten ligger vänster om den.
+        let first_text = &g.rows[first_row(&g, 'L')];
+        if x >= 250.0 {
+            assert!(row_end(&g, first_row(&g, 'L')) <= want - 5.0 - 12.0 + 0.5 || first_text.pos.y > boxr.pos.y + 60.0, "x={x}");
+        }
+    }
+}
+
+#[test]
 fn ruta_mitt_i_spalten_med_sidor_flyter_likadant() {
     let a = markup::analyze("");
     let geom = pages::Geom::new(1.0, &a.defaults);

@@ -10,7 +10,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ### Rättat
 
-- **Text flyter nu alltid runt (eller hoppar förbi) en dragen textruta.** Dras en ruta in mot mitten av en spalt, där det inte finns plats bredvid den på någon sida, ritades texten förut över rutan i dokumentläget: hoppet förbi rutan förbrukades av den dolda taggraden (`<div>`) före stycket och gick förlorat vid spaltindelningen. Hoppet läggs nu på första synliga stycket och bevaras av sidbrytningen i dokument med spalter. En ruta som dragits (`x`, `y`, ny storlek) och sparas i ett nytt `.docx` behåller dessutom läge, omflöde och avstånd (förut föll `y` och omflödet bort).
+- **Text flyter nu alltid runt (eller hoppar förbi) en dragen textruta.** Dras en ruta in mot mitten av en spalt, där det inte finns plats bredvid den på någon sida, ritades texten förut över rutan i dokumentläget: hoppet förbi rutan förbrukades av den dolda taggraden (`<div>`) före stycket och gick förlorat vid spaltindelningen. Hoppet läggs nu på första synliga stycket och bevaras av sidbrytningen i dokument med spalter. En ruta som dragits (`x`, `y`, ny storlek) och sparas i ett nytt `.docx` behåller dessutom läge, omflöde och avstånd (förut föll `y` och omflödet bort). En ruta dragen ut över spaltens kant ritas inom spalten, och texten flyter nu runt den där den syns (layouten använder samma kant som ritningen).
 
 ## [2.5.0] – 2026-11-21
 
