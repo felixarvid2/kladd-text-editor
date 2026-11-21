@@ -727,9 +727,12 @@ Ett avsnitt börjar vid en egen rad i Markdown-dialekten (en HTML-kommentar, som
   `style:column` med `style:rel-width` (andel av textytan inklusive utfyllnad, skrivs i twips) och
   `fo:start-padding`/`fo:end-padding` (LibreOffice: `fo:start-indent`/`fo:end-indent`; lika andelar är lika breda
   spalter), och `style:column-sep` (skrivs före spalterna). PDF: x och bredd per spalt, linjerna ritas med sidan.
-  Layout: vid olika bredder balanseras inte spalterna, och `ColSim` (secpages.rs) följer spaltfyllnaden så att varje
+  Layout: `ColSim` (secpages.rs) följer spaltfyllnaden så att varje
   stycke läggs ut i sin spalts bredd (ett stycke som byter spalt får den smalare spaltens bredd).
   Spalter jämnas ut på avsnittets sista sida när ett löpande avsnitt följer, som i Word och LibreOffice.
+  `column-balance: no` stänger av det för avsnittet (`SectionProps::no_balance`, i dokumentläget `SecGeom::no_balance`, i PDF
+  `Layout::no_balance`). Odt: `text:dont-balance-text-columns="true"` på sektionsstilen läses som markören och skrivs bara
+  tillbaka för den (`ColsDef::no_balance`, `open_columns`); olika breda spalter skrivs med `false` eftersom Kladd jämnar ut dem.
 - **Egenskaper som saknas ärver dokumentets grundformat**, inte föregående avsnitt. Ett avsnitt utan egenskaper
   är alltså "tillbaka till grundformatet".
 - En avsnittsrad som står före all text (bara tomma rader och grundformatraden före) gäller **första avsnittet**
@@ -828,8 +831,17 @@ ODT sparas inte förlustfritt, så markören följer med bara så långt `render
 rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_page` går till nästa spalt innan en
 ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
 ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Texten bryts i bredden för
-spalten den hamnar i (`text_block` räknar om bredden när den går till nästa spalt). Skillnad mot dokumentläget:
-spalterna före ett löpande byte jämnas **inte** ut i PDF:en.
+spalten den hamnar i (`text_block` räknar om bredden när den går till nästa spalt). Spalterna på avsnittets
+sista sida före ett löpande byte jämnas ut (`balance_columns`): `lay_out` lägger ut hela dokumentet, och för varje byte
+(`SecEnd`, noterat i `section_break`) söks lägsta spalthöjd där allt ryms kvar på sidan (start vid innehållets yta
+delad på spaltbredden, växande steg, sedan halvering; varje försök är en ny utläggning med `Layout::balance`). `room_end`
+ger nedre gränsen i `ensure`, fotnotskontrollen och kodrutor. Raderna bryts i varje spalts bredd (lika eller olika
+bredd), skiljelinjerna följer den högsta spalten, och fotnoter fungerar som förut. En manuell spaltbrytning
+(`manual_col`) på sidan stänger av utjämningen (som i Word), och inget jämnas ut sist i dokumentet utan löpande byte.
+Ett `text:section` med spalter i en `.odt` läses som ett avsnitt följt av en löpande avsnittsrad som återställer
+(`odt.rs`, `text:section`), också när det står sist i dokumentet, så LibreOffices utjämning av det sista avsnittet
+följs i både PDF och dokumentläget (secpages.rs `Balance`); spalter från sidmallen (och `.docx`) har ingen sådan rad
+och jämnas inte ut sist. Skrivningen ger `text:section` tillbaka (`open_columns`/`close_text_section`).
 
 ## Ekvationer (`src/math/`)
 

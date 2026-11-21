@@ -1,5 +1,6 @@
 //! Tester för textrutor i Word: läsning, orörd sparning och ändrad text (`docx_tbox`).
 use super::*;
+use crate::word::anchor::Pos;
 
 const NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml""#;
 
@@ -175,4 +176,39 @@ fn set_geometry_updates_vml_style() {
     assert!(y.contains("width:150pt") && y.contains("margin-left:30pt") && y.contains("mso-position-horizontal-relative:text"), "{y}");
     // Oförändrat: orört.
     assert_eq!(docx_tbox::set_geometry(x, &old, &old), x);
+}
+
+/// Flyttar rutan i texten som dragning i dokumentläget gör (`tboxui`): nytt `x`/`y` från spaltens vänsterkant och styckets överkant.
+fn drag_box(md: &str, x: f32, y: f32) -> String {
+    use crate::word::{anchor::Pos, tboxui};
+    let o = md.find("<!--k:tb").unwrap();
+    let open = o..md[o..].find("-->").unwrap() + o + 3;
+    let mut head = docx_tbox::parse_head(&md[open.clone()]).unwrap().1;
+    let mut a = head.anchor.unwrap_or_default();
+    (a.h, a.v) = (Pos::Off(x), Pos::Off(y));
+    head.anchor = Some(a);
+    tboxui::apply(md, &tboxui::Change { open, head, x_pt: Some(x * 0.75) }).unwrap()
+}
+
+fn box_pos(md: &str) -> (Pos, Pos, f32, f32) {
+    let o = md.find("<!--k:tb").unwrap();
+    let h = docx_tbox::parse_head(&md[o..o + md[o..].find("-->").unwrap() + 3]).unwrap().1;
+    let a = h.anchor.unwrap();
+    (a.h, a.v, h.w, h.h)
+}
+
+#[test]
+fn dragged_box_is_saved_and_read_back_at_the_same_place() {
+    let l = read(&doc()).unwrap();
+    let md = drag_box(&l.markdown, 73.5, 21.0);
+    // Både med originalpaketet (läget skrivs in i originalets XML) och som nytt dokument.
+    for source in [l.source.as_ref(), None] {
+        let out = write(&md, "x", &|_| None, source).unwrap().bytes;
+        let back = read(&out).unwrap();
+        let (h, v, w, hh) = box_pos(&back.markdown);
+        let (_, _, w0, h0h) = box_pos(&md);
+        assert_eq!((h, v), (Pos::Off(73.5), Pos::Off(21.0)), "{}", back.markdown);
+        assert!((w - w0).abs() < 0.6 && (hh - h0h).abs() < 0.6, "{w}x{hh} mot {w0}x{h0h}");
+        assert!(back.markdown.contains("**Faktaruta**") && back.markdown.contains("Text i rutan"));
+    }
 }

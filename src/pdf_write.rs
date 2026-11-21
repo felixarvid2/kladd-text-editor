@@ -767,6 +767,15 @@ struct Layout<'a> {
     rt: f32,
     /// Längsta y som använts i spalter som lämnats på sidan (för löpande avsnitt).
     page_ymax: f32,
+    /// Utjämning av spalterna på avsnittets sista sida före ett löpande byte: spalthöjd (pt från
+    /// spalternas överkant) per (avsnitt, sida), och uppgifter om varje sådant byte (`SecEnd`).
+    balance: Vec<(usize, usize, f32)>,
+    sec_ends: Vec<SecEnd>,
+    /// Summan av (höjd × bredd) i spalter som lämnats på sidan, och om en manuell spaltbrytning setts.
+    col_area: f32,
+    manual_col: bool,
+    /// Avsnittet jämnar inte ut sina spalter (`column-balance: no`).
+    no_balance: bool,
     /// Räknas upp vid varje spalt- eller sidbyte.
     breaks: usize,
     /// Avsnittet vi står i och om en avsnittsrad redan setts (en rad före all text gäller första avsnittet).
@@ -789,6 +798,23 @@ struct Layout<'a> {
     /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
     toc_entries: Vec<(u8, String)>,
     toc_pos: Vec<(usize, f32)>,
+}
+
+/// Ett löpande avsnittsbyte efter ett flerspaltigt avsnitt: avsnittet, dess sista sida och vad som
+/// behövs för att jämna ut spalterna där (`balance_columns`).
+struct SecEnd {
+    sec: usize,
+    page: usize,
+    /// Spalternas överkant och längsta använda y på sidan.
+    top: f32,
+    bottom: f32,
+    /// Innehållets yta (pt²) och spaltbredden i summa: lägsta möjliga spalthöjd.
+    area: f32,
+    width: f32,
+    /// Manuell spaltbrytning (inget utjämnas, som i Word) eller byte som inte ska jämna ut.
+    skip: bool,
+    /// Radhöjd (pt) att stega med.
+    step: f32,
 }
 
 /// En flytande bild: sida, upptagen bredd (bild + luft), sidan (0-baserad) och understa kanten (pt).
@@ -932,6 +958,11 @@ impl<'a> Layout<'a> {
             text_w: cw,
             col_w: cw,
             col_ws: Vec::new(),
+            balance: Vec::new(),
+            sec_ends: Vec::new(),
+            col_area: 0.0,
+            manual_col: false,
+            no_balance: false,
             rule: false,
             rt: mt,
             page_ymax: 0.0,
@@ -1126,6 +1157,7 @@ impl<'a> Layout<'a> {
     fn new_page(&mut self) {
         if self.cols > 1 && self.col + 1 < self.cols && !self.pages.is_empty() {
             self.page_ymax = self.page_ymax.max(self.y);
+            self.col_area += (self.y - self.rt) * self.col_width(self.col);
             self.col += 1;
             self.ml = self.text_l + self.col_left(self.col);
             self.cw = self.col_width(self.col);
@@ -1134,6 +1166,17 @@ impl<'a> Layout<'a> {
             self.breaks += 1;
         } else {
             self.real_page();
+        }
+    }
+
+    /// Nedre gräns (y) för text i spalten: sidans botten minus fotnoterna, och vid utjämning av
+    /// avsnittets sista sida spalternas överkant plus vald höjd.
+    fn room_end(&self) -> f32 {
+        let end = self.ph - self.mb - self.reserved;
+        let page = self.pages.len().wrapping_sub(1);
+        match self.balance.iter().find(|b| b.0 == self.cur_sec && b.1 == page) {
+            Some(b) if self.cols > 1 => end.min(self.rt + b.2),
+            _ => end,
         }
     }
 
@@ -1178,6 +1221,8 @@ impl<'a> Layout<'a> {
         self.y = self.mt;
         self.rt = self.mt;
         self.page_ymax = 0.0;
+        self.col_area = 0.0;
+        self.manual_col = false;
         self.col = 0;
         self.ml = self.text_l;
         self.cw = self.col_width(0);
@@ -1207,6 +1252,7 @@ impl<'a> Layout<'a> {
             Vec::new()
         };
         self.rule = sec.rule && self.cols > 1;
+        self.no_balance = sec.no_balance;
         self.col = 0;
         self.ml = ml;
         self.cw = self.col_width(0);
@@ -1220,8 +1266,17 @@ impl<'a> Layout<'a> {
             .iter()
             .all(|(a, b)| (a - b).abs() < 0.5);
         if !page_empty {
+            if self.cols > 1 && sec.continuous && same_sheet {
+                let bottom = self.y.max(self.page_ymax);
+                let area = self.col_area + (self.y - self.rt) * self.col_width(self.col);
+                let width: f32 = (0..self.cols).map(|c| self.col_width(c)).sum();
+                let (page, sec_i) = (self.pages.len() - 1, self.cur_sec);
+                self.sec_ends.push(SecEnd { sec: sec_i, page, top: self.rt, bottom, area, width, skip: self.manual_col || self.no_balance, step: self.body * LINE });
+            }
             self.flush_rules();
         }
+        self.manual_col = false;
+        self.col_area = 0.0;
         if !(self.pages.len() <= 1 && page_empty && !self.sec_row_seen) {
             self.cur_sec += 1;
         }
@@ -1244,6 +1299,7 @@ impl<'a> Layout<'a> {
             self.y = y;
             self.rt = y;
             self.page_ymax = 0.0;
+            self.col_area = 0.0;
             self.floats.clear();
             self.breaks += 1;
         } else {
@@ -1254,7 +1310,7 @@ impl<'a> Layout<'a> {
     }
 
     fn ensure(&mut self, h: f32) {
-        if self.y + h + self.reserved > self.ph - self.mb && self.y > self.rt + 0.5 {
+        if self.y + h > self.room_end() && self.y > self.rt + 0.5 {
             self.new_page();
         }
     }
@@ -1472,7 +1528,7 @@ impl<'a> Layout<'a> {
             let mut refs = refs_of(self, &line);
             let line_h0 = line_size(&line, size) * self.line;
             let need0 = self.note_cost(&refs);
-            if need0 > 0.0 && self.y + line_h0 + self.reserved + need0 > self.ph - self.mb && self.y > self.rt + 0.5 {
+            if need0 > 0.0 && self.y + line_h0 + need0 > self.room_end() && self.y > self.rt + 0.5 {
                 self.new_page();
             }
             self.ensure(line_h0);
@@ -1970,7 +2026,7 @@ impl<'a> Layout<'a> {
             self.ensure(line_h + 2.0 * pad);
             let x = self.ml + indent;
             // Så många rader som får plats på sidan.
-            let room = ((self.ph - self.mb - self.reserved - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
+            let room = ((self.room_end() - self.y - 2.0 * pad) / line_h).floor().max(1.0) as usize;
             let chunk = &lines[i..(i + room).min(lines.len())];
             let h = chunk.len() as f32 * line_h + 2.0 * pad;
             let top = self.y;
@@ -2180,7 +2236,10 @@ impl<'a> Layout<'a> {
                 Block::Image { src, alt, indent, size, align, float, place } => self.image(src, alt, *indent, *size, *align, *float, *place),
                 Block::Toc => self.toc(),
                 Block::SectionBreak(props) => self.section_break(props),
-                Block::ColumnBreak => self.new_page(),
+                Block::ColumnBreak => {
+                    self.manual_col = true;
+                    self.new_page();
+                }
                 Block::PageBreak => {
                     // Ny sida (i alla spalter) om den nuvarande har innehåll.
                     let empty = self.pages.last().is_some_and(|p| p.ops.is_empty()) && self.col == 0 && (self.y - self.rt).abs() < 0.5;
@@ -2314,29 +2373,84 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
         })
         .collect();
     let reserve = hf_reserve(blocks, defaults);
-    let mut lay = Layout::new(resolve, defaults);
-    lay.hf_reserve = reserve.clone();
-    lay.toc_entries = toc_entries.clone();
-    lay.notes = notes.to_vec();
-    lay.new_page();
-    lay.run(blocks);
-    lay.flush_rules();
-    lay.flush_notes();
+    let pass = |toc_pos: Vec<(usize, f32)>, balance: &[(usize, usize, f32)]| -> Layout<'a> {
+        let mut lay = Layout::new(resolve, defaults);
+        lay.hf_reserve = reserve.clone();
+        lay.toc_entries = toc_entries.clone();
+        lay.toc_pos = toc_pos;
+        lay.notes = notes.to_vec();
+        lay.balance = balance.to_vec();
+        lay.new_page();
+        lay.run(blocks);
+        lay.flush_rules();
+        lay.flush_notes();
+        lay
+    };
+    let balance = balance_columns(&|b| pass(Vec::new(), b));
+    let mut lay = pass(Vec::new(), &balance);
     if blocks.iter().any(|b| matches!(b, Block::Toc)) {
         let pos: Vec<(usize, f32)> =
             lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
-        let mut second = Layout::new(resolve, defaults);
-        second.hf_reserve = reserve;
-        second.toc_entries = toc_entries;
-        second.toc_pos = pos;
-        second.notes = notes.to_vec();
-        second.new_page();
-        second.run(blocks);
-        second.flush_rules();
-        second.flush_notes();
-        lay = second;
+        lay = pass(pos, &balance);
     }
     lay
+}
+
+/// Jämnar ut spalterna på avsnittets sista sida före varje löpande avsnittsbyte (som Word och
+/// LibreOffice; inte sist i dokumentet och inte när avsnittet har en manuell spaltbrytning på sidan).
+/// `pass` lägger ut hela dokumentet med givna spalthöjder (avsnitt, sida, höjd från spalternas
+/// överkant). Per byte söks lägsta höjd där allt ryms kvar på sidan: först ur ytan delad på spaltbredden,
+/// sedan med växande steg och halvering. Resultatet är höjderna att lägga ut dokumentet med.
+fn balance_columns<'a>(pass: &dyn Fn(&[(usize, usize, f32)]) -> Layout<'a>) -> Vec<(usize, usize, f32)> {
+    let mut fixed: Vec<(usize, usize, f32)> = Vec::new();
+    let mut done: Vec<usize> = Vec::new();
+    let mut lay = pass(&fixed);
+    while let Some(e) = lay.sec_ends.iter().find(|e| !done.contains(&e.sec)) {
+        let (sec, page, top, step) = (e.sec, e.page, e.top, e.step.max(1.0));
+        let full = e.bottom - top;
+        let low = (e.area / e.width.max(1.0)).max(step);
+        let skip = e.skip || low >= full - 0.5;
+        done.push(sec);
+        if skip {
+            continue;
+        }
+        // Ryms allt på sidan med spalthöjden `h`? Då slutar avsnittet på samma sida.
+        let fits = |h: f32| -> Option<Layout<'a>> {
+            let mut b = fixed.clone();
+            b.push((sec, page, h));
+            let l = pass(&b);
+            l.sec_ends.iter().find(|e| e.sec == sec).is_some_and(|e| e.page == page).then_some(l)
+        };
+        let (mut lo, mut hi, mut best) = (low - step * 0.5, full, None);
+        // Växande steg uppåt från den lägsta möjliga höjden, sedan halvering.
+        let mut grow = step;
+        let mut h = low;
+        while h < full - 0.5 {
+            if let Some(l) = fits(h) {
+                best = Some((h, l));
+                hi = h;
+                break;
+            }
+            lo = h;
+            h = (h + grow).min(full);
+            grow *= 2.0;
+        }
+        while best.is_some() && hi - lo > 2.0 {
+            let mid = (lo + hi) / 2.0;
+            match fits(mid) {
+                Some(l) => {
+                    best = Some((mid, l));
+                    hi = mid;
+                }
+                None => lo = mid,
+            }
+        }
+        if let Some((h, l)) = best {
+            fixed.push((sec, page, h));
+            lay = l;
+        }
+    }
+    fixed
 }
 
 /// Bygger en PDF av Markdown-text.

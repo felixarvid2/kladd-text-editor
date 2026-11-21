@@ -68,6 +68,8 @@ pub struct SectionProps {
     pub column_rule: bool,
     /// Börjar på samma sida som föregående avsnitt (annars på en ny sida).
     pub continuous: bool,
+    /// Spalterna jämnas inte ut på avsnittets sista sida (`column-balance: no`, odt `text:dont-balance-text-columns`).
+    pub no_balance: bool,
     /// Egna sidhuvuden och sidfötter, sidnumrering som börjar om (`crate::hf`).
     pub hf: crate::hf::SecHf,
 }
@@ -98,6 +100,9 @@ impl SectionProps {
         if self.continuous {
             parts.push("type: continuous".to_owned());
         }
+        if self.no_balance {
+            parts.push("column-balance: no".to_owned());
+        }
         parts.extend(self.hf.to_parts());
         format!("<!-- kladd: {} -->", parts.join("; "))
     }
@@ -124,6 +129,7 @@ impl SectionProps {
                     p.column_widths = Some(w).filter(|w| w.len() > 1 && w.len() <= MAX_COLUMNS);
                 }
                 "column-rule" => p.column_rule = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "ja" | "1" | "true" | "solid"),
+                "column-balance" => p.no_balance = matches!(v.trim().to_ascii_lowercase().as_str(), "no" | "nej" | "off" | "false" | "0"),
                 "type" => p.continuous = v.trim().eq_ignore_ascii_case("continuous"),
                 k => {
                     p.hf.read_decl(k, &v);
@@ -154,6 +160,8 @@ pub struct Section {
     /// Skiljelinje mellan spalterna.
     pub rule: bool,
     pub continuous: bool,
+    /// Spalterna jämnas inte ut sist på sidan.
+    pub no_balance: bool,
 }
 
 impl Section {
@@ -179,6 +187,7 @@ impl Section {
             col_widths,
             rule: props.column_rule && columns > 1,
             continuous: props.continuous,
+            no_balance: props.no_balance,
         }
     }
 

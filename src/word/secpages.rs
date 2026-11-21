@@ -40,6 +40,8 @@ pub struct SecGeom {
     pub rule: bool,
     /// Börjar på samma sida som föregående avsnitt (om sidorna är lika stora).
     pub continuous: bool,
+    /// Spalterna jämnas inte ut på avsnittets sista ark.
+    pub no_balance: bool,
 }
 
 impl SecGeom {
@@ -76,6 +78,7 @@ impl SecGeom {
             col_ws,
             rule: s.rule,
             continuous: s.continuous,
+            no_balance: s.no_balance,
         }
     }
 
@@ -100,6 +103,7 @@ impl SecGeom {
             w.to_bits().hash(h);
         }
         self.continuous.hash(h);
+        self.no_balance.hash(h);
     }
 }
 
@@ -168,6 +172,7 @@ impl Geom {
                 col_ws: Vec::new(),
                 rule: false,
                 continuous: false,
+                no_balance: false,
             },
         }
     }
@@ -186,7 +191,7 @@ impl Geom {
     /// spalterna ut på avsnittets sista ark (se `layout::relayout`).
     pub fn balance_candidate(&self, i: usize) -> bool {
         let (a, b) = (self.sec(i), self.secs.get(i + 1));
-        !a.col_ws.is_empty() && b.is_some_and(|b| b.continuous && b.same_sheet(&a))
+        !a.no_balance && !a.col_ws.is_empty() && b.is_some_and(|b| b.continuous && b.same_sheet(&a))
     }
 
     /// Bredaste arket.
@@ -616,6 +621,9 @@ pub fn paginate_sections(
     // Rutor med omflöde (`overlay`): raderna ligger ovanpå texten och tar ingen plats; de placeras när raden
     // efter dem (`pending.end`) har fått sitt läge, med samma avstånd till den som de hade i layouten.
     let mut pending: Option<Range<usize>> = None;
+    // Underkanten (i layoutens egna koordinater) på raden/gruppen som placerades senast: ett avstånd som layouten
+    // lagt in mellan två rader (en ruta eller bild över hela bredden som texten hoppar förbi) bevaras.
+    let mut prev_raw = f32::NEG_INFINITY;
     let mut i = 0;
     while i < n_rows {
         while next_ov < overlay.len() && overlay[next_ov].start < i {
@@ -640,6 +648,7 @@ pub fn paginate_sections(
             y1 = y1.max(pr.pos.y + pr.row.size.y);
         }
         let h = y1 - y0;
+        let skip = |col_y: f32, region_top: f32| if col_y > region_top + eps && prev_raw.is_finite() { (y0 - prev_raw).max(0.0) } else { 0.0 };
         let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
         let sec = row_sec.get(i).map_or(0, |s| *s as usize);
 
@@ -647,13 +656,13 @@ pub fn paginate_sections(
         if sec != cur_sec {
             let ng = geom.sec(sec);
             let same = boxes.last().is_some_and(|b| {
-                let cmp = SecGeom { cols: 1, col_w: 0.0, gap: 0.0, col_ws: Vec::new(), rule: false, continuous: false, page_w: b.w, page_h: b.h, top: b.margin[0], right: b.margin[1], bottom: b.margin[2], left: b.margin[3] };
+                let cmp = SecGeom { cols: 1, col_w: 0.0, gap: 0.0, col_ws: Vec::new(), rule: false, continuous: false, no_balance: false, page_w: b.w, page_h: b.h, top: b.margin[0], right: b.margin[1], bottom: b.margin[2], left: b.margin[3] };
                 ng.same_sheet(&cmp)
             });
             if ng.continuous && same && cur_sec != usize::MAX {
                 // Föregående avsnitts spalter jämnas ut på sista sidan (som Word och LibreOffice gör vid ett
                 // löpande avsnittsbyte); `units` innehåller bara den sidans stycken.
-                if sg.cols > 1 && sg.col_ws.is_empty() && !units.is_empty() {
+                if sg.cols > 1 && sg.col_ws.is_empty() && !sg.no_balance && !units.is_empty() {
                     let hs: Vec<f32> = units.iter().map(|u| u.h).collect();
                     let cap = balanced_height(&hs, sg.cols);
                     let (mut c, mut y) = (0usize, region_top);
@@ -744,7 +753,7 @@ pub fn paginate_sections(
                     }
                 }
                 let limit = text_bottom - flow.reserved() - extra;
-                let no_room = col_y + h.max(fh) > limit + eps && col_y > region_top + eps;
+                let no_room = col_y + skip(col_y, region_top) + h.max(fh) > limit + eps && col_y > region_top + eps;
                 let overlaps = extra > 0.0 && page_bottom > limit + eps && page_bottom > region_top + eps;
                 if !(no_room || overlaps) || guard >= 8 {
                     break;
@@ -758,7 +767,7 @@ pub fn paginate_sections(
         flow.commit(new, extra);
         let _ = region_page;
 
-        let top = round(col_y);
+        let top = round(col_y + skip(col_y, region_top));
         let dy = top - y0;
         let cx = col_x(&boxes, &sg, col);
         if let Some(ov) = pending.take().filter(|o| o.end == i) {
@@ -775,6 +784,7 @@ pub fn paginate_sections(
             dx[i + k] = cx;
         }
         units.push(Unit { rows: i..end, top, col, h });
+        prev_raw = y1;
         col_y = top + h;
         prev_bottom = prev_bottom.max(col_y).max(if fh > 0.0 { top + fh } else { f32::NEG_INFINITY });
         page_bottom = page_bottom.max(col_y);

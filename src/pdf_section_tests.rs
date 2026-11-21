@@ -175,3 +175,186 @@ fn paragraph_flowing_into_a_narrower_column_wraps_at_that_columns_width() {
     assert!((chars.1 as f32) < chars.0 as f32 * (w1 / w0) * 1.4, "{chars:?} {w0} {w1}");
     assert!(chars.0 as f32 > (w1 / 0.5) * 0.0 + 60.0, "{chars:?}");
 }
+
+fn lay_bal(md: &str) -> Layout<'static> {
+    let (blocks, notes) = parse_blocks_notes(md);
+    let defaults = doc_defaults(md);
+    let resolve: &'static dyn Fn(&str) -> Option<DocImage> = &|_| None;
+    lay_out(&blocks, &notes, &defaults, resolve)
+}
+
+/// Understa textraden (y) per spalt på sidan, för text som börjar efter `after_y`, med spaltens x som gräns.
+fn col_bottoms(l: &Layout, page: usize, xs: &[f32], after: &str) -> Vec<f32> {
+    let t = texts(&l.pages[page].ops);
+    let top = t.iter().find(|t| t.2.contains(after)).map_or(0.0, |t| t.1);
+    let mut out = vec![0.0f32; xs.len()];
+    for (x, y, s) in &t {
+        if *y <= top || s.contains("Slut") {
+            continue;
+        }
+        let c = xs.iter().rposition(|cx| *x >= *cx - 1.0).unwrap_or(0);
+        out[c] = out[c].max(*y);
+    }
+    out
+}
+
+fn col_xs(l: &Layout) -> Vec<f32> {
+    (0..l.cols).map(|c| l.text_l + l.col_left(c)).collect()
+}
+
+fn balanced_doc(cols: &str, n: usize) -> String {
+    format!("Rubrik\n\n<!-- kladd: avsnitt; columns: {cols}; type: continuous -->\n\n{}<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n", filler(n))
+}
+
+#[test]
+fn two_equal_columns_are_balanced_before_a_continuous_section() {
+    let l = lay_bal(&balanced_doc("2", 6));
+    assert_eq!(l.pages.len(), 1);
+    let mut probe = lay_bal("<!-- kladd: avsnitt; columns: 2 -->\n\nx\n");
+    probe.cols = 2;
+    let xs = col_xs(&probe);
+    let b = col_bottoms(&l, 0, &xs, "Rubrik");
+    let line = l.body * LINE;
+    assert!(b[0] > 0.0 && b[1] > 0.0, "{b:?}");
+    assert!((b[0] - b[1]).abs() <= line * 1.01, "{b:?}");
+    // Slutavsnittet börjar under den högsta spalten.
+    let t = texts(&l.pages[0].ops);
+    let slut = t.iter().find(|t| t.2 == "Slut").unwrap();
+    assert!(slut.1 > b[0].max(b[1]), "{slut:?} {b:?}");
+    // Utan balansering fylls bara första spalten: spalt 2 är tom.
+    let raw = lay(&balanced_doc("2", 6));
+    let br = col_bottoms(&raw, 0, &xs, "Rubrik");
+    assert!(br[1] == 0.0 || (br[0] - br[1]).abs() > line * 3.0, "{br:?}");
+}
+
+#[test]
+fn three_equal_columns_are_balanced() {
+    let l = lay_bal(&balanced_doc("3", 9));
+    assert_eq!(l.pages.len(), 1);
+    let mut probe = lay_bal("<!-- kladd: avsnitt; columns: 3 -->\n\nx\n");
+    probe.cols = 3;
+    let xs = col_xs(&probe);
+    let b = col_bottoms(&l, 0, &xs, "Rubrik");
+    let line = l.body * LINE;
+    let (lo, hi) = (b.iter().cloned().fold(f32::MAX, f32::min), b.iter().cloned().fold(0.0, f32::max));
+    assert!(lo > 0.0 && hi - lo <= line * 1.01, "{b:?}");
+}
+
+#[test]
+fn unequal_columns_are_balanced_in_their_own_widths() {
+    let md = format!(
+        "Rubrik\n\n<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 50mm 110mm; column-rule: yes; type: continuous -->\n\n{}<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n",
+        filler(6)
+    );
+    let l = lay_bal(&md);
+    assert_eq!(l.pages.len(), 1);
+    let gap = 10.0 * 72.0 / 25.4;
+    let w0 = (l.text_w - gap) * 50.0 / 160.0;
+    let xs = vec![l.text_l, l.text_l + w0 + gap];
+    let b = col_bottoms(&l, 0, &xs, "Rubrik");
+    assert!(b[0] > 0.0 && b[1] > 0.0, "{b:?}");
+    assert!((b[0] - b[1]).abs() <= l.body * LINE * 1.01 * 2.0, "{b:?}");
+    // Skiljelinjen går lika långt ned som den högsta spalten.
+    let rule_end = l.pages[0].ops.iter().filter_map(|o| match o { Op::Line { x1, x2, y2, .. } if (x1 - x2).abs() < 0.01 => Some(*y2), _ => None }).fold(0.0, f32::max);
+    assert!(rule_end >= b[0].max(b[1]) && rule_end < b[0].max(b[1]) + l.body * LINE * 1.5, "{rule_end} {b:?}");
+    let slut = texts(&l.pages[0].ops).into_iter().find(|t| t.2 == "Slut").unwrap();
+    assert!(slut.1 > rule_end - 1.0, "{slut:?} {rule_end}");
+}
+
+#[test]
+fn a_manual_column_break_stops_the_balancing() {
+    let md = "Rubrik\n\n<!-- kladd: avsnitt; columns: 2; type: continuous -->\n\nEtt\n\nTvå\n\nTre\n\n<!-- kladd: spaltbrytning -->\n\nFyra\n\n<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n";
+    let l = lay_bal(md);
+    let t = texts(&l.pages[0].ops);
+    let at = |s: &str| t.iter().find(|t| t.2 == s).unwrap().clone();
+    let (ett, tre, fyra) = (at("Ett"), at("Tre"), at("Fyra"));
+    // Spalt 1 har tre stycken, spalt 2 ett: oförändrat.
+    assert!(tre.0 < fyra.0 && (ett.1 - fyra.1).abs() < 1.0 && tre.1 > ett.1 + 20.0, "{ett:?} {tre:?} {fyra:?}");
+}
+
+#[test]
+fn only_the_last_page_of_a_multi_page_section_is_balanced() {
+    let l = lay_bal(&balanced_doc("2", 60));
+    assert!(l.pages.len() >= 2);
+    let last = l.pages.len() - 1;
+    // Första sidan är full i båda spalterna.
+    let g = l.pages[0].geom;
+    let t = texts(&l.pages[0].ops);
+    let max_y = t.iter().map(|t| t.1).fold(0.0, f32::max);
+    assert!(max_y > g.ph - g.mb - 40.0, "{max_y}");
+    let mut probe = lay_bal("<!-- kladd: avsnitt; columns: 2 -->\n\nx\n");
+    probe.cols = 2;
+    let xs = col_xs(&probe);
+    let first = col_bottoms(&l, 0, &xs, "Rubrik");
+    assert!(first[0] > g.ph - g.mb - 40.0 && first[1] > g.ph - g.mb - 40.0, "{first:?}");
+    // Sista sidan: jämn och med slutavsnittet under.
+    let b = col_bottoms(&l, last, &xs, "zzz");
+    assert!(b[0] > 0.0 && b[1] > 0.0 && (b[0] - b[1]).abs() <= l.body * LINE * 1.01, "{b:?}");
+    assert!(texts(&l.pages[last].ops).iter().any(|t| t.2 == "Slut"));
+}
+
+#[test]
+fn no_balancing_at_the_end_of_the_document() {
+    let md = format!("<!-- kladd: avsnitt; columns: 2 -->\n\n{}", filler(3));
+    let l = lay_bal(&md);
+    let t = texts(&l.pages[0].ops);
+    let right = l.text_l + l.col_left(1) - 1.0;
+    assert!(t.iter().all(|t| t.0 < right), "allt står i första spalten");
+}
+
+#[test]
+fn balanced_pdf_with_footnotes_and_rules_is_written() {
+    let md = format!(
+        "Rubrik\n\n<!-- kladd: avsnitt; columns: 2; column-rule: yes; type: continuous -->\n\n{}Text med not[^1].\n\n<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n\n[^1]: Noten.\n",
+        filler(5)
+    );
+    let l = lay_bal(&md);
+    assert_eq!(l.pages.len(), 1);
+    let t = texts(&l.pages[0].ops);
+    assert!(t.iter().any(|t| t.2.contains("Noten")), "fotnoten ritas");
+    let w = write(&md, "x", &|_| None).unwrap();
+    assert!(w.bytes.starts_with(b"%PDF"));
+}
+
+#[test]
+fn trailing_continuous_row_balances_but_the_last_section_without_one_does_not() {
+    // `.odt` från LibreOffice: ett `text:section` med spalter ger en löpande rad efter sig, också sist.
+    let sect = format!("Rubrik\n\n<!-- kladd: avsnitt; columns: 2; type: continuous -->\n\n{}", filler(5));
+    let with_row = lay_bal(&format!("{sect}<!-- kladd: avsnitt; type: continuous -->\n"));
+    let right = with_row.text_l + with_row.text_w / 2.0;
+    assert!(texts(&with_row.pages[0].ops).iter().any(|t| t.0 > right), "spalt 2 används");
+    let without = lay_bal(&sect);
+    assert!(texts(&without.pages[0].ops).iter().all(|t| t.0 < right), "utan rad fylls bara spalt 1");
+}
+
+#[test]
+fn column_balance_no_keeps_the_columns_unbalanced_in_the_pdf() {
+    let md = format!("Rubrik\n\n<!-- kladd: avsnitt; columns: 2; type: continuous; column-balance: no -->\n\n{}<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n", filler(5));
+    let l = lay_bal(&md);
+    let right = l.text_l + l.text_w / 2.0;
+    assert!(texts(&l.pages[0].ops).iter().filter(|t| t.2 != "Slut").all(|t| t.0 < right), "bara spalt 1 fylls");
+}
+
+/// Ruta mitt i en smal spalt där inget ryms bredvid: texten hoppar förbi rutan (ritas inte över den).
+fn skipped_past_box(prefix: &str, w_px: u32, x_px: u32) {
+    let pp = format!("<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\" fr=\"w={} x={} pl=8 pr=8 h=75\"-->", w_px * 3 / 4, x_px * 3 / 4);
+    let md = format!("{prefix}Före\n\n<!--k:tb 1 w=\"{w_px}\" h=\"100\" x=\"{x_px}\" y=\"0\"-->\n\nRutan{pp}\n\n<!--k:/tb-->\n\n{}", filler(3));
+    let l = lay(&md);
+    let t = texts(&l.pages[0].ops);
+    let (bx, by, _) = t.iter().find(|t| t.2.contains("Rutan")).unwrap().clone();
+    let first = t.iter().filter(|t| t.2.starts_with("Stycke")).map(|t| t.1).fold(f32::INFINITY, f32::min);
+    // Rutan är 100 px = 75 pt hög (texten i rutan börjar vid överkanten); första brödtextraden ligger under den.
+    assert!(first > by + 60.0, "text y {first} ruta y {by} x {bx}");
+    // Ingen brödtextrad vid rutans höjd.
+    assert!(t.iter().filter(|t| t.2.starts_with("Stycke") && t.1 < by + 60.0 && t.1 > by - 10.0).count() == 0, "{t:?}");
+}
+
+#[test]
+fn text_jumps_past_a_box_in_a_narrow_column() {
+    skipped_past_box("<!-- kladd: avsnitt; columns: 2 -->\n\n", 160, 40);
+}
+
+#[test]
+fn text_jumps_past_a_box_in_a_single_column() {
+    skipped_past_box("", 480, 20);
+}

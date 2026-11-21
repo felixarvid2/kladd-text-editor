@@ -271,3 +271,30 @@ fn unequal_columns_are_balanced_before_a_continuous_section() {
         assert!(r.row.size.x <= col_w_at(&l, r).max(l.boxes[0].regions[1].col_ws.iter().copied().fold(0.0, f32::max)) + 1.0);
     }
 }
+
+#[test]
+fn trailing_section_row_balances_the_last_columns_but_nothing_does_at_the_end_without_one() {
+    // LibreOffice skriver ett `text:section` med spalter; läsningen ger en löpande avsnittsrad efter, och
+    // spalterna jämnas ut också när den är sist. Utan raden (spalter från sidmallen) fylls första spalten.
+    let paras: String = (1..=6).map(|i| format!("Stycke {i} med text som tar upp flera rader i spalten och fortsätter lite till här.\n\n")).collect();
+    for cols in ["columns: 2", "columns: 3; column-widths: 60mm 40mm 40mm"] {
+        let open = format!("Rubrik\n\n<!-- kladd: avsnitt; {cols}; column-gap: 8mm; type: continuous -->\n\n{paras}");
+        let with_row = lay(&format!("{open}<!-- kladd: avsnitt; type: continuous -->\n"));
+        let (first, last) = (pos_of(&with_row, "Stycke 1"), pos_of(&with_row, "Stycke 6"));
+        assert!(last.min.x > first.min.x + 50.0, "{cols}: jämnas ut\n{}", dump(&with_row));
+        let without = lay(&open);
+        let (first, last) = (pos_of(&without, "Stycke 1"), pos_of(&without, "Stycke 6"));
+        assert!((last.min.x - first.min.x).abs() < 1.0, "{cols}: inget utjämnas sist\n{}", dump(&without));
+    }
+}
+
+#[test]
+fn column_balance_no_keeps_the_columns_unbalanced_in_the_document_view() {
+    let paras: String = (1..=6).map(|i| format!("Stycke {i} med text som tar upp flera rader i spalten och fortsätter lite till här.\n\n")).collect();
+    for cols in ["columns: 2", "columns: 3; column-widths: 60mm 40mm 40mm"] {
+        let t = format!("Rubrik\n\n<!-- kladd: avsnitt; {cols}; column-gap: 8mm; type: continuous; column-balance: no -->\n\n{paras}<!-- kladd: avsnitt; type: continuous -->\n\nSlut\n");
+        let l = lay(&t);
+        let (first, last) = (pos_of(&l, "Stycke 1"), pos_of(&l, "Stycke 6"));
+        assert!((last.min.x - first.min.x).abs() < 1.0, "{cols}: ingen utjämning\n{}", dump(&l));
+    }
+}

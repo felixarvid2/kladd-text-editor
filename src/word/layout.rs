@@ -14,7 +14,7 @@ use egui::epaint::text::FontsView;
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
-use super::anchor::{self, Anchor, PageCtx, VAt, Wrap};
+use super::anchor::{self, Anchor, HRel, PageCtx, Pos, VAt, Wrap};
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use super::pbox::{self, LineRule, PPr};
@@ -786,9 +786,14 @@ fn relayout_pass(
             let w_z = if b.tb.w > 0.0 { b.tb.w * z } else { wrap_width * 0.5 };
             let h_z = (b.tb.h * z).max(b.content_h);
             let page_y = sim.as_ref().map(|s| s.sheet_y(y));
-            let spec = FloatSpec { side: Float::Right, anchor: Some(b.tb.anchor), size: egui::vec2(w_z, h_z), alone: false };
+            // Samma kant som ritningen (`Frame::span`): en ruta ligger inom spalten, så texten flyter runt den där den syns.
+            let mut tb_anchor = b.tb.anchor;
+            if let (HRel::Column, Pos::Off(o)) = (tb_anchor.hrel, tb_anchor.h) {
+                tb_anchor.h = Pos::Off(o.clamp(0.0, ((wrap_width - w_z) / z).max(0.0)));
+            }
+            let spec = FloatSpec { side: Float::Right, anchor: Some(tb_anchor), size: egui::vec2(w_z, h_z), alone: false };
             let mut plan = plan_float(&spec, z, wrap_width, &ctx, page_y, min_h);
-            let a = b.tb.anchor.scaled(z);
+            let a = tb_anchor.scaled(z);
             let top = match a.y_at(h_z, &ctx) {
                 VAt::Para(o) => o,
                 VAt::Page(py) => page_y.map_or(0.0, |s| py - s),
@@ -2208,7 +2213,9 @@ fn layout_para_floats(
     ppp: f32,
     floats: &[ActiveFloat],
 ) -> Arc<Galley> {
-    if floats.is_empty() || para.range.is_empty() || !avail.is_finite() {
+    // Dolda taggrader (`<div>`, `<!--k:/tb-->` …) är nästan höjdlösa: de släpper förbi en ruta/bild över hela
+    // bredden utan att ta dess "hoppa förbi"-avstånd, annars förbrukas hoppet av raden och texten ritas över rutan.
+    if floats.is_empty() || para.range.is_empty() || para.collapse || !avail.is_finite() {
         return layout_para(fonts, full, para, avail, ppp);
     }
     let mut pieces: Vec<Arc<Galley>> = Vec::new();

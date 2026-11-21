@@ -20,7 +20,7 @@
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::word::anchor::{Anchor, HRel, Pos, VRel};
+use crate::word::anchor::{Anchor, HRel, Pos, VRel, Wrap};
 use crate::word::pbox::{Border, Borders, Frame, FrameX, LineStyle, PPr};
 
 pub const OPEN: &str = "<!--k:tb ";
@@ -393,9 +393,10 @@ pub fn new_block() -> String {
 }
 
 /// Originalkörningen (`w:r` med en förankrad `wps`-textruta) för en ny ruta. `content` är styckena som XML,
-/// `pp` rutans ram (bredd, läge, kant och fyllning), `text_w` textytans bredd i punkter och `lines` ungefär
+/// `pp` rutans ram (bredd, läge, kant och fyllning), `head` måtten och läget ur öppningsraden (en dragen eller
+/// ändrad ruta behåller sitt läge, omflöde och avstånd), `text_w` textytans bredd i punkter och `lines` ungefär
 /// hur många rader texten har (för starthöjden; rutan växer med texten i Word).
-pub fn new_box_run(content: &str, pp: &PPr, id: u32, text_w: f32, lines: usize) -> String {
+pub fn new_box_run(content: &str, pp: &PPr, head: &Head, id: u32, text_w: f32, lines: usize) -> String {
     let w = pp.frame.map(|f| f.w).filter(|w| *w < 5000.0).unwrap_or(text_w).clamp(36.0, text_w.max(36.0));
     let h = (lines as f32 * 18.0 + 14.0).max(30.0);
     let emu = |v: f32| (v * 12700.0).round() as i64;
@@ -417,13 +418,45 @@ pub fn new_box_run(content: &str, pp: &PPr, id: u32, text_w: f32, lines: usize) 
         _ => "<wp:align>left</wp:align>".to_owned(),
     };
     let (cx, cy) = (emu(w), emu(h));
-    format!(
+    let run = format!(
         "<w:r><w:drawing><wp:anchor xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\" distT=\"0\" distB=\"91440\" distL=\"114300\" distR=\"114300\" simplePos=\"0\" relativeHeight=\"251659264\" behindDoc=\"0\" locked=\"0\" layoutInCell=\"1\" allowOverlap=\"1\"><wp:simplePos x=\"0\" y=\"0\"/><wp:positionH relativeFrom=\"column\">{pos}</wp:positionH><wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/><wp:wrapTopAndBottom/><wp:docPr id=\"{id}\" name=\"Textruta {id}\"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><wps:wsp><wps:cNvSpPr txBox=\"1\"/><wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>{fill}{ln}</wps:spPr><wps:txbx><w:txbxContent>{content}</w:txbxContent></wps:txbx><wps:bodyPr rot=\"0\" vert=\"horz\" wrap=\"square\" lIns=\"{}\" tIns=\"{}\" rIns=\"{}\" bIns=\"{}\" anchor=\"t\" anchorCtr=\"0\"><a:spAutoFit/></wps:bodyPr></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>",
         ins(pp.borders.left),
         ins(pp.borders.top),
         ins(pp.borders.right),
         ins(pp.borders.bottom)
-    )
+    );
+    place_new_run(run, head)
+}
+
+/// Lägger öppningsradens mått och ankare (läge, omflöde, avstånd) i en nyskriven rutkörning.
+fn place_new_run(mut x: String, head: &Head) -> String {
+    let emu = |px: f32| (px * 9525.0).round() as i64;
+    if head.w > 0.0 && head.h > 0.0 {
+        x = set_cx_cy(&x, "<wp:extent", emu(head.w), emu(head.h));
+        x = set_cx_cy(&x, "<a:ext ", emu(head.w), emu(head.h));
+    }
+    let Some(a) = head.anchor else { return x };
+    let hrel = match a.hrel {
+        HRel::Column => "column",
+        HRel::Margin => "margin",
+        HRel::Page => "page",
+    };
+    let vrel = match a.vrel {
+        VRel::Paragraph => "paragraph",
+        VRel::Margin => "margin",
+        VRel::Page => "page",
+    };
+    x = set_position(&x, "positionH", hrel, a.h, ["left", "center", "right"]);
+    x = set_position(&x, "positionV", vrel, a.v, ["top", "center", "bottom"]);
+    let (wrap, behind) = match a.wrap {
+        Wrap::Square => ("<wp:wrapSquare wrapText=\"bothSides\"/>", "0"),
+        Wrap::TopBottom => ("<wp:wrapTopAndBottom/>", "0"),
+        Wrap::Behind => ("<wp:wrapNone/>", "1"),
+        Wrap::Front => ("<wp:wrapNone/>", "0"),
+    };
+    x = x.replacen("<wp:wrapTopAndBottom/>", wrap, 1).replacen("behindDoc=\"0\"", &format!("behindDoc=\"{behind}\""), 1);
+    let d = a.dist;
+    x.replacen("distT=\"0\" distB=\"91440\" distL=\"114300\" distR=\"114300\"", &format!("distT=\"{}\" distB=\"{}\" distL=\"{}\" distR=\"{}\"", emu(d[0]), emu(d[2]), emu(d[3]), emu(d[1])), 1)
 }
 
 /// Byter innehållet i alla `w:txbxContent` i rutans originalkörning (både `mc:Choice` och

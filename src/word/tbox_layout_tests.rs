@@ -120,3 +120,122 @@ fn omflode_overlever_sidbrytning() {
     assert!(boxr.pos.x > text.pos.x + 150.0, "ruta x {} text x {}", boxr.pos.x, text.pos.x);
     assert_eq!(chars(&g), t.chars().count());
 }
+
+/// Flyttar rutan som `tboxui` gör vid dragning: nytt `x`/`y` i öppningsraden och `fr=` i rutans stycken.
+fn dragged(t: &str, x: f32, y: f32) -> String {
+    let open = t.find("<!--k:tb").unwrap();
+    let open = open..t[open..].find("-->").unwrap() + open + 3;
+    let head = crate::docx_tbox::parse_head(&t[open.clone()]).unwrap().1;
+    let mut a = head.anchor.unwrap_or_default();
+    a.h = super::anchor::Pos::Off(x);
+    a.v = super::anchor::Pos::Off(y);
+    let mut head = head;
+    head.anchor = Some(a);
+    super::tboxui::apply(t, &super::tboxui::Change { open, head, x_pt: Some(x * 0.75) }).unwrap()
+}
+
+fn row_text(g: &Galley, i: usize) -> String {
+    g.rows[i].row.glyphs.iter().map(|c| c.chr).collect()
+}
+
+/// Raderna mellan `<!--k:tb` och `<!--k:/tb-->` (rutans egna) respektive brödtextrader (minst 12 tecken) efter dem.
+fn box_range(g: &Galley) -> std::ops::Range<usize> {
+    let find = |p: &str| (0..g.rows.len()).find(|&i| row_text(g, i).starts_with(p));
+    let (o, c) = (find("<!--k:tb").expect("rutans öppning"), find("<!--k:/tb-->").expect("rutans stängning"));
+    o + 1..c
+}
+
+fn is_body_row(g: &Galley, i: usize) -> bool {
+    let t = row_text(g, i);
+    t.chars().count() >= 12 && !t.starts_with('<') && !box_range(g).contains(&i)
+}
+
+/// Kontrollerar att ingen brödtextrad ligger över rutan (rutans vänsterkant `pad` till vänster om dess första
+/// rad, bredd `w`, höjd `h` från textens läge efter rutan). Ger antalet brödtextrader som ligger vid rutans höjd.
+fn check_no_overlap(g: &Galley, pad: f32, w: f32, h: f32, what: &str) -> usize {
+    let br = box_range(g);
+    let open = br.start;
+    let r0 = br.clone().find(|&i| g.rows[i].row.size.y > 5.0 && !row_text(g, i).is_empty()).unwrap_or_else(|| panic!("{what}: ingen rutrad"));
+    // Texten efter rutan dras upp till rutans överkant: stängningsradens läge är rutans överkant i texten.
+    let (bx0, y0) = (g.rows[r0].pos.x - pad, g.rows[br.end].pos.y);
+    let (bx1, y1) = (bx0 + w, y0 + h);
+    let mut n = 0;
+    for i in (open..g.rows.len()).filter(|&i| is_body_row(g, i)) {
+        let r = &g.rows[i];
+        if r.pos.y + r.row.size.y <= y0 + 0.5 || r.pos.y >= y1 - 0.5 {
+            continue;
+        }
+        n += 1;
+        let (s, e) = (r.pos.x, row_end(g, i));
+        assert!(e <= bx0 + 0.5 || s >= bx1 - 0.5, "{what}: rad {i} \"{}\" {s}..{e} (y {}) ligger över rutan {bx0}..{bx1} (y {y0}..{y1})", row_text(g, i), r.pos.y);
+    }
+    n
+}
+
+#[test]
+fn text_flyter_runt_eller_hoppar_forbi_ruta_var_som_helst_i_spalten() {
+    // Smal spalt (300 px): en 150 px bred ruta mitt i lämnar mindre än FLOAT_MIN_ROOM på båda sidor, så texten
+    // ska hoppa förbi rutan; närmare en kant flyter den på den bredare sidan.
+    for x in [0.0, 20.0, 45.0, 70.0, 100.0, 125.0, 150.0] {
+        let t = dragged(&doc("x=\"right\" y=\"0\""), x, 0.0);
+        let g = lay(&t, 300.0, None);
+        assert_eq!(chars(&g), t.chars().count());
+        check_no_overlap(&g, 5.0, 150.0, 65.0, &format!("x={x}"));
+        // Texten finns kvar i dokumentet och börjar inte ovanför rutan.
+        assert!((0..g.rows.len()).any(|i| is_body_row(&g, i)));
+    }
+}
+
+#[test]
+fn ruta_dragen_ut_over_spaltens_kant_stammer_med_ritningen() {
+    // Ritningen kläms till spalten (x 0..250 för en 150 px bred ruta i 400 px); layouten gör likadant.
+    for x in [-40.0, 300.0, 400.0] {
+        let t = dragged(&doc("x=\"right\" y=\"0\""), x, 0.0);
+        let g = lay(&t, 400.0, None);
+        let boxr = &g.rows[first_row(&g, 'R')];
+        let want = x.clamp(0.0, 250.0) + 5.0;
+        assert!((boxr.pos.x - want).abs() < 1.5, "x={x}: ruta x {} väntade {want}", boxr.pos.x);
+        check_no_overlap(&g, 5.0, 150.0, 65.0, &format!("x={x}"));
+        // Till höger om rutan (x=300 kläms till 250) finns ingen plats: texten ligger vänster om den.
+        let first_text = &g.rows[first_row(&g, 'L')];
+        if x >= 250.0 {
+            assert!(row_end(&g, first_row(&g, 'L')) <= want - 5.0 - 12.0 + 0.5 || first_text.pos.y > boxr.pos.y + 60.0, "x={x}");
+        }
+    }
+}
+
+#[test]
+fn ruta_mitt_i_spalten_med_sidor_flyter_likadant() {
+    let a = markup::analyze("");
+    let geom = pages::Geom::new(1.0, &a.defaults);
+    let col = geom.edit_w();
+    for x in [(col - 150.0) / 2.0, col * 0.2, col * 0.35, col * 0.5, col * 0.6] {
+        let t = dragged(&doc("x=\"right\" y=\"0\""), x, 0.0);
+        let g = lay(&t, col, Some(&geom));
+        assert_eq!(chars(&g), t.chars().count());
+        check_no_overlap(&g, 5.0, 150.0, 65.0, &format!("sida x={x}"));
+    }
+}
+
+fn newsletter() -> String {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/docx/gen-nyhetsbrev.docx")).unwrap();
+    crate::docx::read(&bytes).unwrap().markdown
+}
+
+fn lay_sections(text: &str) -> Arc<Galley> {
+    let a = markup::analyze(text);
+    let geom = pages::Geom::for_sections(1.0, &a.defaults, &a.sections);
+    lay(text, geom.edit_w(), Some(&geom))
+}
+
+#[test]
+fn nyhetsbrevets_ruta_dragen_mot_mitten_av_spalten() {
+    // "Städdag"-rutan (157 px) i en spalt på ca 302 px: dras den in mot mitten finns inte plats på någon sida.
+    let t0 = newsletter();
+    for x in [None, Some(0.0), Some(20.0), Some(50.0), Some(70.0), Some(100.0), Some(145.0)] {
+        let t = x.map_or_else(|| t0.clone(), |x| dragged(&t0, x, 6.3));
+        let g = lay_sections(&t);
+        let n = check_no_overlap(&g, 12.0, 157.5, 100.0, &format!("nyhetsbrev x={x:?}"));
+        println!("x={x:?}: {n} rader bredvid rutan");
+    }
+}

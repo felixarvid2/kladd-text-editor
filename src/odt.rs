@@ -353,6 +353,8 @@ struct ColsDef {
     /// (start + slut) i pt; tom när spalterna saknar egna mått.
     shares: Vec<(f32, f32)>,
     rule: bool,
+    /// `text:dont-balance-text-columns="true"` på sektionsstilen.
+    no_balance: bool,
 }
 
 impl ColsDef {
@@ -377,6 +379,7 @@ impl ColsDef {
         p.column_gap = Some(self.gap).filter(|g| (g - sections::DEFAULT_GAP).abs() > 0.5);
         p.column_widths = Some(self.widths(text_w)).filter(|w| w.len() > 1);
         p.column_rule = self.rule;
+        p.no_balance = self.no_balance;
     }
 }
 
@@ -409,7 +412,7 @@ fn columns_of(c: &Node) -> Option<ColsDef> {
             .collect();
     }
     let rule = c.child("style:column-sep").is_some_and(|s| s.attr("style:style") != Some("none") && s.attr("style:width").and_then(style::parse_length).is_none_or(|w| w > 0.0));
-    Some(ColsDef { n, gap, shares, rule })
+    Some(ColsDef { n, gap, shares, rule, no_balance: false })
 }
 
 fn unquote_font(f: &str) -> String {
@@ -484,7 +487,10 @@ impl Styles {
         };
         for c in s.els() {
             match c.name.as_str() {
-                "style:section-properties" => d.cols = c.child("style:columns").and_then(columns_of),
+                "style:section-properties" => d.cols = c.child("style:columns").and_then(columns_of).map(|mut cols| {
+                        cols.no_balance = c.attr("text:dont-balance-text-columns").is_some_and(|v| v.trim() == "true");
+                        cols
+                    }),
                 "style:text-properties" => d.tp = self.text_props(c),
                 "style:paragraph-properties" => {
                     if let Some(a) = c.attr("fo:text-align") {
@@ -2731,7 +2737,7 @@ impl<'a> W<'a> {
             let name = format!("Sect{}", self.n_sect);
             self.auto.push_str(&format!(
                 "<style:style style:name=\"{name}\" style:family=\"section\"><style:section-properties text:dont-balance-text-columns=\"{}\">{}</style:section-properties></style:style>",
-                !sec.col_widths.is_empty(),
+                sec.no_balance,
                 columns_xml(sec)
             ));
             self.body.push_str(&format!("<text:section text:style-name=\"{name}\" text:name=\"Avsnitt{}\">", self.n_sect));
@@ -4434,6 +4440,27 @@ Slut.
         assert!(block.contains("**Faktaruta**") && block.contains("Text i rutan") && block.contains("shd=\"FFF2CC\""), "{m}");
         assert!(block.contains("x=end") && block.contains("w=200"), "{m}");
         assert!(m.find("Före").unwrap() < m.find("k:tb").unwrap() && m.find("k:/tb").unwrap() < m.find("Efter").unwrap(), "{m}");
+    }
+
+    #[test]
+    fn dragged_text_box_roundtrip() {
+        use crate::word::{anchor::Pos, tboxui};
+        let pp = "<!--k:pp bdr=\"t=single:6:6:112233 l=single:6:6:112233 b=single:6:6:112233 r=single:6:6:112233\" shd=\"FFF2CC\" fr=\"w=112.5 x=end pl=6.75 pr=6.75\"-->";
+        let md = format!("Före\n\n<!--k:tb 0 w=\"150\" h=\"90\" x=\"right\" y=\"0\"-->\n\n**Faktaruta**{pp}\n\n<!--k:/tb-->\n\nEfter\n");
+        let o = md.find("<!--k:tb").unwrap();
+        let open = o..md[o..].find("-->").unwrap() + o + 3;
+        let mut head = crate::docx_tbox::parse_head(&md[open.clone()]).unwrap().1;
+        let mut a = head.anchor.unwrap();
+        (a.h, a.v) = (Pos::Off(73.5), Pos::Off(21.0));
+        head.anchor = Some(a);
+        let md = tboxui::apply(&md, &tboxui::Change { open, head, x_pt: Some(73.5 * 0.75) }).unwrap();
+        let w = write(&md, "T", &resolver()).unwrap();
+        let back = read(&w.bytes).unwrap().markdown;
+        let o = back.find("<!--k:tb").unwrap();
+        let h = crate::docx_tbox::parse_head(&back[o..o + back[o..].find("-->").unwrap() + 3]).unwrap().1;
+        let a = h.anchor.unwrap();
+        assert_eq!((a.h, a.v), (Pos::Off(73.5), Pos::Off(21.0)), "{back}");
+        assert!((h.w - 150.0).abs() < 0.6 && (h.h - 90.0).abs() < 0.6, "{back}");
     }
 
     #[test]
