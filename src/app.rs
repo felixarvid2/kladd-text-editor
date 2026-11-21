@@ -1490,8 +1490,12 @@ impl KladdApp {
         // Flikbyte med Ctrl+Tab är Ctrl även på Mac.
         let tab_ctrl = Modifiers::CTRL;
         let tab_ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        // egui:s `consume_shortcut` bryr sig inte om Alt. Utan kontrollen tog Ctrl+F (sök)
+        // Ctrl+Alt+F (fotnot i dokumentläget) innan dokumentläget hann se den, och AltGr-tecken
+        // (Ctrl+Alt på Windows) kunde starta kommandon.
+        let alt = ctx.input(|i| i.modifiers.alt);
         let hit = |m: Modifiers, k: Key| {
-            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
+            (m.alt || !alt) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
         };
         // I presentationsläget är det bara visaren som får tangenter.
         if self.pdf_presenting() {

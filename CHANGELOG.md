@@ -12,6 +12,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - README är nu en kort översikt med en tabell över filformaten Kladd öppnar, sparar och exporterar. Hela beskrivningen av funktionerna finns i `docs/handbok.md`.
 
+### Rättat
+
+- Kortkommandon med Alt tas inte längre av samma kommando utan Alt: `Ctrl+Alt+F` (fotnot) öppnade sökfältet i stället för att infoga en fotnot, och AltGr-tecken (Ctrl+Alt på Windows) kunde starta kommandon.
+
 ## [2.4.0] – 2026-11-17
 
 ### Nytt

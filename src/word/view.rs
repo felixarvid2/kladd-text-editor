@@ -494,9 +494,13 @@ impl KladdApp {
         self.review_keys(ctx);
         // egui:s `consume_shortcut` bryr sig inte om Shift. Utan kontrollen skulle Ctrl+L
         // (vänsterjustera) ta Ctrl+Shift+L (byt tema) och Ctrl+I ta Ctrl+Shift+I (infoga bild).
+        // Samma sak för Alt: Ctrl+B ska inte ta Ctrl+Alt+B.
         let shift = ctx.input(|i| i.modifiers.shift);
+        let alt = ctx.input(|i| i.modifiers.alt);
         let hit = |m: Modifiers, k: Key| {
-            (m.shift || !shift) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
+            (m.shift || !shift)
+                && (m.alt || !alt)
+                && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
         };
         // COMMAND = ⌘ på Mac, Ctrl annars (⌘⌥1 för rubriker som i Word för Mac).
         let ctrl = Modifiers::COMMAND;
