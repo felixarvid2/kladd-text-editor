@@ -216,3 +216,58 @@ fn page_numbers_continue_over_sections() {
     assert_eq!(page_index(&l.boxes, l.g.rows.last().unwrap().pos.y), n - 1);
     assert!(l.boxes.iter().any(|b| (b.w - 419.53 * 96.0 / 72.0).abs() < 1.0));
 }
+
+fn row_cols(l: &Laid, right_x: f32) -> (Vec<&PlacedRow>, Vec<&PlacedRow>) {
+    let rows: Vec<&PlacedRow> = l.g.rows.iter().filter(|r| page_index(&l.boxes, r.pos.y) == 0 && r.row.size.x > 1.0).collect();
+    (rows.iter().copied().filter(|r| r.pos.x < right_x - 1.0).collect(), rows.iter().copied().filter(|r| r.pos.x >= right_x - 1.0).collect())
+}
+
+#[test]
+fn paragraph_continuing_into_a_narrower_column_breaks_each_row_at_its_columns_width() {
+    // Ett långt stycke fyller den breda spalten och fortsätter i den smala.
+    let long = "Ord som fyller raderna med flera ord på varje rad och fortsätter. ".repeat(160);
+    let t = format!("<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 120mm 40mm -->\n\n{long}\n");
+    let l = lay(&t);
+    let b0 = &l.boxes[0];
+    let r = b0.region_at(b0.text_top());
+    assert_eq!(r.col_ws.len(), 2);
+    let (w0, w1) = (r.col_ws[0], r.col_ws[1]);
+    assert!(w0 > w1 * 2.5);
+    let right_x = b0.text_left() + w0 + r.gap - l.geom.origin_x();
+    let (left, right) = row_cols(&l, right_x);
+    assert!(left.len() > 20 && right.len() > 20, "stycket går över båda spalterna: {} {}", left.len(), right.len());
+    let widest = |rows: &[&PlacedRow]| rows.iter().map(|r| r.row.size.x).fold(0.0, f32::max);
+    // Raderna i den breda spalten är bredare än den smala spalten, och ingen rad är bredare än sin spalt.
+    assert!(widest(&left) > w1 + 40.0, "{} {w1}", widest(&left));
+    assert!(widest(&left) <= w0 + 1.0 && widest(&right) <= w1 + 1.0, "{} {} {w0} {w1}", widest(&left), widest(&right));
+    // Den breda spalten fylls ned till sidans botten (inte bara till det som den smala bredden skulle ge).
+    let bottom = left.iter().map(|r| r.pos.y + r.row.size.y).fold(0.0, f32::max);
+    assert!(bottom > b0.text_bottom() - 40.0, "{bottom} {}", b0.text_bottom());
+}
+
+#[test]
+fn unequal_columns_are_balanced_before_a_continuous_section() {
+    let paras: String = (1..=6).map(|i| format!("Stycke {i} med text som tar upp flera rader i spalten och fortsätter lite till här.\n\n")).collect();
+    let t = format!(
+        "Rubrik\n\n<!-- kladd: avsnitt; columns: 3; column-gap: 8mm; column-widths: 60mm 40mm 40mm; type: continuous -->\n\n{paras}<!-- kladd: avsnitt; type: continuous -->\n\nSlut över hela bredden\n"
+    );
+    let l = lay(&t);
+    assert_eq!(l.boxes.len(), 1);
+    let (first, last) = (pos_of(&l, "Stycke 1"), pos_of(&l, "Stycke 6"));
+    // Utan utjämning hamnar allt i första spalten; nu fördelas texten på flera spalter.
+    assert!(last.min.x > first.min.x + 50.0, "{first:?} {last:?}\n{}", dump(&l));
+    let regs = &l.boxes[0].regions;
+    assert_eq!(regs.len(), 3, "{regs:?}");
+    let slut = pos_of(&l, "Slut över");
+    assert!(slut.min.y >= regs[2].y0 - 0.5);
+    // Sista avsnittet börjar strax under den högsta spalten, inte under all text i en enda spalt.
+    let all_rows: Vec<&PlacedRow> = l.g.rows.iter().filter(|r| r.pos.y >= regs[1].y0 && r.pos.y < regs[2].y0 - 0.5).collect();
+    let tallest = all_rows.iter().map(|r| r.pos.y + r.row.size.y).fold(0.0, f32::max);
+    assert!(slut.min.y < tallest + 30.0, "{} {tallest}", slut.min.y);
+    let total: f32 = all_rows.iter().map(|r| r.row.size.y).sum();
+    assert!(tallest - regs[1].y0 < total * 0.7, "kolumnerna jämnas ut: {} av {total}", tallest - regs[1].y0);
+    // Alla rader ryms i sin spalts bredd.
+    for r in &l.g.rows {
+        assert!(r.row.size.x <= col_w_at(&l, r).max(l.boxes[0].regions[1].col_ws.iter().copied().fold(0.0, f32::max)) + 1.0);
+    }
+}

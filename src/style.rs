@@ -567,7 +567,8 @@ pub(crate) fn quote(t: &str) -> String {
         match c {
             '"' => s.push_str("\\\""),
             '\\' => s.push_str("\\\\"),
-            '\n' => s.push(' '),
+            // Flera rader (stycken) i ett sidhuvud: `\n`.
+            '\n' => s.push_str("\\n"),
             // "--" skulle avsluta kommentaren i HTML.
             '-' if s.ends_with('-') => s.push_str("\\-"),
             c => s.push(c),
@@ -586,7 +587,7 @@ pub(crate) fn unquote(v: &str) -> String {
     let mut esc = false;
     for c in inner.chars() {
         if esc {
-            out.push(c);
+            out.push(if c == 'n' { '\n' } else { c });
             esc = false;
         } else if c == '\\' {
             esc = true;

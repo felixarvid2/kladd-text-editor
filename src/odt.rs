@@ -322,6 +322,8 @@ struct StyleDef {
     /// `fo:break-before` och `fo:break-after` (`page` = true, `auto` = false) i styckeformatet.
     break_before: Option<bool>,
     break_after: Option<bool>,
+    /// `style:page-number`: sidnumret börjar om på detta tal (`auto` = fortsätter).
+    page_number: Option<u32>,
     /// Tabbstoppens typer (`left`, `center`, `right`) och ramlinjerna över/under stycket (för sidhuvud och sidfot).
     tabs: Option<Vec<String>>,
     border_top: Option<String>,
@@ -495,6 +497,7 @@ impl Styles {
                     };
                     d.break_before = c.attr("fo:break-before").and_then(brk);
                     d.break_after = c.attr("fo:break-after").and_then(brk);
+                    d.page_number = c.attr("style:page-number").and_then(|v| v.trim().parse().ok());
                     d.tabs = c
                         .child("style:tab-stops")
                         .map(|t| t.els().filter(|k| k.name == "style:tab-stop").map(|k| k.attr("style:type").unwrap_or("left").to_owned()).collect());
@@ -680,6 +683,11 @@ impl Styles {
     /// Sidmallen som ett stycke byter till (`style:master-page-name`), direkt eller ärvd.
     fn master_of(&self, style: &str) -> Option<&str> {
         self.chain("paragraph", style).iter().rev().find_map(|d| d.master.as_deref())
+    }
+
+    /// Sidnumret ett stycke börjar om på (`style:page-number`), direkt eller ärvt; `auto` ger `None`.
+    fn page_number_of(&self, style: &str) -> Option<u32> {
+        self.chain("paragraph", style).iter().rev().find_map(|d| d.page_number)
     }
 
     /// Sidbrytning före och efter ett stycke (`fo:break-before`/`fo:break-after`), direkt eller ärvd.
@@ -1512,10 +1520,15 @@ impl<'s, 'b> Rd<'s, 'b> {
     /// Byter stycket sidmall börjar en ny sida med nya mått: en avsnittsrad.
     fn check_master(&mut self, n: &Node) {
         let Some(m) = n.attr("text:style-name").and_then(|s| self.st.master_of(s)) else { return };
-        if self.cur_master.as_deref() == Some(m) {
+        // Sidnumret kan börja om också med samma sidmall (`style:page-number` på stycket).
+        let restart = n.attr("text:style-name").and_then(|s| self.st.page_number_of(s));
+        if self.cur_master.as_deref() == Some(m) && (restart.is_none() || self.blocks.is_empty()) {
             return;
         }
-        let Some(props) = self.masters.get(m).cloned() else { return };
+        let Some(mut props) = self.masters.get(m).cloned() else { return };
+        if restart.is_some() {
+            props.hf.page_start = restart;
+        }
         self.cur_master = Some(m.to_owned());
         self.cur_page = props.clone();
         self.section_row(&props);
@@ -2016,6 +2029,7 @@ fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults, ctx: &mut hf:
                 if let (Some(w), Some(h)) = (len("fo:page-width"), len("fo:page-height")) {
                     d.page_size = Some((w, h));
                 }
+                d.page_start = pp.attr("style:first-page-number").and_then(|v| v.trim().parse().ok());
                 d.page_format = pp.attr("style:num-format").and_then(crate::hf::NumFmt::from_name).filter(|f| *f != crate::hf::NumFmt::Decimal);
                 let all_m = len("fo:margin");
                 let m = [
@@ -2441,6 +2455,8 @@ struct W<'a> {
     section_open: bool,
     n_sect: usize,
     pending_break: Option<String>,
+    /// Sidnumret som avsnittet efter brytningen börjar om på (`style:page-number`).
+    pending_start: Option<u32>,
     /// Öppna textrutor (`<!--k:tb N-->`): var rutans innehåll börjar i brödtexten och ramen (första `k:pp`).
     boxes: Vec<(usize, Option<crate::word::pbox::PPr>)>,
     review: ReviewWr,
@@ -2552,6 +2568,7 @@ impl<'a> W<'a> {
             section_open: false,
             n_sect: 0,
             pending_break: None,
+            pending_start: None,
             boxes: Vec::new(),
             review: ReviewWr::default(),
         }
@@ -2682,7 +2699,10 @@ impl<'a> W<'a> {
         let name = format!("P{}", self.n_para);
         let (attrs, props) = match brk {
             "column" | "page" => (String::new(), format!("<style:paragraph-properties fo:break-before=\"{brk}\"/>")),
-            m => (format!(" style:master-page-name=\"{m}\""), String::new()),
+            m => {
+                let start = self.pending_start.take().map_or(String::new(), |n| format!("<style:paragraph-properties style:page-number=\"{n}\"/>"));
+                (format!(" style:master-page-name=\"{m}\""), start)
+            }
         };
         self.auto.push_str(&format!(
             "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{base}\"{attrs}>{props}</style:style>"
@@ -2744,6 +2764,7 @@ impl<'a> W<'a> {
         self.masters.push(sec.clone());
         let name = format!("M{}", self.masters.len());
         self.cur = sec.clone();
+        self.pending_start = sec.props.hf.page_start;
         if sec.columns > 1 {
             // Spalter ligger i ett avsnitt, som inte får börja med sidbrytningen.
             self.pending_break = Some(name);
@@ -3723,14 +3744,21 @@ fn hf_inline(text: &str, f: &style::Fields, out: &mut hf::HfOut<'_>) -> String {
 /// Sidhuvudets eller sidfotens stycke. En mall med `|` blir vänster, mitten och höger skilda av
 /// flikar (stycketypen har tabbstopp mitt och längst till höger).
 fn hf_paragraph(template: &str, style: &str, align: Align, f: &style::Fields, out: &mut hf::HfOut<'_>) -> String {
-    let inner = if style::split_parts(template).is_some() {
-        let p = style::parts_of(template, align);
-        format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f, out), hf_inline(&p[1], f, out), hf_inline(&p[2], f, out))
-    } else {
-        let text = style::parts_of(template, align).into_iter().find(|t| !t.is_empty()).unwrap_or_default();
-        hf_inline(&text, f, out)
-    };
-    format!("<text:p text:style-name=\"{style}\">{inner}</text:p>")
+    let rows = crate::hf::rows(template);
+    // Flera rader (stycken) skrivs alla med flikar, så att varje rads delar hamnar rätt.
+    let tabbed = rows.len() > 1;
+    let mut xml = String::new();
+    for row in rows {
+        let inner = if tabbed || style::split_parts(row).is_some() {
+            let p = style::parts_of(row, align);
+            format!("{}<text:tab/>{}<text:tab/>{}", hf_inline(&p[0], f, out), hf_inline(&p[1], f, out), hf_inline(&p[2], f, out))
+        } else {
+            let text = style::parts_of(row, align).into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+            hf_inline(&text, f, out)
+        };
+        xml.push_str(&format!("<text:p text:style-name=\"{style}\">{inner}</text:p>"));
+    }
+    xml
 }
 
 fn hf_text(t: &str) -> String {
@@ -3804,12 +3832,13 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
                     has_f = true;
                 }
             }
-            let tabs = if style::split_parts(&t).is_some() {
+            let split = style::split_parts(&t).is_some() || crate::hf::rows(&t).len() > 1;
+            let tabs = if split {
                 format!("<style:tab-stops><style:tab-stop style:position=\"{half_w}\" style:type=\"center\"/><style:tab-stop style:position=\"{text_w}\" style:type=\"right\"/></style:tab-stops>")
             } else {
                 String::new()
             };
-            let al = if style::split_parts(&t).is_some() { "start" } else { align_attr(align) };
+            let al = if split { "start" } else { align_attr(align) };
             let name = format!("{auto_name}{sfx}");
             let st = if header { &d.header_style } else { &d.footer_style };
             let border = st.line.map_or(String::new(), |(c, w)| {
@@ -3829,6 +3858,9 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
             if st.italic {
                 tp.push_str(" fo:font-style=\"italic\"");
             }
+            if st.underline {
+                tp.push_str(" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"");
+            }
             let tp = if tp.is_empty() { String::new() } else { format!("<style:text-properties{tp}/>") };
             auto.push_str(&format!(
                 "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\"{border}>{tabs}</style:paragraph-properties>{tp}</style:style>"
@@ -3839,12 +3871,13 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
     };
     // Sidmallens sidformat: `style:num-format` är sidnumrets format (`page-format`).
     let num_fmt = d.page_format.map_or("1", |f| f.odf());
+    let first_no = d.page_start.map_or(String::new(), |n| format!(" style:first-page-number=\"{n}\""));
     let mut hf_auto = String::new();
     let (master_inner, has_h, has_f) = hf_parts(pw - m[1] - m[3], "", 0, &mut hf_auto, env);
     let (top0, hs) = hf_style("header", m[0], has_h);
     let (bot0, fs) = hf_style("footer", m[2], has_f);
     let mut auto = format!(
-        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"{num_fmt}\" style:print-orientation=\"{orient}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>",
+        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties fo:page-width=\"{}\" fo:page-height=\"{}\" style:num-format=\"{num_fmt}\"{first_no} style:print-orientation=\"{orient}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" style:writing-mode=\"lr-tb\"/>",
         cm(pw),
         cm(ph),
         cm(top0),

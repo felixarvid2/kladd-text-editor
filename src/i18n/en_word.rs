@@ -159,4 +159,12 @@ pub const EN: &[(&str, &str)] = &[
     ("Ångra (Ctrl+Z)", "Undo (Ctrl+Z)"),
     ("Överkant", "Top"),
     ("Övriga sidor", "Other pages"),
+    ("Logga", "Logo"),
+    ("Välj logga", "Choose logo"),
+    ("Rad {n}", "Line {n}"),
+    ("Lägg till rad", "Add line"),
+    ("Infoga sidnummer", "Insert page number"),
+    ("Logga…", "Logo…"),
+    ("Ta bort logga", "Remove logo"),
+    ("Sidnummerformat", "Page number format"),
 ];

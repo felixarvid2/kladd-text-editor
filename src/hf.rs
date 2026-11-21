@@ -155,6 +155,7 @@ pub struct HfStyle {
     pub color: Option<[u8; 3]>,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
     /// Linje under sidhuvudet (över sidfoten): färg och tjocklek i pt.
     pub line: Option<([u8; 3], f32)>,
 }
@@ -178,6 +179,9 @@ impl HfStyle {
         if self.italic {
             p.push("italic".into());
         }
+        if self.underline {
+            p.push("underline".into());
+        }
         if let Some((c, w)) = self.line {
             p.push(format!("line={}/{}pt", hex(c), trim_num(w)));
         }
@@ -193,6 +197,8 @@ impl HfStyle {
                 s.bold = true;
             } else if w == "italic" {
                 s.italic = true;
+            } else if w == "underline" {
+                s.underline = true;
             } else if let Some(l) = w.strip_prefix("line=") {
                 let (c, wd) = l.split_once('/').unwrap_or((l, "0.5pt"));
                 if let Some(c) = parse_hex(c.trim_start_matches('#')) {
@@ -405,16 +411,21 @@ impl Plan {
             let mut h: f32 = 0.0;
             for t in tpls.into_iter().flatten().filter(|t| !t.is_empty()) {
                 let size = st.size.unwrap_or(d.size() * 0.9);
-                let mut line = size * LINE_FACTOR;
-                for src in std::iter::once(t.as_str()) {
-                    for p in pieces(src) {
-                        if let Piece::Image(tok) = p {
-                            if tok.at.is_none() {
-                                line = line.max(tok.h);
+                // Varje rad (stycke) är minst en textrad hög, och högre med en bild på raden.
+                let line: f32 = rows(t)
+                    .into_iter()
+                    .map(|row| {
+                        let mut line = size * LINE_FACTOR;
+                        for p in pieces(row) {
+                            if let Piece::Image(tok) = p {
+                                if tok.at.is_none() {
+                                    line = line.max(tok.h);
+                                }
                             }
                         }
-                    }
-                }
+                        line
+                    })
+                    .sum();
                 h = h.max(line);
             }
             if h == 0.0 {
@@ -724,9 +735,40 @@ pub fn layout_zone(
     Zone { items, height: line_h }
 }
 
-/// De tre delarna (vänster, mitten, höger) av en mall, med fälten ifyllda.
-pub fn filled_parts(template: &str, align: Align, f: &Fields) -> [String; 3] {
-    crate::style::parts_of(template, align).map(|p| fill(&p, f).replace('\n', " "))
+/// Raderna (styckena) i en mall: `\n` skiljer dem åt. Varje rad har egna delar (vänster|mitten|höger).
+pub fn rows(template: &str) -> Vec<&str> {
+    template.split('\n').collect()
+}
+
+/// Mallens rader med fälten ifyllda, var och en som vänster, mitten, höger. `align` gäller en rad
+/// med ett enda värde utan `|`.
+pub fn filled_rows(template: &str, align: Align, f: &Fields) -> Vec<[String; 3]> {
+    rows(template).into_iter().map(|r| crate::style::parts_of(r, align).map(|p| fill(&p, f))).collect()
+}
+
+/// Ställer upp flera rader under varandra (se `layout_zone`); `height` är summan av radhöjderna.
+pub fn layout_rows(
+    rows: &[[String; 3]],
+    size_pt: f32,
+    scale: f32,
+    width: f32,
+    measure: &dyn Fn(&str, f32) -> f32,
+    natural: &dyn Fn(&str) -> Option<(f32, f32)>,
+) -> Zone {
+    let mut out = Zone::default();
+    for r in rows {
+        let z = layout_zone(r, size_pt, scale, width, measure, natural);
+        for mut it in z.items {
+            match &mut it {
+                Placed::Text { y, .. } => *y += out.height,
+                Placed::Image { y, anchored: false, .. } => *y += out.height,
+                Placed::Image { .. } => {}
+            }
+            out.items.push(it);
+        }
+        out.height += z.height;
+    }
+    out
 }
 
 /// Standardavstånd från sidkanten till sidhuvudet och sidfoten (Words 1,25 cm = 708 twips).
@@ -784,10 +826,13 @@ mod tests {
 
     #[test]
     fn style_text_round_trips() {
-        let s = HfStyle { size: Some(9.0), color: Some([0x66, 0x66, 0x66]), bold: true, italic: false, line: Some(([0x99, 0x99, 0x99], 0.5)) };
+        let s = HfStyle { size: Some(9.0), color: Some([0x66, 0x66, 0x66]), bold: true, italic: false, underline: false, line: Some(([0x99, 0x99, 0x99], 0.5)) };
         let t = s.to_text();
         assert_eq!(t, "9pt #666666 bold line=#999999/0.5pt");
         assert_eq!(HfStyle::from_text(&t), s);
+        let u = HfStyle { italic: true, underline: true, ..Default::default() };
+        assert_eq!(u.to_text(), "italic underline");
+        assert_eq!(HfStyle::from_text("italic underline"), u);
         assert!(HfStyle::from_text("").is_default());
     }
 
@@ -873,5 +918,33 @@ mod tests {
         let z = layout_zone(&parts, 10.0, 2.0, 400.0, &|_, _| 10.0, &|_| None);
         assert_eq!(z.height, 24.0);
         assert!(matches!(z.items[0], Placed::Image { x, y, anchored: true, .. } if x == 20.0 && y == 10.0));
+    }
+
+    #[test]
+    fn rows_stack_and_reserve_adds_up() {
+        let f = fields(1, 2);
+        let rows = filled_rows("Skola\n||{sida}\nA|B|C", Align::Center, &f);
+        assert_eq!(rows.len(), 3);
+        // Ett enkelt värde följer justeringen, en rad med `|` har egna delar.
+        assert_eq!(rows[0], ["", "Skola", ""].map(String::from));
+        assert_eq!(rows[1], ["", "", "1"].map(String::from));
+        assert_eq!(rows[2], ["A", "B", "C"].map(String::from));
+        let z = layout_rows(&rows, 10.0, 1.0, 400.0, &|t, s| t.chars().count() as f32 * s * 0.5, &|_| None);
+        assert_eq!(z.height, 36.0);
+        let ys: Vec<f32> = z.items.iter().filter_map(|i| if let Placed::Text { y, .. } = i { Some(*y) } else { None }).collect();
+        assert_eq!(ys, [0.0, 12.0, 24.0, 24.0, 24.0]);
+        // Marginalen räknas på alla rader: avstånd + tre rader.
+        let d = DocDefaults { header: Some("a\nb\nc".into()), header_style: HfStyle { size: Some(10.0), ..Default::default() }, ..Default::default() };
+        let plan = Plan::new(&d, &[]);
+        assert!((plan.reserve(&d, 0)[0] - (DEFAULT_DIST + 36.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn multi_line_templates_survive_the_comment() {
+        let d = DocDefaults { header: Some("Rad ett\n||Rad \"två\"".into()), header_align: Align::Center, ..Default::default() };
+        let c = d.to_comment();
+        assert!(c.contains("header: \"Rad ett\\n||Rad \\\"två\\\"\""), "{c}");
+        let back = DocDefaults::from_comment(&c).unwrap();
+        assert_eq!(back.header, d.header);
     }
 }

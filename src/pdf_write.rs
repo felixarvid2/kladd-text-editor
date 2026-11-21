@@ -965,12 +965,12 @@ impl<'a> Layout<'a> {
         let mut out = Vec::new();
         for (footer, tpl, align, st, dist) in items {
             let Some(tpl) = tpl else { continue };
-            let parts = hf::filled_parts(&tpl, align, f);
+            let rows = hf::filled_rows(&tpl, align, f);
             let size = st.size.unwrap_or(self.body * 0.9);
             let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
             // Bilderna först: de behöver sin egen storlek för uppställningen.
             let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
-            for src in parts.iter().flat_map(|p| hf::image_srcs(p)) {
+            for src in rows.iter().flatten().flat_map(|p| hf::image_srcs(p)) {
                 if loaded.contains_key(&src) {
                     continue;
                 }
@@ -980,17 +980,23 @@ impl<'a> Layout<'a> {
                     loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
                 }
             }
-            let base_face = self.base;
+            let base_face = if st.bold && self.base == Face::Sans { Face::SansSemi } else { self.base };
             let m = std::cell::RefCell::new(&mut self.m);
             let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
             let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
-            let zn = hf::layout_zone(&parts, size, 1.0, g.cw, &measure, &natural);
+            let zn = hf::layout_rows(&rows, size, 1.0, g.cw, &measure, &natural);
             let edge = dist.unwrap_or(hf::DEFAULT_DIST);
             let top = if footer { g.ph - edge - zn.height } else { edge };
             for it in &zn.items {
                 match it {
                     Placed::Text { x, y, text, size } => {
-                        out.push(Op::Text { x: g.ml + x, y: top + y + size * 0.95, face: self.base, size: *size, text: text.clone(), color, italic: st.italic });
+                        let base_y = top + y + size * 0.95;
+                        out.push(Op::Text { x: g.ml + x, y: base_y, face: base_face, size: *size, text: text.clone(), color, italic: st.italic });
+                        if st.underline {
+                            let w = m.borrow_mut().width(base_face, *size, text);
+                            let uy = base_y + size * 0.12;
+                            out.push(Op::Line { x1: g.ml + x, y1: uy, x2: g.ml + x + w, y2: uy, width: (size * 0.06).max(0.4), color });
+                        }
                     }
                     Placed::Image { x, y, w, h, src, anchored } => {
                         let Some((index, ..)) = loaded.get(src) else { continue };
@@ -1368,8 +1374,11 @@ impl<'a> Layout<'a> {
         let pieces = self.pieces(spans, base, size);
         let pieces: Vec<Piece> = pieces.into_iter().flat_map(|p| self.split_long(p, width)).collect();
         let (mut next, mut i) = (0usize, 0usize);
-        let ml_entry = self.ml;
+        let (ml_entry, cw_entry) = (self.ml, self.cw);
+        let width0 = width;
         loop {
+            // Texten följer med till nästa spalt och bryts i dess bredd (spalterna kan vara olika breda).
+            let mut width = width0 + (self.cw - cw_entry);
             // Flytande bilder gör raden smalare (och förskjuter den vid vänsterbilder).
             let (mut fx, mut fw) = self.float_room();
             let ind0 = if i == 0 { self.first_indent } else { 0.0 };
@@ -1393,6 +1402,7 @@ impl<'a> Layout<'a> {
             // Texten följer med till nästa spalt.
             let x = x + (self.ml - ml_entry);
             if self.breaks != page_before {
+                width = width0 + (self.cw - cw_entry);
                 (fx, fw) = self.float_room();
                 (line, after) = Self::take_line(&pieces, next, (width - fw.min(width - 24.0) - ind0).max(1.0));
                 refs = refs_of(self, &line);

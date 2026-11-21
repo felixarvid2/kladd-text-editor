@@ -266,3 +266,63 @@ fn changed_section_header_only_touches_that_section() {
 }
 
 
+
+#[test]
+fn several_paragraphs_in_a_header_stay_separate_lines() {
+    let h = hdr(
+        r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Ekbackeskolan</w:t></w:r></w:p><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Rapport 2025</w:t></w:r></w:p><w:p><w:pPr><w:jc w:val="right"/></w:pPr><w:r><w:t>Utkast</w:t></w:r></w:p>"#,
+    );
+    let l = read(&doc_with(h, ftr("<w:p/>"))).unwrap();
+    let d = defaults(&l);
+    // Första radens justering gäller; raden med annan justering skrivs ut med delar.
+    assert_eq!(d.header.as_deref(), Some("Ekbackeskolan\nRapport 2025\n||Utkast"), "{}", base_line(&l));
+    assert_eq!(d.header_align, Align::Center);
+    // Skrivs som tre stycken och läses tillbaka lika.
+    let out = write(&l.markdown, "t", &resolver(&l), None).unwrap().bytes;
+    let h = part(&out, "word/header1.xml");
+    assert_eq!(h.matches("<w:p>").count(), 3, "{h}");
+    assert!(h.contains("Ekbackeskolan") && h.contains("Rapport 2025") && h.contains("Utkast"), "{h}");
+    let back = defaults(&read(&out).unwrap());
+    assert_eq!(back.header.as_deref(), d.header.as_deref());
+    assert_eq!(back.header_align, Align::Center);
+}
+
+#[test]
+fn table_cells_are_placed_by_width_not_by_order() {
+    let cell = |w: i64, jc: &str, text: &str| format!(r#"<w:tc><w:tcPr><w:tcW w:w="{w}" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:jc w:val="{jc}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"#);
+    let row = |cells: String, grid: &[i64]| {
+        let g: String = grid.iter().map(|w| format!(r#"<w:gridCol w:w="{w}"/>"#)).collect();
+        format!(r#"<w:tbl><w:tblGrid>{g}</w:tblGrid><w:tr>{cells}</w:tr></w:tbl><w:p/>"#)
+    };
+    let read_h = |xml: String| defaults(&read(&doc_with(hdr(&xml), ftr("<w:p/>"))).unwrap()).header;
+    // En smal vänstercell och en bred mittencell: titeln hamnar i mitten (inte till höger).
+    let a = row(cell(900, "left", "Logga") + &cell(6754, "center", "Titel"), &[900, 6754]);
+    assert_eq!(read_h(a).as_deref(), Some("Logga|Titel|"));
+    // En bred vänstercell och en smal högercell.
+    let b = row(cell(6754, "left", "Titel") + &cell(900, "right", "Sida"), &[6754, 900]);
+    assert_eq!(read_h(b).as_deref(), Some("Titel||Sida"));
+    // Två lika breda celler: vänster och höger.
+    let c = row(cell(4000, "left", "A") + &cell(4000, "left", "B"), &[4000, 4000]);
+    assert_eq!(read_h(c).as_deref(), Some("A||B"));
+    // Smal vänstercell följd av bred vänsterjusterad cell: båda till vänster.
+    let e = row(cell(900, "left", "Logga") + &cell(6754, "left", "Titel"), &[900, 6754]);
+    assert_eq!(read_h(e).as_deref(), Some("Logga Titel||"));
+    // Tre celler: bredden räknas från gridSpan och rutnätet när tcW saknas.
+    let nw = |span: u32, t: &str| format!(r#"<w:tc><w:tcPr><w:gridSpan w:val="{span}"/></w:tcPr><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>"#);
+    let f = row(nw(1, "V") + &nw(2, "M") + &nw(1, "H"), &[1000, 1000, 1000, 1000]);
+    assert_eq!(read_h(f).as_deref(), Some("V|M|H"));
+}
+
+#[test]
+fn header_underline_is_read_and_written() {
+    let h = hdr(r#"<w:p><w:r><w:rPr><w:b/><w:i/><w:u w:val="single"/><w:color w:val="FF0000"/></w:rPr><w:t>Rubrik</w:t></w:r></w:p>"#);
+    let l = read(&doc_with(h, ftr("<w:p/>"))).unwrap();
+    let d = defaults(&l);
+    assert!(d.header_style.bold && d.header_style.italic && d.header_style.underline, "{}", base_line(&l));
+    assert!(base_line(&l).contains("bold italic underline"), "{}", base_line(&l));
+    // Ändrad text skrivs om med samma utseende.
+    let md = l.markdown.replacen("Rubrik", "Ny rubrik", 1);
+    let out = write(&md, "t", &resolver(&l), l.source.as_ref()).unwrap().bytes;
+    let h = part(&out, "word/header2.xml");
+    assert!(h.contains("<w:b/>") && h.contains("<w:i/>") && h.contains("<w:u w:val=\"single\"/>") && h.contains("FF0000"), "{h}");
+}

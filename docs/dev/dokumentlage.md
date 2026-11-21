@@ -243,8 +243,15 @@ Gemensamma format (alla moduler ska använda dessa):
   referens) om, med fält, bilder och linje. Sektioner som skrivs om från grunden får originalets referenser (`seed_hf`).
   odt: `style:header-left` är jämna sidor, tabbstoppens typer avgör vänster/höger, `text:page-number` följer
   `style:num-format`, och sidmallens övre/nedre marginal är avståndet till sidhuvudet (marginalen i Kladd är avståndet plus
-  sidhuvudets minsta höjd och mellanrum). Begränsningar: ett sidhuvud med flera rader slås ihop till en rad, text i
-  tabellceller placeras efter kolumnens ordning (inte dess bredd) och odt-sidnumrering som börjar om per avsnitt läses inte.
+  sidhuvudets minsta höjd och mellanrum). Flera rader (stycken): mallen har
+  `\n` mellan raderna (`hf::rows`, `hf::filled_rows`, `hf::layout_rows`), var och en med egna delar (`vänster|mitten|höger`
+  eller ett enkelt värde med mallens justering; en rad med annan justering skrivs `|text|` eller `||text`). I grundformatskommentaren
+  skrivs radbrytningen `\n` (`style::quote`/`unquote`). `docx_hf` gör varje stycke eller tabellrad till en rad, odt varje `text:p`;
+  `Plan::reserve` summerar radhöjderna. Tabellceller placeras efter bredd (`docx_hf::table_zones`: cellens mitt i första/sista
+  tredjedelen eller en bred cells justering, bredden ur `w:tcW`, `w:gridSpan` och `w:tblGrid`). `header-style` har även
+  `underline` (fet/kursiv/understruken ritas i dokumentläget, PDF och vid skrivning). odt: `style:page-number` på ett stycke med
+  sidmall och `style:first-page-number` på sidmallen blir `page-start` (och skrivs tillbaka). Dialogen (`word/headers.rs`) visar en
+  logga som brickan `[Logga n]` i fältet (`hide_logos`/`show_logos`) med miniatyr, och en vald bildfil läggs i dokumentets bilder vid OK.
 - **Formatmallar** (`style::StyleSet`, `src/style/formatmall.rs`): en deklaration per mall i
   grundformatskommentaren, `h1`–`h6`, `body`, `quote`, `title`, `subtitle`, med ord i valfri ordning: `"Typsnitt"`,
   `16pt`, `bold`/`nobold`, `italic`/`noitalic`, `#RRGGBB`, `left|center|right|justify`,
@@ -738,7 +745,10 @@ avsnittet (`row_sec`) och spaltbrytningarna. `secpages::paginate_sections` flytt
 - ett nytt avsnitt börjar på ett nytt ark med avsnittets storlek och marginaler. Ett **löpande** avsnitt
   (`type: continuous`) med samma sidstorlek och marginaler fortsätter på samma ark under det förra
   (`PageBox::regions`: en del per spaltindelning); spalterna i avsnittet före ett löpande byte **jämnas ut**
-  (`balanced_height`) om det ryms på sidan;
+  (`balanced_height`) om det ryms på sidan. Olika breda spalter: ett stycke som fortsätter i en smalare spalt delas vid
+  spaltgränsen (`layout::layout_para_cols`, spaltfyllnaden följs av `ColSim::probe`) så att raderna bryts i sin spalts bredd.
+  Jämna ut går inte genom att flytta stycken, så `layout::relayout` söker lägsta spalthöjd som ryms (`Balance`, några
+  omläggningar ur styckecachen) och `paginate_sections` fyller sista arkets spalter bara till den höjden;
 - ark med olika storlek centreras på skrivbordet (`Geom::sheet_left`). Galleriets x = 0 ligger vid den
   vänstraste textkanten (`Geom::origin_x`), så alla rader har x ≥ 0 och TextEdits yta (`Geom::edit_w`) täcker allt;
 - resultatet är `Paged { boxes: Vec<PageBox>, dx }`; `Cache::page_boxes` ger arken till vyn (ritning av ark,
@@ -761,7 +771,7 @@ fotnoterna hamnar sist i dokumentet (som förut).
 
 Läsning: ett toppnivåstycke med `w:pPr/w:sectPr` slutar ett avsnitt; stycket läses som vanligt och följs av
 en avsnittsrad med **nästa** avsnitts egenskaper (sista avsnittets kommer från brödtextens `w:sectPr`). Egenskaperna
-är `w:pgSz` (w, h, orient), `w:pgMar`, `w:cols` (num, space; olika breda spalter räknas som lika breda) och
+är `w:pgSz` (w, h, orient), `w:pgMar`, `w:cols` (num, space, `w:col` för olika breda spalter) och
 `w:type` (`continuous`; övriga typer blir ny sida) och skrivs bara om de skiljer sig från grundformatet. **Grundformatet
 (sida, sidhuvud, sidfot) läses ur första avsnittets `sectPr`**, inte det sista. `w:br w:type="column"` blir
 `<!-- kladd: spaltbrytning -->`.
@@ -791,7 +801,8 @@ ODT sparas inte förlustfritt, så markören följer med bara så långt `render
 `Block::SectionBreak`/`ColumnBreak`; varje sida bär sina mått (`PageOps::geom`) och PDF-sidorna skapas med
 rätt storlek, sidhuvud och sidfot centreras på den egna sidan. Spalter: `new_page` går till nästa spalt innan en
 ny sida (`ml`/`cw` sätts om och `rt` är spaltens överkant), texten följer med (`text_block` flyttar x), fotnoterna
-ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Skillnad mot dokumentläget:
+ritas över hela textbredden. Ett löpande avsnitt fortsätter under föregående del. Texten bryts i bredden för
+spalten den hamnar i (`text_block` räknar om bredden när den går till nästa spalt). Skillnad mot dokumentläget:
 spalterna före ett löpande byte jämnas **inte** ut i PDF:en.
 
 ## Ekvationer (`src/math/`)

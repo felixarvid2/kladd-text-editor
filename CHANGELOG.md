@@ -7,6 +7,16 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Nytt
 
 - **Fotnoter längst ned på sin sida i dokumentläget.** Varje fotnot ritas nu under en kort skiljelinje längst ned på sidan där referensen står, i mindre text med upphöjt nummer, som i Word och i PDF-exporten. Sidbrytningen reserverar plats för sidans fotnoter, och en rad med en referens flyttas till nästa sida om raden och noten inte ryms tillsammans (spalter fungerar också). Klicka på en fotnot, dubbelklicka referensen eller använd *Infoga → Fotnot* för att redigera noten på plats; Enter eller Esc avslutar. Definitionerna ligger kvar sist i texten (dolda i flödet), så markör, klick och markering fungerar som förut. Slutnoter står kvar sist i dokumentet.
+- **Dialogen för sidhuvud och sidfot** visar en logga som miniatyr med namn och bredd (en bricka `[Logga 1]` i fältet) i stället för bildmärket `{bild:…}`, har knapparna *Infoga sidnummer*, *Antal sidor*, *Logga…* (välj en bildfil), *Ta bort logga*, *Lägg till rad* och valet *Sidnummerformat* (1, i, I, a, A), och kan ändra loggans bredd.
+- **Sidhuvud med flera stycken** behåller varje stycke som en egen rad (`\n` i mallen) vid läsning av `.docx` och `.odt`, i dokumentläget, i PDF och vid skrivning, och dialogen kan lägga till och ta bort rader.
+- **Fet, kursiv och understruken text i sidhuvud och sidfot** (`header-style: "bold italic underline"`) ritas nu också i dokumentläget, och fetstil och understrykning i PDF-exporten. Understrykning läses och skrivs i `.docx` och `.odt`.
+
+### Rättat
+
+- Text i tabellceller i ett sidhuvud placeras efter cellernas bredd (`w:tcW`, `w:gridSpan`, `w:tblGrid`) i stället för efter kolumnernas ordning: en smal logga till vänster och en bred titel hamnar vänster och mitten.
+- Sidnumrering som börjar om per avsnitt läses nu också från `.odt` (`style:page-number` på stycket och `style:first-page-number` på sidmallen) och skrivs tillbaka.
+- Ett stycke som fortsätter från en bredare spalt in i en smalare delas vid spaltgränsen: raderna bryts i respektive spalts bredd i dokumentläget och i PDF (förut fick hela stycket den smalaste bredden i vyn och den breda spaltens bredd i PDF).
+- Spalter med olika bredd jämnas nu ut på avsnittets sista sida före ett löpande avsnittsbyte i dokumentläget (som Word och LibreOffice). I PDF jämnas spalter fortfarande inte ut.
 
 ### Ändrat
 

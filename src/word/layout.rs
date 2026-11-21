@@ -479,6 +479,11 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
 
 /// Lägger ut dokumentet från styckecachen och fogar ihop det. `env` = hash av parametrarna
 /// som gäller alla stycken.
+///
+/// Avsnitt med olika breda spalter som följs av ett löpande avsnitt på samma ark jämnas ut på sista
+/// arket (som Word och LibreOffice): stycken kan inte flyttas mellan spalter utan att brytas om, så
+/// den lägsta spalthöjden som ryms i avsnittets spalter söks genom att lägga ut om dokumentet med
+/// olika höjder (utläggningen av oförändrade stycken kommer ur styckecachen).
 #[allow(clippy::too_many_arguments)]
 fn relayout(
     st: &mut DocState,
@@ -490,6 +495,50 @@ fn relayout(
     env: u64,
     pages: Option<&super::pages::Geom>,
 ) -> Galley {
+    use super::secpages::Balance;
+    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new());
+    let Some(geom) = pages.filter(|g| g.multi() && g.unequal_cols()) else { return g };
+    let cands: Vec<(usize, super::secpages::SecRun)> = runs.iter().filter(|(s, _)| geom.balance_candidate(**s)).map(|(s, r)| (*s, *r)).collect();
+    if cands.is_empty() {
+        return g;
+    }
+    // Minsta höjd: lika fördelat; största: som den är nu.
+    let mut lo: HashMap<usize, f32> = cands.iter().map(|(s, r)| (*s, r.used / geom.sec(*s).cols as f32)).collect();
+    let mut hi: HashMap<usize, f32> = cands.iter().map(|(s, r)| (*s, r.used)).collect();
+    for _ in 0..8 {
+        if cands.iter().all(|(s, _)| hi[s] - lo[s] < 2.0) {
+            break;
+        }
+        let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, (lo[s] + hi[s]) / 2.0))).collect();
+        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal);
+        for (s, r) in &cands {
+            let mid = (lo[s] + hi[s]) / 2.0;
+            // Ryms allt på sista arket (inga fler arkbyten)?
+            if run.get(s).is_some_and(|x| x.sheets == r.sheets) {
+                hi.insert(*s, mid);
+            } else {
+                lo.insert(*s, mid);
+            }
+        }
+    }
+    // Några px marginal: sidbrytningen avrundar raderna något annorlunda än uppskattningen.
+    let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, hi[s] + 2.0))).collect();
+    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal).0
+}
+
+/// Ett utläggningsvarv (se `relayout`); ger också hur varje avsnitt med olika breda spalter fyllde arken.
+#[allow(clippy::too_many_arguments)]
+fn relayout_pass(
+    st: &mut DocState,
+    ctx: &egui::Context,
+    text: &str,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    env: u64,
+    pages: Option<&super::pages::Geom>,
+    balance: &super::secpages::Balance,
+) -> (Galley, HashMap<usize, super::secpages::SecRun>) {
     st.tick += 1;
     let tick = st.tick;
     let a = st.analysis.clone();
@@ -534,7 +583,7 @@ fn relayout(
     let mut sim = pages.filter(|_| !multi).map(PageSim::new);
     // Olika breda spalter: spaltfyllnaden följs i förväg så att varje stycke får sin spalts bredd.
     let unequal = multi && pages.is_some_and(|g| g.unequal_cols());
-    let mut csim = super::secpages::ColSim::default();
+    let mut csim = super::secpages::ColSim::with_balance(balance.clone());
     for (pr, w, tbl) in groups.iter() {
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
@@ -594,10 +643,15 @@ fn relayout(
                 .collect()
         };
         let mut retry = false;
+        // Stycket delas vid spaltgränsen när det går in i en smalare spalt (raderna bryts i sin spalts bredd).
+        let mut by_cols = false;
         let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = loop {
         let key = {
             let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
             wrap_width.to_bits().hash(&mut h);
+            if by_cols {
+                csim.state_key().hash(&mut h);
+            }
             for f in &rel {
                 (f.side, f.w.to_bits(), f.top.to_bits(), f.bottom.to_bits()).hash(&mut h);
             }
@@ -622,9 +676,13 @@ fn relayout(
                 let lines: Vec<Range<usize>> = paras[pr.clone()].iter().map(|q| q.range.clone()).collect();
                 Arc::new(grid::plan(text, &a, &lines, p, wrap_width).rel(w.start))
             });
-            let laid: Vec<Arc<Galley>> = ctx.fonts_mut(|f| match &geom {
-                Some(g) => layout_table_lines(f, &job, &relp, g, p, wrap_width, ppp, min_h),
-                None => relp.iter().map(|q| layout_para_floats(f, &job, q, wrap_width, ppp, &rel)).collect(),
+            let laid: Vec<Arc<Galley>> = ctx.fonts_mut(|f| match (&geom, pages) {
+                (Some(g), _) => layout_table_lines(f, &job, &relp, g, p, wrap_width, ppp, min_h),
+                (None, Some(pg)) if by_cols => {
+                    let mut sim = csim.clone();
+                    relp.iter().map(|q| layout_para_cols(f, &job, q, wrap_width, ppp, &mut sim, pg, sec)).collect()
+                }
+                (None, _) => relp.iter().map(|q| layout_para_floats(f, &job, q, wrap_width, ppp, &rel)).collect(),
             });
             let gs = Arc::new(laid);
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
@@ -636,7 +694,12 @@ fn relayout(
             let hs: Vec<f32> = laid_out.0.iter().flat_map(|lg| lg.rows.iter().map(|r| r.row.size.y)).collect();
             let min_w = t.place(g, sec, hs);
             if min_w < wrap_width - 0.5 {
-                wrap_width = min_w;
+                // Utan flytande bilder delas stycket vid spaltgränsen; annars får hela stycket den smalaste bredden.
+                if rel.is_empty() {
+                    by_cols = true;
+                } else {
+                    wrap_width = min_w;
+                }
                 retry = true;
                 continue;
             }
@@ -723,7 +786,7 @@ fn relayout(
     };
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec, balance);
             // Tabellernas kolumnkanter följer med raderna i sidled.
             for (t, r) in geoms.iter_mut().zip(&geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
@@ -744,7 +807,7 @@ fn relayout(
     }
     st.geoms = Arc::new(geoms);
     st.notes = Arc::new(note_layouts);
-    g
+    (g, csim.runs)
 }
 
 /// Stycken som läggs ut tillsammans: ett vanligt stycke, eller alla rader i en tabell.
@@ -2060,6 +2123,85 @@ fn layout_para_floats(
     let whole = Arc::new(clip_job(full, para.range.clone()));
     let mut g = Galley::concat(whole, &pieces, ppp);
     // Delningen är ingen radbrytning i texten.
+    let mut at = 0;
+    for pc in &pieces[..pieces.len() - 1] {
+        at += pc.rows.len();
+        g.rows[at - 1].ends_with_newline = false;
+    }
+    Arc::new(g)
+}
+
+/// Lägger ut ett stycke som går över flera spalter med olika bredd: raderna i varje spalt bryts i den
+/// spaltens bredd (stycket delas vid spaltgränsen, som i Word och LibreOffice). `sim` är spaltfyllnaden
+/// där stycket börjar och följer med genom stycket; `first_w` är bredden på spalten stycket börjar i.
+#[allow(clippy::too_many_arguments)]
+fn layout_para_cols(
+    fonts: &mut FontsView<'_>,
+    full: &LayoutJob,
+    para: &Para,
+    first_w: f32,
+    ppp: f32,
+    sim: &mut super::secpages::ColSim,
+    geom: &super::pages::Geom,
+    sec: usize,
+) -> Arc<Galley> {
+    if para.range.is_empty() || !first_w.is_finite() {
+        return layout_para(fonts, full, para, first_w, ppp);
+    }
+    let mut pieces: Vec<Arc<Galley>> = Vec::new();
+    let mut cur = para.clone();
+    let mut width = first_w;
+    // Varje varv går vidare en spalt eller lägger ut resten av stycket; taket skyddar mot oändlig slinga.
+    for _ in 0..2000 {
+        let cont = !pieces.is_empty();
+        let (g, _) = layout_piece(fonts, full, &cur, width, 0.0, ppp, None, cont, true);
+        let hs: Vec<f32> = g.rows.iter().map(|r| r.row.size.y).collect();
+        match sim.probe(geom, sec, &hs) {
+            // Hela resten går till nästa spalt: lägg ut den i den spaltens bredd.
+            Some((0, w2)) => {
+                sim.advance(geom, sec);
+                if (w2 - width).abs() < 0.5 {
+                    // Samma bredd: utläggningen gäller redan.
+                    sim.place(geom, sec, hs.iter().copied());
+                    pieces.push(g);
+                    break;
+                }
+                width = w2;
+            }
+            // Raderna före `k` ryms i spalten; resten läggs ut i nästa spalts bredd.
+            Some((k, w2)) => {
+                let before = if cont { 0.0 } else { para.space_before };
+                let cut_y = g.rows[k].pos.y - before;
+                let (g1, consumed) = layout_piece(fonts, full, &cur, width, 0.0, ppp, Some(cut_y), cont, false);
+                sim.place(geom, sec, g1.rows.iter().map(|r| r.row.size.y));
+                pieces.push(g1);
+                let Some(n) = consumed else { break };
+                let text = &full.text[cur.range.clone()];
+                let Some((off, _)) = text.char_indices().nth(n) else { break };
+                cur.range.start += off;
+                cur.list = cur.list.map(|l| ListGeom { marker_chars: 0, ..l });
+                sim.advance(geom, sec);
+                width = w2;
+                if cur.range.is_empty() {
+                    break;
+                }
+            }
+            None => {
+                sim.place(geom, sec, hs.iter().copied());
+                pieces.push(g);
+                break;
+            }
+        }
+    }
+    if pieces.is_empty() {
+        return layout_para(fonts, full, para, first_w, ppp);
+    }
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_else(|| unreachable!());
+    }
+    let whole = Arc::new(clip_job(full, para.range.clone()));
+    let mut g = Galley::concat(whole, &pieces, ppp);
+    // Delningen vid spaltgränsen är ingen radbrytning i texten.
     let mut at = 0;
     for pc in &pieces[..pieces.len() - 1] {
         at += pc.rows.len();

@@ -66,7 +66,7 @@ const MAX_ZOOM: f32 = 3.0;
 const GAP: f32 = 24.0;
 
 /// En bild som lästs in för dokumentläget.
-struct ImgInfo {
+pub(crate) struct ImgInfo {
     /// Naturlig storlek i px (utan zoom).
     size: Vec2,
 }
@@ -108,7 +108,7 @@ enum SpellAct {
 
 #[derive(Default)]
 pub struct State {
-    images: HashMap<(u64, String), Option<ImgInfo>>,
+    pub(crate) images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
     /// Vald bild, pågående storleksändring.
     pub(crate) img: images::State,
@@ -1482,7 +1482,7 @@ impl KladdApp {
                     }
                     // Varje ark har sin egen storlek: sidhuvudet och sidfoten följer arkets mått.
                     let page_hf = hf_plan.page(&hf_pages, k, &hf_fields);
-                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, &page_hf, &analysis.defaults, hf_font.clone(), doc_id, z, &hf_imgs) {
+                    if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, &page_hf, &analysis.defaults, hf_font.clone(), &|b, i| font_family(Some(analysis.defaults.font()), b, i), doc_id, z, &hf_imgs) {
                         open_hf_dlg = Some((footer, k));
                     }
                 }
