@@ -107,12 +107,140 @@ sammanfogning ~25 ms vid 2000 sidor), så att skriva på sida 1500 av 2000 ligge
 16 ms. Nästa steg är ett galleri som bara lägger ut och fogar ihop sidorna nära vyn (och uppskattade höjder
 för resten), vilket kräver att `word/view.rs` slutar anta att galleriet täcker hela dokumentet.
 
+## Öppna stora Word-dokument (100–400 sidor)
+
+Mål: första sidan syns direkt och fönstret fryser aldrig, hur stort dokumentet än är.
+
+### Mätning
+
+`bench_docx_open` i `src/word/bench.rs` (ignorerat test) läser ett `.docx`/`.odt` och mäter varje steg, och en
+stegvis öppning som i appen. Testdokumenten byggs av `tests/corpus/docx/gen-skolrapport.docx` upprepad N gånger
+(rubriker, tabeller, bilder, fotnoter, tvåspaltsavsnitt, textrutor, sidhuvud; skriptet ligger inte i repot, det
+räcker att klistra in dokumentets `<w:body>` N gånger och numrera om fotnoterna):
+
+```
+cargo test --no-run
+KLADD_BENCH_DOCX=stor.docx target/debug/deps/kladd-<hash> --ignored bench_docx_open --nocapture --test-threads=1
+```
+
+`KLADD_BENCH_NO_INCR=1` slår av den inkrementella analysen (så som det var före, för jämförelse), `KLADD_BENCH_VERBOSE=1`
+skriver varje bildrutas analystid och varför den inkrementella analysen avstod, `KLADD_BENCH_DUMP=fil` sparar Markdown.
+Alla siffror är debugbygge (inte `--release`; disken räckte inte till ett optimerat bygge) på en delad 4-kärnig maskin,
+så de varierar ±30 %. Ett optimerat bygge har inte mätts; det brukar vara en tiondel av debugtiden i layout och analys.
+
+| Dokument | 202 sidor (330 kB Markdown) | 323 sidor (528 kB) | 376 sidor (624 kB, mycket unik text) |
+|---|---|---|---|
+| Läsning zip/XML till Markdown | 0,4–0,6 s | 0,7–0,9 s | 0,6 s |
+| Markup-analys, hel text | 80–110 ms | 125–185 ms | 155 ms |
+| Stavning, kall (svensk ordlista) | 20–45 ms | 25–30 ms | – |
+| Utläggning + sidindelning, kall | 2,0–2,6 s | 2,8–3,8 s | 6,8 s |
+| Före: fönstret frös under läsning + analys + utläggning | ca 3,0 s | ca 4,7 s | ca 7,6 s |
+| Efter: längsta bildruta, stegvis | 0,3–0,4 s | 0,4–0,6 s | 0,4 s |
+| Efter: första sidan syns | efter första bildrutan | efter första bildrutan | efter första bildrutan |
+| Efter: allt utlagt (tid i bildrutor) | 3,2–3,8 s i 16 bildrutor | 6,1–8,1 s i 22–25 bildrutor | 13,6 s i 51 bildrutor |
+| Tangenttryck, median av 8 ställen: före | 203 ms | 370 ms | 437 ms |
+| Tangenttryck, median av 8 ställen: efter | 135 ms | 290 ms | 302 ms |
+| Tangenttryck, sämsta av 8: före / efter | 252 / 213 ms | 449 / 578 ms | 544 / 415 ms |
+| Oförändrad bildruta | 0,1 ms | 0,1 ms | 0,1 ms |
+
+Slutsatser av mätningen: textformningen av styckena (`loop`, 1,9–6,5 s kallt) är helt dominerande vid öppning;
+läsningen är nästa (0,4–0,9 s) och analysen av hela texten (80–185 ms) kommer en gång vid öppning och igen vid varje
+tangent som inte går att analysera inkrementellt. Stavningskontrollen är ingen flaskhals (styckecache, ordcache och
+ordlistan läses i en bakgrundstråd), och styckecachen träffar: ett tecken ger 1–3 omlagda stycken av över tusen.
+
+### Vad som gjordes
+
+- **Läsning i bakgrunden** (`bigfiles::wants_background`): `.docx`, `.dotx` och `.odt` över 100 kB (packat) läses i
+  samma bakgrundstråd som stora textfiler, med förloppsruta (stapeln står på 90 % när filen är läst och tolkningen
+  återstår). Under tiden fryser ingenting och inga andra flikar påverkas. Startar Kladd med en sådan fil som argument
+  är `KladdApp::new` klar efter ca 100 ms i stället för efter läsningen.
+- **Stegvis utläggning** (`word/layout_lazy.rs`, `Cache::galley_paged_lazy`): `relayout_pass` lägger ut stycken tills
+  tiden för stycken som inte finns i styckecachen överstiger budgeten (25 ms, växer till 120 ms per bildruta, och
+  alltid minst lika mycket som resten av varvet). Resten av dokumentet blir platshållare: stycken med rätt antal
+  tecken men utan glyfer, en höjd uppskattad från de stycken som redan lagts ut, och inget att rita. Sidindelning och
+  fotnoter körs som vanligt över galleriet, så sidantal och rullningslist är uppskattade tills allt är klart, och
+  statusraden visar *Sida X av ca N (lägger ut dokumentet: Y %)*. Nästa bildruta fortsätter där den förra slutade
+  (färdiga stycken kommer ur cachen) och till slut är resultatet detsamma som i en enda omgång: samma kod och samma
+  nycklar, galleriet jämförs med `==` i `lazy_tests`. Ett ofullständigt galleri cachas aldrig som bildrutans galleri
+  och spalt-jämningen görs först när allt är utlagt.
+- **Hopp och tangenter**: en tangent (text, piltangenter, `Ctrl+End`), `scroll_to_char` (sök, rubrikträd, fotnotshopp)
+  och att bara platshållare syns i fönstret ger ett komplett galleri direkt (budget `None`); syns platshållare längst
+  ned i fönstret får nästa bildruta 250 ms. Dokument under 60 kB läggs alltid ut i en omgång, som förut.
+- **Inkrementell analys för Word-dokument** (`word/incr.rs`): fotnoter och avsnitt (vanliga i Word-dokument) gav
+  tidigare alltid full analys av hela texten vid varje tangent. Nu räcker det att fönstret (stycket med ändringen och ett
+  stycke på var sida) inte rör dem: fotnotsreferenser tolkas med en tillfällig definition per etikett efter fönstret,
+  avsnitten efter fönstret flyttas med texten, `<div align>`-block hålls hela genom att fönstret vidgas, och gamla bitar
+  klipps vid fönstrets kant (bitar slås ihop över styckegränser). Kontrollerna är strängare än förut (raderna före och
+  efter raden med ändringen jämförs med den gamla analysen), och fuzz mot `markup::analyze` ingår som test, med fotnoter,
+  avsnitt och trasig markup i dokumenten (`KLADD_FUZZ_SEEDS=150` kör fler frön). Fuzzningen hittade en gammal brist: en
+  bit som sträckte sig över fönstrets kant gav en annan tolkning av kanten; den är rättad.
+
+### Kvar
+
+- Tangenttryck i ett stort dokument kostar fortfarande styckeloopens nycklar (0,1 ms per stycke i debug, `unit_key`
+  hashar hela styckets text och bitar), sidindelningen och sammanfogningen över hela galleriet: 100–300 ms i debug,
+  uppskattat en tiondel optimerat. Nästa steg är det som står ovan (galleri bara nära vyn).
+- Den inkrementella analysen avstår fortfarande vid referenslänkar, kodstaket, första raden, avsnittsrader i fönstret,
+  fotnotsdefinitioner och ändringar nära dem (4 kB), och när kontrollerna i fönstrets kant inte stämmer.
+- Platshållarnas höjd är en uppskattning (sidantalet i statusraden kan skilja några procent), och bildrutor med
+  platshållare ritas utan text för dem. Analysen av hela texten vid öppning (80–185 ms i debug) görs fortfarande i
+  första bildrutan; den skulle kunna göras i inläsningstråden.
+- Bilder avkodas av egui:s bildinläsare och påverkar inte layouten förrän storleken är känd (`word_image` rensar då
+  layoutcachen, en gång per bild), så ett dokument med hundratals bilder lägger ut om en gång i början.
+
 ## PDF-visaren
 
 Layouten (`build_layout`) är O(sidor) med binärsökning, miniatyrpanelen är virtualiserad och texturcachen har
 tak (256 MB, 240 miniatyrer). Nytt: textlagren (`PageText`, ~0,2 MB per sida) har tak (`MAX_TEXT_PAGES` = 160)
 och släpps långt från vyn; sidor som redan sökts hämtas inte om, den aktuella träffens sida hämtas vid behov
 och "markera allt" behåller allt. `find_status` bygger inte längre träfflistan varje bildruta.
+
+## PDF-export (`pdf_write.rs`)
+
+Mätning: `src/pdf_bench.rs` (`pdf_bench`, bygger ett stort dokument av `gen-skolrapport.docx` och
+`gen-nyhetsbrev.docx` upprepade `KLADD_BENCH_PDF_REPS` gånger, standard 40 = 961 sidor med spaltavsnitt,
+fotnoter, tabeller, bilder, textrutor och innehållsförteckning) och `balance_bench` i `pdf_section_tests.rs`
+(`KLADD_BENCH_PDF_SECTIONS` spaltavsnitt, jämför nya och gamla utjämningen). Båda är `#[ignore]`; fasernas
+tider skrivs med `KLADD_TIMING=1`. Opt-level 2 bara för kladd och PDF-beroendena i samma målkatalog (ingen
+fullständig optimerad byggnad, disken räcker inte):
+
+```
+args=(); for p in kladd krilla rustybuzz skrifa read-fonts ttf-parser subsetter write-fonts pdf-writer flate2 miniz_oxide png zlib-rs fdeflate kurbo tiny-skia-path image-webp zune-jpeg hashbrown indexmap smallvec crc32fast; do args+=(--config "profile.dev.package.$p.opt-level=2"); done
+KLADD_TIMING=1 KLADD_BENCH_PDF_REPS=40 cargo test "${args[@]}" pdf_bench -- --ignored --nocapture
+```
+
+| Fas (961 sidor, opt-level 2) | Före | Efter |
+|---|---|---|
+| Förberedelse (rensning, tolkning) | 24 ms | 22–32 ms |
+| Utläggning inkl. utjämning (första passet) | 113 + 115 ms | 64–68 ms |
+| Utläggning, pass för innehållsförteckning | 118 ms | 77 ms |
+| Sidhuvud och sidfot | 760 ms | 15 ms |
+| Ritning av sidor (formning, krilla) | 5 820 ms | 2 850 ms |
+| Skrivning (delmängder, komprimering) | 85 ms | 83 ms |
+| **Hela exporten** | **7,1 s** | **3,1–3,2 s** |
+| 67 sidor, debug (opt-level 0) | 16,2 s | 2,4 s |
+| 150 spaltavsnitt (123 sidor), bara utläggning | 31–34 s | 0,36–0,45 s |
+| 40 spaltavsnitt (32 sidor), debug | 22,2 s | 0,41 s |
+
+(Delad 4-kärnig maskin, ±30 %.) PDF:erna för 19 och 67 sidor är byte för byte lika före och efter.
+
+Vad som tog tid och vad som gjordes:
+
+- **Utjämning av spalter.** Förut lades hela dokumentet ut för varje försök i binärsökningen per avsnitt
+  (kvadratiskt). `Layout::run_balanced` lägger ut avsnitten ett i taget framåt: vid början av varje avsnitt tas
+  en ögonblicksbild (`Layout::snapshot`, allt utom de växande listorna, plus den senaste sidan) och sökningen
+  återställer den (`rollback`) och lägger bara ut det avsnittet igen. Sidorna före avsnittet påverkas inte av
+  dess spalthöjd. Den gamla metoden finns kvar som referens i `pdf_section_tests.rs`
+  (`lay_out_reference`) och ett test jämför sidor, positioner och spalthöjder.
+- **Bilder.** Sidhuvudets bilder avkodades för varje sida och bodybilder i varje pass; `Layout::load_pic`
+  sparar den avkodade bilden per källa (delas mellan passen) och sidhuvudet lägger in varje bild en gång.
+- **Textmätning.** Mätcachen och typsnittsytorna delas mellan passen (`Rc`), och cachen slår upp utan att
+  allokera en nyckelsträng.
+- **Formning vid ritning.** `Surface::draw_text` tolkar om hela typsnittets tabeller för varje textkörning.
+  Nu formas texten med `Shaper` (återanvända typsnittsytor och formningsplaner, samma glyfer som
+  `rustybuzz::shape`, testat) på upp till 8 trådar, 32 sidor i taget, och ritas med `draw_glyphs`.
+- Återstår: formningen och krillas `draw_glyphs` är nu det mesta av tiden (~3 s för 125 000 textkörningar);
+  PDF-exporten körs fortfarande på gränssnittstråden (Arkiv → Spara som PDF och utskrift).
 
 ## Stavning och grammatik
 

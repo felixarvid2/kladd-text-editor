@@ -4,6 +4,17 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.6.1] – 2026-11-23
+
+### Nytt
+
+- **Stora Word-dokument öppnas utan att fönstret fryser.** En `.docx` eller `.odt` över 100 kB läses in i en bakgrundstråd med förlopp (som stora textfiler), och i dokumentläget läggs dokumentet ut stegvis: tills tidsbudgeten per bildruta är slut läggs stycken ut på riktigt, resten ersätts av platshållare med uppskattad höjd, så första sidan syns direkt och resten fylls i under följande bildrutor. Statusraden visar *Sida X av ca N (lägger ut dokumentet: Y %)*; en tangent, ett hopp (sök, rubrikträd) eller att bara platshållare syns lägger ut resten direkt. Det färdiga galleriet är identiskt med det som lades ut på en gång (täcks av test), dokument under 60 kB påverkas inte, och en redigering lägger fortfarande bara om stycket som ändrats. Mätningar och verktyg (`bench_docx_open`) i `docs/dev/prestanda.md`.
+- **Snabbare tangenttryck i stora Word-dokument med fotnoter och avsnitt.** Den inkrementella analysen (bara stycket med ändringen och dess grannar tolkas om) gäller nu också dokument med fotnoter och avsnitt, som tidigare alltid tolkades om i sin helhet vid varje tangent, och rättar en gammal brist där en lång bit över fönstrets kant kunde ge en annan tolkning än full analys.
+
+### Rättat
+
+- **PDF-exporten av stora dokument är mycket snabbare.** Utjämningen av spalter på avsnittets sista sida lade ut hela dokumentet om för varje försök (kvadratisk tid med många spaltavsnitt: 150 spaltavsnitt tog 31 s, nu 0,4 s); nu läggs varje avsnitt ut en gång och bara det avsnittet läggs om vid sökningen, med exakt samma resultat. Sidhuvudets och sidfotens bilder avkodades på varje sida och bilder avkodades på nytt i varje utläggningspass (nu en gång per export), orden mäts en gång per export i stället för en gång per pass och texten formas på flera trådar utan att varje textrad tolkar om typsnittet. Dokument med 961 sidor (spaltavsnitt, fotnoter, tabeller, bilder och textrutor) tar 3 s i stället för 7 s och PDF:en är byte för byte densamma. `KLADD_TIMING=1` skriver tiden per fas vid export. Se `docs/dev/prestanda.md`.
+
 ## [2.6.0] – 2026-11-23
 
 ### Nytt

@@ -406,3 +406,217 @@ fn fact_box_of_the_school_report_is_in_the_margin_in_the_pdf() {
     assert!(beside.len() >= 4, "{beside:?}");
     assert!(t.iter().all(|t| t.0 < rx - 1.0 || t.0 >= rx), "ingen text startar under rutan");
 }
+
+// ---- Referens: den gamla metoden, som lägger ut hela dokumentet om för varje försök att jämna ut en
+// ---- spaltsida. Behålls här för att kontrollera att den snabbare `run_balanced` ger samma sidor.
+
+fn lay_out_reference<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
+    let toc_entries: Vec<(u8, String)> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Heading(l, spans, _) if *l <= 3 => {
+                let t: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
+                (!t.trim().is_empty()).then(|| (*l, t.trim().to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
+    let reserve = hf_reserve(blocks, defaults);
+    let pass = |toc_pos: Vec<(usize, f32)>, balance: &[(usize, usize, f32)]| -> Layout<'a> {
+        let mut lay = Layout::new(resolve, defaults);
+        lay.hf_reserve = Rc::new(reserve.clone());
+        lay.toc_entries = Rc::new(toc_entries.clone());
+        lay.toc_pos = toc_pos;
+        lay.notes = Rc::new(notes.to_vec());
+        lay.balance = balance.to_vec();
+        lay.new_page();
+        lay.run(blocks);
+        lay.flush_rules();
+        lay.flush_notes();
+        lay
+    };
+    let balance = balance_columns_reference(&|b| pass(Vec::new(), b));
+    let mut lay = pass(Vec::new(), &balance);
+    if blocks.iter().any(|b| matches!(b, Block::Toc)) {
+        let pos: Vec<(usize, f32)> =
+            lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
+        lay = pass(pos, &balance);
+    }
+    lay
+}
+
+/// Jämnar ut spalterna på avsnittets sista sida före varje löpande avsnittsbyte (som Word och
+/// LibreOffice; inte sist i dokumentet och inte när avsnittet har en manuell spaltbrytning på sidan).
+/// `pass` lägger ut hela dokumentet med givna spalthöjder (avsnitt, sida, höjd från spalternas
+/// överkant). Per byte söks lägsta höjd där allt ryms kvar på sidan: först ur ytan delad på spaltbredden,
+/// sedan med växande steg och halvering. Resultatet är höjderna att lägga ut dokumentet med.
+fn balance_columns_reference<'a>(pass: &dyn Fn(&[(usize, usize, f32)]) -> Layout<'a>) -> Vec<(usize, usize, f32)> {
+    let mut fixed: Vec<(usize, usize, f32)> = Vec::new();
+    let mut done: Vec<usize> = Vec::new();
+    let mut lay = pass(&fixed);
+    while let Some(e) = lay.sec_ends.iter().find(|e| !done.contains(&e.sec)) {
+        let (sec, page, top, step) = (e.sec, e.page, e.top, e.step.max(1.0));
+        let full = e.bottom - top;
+        let low = (e.area / e.width.max(1.0)).max(step);
+        let skip = e.skip || low >= full - 0.5;
+        done.push(sec);
+        if skip {
+            continue;
+        }
+        // Ryms allt på sidan med spalthöjden `h`? Då slutar avsnittet på samma sida.
+        let fits = |h: f32| -> Option<Layout<'a>> {
+            let mut b = fixed.clone();
+            b.push((sec, page, h));
+            let l = pass(&b);
+            l.sec_ends.iter().find(|e| e.sec == sec).is_some_and(|e| e.page == page).then_some(l)
+        };
+        let (mut lo, mut hi, mut best) = (low - step * 0.5, full, None);
+        // Växande steg uppåt från den lägsta möjliga höjden, sedan halvering.
+        let mut grow = step;
+        let mut h = low;
+        while h < full - 0.5 {
+            if let Some(l) = fits(h) {
+                best = Some((h, l));
+                hi = h;
+                break;
+            }
+            lo = h;
+            h = (h + grow).min(full);
+            grow *= 2.0;
+        }
+        while best.is_some() && hi - lo > 2.0 {
+            let mid = (lo + hi) / 2.0;
+            match fits(mid) {
+                Some(l) => {
+                    best = Some((mid, l));
+                    hi = mid;
+                }
+                None => lo = mid,
+            }
+        }
+        if let Some((h, l)) = best {
+            fixed.push((sec, page, h));
+            lay = l;
+        }
+    }
+    fixed
+}
+
+/// Alla sidors innehåll som text (avrundade mått), för jämförelse.
+fn page_signature(l: &Layout) -> Vec<String> {
+    l.pages
+        .iter()
+        .map(|p| {
+            let ops: Vec<String> = p
+                .ops
+                .iter()
+                .map(|o| match o {
+                    Op::Text { x, y, text, size, .. } => format!("T {x:.2} {y:.2} {size} {text}"),
+                    Op::Rect { x, y, w, h, .. } => format!("R {x:.2} {y:.2} {w:.2} {h:.2}"),
+                    Op::Line { x1, y1, x2, y2, .. } => format!("L {x1:.2} {y1:.2} {x2:.2} {y2:.2}"),
+                    Op::Image { x, y, w, h, index, .. } => format!("I {x:.2} {y:.2} {w:.2} {h:.2} {index}"),
+                    Op::Math { x, y, src, .. } => format!("M {x:.2} {y:.2} {src}"),
+                    Op::Link { x, y, w, h, url } => format!("K {x:.2} {y:.2} {w:.2} {h:.2} {url}"),
+                    Op::Goto { x, y, w, h, page, to_y } => format!("G {x:.2} {y:.2} {w:.2} {h:.2} {page} {to_y:.2}"),
+                })
+                .collect();
+            format!("{:?} sec{} {}", p.geom, p.sec, ops.join("|"))
+        })
+        .collect()
+}
+
+/// Dokument med flera spaltavsnitt (olika långa, 2 och 3 spalter, med fotnoter, spaltlinje, flersidiga
+/// avsnitt, en manuell spaltbrytning och `column-balance: no`) och en innehållsförteckning.
+fn many_column_sections_doc(n: usize) -> String {
+    let mut md = String::from("Rubrik\n\n<!-- kladd: toc -->\n\n# Början\n\n");
+    for i in 0..n {
+        let cols = if i % 3 == 2 { 3 } else { 2 };
+        let extra = match i % 7 {
+            3 => "; column-rule: yes",
+            5 => "; column-balance: no",
+            _ => "",
+        };
+        md.push_str(&format!("<!-- kladd: avsnitt; columns: {cols}; type: continuous{extra} -->\n\n## Avsnitt {i}\n\n"));
+        md.push_str(&filler(1 + (i * 5) % 17 + if i % 9 == 4 { 40 } else { 0 }));
+        if i % 4 == 1 {
+            md.push_str(&format!("Text med not[^n{i}].\n\n[^n{i}]: Noten för avsnitt {i}.\n\n"));
+        }
+        if i % 6 == 5 {
+            md.push_str("<!-- kladd: spaltbrytning -->\n\nEfter brytningen.\n\n");
+        }
+        md.push_str("<!-- kladd: avsnitt; type: continuous -->\n\n");
+        md.push_str(&filler(1 + i % 3));
+    }
+    md.push_str("Slut\n");
+    md
+}
+
+/// Den snabbare utjämningen (ett avsnitt i taget) ger samma sidor och positioner som att lägga ut
+/// hela dokumentet om för varje försök.
+#[test]
+fn balancing_one_section_at_a_time_matches_the_old_whole_document_method() {
+    for md in [balanced_doc("2", 6), balanced_doc("3", 9), balanced_doc("2", 60), many_column_sections_doc(14)] {
+        let many = md.contains("Avsnitt 13");
+        let (blocks, notes) = parse_blocks_notes(&md);
+        let defaults = doc_defaults(&md);
+        let resolve: &dyn Fn(&str) -> Option<DocImage> = &|_| None;
+        let new = lay_out(&blocks, &notes, &defaults, resolve);
+        let old = lay_out_reference(&blocks, &notes, &defaults, resolve);
+        assert!(new.pages.len() >= 1);
+        assert_eq!(new.balance, old.balance, "spalthöjderna");
+        let (a, b) = (page_signature(&new), page_signature(&old));
+        assert_eq!(a.len(), b.len(), "antal sidor");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x, y, "sida {i}");
+        }
+        assert_eq!(new.headings.len(), old.headings.len());
+        if many {
+            assert!(new.balance.len() >= 6, "många avsnitt ska ha jämnats ut: {:?}", new.balance);
+        }
+    }
+}
+
+/// Mätning (`KLADD_BENCH_PDF_SECTIONS`, standard 150 avsnitt): utläggningstiden för många spaltavsnitt
+/// med den gamla och den nya utjämningen. `cargo test balance_bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn balance_bench() {
+    let n: usize = std::env::var("KLADD_BENCH_PDF_SECTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+    let md = many_column_sections_doc(n);
+    let (blocks, notes) = parse_blocks_notes(&md);
+    let defaults = doc_defaults(&md);
+    let resolve: &dyn Fn(&str) -> Option<DocImage> = &|_| None;
+    let t = std::time::Instant::now();
+    let new = lay_out(&blocks, &notes, &defaults, resolve);
+    let t_new = t.elapsed();
+    let t = std::time::Instant::now();
+    let old = lay_out_reference(&blocks, &notes, &defaults, resolve);
+    let t_old = t.elapsed();
+    assert_eq!(page_signature(&new), page_signature(&old));
+    eprintln!("balance_bench: {n} avsnitt, {} sidor, {} utjämnade: ny {:.2} s, gammal {:.2} s", new.pages.len(), new.balance.len(), t_new.as_secs_f64(), t_old.as_secs_f64());
+}
+
+/// Delade formningsplaner ger samma glyfer som `rustybuzz::shape` (också för text utan skrift och för
+/// blandade skrifter).
+#[test]
+fn shared_shape_plans_give_the_same_glyphs_as_rustybuzz() {
+    let shaper = Shaper::new();
+    let texts = ["Hej", "Åsa fick ﬁn smörgås", "12 345", "   ", "", "fi fl ffi", "Ünïcödé — “citat” …", "x²+y²", "مرحبا", "日本語", "AV To Wa", "1,5 kr"];
+    for face in FACES {
+        for t in texts {
+            let mut a = rustybuzz::UnicodeBuffer::new();
+            a.push_str(t);
+            let mut b = rustybuzz::UnicodeBuffer::new();
+            b.push_str(t);
+            b.guess_segment_properties();
+            let want = rustybuzz::shape(&shaper.faces[&face], &[], b);
+            let got = shaper.shape(face, a);
+            let key = |g: &rustybuzz::GlyphBuffer| {
+                let p: Vec<_> = g.glyph_positions().iter().map(|p| (p.x_advance, p.x_offset, p.y_offset, p.y_advance)).collect();
+                let i: Vec<_> = g.glyph_infos().iter().map(|i| (i.glyph_id, i.cluster)).collect();
+                (i, p)
+            };
+            assert_eq!(key(&got), key(&want), "{face:?} {t:?}");
+        }
+    }
+}

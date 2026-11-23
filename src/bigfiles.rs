@@ -35,7 +35,9 @@ pub struct Loading {
 
 impl Loading {
     pub fn fraction(&self) -> f32 {
-        (self.progress.load(Ordering::Relaxed) as f32 / self.total.max(1) as f32).clamp(0.0, 1.0)
+        let f = (self.progress.load(Ordering::Relaxed) as f32 / self.total.max(1) as f32).clamp(0.0, 1.0);
+        // Word-filer: när filen är läst återstår att tolka den, så stapeln står på 90 %.
+        if is_word_file(&self.path) { f * 0.9 } else { f }
     }
 }
 
@@ -66,9 +68,23 @@ fn is_container(path: &Path) -> bool {
     matches!(ext.as_str(), "docx" | "dotx" | "doc" | "odt" | "pdf")
 }
 
+/// Word- och OpenDocument-filer över så här många byte (packade) läses i en bakgrundstråd: att packa upp
+/// och tolka XML tar sekunder för ett dokument på hundratals sidor.
+pub const WORD_BACKGROUND_BYTES: u64 = 100_000;
+
+/// Är det ett dokument som `Document::load` gör om till Markdown (`.docx`, `.dotx`, `.odt`)?
+fn is_word_file(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "docx" | "dotx" | "odt")
+}
+
 /// Ska filen läsas in i en bakgrundstråd?
 pub fn wants_background(path: &Path) -> bool {
-    !is_container(path) && std::fs::metadata(path).is_ok_and(|m| m.len() > bigtext::BACKGROUND_LOAD_BYTES)
+    let len = std::fs::metadata(path).map_or(0, |m| m.len());
+    if is_word_file(path) {
+        return len > WORD_BACKGROUND_BYTES;
+    }
+    !is_container(path) && len > bigtext::BACKGROUND_LOAD_BYTES
 }
 
 impl State {
@@ -390,9 +406,51 @@ mod tests {
         let small = dir.join("liten.txt");
         std::fs::write(&small, "hej").unwrap();
         assert!(!wants_background(&small));
-        let docx = dir.join("stor.docx");
-        std::fs::write(&docx, vec![b'a'; bigtext::BACKGROUND_LOAD_BYTES as usize + 1]).unwrap();
-        assert!(!wants_background(&docx));
+        // PDF och .doc går sin egen väg; Word- och ODT-filer läses i bakgrunden först när de är stora.
+        let pdf = dir.join("stor.pdf");
+        std::fs::write(&pdf, vec![b'a'; bigtext::BACKGROUND_LOAD_BYTES as usize + 1]).unwrap();
+        assert!(!wants_background(&pdf));
+        for name in ["stor.docx", "stor.odt", "stor.dotx"] {
+            let f = dir.join(name);
+            std::fs::write(&f, vec![b'a'; WORD_BACKGROUND_BYTES as usize + 1]).unwrap();
+            assert!(wants_background(&f), "{name}");
+            std::fs::write(&f, vec![b'a'; WORD_BACKGROUND_BYTES as usize]).unwrap();
+            assert!(!wants_background(&f), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ett stort Word-dokument som läses i bakgrunden blir exakt samma dokument som vid vanlig läsning.
+    #[test]
+    fn word_document_loaded_in_background_equals_direct_load() {
+        let dir = std::env::temp_dir().join(format!("kladd-big-word-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = crate::word::bench::big_markdown(500_000, 11);
+        let bytes = crate::docx::write(&md, "Stor", &|_| None, None).unwrap().bytes;
+        let path = dir.join("stor.docx");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(wants_background(&path), "{} byte", bytes.len());
+        let direct = Document::load(7, &path).unwrap();
+        let ctx = Context::default();
+        let mut st = State::default();
+        st.spawn_load(&ctx, 7, &path, None);
+        assert!(st.is_loading(&path));
+        let t0 = Instant::now();
+        let mut done = Vec::new();
+        while done.is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(120), "inläsningen tog för lång tid");
+            std::thread::sleep(Duration::from_millis(10));
+            done = st.poll_loads(&ctx);
+        }
+        let (p, loaded) = done.pop().unwrap();
+        assert_eq!(p, path);
+        let (doc, view) = loaded.ok().unwrap();
+        assert!(view.is_none() && doc.docx && doc.word_view);
+        assert_eq!(doc.text, direct.text);
+        assert_eq!(doc.images.len(), direct.images.len());
+        assert_eq!(doc.docx_dropped, direct.docx_dropped);
+        assert!(!doc.dirty);
+        assert!(!st.is_loading(&path));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

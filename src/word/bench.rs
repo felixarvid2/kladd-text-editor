@@ -96,11 +96,31 @@ fn ms(t: Instant) -> f64 {
 
 /// En bildruta i dokumentläget utan UI: det som `word_page` gör före TextEdit.
 fn frame(c: &mut layout::Cache, ctx: &egui::Context, text: &str, reveal: std::ops::Range<usize>) -> usize {
+    frame_lazy(c, ctx, text, reveal, None)
+}
+
+fn frame_lazy(
+    c: &mut layout::Cache,
+    ctx: &egui::Context,
+    text: &str,
+    reveal: std::ops::Range<usize>,
+    budget: Option<std::time::Duration>,
+) -> usize {
     let pal = theme::palette(false);
+    let t = Instant::now();
     let a = c.analysis(1, text);
+    let t_an = ms(t);
     let geom = pages::Geom::new(1.0, &a.defaults);
+    let t = Instant::now();
     let _tabs = c.tables(1, text);
     let _fonts = c.fonts(1, text);
+    if std::env::var_os("KLADD_BENCH_VERBOSE").is_some() {
+        eprintln!(
+            "    frame: analys/tillstånd {t_an:.1} ms, tabeller+typsnitt {:.1} ms (inkrementell analys avstod: {:?})",
+            ms(t),
+            super::incr::WHY.with(|w| w.borrow().last().copied())
+        );
+    }
     let img = |_: &str| None;
     let measure = measure_fn(ctx);
     let p = layout::Params {
@@ -113,7 +133,7 @@ fn frame(c: &mut layout::Cache, ctx: &egui::Context, text: &str, reveal: std::op
         font_family: &fam,
         fonts_gen: 0,
     };
-    let g = c.galley_paged(ctx, 1, text, &p, geom.text_w(), Some(&geom));
+    let g = c.galley_paged_lazy(ctx, 1, text, &p, geom.text_w(), Some(&geom), budget);
     pages::page_count(&g, &geom)
 }
 
@@ -280,4 +300,149 @@ fn bench_write_big_markdown() {
     if let Ok(p) = std::env::var("KLADD_BIG_MD") {
         std::fs::write(p, big_markdown(600_000, 7)).unwrap();
     }
+}
+
+/// Öppning av ett stort Word-dokument (`KLADD_BENCH_DOCX=sökväg`, se docs/dev/prestanda.md):
+/// läsning, analys, stavning, utläggning (med delsteg), en redigering och en oförändrad bildruta.
+#[test]
+#[ignore]
+fn bench_docx_open() {
+    let Ok(path) = std::env::var("KLADD_BENCH_DOCX") else { return };
+    // KLADD_BENCH_NO_INCR=1: full analys vid varje ändring (som före den inkrementella analysen för Word-dokument).
+    super::incr::DISABLED.store(std::env::var_os("KLADD_BENCH_NO_INCR").is_some(), std::sync::atomic::Ordering::Relaxed);
+    let bytes = std::fs::read(&path).unwrap();
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    in_ui(&ctx, || {});
+    let mut res: Vec<(String, f64)> = Vec::new();
+    let t = Instant::now();
+    let loaded = if path.ends_with(".odt") { crate::odt::read(&bytes) } else { crate::docx::read(&bytes) }.unwrap();
+    res.push(("läsning (zip/XML till Markdown)".into(), ms(t)));
+    let text = loaded.markdown;
+    if let Ok(p) = std::env::var("KLADD_BENCH_DUMP") {
+        std::fs::write(p, &text).unwrap();
+    }
+    let t = Instant::now();
+    let a = markup::analyze(&text);
+    res.push(("markup-analys".into(), ms(t)));
+    drop(a);
+    // Stavning: systemets svenska ordlista om den finns, annars en med dokumentets alla ord.
+    let dir = std::env::temp_dir().join(format!("kladd-bench-docx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sys = std::path::Path::new("/usr/share/hunspell");
+    let (paths, lang) = if sys.join("sv_SE.dic").exists() {
+        (vec![sys.to_path_buf()], "sv_SE")
+    } else {
+        let mut words: Vec<&str> = text.split(|c: char| !c.is_alphabetic()).filter(|w| !w.is_empty()).collect();
+        words.sort_unstable();
+        words.dedup();
+        std::fs::write(dir.join("xx_XX.aff"), "SET UTF-8\n").unwrap();
+        std::fs::write(dir.join("xx_XX.dic"), format!("{}\n{}\n", words.len(), words.join("\n"))).unwrap();
+        (vec![dir.clone()], "xx_XX")
+    };
+    let mut sp = crate::spell::Speller::with_paths(paths, dir.join("u.txt"), Some(lang));
+    let t0 = Instant::now();
+    while !sp.ready() {
+        assert!(t0.elapsed().as_secs() < 60);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    res.push(("(stavning: ordlistan laddad i bakgrunden)".into(), ms(t0)));
+    let a = markup::analyze(&text);
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    for pc in &a.pieces {
+        if pc.markup || pc.code || pc.link || pc.image.is_some() || matches!(pc.block, markup::Block::Code | markup::Block::Table) {
+            continue;
+        }
+        match spans.last_mut() {
+            Some(l) if l.end == pc.range.start => l.end = pc.range.end,
+            _ => spans.push(pc.range.clone()),
+        }
+    }
+    let mut per = std::collections::HashMap::new();
+    let t = Instant::now();
+    sp.misspelled_cached(&text, &spans, &mut per);
+    res.push(("stavning (kall, hela dokumentet)".into(), ms(t)));
+    let t = Instant::now();
+    sp.misspelled_cached(&text, &spans, &mut per);
+    res.push(("stavning (varm, oförändrad text)".into(), ms(t)));
+    let mut c = layout::Cache::default();
+    let mut pages_n = 0;
+    let mid = text[..text.len() / 2].rfind(' ').unwrap();
+    let mut edited = text.clone();
+    edited.insert(mid, 'x');
+    let mut first = text.clone();
+    // Första stycket efter rubrikraden/standardraden (en ändring på rad 1 ändrar dokumentets grundformat).
+    let at = text[text.find("\n\n").unwrap() + 2..].find(' ').unwrap() + text.find("\n\n").unwrap() + 2;
+    first.insert(at, 'x');
+    let mut stats = Vec::new();
+    in_ui(&ctx, || {
+        let t = Instant::now();
+        pages_n = frame(&mut c, &ctx, &text, 0..0);
+        res.push(("utläggning + sidindelning, kall (bildruta 1)".into(), ms(t)));
+        stats.push(("kall", c.stats(1)));
+        // Ett tecken i ett stycke på åtta ställen i dokumentet, varje gång från den oförändrade texten.
+        let mut times = Vec::new();
+        for k in 1..=8usize {
+            let mut at = text.len() * k / 9;
+            // Första tecknet i ett ord i löpande text (inte i markup eller en etikett).
+            while !text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic()) {
+                at += 1;
+            }
+            let mut e = text.clone();
+            e.insert(at, 'x');
+            frame(&mut c, &ctx, &text, 0..0);
+            let t = Instant::now();
+            frame(&mut c, &ctx, &e, 0..0);
+            times.push(ms(t));
+            stats.push(("tecken", c.stats(1)));
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        res.push(("tangenttryck: median av 8 ställen (hela bildrutan)".into(), times[times.len() / 2]));
+        res.push(("tangenttryck: sämsta av 8 ställen".into(), times[times.len() - 1]));
+        let _ = (&edited, &first);
+        frame(&mut c, &ctx, &text, 0..0);
+        let t = Instant::now();
+        for _ in 0..10 {
+            frame(&mut c, &ctx, &text, 0..0);
+        }
+        res.push(("oförändrad bildruta".into(), ms(t) / 10.0));
+    });
+    // Stegvis utläggning som i appen: budget per bildruta enligt `lazy_budget`, ny cache och nytt
+    // sammanhang (typsnittsatlasen är kall, som vid öppning).
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    in_ui(&ctx, || {});
+    let mut c2 = layout::Cache::default();
+    let (mut frames, mut worst, mut first, mut est) = (0u32, 0.0f64, 0.0f64, 0usize);
+    let t_all = Instant::now();
+    in_ui(&ctx, || loop {
+        let t = Instant::now();
+        let b = layout::lazy_budget(text.len(), frames, false, false);
+        let n = frame_lazy(&mut c2, &ctx, &text, 0..0, b);
+        let d = ms(t);
+        if frames == 0 {
+            first = d;
+            est = n;
+        }
+        worst = worst.max(d);
+        frames += 1;
+        if !c2.partial(1) {
+            break;
+        }
+    });
+    let all_ms = ms(t_all);
+    res.push((format!("stegvis: första bildrutan (uppskattat {est} sidor)"), first));
+    res.push((format!("stegvis: längsta bildrutan ({frames} bildrutor)"), worst));
+    res.push(("stegvis: summa tills allt är utlagt".into(), all_ms));
+    println!("--- {path}: {} KB markdown, {} sidor", text.len() / 1000, pages_n);
+    for (n, v) in res {
+        println!("{n:<48} {v:>10.1} ms");
+    }
+    for (n, s) in stats.into_iter().take(2) {
+        println!(
+            "  {n:<18} träffar {:>6} missar {:>6} varv {} | plan {:.0} loop {:.0} concat {:.0} sidor {:.0} ms",
+            s.hits, s.misses, s.varv, s.plan_ms, s.loop_ms, s.concat_ms, s.pages_ms
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

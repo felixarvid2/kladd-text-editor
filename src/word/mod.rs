@@ -30,6 +30,8 @@ pub mod view;
 #[cfg(test)]
 pub mod bench;
 #[cfg(test)]
+mod lazy_tests;
+#[cfg(test)]
 mod fn_tests;
 #[cfg(test)]
 mod fn_page_tests;

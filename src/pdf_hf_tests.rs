@@ -86,7 +86,7 @@ fn logo_is_drawn_and_pushes_the_body_down() {
     let defaults = doc_defaults(md);
     let resolve: &dyn Fn(&str) -> Option<DocImage> = &png;
     let mut lay = Layout::new(resolve, &defaults);
-    lay.hf_reserve = hf_reserve(&blocks, &defaults);
+    lay.hf_reserve = Rc::new(hf_reserve(&blocks, &defaults));
     assert!(lay.hf_reserve[0][0] >= 28.35 + 60.0 - 0.1, "{:?}", lay.hf_reserve);
 }
 

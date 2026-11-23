@@ -5,7 +5,9 @@
 //! ändringen är liten och lokal och när kanariestyckena fick samma bitar som i den gamla analysen
 //! (annars har ändringen påverkat något som sträcker sig över styckegränsen, t.ex. ett kodstaket
 //! eller en `<span>`, och hela texten tolkas om). Konstruktioner som är beroende av hela dokumentet
-//! (referenslänkar, fotnoter, avsnitt, kodstaket, indragen kod) ger alltid full analys.
+//! (referenslänkar, kodstaket, indragen kod) ger alltid full analys. Fotnoter och avsnitt, som är vanliga i
+//! Word-dokument, går bra så länge fönstret inte rör dem (fotnotsreferenser och -definitioner och avsnittsrader
+//! finns bara i fönster som innehåller `[^` respektive `avsnitt`, och de ger full analys).
 
 use std::ops::Range;
 
@@ -33,6 +35,10 @@ pub struct Delta {
 /// Uppdaterar `old` (analysen av `old_text`) på plats så att den blir analysen av `new_text`.
 /// `None` (och `old` orörd) om det inte går att göra säkert; då görs en full analys.
 pub fn analyze_incremental(old_text: &str, old: &mut Analysis, new_text: &str) -> Option<Delta> {
+    #[cfg(test)]
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     incremental(old_text, old, new_text, MIN_BYTES)
 }
 
@@ -110,13 +116,92 @@ fn para_end(t: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
+/// Finns det en oavslutad (eller överflödigt avslutad) HTML-kommentar? En sådan sväljer text över blankrader och ändrar
+/// tolkningen av stycken långt från ändringen.
+fn html_comments_open(t: &str) -> bool {
+    let b = t.as_bytes();
+    t.match_indices("<!--").any(|(i, _)| !t[i..line_end(b, i)].contains("-->"))
+}
+
+/// HTML-block som kan fortsätta över blankrader (oavslutad kommentar, `<pre>`, `<script>` …) och därför gör att något
+/// utanför fönstret kan tolkas annorlunda när en ändring avslutar eller öppnar dem.
+fn html_ctx(w: &str) -> bool {
+    if w.matches("<!--").count() != w.matches("-->").count() {
+        return true;
+    }
+    if !w.contains('<') {
+        return false;
+    }
+    let l = w.to_ascii_lowercase();
+    ["<pre", "<script", "<style", "<textarea", "<?", "<![cdata["].iter().any(|m| l.contains(m))
+}
+
+/// Står det en fotnotsdefinition (`[^n]:` först på en rad) i `t[lo..hi]` eller på 4 kB när den?
+fn near_def(t: &[u8], lo: usize, hi: usize) -> bool {
+    const NEAR: usize = 4096;
+    let (lo, hi) = (lo.saturating_sub(NEAR), (hi + NEAR).min(t.len()));
+    t[lo..hi].windows(2).enumerate().any(|(i, w)| w == b"]:" && t[line_start(t, lo + i)..].starts_with(b"[^"))
+}
+
+/// Bitarna i `pieces` (sorterade, utan glapp) klippta till `from..to`.
+fn clip(pieces: &[Piece], from: usize, to: usize) -> Vec<Piece> {
+    let i0 = pieces.partition_point(|p| p.range.end <= from);
+    let mut out = Vec::new();
+    for p in &pieces[i0..] {
+        if p.range.start >= to {
+            break;
+        }
+        let mut q = p.clone();
+        q.range = p.range.start.max(from)..p.range.end.min(to);
+        out.push(q);
+    }
+    out
+}
+
+/// Finns det referenslänkar (`[namn]: adress`)? De ändrar tolkningen av `[text][namn]` var som helst i dokumentet.
+/// Fotnotsdefinitioner (`[^n]: text`) räknas inte.
+fn has_link_defs(text: &str) -> bool {
+    let b = text.as_bytes();
+    text.match_indices("]:").any(|(i, _)| !b[line_start(b, i)..].starts_with(b"[^"))
+}
+
+/// Finns det text (utanför grundformatsraden på första raden) i `prefix`? Avsnittsscanningen räknar en avsnittsrad
+/// som första avsnittet om ingen text föregår den.
+fn has_content_before(prefix: &str) -> bool {
+    prefix.split_inclusive('\n').enumerate().any(|(i, l)| {
+        let t = l.trim();
+        !t.is_empty() && !(i == 0 && super::markup::DocDefaults::from_comment(t).is_some())
+    })
+}
+
 /// Konstruktioner vars tolkning beror på resten av dokumentet: då görs full analys.
 fn risky(s: &str) -> bool {
-    if s.contains("```") || s.contains("~~~") || s.contains("[^") || s.contains("]:") {
+    if s.contains("```") || s.contains("~~~") || s.contains("]:") {
         return true;
     }
     // Indragen kod och fortsättningsrader i listor.
     s.starts_with("    ") || s.starts_with('\t') || s.contains("\n    ") || s.contains("\n\t")
+}
+
+/// Etiketterna i fotnotsreferenserna (`[^etikett]`) i `w`; `None` om någon är ofullständig eller konstig.
+fn note_labels(w: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for (i, _) in w.match_indices("[^") {
+        let rest = &w[i + 2..];
+        let end = rest.find(']')?;
+        let l = &rest[..end];
+        if l.is_empty() || l.len() > 40 || l.chars().any(|c| c.is_whitespace() || matches!(c, '[' | ']' | '(' | ')' | '\\')) {
+            return None;
+        }
+        out.push(l.to_owned());
+    }
+    Some(out)
+}
+
+/// Finns definitionen `[^etikett]:` först på en rad i texten?
+fn has_def(t: &[u8], label: &str) -> bool {
+    let pat = format!("\n[^{label}]:");
+    t.starts_with(&pat.as_bytes()[1..]) || t.windows(pat.len()).any(|w| w == pat.as_bytes())
 }
 
 fn shifted(p: &Piece, delta: isize, base: usize) -> Piece {
@@ -125,6 +210,10 @@ fn shifted(p: &Piece, delta: isize, base: usize) -> Piece {
     q.range = mv(p.range.start)..mv(p.range.end);
     q
 }
+
+/// Mätningar (`bench`): slår av den inkrementella analysen för att jämföra med full analys vid varje ändring.
+#[cfg(test)]
+pub static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 thread_local! {
@@ -142,8 +231,8 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     if old_text.len() < min_bytes || new_text.len() < min_bytes {
         return decline(1);
     }
-    // Kodstaket, fotnoter och referenslänkar påverkar tolkningen över hela dokumentet.
-    if ["```", "~~~", "[^", "]:"].iter().any(|m| new_text.contains(m)) {
+    // Kodstaket och referenslänkar påverkar tolkningen över hela dokumentet (fotnotsdefinitioner `[^n]: text` gör inte det).
+    if new_text.contains("```") || new_text.contains("~~~") || has_link_defs(new_text) || html_comments_open(new_text) {
         return decline(13);
     }
     let (ob, nb) = (old_text.as_bytes(), new_text.as_bytes());
@@ -156,10 +245,14 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     if old_changed.len() > MAX_EDIT || new_changed.len() > MAX_EDIT {
         return decline(2);
     }
-    // Dokumentets grundformat och avsnitt står på/styrs av rader som en liten ändring kan ändra.
+    // Dokumentets grundformat står på första raden, som en liten ändring kan ändra.
     let first_line_end = line_end(ob, 0);
-    if pre <= first_line_end || old_text.contains("kladd: avsnitt") || new_text.contains("kladd: avsnitt") {
+    if pre <= first_line_end {
         return decline(3);
+    }
+    // Ett första avsnitt som tagit över en avsnittsrad kan ändras av text som skrivs före raden.
+    if old.sections.first().is_some_and(|s| s.marker.is_some()) {
+        return decline(14);
     }
     let delta = nb.len() as isize - ob.len() as isize;
 
@@ -168,26 +261,36 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     let mut ws = if edit_para == 0 { 0 } else { para_start(ob, edit_para - 1)? };
     let mid_end = para_end(ob, old_changed.end.min(ob.len().saturating_sub(1)).max(pre))?.max(old_changed.end);
     // Stycket efter: hoppa över blankraderna och ta nästa stycke.
-    let mut we_old = if mid_end >= ob.len() {
-        ob.len()
-    } else {
-        let mut ls = line_start(ob, mid_end);
+    let next_end = |from: usize| -> Option<usize> {
+        if from >= ob.len() {
+            return Some(ob.len());
+        }
+        let mut ls = line_start(ob, from);
         while ls < ob.len() && blank(ob, ls, line_end(ob, ls)) {
             ls = line_end(ob, ls) + 1;
         }
-        if ls >= ob.len() { ob.len() } else { para_end(ob, ls)? }
+        if ls >= ob.len() { Some(ob.len()) } else { para_end(ob, ls) }
     };
-    // Blankrader hör till de närliggande bitarna: fönstret ska börja och sluta mellan bitar.
-    let mut i0 = old.pieces.partition_point(|p| p.range.start < ws);
-    if i0 > 0 && old.pieces[i0 - 1].range.end > ws {
-        ws = old.pieces[i0 - 1].range.start;
-        i0 -= 1;
+    let mut we_old = next_end(mid_end)?;
+    // `<div align>` runt stycken (justerad text i Word-dokument): fönstret ska innehålla hela `<div>`-block, annars
+    // syns inte justeringen vid tolkning av fönstret för sig. Det vidgas till stycken tills blocken är hela.
+    for _ in 0..8 {
+        let w = &old_text[ws..we_old];
+        let (open, close) = (w.matches("<div").count(), w.matches("</div").count());
+        if open == close {
+            break;
+        }
+        if open > close {
+            if we_old >= ob.len() {
+                return decline(16);
+            }
+            we_old = next_end(we_old)?;
+        } else if ws == 0 {
+            return decline(16);
+        } else {
+            ws = para_start(ob, ws - 1)?;
+        }
     }
-    let mut i1 = old.pieces.partition_point(|p| p.range.start < we_old);
-    if i1 > 0 && old.pieces[i1 - 1].range.end > we_old {
-        we_old = old.pieces[i1 - 1].range.end;
-    }
-    i1 = old.pieces.partition_point(|p| p.range.start < we_old);
     if we_old - ws > MAX_WINDOW {
         return decline(4);
     }
@@ -199,42 +302,94 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     if risky(old_win) || risky(new_win) {
         return decline(6);
     }
-    if (i0 > 0 && old.pieces[i0 - 1].range.end > ws) || (i1 > 0 && old.pieces[i1 - 1].range.end > we_old) {
+    // Giltigheten av en fotnotsreferens beror på att definitionen står först i ett stycke var som helst i dokumentet:
+    // en ändring nära en definition (i praktiken längst ned i dokumentet) ger full analys.
+    if near_def(ob, ws, we_old) || near_def(nb, ws, we_new) {
+        return decline(17);
+    }
+    // Avsnittsrader i fönstret (eller en ny): avsnitten räknas om med full analys.
+    if old_win.contains("avsnitt") || new_win.contains("avsnitt") {
+        return decline(3);
+    }
+    // Texten före första avsnittsraden får inte ha blivit tom (då blir raden det första avsnittet).
+    if let Some(m) = old.sections.iter().skip(1).find_map(|s| s.marker.as_ref()).map(|m| m.start) {
+        if pre < m && !has_content_before(&new_text[..(m as isize + delta) as usize]) {
+            return decline(14);
+        }
+    }
+    // Fönstret slutar mellan stycken, men bitar slås ihop över styckegränser (vanlig text i flera stycken är en bit).
+    // De gamla bitarna i fönstret klipps därför vid kanterna; delarna utanför behålls som egna bitar.
+    let i0 = old.pieces.partition_point(|p| p.range.end <= ws);
+    let i1 = old.pieces.partition_point(|p| p.range.start < we_old);
+    if i0 >= i1 {
         return decline(7);
     }
-    let mut mid: Vec<Piece> = markup::pieces_of(new_win);
+    let mut ow: Vec<Piece> = old.pieces[i0..i1].to_vec();
+    let head = (old.pieces[i0].range.start < ws).then(|| Piece { range: old.pieces[i0].range.start..ws, ..old.pieces[i0].clone() });
+    let tail_piece = (old.pieces[i1 - 1].range.end > we_old)
+        .then(|| shifted(&Piece { range: we_old..old.pieces[i1 - 1].range.end, ..old.pieces[i1 - 1].clone() }, delta, 0));
+    if let Some(f) = ow.first_mut() {
+        f.range.start = f.range.start.max(ws);
+    }
+    if let Some(l) = ow.last_mut() {
+        l.range.end = l.range.end.min(we_old);
+    }
+    // Fortfarande ohela `<div>`-block (i den nya texten eller efter fönstrets vidgning): full analys.
+    let unbalanced = |w: &str| w.matches("<div").count() != w.matches("</div").count();
+    if unbalanced(old_win) || unbalanced(new_win) {
+        return decline(16);
+    }
+    if html_ctx(old_win) || html_ctx(new_win) {
+        return decline(18);
+    }
+    if ow.iter().any(|p| p.align != markup::Align::Left) && !old_win.contains("align") {
+        return decline(19);
+    }
+    // Fotnotsreferenser (`[^n]`) tolkas bara om definitionen finns i dokumentet: fönstret tolkas med en definition per
+    // etikett efter sig (som finns i texten, annars full analys) och bitarna efter fönstret kastas.
+    let (Some(l_old), Some(l_new)) = (note_labels(old_win), note_labels(new_win)) else { return decline(20) };
+    let mut labels = l_old;
+    labels.extend(l_new);
+    labels.sort_unstable();
+    labels.dedup();
+    if labels.iter().any(|l| !has_def(nb, l)) {
+        return decline(20);
+    }
+    let mut mid: Vec<Piece> = if labels.is_empty() {
+        markup::pieces_of(new_win)
+    } else {
+        let src = format!("{new_win}{}", labels.iter().map(|l| format!("\n\n[^{l}]: x")).collect::<String>());
+        let mut v = markup::pieces_of(&src);
+        v.retain(|p| p.range.start < new_win.len());
+        if let Some(l) = v.last_mut() {
+            l.range.end = l.range.end.min(new_win.len());
+        }
+        v
+    };
     for p in &mut mid {
         *p = shifted(p, 0, ws);
     }
-    // Kontroll: bitarna före och efter ändringen (utom de som gränsar till den) ska bli desamma
-    // som i den gamla analysen; annars har ändringen påverkat något över styckegränsen.
-    let pre_n = old.pieces.partition_point(|p| p.range.end < pre).saturating_sub(i0);
-    if mid.len() < pre_n || old.pieces[i0..i0 + pre_n] != mid[..pre_n] {
+    // Kontroll: bitarna i raderna före och efter raden med ändringen ska bli desamma som i den gamla analysen (klippta
+    // vid raderna, så att en lång bit som sträcker sig över dem också jämförs); annars har ändringen eller fönstrets
+    // kant påverkat något som sträcker sig över styckegränsen.
+    let before_end = line_start(ob, pre).max(ws);
+    if clip(&ow, ws, before_end) != clip(&mid, ws, before_end) {
         return decline(8);
     }
-    let jb = old.pieces.partition_point(|p| p.range.start <= old_changed.end).max(i0 + pre_n);
-    let post_n = i1.saturating_sub(jb);
-    if mid.len() < pre_n + post_n {
-        return decline(9);
-    }
-    let tail = &mid[mid.len() - post_n..];
-    for (o, n) in old.pieces[jb..i1].iter().zip(tail) {
-        if shifted(o, delta, 0) != *n {
-            return decline(10);
-        }
-    }
-    if we_old >= ob.len() && mid.last().is_some_and(|p| p.range.end != new_text.len()) {
-        return decline(11);
+    let after_old_start = (line_end(ob, old_changed.end.min(ob.len())) + 1).min(we_old);
+    let after_new_start = (after_old_start as isize + delta) as usize;
+    let after_old: Vec<Piece> = clip(&ow, after_old_start, we_old).iter().map(|p| shifted(p, delta, 0)).collect();
+    if after_new_start > we_new || after_old != clip(&mid, after_new_start, we_new) {
+        return decline(10);
     }
     // Täckning utan glapp (som `analyze` ger); annars full analys.
-    if (i0 == 0 && mid.first().is_some_and(|p| p.range.start != 0)) || (i1 == old.pieces.len() && mid.last().is_some_and(|p| p.range.end != new_text.len())) {
+    if mid.first().is_none_or(|p| p.range.start != ws) || mid.last().is_none_or(|p| p.range.end != we_new) {
         return decline(12);
     }
-    let window = &old.pieces[i0..i1];
     let delta_info = Delta {
         ws,
-        touched_table: window.iter().chain(mid.iter()).any(|p| p.block == markup::Block::Table),
-        same_images: window.iter().filter_map(|p| p.image.as_ref()).eq(mid.iter().filter_map(|p| p.image.as_ref())),
+        touched_table: ow.iter().chain(mid.iter()).any(|p| p.block == markup::Block::Table),
+        same_images: ow.iter().filter_map(|p| p.image.as_ref()).eq(mid.iter().filter_map(|p| p.image.as_ref())),
         fonts: super::layout::needed_fonts(&Analysis { pieces: mid.clone(), defaults: old.defaults.clone(), sections: Vec::new() }),
     };
     // Först nu ändras analysen: bitarna efter fönstret flyttas på plats, fönstrets byts ut.
@@ -243,7 +398,48 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
             p.range = (p.range.start as isize + delta) as usize..(p.range.end as isize + delta) as usize;
         }
     }
-    old.pieces.splice(i0..i1, mid);
+    let (n_head, n_mid) = (usize::from(head.is_some()), mid.len());
+    let mut repl: Vec<Piece> = head.into_iter().chain(mid).chain(tail_piece).collect();
+    let n_tail = repl.len() - n_head - n_mid;
+    // Bitar med samma egenskaper bredvid varandra är en bit i `analyze`: slå ihop skarvarna.
+    let same = |a: &Piece, b: &Piece| a.range.end == b.range.start && Piece { range: a.range.clone(), ..b.clone() } == *a;
+    let joint = if n_tail == 1 { n_head + n_mid } else { repl.len() };
+    let merge_right = if joint < repl.len() { same(&repl[joint - 1], &repl[joint]) } else { old.pieces.get(i1).is_some_and(|nx| same(&repl[repl.len() - 1], nx)) };
+    let mut i1 = i1;
+    if merge_right {
+        if joint < repl.len() {
+            let end = repl[joint].range.end;
+            repl[joint - 1].range.end = end;
+            repl.remove(joint);
+        } else {
+            let end = old.pieces[i1].range.end;
+            let last = repl.len() - 1;
+            repl[last].range.end = end;
+            i1 += 1;
+        }
+    }
+    let first_mid = n_head;
+    let left_last = if n_head == 1 { Some(repl[0].clone()) } else { i0.checked_sub(1).map(|k| old.pieces[k].clone()) };
+    if left_last.as_ref().is_some_and(|l| same(l, &repl[first_mid])) {
+        let end = repl[first_mid].range.end;
+        if n_head == 1 {
+            repl[0].range.end = end;
+            repl.remove(1);
+        } else if let Some(k) = i0.checked_sub(1) {
+            old.pieces[k].range.end = end;
+            repl.remove(0);
+        }
+    }
+    old.pieces.splice(i0..i1, repl);
+    // Avsnitten efter fönstret flyttas med texten (fönstret har inga avsnittsrader).
+    if delta != 0 {
+        for sec in old.sections.iter_mut().filter(|s| s.start >= we_old) {
+            sec.start = (sec.start as isize + delta) as usize;
+            if let Some(m) = sec.marker.as_mut() {
+                *m = (m.start as isize + delta) as usize..(m.end as isize + delta) as usize;
+            }
+        }
+    }
     Some(delta_info)
 }
 
@@ -263,8 +459,9 @@ mod tests {
     fn doc(r: &mut Rng, paras: usize, rich: bool) -> String {
         let mut s = String::from("<!-- kladd: sida=a4 -->\n\n");
         let words = ["alfa", "beta", "gamma", "delta", "åäö", "text", "rad", "stycke"];
+        let mut notes = 0;
         for i in 0..paras {
-            let kind = if rich { r.below(14) } else { r.below(4) };
+            let kind = if rich { r.below(18) } else { r.below(4) };
             match kind {
                 0 | 1 | 2 => {
                     for k in 0..(3 + r.below(12)) {
@@ -288,9 +485,17 @@ mod tests {
                 10 => s.push_str("<div align=\"center\">\n\nmittad\n\n</div>"),
                 11 => s.push_str("text med fotnot"),
                 12 => s.push_str("    indragen kod"),
+                14 | 15 => {
+                    notes += 1;
+                    s.push_str(&format!("text med fotnot[^{notes}] och mer text"));
+                }
+                16 => s.push_str("<!-- kladd: avsnitt; columns: 2; type: continuous -->"),
                 _ => s.push_str("![bild](a.png)"),
             }
             s.push_str("\n\n");
+        }
+        for n in 1..=notes {
+            s.push_str(&format!("[^{n}]: Fotnot {n} med text.\n\n"));
         }
         s
     }
@@ -327,7 +532,7 @@ mod tests {
                 }
                 _ => t.insert(at, 'x'),
             }
-            if ["```", "~~~", "[^", "]:"].iter().any(|m| t.contains(m)) {
+            if ["```", "~~~"].iter().any(|m| t.contains(m)) || has_link_defs(&t) {
                 continue;
             }
             let full = markup::analyze(&t);
@@ -367,7 +572,8 @@ mod tests {
 
     #[test]
     fn incremental_equals_full_on_rich_documents() {
-        for seed in [3, 5, 8, 13] {
+        let n: u64 = std::env::var("KLADD_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        for seed in [3, 5, 8, 13, 21, 34].into_iter().chain(100..100 + n) {
             fuzz(true, seed);
         }
     }
@@ -405,5 +611,53 @@ mod tests {
         let mut t = text.clone();
         t.insert_str(at, "```");
         assert!(analyze_incremental(&text, &mut a.clone(), &t).is_none());
+    }
+
+    /// Word-dokument har fotnoter och avsnitt: en vanlig skrivändring ska ändå vara inkrementell och ge exakt `analyze`.
+    #[test]
+    fn footnotes_and_sections_keep_the_incremental_path() {
+        let mut r = Rng(9);
+        let mut text = doc(&mut r, 6000, false);
+        let mut mid = text.len() / 2;
+        while !text.is_char_boundary(mid) {
+            mid += 1;
+        }
+        let at = text[mid..].find("\n\n").unwrap() + mid + 2;
+        text.insert_str(at, "Med fotnot[^1] här.\n\n<!-- kladd: avsnitt; columns: 2; type: continuous -->\n\nTvå spalter.\n\n<!-- kladd: avsnitt; type: continuous -->\n\n");
+        text.push_str("[^1]: Fotnotstext.\n\n");
+        let a = markup::analyze(&text);
+        assert_eq!(a.sections.len(), 3);
+        for frac in [0.1, 0.3, 0.45, 0.6, 0.9] {
+            let mut p = (text.len() as f64 * frac) as usize;
+            while !text.is_char_boundary(p) || text.as_bytes()[p] == b'\n' {
+                p += 1;
+            }
+            let mut t = text.clone();
+            t.insert(p, 'x');
+            let mut inc = a.clone();
+            let d = analyze_incremental(&text, &mut inc, &t);
+            assert!(d.is_some(), "bit {frac}: ska vara inkrementell ({:?})", WHY.with(|w| w.borrow().iter().rev().take(3).copied().collect::<Vec<_>>()));
+            let full = markup::analyze(&t);
+            assert_eq!(inc.pieces, full.pieces, "bit {frac}");
+            assert_eq!(inc.sections, full.sections, "avsnitten flyttas med texten ({frac})");
+        }
+        // Rör ändringen en avsnittsrad görs full analys (och en ändring vid en fotnotsreferens ger samma bitar som `analyze`).
+        let fnr = text.find("[^1] här").unwrap();
+        let mut t = text.clone();
+        t.insert(fnr + 1, 'x');
+        let mut inc = a.clone();
+        if analyze_incremental(&text, &mut inc, &t).is_some() {
+            assert_eq!(inc.pieces, markup::analyze(&t).pieces);
+        }
+        let sec = text.find("<!-- kladd: avsnitt; columns").unwrap();
+        let mut t = text.clone();
+        t.insert(sec + 6, 'x');
+        assert!(analyze_incremental(&text, &mut a.clone(), &t).is_none());
+        // Referenslänkar gäller hela dokumentet.
+        let mut t = text.clone();
+        t.push_str("[namn]: http://x.se\n\n");
+        let mut u = t.clone();
+        u.insert(at - 3, 'x');
+        assert!(analyze_incremental(&t, &mut markup::analyze(&t), &u).is_none());
     }
 }

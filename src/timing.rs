@@ -32,6 +32,27 @@ pub fn mark_once(flag: &'static std::sync::atomic::AtomicBool, label: &str) {
     }
 }
 
+thread_local! {
+    static LAP: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Delmätning inom en åtgärd (PDF-export): skriver tiden sedan förra `lap` (eller `lap_start`) i
+/// tråden som `[timing] <etikett>: <ms> ms`, om mätningen är på.
+pub fn lap_start() {
+    if enabled() {
+        LAP.with(|l| l.set(Some(Instant::now())));
+    }
+}
+
+pub fn lap(label: &str) {
+    if enabled() {
+        let now = Instant::now();
+        if let Some(t) = LAP.with(|l| l.replace(Some(now))) {
+            eprintln!("[timing] {label}: {:.1} ms", now.duration_since(t).as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Markdown-cachen får inte läsa in syntect-uppsättningarna när den skapas: den skapas
