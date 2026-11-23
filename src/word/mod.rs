@@ -8,6 +8,7 @@ pub mod images;
 pub mod layout;
 pub mod markup;
 pub mod nav;
+pub mod notefmt;
 pub mod notesui;
 pub mod pbox;
 pub mod pboxui;

@@ -317,6 +317,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     opts.insert(Options::ENABLE_MATH);
     opts.insert(crate::style::titles::OPTS);
     // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
+    let nf = doc_defaults(md).notes;
     let mut note_labels: Vec<String> = Vec::new();
     let mut end_labels: Vec<String> = Vec::new();
     let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
@@ -633,7 +634,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     }
                 };
                 let st = Style { endref: true, ..style.clone() };
-                spans.push(Span { text: crate::word::markup::roman(n), style: st });
+                spans.push(Span { text: nf.number(true, n), style: st });
             }
             MdEvent::FootnoteReference(t) => {
                 // Samma etikett flera gånger är samma fotnot (som i Markdown).
@@ -645,7 +646,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     }
                 };
                 let st = Style { fnref: Some(n), ..style.clone() };
-                spans.push(Span { text: n.to_string(), style: st });
+                spans.push(Span { text: nf.number(false, n), style: st });
             }
         }
     }
@@ -659,7 +660,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         blocks.push(Block::Rule);
         for (i, l) in end_labels.iter().enumerate() {
             let mut spans = vec![
-                Span { text: crate::word::markup::roman(i + 1), style: Style { endref: true, ..Style::default() } },
+                Span { text: nf.number(true, i + 1), style: Style { endref: true, ..Style::default() } },
                 Span { text: " ".into(), style: Style::default() },
             ];
             spans.extend(note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default());
@@ -1318,7 +1319,7 @@ impl<'a> Layout<'a> {
     /// Fotnotens rader: litet nummer, mellanslag och texten.
     fn note_spans(&self, n: usize) -> Vec<Span> {
         let mut v = vec![
-            Span { text: n.to_string(), style: Style { fnref: Some(n), ..Style::default() } },
+            Span { text: self.defaults.notes.number(false, n), style: Style { fnref: Some(n), ..Style::default() } },
             Span { text: " ".into(), style: Style::default() },
         ];
         v.extend(self.notes.get(n - 1).cloned().unwrap_or_default());
@@ -1370,7 +1371,8 @@ impl<'a> Layout<'a> {
             let face = face_for(&s.style, base);
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
-            let sz = if s.style.fnref.is_some() || s.style.endref { sz * 0.65 } else { sz };
+            // Notnummer: 0,65 av texten (0,8 i notlistan), minst 7,5 pt.
+            let sz = if s.style.fnref.is_some() || s.style.endref { (sz * if self.in_notes { 0.8 } else { 0.65 }).max(7.5) } else { sz };
             if let Some((src, disp)) = &s.style.math {
                 if let Some(f) = crate::math::formula(src, *disp) {
                     // Raden ska rymma formeln: storleken höjs så att över- och underdelen får plats.

@@ -27,6 +27,8 @@ pub const EN: &[(&str, &str)] = &[
     ("Format", "Format"),
     ("Fotnot", "Footnote"),
     ("Slutnot", "Endnote"),
+    ("Fotnoternas numrering", "Footnote numbering"),
+    ("Slutnoternas numrering", "Endnote numbering"),
     ("Fält: {sida} {sidor} {datum} {titel} {fil}. Med | delas texten i vänster, mitten och höger. Dubbelklicka på sidhuvudet i dokumentet för fler val.", "Fields: {sida} {sidor} {datum} {titel} {fil}. Use | to split the text into left, center and right. Double-click the header in the document for more options."),
     ("Färg", "Color"),
     ("Förhandsvisning:  {l}   |   {c}   |   {r}", "Preview:  {l}   |   {c}   |   {r}"),

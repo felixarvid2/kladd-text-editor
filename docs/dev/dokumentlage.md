@@ -579,6 +579,29 @@ funktioner (`Ctrl+Alt+D`).
 - **odt**: `text:note-class="endnote"` ↔ `[^eN]`, med `notes-configuration` för slutnoter (`i`).
 - **PDF**: slutnoterna läggs som en linje och stycken efter sista texten (inte per sida).
 - Fotnoter längst ned på varje sida i dokumentläget är inte gjort.
+
+### Talformat för fot- och slutnoter
+
+Etiketterna i texten är stabila (`[^1]`, `[^ei]` …); formatet ligger i grundformatsraden som
+`footnote-format`, `endnote-format` (`decimal`, `lowerRoman`, `upperRoman`, `lowerLetter`, `upperLetter`
+eller `chicago`, alltså Words `w:numFmt`) och `footnote-start`, `endnote-start` (första numret, standard 1).
+Bara det som avviker från standard (fotnoter `decimal`, slutnoter `lowerRoman`, start 1) skrivs, så äldre
+dokument ser ut som förut. Typen är `word::notefmt::NoteFormats` (fältet `DocDefaults::notes`); `display(etikett)`
+ger den visade texten (`None` = etiketten själv) och `number(slutnot, n)` numret för löpnummer n.
+
+- **Dokumentläget**: för en etikett med annan visning är etikettens tecken dolda (`layout::build_sections`
+  reserverar bredden med `leading_space`, som formler) och vyn ritar numret ovanpå (`layout::note_label_ov`;
+  `view.rs` i flödet, `notesui::paint_label` för noterna längst ned på sidan). Står markören på raden visas etiketten
+  som källa.
+- **docx** (`docx_notes.rs`): `w:footnotePr`/`w:endnotePr` (`w:numFmt`, `w:numStart`) i settings.xml, och i
+  `w:sectPr` (det första avsnittet som anger något går före settings.xml; formatet gäller hela dokumentet i
+  dokumentläget). Skrivningen ändrar bara det som skiljer sig från det som lästes (settings.xml och de `w:sectPr`
+  som hade elementet), så orörda dokument skrivs byte för byte. Okända värden (`decimalZero` …) behandlas som
+  standard och rörs inte.
+- **odt**: `text:notes-configuration` (`style:num-format`, `text:start-value`, som är 0-baserat) i styles.xml
+  läses och skrivs; `chicago` är `*`. `text:note-citation` får det formaterade numret.
+- **PDF**: referenser och notlistor använder samma format (`pdf_write::parse_blocks_notes`).
+- Menyn *Infoga → Fotnoternas/Slutnoternas numrering* ändrar raden (`view::word_note_format`).
 ## Granska: spårade ändringar och kommentarer
 
 Ren textlogik i `src/review.rs`, .docx-delen i `src/docx_review.rs` (underordnad `docx`), gränssnitt i

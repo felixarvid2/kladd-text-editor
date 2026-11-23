@@ -460,6 +460,7 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         (pc.comment.is_some() && crate::review::comments_visible()).hash(&mut h);
         pc.footnote_ref.is_some().hash(&mut h);
         pc.footnote_def.is_some().hash(&mut h);
+        note_label_text(pc, a).hash(&mut h);
         pc.image.as_ref().and_then(|i| i.align).hash(&mut h);
         if let Some(i) = pc.image.as_ref().filter(|i| i.anchor.is_some() || i.crop.is_some()) {
             format!("{:?}{:?}", i.anchor, i.crop).hash(&mut h);
@@ -1033,6 +1034,35 @@ pub fn piece_math_geom(pc: &Piece, p: &Params, d: &DocDefaults) -> Option<MathGe
     math_geom(&m.src, m.display, piece_format(pc, false, None, p, d).font_id.size)
 }
 
+/// Storleken (px) på ett notnummer: 0,65 av texten i flödet och 0,8 i notlistan (där texten redan är liten),
+/// aldrig under 7,5 pt, så att tecken som `II` och `†` går att läsa.
+pub(crate) fn note_label_size(text_px: f32, in_list: bool, zoom: f32) -> f32 {
+    (text_px * if in_list { 0.8 } else { 0.65 }).max(px(zoom, 7.5))
+}
+
+/// Numret som en fot- eller slutnotsetikett visas som i dokumentets talformat; `None` = etiketten själv.
+pub(crate) fn note_label_text(pc: &Piece, a: &Analysis) -> Option<String> {
+    pc.footnote_ref.as_deref().or(pc.footnote_def.as_deref()).and_then(|l| a.defaults.notes.display(l))
+}
+
+/// Det som vyn ritar för ett nummer i annat talformat: texten, dess typsnitt och färg.
+#[derive(Clone)]
+pub struct NoteLabelOv {
+    pub text: String,
+    pub font: FontId,
+    pub color: Color32,
+}
+
+/// Numret för biten `pc` (`None` när etiketten visas som den står, eller när biten visas som källa).
+pub fn note_label_ov(pc: &Piece, a: &Analysis, p: &Params) -> Option<NoteLabelOv> {
+    if intersects(&pc.range, &p.reveal) {
+        return None;
+    }
+    let text = note_label_text(pc, a)?;
+    let f = piece_format(pc, false, None, p, &a.defaults);
+    Some(NoteLabelOv { text, font: f.font_id, color: f.color })
+}
+
 /// Format för en bit. `hide` = bitens markup ska döljas. `grid` = bitens tabell visas som rutnät
 /// (`Some(true)` = rubrikraden). Brödtextens typsnitt och storlek kommer från `d`, och en
 /// `<span>` på biten (`pc.span`) går före både dem och rubrikens värden.
@@ -1118,7 +1148,7 @@ fn piece_format(pc: &Piece, hide: bool, grid: Option<bool>, p: &Params, d: &DocD
     // Fotnotsnummer (referens och definition): litet, upphöjt och i länkfärg. Med egen radhöjd
     // centreras texten alltid, så upphöjningen kräver `line_height: None` och `valign: TOP`.
     if pc.footnote_ref.is_some() || pc.footnote_def.is_some() {
-        f.font_id.size *= 0.65;
+        f.font_id.size = note_label_size(f.font_id.size, pc.footnote_def.is_some(), zoom);
         f.line_height = None;
         f.valign = egui::Align::TOP;
         f.color = pal.page_link;
@@ -1537,6 +1567,20 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
                 }
                 continue;
             }
+        }
+        // Fot- och slutnoternas nummer i dokumentets talformat: etiketten är dold och reserverar bredden,
+        // numret ritas av vyn ovanpå (`note_label_ov`).
+        if let (Some(shown), true) = (note_label_text(pc, a), hide) {
+            let f = piece_format(pc, false, None, p, &a.defaults);
+            let w = (p.measure)(&shown, f.font_id.clone());
+            let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
+            let fam = (p.font_family)(Some(a.defaults.font()), false, false);
+            bld.lead.push((r.start, w));
+            bld.push(r.start..r.start + first, &hidden_format(fam.clone()));
+            if r.start + first < r.end {
+                bld.push(r.start + first..r.end, &hidden_format(fam));
+            }
+            continue;
         }
         if let Some(img) = &pc.image {
             if hide {

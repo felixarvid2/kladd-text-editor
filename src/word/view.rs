@@ -161,6 +161,8 @@ enum BarAct {
     Equation(Option<usize>),
     Footnote,
     Endnote,
+    /// Talformat för fotnoter (`false`) eller slutnoter (`true`).
+    NoteFmt(bool, super::notefmt::NoteFmt),
     Toc,
     SectionBreak,
     Landscape(bool),
@@ -391,6 +393,17 @@ impl KladdApp {
         }
     }
 
+    /// Ändrar talformatet för fotnoter eller slutnoter i dokumentets grundformatsrad.
+    pub(crate) fn word_note_format(&mut self, ctx: &egui::Context, end: bool, f: super::notefmt::NoteFmt) {
+        self.word_edit(ctx, |t, sel| {
+            let mut d = crate::style::DocDefaults::from_comment(t.lines().next().unwrap_or("")).unwrap_or_default();
+            if end { d.notes.end.fmt = f } else { d.notes.foot.fmt = f }
+            let (text, old_len, new_len) = super::pages::set_defaults_line(t, &d);
+            let map = |b: usize| if b >= old_len { b - old_len + new_len } else { b.min(new_len) };
+            markup::Edit { text, sel: map(sel.start)..map(sel.end) }
+        });
+    }
+
     /// Infogar en slutnot vid markören och flyttar markören till den nya definitionen.
     pub(crate) fn word_endnote(&mut self, ctx: &egui::Context) {
         self.word_edit(ctx, |t, s| markup::insert_endnote(t, s.end));
@@ -571,6 +584,7 @@ impl KladdApp {
         let tracking = self.review_tracking();
         let review_changes = self.review_changes();
         let comments_shown = self.settings.word_comments;
+        let note_fmts = analysis.defaults.notes;
         let cur_landscape = analysis.sections[sections::index_at(&analysis.sections, sel_start)].landscape();
 
         let mut acts: Vec<BarAct> = Vec::new();
@@ -783,6 +797,17 @@ impl KladdApp {
                         if crate::app::menu_item(ui, p, t("Slutnot"), "Ctrl+Alt+D", None, true) {
                             acts.push(BarAct::Endnote);
                         }
+                        for (end, title) in [(false, t("Fotnoternas numrering")), (true, t("Slutnoternas numrering"))] {
+                            ui.menu_button(title, |ui| {
+                                let cur = if end { note_fmts.end.fmt } else { note_fmts.foot.fmt };
+                                for f in super::notefmt::NoteFmt::ALL {
+                                    if crate::app::menu_item(ui, p, &f.sample(), "", Some(cur == f), true) {
+                                        acts.push(BarAct::NoteFmt(end, f));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
                         if crate::app::menu_item(ui, p, t("Innehållsförteckning"), "", None, true) {
                             acts.push(BarAct::Toc);
                         }
@@ -880,6 +905,7 @@ impl KladdApp {
                 }),
                 BarAct::Footnote => self.word_footnote(&ctx),
                 BarAct::Endnote => self.word_endnote(&ctx),
+                BarAct::NoteFmt(end, f) => self.word_note_format(&ctx, end, f),
                 BarAct::PageSetup => self.open_page_dialog(),
                 BarAct::EditStyles => {
                     let sel = crate::style::StyleId::for_block(act.block);
@@ -1558,6 +1584,21 @@ impl KladdApp {
                                 let size = layout::piece_font_size(pc, &params, &analysis.defaults);
                                 let col = p.page_text;
                                 crate::math::gui::paint(ui.ctx(), &painter, &m.src, m.display, size, pos2(r.left() - g.w, base), col);
+                            }
+                        }
+                    }
+                    // Fot- och slutnoternas nummer i dokumentets talformat: etiketten är dold, numret ritas här.
+                    // Fotnotsdefinitioner med referens ritas längst ned på sidan (`notesui`); raden i flödet är dold.
+                    let hoisted = pc.footnote_def.as_deref().is_some_and(|l| {
+                        !markup::is_endnote_label(l) && analysis.pieces.iter().any(|q| q.footnote_ref.as_deref() == Some(l))
+                    });
+                    if !shown && !hoisted && (pc.footnote_ref.is_some() || pc.footnote_def.is_some()) {
+                        if let Some(ov) = layout::note_label_ov(pc, &analysis, &params) {
+                            let ci = conv.at(pc.range.start);
+                            let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
+                            if r.bottom() >= clip.top() && r.top() <= clip.bottom() {
+                                let w = (params.measure)(&ov.text, ov.font.clone());
+                                painter.text(pos2(r.left() - w, r.top()), egui::Align2::LEFT_TOP, ov.text, ov.font, ov.color);
                             }
                         }
                     }

@@ -11,6 +11,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Rättat
 
 - **En SVG utan `width` visades i dubbel storlek.** Rastret ritas i dubbel upplösning och styrde storleken; nu används SVG:ns egen storlek (`width`/`height`, annars `viewBox`) i dokumentläget, i sidhuvuden och vid export.
+- **Fot- och slutnoternas talformat följer dokumentet.** `w:numFmt` och `w:numStart` i `w:footnotePr`/`w:endnotePr` (settings.xml och avsnittens `w:sectPr`) och `text:notes-configuration` i `.odt` läses: decimal, små och stora romerska tal, små och stora bokstäver och Chicago (*, †, ‡, §), med eget startnummer. Referenserna och notlistorna visas så i dokumentläget och i PDF-exporten; etiketterna i texten är oförändrade och formatet ligger i grundformatsraden (`endnote-format: decimal; footnote-format: lowerRoman; endnote-start: 3`). Äldre dokument ser ut som förut (fotnoter 1, 2, 3, slutnoter i, ii, iii). Formatet skrivs tillbaka till `.docx` och `.odt` (orörda dokument byte för byte), och *Infoga → Fotnoternas numrering* och *Slutnoternas numrering* i verktygsraden byter format. Formatet gäller hela dokumentet; olika format i olika avsnitt visas med det första avsnittets.
 
 ## [2.5.1] – 2026-11-21
 

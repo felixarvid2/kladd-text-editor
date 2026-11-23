@@ -1079,6 +1079,11 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         sect_hf.push(hf::read_sect(sx, i == 0, even_odd, geo, &mut pkg, &rels, dir, &mut hf_images)?);
     }
     let mut page = page;
+    // Fot- och slutnoternas talformat (settings.xml och avsnittens `w:sectPr`).
+    page.notes = {
+        let settings = find_part("/settings").and_then(|p| pkg.part(&p).ok().flatten());
+        crate::docx_notes::read(settings.as_deref(), &all_sects)
+    };
     if let Some(h) = sect_hf.first() {
         page.header = h.own.header.clone();
         page.footer = h.own.footer.clone();
@@ -1150,6 +1155,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     base.footer_dist = page.footer_dist;
     base.page_start = page.page_start;
     base.page_format = page.page_format;
+    base.notes = page.notes;
     base.styles = style_set;
     if !info.fn_refs.is_empty() {
         markdown.push('\n');
@@ -5715,6 +5721,11 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Fo
             p.1 = cur.replace("<w:compat>", r#"<w:endnotePr><w:endnote w:id="-1"/><w:endnote w:id="0"/></w:endnotePr><w:compat>"#).into_bytes();
         }
     }
+    if defaults.notes != crate::word::notefmt::NoteFormats::default() {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "word/settings.xml") {
+            p.1 = crate::docx_notes::patch_settings(&decode_xml(&p.1), &Default::default(), &defaults.notes).into_bytes();
+        }
+    }
     if let Some(c) = comments_out {
         parts.push(("word/comments.xml".into(), c.xml.into_bytes()));
         if let Some(e) = c.ext {
@@ -6508,6 +6519,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
     let body = fix_sections(&body, &secs, "", false, &edits, &src.sect_prs);
     let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
     let document = format!("{}{body}{sect}{}", fix_head(&src.head), src.tail);
+    let document = crate::docx_notes::patch_sects(&document, &src.page.notes, &defaults.notes);
 
     // ---- formatmallar och numrering: originalen kompletteras bara
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
@@ -6667,6 +6679,16 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
                         replaced.insert(name.to_lowercase(), fix_decl(&patched).into_bytes());
                     }
                 }
+            }
+        }
+    }
+
+    // ---- fot- och slutnoternas talformat (sektionernas `w:sectPr` är redan ändrade ovan)
+    if defaults.notes != src.page.notes {
+        if let Some(name) = find_rel("/settings") {
+            let cur = replaced.get(&name.to_lowercase()).map(|b| decode_xml(b));
+            if let Some(xml) = cur.or_else(|| src.part(&name).map(decode_xml)) {
+                replaced.insert(name.to_lowercase(), fix_decl(&crate::docx_notes::patch_settings(&xml, &src.page.notes, &defaults.notes)).into_bytes());
             }
         }
     }

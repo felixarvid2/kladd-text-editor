@@ -118,6 +118,8 @@ pub struct NoteLayout {
     pub body: Range<usize>,
     /// Nummerts bredd (px) i galleriet: där texten börjar på första raden.
     pub indent: f32,
+    /// Numret i annat talformat än etiketten (se `layout::note_label_ov`) och var det ritas i galleriet.
+    pub label_ov: Option<(super::layout::NoteLabelOv, egui::Pos2)>,
 }
 
 #[cfg(test)]

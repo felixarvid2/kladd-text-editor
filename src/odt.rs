@@ -2052,6 +2052,24 @@ fn master_props(st: &Styles, styles_root: &Node, d: &DocDefaults, ctx: &mut hf::
     (out, start)
 }
 
+/// `text:notes-configuration`: talformat och första nummer för fotnoter och slutnoter (`start-value` är 0-baserat).
+fn read_notes_config(styles_root: &Node, d: &mut DocDefaults) {
+    let Some(os) = styles_root.child("office:styles") else { return };
+    for n in os.els().filter(|n| n.name == "text:notes-configuration") {
+        let st = match n.attr("text:note-class") {
+            Some("footnote") => &mut d.notes.foot,
+            Some("endnote") => &mut d.notes.end,
+            _ => continue,
+        };
+        if let Some(f) = n.attr("style:num-format").and_then(crate::word::notefmt::NoteFmt::from_odf) {
+            st.fmt = f;
+        }
+        if let Some(v) = n.attr("text:start-value").and_then(|v| v.trim().parse::<u32>().ok()) {
+            st.start = v.saturating_add(1);
+        }
+    }
+}
+
 fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults, ctx: &mut hf::HfCtx<'_, '_>) {
     let Some(masters) = styles_root.child("office:master-styles") else { return };
     let mut it = masters.els().filter(|m| m.name == "style:master-page");
@@ -2195,6 +2213,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let mut ctx = hf::HfCtx { pkg: &mut pkg, images: &mut hf_images, by_target: &mut hf_by_target };
         if let Some(s) = &sroot {
             read_page(&st, s, &mut defaults, &mut ctx);
+            read_notes_config(s, &mut defaults);
         }
         sroot.as_ref().map(|s| master_props(&st, s, &defaults, &mut ctx)).unwrap_or_default()
     };
@@ -3473,13 +3492,14 @@ impl<'a> W<'a> {
                 if crate::word::markup::is_endnote_label(label) {
                     // Slutnoterna numreras för sig, med romerska tal.
                     let m = self.note_order[..=n].iter().filter(|l| crate::word::markup::is_endnote_label(l)).count();
-                    let cit = crate::word::markup::roman(m);
+                    let cit = self.defaults.notes.number(true, m);
                     out.push_str(&format!(
                         "<text:note text:id=\"edn{m}\" text:note-class=\"endnote\"><text:note-citation>{cit}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
                     ));
                 } else {
+                    let cit = self.defaults.notes.number(false, k);
                     out.push_str(&format!(
-                        "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{k}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
+                        "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{cit}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
                     ));
                 }
             }
@@ -4053,8 +4073,8 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
     named.push_str("<style:style style:name=\"Visited_20_Internet_20_Link\" style:display-name=\"Visited Internet Link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
 
     apply_style_overrides(&mut named, &d.styles);
-    named.push_str("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"1\" text:start-value=\"0\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>");
-    named.push_str("<text:notes-configuration text:note-class=\"endnote\" style:num-format=\"i\" text:start-value=\"0\"/>");
+    named.push_str(&format!("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"{}\" text:start-value=\"{}\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>", d.notes.foot.fmt.odf(), d.notes.foot.start - 1));
+    named.push_str(&format!("<text:notes-configuration text:note-class=\"endnote\" style:num-format=\"{}\" text:start-value=\"{}\"/>", d.notes.end.fmt.odf(), d.notes.end.start - 1));
 
     format!(
         "{XML_DECL}<office:document-styles {NS} office:version=\"1.2\">{}<office:styles>{named}</office:styles><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>",

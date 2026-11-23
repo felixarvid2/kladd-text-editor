@@ -137,7 +137,18 @@ pub(super) fn layout_def(
     };
     let rel_chars = text[w.start..d.body.max(w.start)].chars().count();
     let indent = galley.pos_from_cursor(CCursor::new(rel_chars)).min.x;
-    NoteLayout { label: d.label.clone(), galley, line: d.line.clone(), body: d.body..d.line.end, indent }
+    // Numret i dokumentets talformat: etiketten är dold i galleriet och numret ritas ovanpå.
+    let label_ov = a
+        .pieces
+        .iter()
+        .find(|pc| pc.footnote_def.as_deref() == Some(d.label.as_str()) && d.line.contains(&pc.range.start))
+        .and_then(|pc| {
+            let ov = note_label_ov(pc, a, &pv)?;
+            let at = galley.pos_from_cursor(CCursor::new(text[w.start..pc.range.start].chars().count())).min;
+            let wd = (pv.measure)(&ov.text, ov.font.clone());
+            Some((ov, egui::pos2(at.x - wd, at.y)))
+        });
+    NoteLayout { label: d.label.clone(), galley, line: d.line.clone(), body: d.body..d.line.end, indent, label_ov }
 }
 
 /// Underlaget till sidbrytningen: höjderna och raderna (i galleriet `g`, före sidbrytningen) som
