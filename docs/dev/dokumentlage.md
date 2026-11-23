@@ -287,7 +287,8 @@ Gemensamma format (alla moduler ska använda dessa):
   - **Förankrade rutor** (`wp:anchor`/`draw:frame` med läge): öppningsraden bär måtten och ankaret,
     `<!--k:tb N w="px" h="px" hrel= x= vrel= y= wrap= dist=-->` (samma attribut som `<img>`, se `word::anchor`;
     `docx_tbox::Head`, `parse_head`, `open_tag_head`). `fr=` på styckena har rutans bredd, vågräta läge i spalten
-    (`pbox::Frame`, räknat ur ankaret med sidans mått vid läsning) och fasta höjd (`h=`, pt). Bara `wrap` fyrkant,
+    (`pbox::Frame`, räknat ur ankaret med sidans mått vid läsning; negativt eller större än spaltbredden när rutan står i
+    marginalen, och klämt mot papperets kant, `Frame::span` med `room` = marginalerna) och fasta höjd (`h=`, pt). Bara `wrap` fyrkant,
     bakom och framför flyter (`wrap="top"` och rutor utan ankare ligger i flödet).
   - Layout (`layout::relayout`): öppnings- och slutradens stycken (`Para::tbox`, `tbox_end`) omger rutans stycken;
     dessa läggs ut som vanligt men tar ingen höjd (`y`), efter slutraden dras alla rader uppåt så att texten efter

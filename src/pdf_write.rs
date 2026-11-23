@@ -2185,7 +2185,7 @@ impl<'a> Layout<'a> {
                     let (mut tx, mut tw) = (self.ml + indent, self.cw - indent);
                     let mut frame_x: Option<(f32, f32)> = None;
                     if let Some(l) = boxed {
-                        if let Some((tl, tr, fl, fw)) = l.frame_geom(self.cw - indent) {
+                        if let Some((tl, tr, fl, fw)) = l.frame_geom(self.cw - indent, (self.ml, (self.pw - self.ml - self.cw).max(0.0))) {
                             tx += tl;
                             tw -= tl + tr;
                             frame_x = Some((self.ml + indent + fl, fw));

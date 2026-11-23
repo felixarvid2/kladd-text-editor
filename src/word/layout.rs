@@ -14,7 +14,7 @@ use egui::epaint::text::FontsView;
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
-use super::anchor::{self, Anchor, HRel, PageCtx, Pos, VAt, Wrap};
+use super::anchor::{self, Anchor, PageCtx, Pos, VAt, Wrap};
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use super::pbox::{self, LineRule, PPr};
@@ -410,6 +410,7 @@ fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, pa
         (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
         if let Some(f) = para.look.as_ref().and_then(|l| l.frame) {
             (f.w.to_bits(), f.pl.to_bits(), f.pr.to_bits(), format!("{:?}", f.x)).hash(&mut h);
+            (para.room.0.to_bits(), para.room.1.to_bits()).hash(&mut h);
         }
         para.empty_h.map(f32::to_bits).hash(&mut h);
     }
@@ -614,6 +615,9 @@ fn relayout_pass(
         let closing = !table && paras[pr.start].tbox_end && boxst.is_some();
         let in_box = !table && !opened && !closing && boxst.is_some();
         let mut gp: Vec<Para> = paras[pr.clone()].to_vec();
+        // Marginalerna: en textruta får stå ut i dem (`Frame::span`).
+        let room = pages.map_or((0.0, 0.0), |g| if multi { let s = g.sec(sec); (s.left, s.right) } else { (g.left, g.right) });
+        gp.iter_mut().for_each(|q| q.room = room);
         let note_def = defs.iter().find(|d| d.para == pr.start && !table);
         if let Some(d) = note_def {
             note_layouts.push(notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d));
@@ -787,10 +791,12 @@ fn relayout_pass(
             let w_z = if b.tb.w > 0.0 { b.tb.w * z } else { wrap_width * 0.5 };
             let h_z = (b.tb.h * z).max(b.content_h);
             let page_y = sim.as_ref().map(|s| s.sheet_y(y));
-            // Samma kant som ritningen (`Frame::span`): en ruta ligger inom spalten, så texten flyter runt den där den syns.
+            // Samma läge som ritningen (`Frame::span`): rutan får stå ut i marginalen men klämms mot papperets kant;
+            // texten flyter bara runt den del som ligger i spalten (`anchor::reserve`).
             let mut tb_anchor = b.tb.anchor;
-            if let (HRel::Column, Pos::Off(o)) = (tb_anchor.hrel, tb_anchor.h) {
-                tb_anchor.h = Pos::Off(o.clamp(0.0, ((wrap_width - w_z) / z).max(0.0)));
+            if let Pos::Off(_) = tb_anchor.h {
+                let x = tb_anchor.scaled(z).x_in_column(w_z, &ctx).clamp(-ctx.col_left, (ctx.page_w - ctx.col_left - w_z).max(-ctx.col_left));
+                tb_anchor.h = Pos::Off((x - tb_anchor.scaled(z).h_ref_left(&ctx)) / z);
             }
             let spec = FloatSpec { side: Float::Right, anchor: Some(tb_anchor), size: egui::vec2(w_z, h_z), alone: false };
             let mut plan = plan_float(&spec, z, wrap_width, &ctx, page_y, min_h);
@@ -1717,6 +1723,8 @@ struct Para {
     hang: f32,
     /// Pixlar per punkt, för indrag som först räknas ut när spaltbredden är känd (ramar med egen bredd).
     ppx: f32,
+    /// Hur långt papperet når utanför spalten (vänster, höger; px): en ruta får stå ut i marginalen (`Frame::span`).
+    room: (f32, f32),
     /// Tomt Word-stycke (`<!--k:ep-->`): radens höjd (px).
     empty_h: Option<f32>,
     /// Öppningsraden till en förankrad textruta med omflöde (`<!--k:tb N …-->`): rutans stycken ligger ovanpå
@@ -1893,6 +1901,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             ind_right: 0.0,
             hang: 0.0,
             ppx: 0.0,
+            room: (0.0, 0.0),
             empty_h: ep.as_ref().map(|(_, h)| *h),
             tbox,
             tbox_end,
@@ -2451,7 +2460,7 @@ fn layout_piece(
     // Indrag från vänster och höger (listor har sitt eget).
     let (mut ind_l, mut ind_r) = if list.is_none() && !para.collapse { (para.ind_left, para.ind_right) } else { (0.0, 0.0) };
     // Ram med egen bredd och eget läge (textruta): indragen räknas mot spaltens bredd.
-    if let (true, true, Some(g)) = (list.is_none() && !para.collapse, avail.is_finite() && para.ppx > 0.0, para.look.as_ref().and_then(|l| l.frame_geom(avail / para.ppx.max(0.001)))) {
+    if let (true, true, Some(g)) = (list.is_none() && !para.collapse, avail.is_finite() && para.ppx > 0.0, para.look.as_ref().and_then(|l| l.frame_geom(avail / para.ppx.max(0.001), (para.room.0 / para.ppx.max(0.001), para.room.1 / para.ppx.max(0.001))))) {
         ind_l = g.0 * para.ppx;
         ind_r = g.1 * para.ppx;
     }

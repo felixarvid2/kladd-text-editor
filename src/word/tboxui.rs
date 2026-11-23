@@ -31,6 +31,10 @@ pub struct BoxView {
     /// Överkanten på stycket rutan är förankrad i och spaltens vänsterkant (skärmpx).
     pub para_top: f32,
     pub col_left: f32,
+    /// Spaltens bredd och papperet utanför den (vänster, höger; marginalerna), skärmpx: rutan får dras ut i
+    /// marginalen men inte förbi papperets kant.
+    pub col_w: f32,
+    pub room: (f32, f32),
 }
 
 /// Ny storlek/läge för en ruta: det som skrivs i öppningsraden och ramarna.
@@ -86,7 +90,8 @@ pub fn change_for(b: &BoxView, new: Rect, z: f32) -> Change {
     head.h = (new.height() / z).max(MIN_H);
     let mut x_pt = None;
     if moved {
-        let x = (new.left() - b.col_left) / z;
+        let (lo, hi) = (-b.room.0, (b.col_w + b.room.1 - new.width()).max(-b.room.0));
+        let x = (new.left() - b.col_left).clamp(lo, hi) / z;
         let y = ((new.top() - b.para_top) / z).max(0.0);
         let mut a: Anchor = head.anchor.unwrap_or_default();
         a.hrel = HRel::Column;
@@ -120,7 +125,7 @@ pub fn apply(text: &str, c: &Change) -> Option<String> {
                     f.w = c.head.w * 0.75;
                     f.h = c.head.h * 0.75;
                     if let Some(x) = c.x_pt {
-                        f.x = FrameX::Off(x.max(0.0));
+                        f.x = FrameX::Off(x);
                     }
                 }
                 out.push_str(&pp.marker());
@@ -141,6 +146,7 @@ pub fn views(
     gpos: egui::Pos2,
     frames: &[(Range<usize>, Rect)],
     col_at: &dyn Fn(f32, f32) -> (f32, f32),
+    room_at: &dyn Fn(f32) -> (f32, f32),
 ) -> Vec<BoxView> {
     let mut out = Vec::new();
     for (range, rect) in frames {
@@ -151,8 +157,9 @@ pub fn views(
         let Some(close) = text[range.end..].find(docx_tbox::CLOSE).map(|i| i + range.end) else { continue };
         let ci = text[..close].chars().count();
         let para_top = galley.pos_from_cursor(egui::text::CCursor::new(ci)).top() + gpos.y;
-        let col_left = gpos.x + col_at(rect.left() - gpos.x, rect.top() - gpos.y).0;
-        out.push(BoxView { open: ls..ls + line.len(), head, rect: *rect, para_top, col_left });
+        let (cl, col_w) = col_at(rect.left() - gpos.x, rect.top() - gpos.y);
+        let room = room_at(rect.top() - gpos.y);
+        out.push(BoxView { open: ls..ls + line.len(), head, rect: *rect, para_top, col_left: gpos.x + cl, col_w, room });
     }
     out
 }
@@ -269,7 +276,7 @@ mod tests {
         let open = TXT.find("<!--k:tb").unwrap();
         let open = open..TXT[open..].find("-->").unwrap() + open + 3;
         let head = docx_tbox::parse_head(&TXT[open.clone()]).unwrap().1;
-        BoxView { open, head, rect: Rect::from_min_size(pos2(500.0, 200.0), vec2(150.0, 90.0)), para_top: 194.0, col_left: 100.0 }
+        BoxView { open, head, rect: Rect::from_min_size(pos2(500.0, 200.0), vec2(150.0, 90.0)), para_top: 194.0, col_left: 100.0, col_w: 600.0, room: (50.0, 80.0) }
     }
 
     #[test]
@@ -283,6 +290,20 @@ mod tests {
         assert!(out.contains("w=\"200\" h=\"100\" x=\"right\""), "{out}");
         assert!(out.contains("fr=\"w=150 x=end pl=4 pr=4 h=75\""), "{out}");
         assert!(out.ends_with("<!--k:/tb-->\n\nSlut\n"));
+    }
+
+    #[test]
+    fn move_into_margin_keeps_position_but_not_past_the_paper() {
+        let v = view();
+        // Spalten 100..700 px (zoom 1), marginalerna 50 vänster och 80 höger: rutan (150 bred) kan stå ut till x=730.
+        let c = change_for(&v, v.rect.translate(vec2(150.0, 0.0)), 1.0);
+        assert_eq!(c.head.anchor.unwrap().h, Pos::Off(530.0));
+        let c = change_for(&v, v.rect.translate(vec2(-470.0, 0.0)), 1.0);
+        assert_eq!(c.head.anchor.unwrap().h, Pos::Off(-50.0));
+        // Delvis i marginalen: skrivs som det står.
+        let c = change_for(&v, Rect::from_min_size(pos2(100.0 + 520.0, 200.0), vec2(150.0, 90.0)), 1.0);
+        assert_eq!(c.head.anchor.unwrap().h, Pos::Off(520.0));
+        assert_eq!(c.x_pt, Some(390.0));
     }
 
     #[test]

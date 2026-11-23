@@ -1469,7 +1469,13 @@ impl<'s, 'b> Rd<'s, 'b> {
         let x = match place.map(|a| a.h) {
             Some(Pos::Center) => FrameX::Center,
             Some(Pos::End) => FrameX::End,
-            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3].round() } else { 0.0 }).max(0.0) * 2.0).round() / 2.0),
+            Some(Pos::Off(px)) => {
+                // Rutan får stå ut i marginalen (som i LibreOffice) men klämms mot papperets kant.
+                let (ml, pw) = (self.page_defaults.margins()[3].round(), self.page_defaults.page().0);
+                let pt = ((px * 0.75 - if from_page { ml } else { 0.0 }) * 2.0).round() / 2.0;
+                let pt = pt.clamp(-ml, (pw - ml - width).max(-ml));
+                if pt == 0.0 { FrameX::Start } else { FrameX::Off(pt) }
+            }
             _ => FrameX::Start,
         };
         let saved = std::mem::take(&mut self.blocks);
@@ -3315,7 +3321,7 @@ impl<'a> W<'a> {
             None => match frame.map(|f| f.x) {
                 Some(FrameX::Center) => ("center", None, "paragraph"),
                 Some(FrameX::End) => ("right", None, "paragraph"),
-                Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v), "paragraph"),
+                Some(FrameX::Off(v)) if v != 0.0 => ("from-left", Some(v), "paragraph"),
                 _ => ("left", None, "paragraph"),
             },
         };
@@ -4513,6 +4519,34 @@ Slut.
         let a = h.anchor.unwrap();
         assert_eq!((a.h, a.v), (Pos::Off(73.5), Pos::Off(21.0)), "{back}");
         assert!((h.w - 150.0).abs() < 0.6 && (h.h - 90.0).abs() < 0.6, "{back}");
+    }
+
+    #[test]
+    fn text_box_in_the_margin_roundtrip() {
+        use crate::word::{anchor::Pos, tboxui};
+        let pp = |w: f32| format!("<!--k:pp bdr=\"t=single:6:6:112233 l=single:6:6:112233 b=single:6:6:112233 r=single:6:6:112233\" shd=\"FFF2CC\" fr=\"w={w} x=end pl=6.75 pr=6.75\"-->");
+        // A4 med 2,54 cm marginal (textytan 602 px): 80 px bred ruta delvis i högermarginalen, hela i den, och i vänstermarginalen.
+        for x in [560.0f32, 610.0, -70.0] {
+            let md = format!("Före\n\n<!--k:tb 0 w=\"80\" h=\"90\" x=\"right\" y=\"0\"-->\n\n**Faktaruta**{}\n\n<!--k:/tb-->\n\nEfter\n", pp(60.0));
+            let o = md.find("<!--k:tb").unwrap();
+            let open = o..md[o..].find("-->").unwrap() + o + 3;
+            let mut head = crate::docx_tbox::parse_head(&md[open.clone()]).unwrap().1;
+            let mut a = head.anchor.unwrap();
+            (a.h, a.v) = (Pos::Off(x), Pos::Off(21.0));
+            head.anchor = Some(a);
+            let md = tboxui::apply(&md, &tboxui::Change { open, head, x_pt: Some(x * 0.75) }).unwrap();
+            let w = write(&md, "T", &resolver()).unwrap();
+            let c = content_xml(&w.bytes);
+            assert!(c.contains(&format!("svg:x=\"{:.5}pt\"", x * 0.75)), "{c}");
+            let back = read(&w.bytes).unwrap();
+            assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+            let m = back.markdown;
+            let o = m.find("<!--k:tb").unwrap();
+            let h = crate::docx_tbox::parse_head(&m[o..o + m[o..].find("-->").unwrap() + 3]).unwrap().1;
+            assert_eq!(h.anchor.unwrap().h, Pos::Off(x), "{m}");
+            // Ramens läge utanför spalten bevaras (inte inklämt i den).
+            assert!(m.contains(&format!("x={}", x * 0.75)), "{m}");
+        }
     }
 
     #[test]

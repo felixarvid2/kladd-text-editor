@@ -3109,7 +3109,8 @@ fn place_box(bx: &mut BoxRead, page: &DocDefaults) {
         (HRel::Column | HRel::Margin, Pos::Start) => FrameX::Start,
         (HRel::Column | HRel::Margin, Pos::Center) => FrameX::Center,
         (HRel::Column | HRel::Margin, Pos::End) => FrameX::End,
-        _ => FrameX::Off((a.x_in_column(w_px, &ctx) / k).max(0.0)),
+        // Rutan får stå ut i marginalen (som i Word) men klämms mot papperets kant.
+        _ => FrameX::Off((a.x_in_column(w_px, &ctx) / k).clamp(-m[3], (pw - m[3] - bx.width).max(-m[3]))),
     };
     bx.page_rel = false;
     bx.head = docx_tbox::Head { w: w_px, h: bx.height, anchor: Some(a) };

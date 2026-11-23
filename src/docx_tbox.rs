@@ -697,11 +697,11 @@ mod tests {
         let pp = frame(&sh, FrameX::Center, 200.0, 0.0);
         assert!(pp.borders.any());
         assert_eq!(pp.shd, Some([255, 255, 255]));
-        let (tl, tr, l, w) = pp.frame_geom(450.0).unwrap();
+        let (tl, tr, l, w) = pp.frame_geom(450.0, (0.0, 0.0)).unwrap();
         assert_eq!((l, w), (125.0, 200.0));
         assert!(tl > l && tr > 125.0);
         // Hela spalten när bredden saknas, och markören överlever en tur och retur.
-        assert_eq!(frame(&sh, FrameX::Start, 0.0, 0.0).frame_geom(300.0).map(|g| g.3), Some(300.0));
+        assert_eq!(frame(&sh, FrameX::Start, 0.0, 0.0).frame_geom(300.0, (0.0, 0.0)).map(|g| g.3), Some(300.0));
         assert_eq!(PPr::parse_marker(&pp.marker()), Some(pp));
         assert!(frame(&Shape::default(), FrameX::Start, 0.0, 0.0).is_empty());
     }

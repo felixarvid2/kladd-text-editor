@@ -504,6 +504,7 @@ impl KladdApp {
             }
         }
         self.word_table_keys(ctx);
+        self.word_tbox_keys(ctx);
         self.word_footnote_keys(ctx);
         self.word_paste_html(ctx);
         self.review_keys(ctx);
@@ -1490,7 +1491,9 @@ impl KladdApp {
                         };
                         let (shp, frames) = super::pboxui::shapes_rects(&env, &pb.0, &pb.1);
                         ui.painter().set(pbox_slot, Shape::Vec(shp));
-                        let tviews = super::tboxui::views(text, &galley, gpos, &frames, &col_at);
+                        let tviews = super::tboxui::views(text, &galley, gpos, &frames, &col_at, &|y| boxes.get(secpages::page_index(&boxes, y)).map_or((0.0, 0.0), |b| (b.margin[3], b.margin[1])));
+                        let rects: Vec<(usize, Rect)> = tviews.iter().map(|b| (b.open.start, b.rect)).collect();
+                        super::tboxnav::pointer_fix(ui.ctx(), id, text, &galley, gpos, &rects, &col_at, &out.response, 6.0);
                         if !tviews.is_empty() || tbox_st.selected.is_some() {
                             let max_w = (0..geom.secs.len().max(1)).map(|i| geom.wrap_for(i)).fold(0.0, f32::max);
                             tbox_act = super::tboxui::ui(ui, &mut tbox_st, doc_id, &tviews, z, max_w, id, p);

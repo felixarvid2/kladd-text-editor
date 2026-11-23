@@ -12,6 +12,7 @@ pub mod notefmt;
 pub mod notesui;
 pub mod pbox;
 pub mod pboxui;
+pub mod tboxnav;
 pub mod tboxui;
 pub mod navui;
 pub mod tables;

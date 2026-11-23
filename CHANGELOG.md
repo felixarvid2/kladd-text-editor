@@ -12,6 +12,11 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **En SVG utan `width` visades i dubbel storlek.** Rastret ritas i dubbel upplösning och styrde storleken; nu används SVG:ns egen storlek (`width`/`height`, annars `viewBox`) i dokumentläget, i sidhuvuden och vid export.
 - **Fot- och slutnoternas talformat följer dokumentet.** `w:numFmt` och `w:numStart` i `w:footnotePr`/`w:endnotePr` (settings.xml och avsnittens `w:sectPr`) och `text:notes-configuration` i `.odt` läses: decimal, små och stora romerska tal, små och stora bokstäver och Chicago (*, †, ‡, §), med eget startnummer. Referenserna och notlistorna visas så i dokumentläget och i PDF-exporten; etiketterna i texten är oförändrade och formatet ligger i grundformatsraden (`endnote-format: decimal; footnote-format: lowerRoman; endnote-start: 3`). Äldre dokument ser ut som förut (fotnoter 1, 2, 3, slutnoter i, ii, iii). Formatet skrivs tillbaka till `.docx` och `.odt` (orörda dokument byte för byte), och *Infoga → Fotnoternas numrering* och *Slutnoternas numrering* i verktygsraden byter format. Formatet gäller hela dokumentet; olika format i olika avsnitt visas med det första avsnittets.
+- **Textrutor kan stå ut i marginalen, som i Word.** En ruta vars läge (från spalten, marginalen eller sidan) hamnar delvis eller helt utanför spalten ritas där den står, och bara klämms mot papperets kant. Texten flyter runt den del som ligger i spalten; en ruta helt i marginalen (som faktarutan i `gen-skolrapport.docx`) påverkar inte texten. Dragning får flytta rutan ut i marginalen och läget sparas som det står i `.docx` och `.odt`. Ritning, layout och PDF-export räknar med samma läge.
+- **Markör och klick bredvid textrutor.** Ett klick i brödtexten bredvid en ruta hamnar i brödtextraden som syns där och ett klick i rutan i rutans text; pil upp/ned i brödtexten hoppar över rutans rader, i rutan rör de sig inom den och lämnar den vid kanterna; drag med musen över en ruta markerar brödtext i läsordning (`src/word/tboxnav.rs`).
+
+
+- **Faktarutan i `gen-skolrapport.docx` ritades ovanpå brödtexten.** Ritningen klämde in rutan i spalten medan layouten lät den stå i marginalen. Alla lägen (kolumn, marginal, sida, tecken) ritas nu på samma plats som i layouten och i PDF-exporten, med ett regressionstest per läge.
 
 ## [2.5.1] – 2026-11-21
 

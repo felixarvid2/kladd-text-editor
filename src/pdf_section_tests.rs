@@ -358,3 +358,51 @@ fn text_jumps_past_a_box_in_a_narrow_column() {
 fn text_jumps_past_a_box_in_a_single_column() {
     skipped_past_box("", 480, 20);
 }
+
+/// Ruta i högermarginalen: ritas där den står (utanför textytan) och texten bredvid påverkas inte.
+#[test]
+fn text_box_in_the_margin_is_drawn_there_and_leaves_the_text_alone() {
+    let plain = lay(&format!("Före\n\n{}", filler(3)));
+    let text_w_px = plain.text_w / 0.75;
+    // 80 px bred ruta 8 px utanför spalten; A4 har 72 pt (96 px) marginal.
+    let (w_px, x_px) = (80.0f32, text_w_px + 8.0);
+    let pp = format!("<!--k:pp bdr=\"t=single:8:4:112233 l=single:8:4:112233 b=single:8:4:112233 r=single:8:4:112233\" shd=\"FFF2CC\" fr=\"w={} x={} pl=4 pr=4 h=75\"-->", w_px * 0.75, x_px * 0.75);
+    let md = format!("Före\n\n<!--k:tb 1 w=\"{w_px}\" h=\"100\" x=\"{x_px}\" y=\"0\"-->\n\nRutan{pp}\n\n<!--k:/tb-->\n\n{}", filler(3));
+    let l = lay(&md);
+    let (t, p) = (texts(&l.pages[0].ops), texts(&plain.pages[0].ops));
+    let (bx, _, _) = t.iter().find(|t| t.2.contains("Rutan")).unwrap().clone();
+    assert!(bx > l.text_l + l.text_w, "rutans text x {bx} ska ligga i marginalen (textytan slutar vid {})", l.text_l + l.text_w);
+    // Brödtexten ser ut som utan rutan: samma rader på samma ställen.
+    let body = |v: &[(f32, f32, String)]| v.iter().filter(|t| t.2.starts_with("Stycke") || t.2.contains("Före")).map(|t| (t.0.round(), t.1.round(), t.2.clone())).collect::<Vec<_>>();
+    assert_eq!(body(&t), body(&p));
+}
+
+/// Faktarutan i gen-skolrapport.docx ritas i högermarginalen i PDF:en, utanför textytan där brödtexten
+/// bryts, så att ingen brödtextrad hamnar under den.
+#[test]
+fn fact_box_of_the_school_report_is_in_the_margin_in_the_pdf() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/docx/gen-skolrapport.docx")).unwrap();
+    let md = crate::docx::read(&bytes).unwrap().markdown;
+    let l = lay(&md);
+    let edge = l.text_l + l.text_w;
+    let (pi, rect) = l
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| {
+            p.ops.iter().find_map(|o| match o {
+                Op::Rect { x, y, w, h, color: (0xE8, 0xF1, 0xF5) } => Some((i, (*x, *y, *w, *h))),
+                _ => None,
+            })
+        })
+        .expect("rutans fyllning");
+    let (rx, ry, rw, rh) = rect;
+    assert!(rx >= edge - 0.5 && rx + rw <= l.pages[pi].geom.pw + 0.5, "rutan {rx}..{} ska ligga i marginalen ({edge}..{})", rx + rw, l.pages[pi].geom.pw);
+    let t = texts(&l.pages[pi].ops);
+    let head = t.iter().find(|t| t.2.contains("Fakta om skolan")).expect("rutans rubrik");
+    assert!(head.0 >= rx && head.0 < rx + rw);
+    // Brödtexten bredvid: flera rader i rutans höjd, alla i spalten (börjar och bryts före rutan).
+    let beside: Vec<_> = t.iter().filter(|t| t.1 > ry && t.1 < ry + rh && t.0 < rx - 1.0).collect();
+    assert!(beside.len() >= 4, "{beside:?}");
+    assert!(t.iter().all(|t| t.0 < rx - 1.0 || t.0 >= rx), "ingen text startar under rutan");
+}

@@ -212,3 +212,44 @@ fn dragged_box_is_saved_and_read_back_at_the_same_place() {
         assert!(back.markdown.contains("**Faktaruta**") && back.markdown.contains("Text i rutan"));
     }
 }
+
+#[test]
+fn box_in_the_margin_is_saved_and_read_back_where_it_stands() {
+    let l = read(&doc()).unwrap();
+    // A4 med 2,54 cm marginal: textytan är ca 602 px bred och rutan 267 px, så x=420 ligger delvis i högermarginalen.
+    for x in [420.0, 431.0, -30.0, -90.0] {
+        let md = drag_box(&l.markdown, x, 21.0);
+        for source in [l.source.as_ref(), None] {
+            let out = write(&md, "x", &|_| None, source).unwrap().bytes;
+            let xml = part_text(&out, "word/document.xml");
+            assert!(xml.contains(&format!("<wp:posOffset>{}</wp:posOffset></wp:positionH>", (x * 9525.0).round() as i64)), "{xml}");
+            let back = read(&out).unwrap();
+            let (h, _, _, _) = box_pos(&back.markdown);
+            assert_eq!(h, Pos::Off(x), "{}", back.markdown);
+            // Ramens läge är kvar utanför spalten (inte inklämt): punkter från spaltens vänsterkant.
+            assert!(back.markdown.contains(&format!("x={}", x * 0.75)), "{}", back.markdown);
+        }
+    }
+}
+
+#[test]
+fn box_far_outside_the_paper_is_clamped_to_the_paper_edge_when_read() {
+    let l = read(&doc()).unwrap();
+    let md = drag_box(&l.markdown, 5000.0, 0.0);
+    let out = write(&md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    let back = read(&out).unwrap();
+    // Ramen klämms mot papperets högerkant (A4 595 pt, 72 pt vänstermarginal, rutan 200 pt bred): 595 - 72 - 200 = 323 pt.
+    assert!(back.markdown.contains("x=323"), "{}", back.markdown);
+}
+
+#[test]
+fn fact_box_in_the_right_margin_keeps_its_place_outside_the_column() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/docx/gen-skolrapport.docx")).unwrap();
+    let md = read(&bytes).unwrap().markdown;
+    // Rutan börjar 464,6 pt från sidans vänsterkant: 393,7 pt från spaltens (spalten är 382,7 pt bred), alltså i marginalen.
+    let o = md.find("<!--k:tb").expect("faktarutan");
+    let line = &md[o..o + md[o..].find("-->").unwrap() + 3];
+    let a = docx_tbox::parse_head(line).unwrap().1.anchor.unwrap();
+    assert_eq!(a.hrel, HRel::Page, "{line}");
+    assert!(md.contains("x=393.7"), "{md}");
+}

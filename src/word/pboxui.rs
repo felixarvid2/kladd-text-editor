@@ -173,12 +173,15 @@ pub fn shapes_rects(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> (Vec<Shap
         // galleriet (varje spalt börjar om), så raderna väljs efter läge och spalt, inte med bisektion.
         let (cl, cw) = (env.col_at)(ra.left(), y0);
         // En ruta med egen bredd kan ha text bredvid sig (omflöde): bara rader i rutans egen bredd hör till den.
-        let fx = first.frame_geom(cw / ppx).map(|(_, _, l, w)| (cl + l * ppx - 1.0, cl + (l + w) * ppx));
+        // Papperet utanför spalten (marginalerna): en ruta får stå ut i dem.
+        let room = env.boxes.get(secpages::page_index(env.boxes, y0)).map_or((0.0, 0.0), |b| (b.margin[3] / ppx, b.margin[1] / ppx));
+        let fx = first.frame_geom(cw / ppx, room).map(|(_, _, l, w)| (cl + l * ppx - 1.0, cl + (l + w) * ppx));
         let rows: Vec<RowSpan> = g
             .rows
             .iter()
-            .filter(|r| r.rect().max.y > y0 + 0.5 && r.pos.y < y1 - 0.01 && r.pos.x >= cl - 1.0 && r.pos.x < cl + cw + 1.0)
-            .filter(|r| fx.is_none_or(|(a, b)| r.pos.x >= a && r.pos.x < b))
+            .filter(|r| r.rect().max.y > y0 + 0.5 && r.pos.y < y1 - 0.01)
+            // Ruta med egen bredd: raderna i rutans läge (den kan ligga i marginalen); annars i spalten.
+            .filter(|r| fx.map_or(r.pos.x >= cl - 1.0 && r.pos.x < cl + cw + 1.0, |(a, b)| r.pos.x >= a && r.pos.x < b))
             .map(|r| RowSpan {
                 top: r.pos.y,
                 bottom: r.rect().max.y,
@@ -196,7 +199,7 @@ pub fn shapes_rects(env: &Env, specs: &[ParaSpec], runs: &[BoxRun]) -> (Vec<Shap
         let fill = first.shd.map(|c| adapt_background(c, env.palette.dark));
         let b = &first.borders;
         for s in &segs {
-            let (left, right) = match first.frame_geom(cw / ppx) {
+            let (left, right) = match first.frame_geom(cw / ppx, room) {
                 // Ram med egen bredd: rutans egna kanter.
                 Some((_, _, l, w)) => (cl + l * ppx, cl + (l + w) * ppx),
                 None => {
