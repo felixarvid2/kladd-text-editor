@@ -114,6 +114,53 @@ tak (256 MB, 240 miniatyrer). Nytt: textlagren (`PageText`, ~0,2 MB per sida) ha
 och släpps långt från vyn; sidor som redan sökts hämtas inte om, den aktuella träffens sida hämtas vid behov
 och "markera allt" behåller allt. `find_status` bygger inte längre träfflistan varje bildruta.
 
+## PDF-export (`pdf_write.rs`)
+
+Mätning: `src/pdf_bench.rs` (`pdf_bench`, bygger ett stort dokument av `gen-skolrapport.docx` och
+`gen-nyhetsbrev.docx` upprepade `KLADD_BENCH_PDF_REPS` gånger, standard 40 = 961 sidor med spaltavsnitt,
+fotnoter, tabeller, bilder, textrutor och innehållsförteckning) och `balance_bench` i `pdf_section_tests.rs`
+(`KLADD_BENCH_PDF_SECTIONS` spaltavsnitt, jämför nya och gamla utjämningen). Båda är `#[ignore]`; fasernas
+tider skrivs med `KLADD_TIMING=1`. Opt-level 2 bara för kladd och PDF-beroendena i samma målkatalog (ingen
+fullständig optimerad byggnad, disken räcker inte):
+
+```
+args=(); for p in kladd krilla rustybuzz skrifa read-fonts ttf-parser subsetter write-fonts pdf-writer flate2 miniz_oxide png zlib-rs fdeflate kurbo tiny-skia-path image-webp zune-jpeg hashbrown indexmap smallvec crc32fast; do args+=(--config "profile.dev.package.$p.opt-level=2"); done
+KLADD_TIMING=1 KLADD_BENCH_PDF_REPS=40 cargo test "${args[@]}" pdf_bench -- --ignored --nocapture
+```
+
+| Fas (961 sidor, opt-level 2) | Före | Efter |
+|---|---|---|
+| Förberedelse (rensning, tolkning) | 24 ms | 22–32 ms |
+| Utläggning inkl. utjämning (första passet) | 113 + 115 ms | 64–68 ms |
+| Utläggning, pass för innehållsförteckning | 118 ms | 77 ms |
+| Sidhuvud och sidfot | 760 ms | 15 ms |
+| Ritning av sidor (formning, krilla) | 5 820 ms | 2 850 ms |
+| Skrivning (delmängder, komprimering) | 85 ms | 83 ms |
+| **Hela exporten** | **7,1 s** | **3,1–3,2 s** |
+| 67 sidor, debug (opt-level 0) | 16,2 s | 2,4 s |
+| 150 spaltavsnitt (123 sidor), bara utläggning | 31–34 s | 0,36–0,45 s |
+| 40 spaltavsnitt (32 sidor), debug | 22,2 s | 0,41 s |
+
+(Delad 4-kärnig maskin, ±30 %.) PDF:erna för 19 och 67 sidor är byte för byte lika före och efter.
+
+Vad som tog tid och vad som gjordes:
+
+- **Utjämning av spalter.** Förut lades hela dokumentet ut för varje försök i binärsökningen per avsnitt
+  (kvadratiskt). `Layout::run_balanced` lägger ut avsnitten ett i taget framåt: vid början av varje avsnitt tas
+  en ögonblicksbild (`Layout::snapshot`, allt utom de växande listorna, plus den senaste sidan) och sökningen
+  återställer den (`rollback`) och lägger bara ut det avsnittet igen. Sidorna före avsnittet påverkas inte av
+  dess spalthöjd. Den gamla metoden finns kvar som referens i `pdf_section_tests.rs`
+  (`lay_out_reference`) och ett test jämför sidor, positioner och spalthöjder.
+- **Bilder.** Sidhuvudets bilder avkodades för varje sida och bodybilder i varje pass; `Layout::load_pic`
+  sparar den avkodade bilden per källa (delas mellan passen) och sidhuvudet lägger in varje bild en gång.
+- **Textmätning.** Mätcachen och typsnittsytorna delas mellan passen (`Rc`), och cachen slår upp utan att
+  allokera en nyckelsträng.
+- **Formning vid ritning.** `Surface::draw_text` tolkar om hela typsnittets tabeller för varje textkörning.
+  Nu formas texten med `Shaper` (återanvända typsnittsytor och formningsplaner, samma glyfer som
+  `rustybuzz::shape`, testat) på upp till 8 trådar, 32 sidor i taget, och ritas med `draw_glyphs`.
+- Återstår: formningen och krillas `draw_glyphs` är nu det mesta av tiden (~3 s för 125 000 textkörningar);
+  PDF-exporten körs fortfarande på gränssnittstråden (Arkiv → Spara som PDF och utskrift).
+
 ## Stavning och grammatik
 
 Körs bara i dokumentläget, som redan bara kontrollerar ändrade stycken (`misspelled_cached`); grammatiken

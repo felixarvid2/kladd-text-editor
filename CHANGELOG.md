@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Rättat
+
+- **PDF-exporten av stora dokument är mycket snabbare.** Utjämningen av spalter på avsnittets sista sida lade ut hela dokumentet om för varje försök (kvadratisk tid med många spaltavsnitt: 150 spaltavsnitt tog 31 s, nu 0,4 s); nu läggs varje avsnitt ut en gång och bara det avsnittet läggs om vid sökningen, med exakt samma resultat. Sidhuvudets och sidfotens bilder avkodades på varje sida och bilder avkodades på nytt i varje utläggningspass (nu en gång per export), orden mäts en gång per export i stället för en gång per pass och texten formas på flera trådar utan att varje textrad tolkar om typsnittet. Dokument med 961 sidor (spaltavsnitt, fotnoter, tabeller, bilder och textrutor) tar 3 s i stället för 7 s och PDF:en är byte för byte densamma. `KLADD_TIMING=1` skriver tiden per fas vid export. Se `docs/dev/prestanda.md`.
+
 ## [2.6.0] – 2026-11-23
 
 ### Nytt

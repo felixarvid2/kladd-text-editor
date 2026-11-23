@@ -169,3 +169,5 @@ fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod bigbench;
+#[cfg(test)]
+mod pdf_bench;

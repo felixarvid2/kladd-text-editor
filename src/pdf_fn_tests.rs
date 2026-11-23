@@ -5,7 +5,7 @@ fn laid_out(md: &str) -> (Layout<'static>, DocDefaults) {
     let d = doc_defaults(md);
     let mut lay = Layout::new(&|_| None, &d);
     let (blocks, notes) = parse_blocks_notes(md);
-    lay.notes = notes;
+    lay.notes = Rc::new(notes);
     lay.new_page();
     lay.run(&blocks);
     lay.flush_notes();

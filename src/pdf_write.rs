@@ -9,14 +9,16 @@
 //! IBM Plex Mono för kod, radbrytning mellan ord (mätt med rustybuzz, samma formning
 //! som krilla använder när texten ritas), sidhuvud och sidfot med sidnummer.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use krilla::color::rgb;
 use krilla::geom::{PathBuilder, Point, Rect, Size, Transform};
 use krilla::num::NormalizedF32;
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, FillRule, LineCap, LineJoin, Stroke};
-use krilla::text::{Font, TextDirection};
+use krilla::text::Font;
 use krilla::Document;
 use krilla::image::Image;
 use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -125,18 +127,46 @@ impl Face {
 }
 
 /// Mäter textbredd med samma formning (rustybuzz) som krilla använder.
+/// Typsnittsytorna och mätcachen delas (`Rc`) mellan utläggningspassen och ögonblicksbilderna, så
+/// att varje ord bara formas en gång per export.
+#[derive(Clone)]
 struct Measurer {
+    shaper: Rc<Shaper>,
+    cache: Rc<RefCell<HashMap<Face, HashMap<String, f32>>>>,
+}
+
+/// Typsnittsytorna (rustybuzz) och färdiga formningsplaner. `rustybuzz::shape` bygger en plan för
+/// typsnittets GSUB/GPOS vid varje anrop (~30 µs); här görs det en gång per typsnitt, riktning och skrift.
+struct Shaper {
     faces: HashMap<Face, rustybuzz::Face<'static>>,
-    cache: HashMap<(Face, String), f32>,
+    plans: RefCell<HashMap<(Face, rustybuzz::Direction, rustybuzz::Script), rustybuzz::ShapePlan>>,
+}
+
+impl Shaper {
+    fn new() -> Self {
+        let faces = FACES.into_iter().map(|f| (f, rustybuzz::Face::from_slice(f.data(), 0).expect("inbyggt typsnitt"))).collect();
+        Self { faces, plans: RefCell::default() }
+    }
+
+    /// Samma resultat som `rustybuzz::shape(face, &[], buf)`.
+    fn shape(&self, face: Face, mut buf: rustybuzz::UnicodeBuffer) -> rustybuzz::GlyphBuffer {
+        buf.guess_segment_properties();
+        let f = &self.faces[&face];
+        let script = buf.script();
+        // Text utan skrift (bara siffror och blanksteg) har ingen plan att dela.
+        if script == rustybuzz::script::UNKNOWN {
+            return rustybuzz::shape(f, &[], buf);
+        }
+        let key = (face, buf.direction(), script);
+        let mut plans = self.plans.borrow_mut();
+        let plan = plans.entry(key).or_insert_with(|| rustybuzz::ShapePlan::new(f, key.1, Some(script), None, &[]));
+        rustybuzz::shape_with_plan(f, plan, buf)
+    }
 }
 
 impl Measurer {
     fn new() -> Self {
-        let mut faces = HashMap::new();
-        for f in FACES {
-            faces.insert(f, rustybuzz::Face::from_slice(f.data(), 0).expect("inbyggt typsnitt"));
-        }
-        Self { faces, cache: HashMap::new() }
+        Self { shaper: Rc::new(Shaper::new()), cache: Rc::default() }
     }
 
     /// Bredd i punkter för `text` i storlek `size`.
@@ -144,24 +174,89 @@ impl Measurer {
         if text.is_empty() {
             return 0.0;
         }
-        let key = (face, text.to_owned());
-        let units = if let Some(w) = self.cache.get(&key) {
-            *w
+        let hit = self.cache.borrow().get(&face).and_then(|m| m.get(text).copied());
+        let units = if let Some(w) = hit {
+            w
         } else {
-            let f = &self.faces[&face];
             let mut buf = rustybuzz::UnicodeBuffer::new();
             buf.push_str(text);
-            buf.guess_segment_properties();
-            let out = rustybuzz::shape(f, &[], buf);
+            let out = self.shaper.shape(face, buf);
             let w: i32 = out.glyph_positions().iter().map(|g| g.x_advance).sum();
-            let w = w as f32 / f.units_per_em() as f32;
-            if self.cache.len() < 50_000 {
-                self.cache.insert(key, w);
+            let w = w as f32 / self.shaper.faces[&face].units_per_em() as f32;
+            let mut cache = self.cache.borrow_mut();
+            let per_face = cache.entry(face).or_default();
+            if per_face.len() < 50_000 {
+                per_face.insert(text.to_owned(), w);
             }
             w
         };
         units * size
     }
+}
+
+/// Formar text som `krilla::Surface::draw_text` gör (`naive_shape`, riktning automatisk), men med en
+/// rustybuzz-yta som återanvänds: `draw_text` tolkar om hela typsnittets tabeller vid varje anrop, och
+/// det var det mesta av tiden för ritningen av sidorna.
+fn shape_glyphs(shaper: &Shaper, face: Face, text: &str) -> Vec<krilla::text::KrillaGlyph> {
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.guess_segment_properties();
+    let dir = buffer.direction();
+    let output = shaper.shape(face, buffer);
+    let (positions, infos) = (output.glyph_positions(), output.glyph_infos());
+    let upm = shaper.faces[&face].units_per_em() as f32;
+    let ltr = dir == rustybuzz::Direction::LeftToRight || dir == rustybuzz::Direction::TopToBottom;
+    (0..output.len())
+        .map(|i| {
+            let (pos, info) = (positions[i], infos[i]);
+            let start = info.cluster as usize;
+            // Slutet av klustret: nästa glyf med annat kluster (framåt vid vänster-till-höger, annars bakåt).
+            let end = if ltr {
+                (i + 1..infos.len()).find(|&j| infos[j].cluster != info.cluster).map(|j| infos[j].cluster as usize)
+            } else {
+                (0..i).rev().find(|&j| infos[j].cluster != info.cluster).map(|j| infos[j].cluster as usize)
+            }
+            .unwrap_or(text.len());
+            krilla::text::KrillaGlyph::new(
+                krilla::text::GlyphId::new(info.glyph_id),
+                pos.x_advance as f32 / upm,
+                pos.x_offset as f32 / upm,
+                pos.y_offset as f32 / upm,
+                pos.y_advance as f32 / upm,
+                start..end,
+                None,
+            )
+        })
+        .collect()
+}
+
+/// Antal sidor vars texter formas åt gången.
+const SHAPE_BATCH: usize = 32;
+
+/// Formar texterna i sidorna `jobs` (en lista per sida: typsnitt och text) på flera trådar. Formningen är
+/// det mesta av tiden för att rita sidorna och beror inte på något annat. Svaret har samma form som `jobs`.
+fn shape_pages(jobs: &[Vec<(Face, &str)>], shaper: &Shaper) -> Vec<Vec<Vec<krilla::text::KrillaGlyph>>> {
+    let flat: Vec<(Face, &str)> = jobs.iter().flatten().copied().collect();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(flat.len() / 200 + 1);
+    let shaped: Vec<Vec<krilla::text::KrillaGlyph>> = if workers <= 1 {
+        flat.iter().map(|(f, t)| shape_glyphs(shaper, *f, t)).collect()
+    } else {
+        let per = flat.len().div_ceil(workers);
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = flat
+                .chunks(per)
+                .map(|chunk| {
+                    sc.spawn(move || {
+                        let shaper = Shaper::new();
+                        chunk.iter().map(|(f, t)| shape_glyphs(&shaper, *f, t)).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().expect("formningstråd")).collect()
+        })
+    };
+    let mut it = shaped.into_iter();
+    jobs.iter().map(|j| it.by_ref().take(j.len()).collect()).collect()
 }
 
 // ============================================================== blockmodell
@@ -673,6 +768,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
 // ============================================================== sidlayout
 
 /// En ritinstruktion på en sida.
+#[derive(Clone)]
 enum Op {
     Text { x: f32, y: f32, face: Face, size: f32, text: String, color: (u8, u8, u8), italic: bool },
     Rect { x: f32, y: f32, w: f32, h: f32, color: (u8, u8, u8) },
@@ -709,6 +805,7 @@ struct PageGeom {
     cw: f32,
 }
 
+#[derive(Clone)]
 struct PageOps {
     ops: Vec<Op>,
     geom: PageGeom,
@@ -716,6 +813,7 @@ struct PageOps {
     sec: usize,
 }
 
+#[derive(Clone)]
 struct Heading {
     level: u8,
     text: String,
@@ -723,6 +821,7 @@ struct Heading {
     y: f32,
 }
 
+#[derive(Clone)]
 struct Layout<'a> {
     m: Measurer,
     pages: Vec<PageOps>,
@@ -783,9 +882,9 @@ struct Layout<'a> {
     cur_sec: usize,
     sec_row_seen: bool,
     /// Minsta marginal uppifrån och nedifrån per avsnitt för sidhuvud och sidfot (`hf::Plan::reserve`).
-    hf_reserve: Vec<[f32; 2]>,
+    hf_reserve: Rc<Vec<[f32; 2]>>,
     /// Fotnoternas text (nummer − 1), och de som hör till sidan som läggs ut just nu.
-    notes: Vec<Vec<Span>>,
+    notes: Rc<Vec<Vec<Span>>>,
     page_notes: Vec<usize>,
     /// Höjd längst ned på sidan som är reserverad för fotnoter (avskiljare och text).
     reserved: f32,
@@ -797,12 +896,25 @@ struct Layout<'a> {
     box_min: Option<f32>,
     /// Rubrikerna (nivå 1–3) som innehållsförteckningen listar, och var de hamnade i förra
     /// passet (sida från 0, y). Antalet rader är detsamma i båda passen.
-    toc_entries: Vec<(u8, String)>,
+    toc_entries: Rc<Vec<(u8, String)>>,
     toc_pos: Vec<(usize, f32)>,
+    /// Avkodade bilder per källa, delade mellan utläggningspassen (varje bild avkodas en gång per export).
+    pics: Rc<RefCell<HashMap<String, PicLoad>>>,
+    /// Sidhuvudets och sidfotens bilder: index i `images` och storlek (pt) per källa.
+    hf_pics: HashMap<String, Option<(usize, f32, f32)>>,
+}
+
+/// En bildkälla som lästs och avkodats (eller inte gick att läsa respektive avkoda).
+#[derive(Clone)]
+enum PicLoad {
+    Missing,
+    Broken,
+    Ok(Pic, Option<(i64, i64)>),
 }
 
 /// Ett löpande avsnittsbyte efter ett flerspaltigt avsnitt: avsnittet, dess sista sida och vad som
 /// behövs för att jämna ut spalterna där (`balance_columns`).
+#[derive(Clone)]
 struct SecEnd {
     sec: usize,
     page: usize,
@@ -819,6 +931,7 @@ struct SecEnd {
 }
 
 /// En flytande bild: sida, upptagen bredd (bild + luft), sidan (0-baserad) och understa kanten (pt).
+#[derive(Clone)]
 struct FloatBox {
     side: Float,
     /// Bilden tar hela radens bredd (texten hoppar under den).
@@ -970,15 +1083,17 @@ impl<'a> Layout<'a> {
             breaks: 0,
             cur_sec: 0,
             sec_row_seen: false,
-            hf_reserve: Vec::new(),
-            notes: Vec::new(),
+            hf_reserve: Rc::default(),
+            notes: Rc::default(),
             page_notes: Vec::new(),
             reserved: 0.0,
             in_notes: false,
             floats: Vec::new(),
             box_min: None,
-            toc_entries: Vec::new(),
+            toc_entries: Rc::default(),
             toc_pos: Vec::new(),
+            pics: Rc::default(),
+            hf_pics: HashMap::new(),
         }
     }
 
@@ -1078,15 +1193,25 @@ impl<'a> Layout<'a> {
             let size = st.size.unwrap_or(self.body * 0.9);
             let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
             // Bilderna först: de behöver sin egen storlek för uppställningen.
+            // En bild läggs bara in en gång (inte per sida).
             let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
             for src in hf::row_image_srcs(&rows) {
                 if loaded.contains_key(&src) {
                     continue;
                 }
-                if let Some(img) = (self.resolve)(&src).and_then(|i| make_pic(&i)) {
-                    let (pw, ph) = img.size();
-                    self.images.push(img);
-                    loaded.insert(src, (self.images.len() - 1, pw * 0.75, ph * 0.75));
+                if !self.hf_pics.contains_key(&src) {
+                    let entry = match self.load_pic(&src) {
+                        PicLoad::Ok(img, _) => {
+                            let (pw, ph) = img.size();
+                            self.images.push(img);
+                            Some((self.images.len() - 1, pw * 0.75, ph * 0.75))
+                        }
+                        _ => None,
+                    };
+                    self.hf_pics.insert(src.clone(), entry);
+                }
+                if let Some(Some(e)) = self.hf_pics.get(&src) {
+                    loaded.insert(src, *e);
                 }
             }
             let (plain, strong) = (self.base, self.base.strong());
@@ -1151,6 +1276,20 @@ impl<'a> Layout<'a> {
         let y = self.y;
         let wide = |side: Float| self.floats.iter().filter(|f| !f.full && f.side == side && f.top <= y + 0.5).map(|f| f.w).fold(0.0, f32::max);
         (wide(Float::Left), wide(Float::Left) + wide(Float::Right))
+    }
+
+    /// Läser och avkodar en bild; resultatet sparas så att samma bild inte avkodas igen i nästa pass,
+    /// på nästa sida eller i sidhuvudet.
+    fn load_pic(&self, src: &str) -> PicLoad {
+        if let Some(p) = self.pics.borrow().get(src) {
+            return p.clone();
+        }
+        let loaded = match (self.resolve)(src) {
+            None => PicLoad::Missing,
+            Some(img) => make_pic(&img).map_or(PicLoad::Broken, |p| PicLoad::Ok(p, img.extent)),
+        };
+        self.pics.borrow_mut().insert(src.to_owned(), loaded.clone());
+        loaded
     }
 
     fn page(&mut self) -> &mut PageOps {
@@ -1656,20 +1795,23 @@ impl<'a> Layout<'a> {
         if float.is_none() && anchor.is_none() {
             self.clear_floats();
         }
-        let Some(img) = (self.resolve)(src) else {
-            self.missing.push(src.to_owned());
-            let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
-            let spans = vec![Span { text: label, style: Style::default() }];
-            self.text_block(&spans, self.ml + indent, self.cw - indent, self.base, self.body, MUTED, false, None);
-            return;
-        };
-        let Some(image) = make_pic(&img) else {
-            self.missing.push(src.to_owned());
-            return;
+        let (image, extent) = match self.load_pic(src) {
+            PicLoad::Ok(p, e) => (p, e),
+            PicLoad::Broken => {
+                self.missing.push(src.to_owned());
+                return;
+            }
+            PicLoad::Missing => {
+                self.missing.push(src.to_owned());
+                let label = if alt.is_empty() { format!("[bild: {src}]") } else { format!("[bild: {alt}]") };
+                let spans = vec![Span { text: label, style: Style::default() }];
+                self.text_block(&spans, self.ml + indent, self.cw - indent, self.base, self.body, MUTED, false, None);
+                return;
+            }
         };
         let (pw, ph) = image.size();
         // Storlek: originalets storlek i Word om den finns, annars 96 dpi, högst sidbredden.
-        let (mut w, mut h) = match img.extent {
+        let (mut w, mut h) = match extent {
             Some((cx, cy)) => (cx as f32 / 12_700.0, cy as f32 / 12_700.0),
             None => (pw * 0.75, ph * 0.75),
         };
@@ -1679,7 +1821,7 @@ impl<'a> Layout<'a> {
         // Beskuren bild: den synliga delen avgör proportionerna.
         if let Some(c) = place.crop {
             aspect *= (1.0 - (c[1] + c[3]) / 100.0) / (1.0 - (c[0] + c[2]) / 100.0);
-            if size.w.is_none() && size.h.is_none() && img.extent.is_none() {
+            if size.w.is_none() && size.h.is_none() && extent.is_none() {
                 w *= 1.0 - (c[0] + c[2]) / 100.0;
                 h = w * aspect;
             }
@@ -2091,8 +2233,14 @@ impl<'a> Layout<'a> {
     }
 
     fn run(&mut self, blocks: &[Block]) {
+        self.run_range(blocks, 0, blocks.len());
+    }
+
+    /// Lägger ut `blocks[from..to]`. Blocken före och efter räknas ändå som grannar (`bi` är index i
+    /// hela `blocks`), så att resultatet blir detsamma som när allt läggs ut i ett svep.
+    fn run_range(&mut self, blocks: &[Block], from: usize, to: usize) {
         let mut skip_to = 0;
-        for (bi, b) in blocks.iter().enumerate() {
+        for (bi, b) in blocks.iter().enumerate().take(to).skip(from) {
             if bi < skip_to {
                 continue;
             }
@@ -2318,6 +2466,7 @@ fn draw_math(s: &mut krilla::surface::Surface<'_>, src: &str, display: bool, x: 
 }
 
 /// En bild på en sida: raster, eller en SVG som ritas som vektor (text och former, inga bildpunkter).
+#[derive(Clone)]
 enum Pic {
     Raster(Image),
     Svg(std::sync::Arc<resvg::usvg::Tree>),
@@ -2416,62 +2565,149 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
             _ => None,
         })
         .collect();
-    let reserve = hf_reserve(blocks, defaults);
-    let pass = |toc_pos: Vec<(usize, f32)>, balance: &[(usize, usize, f32)]| -> Layout<'a> {
+    let reserve = Rc::new(hf_reserve(blocks, defaults));
+    let toc_entries = Rc::new(toc_entries);
+    let notes = Rc::new(notes.to_vec());
+    // Mätcachen och de avkodade bilderna delas mellan passen.
+    let (m, pics) = (Measurer::new(), Rc::<RefCell<HashMap<String, PicLoad>>>::default());
+    let pass = |toc_pos: Vec<(usize, f32)>, balance: &[(usize, usize, f32)], search: bool| -> Layout<'a> {
         let mut lay = Layout::new(resolve, defaults);
+        lay.m = m.clone();
+        lay.pics = pics.clone();
         lay.hf_reserve = reserve.clone();
         lay.toc_entries = toc_entries.clone();
         lay.toc_pos = toc_pos;
-        lay.notes = notes.to_vec();
+        lay.notes = notes.clone();
         lay.balance = balance.to_vec();
         lay.new_page();
-        lay.run(blocks);
+        if search {
+            lay.run_balanced(blocks);
+        } else {
+            lay.run(blocks);
+        }
         lay.flush_rules();
         lay.flush_notes();
         lay
     };
-    let balance = balance_columns(&|b| pass(Vec::new(), b));
-    let mut lay = pass(Vec::new(), &balance);
+    let mut lay = pass(Vec::new(), &[], true);
+    crate::timing::lap("pdf: utläggning (inkl. utjämning av spalter)");
     if blocks.iter().any(|b| matches!(b, Block::Toc)) {
+        // Andra passet använder samma spalthöjder och söker inga nya.
+        let balance = lay.balance.clone();
         let pos: Vec<(usize, f32)> =
             lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
-        lay = pass(pos, &balance);
+        lay = pass(pos, &balance, false);
+        crate::timing::lap("pdf: utläggning, pass för innehållsförteckning");
     }
     lay
 }
 
-/// Jämnar ut spalterna på avsnittets sista sida före varje löpande avsnittsbyte (som Word och
-/// LibreOffice; inte sist i dokumentet och inte när avsnittet har en manuell spaltbrytning på sidan).
-/// `pass` lägger ut hela dokumentet med givna spalthöjder (avsnitt, sida, höjd från spalternas
-/// överkant). Per byte söks lägsta höjd där allt ryms kvar på sidan: först ur ytan delad på spaltbredden,
-/// sedan med växande steg och halvering. Resultatet är höjderna att lägga ut dokumentet med.
-fn balance_columns<'a>(pass: &dyn Fn(&[(usize, usize, f32)]) -> Layout<'a>) -> Vec<(usize, usize, f32)> {
-    let mut fixed: Vec<(usize, usize, f32)> = Vec::new();
-    let mut done: Vec<usize> = Vec::new();
-    let mut lay = pass(&fixed);
-    while let Some(e) = lay.sec_ends.iter().find(|e| !done.contains(&e.sec)) {
+/// Layoutens tillstånd vid ett avsnitts början. `Layout::rollback` återställer det, så att avsnittet kan
+/// läggas ut igen med en annan spalthöjd utan att allt före det läggs ut om.
+struct Snapshot<'a> {
+    /// Allt utom de växande listorna (sidor, rubriker, bilder, saknade bilder, avsnittsslut).
+    state: Layout<'a>,
+    pages: usize,
+    /// Sidan som lades ut när bilden togs (den enda tidigare sida som kan ändras efteråt).
+    last: Option<PageOps>,
+    headings: usize,
+    images: usize,
+    missing: usize,
+    sec_ends: usize,
+}
+
+impl<'a> Layout<'a> {
+    fn snapshot(&mut self) -> Snapshot<'a> {
+        let (pages, headings, images) = (std::mem::take(&mut self.pages), std::mem::take(&mut self.headings), std::mem::take(&mut self.images));
+        let (missing, sec_ends) = (std::mem::take(&mut self.missing), std::mem::take(&mut self.sec_ends));
+        let snap = Snapshot {
+            state: self.clone(),
+            pages: pages.len(),
+            last: pages.last().cloned(),
+            headings: headings.len(),
+            images: images.len(),
+            missing: missing.len(),
+            sec_ends: sec_ends.len(),
+        };
+        (self.pages, self.headings, self.images, self.missing, self.sec_ends) = (pages, headings, images, missing, sec_ends);
+        snap
+    }
+
+    fn rollback(&mut self, snap: &Snapshot<'a>) {
+        let (mut pages, mut headings, mut images) = (std::mem::take(&mut self.pages), std::mem::take(&mut self.headings), std::mem::take(&mut self.images));
+        let (mut missing, mut sec_ends) = (std::mem::take(&mut self.missing), std::mem::take(&mut self.sec_ends));
+        pages.truncate(snap.pages);
+        if let (Some(last), Some(slot)) = (&snap.last, pages.last_mut()) {
+            *slot = last.clone();
+        }
+        headings.truncate(snap.headings);
+        images.truncate(snap.images);
+        missing.truncate(snap.missing);
+        sec_ends.truncate(snap.sec_ends);
+        *self = snap.state.clone();
+        (self.pages, self.headings, self.images, self.missing, self.sec_ends) = (pages, headings, images, missing, sec_ends);
+    }
+
+    /// Lägger ut alla block och jämnar ut spalterna på avsnittets sista sida före varje löpande
+    /// avsnittsbyte (som Word och LibreOffice; inte sist i dokumentet och inte när avsnittet har en
+    /// manuell spaltbrytning på sidan). Avsnitten läggs ut ett i taget, framåt: vid ett byte med
+    /// spalter söks lägsta spalthöjd där allt ryms kvar på sidan genom att bara det avsnittet läggs ut
+    /// igen från sitt början (först ur ytan delad på spaltbredden, sedan med växande steg och halvering).
+    /// Dokumentet före avsnittet påverkas inte av höjden, så resultatet är detsamma som när hela
+    /// dokumentet läggs ut om för varje försök, men tiden växer inte med antalet avsnitt.
+    fn run_balanced(&mut self, blocks: &[Block]) {
+        // Avsnittsbyten på översta nivån (de i textrutor läggs ut av rutan).
+        let mut breaks = Vec::new();
+        let mut i = 0;
+        while i < blocks.len() {
+            match &blocks[i] {
+                Block::TBoxOpen(_) => {
+                    i = blocks[i + 1..].iter().position(|b| matches!(b, Block::TBoxClose)).map_or(blocks.len(), |k| i + 1 + k) + 1;
+                    continue;
+                }
+                Block::SectionBreak(_) => breaks.push(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        let mut start = 0;
+        let mut snap = self.snapshot();
+        for j in breaks {
+            let before = self.sec_ends.len();
+            self.run_range(blocks, start, j + 1);
+            if self.sec_ends.len() > before {
+                self.balance_section(blocks, start, j + 1, &snap);
+            }
+            start = j + 1;
+            snap = self.snapshot();
+        }
+        self.run_range(blocks, start, blocks.len());
+    }
+
+    /// Avsnittet `blocks[from..to]` (till och med bytet) har just lagts ut med ett avsnittsslut sist i
+    /// `sec_ends`: väljer spalthöjd för dess sista sida och lägger ut avsnittet med den.
+    fn balance_section(&mut self, blocks: &[Block], from: usize, to: usize, snap: &Snapshot<'a>) {
+        let Some(e) = self.sec_ends.last() else { return };
         let (sec, page, top, step) = (e.sec, e.page, e.top, e.step.max(1.0));
         let full = e.bottom - top;
         let low = (e.area / e.width.max(1.0)).max(step);
-        let skip = e.skip || low >= full - 0.5;
-        done.push(sec);
-        if skip {
-            continue;
+        if e.skip || low >= full - 0.5 {
+            return;
         }
         // Ryms allt på sidan med spalthöjden `h`? Då slutar avsnittet på samma sida.
-        let fits = |h: f32| -> Option<Layout<'a>> {
-            let mut b = fixed.clone();
-            b.push((sec, page, h));
-            let l = pass(&b);
-            l.sec_ends.iter().find(|e| e.sec == sec).is_some_and(|e| e.page == page).then_some(l)
+        let fits = |lay: &mut Self, h: f32| -> bool {
+            lay.rollback(snap);
+            lay.balance.push((sec, page, h));
+            lay.run_range(blocks, from, to);
+            lay.sec_ends.iter().find(|e| e.sec == sec).is_some_and(|e| e.page == page)
         };
         let (mut lo, mut hi, mut best) = (low - step * 0.5, full, None);
         // Växande steg uppåt från den lägsta möjliga höjden, sedan halvering.
         let mut grow = step;
         let mut h = low;
         while h < full - 0.5 {
-            if let Some(l) = fits(h) {
-                best = Some((h, l));
+            if fits(self, h) {
+                best = Some(h);
                 hi = h;
                 break;
             }
@@ -2481,29 +2717,31 @@ fn balance_columns<'a>(pass: &dyn Fn(&[(usize, usize, f32)]) -> Layout<'a>) -> V
         }
         while best.is_some() && hi - lo > 2.0 {
             let mid = (lo + hi) / 2.0;
-            match fits(mid) {
-                Some(l) => {
-                    best = Some((mid, l));
-                    hi = mid;
-                }
-                None => lo = mid,
+            if fits(self, mid) {
+                best = Some(mid);
+                hi = mid;
+            } else {
+                lo = mid;
             }
         }
-        if let Some((h, l)) = best {
-            fixed.push((sec, page, h));
-            lay = l;
+        // Sista utläggningen med den valda höjden (eller utan utjämning om ingen höjd räckte).
+        self.rollback(snap);
+        if let Some(h) = best {
+            self.balance.push((sec, page, h));
         }
+        self.run_range(blocks, from, to);
     }
-    fixed
 }
 
 /// Bygger en PDF av Markdown-text.
 pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Result<Written, String> {
     // Ändringar godkänns och kommentarer utelämnas i PDF.
+    crate::timing::lap_start();
     let cleaned = crate::review::clean_for_export(markdown);
     let markdown = cleaned.as_str();
     let (blocks, notes) = parse_blocks_notes(markdown);
     let defaults = doc_defaults(markdown);
+    crate::timing::lap("pdf: förberedelse (rensning, tolkning)");
     let mut lay = lay_out(&blocks, &notes, &defaults, resolve);
 
     let fonts: HashMap<Face, Font> = FACES
@@ -2511,6 +2749,8 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
         .map(|f| (f, Font::new(krilla::Data::from(f.data()), 0).expect("inbyggt typsnitt")))
         .collect();
 
+    let shapers = lay.m.shaper.clone();
+    crate::timing::lap("pdf: typsnitt");
     let mut doc = Document::new();
     let total = lay.pages.len();
     // Sidhuvud och sidfot ritas sist, när sidantalet är känt.
@@ -2520,7 +2760,28 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let hf_pages = hf_plan.pages(&lay.pages.iter().map(|p| p.sec).collect::<Vec<_>>());
     let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer_page(&defaults, &hf_plan, &hf_pages, &fields, pi)).collect();
     let images = std::mem::take(&mut lay.images);
+    crate::timing::lap("pdf: sidhuvud/sidfot");
+    // Texterna formas på flera trådar, några sidor i taget (formen är densamma som `Surface::draw_text`).
+    let mut shaped: std::collections::VecDeque<std::vec::IntoIter<Vec<krilla::text::KrillaGlyph>>> = std::collections::VecDeque::new();
     for (pi, page_ops) in lay.pages.iter().enumerate() {
+        if shaped.is_empty() {
+            let end = (pi + SHAPE_BATCH).min(total);
+            let jobs: Vec<Vec<(Face, &str)>> = (pi..end)
+                .map(|k| {
+                    lay.pages[k]
+                        .ops
+                        .iter()
+                        .chain(extras[k].iter())
+                        .filter_map(|o| match o {
+                            Op::Text { face, text, .. } => Some((*face, text.as_str())),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect();
+            shaped = shape_pages(&jobs, &shapers).into_iter().map(Vec::into_iter).collect();
+        }
+        let mut page_glyphs = shaped.pop_front().expect("formade sidor");
         let mut page = doc.start_page_with(PageSettings::from_wh(page_ops.geom.pw, page_ops.geom.ph).ok_or("ogiltig sidstorlek")?);
         let mut links = Vec::new();
         let mut gotos = Vec::new();
@@ -2565,7 +2826,8 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                             // Plex finns inte i kursiv här: luta texten 12° (falsk kursiv).
                             s.push_transform(&Transform::from_row(1.0, 0.0, -0.21, 1.0, 0.21 * y, 0.0));
                         }
-                        s.draw_text(Point::from_xy(*x, *y), fonts[face].clone(), *size, text, false, TextDirection::Auto);
+                        let glyphs = page_glyphs.next().expect("formad text");
+                        s.draw_glyphs(Point::from_xy(*x, *y), &glyphs, fonts[face].clone(), text, *size, false);
                         if *italic {
                             s.pop();
                         }
@@ -2618,6 +2880,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
         page.finish();
     }
 
+    crate::timing::lap("pdf: ritning av sidor");
     // Bokmärken från rubrikerna (nivå 1–3), nästlade efter nivå.
     let mut outline = krilla::outline::Outline::new();
     let mut stack: Vec<(u8, krilla::outline::OutlineNode)> = Vec::new();
@@ -2650,7 +2913,9 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
             .language("sv".to_owned()),
     );
 
+    crate::timing::lap("pdf: bokmärken, metadata");
     let bytes = doc.finish().map_err(|e| crate::tf!("PDF:en kunde inte skapas: {e}", e = format!("{e:?}")))?;
+    crate::timing::lap("pdf: skrivning (typsnittsdelmängder, bilder, komprimering)");
     Ok(Written { bytes, missing_images: lay.missing })
 }
 
