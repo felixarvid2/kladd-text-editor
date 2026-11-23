@@ -699,9 +699,8 @@ pub fn resolve_image(src: &str, base: &Path, images: &[(String, crate::docx::Ima
         return None;
     }
     let bytes = std::fs::read(&path).ok()?;
-    // WebP och SVG görs om till PNG så att Word, OpenDocument och PDF kan bädda in dem.
-    let bytes = crate::imgfmt::to_supported(bytes)?;
-    Some(crate::docx::Image { bytes, extent: None })
+    // WebP görs om till PNG; SVG får en PNG som raster men behåller sin källa (vektor i .docx, .odt, PDF, HTML).
+    crate::imgfmt::prepare(bytes)
 }
 
 /// Gör om en bildkälla till en sökväg på disken (eller `None` för webbadresser).

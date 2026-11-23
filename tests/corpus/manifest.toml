@@ -939,12 +939,12 @@ dropped = []
 headings = 1
 
 ["odt/lo-export-DUMMY2.odt"]
-dropped = ["diagram och former"]
+dropped = []
 headings = 1
 skip_idempotent = "bild bredare än textytan krymps till textbredden"
 
 ["odt/lo-export-DUMMY2B.odt"]
-dropped = ["diagram och former"]
+dropped = []
 headings = 1
 skip_idempotent = "bild bredare än textytan krymps till textbredden"
 
@@ -1074,7 +1074,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-qrcode-properties.odt"]
-dropped = ["diagram och former"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-redlineTextFrame.odt"]
@@ -1170,7 +1170,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-tdf103567.odt"]
-dropped = ["diagram och former"]
+dropped = []
 headings = 0
 
 ["odt/lo-export-tdf107292.odt"]

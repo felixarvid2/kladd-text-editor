@@ -317,6 +317,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     opts.insert(Options::ENABLE_MATH);
     opts.insert(crate::style::titles::OPTS);
     // Fotnoter: etiketter i ordning (nummer = plats + 1), definitionernas text och pågående definition.
+    let nf = doc_defaults(md).notes;
     let mut note_labels: Vec<String> = Vec::new();
     let mut end_labels: Vec<String> = Vec::new();
     let mut note_defs: Vec<(String, Vec<Span>)> = Vec::new();
@@ -633,7 +634,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     }
                 };
                 let st = Style { endref: true, ..style.clone() };
-                spans.push(Span { text: crate::word::markup::roman(n), style: st });
+                spans.push(Span { text: nf.number(true, n), style: st });
             }
             MdEvent::FootnoteReference(t) => {
                 // Samma etikett flera gånger är samma fotnot (som i Markdown).
@@ -645,7 +646,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     }
                 };
                 let st = Style { fnref: Some(n), ..style.clone() };
-                spans.push(Span { text: n.to_string(), style: st });
+                spans.push(Span { text: nf.number(false, n), style: st });
             }
         }
     }
@@ -659,7 +660,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
         blocks.push(Block::Rule);
         for (i, l) in end_labels.iter().enumerate() {
             let mut spans = vec![
-                Span { text: crate::word::markup::roman(i + 1), style: Style { endref: true, ..Style::default() } },
+                Span { text: nf.number(true, i + 1), style: Style { endref: true, ..Style::default() } },
                 Span { text: " ".into(), style: Style::default() },
             ];
             spans.extend(note_defs.iter().find(|(d, _)| d == l).map(|(_, t)| t.clone()).unwrap_or_default());
@@ -727,7 +728,7 @@ struct Layout<'a> {
     pages: Vec<PageOps>,
     y: f32,
     headings: Vec<Heading>,
-    images: Vec<Image>,
+    images: Vec<Pic>,
     resolve: &'a dyn Fn(&str) -> Option<DocImage>,
     missing: Vec<String>,
     /// Brödtextens storlek (dokumentets grundstorlek) och faktorn mot `BODY_SIZE`
@@ -1073,35 +1074,38 @@ impl<'a> Layout<'a> {
         let mut out = Vec::new();
         for (footer, tpl, align, st, dist) in items {
             let Some(tpl) = tpl else { continue };
-            let rows = hf::filled_rows(&tpl, align, f);
+            let rows = hf::filled_rows(&tpl, align, f, st);
             let size = st.size.unwrap_or(self.body * 0.9);
             let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
             // Bilderna först: de behöver sin egen storlek för uppställningen.
             let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
-            for src in rows.iter().flatten().flat_map(|p| hf::image_srcs(p)) {
+            for src in hf::row_image_srcs(&rows) {
                 if loaded.contains_key(&src) {
                     continue;
                 }
-                if let Some(img) = (self.resolve)(&src).and_then(|i| make_image(&i.bytes)) {
+                if let Some(img) = (self.resolve)(&src).and_then(|i| make_pic(&i)) {
                     let (pw, ph) = img.size();
                     self.images.push(img);
-                    loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
+                    loaded.insert(src, (self.images.len() - 1, pw * 0.75, ph * 0.75));
                 }
             }
-            let base_face = if st.bold { self.base.strong() } else { self.base };
+            let (plain, strong) = (self.base, self.base.strong());
+            let face_of = |fmt: &hf::RunFmt| if fmt.bold { strong } else { plain };
             let m = std::cell::RefCell::new(&mut self.m);
-            let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
+            let measure = |t: &str, sz: f32, fmt: &hf::RunFmt| m.borrow_mut().width(face_of(fmt), sz, t);
             let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
             let zn = hf::layout_rows(&rows, size, 1.0, g.cw, &measure, &natural);
             let edge = dist.unwrap_or(hf::DEFAULT_DIST);
             let top = if footer { g.ph - edge - zn.height } else { edge };
             for it in &zn.items {
                 match it {
-                    Placed::Text { x, y, text, size } => {
+                    Placed::Text { x, y, text, size, fmt } => {
                         let base_y = top + y + size * 0.95;
-                        out.push(Op::Text { x: g.ml + x, y: base_y, face: base_face, size: *size, text: text.clone(), color, italic: st.italic });
-                        if st.underline {
-                            let w = m.borrow_mut().width(base_face, *size, text);
+                        let face = face_of(fmt);
+                        let color = fmt.color.map_or(color, |c| (c[0], c[1], c[2]));
+                        out.push(Op::Text { x: g.ml + x, y: base_y, face, size: *size, text: text.clone(), color, italic: fmt.italic });
+                        if fmt.underline {
+                            let w = m.borrow_mut().width(face, *size, text);
                             let uy = base_y + size * 0.12;
                             out.push(Op::Line { x1: g.ml + x, y1: uy, x2: g.ml + x + w, y2: uy, width: (size * 0.06).max(0.4), color });
                         }
@@ -1318,7 +1322,7 @@ impl<'a> Layout<'a> {
     /// Fotnotens rader: litet nummer, mellanslag och texten.
     fn note_spans(&self, n: usize) -> Vec<Span> {
         let mut v = vec![
-            Span { text: n.to_string(), style: Style { fnref: Some(n), ..Style::default() } },
+            Span { text: self.defaults.notes.number(false, n), style: Style { fnref: Some(n), ..Style::default() } },
             Span { text: " ".into(), style: Style::default() },
         ];
         v.extend(self.notes.get(n - 1).cloned().unwrap_or_default());
@@ -1370,7 +1374,8 @@ impl<'a> Layout<'a> {
             let face = face_for(&s.style, base);
             let sz = s.style.span.font_size.unwrap_or(size);
             let sz = if s.style.code { sz * 0.9 } else { sz };
-            let sz = if s.style.fnref.is_some() || s.style.endref { sz * 0.65 } else { sz };
+            // Notnummer: 0,65 av texten (0,8 i notlistan), minst 7,5 pt.
+            let sz = if s.style.fnref.is_some() || s.style.endref { (sz * if self.in_notes { 0.8 } else { 0.65 }).max(7.5) } else { sz };
             if let Some((src, disp)) = &s.style.math {
                 if let Some(f) = crate::math::formula(src, *disp) {
                     // Raden ska rymma formeln: storleken höjs så att över- och underdelen får plats.
@@ -1658,7 +1663,7 @@ impl<'a> Layout<'a> {
             self.text_block(&spans, self.ml + indent, self.cw - indent, self.base, self.body, MUTED, false, None);
             return;
         };
-        let Some(image) = make_image(&img.bytes) else {
+        let Some(image) = make_pic(&img) else {
             self.missing.push(src.to_owned());
             return;
         };
@@ -1666,11 +1671,11 @@ impl<'a> Layout<'a> {
         // Storlek: originalets storlek i Word om den finns, annars 96 dpi, högst sidbredden.
         let (mut w, mut h) = match img.extent {
             Some((cx, cy)) => (cx as f32 / 12_700.0, cy as f32 / 12_700.0),
-            None => (pw as f32 * 0.75, ph as f32 * 0.75),
+            None => (pw * 0.75, ph * 0.75),
         };
         // Angiven storlek (`width`/`height` i CSS-px, redan omräknat till pt); proportionerna bevaras
         // när bara en sida anges.
-        let mut aspect = if pw > 0 { ph as f32 / pw as f32 } else { 1.0 };
+        let mut aspect = if pw > 0.0 { ph / pw } else { 1.0 };
         // Beskuren bild: den synliga delen avgör proportionerna.
         if let Some(c) = place.crop {
             aspect *= (1.0 - (c[1] + c[3]) / 100.0) / (1.0 - (c[0] + c[2]) / 100.0);
@@ -2183,7 +2188,7 @@ impl<'a> Layout<'a> {
                     let (mut tx, mut tw) = (self.ml + indent, self.cw - indent);
                     let mut frame_x: Option<(f32, f32)> = None;
                     if let Some(l) = boxed {
-                        if let Some((tl, tr, fl, fw)) = l.frame_geom(self.cw - indent) {
+                        if let Some((tl, tr, fl, fw)) = l.frame_geom(self.cw - indent, (self.ml, (self.pw - self.ml - self.cw).max(0.0))) {
                             tx += tl;
                             tw -= tl + tr;
                             frame_x = Some((self.ml + indent + fl, fw));
@@ -2310,6 +2315,45 @@ fn draw_math(s: &mut krilla::surface::Surface<'_>, src: &str, display: bool, x: 
             s.draw_path(&path);
         }
     }
+}
+
+/// En bild på en sida: raster, eller en SVG som ritas som vektor (text och former, inga bildpunkter).
+enum Pic {
+    Raster(Image),
+    Svg(std::sync::Arc<resvg::usvg::Tree>),
+}
+
+impl Pic {
+    /// Storleken i bildpunkter (96 dpi).
+    fn size(&self) -> (f32, f32) {
+        match self {
+            Pic::Raster(i) => {
+                let (w, h) = i.size();
+                (w as f32, h as f32)
+            }
+            Pic::Svg(t) => (t.size().width(), t.size().height()),
+        }
+    }
+
+    /// Ritar bilden med övre vänstra hörnet i origo i storleken `size`.
+    fn draw(&self, s: &mut krilla::surface::Surface, size: Size) {
+        match self {
+            Pic::Raster(i) => s.draw_image(i.clone(), size),
+            Pic::Svg(t) => {
+                use krilla_svg::SurfaceExt;
+                s.draw_svg(t, size, krilla_svg::SvgSettings::default());
+            }
+        }
+    }
+}
+
+fn make_pic(img: &DocImage) -> Option<Pic> {
+    if let Some(svg) = &img.svg {
+        if let Some(tree) = crate::imgfmt::parse_svg(&svg.data) {
+            return Some(Pic::Svg(std::sync::Arc::new(tree)));
+        }
+    }
+    make_image(&img.bytes).map(Pic::Raster)
 }
 
 fn make_image(bytes: &[u8]) -> Option<Image> {
@@ -2538,7 +2582,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                                         if let Some(path) = pb.finish() {
                                             s.push_clip_path(&path, &FillRule::NonZero);
                                             s.push_transform(&Transform::from_translate(*x - fw * c[0] / 100.0, *y - fh * c[1] / 100.0));
-                                            s.draw_image(images[*index].clone(), full);
+                                            images[*index].draw(&mut s, full);
                                             s.pop();
                                             s.pop();
                                         }
@@ -2546,7 +2590,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                                 }
                                 None => {
                                     s.push_transform(&Transform::from_translate(*x, *y));
-                                    s.draw_image(images[*index].clone(), size);
+                                    images[*index].draw(&mut s, size);
                                     s.pop();
                                 }
                             }
@@ -3102,7 +3146,7 @@ mod tests {
     #[test]
     fn img_width_sets_size_keeping_aspect_and_clamps() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let (lay, _) = laid_out("<img src=\"bild:a.png\" alt=\"A\" width=\"192\">\n", &resolve);
         let im = images_of(&lay);
         assert_eq!(im.len(), 1);
@@ -3124,7 +3168,7 @@ mod tests {
     #[test]
     fn div_align_places_an_image() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let md = "<div align=\"center\">\n\n<img src=\"a\" width=\"96\">\n\n</div>\n\n<div align=\"right\">\n\n<img src=\"a\" width=\"96\">\n\n</div>\n";
         let (lay, _) = laid_out(md, &resolve);
         let im = images_of(&lay);
@@ -3138,7 +3182,7 @@ mod tests {
     #[test]
     fn floats_wrap_text_line_by_line() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         for (side, tag) in [(Float::Left, "left"), (Float::Right, "right")] {
             let md = format!("<img src=\"a\" width=\"192\" align=\"{tag}\">\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n");
             let (mut lay, _) = laid_out(&md, &resolve);
@@ -3170,7 +3214,7 @@ mod tests {
     #[test]
     fn float_that_does_not_fit_moves_to_the_next_page() {
         let data = png(100, 100);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         // Fyll sidan nästan helt, sedan en bild på 150 pt som inte ryms.
         let filler: Vec<String> = (0..12).map(|_| LOREM.to_owned()).collect();
         let md = format!("{}\n\n<img src=\"a\" width=\"200\" align=\"left\">\n\n{LOREM}\n\n{LOREM}\n", filler.join("\n\n"));
@@ -3186,7 +3230,7 @@ mod tests {
     #[test]
     fn anchored_images_are_placed_like_in_the_document_mode() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         // Mot sidan: absolut plats (96 px = 72 pt från sidans kant), text påverkas inte (bakom).
         let md = format!("<img src=\"a\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\">\n\n{LOREM}\n");
         let (lay, _) = laid_out(&md, &resolve);
@@ -3211,7 +3255,7 @@ mod tests {
     #[test]
     fn cropped_image_keeps_the_visible_proportions() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let md = "<img src=\"a\" width=\"100\" crop=\"0 0 50 0\">\n";
         let (lay, _) = laid_out(md, &resolve);
         let (_, _, w, h) = images_of(&lay)[0];
@@ -3222,7 +3266,7 @@ mod tests {
     #[test]
     fn float_without_room_is_a_plain_block() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let md = format!("<img src=\"a\" width=\"700\" align=\"left\">\n\n{LOREM}\n");
         let (lay, _) = laid_out(&md, &resolve);
         let (_, iy, _, ih) = images_of(&lay)[0];
@@ -3250,7 +3294,7 @@ mod manual {
         let md = std::fs::read_to_string(&i).unwrap();
         let dir = std::path::Path::new(&i).parent().unwrap().to_path_buf();
         let w = super::write(&md, "Prov", &|src| {
-            std::fs::read(dir.join(src)).ok().map(|bytes| crate::docx::Image { bytes, extent: None })
+            std::fs::read(dir.join(src)).ok().map(|bytes| crate::docx::Image { bytes, extent: None, svg: None })
         })
         .unwrap();
         println!("saknade bilder: {:?}", w.missing_images);

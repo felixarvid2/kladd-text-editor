@@ -237,6 +237,8 @@ pub struct DocDefaults {
     /// Sidnumret på första sidan (`page-start`) och dess format (`page-format: roman`).
     pub page_start: Option<u32>,
     pub page_format: Option<crate::hf::NumFmt>,
+    /// Fot- och slutnoternas talformat (`endnote-format: decimal`), se `word::notefmt`.
+    pub notes: crate::word::notefmt::NoteFormats,
     /// Formatmallarnas ändringar (`h1: …`, `body: …`, `quote: …`), se `formatmall`.
     pub styles: StyleSet,
 }
@@ -348,6 +350,7 @@ impl DocDefaults {
         if let Some(f) = self.page_format.filter(|f| *f != crate::hf::NumFmt::Decimal) {
             parts.push(format!("page-format: {}", f.name()));
         }
+        parts.extend(self.notes.to_parts());
         parts.extend(self.styles.to_parts());
         if parts.is_empty() {
             return String::new();
@@ -386,7 +389,9 @@ impl DocDefaults {
                 "header-align" => d.header_align = Align::from_attr(&v),
                 "footer-align" => d.footer_align = Align::from_attr(&v),
                 k => {
-                    d.styles.read_decl(k, &v);
+                    if !d.notes.read_decl(k, &v) {
+                        d.styles.read_decl(k, &v);
+                    }
                 }
             }
         }

@@ -46,7 +46,7 @@ svenska och engelska. Allt beskrivs i [handboken](docs/handbok.md).
   inte resten av filen.
 - **`.doc`, `.rtf`, `.wpd` och `.wps`** konverteras till `.docx` med LibreOffice när du öppnar dem (LibreOffice måste vara installerat). Originalet skrivs aldrig över: *Spara* frågar efter ett nytt `.docx`-namn. Utan LibreOffice öppnas `.rtf` med en enkel inbyggd läsare (text, fet, kursiv, stycken); övriga ger ett felmeddelande.
 - **Teckenkodning**: UTF-8, UTF-16 och Windows-1252. Radsluten (LF eller CRLF) bevaras.
-- **Bilder** (`.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.svg`) kan infogas i dokument. WebP och SVG sparas som PNG i `.docx`, `.odt` och PDF.
+- **Bilder** (`.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.svg`) kan infogas i dokument. WebP sparas som PNG i `.docx`, `.odt` och PDF; SVG behåller vektorn (SVG-del med PNG-reserv i `.docx` och `.odt`, vektor i PDF, SVG-fil i HTML/EPUB).
 
 ## Installera
 

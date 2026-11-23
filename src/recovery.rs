@@ -339,7 +339,7 @@ impl Found {
             .iter()
             .filter_map(|r| {
                 let bytes = std::fs::read(side.join(&r.file)).ok()?;
-                Some((r.name.clone(), crate::docx::Image { bytes, extent: r.extent }))
+                Some((r.name.clone(), crate::docx::Image { bytes, extent: r.extent, svg: None }))
             })
             .collect()
     }
@@ -541,8 +541,8 @@ mod tests {
         d.word_view = true;
         d.encoding = TextEncoding::Utf16Le;
         d.line_ending = LineEnding::CrLf;
-        d.images.push(("a b.png".into(), crate::docx::Image { bytes: vec![1, 2, 3], extent: Some((10, 20)) }));
-        d.images.push(("oanvand.png".into(), crate::docx::Image { bytes: vec![9], extent: None }));
+        d.images.push(("a b.png".into(), crate::docx::Image { bytes: vec![1, 2, 3], extent: Some((10, 20)), svg: None }));
+        d.images.push(("oanvand.png".into(), crate::docx::Image { bytes: vec![9], extent: None, svg: None }));
         let (snap, data) = Snapshot::from_doc(&d, 42, 1000);
         assert_eq!(snap.images.len(), 1, "bara bilder som används sparas");
         assert_eq!(data, vec![vec![1, 2, 3]]);
@@ -605,7 +605,7 @@ mod tests {
         let dir = tmp("images");
         let mut r = Recovery::with_dir(dir.clone());
         let mut d = dirty_doc(5, "![a](bild:p.png)");
-        d.images.push(("p.png".into(), crate::docx::Image { bytes: vec![7; 100], extent: Some((1, 2)) }));
+        d.images.push(("p.png".into(), crate::docx::Image { bytes: vec![7; 100], extent: Some((1, 2)), svg: None }));
         let docs = vec![d];
         r.sync(&docs, true);
         wait_idle(&r);

@@ -1024,7 +1024,7 @@ impl Conv<'_> {
                     ),
                     None => format!("![{}]({}{name})", alt.replace(['[', ']'], ""), docx::IMAGE_SCHEME),
                 });
-                self.images.push((name, Image { bytes, extent: None }));
+                self.images.push((name, Image { bytes, extent: None, svg: None }));
             }
         }
         match raw {
@@ -1301,7 +1301,7 @@ Ny rad.</p><ul><li>Ett</li><li>Tv&aring;<ul><li>Inre</li></ul></li></ul><p><img 
     #[test]
     fn unique_image_names() {
         let mut p = html_to_markdown(&format!("<img src=\"data:image/png;base64,{PNG}\">"), None);
-        let ex = vec![("inklistrad-1.png".to_owned(), Image { bytes: vec![], extent: None })];
+        let ex = vec![("inklistrad-1.png".to_owned(), Image { bytes: vec![], extent: None, svg: None })];
         make_names_unique(&mut p, &ex);
         assert_eq!(p.images[0].0, "inklistrad-1-2.png");
         assert_eq!(p.markdown, "![](bild:inklistrad-1-2.png)");

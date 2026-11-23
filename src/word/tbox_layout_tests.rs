@@ -46,8 +46,14 @@ fn first_row(g: &Galley, ch: char) -> usize {
 
 /// Dokument: en rad före, rutan (150 px bred, 90 px hög, `x`/`y`/övrigt i `head`), därefter lång text.
 fn doc(head: &str) -> String {
+    doc_w(150, head)
+}
+
+/// Som `doc`, men med rutans bredd `w` px.
+fn doc_w(w: u32, head: &str) -> String {
     format!(
-        "Före\n\n<!--k:tb 1 w=\"150\" h=\"90\" {head}-->\n\nRuta<!--k:pp fr=\"w=112.5 x=end pl=4 pr=4 h=67.5\"-->\n\n<!--k:/tb-->\n\n{LONG}\n\n{LONG}\n\nSlut"
+        "Före\n\n<!--k:tb 1 w=\"{w}\" h=\"90\" {head}-->\n\nRuta<!--k:pp fr=\"w={} x=end pl=4 pr=4 h=67.5\"-->\n\n<!--k:/tb-->\n\n{LONG}\n\n{LONG}\n\nSlut",
+        w as f32 * 0.75
     )
 }
 
@@ -237,5 +243,309 @@ fn nyhetsbrevets_ruta_dragen_mot_mitten_av_spalten() {
         let g = lay_sections(&t);
         let n = check_no_overlap(&g, 12.0, 157.5, 100.0, &format!("nyhetsbrev x={x:?}"));
         println!("x={x:?}: {n} rader bredvid rutan");
+    }
+}
+
+// ---------------------------------------------------------------- rutor i marginalen
+
+/// Brödtextraderna (text, y, slutkant) i ordning; rutans rader och markörrader räknas inte.
+fn body(g: &Galley) -> Vec<(String, f32, f32)> {
+    let boxed = (0..g.rows.len()).any(|i| row_text(g, i).starts_with("<!--k:tb"));
+    let long = |i: usize| row_text(g, i).chars().count() >= 12 && !row_text(g, i).starts_with('<');
+    (0..g.rows.len()).filter(|&i| long(i) && (!boxed || is_body_row(g, i))).map(|i| (row_text(g, i), g.rows[i].pos.y, row_end(g, i))).collect()
+}
+
+/// Pixlar per punkt-px i rutans ram: `pl=4` pt är 5,33 px.
+const PL: f32 = 4.0 / 0.75;
+
+fn page_geom() -> pages::Geom {
+    pages::Geom::new(1.0, &markup::analyze("").defaults)
+}
+
+#[test]
+fn ruta_helt_i_hogermarginalen_paverkar_inte_texten() {
+    let geom = page_geom();
+    let col = geom.edit_w();
+    assert!(geom.right > 90.0, "marginal {}", geom.right);
+    // 80 px bred ruta 8 px utanför spalten: ryms i marginalen (96 px).
+    let t = dragged(&doc_w(80, "x=\"right\" y=\"0\""), col + 8.0, 0.0);
+    let g = lay(&t, col, Some(&geom));
+    let plain = lay(&format!("Före\n\n{LONG}\n\n{LONG}\n\nSlut"), col, Some(&geom));
+    let (a, b) = (body(&g), body(&plain));
+    // Samma rader, samma radbrytning och samma läge som utan rutan: texten ser inte rutan.
+    let n = b.len();
+    let a: Vec<_> = a.into_iter().filter(|r| r.0.chars().count() >= 12).collect();
+    let b: Vec<_> = b.into_iter().filter(|r| r.0.chars().count() >= 12).collect();
+    assert_eq!(a.len(), b.len(), "{n} rader utan ruta");
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(x.0, y.0);
+        assert!((x.1 - y.1).abs() < 1.5 && (x.2 - y.2).abs() < 1.5, "{x:?} mot {y:?}");
+    }
+    // Rutan ritas där den står: ut i marginalen.
+    let boxr = &g.rows[first_row(&g, 'R')];
+    assert!((boxr.pos.x - (col + 8.0 + PL)).abs() < 1.5, "ruta x {} spalt {col}", boxr.pos.x);
+    assert_eq!(chars(&g), t.chars().count());
+}
+
+#[test]
+fn ruta_delvis_i_marginalen_flyter_texten_runt_delen_i_spalten() {
+    let geom = page_geom();
+    let col = geom.edit_w();
+    // 150 px bred ruta, 60 px in i spalten: 90 px sticker ut i marginalen.
+    let t = dragged(&doc("x=\"right\" y=\"0\"").replace("\n\nSlut", &format!("\n\n{LONG}\n\n{LONG}\n\nSlut")), col - 60.0, 0.0);
+    let g = lay(&t, col, Some(&geom));
+    let boxr = &g.rows[first_row(&g, 'R')];
+    assert!((boxr.pos.x - (col - 60.0 + PL)).abs() < 1.5, "ruta x {} spalt {col}", boxr.pos.x);
+    // Raderna bredvid rutan slutar före dess vänsterkant (och luften); under den går de ända ut.
+    let first = &g.rows[first_row(&g, 'L')];
+    let (mut beside, mut below) = (0, 0);
+    for i in (0..g.rows.len()).filter(|&i| is_body_row(&g, i)) {
+        let r = &g.rows[i];
+        if r.pos.y < first.pos.y + 90.0 - 20.0 && r.pos.y > first.pos.y - 1.0 {
+            beside += 1;
+            assert!(row_end(&g, i) <= col - 60.0 - 12.0 + 0.5, "rad {i} slutar vid {}", row_end(&g, i));
+        } else if r.pos.y > first.pos.y + 100.0 && row_end(&g, i) > col - 72.0 + 20.0 {
+            below += 1;
+        }
+    }
+    assert!(beside >= 3 && below >= 2, "{beside} bredvid, {below} under");
+    check_no_overlap(&g, PL, 150.0, 65.0, "delvis i marginalen");
+    assert_eq!(chars(&g), t.chars().count());
+}
+
+#[test]
+fn ruta_i_vanstermarginalen_och_vid_papperets_kant() {
+    let geom = page_geom();
+    let col = geom.edit_w();
+    // Helt i vänstermarginalen (x < 0): ritas där, texten opåverkad.
+    let t = dragged(&doc_w(60, "x=\"right\" y=\"0\""), -70.0, 0.0);
+    let g = lay(&t, col, Some(&geom));
+    assert!((g.rows[first_row(&g, 'R')].pos.x - (-70.0 + PL)).abs() < 1.5, "x {} left {}", g.rows[first_row(&g, 'R')].pos.x, geom.left);
+    let plain = lay(&format!("Före\n\n{LONG}\n\n{LONG}\n\nSlut"), col, Some(&geom));
+    assert_eq!(body(&g).iter().filter(|r| r.0.chars().count() >= 12).count(), body(&plain).iter().filter(|r| r.0.chars().count() >= 12).count());
+    // Förbi papperets kant klämms rutan mot kanten så att den inte försvinner.
+    let (left, right) = (geom.left, geom.right);
+    for (x, want) in [(-5000.0, -left), (col + 5000.0, col + right - 150.0)] {
+        let t = dragged(&doc("x=\"right\" y=\"0\""), x, 0.0);
+        let g = lay(&t, col, Some(&geom));
+        let boxr = &g.rows[first_row(&g, 'R')];
+        assert!((boxr.pos.x - (want + PL)).abs() < 1.5, "x={x}: ruta x {} väntade {}", boxr.pos.x, want + PL);
+        check_no_overlap(&g, PL, 150.0, 65.0, &format!("papperskant x={x}"));
+    }
+}
+
+#[test]
+fn ruta_relativt_sidan_eller_marginalen_hamnar_som_relativt_spalten() {
+    let geom = page_geom();
+    let col = geom.edit_w();
+    let head = |hrel: &str, x: f32| format!("hrel=\"{hrel}\" x=\"{x}\" y=\"0\"");
+    // Samma läge angivet från spalten, marginalen (= spalten här) och sidan (marginalen till vänster längre ut).
+    let by_col = lay(&dragged(&doc("x=\"right\" y=\"0\""), col - 60.0, 0.0), col, Some(&geom));
+    for h in [head("margin", col - 60.0), head("page", geom.left + col - 60.0)] {
+        // `dragged` skriver om ankaret till kolumn; här sätts rubriken för hand och ramens läge görs likadant.
+        let t = doc(&h).replace("x=end", &format!("x={}", (col - 60.0) * 0.75));
+        let g = lay(&t, col, Some(&geom));
+        let (a, b) = (body(&g), body(&by_col));
+        assert_eq!(a.len(), b.len(), "{h}");
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.0, y.0, "{h}");
+            assert!((x.1 - y.1).abs() < 1.5 && (x.2 - y.2).abs() < 0.5, "{h}: {x:?} mot {y:?}");
+        }
+        assert!((g.rows[first_row(&g, 'R')].pos.x - by_col.rows[first_row(&by_col, 'R')].pos.x).abs() < 1.5, "{h}");
+    }
+}
+
+// ---------------------------------------------------------------- markör och pekare
+
+use super::grid::GalleyIndex;
+use super::tboxnav::{self, Boxes, Zone};
+
+/// Rutans skärmruta (galleri-koordinater): rutans egna rader, `w` bred.
+fn box_rect(g: &Galley, w: f32) -> (usize, egui::Rect) {
+    let idx = GalleyIndex::new("", g);
+    let _ = idx;
+    let br = box_range(g);
+    let rows: Vec<_> = br.clone().filter(|&i| g.rows[i].row.size.y > 5.0 && !row_text(g, i).is_empty()).collect();
+    let (top, bottom) = (g.rows[rows[0]].pos.y, g.rows[*rows.last().unwrap()].rect().max.y);
+    let x0 = g.rows[rows[0]].pos.x - PL;
+    (0, egui::Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x0 + w, bottom.max(top + 65.0))))
+}
+
+/// Raden markören syns på: vid en mjuk radbrytning ligger slutet av en rad på radgränsen och visas sist på raden före.
+fn row_at(text: &str, g: &Galley, byte: usize) -> usize {
+    let idx = GalleyIndex::new(text, g);
+    let c = idx.chr(byte);
+    let r = idx.row_of(c);
+    if r > 0 && c == idx.start(r) && !g.rows[r - 1].ends_with_newline { r - 1 } else { r }
+}
+
+fn byte_of_row_start(text: &str, g: &Galley, row: usize) -> usize {
+    let idx = GalleyIndex::new(text, g);
+    crate::app::char_to_byte(text, idx.start(row))
+}
+
+fn with_boxes<R>(t: &str, g: &Galley, f: impl FnOnce(&Boxes) -> R) -> R {
+    let idx = GalleyIndex::new(t, g);
+    f(&Boxes::new(t, g, &idx))
+}
+
+fn opens(t: &str, g: &Galley) -> Vec<usize> {
+    with_boxes(t, g, |b| b.opens.clone())
+}
+
+#[test]
+fn pil_upp_och_ned_hoppar_over_rutans_rader() {
+    // Ruta mitt i spalten (x=60): brödtextraderna bredvid ligger i samma höjd som rutans.
+    let t = dragged(&doc("x=\"right\" y=\"0\""), 60.0, 0.0);
+    let g = lay(&t, 400.0, None);
+    let (fore, first, second) = (first_row(&g, 'F'), first_row(&g, 'L'), first_row(&g, 'L') + 1);
+    let boxr = first_row(&g, 'R');
+    assert!(g.rows[first].pos.y < g.rows[boxr].pos.y + 20.0, "brödtext och ruta överlappar inte i y");
+    with_boxes(&t, &g, |boxes| {
+        assert_eq!(boxes.zone_of(boxr), Zone::Box(0));
+        assert_eq!(boxes.zone_of(first), Zone::Body);
+        // Upp från första brödtextraden efter rutan: raden före rutan, inte rutans rad.
+        let from = byte_of_row_start(&t, &g, first) + 3;
+        let b = tboxnav::vertical(&t, &g, boxes, from, true).expect("hoppar");
+        assert_eq!(row_at(&t, &g, b), fore, "upp hamnade på rad {}", row_at(&t, &g, b));
+        // Ned från raden före rutan: TextEdit tar den tomma raden under (brödtext); därifrån hoppar markören
+        // över rutan till första synliga brödtextraden efter den.
+        assert_eq!(tboxnav::vertical(&t, &g, boxes, byte_of_row_start(&t, &g, fore) + 1, false), None);
+        let b = tboxnav::vertical(&t, &g, boxes, byte_of_row_start(&t, &g, fore + 1), false).expect("hoppar");
+        assert_eq!(row_at(&t, &g, b), first, "ned hamnade på rad {}", row_at(&t, &g, b));
+        // Vanliga rader (nästa rad är brödtext): TextEdit sköter det.
+        assert_eq!(tboxnav::vertical(&t, &g, boxes, byte_of_row_start(&t, &g, first) + 3, false), None);
+        assert_eq!(tboxnav::vertical(&t, &g, boxes, byte_of_row_start(&t, &g, second) + 3, true), None);
+    });
+}
+
+#[test]
+fn pil_upp_och_ned_i_rutan_ror_sig_inom_den_och_lamnar_den_vid_kanten() {
+    let pp = "<!--k:pp fr=\"w=112.5 x=end pl=4 pr=4 h=67.5\"-->";
+    let t = format!(
+        "Före\n\n<!--k:tb 1 w=\"150\" h=\"90\" x=\"right\" y=\"0\"-->\n\nRuta ett{pp}\n\nRuta två{pp}\n\nRuta tre{pp}\n\n<!--k:/tb-->\n\n{LONG}\n\nSlut"
+    );
+    let g = lay(&t, 400.0, None);
+    let rows: Vec<usize> = ["Ruta ett", "Ruta två", "Ruta tre"].iter().map(|p| (0..g.rows.len()).find(|&i| row_text(&g, i).starts_with(p)).unwrap()).collect();
+    let (fore, first) = (first_row(&g, 'F'), first_row(&g, 'L'));
+    with_boxes(&t, &g, |boxes| {
+        let at = |r: usize, off: usize| byte_of_row_start(&t, &g, r) + off;
+        let to = |b: Option<usize>| b.map(|b| row_at(&t, &g, b));
+        assert_eq!(to(tboxnav::vertical(&t, &g, boxes, at(rows[0], 3), false)), Some(rows[1]));
+        assert_eq!(to(tboxnav::vertical(&t, &g, boxes, at(rows[1], 3), false)), Some(rows[2]));
+        assert_eq!(to(tboxnav::vertical(&t, &g, boxes, at(rows[2], 3), true)), Some(rows[1]));
+        // Vid kanterna: upp ur första raden till raden före rutan, ned ur sista till brödtexten efter den.
+        assert_eq!(to(tboxnav::vertical(&t, &g, boxes, at(rows[0], 3), true)), Some(fore));
+        assert_eq!(to(tboxnav::vertical(&t, &g, boxes, at(rows[2], 3), false)), Some(first));
+    });
+}
+
+#[test]
+fn klick_bredvid_ruta_ger_brodtexten_och_klick_i_rutan_rutans_text() {
+    let t = dragged(&doc("x=\"right\" y=\"0\""), 200.0, 0.0);
+    let g = lay(&t, 400.0, None);
+    let (open, rect) = box_rect(&g, 150.0);
+    let _ = open;
+    let rects = [(opens(&t, &g)[0], rect)];
+    let idx = GalleyIndex::new(&t, &g);
+    let first = first_row(&g, 'L');
+    with_boxes(&t, &g, |boxes| {
+        // Bredvid rutan, i höjd med dess rad: brödtexten.
+        let local = egui::vec2(40.0, g.rows[first].pos.y + 4.0);
+        let (b, z) = tboxnav::hit(&t, &g, &idx, boxes, &rects, local, None, (0.0, 400.0)).unwrap();
+        assert_eq!(z, Zone::Body);
+        assert_eq!(row_at(&t, &g, b), first);
+        // I rutan: rutans text, också där en brödtextrad ligger i samma höjd.
+        let rr = &g.rows[first_row(&g, 'R')];
+        let local = egui::vec2(rr.pos.x + 6.0, rr.pos.y + 4.0);
+        let (b, z) = tboxnav::hit(&t, &g, &idx, boxes, &rects, local, None, (0.0, 400.0)).unwrap();
+        assert_eq!(z, Zone::Box(0));
+        assert!(t[b..].starts_with("uta"), "{:?}", &t[b..b + 5]);
+        // Markering som började i brödtexten följer brödtexten även över rutan (läsordning).
+        let (b, z) = tboxnav::hit(&t, &g, &idx, boxes, &rects, local, Some(Zone::Body), (0.0, 400.0)).unwrap();
+        assert_eq!(z, Zone::Body);
+        assert_eq!(row_at(&t, &g, b), first, "markering över rutan ska ge brödtext");
+    });
+}
+
+#[test]
+fn klick_i_hogermarginalen_ger_rutans_text_och_brodtexten_ar_orord() {
+    let geom = page_geom();
+    let col = geom.edit_w();
+    let t = dragged(&doc_w(80, "x=\"right\" y=\"0\""), col + 8.0, 0.0);
+    let g = lay(&t, col, Some(&geom));
+    let (_, rect) = box_rect(&g, 80.0);
+    let rects = [(opens(&t, &g)[0], rect)];
+    let idx = GalleyIndex::new(&t, &g);
+    let first = first_row(&g, 'L');
+    with_boxes(&t, &g, |boxes| {
+        let rr = &g.rows[first_row(&g, 'R')];
+        assert!(rr.pos.x > col, "rutans rad ligger i marginalen");
+        let (b, z) = tboxnav::hit(&t, &g, &idx, boxes, &rects, egui::vec2(rr.pos.x + 6.0, rr.pos.y + 4.0), None, (0.0, col)).unwrap();
+        assert_eq!(z, Zone::Box(0));
+        assert!(t[b..].starts_with("uta"));
+        let (b, z) = tboxnav::hit(&t, &g, &idx, boxes, &rects, egui::vec2(col - 20.0, g.rows[first].pos.y + 4.0), None, (0.0, col)).unwrap();
+        assert_eq!((z, row_at(&t, &g, b)), (Zone::Body, first));
+        // Pil upp förbi en ruta i marginalen går till raden ovanför.
+        let up = tboxnav::vertical(&t, &g, boxes, byte_of_row_start(&t, &g, first) + 3, true).unwrap();
+        assert_eq!(row_at(&t, &g, up), first_row(&g, 'F'));
+    });
+}
+
+// ---------------------------------------------------------------- faktarutan i gen-skolrapport.docx
+
+/// gen-skolrapport.docx med faktarutans vågräta läge angivet från `rel` (`off` EMU): samma plats på sidan.
+fn skolrapport_with(rel: &str, off: i64) -> String {
+    use std::io::{Read, Write};
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/docx/gen-skolrapport.docx")).unwrap();
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zout = zip::ZipWriter::new(&mut buf);
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).unwrap();
+            let mut data = Vec::new();
+            f.read_to_end(&mut data).unwrap();
+            if f.name() == "word/document.xml" {
+                let x = String::from_utf8(data).unwrap();
+                let old = "<wp:positionH relativeFrom=\"page\"><wp:posOffset>5900000</wp:posOffset></wp:positionH>";
+                assert!(x.contains(old));
+                data = x.replace(old, &format!("<wp:positionH relativeFrom=\"{rel}\"><wp:posOffset>{off}</wp:posOffset></wp:positionH>")).into_bytes();
+            }
+            zout.start_file(f.name().to_owned(), zip::write::SimpleFileOptions::default()).unwrap();
+            zout.write_all(&data).unwrap();
+        }
+        zout.finish().unwrap();
+    }
+    crate::docx::read(&buf.into_inner()).unwrap().markdown
+}
+
+/// Faktarutan ligger i högermarginalen i alla lägen (kolumn, marginal, sida, tecken) och ritning och layout
+/// är överens: rutans rader står utanför spalten och ingen brödtextrad når in i dem.
+#[test]
+fn faktarutan_i_skolrapporten_star_i_marginalen_for_alla_hrel() {
+    // 5 900 000 EMU från sidans kant; vänstermarginalen är 1417 twips = 899 795 EMU.
+    for (rel, off) in [("page", 5_900_000), ("margin", 5_000_205), ("column", 5_000_205), ("character", 5_000_205)] {
+        let md = skolrapport_with(rel, off);
+        let a = markup::analyze(&md);
+        let geom = pages::Geom::for_sections(1.0, &a.defaults, &a.sections);
+        let col = geom.edit_w();
+        let g = lay(&md, col, Some(&geom));
+        let find = |p: &str| (0..g.rows.len()).find(|&i| row_text(&g, i).contains(p) && !row_text(&g, i).starts_with("<!--k:tb")).unwrap_or_else(|| panic!("{rel}: ingen rad {p}"));
+        let head = &g.rows[find("Fakta om skolan")];
+        assert!(head.pos.x > col, "{rel}: rutans text x {} ska ligga utanför spalten ({col})", head.pos.x);
+        // Rutans rektangel: från rutans vänsterkant (rubrikens x minus luften) och rutans höjd (1 650 000 EMU).
+        let (bx0, y0, y1) = (head.pos.x - 12.0, head.pos.y - 5.0, head.pos.y - 5.0 + 1_650_000.0 / 9525.0);
+        let br = box_range(&g);
+        let mut beside = 0;
+        for i in (0..g.rows.len()).filter(|&i| !br.contains(&i) && row_text(&g, i).chars().count() >= 8 && !row_text(&g, i).starts_with('<')) {
+            let r = &g.rows[i];
+            if r.pos.y + r.row.size.y <= y0 || r.pos.y >= y1 {
+                continue;
+            }
+            beside += 1;
+            assert!(row_end(&g, i) <= bx0 + 0.5, "{rel}: rad \"{}\" slutar vid {} över rutan från {bx0}", row_text(&g, i), row_end(&g, i));
+        }
+        assert!(beside >= 3, "{rel}: bara {beside} brödtextrader bredvid rutan");
     }
 }

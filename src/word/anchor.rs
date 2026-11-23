@@ -329,6 +329,10 @@ pub fn reserve(a: &Anchor, x: f32, w: f32, col_w: f32) -> Reserve {
         Wrap::Behind | Wrap::Front => return Reserve::Full,
         Wrap::Square => {}
     }
+    // Helt utanför spalten (i marginalen): texten påverkas inte, inte heller av avståndet.
+    if x >= col_w || x + w <= 0.0 {
+        return Reserve::Left(0.0);
+    }
     let left_room = (x - a.dist[3]).max(0.0);
     let right_room = (col_w - (x + w + a.dist[1])).max(0.0);
     if right_room >= left_room {

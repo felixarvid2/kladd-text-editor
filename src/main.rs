@@ -12,6 +12,7 @@ mod bigfiles;
 mod bigtext;
 mod doc;
 mod docx;
+mod docx_notes;
 mod docx_para;
 mod docx_styles;
 mod docx_tables;
@@ -20,6 +21,7 @@ mod export;
 mod grammar;
 mod grammar_ui;
 mod hf;
+mod hf_inline;
 mod imgfmt;
 mod legacy;
 mod ocr;
@@ -68,6 +70,8 @@ mod git_ui;
 mod corpus_tests;
 #[cfg(test)]
 mod brk_tests;
+#[cfg(test)]
+mod svg_tests;
 
 use std::path::PathBuf;
 

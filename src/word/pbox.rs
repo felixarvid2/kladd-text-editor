@@ -227,16 +227,21 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Rutans vänsterkant och ytterbredd i en spalt `avail` punkter bred.
-    pub fn span(&self, avail: f32) -> (f32, f32) {
-        let w = self.w.clamp(1.0, avail.max(1.0));
+    /// Rutans vänsterkant och ytterbredd i en spalt `avail` punkter bred. `room` är hur långt papperet når
+    /// utanför spalten (vänster, höger; marginalerna): rutan får stå ut i marginalen, som i Word, men klämms mot
+    /// papperets kant så att den inte försvinner. Utan sidor (textläge) är `room` noll.
+    pub fn span(&self, avail: f32, room: (f32, f32)) -> (f32, f32) {
+        let (rl, rr) = (room.0.max(0.0), room.1.max(0.0));
+        // 10 000 = hela spalten (ruta utan egen bredd).
+        let w = if self.w >= 5000.0 { avail.max(1.0) } else { self.w.clamp(1.0, (avail + rl + rr).max(1.0)) };
         let l = match self.x {
             FrameX::Off(v) => v,
             FrameX::Start => 0.0,
             FrameX::Center => (avail - w) / 2.0,
             FrameX::End => avail - w,
         };
-        (l.clamp(0.0, (avail - w).max(0.0)), w)
+        let (lo, hi) = (-rl, (avail + rr - w).max(-rl));
+        (l.clamp(lo, hi), w)
     }
 }
 
@@ -299,11 +304,11 @@ impl PPr {
     }
 
     /// Textens indrag (vänster, höger) och rutans vänsterkant och bredd i en spalt `avail` punkter bred,
-    /// om stycket ligger i en ram med egen bredd.
-    pub fn frame_geom(&self, avail: f32) -> Option<(f32, f32, f32, f32)> {
+    /// om stycket ligger i en ram med egen bredd (`room`: se `Frame::span`; en ruta i marginalen ger negativa indrag).
+    pub fn frame_geom(&self, avail: f32, room: (f32, f32)) -> Option<(f32, f32, f32, f32)> {
         let f = self.frame?;
-        let (l, w) = f.span(avail);
-        Some((l + f.pl, (avail - l - w).max(0.0) + f.pr, l, w))
+        let (l, w) = f.span(avail, room);
+        Some((l + f.pl, avail - l - w + f.pr, l, w))
     }
 
     pub fn has_spacing(&self) -> bool {

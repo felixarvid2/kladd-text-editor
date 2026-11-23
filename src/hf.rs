@@ -11,7 +11,11 @@
 //! - `{bild:namn 80x30}`: en bild på raden (bredd x höjd i pt), `{bild:namn 80x30 @12,20}` en förankrad
 //!   bild vars övre vänstra hörn ligger 12 pt från sidans vänsterkant och 20 pt från överkanten.
 //!   `namn` är en av dokumentets bilder (`bild:namn`); mellanslag i namnet skrivs `%20`.
+//! - Inline-formatering per körning (`hf_inline.rs`): `**fet**`, `*kursiv*`, `<u>understruken</u>` och
+//!   `<span style="color: #C00000; font-size: 14pt">…</span>`, som i brödtexten. `header-style` är
+//!   standardstilen för hela sidhuvudet; en körning lägger bara till det som avviker.
 
+pub use crate::hf_inline::RunFmt;
 use crate::style::{Align, DocDefaults, Fields};
 use crate::word::sections::Section;
 
@@ -415,7 +419,8 @@ impl Plan {
                 let line: f32 = rows(t)
                     .into_iter()
                     .map(|row| {
-                        let mut line = size * LINE_FACTOR;
+                        // Större tecken i en körning (`font-size`) gör raden högre.
+                        let mut line = size.max(crate::hf_inline::max_size(row).unwrap_or(0.0)) * LINE_FACTOR;
                         for p in pieces(row) {
                             if let Piece::Image(tok) = p {
                                 if tok.at.is_none() {
@@ -649,7 +654,8 @@ pub fn fill(template: &str, f: &Fields) -> String {
 /// områdets övre vänstra hörn (förankrade bilder från arkets övre vänstra hörn).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Placed {
-    Text { x: f32, y: f32, text: String, size: f32 },
+    /// `fmt` är körningens format ovanpå `header-style` (färg `None` = sidhuvudets standardfärg).
+    Text { x: f32, y: f32, text: String, size: f32, fmt: RunFmt },
     Image { x: f32, y: f32, w: f32, h: f32, src: String, anchored: bool },
 }
 
@@ -664,36 +670,52 @@ pub struct Zone {
 /// Radhöjden som faktor av teckenstorleken.
 pub const LINE_FACTOR: f32 = 1.2;
 
-/// Ställer upp en rad av `parts` (vänster, mitten, höger; fälten ifyllda). `scale` är enheter per
-/// pt, `width` textbredden i samma enhet, `measure(text, storlek)` ger textens bredd och
-/// `natural(src)` bildens egna storlek i pt (för bilder utan egen storlek i märket).
+/// Ett stycke av en rad med sitt format (ovanpå `header-style`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Run {
+    pub piece: Piece,
+    pub fmt: RunFmt,
+}
+
+/// En rad: vänster, mitten och höger som körningar.
+pub type RowRuns = [Vec<Run>; 3];
+
+/// Ställer upp en rad av `parts` (vänster, mitten, höger; fälten ifyllda, se `filled_rows`). `size_pt` är
+/// standardstorleken, `scale` enheter per pt, `width` textbredden i samma enhet, `measure(text, storlek, format)`
+/// ger textens bredd och `natural(src)` bildens egna storlek i pt (för bilder utan egen storlek i märket).
 pub fn layout_zone(
-    parts: &[String; 3],
+    parts: &RowRuns,
     size_pt: f32,
     scale: f32,
     width: f32,
-    measure: &dyn Fn(&str, f32) -> f32,
+    measure: &dyn Fn(&str, f32, &RunFmt) -> f32,
     natural: &dyn Fn(&str) -> Option<(f32, f32)>,
 ) -> Zone {
     struct Seg {
         piece: Piece,
+        fmt: RunFmt,
+        size: f32,
         w: f32,
         h: f32,
     }
-    let size = size_pt * scale;
-    let text_h = size * LINE_FACTOR;
+    let text_h = size_pt * scale * LINE_FACTOR;
     let mut cols: Vec<Vec<Seg>> = Vec::new();
     let mut line_h = text_h;
     let mut anchored: Vec<Placed> = Vec::new();
     for part in parts {
         let mut segs = Vec::new();
-        for p in pieces(part) {
-            match p {
+        for run in part {
+            match &run.piece {
                 Piece::Text(t) => {
-                    let w = measure(&t, size);
-                    segs.push(Seg { piece: Piece::Text(t), w, h: text_h });
+                    // En körning kan ha egen storlek; raden är så hög som den högsta.
+                    let size = run.fmt.size.unwrap_or(size_pt) * scale;
+                    let w = measure(t, size, &run.fmt);
+                    let h = size * LINE_FACTOR;
+                    line_h = line_h.max(h);
+                    segs.push(Seg { piece: run.piece.clone(), fmt: run.fmt.clone(), size, w, h });
                 }
-                Piece::Image(mut tok) => {
+                Piece::Image(tok) => {
+                    let mut tok = tok.clone();
                     if tok.w <= 0.0 || tok.h <= 0.0 {
                         let (nw, nh) = natural(&tok.src).unwrap_or((48.0, 48.0));
                         let k = if tok.w > 0.0 { tok.w / nw.max(1.0) } else if tok.h > 0.0 { tok.h / nh.max(1.0) } else { 1.0 };
@@ -705,7 +727,7 @@ pub fn layout_zone(
                         anchored.push(Placed::Image { x: x * scale, y: y * scale, w, h, src: tok.src, anchored: true });
                     } else {
                         line_h = line_h.max(h);
-                        segs.push(Seg { piece: Piece::Image(tok), w, h });
+                        segs.push(Seg { piece: Piece::Image(tok), fmt: run.fmt.clone(), size: 0.0, w, h });
                     }
                 }
             }
@@ -724,7 +746,8 @@ pub fn layout_zone(
             match &s.piece {
                 Piece::Text(t) => {
                     if !t.trim().is_empty() {
-                        items.push(Placed::Text { x, y: line_h - text_h, text: t.clone(), size });
+                        // Underkanterna ligger på samma linje (grundlinjerna nästan, som i Word).
+                        items.push(Placed::Text { x, y: line_h - s.h, text: t.clone(), size: s.size, fmt: s.fmt.clone() });
                     }
                 }
                 Piece::Image(tok) => items.push(Placed::Image { x, y: line_h - s.h, w: s.w, h: s.h, src: tok.src.clone(), anchored: false }),
@@ -740,19 +763,41 @@ pub fn rows(template: &str) -> Vec<&str> {
     template.split('\n').collect()
 }
 
-/// Mallens rader med fälten ifyllda, var och en som vänster, mitten, höger. `align` gäller en rad
-/// med ett enda värde utan `|`.
-pub fn filled_rows(template: &str, align: Align, f: &Fields) -> Vec<[String; 3]> {
-    rows(template).into_iter().map(|r| crate::style::parts_of(r, align).map(|p| fill(&p, f))).collect()
+/// En del av en rad som körningar: markupen tolkas (`hf_inline::parse_inline`) och fälten fylls i per
+/// körning, så att ett fältvärde aldrig blir markup. `st` är sidhuvudets standardstil.
+pub fn runs_of(part: &str, f: &Fields, st: &HfStyle) -> Vec<Run> {
+    let mut out = Vec::new();
+    for (text, fmt) in crate::hf_inline::parse_inline(part) {
+        let eff = fmt.over(st);
+        for piece in pieces(&fill(&text, f)) {
+            out.push(Run { piece, fmt: eff.clone() });
+        }
+    }
+    out
+}
+
+/// Mallens rader med fälten ifyllda, var och en som vänster, mitten, höger i körningar. `align` gäller
+/// en rad med ett enda värde utan `|`; `st` är standardstilen (`header-style`) som körningarna läggs ovanpå.
+pub fn filled_rows(template: &str, align: Align, f: &Fields, st: &HfStyle) -> Vec<RowRuns> {
+    rows(template).into_iter().map(|r| crate::style::parts_of(r, align).map(|p| runs_of(&p, f, st))).collect()
+}
+
+/// Bildkällorna på raderna.
+pub fn row_image_srcs(rows: &[RowRuns]) -> Vec<String> {
+    rows.iter()
+        .flatten()
+        .flatten()
+        .filter_map(|r| if let Piece::Image(t) = &r.piece { Some(t.src.clone()) } else { None })
+        .collect()
 }
 
 /// Ställer upp flera rader under varandra (se `layout_zone`); `height` är summan av radhöjderna.
 pub fn layout_rows(
-    rows: &[[String; 3]],
+    rows: &[RowRuns],
     size_pt: f32,
     scale: f32,
     width: f32,
-    measure: &dyn Fn(&str, f32) -> f32,
+    measure: &dyn Fn(&str, f32, &RunFmt) -> f32,
     natural: &dyn Fn(&str) -> Option<(f32, f32)>,
 ) -> Zone {
     let mut out = Zone::default();
@@ -899,10 +944,14 @@ mod tests {
         assert_eq!(plan.page(&pp, 2, &base).header, Some("A"));
     }
 
+    fn runs3(p: [&str; 3]) -> RowRuns {
+        p.map(|t| runs_of(t, &fields(1, 1), &HfStyle::default()))
+    }
+
     #[test]
     fn layout_places_parts_and_images() {
-        let parts = ["{bild:l.png 40x30}".to_owned(), "Titel".to_owned(), "Sida 1".to_owned()];
-        let z = layout_zone(&parts, 10.0, 1.0, 400.0, &|t, s| t.chars().count() as f32 * s * 0.5, &|_| None);
+        let parts = runs3(["{bild:l.png 40x30}", "Titel", "Sida 1"]);
+        let z = layout_zone(&parts, 10.0, 1.0, 400.0, &|t, s, _| t.chars().count() as f32 * s * 0.5, &|_| None);
         assert_eq!(z.height, 30.0);
         let img = z.items.iter().find_map(|i| if let Placed::Image { x, y, w, .. } = i { Some((*x, *y, *w)) } else { None }).unwrap();
         assert_eq!(img, (0.0, 0.0, 40.0));
@@ -914,8 +963,8 @@ mod tests {
 
     #[test]
     fn anchored_images_do_not_grow_the_line() {
-        let parts = ["{bild:l.png 40x80 @10,5}".to_owned(), "X".to_owned(), String::new()];
-        let z = layout_zone(&parts, 10.0, 2.0, 400.0, &|_, _| 10.0, &|_| None);
+        let parts = runs3(["{bild:l.png 40x80 @10,5}", "X", ""]);
+        let z = layout_zone(&parts, 10.0, 2.0, 400.0, &|_, _, _| 10.0, &|_| None);
         assert_eq!(z.height, 24.0);
         assert!(matches!(z.items[0], Placed::Image { x, y, anchored: true, .. } if x == 20.0 && y == 10.0));
     }
@@ -923,13 +972,14 @@ mod tests {
     #[test]
     fn rows_stack_and_reserve_adds_up() {
         let f = fields(1, 2);
-        let rows = filled_rows("Skola\n||{sida}\nA|B|C", Align::Center, &f);
+        let rows = filled_rows("Skola\n||{sida}\nA|B|C", Align::Center, &f, &HfStyle::default());
         assert_eq!(rows.len(), 3);
         // Ett enkelt värde följer justeringen, en rad med `|` har egna delar.
-        assert_eq!(rows[0], ["", "Skola", ""].map(String::from));
-        assert_eq!(rows[1], ["", "", "1"].map(String::from));
-        assert_eq!(rows[2], ["A", "B", "C"].map(String::from));
-        let z = layout_rows(&rows, 10.0, 1.0, 400.0, &|t, s| t.chars().count() as f32 * s * 0.5, &|_| None);
+        let text = |r: &RowRuns| r.clone().map(|p| p.into_iter().map(|r| if let Piece::Text(t) = r.piece { t } else { String::new() }).collect::<String>());
+        assert_eq!(text(&rows[0]), ["", "Skola", ""].map(String::from));
+        assert_eq!(text(&rows[1]), ["", "", "1"].map(String::from));
+        assert_eq!(text(&rows[2]), ["A", "B", "C"].map(String::from));
+        let z = layout_rows(&rows, 10.0, 1.0, 400.0, &|t, s, _| t.chars().count() as f32 * s * 0.5, &|_| None);
         assert_eq!(z.height, 36.0);
         let ys: Vec<f32> = z.items.iter().filter_map(|i| if let Placed::Text { y, .. } = i { Some(*y) } else { None }).collect();
         assert_eq!(ys, [0.0, 12.0, 24.0, 24.0, 24.0]);
@@ -937,6 +987,51 @@ mod tests {
         let d = DocDefaults { header: Some("a\nb\nc".into()), header_style: HfStyle { size: Some(10.0), ..Default::default() }, ..Default::default() };
         let plan = Plan::new(&d, &[]);
         assert!((plan.reserve(&d, 0)[0] - (DEFAULT_DIST + 36.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_formatting_gives_runs_with_the_header_style_underneath() {
+        let f = fields(2, 5);
+        let st = HfStyle { size: Some(9.0), color: Some([0x66, 0x66, 0x66]), italic: true, ..Default::default() };
+        let rows = filled_rows("**Skolrapport** · Klass 9B||Sida **{sida}** av {sidor}", Align::Left, &f, &st);
+        let l = &rows[0][0];
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].piece, Piece::Text("Skolrapport".into()));
+        // Fet ovanpå standardstilen (kursiv, grå, 9 pt).
+        assert_eq!(l[0].fmt, RunFmt { bold: true, italic: true, color: Some([0x66, 0x66, 0x66]), size: Some(9.0), ..Default::default() });
+        assert!(!l[1].fmt.bold && l[1].fmt.italic);
+        // Fältet fylls i inuti märkena; värdet är aldrig markup.
+        let r = &rows[0][2];
+        let texts: Vec<_> = r.iter().map(|x| if let Piece::Text(t) = &x.piece { (t.as_str(), x.fmt.bold) } else { ("", false) }).collect();
+        assert_eq!(texts, [("Sida ", false), ("2", true), (" av 5", false)]);
+        let mut g = fields(1, 1);
+        g.title = "a*b*c".into();
+        let rows = filled_rows("**{titel}**", Align::Left, &g, &HfStyle::default());
+        assert_eq!(rows[0][0].len(), 1);
+        assert_eq!(rows[0][0][0].piece, Piece::Text("a*b*c".into()));
+    }
+
+    #[test]
+    fn a_larger_run_makes_the_line_taller_and_sits_on_the_same_bottom_edge() {
+        let rows = filled_rows("liten <span style=\"font-size: 20pt\">STOR</span>", Align::Left, &fields(1, 1), &HfStyle::default());
+        let z = layout_rows(&rows, 10.0, 1.0, 400.0, &|t, s, f| t.chars().count() as f32 * s * if f.bold { 0.6 } else { 0.5 }, &|_| None);
+        assert_eq!(z.height, 24.0);
+        let ys: Vec<(String, f32, f32)> = z.items.iter().filter_map(|i| if let Placed::Text { y, text, size, .. } = i { Some((text.clone(), *y, *size)) } else { None }).collect();
+        assert_eq!(ys, [("liten ".to_owned(), 12.0, 10.0), ("STOR".to_owned(), 0.0, 20.0)]);
+        // Marginalen räknar med den största körningen.
+        let d = DocDefaults { header: Some("a <span style=\"font-size: 20pt\">b</span>".into()), header_style: HfStyle { size: Some(10.0), ..Default::default() }, ..Default::default() };
+        let plan = Plan::new(&d, &[]);
+        assert!((plan.reserve(&d, 0)[0] - (DEFAULT_DIST + 24.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn old_templates_without_markup_lay_out_as_before() {
+        let f = fields(1, 1);
+        let rows = filled_rows("A * B|{sida} < 2|5 ** 3", Align::Left, &f, &HfStyle { bold: true, ..Default::default() });
+        assert_eq!(rows[0][0].len(), 1);
+        assert_eq!(rows[0][0][0].piece, Piece::Text("A * B".into()));
+        assert!(rows[0][0][0].fmt.bold);
+        assert_eq!(rows[0][2][0].piece, Piece::Text("5 ** 3".into()));
     }
 
     #[test]

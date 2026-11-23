@@ -56,12 +56,11 @@ pub fn header_footer(
         }
         resp.on_hover_text(t("Dubbelklicka för att ändra sidhuvud och sidfot"));
         let Some(tpl) = text else { continue };
-        let rows = hf::filled_rows(tpl, align, &hf.fields);
+        let rows = hf::filled_rows(tpl, align, &hf.fields, st);
         let size_pt = st.size.unwrap_or(font.size / scale);
         let color = st.color.map_or(p.page_muted, |c| Color32::from_rgb(c[0], c[1], c[2]));
-        // Fet, kursiv och understruken stil (`header-style`) ritas som i PDF:en och i den skrivna filen.
-        let family = family_of(st.bold, st.italic);
-        let measure = |s: &str, size: f32| painter.layout_no_wrap(s.to_owned(), FontId::new(size, family.clone()), color).size().x;
+        // Fet, kursiv och understruken stil (`header-style`, och per körning) ritas som i PDF:en och i den skrivna filen.
+        let measure = |s: &str, size: f32, fmt: &hf::RunFmt| painter.layout_no_wrap(s.to_owned(), FontId::new(size, family_of(fmt.bold, fmt.italic)), color).size().x;
         let natural = |src: &str| imgs.get(src).map(|(_, s)| (s.x * 0.75, s.y * 0.75));
         let zn = hf::layout_rows(&rows, size_pt, scale, text_w, &measure, &natural);
         let edge = dist.unwrap_or(hf::DEFAULT_DIST) * scale;
@@ -69,9 +68,10 @@ pub fn header_footer(
         let left = sheet.left() + geom.left;
         for it in &zn.items {
             match it {
-                Placed::Text { x, y, text, size } => {
-                    let mut job = egui::text::LayoutJob::simple_singleline(text.clone(), FontId::new(*size, family.clone()), color);
-                    if st.underline {
+                Placed::Text { x, y, text, size, fmt } => {
+                    let color = fmt.color.map_or(color, |c| Color32::from_rgb(c[0], c[1], c[2]));
+                    let mut job = egui::text::LayoutJob::simple_singleline(text.clone(), FontId::new(*size, family_of(fmt.bold, fmt.italic)), color);
+                    if fmt.underline {
                         job.sections[0].format.underline = Stroke::new((scale).max(0.6), color);
                     }
                     let galley = painter.layout_job(job);
@@ -122,6 +122,8 @@ pub struct HfDialog {
     logos: [[Vec<String>; 2]; 2],
     /// Raden och fältet (0 vänster, 1 mitten, 2 höger) som senast hade markören; dit infogas fälten.
     focus: (usize, usize),
+    /// Markeringen (teckenindex, från–till) i fältet som senast hade markören; dit läggs fet/kursiv/understruken.
+    sel: (usize, usize),
     /// Dokumentets övriga fält som ska bevaras.
     base: DocDefaults,
     /// Filnamnet, för förhandsvisningen.
@@ -198,6 +200,7 @@ impl HfDialog {
             rows,
             logos,
             focus: (0, 1),
+            sel: (0, 0),
             base: d.clone(),
             name: name.to_owned(),
             want_focus: true,
@@ -269,6 +272,34 @@ impl HfDialog {
         let r = r.min(rows.len() - 1);
         rows[r][z].push_str(text);
         self.focus = (r, z);
+        self.want_focus = true;
+    }
+
+    /// Fältets id (för markeringen och markören).
+    fn field_id(r: usize, z: usize) -> Id {
+        Id::NULL.with(("kladd-hf-field", r, z))
+    }
+
+    /// Sätter `open`…`close` (`**`, `*`, `<u>`…) runt markeringen i fältet som senast hade markören, eller tar bort
+    /// märket om det redan finns. Utan markering läggs ett par märken vid markören.
+    fn format_selection(&mut self, ctx: &egui::Context, open: &str, close: &str) {
+        let (r, z) = self.focus;
+        let (a, b) = self.sel;
+        let Some(text) = self.rows_mut().get_mut(r).map(|row| &mut row[z]) else { return };
+        let byte = |text: &str, c: usize| text.char_indices().nth(c).map_or(text.len(), |(i, _)| i);
+        let (ba, bb) = (byte(text, a.min(b)), byte(text, a.max(b)));
+        let (new, sel) = if ba == bb {
+            (format!("{}{open}{close}{}", &text[..ba], &text[ba..]), ba + open.len()..ba + open.len())
+        } else {
+            crate::hf_inline::toggle(text, ba..bb, open, close)
+        };
+        let (ca, cb) = (new[..sel.start].chars().count(), new[..sel.end].chars().count());
+        *text = new;
+        self.sel = (ca, cb);
+        let id = Self::field_id(r, z);
+        let mut st = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(ca), egui::text::CCursor::new(cb))));
+        st.store(ctx, id);
         self.want_focus = true;
     }
 
@@ -383,6 +414,46 @@ enum Act {
     Cancel,
 }
 
+/// Förhandsvisningen av en rad: vänster, mitten och höger med körningarnas formatering (fet, kursiv,
+/// understruken, färg och storlek ovanpå `header-style`).
+fn preview_job(row: &Row, f: &Fields, base: &DocDefaults, footer: bool, p: &Palette) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let st = if footer { &base.footer_style } else { &base.header_style };
+    let mut job = LayoutJob::default();
+    let put = |job: &mut LayoutJob, text: &str, fmt: Option<&crate::hf::RunFmt>| {
+        let (bold, italic, underline, color, size) = match fmt {
+            Some(f) => (f.bold, f.italic, f.underline, f.color, f.size),
+            None => Default::default(),
+        };
+        let col = color.map_or(p.muted, |c| Color32::from_rgb(c[0], c[1], c[2]));
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: FontId::new(size.map_or(12.5, |s| (s * 1.2).clamp(9.0, 22.0)), if bold { theme::semibold() } else { FontFamily::Proportional }),
+                color: col,
+                italics: italic,
+                underline: if underline { Stroke::new(1.0, col) } else { Stroke::NONE },
+                ..Default::default()
+            },
+        );
+    };
+    put(&mut job, &format!("{}  ", t("Förhandsvisning:")), None);
+    for (i, part) in row.iter().enumerate() {
+        if i > 0 {
+            put(&mut job, "   |   ", None);
+        }
+        for run in crate::hf::runs_of(part, f, st) {
+            if let crate::hf::Piece::Text(text) = &run.piece {
+                put(&mut job, text, Some(&run.fmt));
+            } else {
+                put(&mut job, &format!("[{}]", t("Logga")), None);
+            }
+        }
+    }
+    job
+}
+
 /// Talformaten i valet "Sidnummerformat".
 const NUM_FORMATS: [(crate::hf::NumFmt, &str); 5] = [
     (crate::hf::NumFmt::Decimal, "1, 2, 3"),
@@ -472,14 +543,19 @@ impl KladdApp {
                     egui::Grid::new(("kladd-hf-grid", ri)).num_columns(2).spacing(vec2(14.0, 8.0)).show(ui, |ui| {
                         for (i, label) in [t("Vänster"), t("Mitten"), t("Höger")].into_iter().enumerate() {
                             ui.label(RichText::new(label).color(p.muted));
+                            let id = HfDialog::field_id(ri, i);
                             let r = ui.add(
-                                egui::TextEdit::singleline(&mut d.rows_mut()[ri][i]).desired_width(360.0).margin(Margin::symmetric(8, 5)),
+                                egui::TextEdit::singleline(&mut d.rows_mut()[ri][i]).id(id).desired_width(360.0).margin(Margin::symmetric(8, 5)),
                             );
                             if want_focus && (ri, i) == focus {
                                 r.request_focus();
                             }
                             if r.has_focus() {
                                 new_focus = Some((ri, i));
+                                // Markeringen sparas medan fältet har fokus: en knapp tar fokus när man klickar på den.
+                                if let Some(rg) = egui::TextEdit::load_state(ui.ctx(), id).and_then(|s| s.cursor.char_range()) {
+                                    d.sel = (rg.primary.index.0.min(rg.secondary.index.0), rg.primary.index.0.max(rg.secondary.index.0));
+                                }
                             }
                             ui.end_row();
                         }
@@ -507,6 +583,37 @@ impl KladdApp {
                     d.want_focus = true;
                 }
                 ui.add_space(8.0);
+                // Fet, kursiv och understruken på den markerade texten i fältet (Ctrl+B/I/U när ett fält har markören).
+                let (fr, fz) = d.focus;
+                let in_field = ui.memory(|m| m.has_focus(HfDialog::field_id(fr, fz)));
+                let mut fmt_key: Option<(&str, &str)> = None;
+                if in_field {
+                    use egui::{Key, Modifiers};
+                    ui.input_mut(|i| {
+                        for (key, o, c) in [(Key::B, "**", "**"), (Key::I, "*", "*"), (Key::U, "<u>", "</u>")] {
+                            if i.consume_key(Modifiers::COMMAND, key) {
+                                fmt_key = Some((o, c));
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t("Formatera markerad text")).color(p.muted).size(12.5));
+                    let btn = |txt: RichText| egui::Button::new(txt.color(p.text)).fill(p.surface_hover).stroke(Stroke::NONE).min_size(vec2(28.0, 0.0));
+                    if ui.add(btn(RichText::new(t("F")).strong())).on_hover_text(t("Fetstil (Ctrl+B)")).clicked() {
+                        fmt_key = Some(("**", "**"));
+                    }
+                    if ui.add(btn(RichText::new(t("K")).italics())).on_hover_text(t("Kursiv (Ctrl+I)")).clicked() {
+                        fmt_key = Some(("*", "*"));
+                    }
+                    if ui.add(btn(RichText::new(t("U")).underline())).on_hover_text(t("Understruken (Ctrl+U)")).clicked() {
+                        fmt_key = Some(("<u>", "</u>"));
+                    }
+                });
+                if let Some((o, c)) = fmt_key {
+                    d.format_selection(ctx, o, c);
+                }
+                ui.add_space(6.0);
                 ui.label(RichText::new(t("Infoga i det markerade fältet")).color(p.muted).size(12.5));
                 ui.horizontal_wrapped(|ui| {
                     if ui.add(quiet_button(t("Infoga sidnummer"), p)).clicked() {
@@ -573,8 +680,8 @@ impl KladdApp {
                 f.fmt = d.base.page_format.unwrap_or_default();
                 ui.add_space(6.0);
                 let rows = d.rows_mut().clone();
-                for [l, c, r] in rows.into_iter().map(|r| r.map(|t| style::fill_fields(&t, &f))) {
-                    ui.label(RichText::new(tf!("Förhandsvisning:  {l}   |   {c}   |   {r}", l = l, c = c, r = r)).color(p.muted).size(12.5));
+                for row in &rows {
+                    ui.label(preview_job(row, &f, &d.base, d.footer, p));
                 }
                 ui.add_space(20.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -613,7 +720,7 @@ impl KladdApp {
                 }
                 if let Some((_, bytes)) = d.images.iter().find(|(n, _)| n == name) {
                     if !doc.images.iter().any(|(n, _)| n == name) {
-                        doc.images.push((name.clone(), crate::docx::Image { bytes: bytes.clone(), extent: None }));
+                        doc.images.push((name.clone(), crate::docx::Image { bytes: bytes.clone(), extent: None, svg: None }));
                     }
                 }
                 self.wv.images.remove(&(doc.id, src));
@@ -710,7 +817,7 @@ mod tests {
     #[test]
     fn logos_show_as_markers_and_can_be_added_resized_and_removed() {
         let d = DocDefaults { header: Some("{bild:logo.png 80x30}|Titel|{sida}".into()), ..Default::default() };
-        let img = crate::docx::Image { bytes: PNG.to_vec(), extent: None };
+        let img = crate::docx::Image { bytes: PNG.to_vec(), extent: None, svg: None };
         let mut dlg = HfDialog::from_defaults(&d, false, false, "a.docx", &[("logo.png".into(), img)]);
         // Fältet visar en bricka i stället för bildmärket; oförändrat ger samma mall tillbaka.
         assert_eq!(dlg.rows[0][0][0][0], placeholder(1));

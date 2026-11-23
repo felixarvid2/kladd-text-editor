@@ -527,7 +527,7 @@ impl<'a> Collector<'a> {
             let name = format!("pdf-bild{}.{ext}", self.found_images.len() + 1);
             // Storleken på sidan i EMU (1 pt = 12 700 EMU).
             let extent = Some(((w * 12_700.0) as i64, (h * 12_700.0) as i64));
-            self.found_images.push((name.clone(), DocImage { bytes, extent }));
+            self.found_images.push((name.clone(), DocImage { bytes, extent, svg: None }));
             if let Some(i) = id {
                 self.image_by_id.insert(i, name.clone());
             }

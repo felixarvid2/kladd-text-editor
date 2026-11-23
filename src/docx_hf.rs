@@ -4,7 +4,8 @@
 //! Resultatet är en mall som `crate::hf` ritar; se `docs/dev/dokumentlage.md`.
 
 use super::*;
-use crate::hf::{HfStyle, NumFmt, SecHf};
+use crate::hf::{HfStyle, NumFmt, RunFmt, SecHf};
+use crate::hf_inline::RunAcc;
 
 /// Bilder som hittats i sidhuvuden och sidfötter: namn → bild, och vilket namn en filplats fått.
 #[derive(Default)]
@@ -33,7 +34,7 @@ impl HfImages {
             name = format!("{n}-{base}");
             n += 1;
         }
-        self.list.push((name.clone(), Image { bytes, extent }));
+        self.list.push((name.clone(), Image { bytes, extent, svg: None }));
         self.by_target.insert(target.to_owned(), name.clone());
         Some(name)
     }
@@ -195,6 +196,57 @@ fn field_template(instr: &str) -> Option<String> {
     })
 }
 
+/// Det vanligaste värdet (vid lika det först funna).
+fn majority<T: PartialEq + Clone>(v: &[T]) -> T
+where
+    T: Default,
+{
+    let mut best: Option<(&T, usize)> = None;
+    for x in v {
+        let n = v.iter().filter(|y| *y == x).count();
+        if best.is_none_or(|(_, bn)| n > bn) {
+            best = Some((x, n));
+        }
+    }
+    best.map(|(x, _)| x.clone()).unwrap_or_default()
+}
+
+/// Standardstilen för ett stycke: fet, kursiv och understruken om alla körningar har det; färg och storlek
+/// är de flesta körningarnas (resten får `font-size`/`color` i markupen); om ingen körning anger något gäller
+/// det första `rPr` i stycket anger.
+fn base_style(acc: &mut RunAcc, mut st: HfStyle) -> HfStyle {
+    if acc.para.is_empty() {
+        return st;
+    }
+    st.bold = acc.para.iter().all(|f| f.bold);
+    st.italic = acc.para.iter().all(|f| f.italic);
+    st.underline = acc.para.iter().all(|f| f.underline);
+    let colors: Vec<Option<[u8; 3]>> = acc.para.iter().map(|f| f.color).collect();
+    let uniform = colors.iter().all(|c| *c == colors[0]);
+    let color = majority(&colors);
+    // Ingen körning med färg: stycket kan ha fått sin färg av `w:pPr/w:rPr` (då ärver körningarna den).
+    st.color = if uniform { color.or(st.color) } else { color };
+    acc.marks.black_none = !(uniform && color.is_none());
+    let sizes: Vec<Option<f32>> = acc.para.iter().map(|f| f.size.map(|s| (s * 2.0).round() / 2.0)).collect();
+    let uniform = sizes.iter().all(|c| *c == sizes[0]);
+    let size = majority(&sizes);
+    st.size = if uniform { size.or(st.size) } else { size };
+    st
+}
+
+/// Körningens format ur ett barn till `w:rPr`.
+fn run_prop(fmt: &mut RunFmt, name: &[u8], e: &BytesStart<'_>) {
+    match name {
+        b"b" => fmt.bold = on_off(e),
+        b"i" => fmt.italic = on_off(e),
+        b"u" => fmt.underline = attr(e, b"val").is_none_or(|v| v != "none"),
+        b"color" => fmt.color = attr(e, b"val").and_then(|c| crate::hf::parse_hex(&c)),
+        b"sz" => fmt.size = attr(e, b"val").and_then(|v| v.parse::<f32>().ok()).map(|v| v / 2.0).filter(|v| *v > 0.0),
+        b"rFonts" => fmt.family = attr(e, b"ascii").or_else(|| attr(e, b"hAnsi")).filter(|f| !f.is_empty()),
+        _ => {}
+    }
+}
+
 /// En rad: delarna efter tabbstopp eller tabellceller, och styckets justering.
 struct Line {
     parts: Vec<String>,
@@ -253,6 +305,12 @@ fn read_part(
     let mut style_done = false;
     let mut p_style = HfStyle::default();
     let mut any_content = false;
+    // Körningar: formatet i `w:r` som läses, formatet i fältets första körning och ett enkelt fält som väntar.
+    let mut acc = RunAcc::default();
+    let mut in_r = false;
+    let mut run_fmt = RunFmt::default();
+    let mut field_fmt: Vec<RunFmt> = Vec::new();
+    let mut pending_simple: Option<String> = None;
 
     // Lägger en bild som märke i raden.
     let push_image = |d: Drawing, cur: &mut String, pkg: &mut Package<'_>, images: &mut HfImages| {
@@ -343,7 +401,14 @@ fn read_part(
                     }
                     continue;
                 }
+                if in_r && in_rpr && !in_ppr {
+                    run_prop(&mut run_fmt, &name, e);
+                }
                 match name.as_slice() {
+                    b"r" if !empty => {
+                        in_r = true;
+                        run_fmt = RunFmt::default();
+                    }
                     // Alternativ som Word bara visar om det första inte går: bara det första.
                     b"Fallback" | b"txbxContent" => {
                         if !empty {
@@ -387,7 +452,9 @@ fn read_part(
                         tab_stops.clear();
                         jc = None;
                         p_style = HfStyle::default();
-                                    }
+                        acc.new_para();
+                        pending_simple = None;
+                    }
                     b"pPr" => in_ppr = !empty,
                     b"rPr" => in_rpr = !empty,
                     b"pBdr" if in_ppr => in_pbdr = !empty,
@@ -410,10 +477,21 @@ fn read_part(
                     b"b" if in_rpr => p_style.bold = on_off(e),
                     b"i" if in_rpr => p_style.italic = on_off(e),
                     b"u" if in_rpr => p_style.underline = attr(e, b"val").is_none_or(|v| v != "none"),
-                    b"t" => in_t = !empty,
+                    b"t" => {
+                        in_t = !empty;
+                        if let Some(ph) = pending_simple.take() {
+                            acc.put(&mut cur, &run_fmt, &ph, true);
+                        }
+                    }
                     b"instrText" => in_instr = !empty,
-                    b"tab" if in_p && !in_ppr && !in_rpr => segs.push(std::mem::take(&mut cur)),
-                    b"ptab" if in_p => segs.push(std::mem::take(&mut cur)),
+                    b"tab" if in_p && !in_ppr && !in_rpr => {
+                        acc.close(&mut cur);
+                        segs.push(std::mem::take(&mut cur));
+                    }
+                    b"ptab" if in_p => {
+                        acc.close(&mut cur);
+                        segs.push(std::mem::take(&mut cur));
+                    }
                     b"tab" if in_ppr => {
                         if let Some(v) = attr(e, b"val").filter(|v| v != "clear") {
                             tab_stops.push(v);
@@ -421,27 +499,36 @@ fn read_part(
                     }
                     b"br" | b"cr" if in_p && !in_ppr && attr(e, b"type").as_deref() != Some("page") => cur.push(' '),
                     b"fldChar" => match attr(e, b"fldCharType").as_deref() {
-                        Some("begin") => fields.push((String::new(), false, None)),
+                        Some("begin") => {
+                            fields.push((String::new(), false, None));
+                            field_fmt.push(run_fmt.clone());
+                        }
                         Some("separate") => {
                             if let Some(f) = fields.last_mut() {
                                 f.1 = true;
                                 f.2 = field_template(&f.0);
                                 if let Some(ph) = &f.2 {
-                                    cur.push_str(ph);
+                                    // Fältets format: den här körningens, annars den första (`begin`).
+                                    let fmt = if run_fmt.is_default() { field_fmt.last().cloned().unwrap_or_default() } else { run_fmt.clone() };
+                                    acc.put(&mut cur, &fmt, ph, true);
                                 }
                             }
                         }
                         Some("end") => {
                             fields.pop();
+                            field_fmt.pop();
                         }
                         _ => {}
                     },
                     b"fldSimple" => {
                         let ph = attr(e, b"instr").and_then(|i| field_template(&i));
-                        if let Some(ph) = &ph {
-                            cur.push_str(ph);
-                        }
-                        if !empty {
+                        if empty {
+                            if let Some(ph) = &ph {
+                                acc.put(&mut cur, &RunFmt::default(), ph, true);
+                            }
+                        } else {
+                            // Formatet kommer från körningen inuti; märket läggs vid dess första text.
+                            pending_simple = ph.clone();
                             simples.push(ph.is_some());
                         }
                     }
@@ -467,6 +554,7 @@ fn read_part(
                     }
                     let d = drawing.take().unwrap_or_default();
                     if !fields.iter().any(|f| !f.1) {
+                        acc.close(&mut cur);
                         push_image(d, &mut cur, pkg, images);
                     }
                     continue;
@@ -477,7 +565,14 @@ fn read_part(
                     b"pBdr" => in_pbdr = false,
                     b"t" => in_t = false,
                     b"instrText" => in_instr = false,
+                    b"r" => {
+                        in_r = false;
+                        run_fmt = RunFmt::default();
+                    }
                     b"fldSimple" => {
+                        if let Some(ph) = pending_simple.take() {
+                            acc.put(&mut cur, &RunFmt::default(), &ph, true);
+                        }
                         simples.pop();
                     }
                     b"tc" if tbl_depth == 1 => in_cell_depth = in_cell_depth.saturating_sub(1),
@@ -492,13 +587,14 @@ fn read_part(
                     b"tbl" => tbl_depth = tbl_depth.saturating_sub(1),
                     b"p" if in_p => {
                         in_p = false;
+                        acc.close(&mut cur);
                         segs.push(std::mem::take(&mut cur));
-                        let parts: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
+                        let parts: Vec<String> = segs.iter().map(|s| crate::hf_inline::trim_marked(s).replace('|', "\\|")).collect();
                         let text = parts.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
                         // Utseendet kommer från första stycket med text (inte bara en bild).
-                        let has_text = crate::hf::pieces(&text).iter().any(|p| matches!(p, crate::hf::Piece::Text(t) if !t.trim().is_empty()));
+                        let has_text = crate::hf::pieces(&crate::hf_inline::strip_marks(&text)).iter().any(|p| matches!(p, crate::hf::Piece::Text(t) if !t.trim().is_empty()));
                         if has_text && !style_done {
-                            style = p_style.clone();
+                            style = base_style(&mut acc, p_style.clone());
                             style_done = true;
                         }
                         if tbl_depth == 1 && in_cell_depth > 0 {
@@ -548,7 +644,7 @@ fn read_part(
                 } else if in_t && in_p {
                     let hidden = fields.iter().any(|f| !f.1) || fields.iter().any(|f| f.1 && f.2.is_some()) || simples.iter().any(|&x| x);
                     if !hidden {
-                        cur.push_str(&t.replace(['\n', '\r'], " "));
+                        acc.put(&mut cur, &run_fmt, &t.replace(['\n', '\r'], " "), false);
                     }
                 }
             }
@@ -581,7 +677,8 @@ fn read_part(
         if rows.is_empty() {
             return None;
         }
-        return Some(HfRead { template: rows.join("\n"), align: [Align::Left, Align::Center, Align::Right][first_idx], style });
+        let template = acc.marks.render(&rows.join("\n"), &style, acc.base_family.as_deref());
+        return Some(HfRead { template, align: [Align::Left, Align::Center, Align::Right][first_idx], style });
     }
     let mut zones: [Vec<String>; 3] = Default::default();
     for l in &lines {
@@ -600,6 +697,7 @@ fn read_part(
         [i] => (parts[*i].clone(), [Align::Left, Align::Center, Align::Right][*i]),
         _ => (parts.join("|"), Align::Left),
     };
+    let template = acc.marks.render(&template, &style, acc.base_family.as_deref());
     Some(HfRead { template, align, style })
 }
 
@@ -720,8 +818,14 @@ pub(super) struct HfWritten {
 }
 
 /// Körningar för en text: fälten (`{sida}` …) blir Word-fält med värdena i `f` som förhandsvisning
-/// och `{bild:…}` blir bilder. `rpr` är textens utseende (`w:rPr`).
-fn runs_for(text: &str, f: &style::Fields, rpr: &str, imgs: &mut ImgOut<'_>) -> String {
+/// och `{bild:…}` blir bilder. Inline-formateringen (`**fet**` …) ger en körning (`w:r`) per format;
+/// `st` är standardstilen som körningarnas `w:rPr` läggs ovanpå.
+fn runs_for(text: &str, f: &style::Fields, st: &HfStyle, imgs: &mut ImgOut<'_>) -> String {
+    crate::hf_inline::parse_inline(text).into_iter().map(|(t, fmt)| plain_runs(&t, f, &rpr_of(st, &fmt), imgs)).collect()
+}
+
+/// Körningar för en text med ett och samma utseende (`rpr` är dess `w:rPr`).
+fn plain_runs(text: &str, f: &style::Fields, rpr: &str, imgs: &mut ImgOut<'_>) -> String {
     let mut runs = String::new();
     let mut rest = text;
     let plain = |t: &str, runs: &mut String| {
@@ -815,7 +919,7 @@ impl ImgOut<'_> {
         if w <= 0.0 || h <= 0.0 {
             let (nw, nh) = match img.extent {
                 Some((cx, cy)) => (cx as f32 / 12700.0, cy as f32 / 12700.0),
-                None => imagesize::blob_size(&img.bytes).map(|s| (s.width as f32 * 0.75, s.height as f32 * 0.75)).unwrap_or((48.0, 48.0)),
+                None => img.natural_px().map(|s| (s.0 * 0.75, s.1 * 0.75)).unwrap_or((48.0, 48.0)),
             };
             let k = if w > 0.0 { w / nw.max(1.0) } else if h > 0.0 { h / nh.max(1.0) } else { 1.0 };
             (w, h) = (nw * k, nh * k);
@@ -840,9 +944,15 @@ impl ImgOut<'_> {
     }
 }
 
-/// `w:rPr` för mallens utseende (tom om inget avviker).
-fn rpr_of(st: &HfStyle) -> String {
+/// `w:rPr` för en körning: mallens utseende (`header-style`) med körningens format ovanpå (tom om inget avviker).
+fn rpr_of(st: &HfStyle, run: &RunFmt) -> String {
+    let st = &HfStyle { bold: st.bold || run.bold, italic: st.italic || run.italic, underline: st.underline || run.underline, color: run.color.or(st.color), size: run.size.or(st.size), ..st.clone() };
     let mut x = String::new();
+    if let Some(fam) = &run.family {
+        let mut n = String::new();
+        xml_escape(fam, &mut n);
+        x.push_str(&format!("<w:rFonts w:ascii=\"{n}\" w:hAnsi=\"{n}\" w:cs=\"{n}\"/>"));
+    }
     if st.bold {
         x.push_str("<w:b/>");
     }
@@ -879,7 +989,7 @@ pub(super) fn write_part(
     page: (f32, f32),
 ) -> HfWritten {
     let mut imgs = ImgOut { resolve, taken, rels: Vec::new(), media: Vec::new(), by_src: HashMap::new(), next_id: 0, page };
-    let rpr = rpr_of(st);
+    let rpr = rpr_of(st, &RunFmt::default());
     let mut border = String::new();
     if let Some((c, w)) = st.line {
         let side = if root == "hdr" { "bottom" } else { "top" };
@@ -895,9 +1005,9 @@ pub(super) fn write_part(
             // Delarna efter `parts_of` har `\|` utskrivet som `|`; fälten läses vidare i `runs_for`.
             let tab = format!("<w:r>{rpr}<w:tab/></w:r>");
             ppr.push_str(&format!("<w:tabs><w:tab w:val=\"center\" w:pos=\"{}\"/><w:tab w:val=\"right\" w:pos=\"{text_w}\"/></w:tabs>", text_w / 2));
-            let a = runs_for(&p[0], f, &rpr, &mut imgs);
-            let b = runs_for(&p[1], f, &rpr, &mut imgs);
-            let c = runs_for(&p[2], f, &rpr, &mut imgs);
+            let a = runs_for(&p[0], f, st, &mut imgs);
+            let b = runs_for(&p[1], f, st, &mut imgs);
+            let c = runs_for(&p[2], f, st, &mut imgs);
             format!("{a}{tab}{b}{tab}{c}")
         } else {
             let [l, c, r] = style::parts_of(row, align);
@@ -905,7 +1015,7 @@ pub(super) fn write_part(
             if align != Align::Left {
                 ppr.push_str(&format!("<w:jc w:val=\"{}\"/>", align.as_jc()));
             }
-            runs_for(&text, f, &rpr, &mut imgs)
+            runs_for(&text, f, st, &mut imgs)
         };
         let ppr = if ppr.is_empty() { ppr } else { format!("<w:pPr>{ppr}</w:pPr>") };
         paras.push_str(&format!("<w:p>{ppr}{runs}</w:p>"));

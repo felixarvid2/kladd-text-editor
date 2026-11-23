@@ -112,9 +112,11 @@ pub fn show(ui: &mut Ui, env: &Env, edit: &mut Option<NoteEdit>) -> Out {
                 let row0 = nl.galley.rows.first().map_or(h, |r| r.row.size.y);
                 let num = ui.painter().with_clip_rect(Rect::from_min_size(rect.min, vec2(nl.indent.max(1.0), row0)).intersect(env.clip));
                 num.galley(rect.min, nl.galley.clone(), p.page_text);
+                paint_label(&num, nl, rect.min);
                 edit_box(ui, env, nl, rect, edit, &mut out);
             } else {
                 clipped.galley(rect.min, nl.galley.clone(), p.page_text);
+                paint_label(&clipped, nl, rect.min);
                 let id = Id::unique(("kladd-note", env.doc_id, bi, n));
                 let r = ui.interact(rect.intersect(Rect::from_min_max(pos2(x - 4.0, area_top), pos2(x + w + 4.0, area_bottom))), id, Sense::click());
                 if r.hovered() {
@@ -137,6 +139,13 @@ pub fn show(ui: &mut Ui, env: &Env, edit: &mut Option<NoteEdit>) -> Out {
 }
 
 /// Textrutan som ersätter noten medan den redigeras.
+/// Numret i annat talformat än etiketten (dolt i galleriet).
+fn paint_label(painter: &egui::Painter, nl: &NoteLayout, origin: egui::Pos2) {
+    if let Some((ov, at)) = &nl.label_ov {
+        painter.text(origin + at.to_vec2(), egui::Align2::LEFT_TOP, &ov.text, ov.font.clone(), ov.color);
+    }
+}
+
 fn edit_box(ui: &mut Ui, env: &Env, nl: &NoteLayout, rect: Rect, edit: &mut Option<NoteEdit>, out: &mut Out) {
     let Some(e) = edit.as_mut() else { return };
     let ctx = ui.ctx().clone();

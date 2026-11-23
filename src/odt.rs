@@ -1274,19 +1274,26 @@ impl<'s, 'b> Rd<'s, 'b> {
             self.text_box(e, tb);
             return;
         }
-        let Some(img) = e.child("draw:image") else {
+        // LibreOffice skriver en SVG som två `draw:image`: SVG-filen och en PNG-reserv. Rastret är nyckeln;
+        // SVG:n följer med som vektorkälla.
+        let hrefs: Vec<String> = e
+            .els()
+            .filter(|c| c.name == "draw:image")
+            .filter_map(|c| c.attr("xlink:href").map(|h| h.trim().to_owned()))
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hrefs.is_empty() {
             self.dropped.shapes = true;
             return;
-        };
-        let Some(href) = img.attr("xlink:href").map(|h| h.trim().to_owned()) else {
-            self.dropped.shapes = true;
-            return;
-        };
-        if href.contains("://") || href.starts_with("..") || href.starts_with('/') {
+        }
+        if hrefs.iter().all(|h| h.contains("://") || h.starts_with("..") || h.starts_with('/')) {
             self.dropped.linked = true;
             return;
         }
-        let target = href.trim_start_matches("./").to_owned();
+        let local: Vec<String> = hrefs.iter().filter(|h| !(h.contains("://") || h.starts_with("..") || h.starts_with('/'))).map(|h| h.trim_start_matches("./").to_owned()).collect();
+        let is_svg_href = |h: &str| h.to_lowercase().ends_with(".svg");
+        let target = local.iter().find(|h| !is_svg_href(h)).or(local.first()).cloned().unwrap_or_default();
+        let svg_target = local.iter().find(|h| is_svg_href(h) && **h != target).cloned();
         let name = if let Some(n) = self.by_target.get(&target) {
             n.clone()
         } else {
@@ -1294,10 +1301,25 @@ impl<'s, 'b> Rd<'s, 'b> {
                 self.dropped.shapes = true;
                 return;
             };
-            if !is_supported_image(&bytes) {
+            let svg_bytes = svg_target.as_ref().and_then(|t| self.pkg.bytes(t).ok().flatten());
+            let (bytes, svg) = if crate::imgfmt::is_svg(&bytes) {
+                // Bara SVG (utan reserv): rastret ritas ur SVG:n.
+                match crate::imgfmt::from_package(bytes, None) {
+                    Some(i) => (i.bytes, i.svg),
+                    None => {
+                        self.dropped.shapes = true;
+                        return;
+                    }
+                }
+            } else if !is_supported_image(&bytes) {
                 self.dropped.shapes = true;
                 return;
-            }
+            } else {
+                match svg_bytes.and_then(|sv| crate::imgfmt::from_package(sv, Some(bytes.clone()))) {
+                    Some(i) => (i.bytes, i.svg),
+                    None => (bytes, None),
+                }
+            };
             let base = target.rsplit('/').next().unwrap_or("bild").to_owned();
             let mut name = base.clone();
             let mut k = 2;
@@ -1308,7 +1330,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             let w = e.attr("svg:width").and_then(style::parse_length);
             let h = e.attr("svg:height").and_then(style::parse_length);
             let extent = w.zip(h).map(|(w, h)| ((w * 12700.0) as i64, (h * 12700.0) as i64));
-            self.images.push((name.clone(), Image { bytes, extent }));
+            self.images.push((name.clone(), Image { bytes, extent, svg }));
             self.by_target.insert(target.clone(), name.clone());
             name
         };
@@ -1317,7 +1339,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             .find_map(|k| e.child(k).map(|n| n.deep_text()).filter(|t| !t.trim().is_empty()))
             .unwrap_or_default();
         let (_, image) = self.images.iter().find(|(m, _)| *m == name).unwrap();
-        let natural = imagesize::blob_size(&image.bytes).ok().map(|s| (s.width as f32, s.height as f32));
+        let natural = image.natural_px();
         let fw = e.attr("svg:width").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let fh = e.attr("svg:height").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
@@ -1447,7 +1469,13 @@ impl<'s, 'b> Rd<'s, 'b> {
         let x = match place.map(|a| a.h) {
             Some(Pos::Center) => FrameX::Center,
             Some(Pos::End) => FrameX::End,
-            Some(Pos::Off(px)) if px > 0.0 => FrameX::Off(((px * 0.75 - if from_page { self.page_defaults.margins()[3].round() } else { 0.0 }).max(0.0) * 2.0).round() / 2.0),
+            Some(Pos::Off(px)) => {
+                // Rutan får stå ut i marginalen (som i LibreOffice) men klämms mot papperets kant.
+                let (ml, pw) = (self.page_defaults.margins()[3].round(), self.page_defaults.page().0);
+                let pt = ((px * 0.75 - if from_page { ml } else { 0.0 }) * 2.0).round() / 2.0;
+                let pt = pt.clamp(-ml, (pw - ml - width).max(-ml));
+                if pt == 0.0 { FrameX::Start } else { FrameX::Off(pt) }
+            }
             _ => FrameX::Start,
         };
         let saved = std::mem::take(&mut self.blocks);
@@ -2030,6 +2058,24 @@ fn master_props(st: &Styles, styles_root: &Node, d: &DocDefaults, ctx: &mut hf::
     (out, start)
 }
 
+/// `text:notes-configuration`: talformat och första nummer för fotnoter och slutnoter (`start-value` är 0-baserat).
+fn read_notes_config(styles_root: &Node, d: &mut DocDefaults) {
+    let Some(os) = styles_root.child("office:styles") else { return };
+    for n in os.els().filter(|n| n.name == "text:notes-configuration") {
+        let st = match n.attr("text:note-class") {
+            Some("footnote") => &mut d.notes.foot,
+            Some("endnote") => &mut d.notes.end,
+            _ => continue,
+        };
+        if let Some(f) = n.attr("style:num-format").and_then(crate::word::notefmt::NoteFmt::from_odf) {
+            st.fmt = f;
+        }
+        if let Some(v) = n.attr("text:start-value").and_then(|v| v.trim().parse::<u32>().ok()) {
+            st.start = v.saturating_add(1);
+        }
+    }
+}
+
 fn read_page(st: &Styles, styles_root: &Node, d: &mut DocDefaults, ctx: &mut hf::HfCtx<'_, '_>) {
     let Some(masters) = styles_root.child("office:master-styles") else { return };
     let mut it = masters.els().filter(|m| m.name == "style:master-page");
@@ -2173,6 +2219,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let mut ctx = hf::HfCtx { pkg: &mut pkg, images: &mut hf_images, by_target: &mut hf_by_target };
         if let Some(s) = &sroot {
             read_page(&st, s, &mut defaults, &mut ctx);
+            read_notes_config(s, &mut defaults);
         }
         sroot.as_ref().map(|s| master_props(&st, s, &defaults, &mut ctx)).unwrap_or_default()
     };
@@ -3063,6 +3110,18 @@ impl<'a> W<'a> {
         self.after_space = true;
     }
 
+    /// Sökvägen i paketet för en bildfil (en gång per innehåll).
+    fn media_path(&mut self, bytes: &[u8], ext: &str, mime: &'static str) -> String {
+        match self.media.iter().find(|(_, b, _)| b == bytes) {
+            Some((p, _, _)) => p.clone(),
+            None => {
+                let p = format!("Pictures/image{}.{ext}", self.media.len() + 1);
+                self.media.push((p.clone(), bytes.to_vec(), mime));
+                p
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>, float: Option<Float>, anchor: Option<Anchor>, crop: Option<[f32; 4]>) {
         let Some(img) = (self.resolve)(src).filter(|i| is_supported_image(&i.bytes)) else {
@@ -3078,15 +3137,10 @@ impl<'a> W<'a> {
             "bmp" => "image/bmp",
             _ => "image/png",
         };
-        let path = match self.media.iter().find(|(_, b, _)| *b == img.bytes) {
-            Some((p, _, _)) => p.clone(),
-            None => {
-                let p = format!("Pictures/image{}.{ext}", self.media.len() + 1);
-                self.media.push((p.clone(), img.bytes.clone(), mime));
-                p
-            }
-        };
-        let natural = imagesize::blob_size(&img.bytes).ok().map(|s| (s.width as f32, s.height as f32));
+        let path = self.media_path(&img.bytes, ext, mime);
+        // SVG: filen som vektor och PNG-reserven efter (LibreOffices mönster).
+        let svg_path = img.svg.as_ref().map(|s| self.media_path(&s.data, "svg", "image/svg+xml"));
+        let natural = img.natural_px();
         let ratio = natural.map(|(w, h)| h / w.max(1.0)).unwrap_or(0.66);
         // Beskuren bild: de synliga proportionerna styr höjden när bara bredden är angiven.
         let ratio = match (natural, crop) {
@@ -3201,9 +3255,12 @@ impl<'a> W<'a> {
         self.open_link_if_needed();
         self.n_frame += 1;
         let n = self.n_frame;
+        let svg_frame = svg_path
+            .map(|p| format!("<draw:image xlink:href=\"{p}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"image/svg+xml\"/>"))
+            .unwrap_or_default();
         let desc = if alt.is_empty() { String::new() } else { format!("<svg:desc>{}</svg:desc>", esc(alt)) };
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\"{frame_pos} svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
+            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\"{frame_pos} svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\">{svg_frame}<draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
             cm(w_pt),
             cm(h_pt),
             n - 1
@@ -3264,7 +3321,7 @@ impl<'a> W<'a> {
             None => match frame.map(|f| f.x) {
                 Some(FrameX::Center) => ("center", None, "paragraph"),
                 Some(FrameX::End) => ("right", None, "paragraph"),
-                Some(FrameX::Off(v)) if v > 0.0 => ("from-left", Some(v), "paragraph"),
+                Some(FrameX::Off(v)) if v != 0.0 => ("from-left", Some(v), "paragraph"),
                 _ => ("left", None, "paragraph"),
             },
         };
@@ -3441,13 +3498,14 @@ impl<'a> W<'a> {
                 if crate::word::markup::is_endnote_label(label) {
                     // Slutnoterna numreras för sig, med romerska tal.
                     let m = self.note_order[..=n].iter().filter(|l| crate::word::markup::is_endnote_label(l)).count();
-                    let cit = crate::word::markup::roman(m);
+                    let cit = self.defaults.notes.number(true, m);
                     out.push_str(&format!(
                         "<text:note text:id=\"edn{m}\" text:note-class=\"endnote\"><text:note-citation>{cit}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
                     ));
                 } else {
+                    let cit = self.defaults.notes.number(false, k);
                     out.push_str(&format!(
-                        "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{k}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
+                        "<text:note text:id=\"ftn{k}\" text:note-class=\"footnote\"><text:note-citation>{cit}</text:note-citation><text:note-body>{paras}</text:note-body></text:note>"
                     ));
                 }
             }
@@ -3928,6 +3986,8 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
                 "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\"{border}>{tabs}</style:paragraph-properties>{tp}</style:style>"
             ));
             out.push_str(&format!("<style:{tag}>{}</style:{tag}>", hf_paragraph(&t, &name, align, fields, &mut env.out)));
+            // Körningarnas teckenstilar (`text:span`) hör till de automatiska stilarna.
+            auto.push_str(&env.out.take_styles());
         }
         (out, has_h, has_f)
     };
@@ -4021,8 +4081,8 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
     named.push_str("<style:style style:name=\"Visited_20_Internet_20_Link\" style:display-name=\"Visited Internet Link\" style:family=\"text\"><style:text-properties fo:color=\"#0563C1\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>");
 
     apply_style_overrides(&mut named, &d.styles);
-    named.push_str("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"1\" text:start-value=\"0\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>");
-    named.push_str("<text:notes-configuration text:note-class=\"endnote\" style:num-format=\"i\" text:start-value=\"0\"/>");
+    named.push_str(&format!("<text:notes-configuration text:note-class=\"footnote\" style:num-format=\"{}\" text:start-value=\"{}\" text:footnotes-position=\"page\" text:start-numbering-at=\"document\" text:citation-style-name=\"Footnote_20_Symbol\" text:citation-body-style-name=\"Footnote_20_anchor\"/>", d.notes.foot.fmt.odf(), d.notes.foot.start - 1));
+    named.push_str(&format!("<text:notes-configuration text:note-class=\"endnote\" style:num-format=\"{}\" text:start-value=\"{}\"/>", d.notes.end.fmt.odf(), d.notes.end.start - 1));
 
     format!(
         "{XML_DECL}<office:document-styles {NS} office:version=\"1.2\">{}<office:styles>{named}</office:styles><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>",
@@ -4291,7 +4351,7 @@ Slut.
 
     fn resolver() -> impl Fn(&str) -> Option<Image> {
         let p = png();
-        move |src| (src == "bild:image1.png").then(|| Image { bytes: p.clone(), extent: None })
+        move |src| (src == "bild:image1.png").then(|| Image { bytes: p.clone(), extent: None, svg: None })
     }
 
     #[test]
@@ -4464,6 +4524,34 @@ Slut.
     }
 
     #[test]
+    fn text_box_in_the_margin_roundtrip() {
+        use crate::word::{anchor::Pos, tboxui};
+        let pp = |w: f32| format!("<!--k:pp bdr=\"t=single:6:6:112233 l=single:6:6:112233 b=single:6:6:112233 r=single:6:6:112233\" shd=\"FFF2CC\" fr=\"w={w} x=end pl=6.75 pr=6.75\"-->");
+        // A4 med 2,54 cm marginal (textytan 602 px): 80 px bred ruta delvis i högermarginalen, hela i den, och i vänstermarginalen.
+        for x in [560.0f32, 610.0, -70.0] {
+            let md = format!("Före\n\n<!--k:tb 0 w=\"80\" h=\"90\" x=\"right\" y=\"0\"-->\n\n**Faktaruta**{}\n\n<!--k:/tb-->\n\nEfter\n", pp(60.0));
+            let o = md.find("<!--k:tb").unwrap();
+            let open = o..md[o..].find("-->").unwrap() + o + 3;
+            let mut head = crate::docx_tbox::parse_head(&md[open.clone()]).unwrap().1;
+            let mut a = head.anchor.unwrap();
+            (a.h, a.v) = (Pos::Off(x), Pos::Off(21.0));
+            head.anchor = Some(a);
+            let md = tboxui::apply(&md, &tboxui::Change { open, head, x_pt: Some(x * 0.75) }).unwrap();
+            let w = write(&md, "T", &resolver()).unwrap();
+            let c = content_xml(&w.bytes);
+            assert!(c.contains(&format!("svg:x=\"{:.5}pt\"", x * 0.75)), "{c}");
+            let back = read(&w.bytes).unwrap();
+            assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+            let m = back.markdown;
+            let o = m.find("<!--k:tb").unwrap();
+            let h = crate::docx_tbox::parse_head(&m[o..o + m[o..].find("-->").unwrap() + 3]).unwrap().1;
+            assert_eq!(h.anchor.unwrap().h, Pos::Off(x), "{m}");
+            // Ramens läge utanför spalten bevaras (inte inklämt i den).
+            assert!(m.contains(&format!("x={}", x * 0.75)), "{m}");
+        }
+    }
+
+    #[test]
     fn frame_crop_and_page_anchor_are_read() {
         let c = LO_CONTENT.replace("svg:width=\"0.0265cm\" svg:height=\"0.0265cm\"", "svg:width=\"6.35cm\" svg:height=\"6.35cm\" svg:x=\"1cm\" svg:y=\"2cm\"");
         let c = c.replace("<draw:frame draw:name=\"Bild1\" text:anchor-type=\"as-char\"", "<draw:frame draw:style-name=\"fr9\" draw:name=\"Bild1\" text:anchor-type=\"page\"");
@@ -4509,7 +4597,7 @@ Slut.
         img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
         let md = format!("<img src=\"b.png\" alt=\"\" width=\"240\" align=\"left\">{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n");
-        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None })).unwrap();
+        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None, svg: None })).unwrap();
         let odt = dir.join("f.odt");
         std::fs::write(&odt, w.bytes).unwrap();
         let st = std::process::Command::new("soffice")

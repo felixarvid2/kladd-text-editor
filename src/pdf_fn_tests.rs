@@ -118,3 +118,23 @@ fn endnotes_follow_the_last_text() {
         .collect();
     assert!(sup.iter().any(|t| t == "ii") && sup.iter().any(|t| t == "i"), "{sup:?}");
 }
+
+#[test]
+fn note_numbers_follow_the_document_format() {
+    let md = "<!-- kladd: footnote-format: lowerRoman; endnote-format: chicago; footnote-start: 2 -->\n\nA[^1] B[^2] C[^ei] D[^eii].\n\n[^1]: Ett.\n[^2]: Två.\n[^ei]: Slut ett.\n[^eii]: Slut två.\n";
+    let (blocks, notes) = parse_blocks_notes(md);
+    let Some(Block::Para { spans, .. }) = blocks.first() else { panic!("inget stycke") };
+    let refs: Vec<&str> = spans.iter().filter(|s| s.style.fnref.is_some() || s.style.endref).map(|s| s.text.as_str()).collect();
+    assert_eq!(refs, ["ii", "iii", "*", "†"]);
+    // Slutnotslistan under linjen använder samma nummer.
+    let ends: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| if let Block::Para { spans, .. } = b { spans.first() } else { None })
+        .filter(|s| s.style.endref)
+        .map(|s| s.text.as_str())
+        .collect();
+    assert_eq!(ends, ["*", "†"]);
+    let (lay, _) = laid_out(md);
+    assert!(find(&lay, 0, "iii").is_some() && find(&lay, 0, "ii").is_some(), "{:?}", texts(&lay, 0));
+    assert_eq!(notes.len(), 2);
+}

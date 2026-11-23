@@ -8,7 +8,7 @@ const PNG: [u8; 69] = [
 ];
 
 fn png(src: &str) -> Option<DocImage> {
-    (src == "bild:logo.png").then(|| DocImage { bytes: PNG.to_vec(), extent: None })
+    (src == "bild:logo.png").then(|| DocImage { bytes: PNG.to_vec(), extent: None, svg: None })
 }
 
 /// Sidhuvud/sidfot per sida som `write` räknar dem: (huvudets text, sidfotens text, antal bilder).
@@ -95,4 +95,40 @@ fn full_pdf_with_header_image_is_written() {
     let md = "<!-- kladd: header: \"{bild:logo.png 40x20}|Titel|{datum}\"; footer: \"Sida {sida} av {sidor}\"; footer-align: center; header-style: \"9pt #666666 line=#999999/0.5pt\" -->\n\nText\n";
     let out = write(md, "rapport", &png).unwrap();
     assert!(out.bytes.starts_with(b"%PDF"));
+}
+
+#[test]
+fn inline_formatting_is_drawn_per_run() {
+    let md = "<!-- kladd: header: \"**Fet** vanlig *kursiv* <u>under</u> <span style='color: #C00000; font-size: 14pt'>röd</span>|||**{sida}**\"; footer: \"Rad ett\\n<u>Rad två</u>\"; header-style: \"9pt #666666\" -->\n\nText\n";
+    let (blocks, notes) = parse_blocks_notes(md);
+    let defaults = doc_defaults(md);
+    let mut lay = lay_out(&blocks, &notes, &defaults, &png);
+    let ops = lay.header_footer(&defaults, &style::Fields::new(1, 1, "x"));
+    let top = lay.ph / 2.0;
+    let runs: Vec<(&String, Face, f32, (u8, u8, u8), bool)> = ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::Text { text, face, size, color, italic, y, .. } if *y < top => Some((text, *face, *size, *color, *italic)),
+            _ => None,
+        })
+        .collect();
+    let find = |t: &str| runs.iter().find(|r| r.0.trim() == t).unwrap_or_else(|| panic!("{t}: {runs:?}"));
+    let plain = find("vanlig");
+    assert_eq!(plain.1, lay.base);
+    assert_eq!(find("Fet").1, lay.base.strong());
+    assert_eq!(plain.3, (0x66, 0x66, 0x66));
+    assert!(find("kursiv").4 && !plain.4);
+    // Egen färg och storlek.
+    let red = find("röd");
+    assert_eq!((red.2, red.3), (14.0, (0xC0, 0, 0)));
+    assert_eq!(plain.2, 9.0);
+    // Sidnumret i fetstil längst till höger.
+    assert_eq!(find("1").1, lay.base.strong());
+    // Understrykningen är en linje under just den körningen: en i sidhuvudet och en i sidfoten.
+    let lines = ops.iter().filter(|o| matches!(o, Op::Line { .. })).count();
+    assert_eq!(lines, 2);
+    // Radens höjd följer den största körningen: texten på samma rad delar underkant.
+    let ys: Vec<f32> = ops.iter().filter_map(|o| match o { Op::Text { y, text, .. } if *y < top && !text.trim().is_empty() => Some(*y), _ => None }).collect();
+    assert!(ys.iter().all(|y| (y - ys[0]).abs() < 4.0), "{ys:?}");
+    assert!(write(md, "x", &|_| None).unwrap().bytes.starts_with(b"%PDF"));
 }

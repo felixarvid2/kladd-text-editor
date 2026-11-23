@@ -302,3 +302,83 @@ fn endnote_added_to_document_without_endnotes_part() {
     let back = read(&out).unwrap();
     assert!(back.markdown.contains("[^ei]: Ny slutnot"), "{}", back.markdown);
 }
+
+// ---------------------------------------------------------------- talformat (`w:numFmt`)
+
+fn with_footnote_pr(docx: &[u8], inner: &str) -> Vec<u8> {
+    patch_part(docx, "word/settings.xml", |x| x.replacen("<w:footnotePr>", &format!("<w:footnotePr>{inner}"), 1))
+}
+
+#[test]
+fn reads_note_number_format_from_settings() {
+    let docx = with_footnote_pr(&fixture(), r#"<w:numFmt w:val="upperLetter"/><w:numStart w:val="3"/>"#);
+    let l = read(&docx).unwrap();
+    assert!(l.markdown.lines().next().unwrap().contains("footnote-format: upperLetter; footnote-start: 3"), "{}", l.markdown);
+    // Etiketterna är oförändrade; visningen följer formatet: 1 → C, 2 → D.
+    assert!(l.markdown.contains("[^1]") && l.markdown.contains("[^2]"));
+    let a = markup::analyze(&l.markdown);
+    assert_eq!(a.defaults.notes.display("1").as_deref(), Some("C"));
+    assert_eq!(a.defaults.notes.display("2").as_deref(), Some("D"));
+    // Endnotes behåller sitt standardformat.
+    assert_eq!(a.defaults.notes.display("ei"), None);
+}
+
+#[test]
+fn section_note_format_overrides_settings() {
+    let docx = patch_part(&fixture(), "word/document.xml", |x| {
+        x.replacen("<w:sectPr>", r#"<w:sectPr><w:footnotePr><w:numFmt w:val="chicago"/></w:footnotePr><w:endnotePr><w:numFmt w:val="decimal"/></w:endnotePr>"#, 1)
+    });
+    let l = read(&docx).unwrap();
+    assert!(l.markdown.lines().next().unwrap().contains("endnote-format: decimal; footnote-format: chicago"), "{}", l.markdown);
+}
+
+#[test]
+fn untouched_note_format_is_byte_for_byte() {
+    let docx = with_footnote_pr(&fixture(), r#"<w:numFmt w:val="lowerRoman"/>"#);
+    let l = read(&docx).unwrap();
+    let out = write(&l.markdown, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    let strip = |x: String| x.replace(r#" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing""#, "");
+    for part in ["word/settings.xml", "word/document.xml", "word/footnotes.xml"] {
+        assert_eq!(strip(part_text(&out, part)), strip(part_text(&docx, part)), "{part}");
+    }
+}
+
+#[test]
+fn changed_note_format_is_written_back_and_read_again() {
+    let docx = with_footnote_pr(&fixture(), r#"<w:numFmt w:val="lowerRoman"/><w:numStart w:val="4"/>"#);
+    let l = read(&docx).unwrap();
+    // Slutnoter finns inte i filen: formatet läggs till i settings.xml. Fotnotsformatet byts och startnumret återställs.
+    let md = l.markdown.replacen("footnote-format: lowerRoman; footnote-start: 4", "footnote-format: chicago; endnote-format: decimal; endnote-start: 2", 1);
+    assert!(md.lines().next().unwrap().contains("footnote-format: lowerRoman") || md != l.markdown, "{}", l.markdown);
+    assert_ne!(md, l.markdown);
+    let out = write(&md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    let s = part_text(&out, "word/settings.xml");
+    assert!(s.contains(r#"<w:numFmt w:val="chicago"/>"#) && !s.contains("lowerRoman") && !s.contains(r#"w:val="4""#), "{s}");
+    assert!(s.contains(r#"<w:endnotePr><w:numFmt w:val="decimal"/><w:numStart w:val="2"/></w:endnotePr>"#), "{s}");
+    let back = read(&out).unwrap();
+    let line = |m: &str| markup::analyze(m).defaults.notes;
+    assert_eq!(line(&back.markdown), line(&md), "{}", back.markdown);
+}
+
+#[test]
+fn changed_format_updates_section_properties_too() {
+    let docx = patch_part(&fixture(), "word/document.xml", |x| {
+        x.replacen("<w:sectPr>", r#"<w:sectPr><w:footnotePr><w:numFmt w:val="decimal"/></w:footnotePr>"#, 1)
+    });
+    let l = read(&docx).unwrap();
+    let md = format!("<!-- kladd: footnote-format: upperRoman -->\n\n{}", l.markdown);
+    let out = write(&md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+    assert!(part_text(&out, "word/document.xml").contains(r#"<w:footnotePr><w:numFmt w:val="upperRoman"/></w:footnotePr>"#));
+    assert!(read(&out).unwrap().markdown.starts_with("<!-- kladd: footnote-format: upperRoman -->"));
+}
+
+#[test]
+fn fresh_document_writes_note_formats() {
+    let md = "<!-- kladd: endnote-format: decimal; footnote-format: lowerLetter; footnote-start: 2 -->\n\nA[^1] B[^ei]\n\n[^1]: Fot.\n[^ei]: Slut.\n";
+    let out = write(md, "x", &|_| None, None).unwrap().bytes;
+    let s = part_text(&out, "word/settings.xml");
+    assert!(s.contains(r#"<w:footnotePr><w:numFmt w:val="lowerLetter"/><w:numStart w:val="2"/>"#), "{s}");
+    assert!(s.contains(r#"<w:endnotePr><w:numFmt w:val="decimal"/>"#), "{s}");
+    let back = read(&out).unwrap();
+    assert_eq!(back.markdown, md);
+}
