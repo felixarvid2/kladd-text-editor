@@ -228,7 +228,7 @@ fn changed_header_text_keeps_logo_and_fields() {
 #[test]
 fn fresh_document_writes_formats_even_odd_sections_and_page_start() {
     let md = "<!-- kladd: header: \"Rapport|{bild:logo.png 40x20}|{datum}\"; footer: \"Sida {sida:roman} av {sidor} ({avsnittssidor})\"; footer-align: center; header-even: \"Jämn\"; header-style: \"9pt #666666 line=#999999/0.5pt\"; header-dist: 10mm; page-format: roman -->\n\nFörsta\n\n<!-- kladd: avsnitt; header: \"Bilaga\"; page-start: 1; page-format: 1; title-page: yes; header-first: \"\" -->\n\nAndra\n";
-    let l = Loaded { source: None, markdown: md.to_owned(), images: vec![("logo.png".into(), Image { bytes: PNG.to_vec(), extent: None })], dropped: vec![] };
+    let l = Loaded { source: None, markdown: md.to_owned(), images: vec![("logo.png".into(), Image { bytes: PNG.to_vec(), extent: None, svg: None })], dropped: vec![] };
     let out = write(md, "t", &resolver(&l), None).unwrap().bytes;
     let h = part(&out, "word/header1.xml");
     assert!(h.contains("<w:drawing>") && h.contains("w:color w:val=\"666666\"") && h.contains("<w:pBdr><w:bottom") && h.contains("w:tab w:val=\"right\""), "{h}");

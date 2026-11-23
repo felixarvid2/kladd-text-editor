@@ -4,6 +4,14 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **SVG behåller vektorkvaliteten i Word, LibreOffice och PDF.** I `.docx` skrivs en SVG som Word 2016+ gör (`a:blip` till en PNG-reserv och `asvg:svgBlip` till `word/media/*.svg`), i `.odt` som LibreOffice (en `draw:image` med SVG:n och en med PNG-reserv, med manifest) och i PDF ritas den som vektor med `krilla-svg` (text blir text). HTML och EPUB behåller SVG-filen. Båda formaten läses tillbaka med SVG:n kvar, så den går inte förlorad vid tur och retur (LibreOffice-filer med SVG visar nu bilden i stället för att räknas som bortfallna former). Nya beroenden: `krilla-svg` 0.8 och `resvg` 0.47 (uppgraderad från 0.45; MIT/Apache-2.0).
+
+### Rättat
+
+- **En SVG utan `width` visades i dubbel storlek.** Rastret ritas i dubbel upplösning och styrde storleken; nu används SVG:ns egen storlek (`width`/`height`, annars `viewBox`) i dokumentläget, i sidhuvuden och vid export.
+
 ## [2.5.1] – 2026-11-21
 
 ### Nytt

@@ -268,7 +268,11 @@ impl<'r> Images<'r> {
             return (self.mode == Mode::Html).then(|| raw.to_owned());
         }
         let img = (self.resolve)(raw)?;
-        let (mut bytes, mut media, mut ext) = sniff(&img.bytes)?;
+        // SVG behåller sin vektorfil (data-URI i HTML, `images/imgN.svg` i EPUB), inte PNG-rastret.
+        let (mut bytes, mut media, mut ext) = match &img.svg {
+            Some(svg) => (svg.data.clone(), "image/svg+xml", "svg"),
+            None => sniff(&img.bytes)?,
+        };
         if self.mode == Mode::Html {
             return Some(format!("data:{media};base64,{}", base64(&bytes)));
         }
@@ -1427,7 +1431,7 @@ mod tests {
         let (Ok(i), Ok(o)) = (std::env::var("KLADD_MD_IN"), std::env::var("KLADD_HTML_OUT")) else { return };
         let md = std::fs::read_to_string(&i).unwrap();
         let dir = std::path::Path::new(&i).parent().unwrap().to_path_buf();
-        let w = html(&md, "Prov", &|src| std::fs::read(dir.join(src)).ok().map(|bytes| Image { bytes, extent: None })).unwrap();
+        let w = html(&md, "Prov", &|src| std::fs::read(dir.join(src)).ok().map(|bytes| Image { bytes, extent: None, svg: None })).unwrap();
         std::fs::write(o, w.bytes).unwrap();
     }
 
@@ -1457,7 +1461,7 @@ mod tests {
     ];
 
     fn resolve(src: &str) -> Option<Image> {
-        (src == "bild:a.png" || src == "lokal.png").then(|| Image { bytes: PNG.to_vec(), extent: None })
+        (src == "bild:a.png" || src == "lokal.png").then(|| Image { bytes: PNG.to_vec(), extent: None, svg: None })
     }
 
     const RICH: &str = "<!-- kladd: font-family: \"Times New Roman\"; font-size: 12pt; page-size: A4 -->\n\

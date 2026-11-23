@@ -727,7 +727,7 @@ struct Layout<'a> {
     pages: Vec<PageOps>,
     y: f32,
     headings: Vec<Heading>,
-    images: Vec<Image>,
+    images: Vec<Pic>,
     resolve: &'a dyn Fn(&str) -> Option<DocImage>,
     missing: Vec<String>,
     /// Brödtextens storlek (dokumentets grundstorlek) och faktorn mot `BODY_SIZE`
@@ -1082,10 +1082,10 @@ impl<'a> Layout<'a> {
                 if loaded.contains_key(&src) {
                     continue;
                 }
-                if let Some(img) = (self.resolve)(&src).and_then(|i| make_image(&i.bytes)) {
+                if let Some(img) = (self.resolve)(&src).and_then(|i| make_pic(&i)) {
                     let (pw, ph) = img.size();
                     self.images.push(img);
-                    loaded.insert(src, (self.images.len() - 1, pw as f32 * 0.75, ph as f32 * 0.75));
+                    loaded.insert(src, (self.images.len() - 1, pw * 0.75, ph * 0.75));
                 }
             }
             let base_face = if st.bold { self.base.strong() } else { self.base };
@@ -1658,7 +1658,7 @@ impl<'a> Layout<'a> {
             self.text_block(&spans, self.ml + indent, self.cw - indent, self.base, self.body, MUTED, false, None);
             return;
         };
-        let Some(image) = make_image(&img.bytes) else {
+        let Some(image) = make_pic(&img) else {
             self.missing.push(src.to_owned());
             return;
         };
@@ -1666,11 +1666,11 @@ impl<'a> Layout<'a> {
         // Storlek: originalets storlek i Word om den finns, annars 96 dpi, högst sidbredden.
         let (mut w, mut h) = match img.extent {
             Some((cx, cy)) => (cx as f32 / 12_700.0, cy as f32 / 12_700.0),
-            None => (pw as f32 * 0.75, ph as f32 * 0.75),
+            None => (pw * 0.75, ph * 0.75),
         };
         // Angiven storlek (`width`/`height` i CSS-px, redan omräknat till pt); proportionerna bevaras
         // när bara en sida anges.
-        let mut aspect = if pw > 0 { ph as f32 / pw as f32 } else { 1.0 };
+        let mut aspect = if pw > 0.0 { ph / pw } else { 1.0 };
         // Beskuren bild: den synliga delen avgör proportionerna.
         if let Some(c) = place.crop {
             aspect *= (1.0 - (c[1] + c[3]) / 100.0) / (1.0 - (c[0] + c[2]) / 100.0);
@@ -2312,6 +2312,45 @@ fn draw_math(s: &mut krilla::surface::Surface<'_>, src: &str, display: bool, x: 
     }
 }
 
+/// En bild på en sida: raster, eller en SVG som ritas som vektor (text och former, inga bildpunkter).
+enum Pic {
+    Raster(Image),
+    Svg(std::sync::Arc<resvg::usvg::Tree>),
+}
+
+impl Pic {
+    /// Storleken i bildpunkter (96 dpi).
+    fn size(&self) -> (f32, f32) {
+        match self {
+            Pic::Raster(i) => {
+                let (w, h) = i.size();
+                (w as f32, h as f32)
+            }
+            Pic::Svg(t) => (t.size().width(), t.size().height()),
+        }
+    }
+
+    /// Ritar bilden med övre vänstra hörnet i origo i storleken `size`.
+    fn draw(&self, s: &mut krilla::surface::Surface, size: Size) {
+        match self {
+            Pic::Raster(i) => s.draw_image(i.clone(), size),
+            Pic::Svg(t) => {
+                use krilla_svg::SurfaceExt;
+                s.draw_svg(t, size, krilla_svg::SvgSettings::default());
+            }
+        }
+    }
+}
+
+fn make_pic(img: &DocImage) -> Option<Pic> {
+    if let Some(svg) = &img.svg {
+        if let Some(tree) = crate::imgfmt::parse_svg(&svg.data) {
+            return Some(Pic::Svg(std::sync::Arc::new(tree)));
+        }
+    }
+    make_image(&img.bytes).map(Pic::Raster)
+}
+
 fn make_image(bytes: &[u8]) -> Option<Image> {
     let data = || krilla::Data::from(bytes.to_vec());
     match crate::docx::image_ext(bytes) {
@@ -2538,7 +2577,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                                         if let Some(path) = pb.finish() {
                                             s.push_clip_path(&path, &FillRule::NonZero);
                                             s.push_transform(&Transform::from_translate(*x - fw * c[0] / 100.0, *y - fh * c[1] / 100.0));
-                                            s.draw_image(images[*index].clone(), full);
+                                            images[*index].draw(&mut s, full);
                                             s.pop();
                                             s.pop();
                                         }
@@ -2546,7 +2585,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
                                 }
                                 None => {
                                     s.push_transform(&Transform::from_translate(*x, *y));
-                                    s.draw_image(images[*index].clone(), size);
+                                    images[*index].draw(&mut s, size);
                                     s.pop();
                                 }
                             }
@@ -3102,7 +3141,7 @@ mod tests {
     #[test]
     fn img_width_sets_size_keeping_aspect_and_clamps() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let (lay, _) = laid_out("<img src=\"bild:a.png\" alt=\"A\" width=\"192\">\n", &resolve);
         let im = images_of(&lay);
         assert_eq!(im.len(), 1);
@@ -3124,7 +3163,7 @@ mod tests {
     #[test]
     fn div_align_places_an_image() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let md = "<div align=\"center\">\n\n<img src=\"a\" width=\"96\">\n\n</div>\n\n<div align=\"right\">\n\n<img src=\"a\" width=\"96\">\n\n</div>\n";
         let (lay, _) = laid_out(md, &resolve);
         let im = images_of(&lay);
@@ -3138,7 +3177,7 @@ mod tests {
     #[test]
     fn floats_wrap_text_line_by_line() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         for (side, tag) in [(Float::Left, "left"), (Float::Right, "right")] {
             let md = format!("<img src=\"a\" width=\"192\" align=\"{tag}\">\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n\n{LOREM}\n");
             let (mut lay, _) = laid_out(&md, &resolve);
@@ -3170,7 +3209,7 @@ mod tests {
     #[test]
     fn float_that_does_not_fit_moves_to_the_next_page() {
         let data = png(100, 100);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         // Fyll sidan nästan helt, sedan en bild på 150 pt som inte ryms.
         let filler: Vec<String> = (0..12).map(|_| LOREM.to_owned()).collect();
         let md = format!("{}\n\n<img src=\"a\" width=\"200\" align=\"left\">\n\n{LOREM}\n\n{LOREM}\n", filler.join("\n\n"));
@@ -3186,7 +3225,7 @@ mod tests {
     #[test]
     fn anchored_images_are_placed_like_in_the_document_mode() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         // Mot sidan: absolut plats (96 px = 72 pt från sidans kant), text påverkas inte (bakom).
         let md = format!("<img src=\"a\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\">\n\n{LOREM}\n");
         let (lay, _) = laid_out(&md, &resolve);
@@ -3211,7 +3250,7 @@ mod tests {
     #[test]
     fn cropped_image_keeps_the_visible_proportions() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let md = "<img src=\"a\" width=\"100\" crop=\"0 0 50 0\">\n";
         let (lay, _) = laid_out(md, &resolve);
         let (_, _, w, h) = images_of(&lay)[0];
@@ -3222,7 +3261,7 @@ mod tests {
     #[test]
     fn float_without_room_is_a_plain_block() {
         let data = png(100, 50);
-        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None });
+        let resolve = |_: &str| Some(DocImage { bytes: data.clone(), extent: None, svg: None });
         let md = format!("<img src=\"a\" width=\"700\" align=\"left\">\n\n{LOREM}\n");
         let (lay, _) = laid_out(&md, &resolve);
         let (_, iy, _, ih) = images_of(&lay)[0];
@@ -3250,7 +3289,7 @@ mod manual {
         let md = std::fs::read_to_string(&i).unwrap();
         let dir = std::path::Path::new(&i).parent().unwrap().to_path_buf();
         let w = super::write(&md, "Prov", &|src| {
-            std::fs::read(dir.join(src)).ok().map(|bytes| crate::docx::Image { bytes, extent: None })
+            std::fs::read(dir.join(src)).ok().map(|bytes| crate::docx::Image { bytes, extent: None, svg: None })
         })
         .unwrap();
         println!("saknade bilder: {:?}", w.missing_images);

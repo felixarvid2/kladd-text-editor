@@ -1274,19 +1274,26 @@ impl<'s, 'b> Rd<'s, 'b> {
             self.text_box(e, tb);
             return;
         }
-        let Some(img) = e.child("draw:image") else {
+        // LibreOffice skriver en SVG som två `draw:image`: SVG-filen och en PNG-reserv. Rastret är nyckeln;
+        // SVG:n följer med som vektorkälla.
+        let hrefs: Vec<String> = e
+            .els()
+            .filter(|c| c.name == "draw:image")
+            .filter_map(|c| c.attr("xlink:href").map(|h| h.trim().to_owned()))
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hrefs.is_empty() {
             self.dropped.shapes = true;
             return;
-        };
-        let Some(href) = img.attr("xlink:href").map(|h| h.trim().to_owned()) else {
-            self.dropped.shapes = true;
-            return;
-        };
-        if href.contains("://") || href.starts_with("..") || href.starts_with('/') {
+        }
+        if hrefs.iter().all(|h| h.contains("://") || h.starts_with("..") || h.starts_with('/')) {
             self.dropped.linked = true;
             return;
         }
-        let target = href.trim_start_matches("./").to_owned();
+        let local: Vec<String> = hrefs.iter().filter(|h| !(h.contains("://") || h.starts_with("..") || h.starts_with('/'))).map(|h| h.trim_start_matches("./").to_owned()).collect();
+        let is_svg_href = |h: &str| h.to_lowercase().ends_with(".svg");
+        let target = local.iter().find(|h| !is_svg_href(h)).or(local.first()).cloned().unwrap_or_default();
+        let svg_target = local.iter().find(|h| is_svg_href(h) && **h != target).cloned();
         let name = if let Some(n) = self.by_target.get(&target) {
             n.clone()
         } else {
@@ -1294,10 +1301,25 @@ impl<'s, 'b> Rd<'s, 'b> {
                 self.dropped.shapes = true;
                 return;
             };
-            if !is_supported_image(&bytes) {
+            let svg_bytes = svg_target.as_ref().and_then(|t| self.pkg.bytes(t).ok().flatten());
+            let (bytes, svg) = if crate::imgfmt::is_svg(&bytes) {
+                // Bara SVG (utan reserv): rastret ritas ur SVG:n.
+                match crate::imgfmt::from_package(bytes, None) {
+                    Some(i) => (i.bytes, i.svg),
+                    None => {
+                        self.dropped.shapes = true;
+                        return;
+                    }
+                }
+            } else if !is_supported_image(&bytes) {
                 self.dropped.shapes = true;
                 return;
-            }
+            } else {
+                match svg_bytes.and_then(|sv| crate::imgfmt::from_package(sv, Some(bytes.clone()))) {
+                    Some(i) => (i.bytes, i.svg),
+                    None => (bytes, None),
+                }
+            };
             let base = target.rsplit('/').next().unwrap_or("bild").to_owned();
             let mut name = base.clone();
             let mut k = 2;
@@ -1308,7 +1330,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             let w = e.attr("svg:width").and_then(style::parse_length);
             let h = e.attr("svg:height").and_then(style::parse_length);
             let extent = w.zip(h).map(|(w, h)| ((w * 12700.0) as i64, (h * 12700.0) as i64));
-            self.images.push((name.clone(), Image { bytes, extent }));
+            self.images.push((name.clone(), Image { bytes, extent, svg }));
             self.by_target.insert(target.clone(), name.clone());
             name
         };
@@ -1317,7 +1339,7 @@ impl<'s, 'b> Rd<'s, 'b> {
             .find_map(|k| e.child(k).map(|n| n.deep_text()).filter(|t| !t.trim().is_empty()))
             .unwrap_or_default();
         let (_, image) = self.images.iter().find(|(m, _)| *m == name).unwrap();
-        let natural = imagesize::blob_size(&image.bytes).ok().map(|s| (s.width as f32, s.height as f32));
+        let natural = image.natural_px();
         let fw = e.attr("svg:width").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let fh = e.attr("svg:height").and_then(style::parse_length).map(|pt| pt * 96.0 / 72.0);
         let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
@@ -3063,6 +3085,18 @@ impl<'a> W<'a> {
         self.after_space = true;
     }
 
+    /// Sökvägen i paketet för en bildfil (en gång per innehåll).
+    fn media_path(&mut self, bytes: &[u8], ext: &str, mime: &'static str) -> String {
+        match self.media.iter().find(|(_, b, _)| b == bytes) {
+            Some((p, _, _)) => p.clone(),
+            None => {
+                let p = format!("Pictures/image{}.{ext}", self.media.len() + 1);
+                self.media.push((p.clone(), bytes.to_vec(), mime));
+                p
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn image(&mut self, src: &str, alt: &str, width: Option<f32>, height: Option<f32>, float: Option<Float>, anchor: Option<Anchor>, crop: Option<[f32; 4]>) {
         let Some(img) = (self.resolve)(src).filter(|i| is_supported_image(&i.bytes)) else {
@@ -3078,15 +3112,10 @@ impl<'a> W<'a> {
             "bmp" => "image/bmp",
             _ => "image/png",
         };
-        let path = match self.media.iter().find(|(_, b, _)| *b == img.bytes) {
-            Some((p, _, _)) => p.clone(),
-            None => {
-                let p = format!("Pictures/image{}.{ext}", self.media.len() + 1);
-                self.media.push((p.clone(), img.bytes.clone(), mime));
-                p
-            }
-        };
-        let natural = imagesize::blob_size(&img.bytes).ok().map(|s| (s.width as f32, s.height as f32));
+        let path = self.media_path(&img.bytes, ext, mime);
+        // SVG: filen som vektor och PNG-reserven efter (LibreOffices mönster).
+        let svg_path = img.svg.as_ref().map(|s| self.media_path(&s.data, "svg", "image/svg+xml"));
+        let natural = img.natural_px();
         let ratio = natural.map(|(w, h)| h / w.max(1.0)).unwrap_or(0.66);
         // Beskuren bild: de synliga proportionerna styr höjden när bara bredden är angiven.
         let ratio = match (natural, crop) {
@@ -3201,9 +3230,12 @@ impl<'a> W<'a> {
         self.open_link_if_needed();
         self.n_frame += 1;
         let n = self.n_frame;
+        let svg_frame = svg_path
+            .map(|p| format!("<draw:image xlink:href=\"{p}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"image/svg+xml\"/>"))
+            .unwrap_or_default();
         let desc = if alt.is_empty() { String::new() } else { format!("<svg:desc>{}</svg:desc>", esc(alt)) };
         self.body.push_str(&format!(
-            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\"{frame_pos} svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\"><draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
+            "<draw:frame draw:style-name=\"{style_name}\" draw:name=\"Bild{n}\" text:anchor-type=\"{anchor}\"{frame_pos} svg:width=\"{}\" svg:height=\"{}\" draw:z-index=\"{}\">{svg_frame}<draw:image xlink:href=\"{path}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{mime}\"/>{desc}</draw:frame>",
             cm(w_pt),
             cm(h_pt),
             n - 1
@@ -4291,7 +4323,7 @@ Slut.
 
     fn resolver() -> impl Fn(&str) -> Option<Image> {
         let p = png();
-        move |src| (src == "bild:image1.png").then(|| Image { bytes: p.clone(), extent: None })
+        move |src| (src == "bild:image1.png").then(|| Image { bytes: p.clone(), extent: None, svg: None })
     }
 
     #[test]
@@ -4509,7 +4541,7 @@ Slut.
         img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
         let md = format!("<img src=\"b.png\" alt=\"\" width=\"240\" align=\"left\">{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n");
-        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None })).unwrap();
+        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None, svg: None })).unwrap();
         let odt = dir.join("f.odt");
         std::fs::write(&odt, w.bytes).unwrap();
         let st = std::process::Command::new("soffice")

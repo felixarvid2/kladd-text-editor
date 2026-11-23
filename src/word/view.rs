@@ -921,8 +921,8 @@ impl KladdApp {
             let size = match img.extent {
                 Some((cx, cy)) if cx > 0 && cy > 0 => vec2(cx as f32 / 9525.0, cy as f32 / 9525.0),
                 _ => {
-                    let s = imagesize::blob_size(&img.bytes).ok()?;
-                    vec2(s.width as f32, s.height as f32)
+                    let s = img.natural_px()?;
+                    vec2(s.0, s.1)
                 }
             };
             ctx.include_bytes(image_uri(src, doc.id), img.bytes);

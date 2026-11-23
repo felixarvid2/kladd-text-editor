@@ -1,6 +1,7 @@
 //! Bildformat som Kladd kan infoga men som Word, OpenDocument och PDF inte alla kan bädda in:
-//! WebP och SVG görs om till PNG när bilden läses för ritning eller export. De andra formaten
-//! (png, jpeg, gif, bmp) går orörda igenom.
+//! WebP görs om till PNG när bilden läses för ritning eller export. SVG får en PNG som raster
+//! (visning, utskrift, reserv) men behåller sin källa (`docx::Image::svg`), som skrivs som vektor i
+//! .docx, .odt, PDF och HTML/EPUB. De andra formaten (png, jpeg, gif, bmp) går orörda igenom.
 
 use std::io::Cursor;
 
@@ -31,7 +32,7 @@ pub fn svg_size(bytes: &[u8]) -> Option<(f32, f32)> {
     (s.width() > 0.0 && s.height() > 0.0).then(|| (s.width(), s.height()))
 }
 
-fn parse_svg(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+pub(crate) fn parse_svg(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
     let mut opt = resvg::usvg::Options::default();
     // Systemets typsnitt läses bara in när SVG:n har text (det tar en stund).
     if bytes.windows(5).any(|w| w == b"<text") {
@@ -71,6 +72,31 @@ pub fn to_supported(bytes: Vec<u8>) -> Option<Vec<u8>> {
     } else {
         Some(bytes)
     }
+}
+
+/// Läser en bildfil till en [`Image`]: SVG behåller sin källa (för vektorskrivning) och får en PNG som
+/// raster för visning och reserv; övriga format går som i [`to_supported`]. `None` om bilden inte kan avkodas.
+pub fn prepare(bytes: Vec<u8>) -> Option<crate::docx::Image> {
+    if is_svg(&bytes) {
+        let size = svg_size(&bytes)?;
+        let png = svg_to_png(&bytes)?;
+        return Some(crate::docx::Image { bytes: png, extent: None, svg: Some(crate::docx::Svg { data: bytes, size }) });
+    }
+    Some(crate::docx::Image::raster(to_supported(bytes)?, None))
+}
+
+/// En SVG-del ur ett paket (`.docx`/`.odt`) med PNG-reserven som raster; saknas reserven (eller går
+/// den inte att avkoda) ritas SVG:n.
+pub fn from_package(svg: Vec<u8>, fallback: Option<Vec<u8>>) -> Option<crate::docx::Image> {
+    if !is_svg(&svg) {
+        return None;
+    }
+    let size = svg_size(&svg)?;
+    let png = match fallback.filter(|b| crate::docx::is_supported_image(b)) {
+        Some(b) => b,
+        None => svg_to_png(&svg)?,
+    };
+    Some(crate::docx::Image { bytes: png, extent: None, svg: Some(crate::docx::Svg { data: svg, size }) })
 }
 
 /// Är filen en bild som Kladd kan infoga (efter omvandling)?

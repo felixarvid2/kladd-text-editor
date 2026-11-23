@@ -38,10 +38,43 @@ const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relati
 /// En bild i ett Word-dokument.
 #[derive(Clone, Debug)]
 pub struct Image {
+    /// Rastret: PNG/JPEG/GIF/BMP, eller för en SVG dess PNG-reserv (visning, utskrift, HTML-reserv).
     pub bytes: Vec<u8>,
     /// Storleken i originalet (EMU), om den är känd.
     pub extent: Option<(i64, i64)>,
+    /// SVG-källan när bilden är en vektorbild; skrivs som vektor i .docx, .odt, PDF och HTML.
+    pub svg: Option<Svg>,
 }
+
+/// En SVG-fil och dess naturliga storlek (CSS-pixlar).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Svg {
+    pub data: Vec<u8>,
+    pub size: (f32, f32),
+}
+
+impl Image {
+    /// Raster utan vektorkälla.
+    pub fn raster(bytes: Vec<u8>, extent: Option<(i64, i64)>) -> Self {
+        Image { bytes, extent, svg: None }
+    }
+
+    fn bytes_and_svg(self) -> (Vec<u8>, Option<Svg>) {
+        (self.bytes, self.svg)
+    }
+
+    /// Den naturliga storleken i bildpunkter (96 dpi). För en SVG är det SVG:ns egen storlek, inte
+    /// reservrastrets (som ritas i högre upplösning).
+    pub fn natural_px(&self) -> Option<(f32, f32)> {
+        match &self.svg {
+            Some(s) => Some(s.size),
+            None => imagesize::blob_size(&self.bytes).ok().map(|s| (s.width as f32, s.height as f32)),
+        }
+    }
+}
+
+/// Namnrymden för `asvg:svgBlip` (Word 2016+: SVG-bild med PNG-reserv).
+const SVG_NS: &str = "http://schemas.microsoft.com/office/drawing/2016/SVG/main";
 
 /// Prefix för bilder som finns inbäddade i dokumentet, t.ex. `![Sol](bild:image1.png)`.
 pub const IMAGE_SCHEME: &str = "bild:";
@@ -1156,9 +1189,18 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         let name = if let Some(n) = by_target.get(&f.target) {
             Some(n.clone())
         } else {
-            match pkg.part_bytes(&f.target)?.filter(|b| is_supported_image(b)) {
+            // Word 2016+: SVG-delen först (PNG-reserven blir rastret); annars bara bilden.
+            let vector = match &f.svg {
+                Some(t) => pkg.part_bytes(t)?.and_then(|svg| crate::imgfmt::from_package(svg, pkg.part_bytes(&f.target).ok().flatten())),
                 None => None,
-                Some(bytes) => {
+            };
+            let plain = match vector {
+                Some(_) => None,
+                None => pkg.part_bytes(&f.target)?.filter(|b| is_supported_image(b)),
+            };
+            match vector.map(|v| v.bytes_and_svg()).or_else(|| plain.map(|b| (b, None))) {
+                None => None,
+                Some((bytes, svg)) => {
                     let base = f.target.rsplit('/').next().unwrap_or("bild").to_owned();
                     let mut name = base.clone();
                     let mut n = 2;
@@ -1166,7 +1208,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
                         name = format!("{n}-{base}");
                         n += 1;
                     }
-                    images.push((name.clone(), Image { bytes, extent: f.extent }));
+                    images.push((name.clone(), Image { bytes, extent: f.extent, svg }));
                     by_target.insert(f.target.clone(), name.clone());
                     Some(name)
                 }
@@ -1336,7 +1378,7 @@ fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Imag
     let floating = float.is_some() || anchor.is_some();
     let differs = |a: f64, b: f64| b > 0.0 && (a - b).abs() / b > 0.02;
     let want = extent.map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
-    let nat = img.and_then(|i| imagesize::blob_size(&i.bytes).ok()).map(|s| (s.width as f64, s.height as f64));
+    let nat = img.and_then(Image::natural_px).map(|s| (s.0 as f64, s.1 as f64));
     let natural = nat.map(|n| n.0);
     let stored = img.and_then(|i| i.extent).map(|(cx, _)| cx as f64 / EMU_PER_PIXEL as f64);
     let src = format!("{IMAGE_SCHEME}{}", name.replace(' ', "%20"));
@@ -1573,6 +1615,8 @@ fn read_page(sect: &str) -> Result<DocDefaults, String> {
 struct FoundImage {
     placeholder: String,
     target: String,
+    /// SVG-delen (`asvg:svgBlip`); `target` är då PNG-reserven.
+    svg: Option<String>,
     alt: String,
     extent: Option<(i64, i64)>,
     /// Förankrad bild (`wp:anchor`): läge, omflöde och avstånd.
@@ -1671,6 +1715,8 @@ fn push_token(para: &mut Option<Para>, info: &mut BodyInfo, xml: &str) {
 struct Drawing {
     depth: usize,
     blip: Option<String>,
+    /// SVG-delen i `asvg:svgBlip` (Word 2016+), om bilden har en.
+    svg: Option<String>,
     linked: bool,
     alt: String,
     title: String,
@@ -2111,6 +2157,11 @@ fn parse_body(
                                 }
                             } else if attr(e, b"link").is_some() {
                                 d.linked = true;
+                            }
+                        }
+                        b"svgBlip" => {
+                            if let Some((t, _, false)) = attr(e, b"embed").and_then(|id| rels.get(&id)) {
+                                d.svg.get_or_insert_with(|| t.clone());
                             }
                         }
                         b"docPr" => {
@@ -2567,6 +2618,7 @@ fn parse_body(
                             found.push(FoundImage {
                                 placeholder,
                                 target: resolve_target(dir, &target),
+                                svg: d.svg.map(|t| resolve_target(dir, &t)),
                                 alt: alt.trim().to_owned(),
                                 extent: d.extent,
                                 anchor: d.anchored.then_some(d.pos),
@@ -3557,25 +3609,23 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn picture(&mut self, bytes: Vec<u8>, extent: Option<(i64, i64)>, alt: &str, place: Option<(Option<Float>, Option<Anchor>)>, crop: Option<[f64; 4]>) {
-        let Some(ext) = image_ext(&bytes) else { return };
-        // Samma bild flera gånger bäddas bara in en gång; en bild som redan finns i
-        // originalpaketet återanvänds.
+    /// Bäddar in en mediefil (en gång per innehåll) och ger dess relations-id. En fil som redan finns i
+    /// originalpaketet återanvänds.
+    fn media_id(&mut self, bytes: Vec<u8>, ext: &str) -> String {
         let existing = self
             .media
             .iter()
             .find(|(_, _, b)| *b == bytes)
             .map(|(id, _, _)| id.clone())
             .or_else(|| self.ctx.media.iter().find(|(_, b)| *b == bytes.as_slice()).map(|(id, _)| id.clone()));
-        let (cx, cy) = image_extent(&bytes, extent, self.ctx.max_width);
-        let id = match existing {
+        match existing {
             Some(id) => id,
             None => {
                 let id = self.fresh_id("rIdImg");
                 let mut n = self.media.len() + 1;
                 let file = loop {
                     let f = format!("image{n}.{ext}");
-                    if !self.ctx.taken.contains(&format!("word/media/{f}").to_lowercase()) {
+                    if !self.ctx.taken.contains(&format!("word/media/{f}").to_lowercase()) && !self.media.iter().any(|(_, m, _)| *m == f) {
                         break f;
                     }
                     n += 1;
@@ -3583,6 +3633,21 @@ impl<'a> Writer<'a> {
                 self.media.push((id.clone(), file, bytes));
                 id
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn picture(&mut self, bytes: Vec<u8>, svg: Option<Vec<u8>>, natural: Option<(f32, f32)>, extent: Option<(i64, i64)>, alt: &str, place: Option<(Option<Float>, Option<Anchor>)>, crop: Option<[f64; 4]>) {
+        let Some(ext) = image_ext(&bytes) else { return };
+        let (cx, cy) = image_extent(natural.or_else(|| imagesize::blob_size(&bytes).ok().map(|s| (s.width as f32, s.height as f32))), extent, self.ctx.max_width);
+        let id = self.media_id(bytes, ext);
+        // Vektorbild som Word 2016+: PNG-reserven i `a:blip` och SVG-filen i tillägget `asvg:svgBlip`.
+        let svg_ext = match svg {
+            Some(data) => {
+                let sid = self.media_id(data, "svg");
+                format!(r#"<a:extLst><a:ext uri="{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}"><asvg:svgBlip xmlns:asvg="{SVG_NS}" r:embed="{sid}"/></a:ext></a:extLst>"#)
+            }
+            None => String::new(),
         };
         let doc_pr = self.doc_pr_next;
         self.doc_pr_next += 1;
@@ -3590,9 +3655,10 @@ impl<'a> Writer<'a> {
         xml_escape(alt, &mut alt_x);
         self.open_para();
         const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+        let blip = if svg_ext.is_empty() { format!(r#"<a:blip r:embed="{id}"/>"#) } else { format!(r#"<a:blip r:embed="{id}">{svg_ext}</a:blip>"#) };
         // Gemensam del efter placeringen: storlek, beskrivning och själva bilden.
         let tail = format!(
-            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/>{{SRC_RECT}}<a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
+            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{{WRAP}}<wp:docPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{doc_pr}" name="Bild {doc_pr}" descr="{alt_x}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill>{blip}{{SRC_RECT}}<a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"#
         );
         let src_rect = crop
             .map(|c| format!(r#"<a:srcRect l="{}" t="{}" r="{}" b="{}"/>"#, (c[0] * 1000.0).round() as i64, (c[1] * 1000.0).round() as i64, (c[2] * 1000.0).round() as i64, (c[3] * 1000.0).round() as i64))
@@ -3956,7 +4022,8 @@ impl<'a> Writer<'a> {
                 let extent = sized_extent(&img, (tag.width, tag.height), tag.crop);
                 // En bild i en tabellcell eller i en lista flyter inte.
                 let place = if self.table.is_some() { None } else { Some((tag.align, tag.anchor)) };
-                self.picture(img.bytes, extent, alt, place, tag.crop);
+                let natural = img.natural_px();
+                self.picture(img.bytes, img.svg.map(|s| s.data), natural, extent, alt, place, tag.crop);
             }
             _ => {
                 self.missing.push(src.to_owned());
@@ -4126,7 +4193,7 @@ fn parse_img(s: &str) -> Option<ImgTag> {
 /// Bildens storlek i EMU när taggen anger bredd och/eller höjd i CSS-pixlar (bevarar proportionerna).
 fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>), crop: Option<[f64; 4]>) -> Option<(i64, i64)> {
     let px = EMU_PER_PIXEL as f64;
-    let natural = imagesize::blob_size(&img.bytes).ok().map(|s| (s.width as f64, s.height as f64)).or(img.extent.map(|(x, y)| (x as f64, y as f64)));
+    let natural = img.natural_px().map(|s| (s.0 as f64, s.1 as f64)).or(img.extent.map(|(x, y)| (x as f64, y as f64)));
     // Den synliga delen av en beskuren bild bestämmer proportionerna och grundstorleken.
     let natural = natural.map(|(w, h)| match crop {
         Some(c) => (w * (1.0 - (c[0] + c[2]) / 100.0), h * (1.0 - (c[1] + c[3]) / 100.0)),
@@ -4628,11 +4695,11 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
 const MAX_IMAGE_WIDTH_EMU: i64 = 9026 * 635;
 const EMU_PER_PIXEL: i64 = 9525; // 96 dpi
 
-fn image_extent(bytes: &[u8], extent: Option<(i64, i64)>, max_width: i64) -> (i64, i64) {
+fn image_extent(natural: Option<(f32, f32)>, extent: Option<(i64, i64)>, max_width: i64) -> (i64, i64) {
     let max_width = if max_width > 0 { max_width } else { MAX_IMAGE_WIDTH_EMU };
-    let (mut cx, mut cy) = extent.unwrap_or_else(|| match imagesize::blob_size(bytes) {
-        Ok(sz) => (sz.width as i64 * EMU_PER_PIXEL, sz.height as i64 * EMU_PER_PIXEL),
-        Err(_) => (MAX_IMAGE_WIDTH_EMU / 2, MAX_IMAGE_WIDTH_EMU / 3),
+    let (mut cx, mut cy) = extent.unwrap_or_else(|| match natural {
+        Some((w, h)) => (w as i64 * EMU_PER_PIXEL, h as i64 * EMU_PER_PIXEL),
+        None => (MAX_IMAGE_WIDTH_EMU / 2, MAX_IMAGE_WIDTH_EMU / 3),
     });
     cx = cx.max(1);
     cy = cy.max(1);
@@ -4644,7 +4711,7 @@ fn image_extent(bytes: &[u8], extent: Option<(i64, i64)>, max_width: i64) -> (i6
 }
 
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#;
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="svg" ContentType="image/svg+xml"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#;
 
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#;
@@ -5409,6 +5476,7 @@ impl Extras {
 fn image_mime(ext: &str) -> &'static str {
     match ext {
         "png" => "image/png",
+        "svg" => "image/svg+xml",
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         _ => "image/jpeg",
@@ -6767,7 +6835,7 @@ mod tests {
         ];
         let md = "# Bilder\n\nFöre ![En sol](sol.png) efter.\n\n![](saknas.png)\n\n![Igen](sol.png)\n";
         let p2 = png.clone();
-        let w = write(md, "x", &move |src| (src == "sol.png").then(|| Image { bytes: p2.clone(), extent: None }), None).unwrap();
+        let w = write(md, "x", &move |src| (src == "sol.png").then(|| Image { bytes: p2.clone(), extent: None, svg: None }), None).unwrap();
         assert_eq!(w.missing_images, vec!["saknas.png".to_owned()]);
         let back = read(&w.bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
@@ -7523,7 +7591,7 @@ Marginal
             5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         let p = png.clone();
-        let resolve = move |src: &str| (src == "bild:a.png").then(|| Image { bytes: p.clone(), extent: None });
+        let resolve = move |src: &str| (src == "bild:a.png").then(|| Image { bytes: p.clone(), extent: None, svg: None });
         let md = "<img src=\"bild:a.png\" alt=\"Sol &amp; måne\" width=\"240\">\n\nText med <img src=\"bild:a.png\" width=\"100\" height=\"50\"> inne.\n\n![Ren](bild:a.png)\n";
         let out = write(md, "x", &resolve, None).unwrap();
         assert!(out.missing_images.is_empty(), "{:?}", out.missing_images);
@@ -7554,7 +7622,7 @@ Marginal
 
     #[test]
     fn floating_image_roundtrip() {
-        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None, svg: None });
         let md = "<img src=\"bild:a.png\" alt=\"Sol\" width=\"200\" align=\"left\">Text bredvid.\n\n<img src=\"bild:a.png\" alt=\"\" width=\"100\" align=\"right\">\n\nSlut\n";
         let out = write(md, "x", &resolve, None).unwrap();
         assert!(out.missing_images.is_empty());
@@ -7587,7 +7655,7 @@ Marginal
 
     #[test]
     fn anchor_variants_are_read() {
-        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None, svg: None });
         let md = "<img src=\"bild:a.png\" alt=\"\" width=\"200\" align=\"left\">\n";
         let w = write(md, "x", &resolve, None).unwrap().bytes;
         // Byter `from` mot `to` i document.xml och ger bildtaggens attribut vid inläsning.
@@ -7633,7 +7701,7 @@ Marginal
 
     #[test]
     fn anchored_image_roundtrip() {
-        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None, svg: None });
         let md = concat!(
             "<img src=\"bild:a.png\" alt=\"A\" width=\"200\" hrel=\"page\" x=\"96\" vrel=\"page\" y=\"bottom\" wrap=\"behind\" dist=\"0 6 0 6\"> Text\n\n",
             "<img src=\"bild:a.png\" alt=\"\" width=\"100\" height=\"60\" x=\"center\" y=\"12\" wrap=\"top\" crop=\"10 0 5.5 0\">\n\n",
@@ -7659,7 +7727,7 @@ Marginal
 
     #[test]
     fn anchored_image_in_table_cell_is_inline() {
-        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None, svg: None });
         let w = write("<img src=\"bild:a.png\" alt=\"\" width=\"60\" align=\"left\">\n", "x", &resolve, None).unwrap().bytes;
         // Flytta in anchor-elementet i en tabellcell.
         let b = patch_document(&w, |x| {
@@ -7675,7 +7743,7 @@ Marginal
 
     #[test]
     fn vml_picture_position_is_read() {
-        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None, svg: None });
         let w = write("<img src=\"bild:a.png\" alt=\"\" width=\"60\" align=\"left\">\n", "x", &resolve, None).unwrap().bytes;
         let b = patch_document(&w, |x| {
             let id = x.split("r:embed=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_owned();
@@ -7691,7 +7759,7 @@ Marginal
     }
 
     fn w_inline() -> Vec<u8> {
-        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None });
+        let resolve = |src: &str| (src == "bild:a.png").then(|| Image { bytes: TEST_PNG.to_vec(), extent: None, svg: None });
         write("<img src=\"bild:a.png\" width=\"50\">\n", "x", &resolve, None).unwrap().bytes
     }
 
@@ -7711,7 +7779,7 @@ Marginal
         img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
         let md = format!("<img src=\"b.png\" alt=\"\" width=\"240\" align=\"left\">{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n\n{lorem}\n");
-        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None }), None).unwrap();
+        let w = write(&md, "x", &|_| Some(Image { bytes: png.clone(), extent: None, svg: None }), None).unwrap();
         let docx = dir.join("f.docx");
         std::fs::write(&docx, w.bytes).unwrap();
         let st = std::process::Command::new("soffice")
@@ -8026,7 +8094,7 @@ mod manual {
             let md = std::fs::read_to_string(i).unwrap();
             let dir = std::path::Path::new(&o).parent().unwrap().to_path_buf();
             let w = super::write(&md, "Prov", &|src| {
-                std::fs::read(dir.join(src)).ok().map(|bytes| super::Image { bytes, extent: None })
+                std::fs::read(dir.join(src)).ok().map(|bytes| super::Image { bytes, extent: None, svg: None })
             }, None)
             .unwrap();
             println!("saknade bilder: {:?}", w.missing_images);

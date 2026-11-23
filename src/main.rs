@@ -68,6 +68,8 @@ mod git_ui;
 mod corpus_tests;
 #[cfg(test)]
 mod brk_tests;
+#[cfg(test)]
+mod svg_tests;
 
 use std::path::PathBuf;
 

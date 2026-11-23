@@ -33,7 +33,7 @@ impl HfImages {
             name = format!("{n}-{base}");
             n += 1;
         }
-        self.list.push((name.clone(), Image { bytes, extent }));
+        self.list.push((name.clone(), Image { bytes, extent, svg: None }));
         self.by_target.insert(target.to_owned(), name.clone());
         Some(name)
     }
@@ -815,7 +815,7 @@ impl ImgOut<'_> {
         if w <= 0.0 || h <= 0.0 {
             let (nw, nh) = match img.extent {
                 Some((cx, cy)) => (cx as f32 / 12700.0, cy as f32 / 12700.0),
-                None => imagesize::blob_size(&img.bytes).map(|s| (s.width as f32 * 0.75, s.height as f32 * 0.75)).unwrap_or((48.0, 48.0)),
+                None => img.natural_px().map(|s| (s.0 * 0.75, s.1 * 0.75)).unwrap_or((48.0, 48.0)),
             };
             let k = if w > 0.0 { w / nw.max(1.0) } else if h > 0.0 { h / nh.max(1.0) } else { 1.0 };
             (w, h) = (nw * k, nh * k);

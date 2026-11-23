@@ -613,7 +613,7 @@ impl KladdApp {
                 }
                 if let Some((_, bytes)) = d.images.iter().find(|(n, _)| n == name) {
                     if !doc.images.iter().any(|(n, _)| n == name) {
-                        doc.images.push((name.clone(), crate::docx::Image { bytes: bytes.clone(), extent: None }));
+                        doc.images.push((name.clone(), crate::docx::Image { bytes: bytes.clone(), extent: None, svg: None }));
                     }
                 }
                 self.wv.images.remove(&(doc.id, src));
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn logos_show_as_markers_and_can_be_added_resized_and_removed() {
         let d = DocDefaults { header: Some("{bild:logo.png 80x30}|Titel|{sida}".into()), ..Default::default() };
-        let img = crate::docx::Image { bytes: PNG.to_vec(), extent: None };
+        let img = crate::docx::Image { bytes: PNG.to_vec(), extent: None, svg: None };
         let mut dlg = HfDialog::from_defaults(&d, false, false, "a.docx", &[("logo.png".into(), img)]);
         // Fältet visar en bricka i stället för bildmärket; oförändrat ger samma mall tillbaka.
         assert_eq!(dlg.rows[0][0][0][0], placeholder(1));

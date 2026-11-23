@@ -8,7 +8,7 @@ const PNG: [u8; 69] = [
 ];
 
 fn png(src: &str) -> Option<DocImage> {
-    (src == "bild:logo.png").then(|| DocImage { bytes: PNG.to_vec(), extent: None })
+    (src == "bild:logo.png").then(|| DocImage { bytes: PNG.to_vec(), extent: None, svg: None })
 }
 
 /// Sidhuvud/sidfot per sida som `write` räknar dem: (huvudets text, sidfotens text, antal bilder).

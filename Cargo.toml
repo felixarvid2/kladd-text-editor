@@ -22,7 +22,9 @@ eframe = { version = "0.37", default-features = false, features = [
 egui = { version = "0.37", features = ["serde"] }
 egui_extras = { version = "0.37", features = ["syntect", "image", "file", "svg"] }
 # SVG-bilder rasteriseras till PNG (ren Rust, MIT/Apache-2.0); text i SVG ritas med systemets typsnitt.
-resvg = { version = "0.45.1", default-features = false, features = ["text", "system-fonts"] }
+resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts"] }
+# SVG som vektor i PDF (krilla-svg delar usvg/resvg 0.47 med resvg ovan; MIT/Apache-2.0).
+krilla-svg = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 imagesize = "0.14"
 krilla = { version = "0.8", default-features = false, features = ["raster-images", "simple-text"] }

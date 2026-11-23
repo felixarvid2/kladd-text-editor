@@ -72,7 +72,7 @@ fn frame_token(e: &Node, ctx: &mut HfCtx<'_, '_>) -> Option<String> {
             let w = e.attr("svg:width").and_then(style::parse_length);
             let h = e.attr("svg:height").and_then(style::parse_length);
             let extent = w.zip(h).map(|(w, h)| ((w * 12700.0) as i64, (h * 12700.0) as i64));
-            ctx.images.push((name.clone(), Image { bytes, extent }));
+            ctx.images.push((name.clone(), Image { bytes, extent, svg: None }));
             ctx.by_target.insert(target, name.clone());
             name
         }
@@ -418,7 +418,7 @@ impl<'a> HfOut<'a> {
         if w <= 0.0 || h <= 0.0 {
             let (nw, nh) = match img.extent {
                 Some((cx, cy)) => (cx as f32 / 12700.0, cy as f32 / 12700.0),
-                None => imagesize::blob_size(&img.bytes).map(|s| (s.width as f32 * 0.75, s.height as f32 * 0.75)).unwrap_or((48.0, 48.0)),
+                None => img.natural_px().map(|s| (s.0 * 0.75, s.1 * 0.75)).unwrap_or((48.0, 48.0)),
             };
             let k = if w > 0.0 { w / nw.max(1.0) } else if h > 0.0 { h / nh.max(1.0) } else { 1.0 };
             (w, h) = (nw * k, nh * k);
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn written_odt_has_logo_page_formats_and_even_header_and_reads_back() {
         let md = "<!-- kladd: header: \"{bild:logo.png 40x20}|Titel|\"; footer: \"Sida {sida:roman} av {sidor}\"; header-even: \"Jämn\"; header-style: \"9pt #666666 line=#999999/0.5pt\"; page-margin: 30mm 20mm; page-format: roman -->\n\nText\n";
-        let resolve = |s: &str| (s == "bild:logo.png").then(|| Image { bytes: PNG.to_vec(), extent: None });
+        let resolve = |s: &str| (s == "bild:logo.png").then(|| Image { bytes: PNG.to_vec(), extent: None, svg: None });
         let out = crate::odt::write(md, "t", &resolve).unwrap().bytes;
         let mut z = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
         let mut styles = String::new();
