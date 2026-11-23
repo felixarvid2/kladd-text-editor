@@ -1074,12 +1074,12 @@ impl<'a> Layout<'a> {
         let mut out = Vec::new();
         for (footer, tpl, align, st, dist) in items {
             let Some(tpl) = tpl else { continue };
-            let rows = hf::filled_rows(&tpl, align, f);
+            let rows = hf::filled_rows(&tpl, align, f, st);
             let size = st.size.unwrap_or(self.body * 0.9);
             let color = st.color.map_or(MUTED, |c| (c[0], c[1], c[2]));
             // Bilderna först: de behöver sin egen storlek för uppställningen.
             let mut loaded: HashMap<String, (usize, f32, f32)> = HashMap::new();
-            for src in rows.iter().flatten().flat_map(|p| hf::image_srcs(p)) {
+            for src in hf::row_image_srcs(&rows) {
                 if loaded.contains_key(&src) {
                     continue;
                 }
@@ -1089,20 +1089,23 @@ impl<'a> Layout<'a> {
                     loaded.insert(src, (self.images.len() - 1, pw * 0.75, ph * 0.75));
                 }
             }
-            let base_face = if st.bold { self.base.strong() } else { self.base };
+            let (plain, strong) = (self.base, self.base.strong());
+            let face_of = |fmt: &hf::RunFmt| if fmt.bold { strong } else { plain };
             let m = std::cell::RefCell::new(&mut self.m);
-            let measure = |t: &str, sz: f32| m.borrow_mut().width(base_face, sz, t);
+            let measure = |t: &str, sz: f32, fmt: &hf::RunFmt| m.borrow_mut().width(face_of(fmt), sz, t);
             let natural = |src: &str| loaded.get(src).map(|(_, w, h)| (*w, *h));
             let zn = hf::layout_rows(&rows, size, 1.0, g.cw, &measure, &natural);
             let edge = dist.unwrap_or(hf::DEFAULT_DIST);
             let top = if footer { g.ph - edge - zn.height } else { edge };
             for it in &zn.items {
                 match it {
-                    Placed::Text { x, y, text, size } => {
+                    Placed::Text { x, y, text, size, fmt } => {
                         let base_y = top + y + size * 0.95;
-                        out.push(Op::Text { x: g.ml + x, y: base_y, face: base_face, size: *size, text: text.clone(), color, italic: st.italic });
-                        if st.underline {
-                            let w = m.borrow_mut().width(base_face, *size, text);
+                        let face = face_of(fmt);
+                        let color = fmt.color.map_or(color, |c| (c[0], c[1], c[2]));
+                        out.push(Op::Text { x: g.ml + x, y: base_y, face, size: *size, text: text.clone(), color, italic: fmt.italic });
+                        if fmt.underline {
+                            let w = m.borrow_mut().width(face, *size, text);
                             let uy = base_y + size * 0.12;
                             out.push(Op::Line { x1: g.ml + x, y1: uy, x2: g.ml + x + w, y2: uy, width: (size * 0.06).max(0.4), color });
                         }

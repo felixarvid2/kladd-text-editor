@@ -243,6 +243,26 @@ Gemensamma format (alla moduler ska använda dessa):
   avstånd) i både dokumentläget (`word/headers.rs`) och PDF-exporten (`Layout::header_footer_page`). `Plan::reserve`
   ger den marginal sidhuvudet och sidfoten behöver (avstånd + höjd + linje); `DocDefaults::layout_margins`, `SecGeom` och
   PDF-layouten skjuter ned brödtexten med den, medan `margins()` (det som skrivs till filen) är orörd.
+- **Formatering per körning i sidhuvud och sidfot** (`src/hf_inline.rs`). Mallens text har brödtextens inline-syntax:
+  `**fet**`, `*kursiv*`, `***båda***`, `<u>…</u>` och `<span style="color: …; font-size: …; font-family: …">…</span>` (samma
+  `style::SpanStyle`; spans ytterst). Fält och bildmärken (`{…}`) är hela och tolkas inte inuti. Märken utan par är text (så att
+  gamla mallar är orörda), `\*` och `\<` skriver ett tecken som annars blir märke. `header-style` är standardstilen:
+  `RunFmt` (fet/kursiv/understruken läggs till, färg/storlek/typsnitt ersätter) läggs ovanpå av `hf::filled_rows`, som tolkar
+  markupen per del (`parse_inline`) och fyller i fälten per körning, så att ett fältvärde aldrig blir markup. `hf::layout_zone`
+  tar `Run`s (text eller bild + format) och ger `Placed::Text { size, fmt }`; raden är så hög som den högsta körningen (och
+  `Plan::reserve` räknar med `font-size`), underkanterna ligger på samma linje. Dokumentläget (`word/headers.rs`) och PDF
+  (`Layout::header_footer_page`) ritar varje körning med egen yta, färg och understrykning.
+  - **docx**: läsaren (`docx_hf.rs`) håller reda på `w:rPr` i `w:r` (`b`, `i`, `u`, `color`, `sz`, `rFonts`) och lägger ett privat
+    märke i texten där formatet byter (`RunAcc`/`RunMarks`; också för `PAGE` som komplext fält eller `w:fldSimple`). När första
+    stycket med text är läst väljs standardstilen: fet/kursiv/understruken om alla körningar har det, färg och storlek de
+    flestas; `RunMarks::render` skriver sedan markupen med bara det som avviker (en körning utan färg mot en färgad
+    standardstil blir svart), och typsnittet i första körningen är bastypsnittet som inte skrivs. Skrivaren (`runs_for`) ger en
+    `w:r` per körning med `w:rPr` (`rFonts`, `b`, `i`, `color`, `sz`, `szCs`, `u`). En del skrivs bara om när mallens text ändrats,
+    så orörda sidhuvuden sparas byte för byte.
+  - **odt**: `text:span` läses med teckenstilen (automatisk stil i `styles.xml`) som skiljer sig från styckets egenskaper och
+    skrivs som `text:span` med en automatisk teckenstil per format (`HFT1` …) bland sidmallens automatiska stilar.
+  - **Dialogen**: knapparna F/K/U och Ctrl+B/I/U sätter märken runt markeringen i fältet (`hf_inline::toggle`, igen tar bort
+    dem), förhandsvisningen ritar körningarna med `hf::runs_of`.
   docx-skrivning: oförändrade delar och `w:sectPr` skrivs tillbaka orörda; ändras en del skrivs bara den (och sektionens
   referens) om, med fält, bilder och linje. Sektioner som skrivs om från grunden får originalets referenser (`seed_hf`).
   odt: `style:header-left` är jämna sidor, tabbstoppens typer avgör vänster/höger, `text:page-number` följer

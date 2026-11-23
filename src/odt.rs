@@ -3986,6 +3986,8 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
                 "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\"><style:paragraph-properties fo:text-align=\"{al}\" style:justify-single-word=\"false\"{border}>{tabs}</style:paragraph-properties>{tp}</style:style>"
             ));
             out.push_str(&format!("<style:{tag}>{}</style:{tag}>", hf_paragraph(&t, &name, align, fields, &mut env.out)));
+            // Körningarnas teckenstilar (`text:span`) hör till de automatiska stilarna.
+            auto.push_str(&env.out.take_styles());
         }
         (out, has_h, has_f)
     };

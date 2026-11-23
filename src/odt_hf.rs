@@ -4,7 +4,8 @@
 //! sidmallar per avsnitt. Resultatet är samma mall som i docx (se `crate::hf`).
 
 use super::*;
-use crate::hf::{HfStyle, NumFmt, SecHf};
+use crate::hf::{HfStyle, NumFmt, RunFmt, SecHf};
+use crate::hf_inline::RunAcc;
 
 /// Paketet och bilderna som hittats i sidhuvuden och sidfötter.
 pub(super) struct HfCtx<'a, 'b> {
@@ -86,41 +87,85 @@ fn frame_token(e: &Node, ctx: &mut HfCtx<'_, '_>) -> Option<String> {
     Some(crate::hf::ImgTok { src: format!("{IMAGE_SCHEME}{name}"), w, h, at }.to_token())
 }
 
+/// Körningens format i en `text:span`: det som den automatiska eller namngivna teckenstilen anger och som
+/// skiljer sig från styckets (`ptp`), ovanpå det yttre formatet.
+fn span_fmt(st: &Styles, ptp: &TProps, name: Option<&str>, outer: &RunFmt) -> RunFmt {
+    let Some(n) = name else { return outer.clone() };
+    let tp = st.tprops("text", n);
+    let mut f = outer.clone();
+    f.bold |= tp.bold == Some(true) && ptp.bold != Some(true);
+    f.italic |= tp.italic == Some(true) && ptp.italic != Some(true);
+    f.underline |= tp.underline == Some(true) && ptp.underline != Some(true);
+    if let Some(c) = tp.color.filter(|c| ptp.color != Some(*c)) {
+        f.color = Some(c);
+    }
+    if let Some(sz) = tp.size.filter(|sz| ptp.size.is_none_or(|p| (p - sz).abs() > 0.05)) {
+        f.size = Some(sz);
+    }
+    if let Some(font) = tp.font.filter(|x| ptp.font.as_ref() != Some(x)) {
+        f.family = Some(font);
+    }
+    f
+}
+
+/// Det som behövs för att läsa körningar i ett stycke: formatmallarna, styckets egenskaper och märkena.
+struct RunCtx<'a> {
+    st: &'a Styles,
+    ptp: TProps,
+    acc: &'a mut RunAcc,
+}
+
 /// Text, fält och bilder i ett stycke; flikar delar texten i `segs` (den sista delen är den pågående).
-fn collect(n: &Node, segs: &mut Vec<String>, ctx: &mut HfCtx<'_, '_>) {
+/// `text:span` ger körningar med eget format (`fmt` är det som gäller just här).
+fn collect(n: &Node, segs: &mut Vec<String>, ctx: &mut HfCtx<'_, '_>, rc: &mut RunCtx<'_>, fmt: &RunFmt) {
     for k in &n.kids {
         match k {
             Kid::Text(t) => {
                 let out = segs.last_mut().expect("minst en del");
+                // Blanksteg i följd blir ett; inget i början av delen.
+                let mut prev = crate::hf_inline::strip_marks(out).chars().last();
+                let mut piece = String::new();
                 for c in t.chars() {
                     if c.is_whitespace() {
-                        if !out.ends_with(' ') && !out.is_empty() {
-                            out.push(' ');
+                        if prev.is_some_and(|p| p != ' ') {
+                            piece.push(' ');
+                            prev = Some(' ');
                         }
                     } else {
-                        out.push(c);
+                        piece.push(c);
+                        prev = Some(c);
                     }
                 }
+                rc.acc.put(out, fmt, &piece, false);
             }
             Kid::El(e) => {
                 if let Some(f) = field_token(e) {
-                    segs.last_mut().expect("minst en del").push_str(&f);
+                    rc.acc.put(segs.last_mut().expect("minst en del"), fmt, &f, true);
                     continue;
                 }
                 match e.name.as_str() {
                     "draw:frame" => {
                         if let Some(t) = frame_token(e, ctx) {
-                            segs.last_mut().expect("minst en del").push_str(&t);
+                            let out = segs.last_mut().expect("minst en del");
+                            rc.acc.close(out);
+                            out.push_str(&t);
                         }
                     }
                     "text:s" => {
                         let c = e.attr("text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).min(100);
-                        segs.last_mut().expect("minst en del").push_str(&" ".repeat(c));
+                        rc.acc.put(segs.last_mut().expect("minst en del"), fmt, &" ".repeat(c), false);
                     }
-                    "text:tab" => segs.push(String::new()),
-                    "text:line-break" => segs.last_mut().expect("minst en del").push(' '),
+                    "text:tab" => {
+                        rc.acc.close(segs.last_mut().expect("minst en del"));
+                        segs.push(String::new());
+                    }
+                    "text:line-break" => rc.acc.put(segs.last_mut().expect("minst en del"), fmt, " ", false),
                     "text:note" | "office:annotation" => {}
-                    _ => collect(e, segs, ctx),
+                    "text:span" => {
+                        let nf = span_fmt(rc.st, &rc.ptp, e.attr("text:style-name"), fmt);
+                        collect(e, segs, ctx, rc, &nf);
+                    }
+                    _ => collect(e, segs, ctx, rc, fmt),
                 }
             }
         }
@@ -166,6 +211,14 @@ impl Styles {
 /// flikar blir vänster|mitten|höger efter tabbstoppen; flera stycken blir flera rader i mallen
 /// (`\n`), var och en med egna delar.
 pub(super) fn slot(st: &Styles, n: &Node, header: bool, ctx: &mut HfCtx<'_, '_>) -> Option<HfSlot> {
+    let mut acc = RunAcc::default();
+    let mut r = slot_runs(st, n, header, ctx, &mut acc)?;
+    // Körningarnas format är redan relativa styckets (inte `header-style`): skrivs som markup.
+    r.text = acc.marks.render(&r.text, &HfStyle::default(), None);
+    Some(r)
+}
+
+fn slot_runs(st: &Styles, n: &Node, header: bool, ctx: &mut HfCtx<'_, '_>, acc: &mut RunAcc) -> Option<HfSlot> {
     let mut parts: Vec<String> = Vec::new();
     let mut layout: Vec<Vec<String>> = Vec::new();
     let mut aligns: Vec<Align> = Vec::new();
@@ -173,8 +226,11 @@ pub(super) fn slot(st: &Styles, n: &Node, header: bool, ctx: &mut HfCtx<'_, '_>)
     let mut style = HfStyle::default();
     for p in n.els().filter(|p| matches!(p.name.as_str(), "text:p" | "text:h")) {
         let mut segs = vec![String::new()];
-        collect(p, &mut segs, ctx);
-        let segs: Vec<String> = segs.iter().map(|s| s.trim().replace('|', "\\|")).collect();
+        acc.new_para();
+        let mut rc = RunCtx { st, ptp: p.attr("text:style-name").map(|n| st.tprops("paragraph", n)).unwrap_or_default(), acc: &mut *acc };
+        collect(p, &mut segs, ctx, &mut rc, &RunFmt::default());
+        acc.close(segs.last_mut().expect("minst en del"));
+        let segs: Vec<String> = segs.iter().map(|s| crate::hf_inline::trim_marked(s).replace('|', "\\|")).collect();
         let s = segs.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
         if s.is_empty() {
             continue;
@@ -373,7 +429,13 @@ pub(super) struct HfOut<'a> {
     pub media: Vec<(String, Vec<u8>, &'static str)>,
     by_src: HashMap<String, String>,
     n: usize,
+    /// Teckenstilar för körningar (`text:span`): format → namn, och de som ännu inte skrivits ut.
+    spans: HashMap<RunKey, String>,
+    new_spans: String,
 }
+
+/// Körningsformatet som nyckel (storleken i halva punkter, färgen som tal).
+type RunKey = (bool, bool, bool, Option<[u8; 3]>, Option<i32>, Option<String>);
 
 /// Det styckena i sidmallarna behöver: bildhämtning, planen för avsnitten och vilken plats varje sidmall (`M1` …) har i den.
 pub(super) struct HfEnv<'a> {
@@ -392,7 +454,7 @@ impl<'a> HfEnv<'a> {
 
 impl<'a> HfOut<'a> {
     pub fn new(resolve: &'a dyn Fn(&str) -> Option<Image>) -> HfOut<'a> {
-        HfOut { resolve, media: Vec::new(), by_src: HashMap::new(), n: 0 }
+        HfOut { resolve, media: Vec::new(), by_src: HashMap::new(), n: 0, spans: HashMap::new(), new_spans: String::new() }
     }
 
     fn frame(&mut self, tok: &crate::hf::ImgTok) -> Option<String> {
@@ -435,8 +497,59 @@ impl<'a> HfOut<'a> {
         ))
     }
 
-    /// En del av en rad: text, fält (`text:page-number` med talformat …) och bilder.
+    /// Namnet på teckenstilen för en körning (skapas första gången).
+    fn span_style(&mut self, f: &RunFmt) -> String {
+        let key: RunKey = (f.bold, f.italic, f.underline, f.color, f.size.map(|s| (s * 2.0).round() as i32), f.family.clone());
+        if let Some(n) = self.spans.get(&key) {
+            return n.clone();
+        }
+        let name = format!("HFT{}", self.spans.len() + 1);
+        let mut tp = String::new();
+        if let Some(fam) = &f.family {
+            tp.push_str(&format!(" fo:font-family=\"{}\"", esc(fam)));
+        }
+        if let Some(sz) = f.size {
+            tp.push_str(&format!(" fo:font-size=\"{}\"", pt_str(sz)));
+        }
+        if let Some(c) = f.color {
+            tp.push_str(&format!(" fo:color=\"{}\"", style::hex(c)));
+        }
+        if f.bold {
+            tp.push_str(" fo:font-weight=\"bold\"");
+        }
+        if f.italic {
+            tp.push_str(" fo:font-style=\"italic\"");
+        }
+        if f.underline {
+            tp.push_str(" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"");
+        }
+        self.new_spans.push_str(&format!("<style:style style:name=\"{name}\" style:family=\"text\"><style:text-properties{tp}/></style:style>"));
+        self.spans.insert(key, name.clone());
+        name
+    }
+
+    /// Teckenstilarna som lagts till sedan sist, att skriva bland de automatiska stilarna.
+    pub fn take_styles(&mut self) -> String {
+        std::mem::take(&mut self.new_spans)
+    }
+
+    /// En del av en rad: text, fält (`text:page-number` med talformat …) och bilder. Inline-formatering
+    /// (`**fet**` …) blir `text:span` med egen teckenstil.
     pub fn inline(&mut self, text: &str, f: &style::Fields) -> String {
+        let mut out = String::new();
+        for (t, fmt) in crate::hf_inline::parse_inline(text) {
+            let inner = self.inline_plain(&t, f);
+            if fmt.is_default() {
+                out.push_str(&inner);
+            } else {
+                let name = self.span_style(&fmt);
+                out.push_str(&format!("<text:span text:style-name=\"{name}\">{inner}</text:span>"));
+            }
+        }
+        out
+    }
+
+    fn inline_plain(&mut self, text: &str, f: &style::Fields) -> String {
         let mut inner = String::new();
         let mut rest = text;
         while let Some(i) = rest.find('{') {
@@ -492,7 +605,7 @@ mod tests {
     fn odt(master: &str) -> Vec<u8> {
         let content = format!(r#"<?xml version="1.0"?><office:document-content {NS}><office:body><office:text><text:p text:style-name="Standard">Text</text:p></office:text></office:body></office:document-content>"#);
         let styles = format!(
-            r##"<?xml version="1.0"?><office:document-styles {NS}><office:styles><style:style style:name="Standard" style:family="paragraph"/><style:style style:name="Header" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties><style:tab-stops><style:tab-stop style:position="15cm" style:type="right"/></style:tab-stops></style:paragraph-properties></style:style><style:style style:name="Hdr" style:family="paragraph" style:parent-style-name="Header"><style:paragraph-properties fo:border-bottom="0.74pt solid #156082"/><style:text-properties fo:font-size="9pt" fo:color="#595959"/></style:style></office:styles><office:automatic-styles><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" style:num-format="i" fo:margin-top="1.27cm" fo:margin-bottom="1.27cm" fo:margin-left="2cm" fo:margin-right="2cm"/><style:header-style><style:header-footer-properties fo:min-height="1cm" fo:margin-bottom="0.2cm"/></style:header-style></style:page-layout></office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">{master}</style:master-page></office:master-styles></office:document-styles>"##
+            r##"<?xml version="1.0"?><office:document-styles {NS}><office:styles><style:style style:name="Standard" style:family="paragraph"/><style:style style:name="Header" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties><style:tab-stops><style:tab-stop style:position="15cm" style:type="right"/></style:tab-stops></style:paragraph-properties></style:style><style:style style:name="Hdr" style:family="paragraph" style:parent-style-name="Header"><style:paragraph-properties fo:border-bottom="0.74pt solid #156082"/><style:text-properties fo:font-size="9pt" fo:color="#595959"/></style:style></office:styles><office:automatic-styles><style:style style:name="T1" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style><style:style style:name="T2" style:family="text"><style:text-properties fo:color="#C00000" fo:font-size="14pt" fo:font-style="italic" style:text-underline-style="solid" style:font-name="Arial"/></style:style><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" style:num-format="i" fo:margin-top="1.27cm" fo:margin-bottom="1.27cm" fo:margin-left="2cm" fo:margin-right="2cm"/><style:header-style><style:header-footer-properties fo:min-height="1cm" fo:margin-bottom="0.2cm"/></style:header-style></style:page-layout></office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">{master}</style:master-page></office:master-styles></office:document-styles>"##
         );
         let mut buf = Cursor::new(Vec::new());
         {
@@ -589,6 +702,43 @@ mod tests {
         assert!(styles.contains("style:text-underline-style=\"solid\"") && styles.contains("fo:font-weight=\"bold\""), "{styles}");
         let d = head(&crate::odt::read(&out).unwrap().markdown);
         assert!(d.header_style.bold && d.header_style.italic && d.header_style.underline, "{:?}", d.header_style);
+    }
+
+    #[test]
+    fn spans_with_automatic_styles_become_inline_markup() {
+        let m = r#"<style:header><text:p text:style-name="Standard"><text:span text:style-name="T1">Skolrapport</text:span> · Klass 9B<text:tab/><text:tab/><text:span text:style-name="T1">Sida <text:page-number>1</text:page-number></text:span> av <text:span text:style-name="T2">5 * 3</text:span></text:p></style:header>"#;
+        let l = crate::odt::read(&odt(m)).unwrap();
+        let d = head(&l.markdown);
+        let t = d.header.as_deref().unwrap();
+        let [a, b, c]: [&str; 3] = t.splitn(3, '|').collect::<Vec<_>>().try_into().unwrap();
+        assert_eq!(a, "**Skolrapport** · Klass 9B", "{t}");
+        assert_eq!(b, "", "{t}");
+        let runs = crate::hf_inline::parse_inline(c);
+        assert_eq!(runs[0], ("Sida {sida}".to_owned(), crate::hf::RunFmt { bold: true, ..Default::default() }), "{c}");
+        assert_eq!(runs[1].0, " av ");
+        let last = &runs[2];
+        assert_eq!(last.0, "5 * 3", "{c}");
+        assert_eq!((last.1.color, last.1.size, last.1.italic, last.1.underline), (Some([0xC0, 0, 0]), Some(14.0), true, true), "{c}");
+        assert_eq!(last.1.family.as_deref(), Some("Arial"));
+        assert!(!d.header_style.bold);
+    }
+
+    #[test]
+    fn inline_markup_is_written_as_spans_and_reads_back() {
+        let tpl = "**Skolrapport** · Klass 9B|*{titel}*|<span style='color: #C00000; font-size: 14pt'>röd</span> <u>**{sida}**</u>";
+        let md = format!("<!-- kladd: header: \"{}\"; header-style: \"9pt\" -->\n\nText\n", tpl.replace('"', "\\\""));
+        let out = crate::odt::write(&md, "t", &|_| None).unwrap().bytes;
+        let mut z = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let mut styles = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("styles.xml").unwrap(), &mut styles).unwrap();
+        assert!(styles.contains("<text:span text:style-name=\"HFT1\">Skolrapport</text:span>"), "{styles}");
+        assert!(styles.contains("style:family=\"text\"><style:text-properties fo:font-weight=\"bold\"/>"), "{styles}");
+        assert!(styles.contains("fo:color=\"#C00000\"") && styles.contains("fo:font-size=\"14pt\""), "{styles}");
+        assert!(styles.contains("<text:page-number") && styles.contains("fo:font-style=\"italic\""), "{styles}");
+        let back = head(&crate::odt::read(&out).unwrap().markdown);
+        let t = back.header.as_deref().unwrap();
+        assert_eq!(crate::hf_inline::parse_inline(t), crate::hf_inline::parse_inline(tpl), "{t}");
+        assert_eq!(back.header_style.size, Some(9.0));
     }
 
     #[test]

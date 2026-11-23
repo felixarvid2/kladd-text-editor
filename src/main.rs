@@ -21,6 +21,7 @@ mod export;
 mod grammar;
 mod grammar_ui;
 mod hf;
+mod hf_inline;
 mod imgfmt;
 mod legacy;
 mod ocr;

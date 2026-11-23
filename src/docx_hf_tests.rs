@@ -119,7 +119,7 @@ fn anchored_logo_is_placed_from_the_page_corner() {
 #[test]
 fn borderless_three_cell_table_becomes_left_middle_right_and_style_is_read() {
     let tbl = format!(
-        r#"<w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc><w:tc><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="8" w:color="156082"/></w:pBdr></w:pPr><w:r><w:rPr><w:color w:val="595959"/><w:sz w:val="20"/></w:rPr><w:t>Titel</w:t></w:r></w:p></w:tc><w:tc><w:p><w:fldSimple w:instr=" DATE "><w:r><w:t>x</w:t></w:r></w:fldSimple></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
+        r#"<w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc><w:tc><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="8" w:color="156082"/></w:pBdr></w:pPr><w:r><w:rPr><w:color w:val="595959"/><w:sz w:val="20"/></w:rPr><w:t>Titel</w:t></w:r></w:p></w:tc><w:tc><w:p><w:fldSimple w:instr=" DATE "><w:r><w:rPr><w:color w:val="595959"/><w:sz w:val="20"/></w:rPr><w:t>x</w:t></w:r></w:fldSimple></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
         inline_logo("rId1", 457200, 457200)
     );
     let l = read(&doc_with(hdr(&tbl), ftr("<w:p/>"))).unwrap();
@@ -325,4 +325,123 @@ fn header_underline_is_read_and_written() {
     let out = write(&md, "t", &resolver(&l), l.source.as_ref()).unwrap().bytes;
     let h = part(&out, "word/header2.xml");
     assert!(h.contains("<w:b/>") && h.contains("<w:i/>") && h.contains("<w:u w:val=\"single\"/>") && h.contains("FF0000"), "{h}");
+}
+
+/// Ett sidhuvud med olika format i samma stycke: fet rubrik, vanlig text, och ett sidnummer i fetstil.
+fn mixed_header() -> Vec<u8> {
+    hdr(r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Skolrapport</w:t></w:r><w:r><w:t xml:space="preserve"> · Klass 9B</w:t></w:r></w:p>"#)
+}
+
+#[test]
+fn runs_with_different_formatting_become_inline_markup() {
+    let l = read(&doc_with(mixed_header(), ftr("<w:p/>"))).unwrap();
+    let d = defaults(&l);
+    assert_eq!(d.header.as_deref(), Some("**Skolrapport** · Klass 9B"), "{}", base_line(&l));
+    // Standardstilen är orörd: fetstilen gäller bara första körningen.
+    assert!(!d.header_style.bold, "{:?}", d.header_style);
+}
+
+#[test]
+fn page_field_in_bold_and_other_run_properties_are_read() {
+    let f = ftr(
+        r#"<w:p><w:r><w:t xml:space="preserve">Sida </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r><w:r><w:rPr><w:b/></w:rPr><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>3</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t xml:space="preserve"> av </w:t></w:r><w:fldSimple w:instr=" NUMPAGES "><w:r><w:rPr><w:i/></w:rPr><w:t>9</w:t></w:r></w:fldSimple><w:r><w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/><w:color w:val="C00000"/><w:sz w:val="28"/><w:u w:val="single"/></w:rPr><w:t xml:space="preserve"> ok</w:t></w:r></w:p>"#,
+    );
+    let l = read(&doc_with(hdr("<w:p/>"), f)).unwrap();
+    let d = defaults(&l);
+    let t = d.footer.as_deref().unwrap();
+    assert!(t.starts_with("Sida **{sida}** av *{sidor}*"), "{t}");
+    let runs = crate::hf_inline::parse_inline(t);
+    let last = &runs.last().unwrap().1;
+    assert_eq!((last.color, last.size, last.underline), (Some([0xC0, 0, 0]), Some(14.0), true), "{t}");
+    // Första körningens typsnitt är bastypsnittet; en annan körnings typsnitt är avvikande.
+    assert_eq!(last.family.as_deref(), Some("Courier New"));
+}
+
+#[test]
+fn uniform_bold_run_formatting_stays_in_the_header_style() {
+    let h = hdr(r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Skol</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>rapport</w:t></w:r></w:p>"#);
+    let l = read(&doc_with(h, ftr("<w:p/>"))).unwrap();
+    let d = defaults(&l);
+    assert_eq!(d.header.as_deref(), Some("Skolrapport"));
+    assert!(d.header_style.bold);
+}
+
+#[test]
+fn inline_markup_is_written_as_one_run_per_format_and_reads_back() {
+    let md = "<!-- kladd: header: \"**Skolrapport** · Klass 9B|*{titel}*|<u>x</u> **{sida}**\"; header-style: \"9pt #666666\" -->\n\nText\n";
+    let out = write(md, "t", &|_| None, None).unwrap().bytes;
+    let h = part(&out, "word/header1.xml");
+    // Första körningen är fet (ovanpå standardstilen), andra inte.
+    assert!(h.contains("<w:rPr><w:b/><w:color w:val=\"666666\"/><w:sz w:val=\"18\"/><w:szCs w:val=\"18\"/></w:rPr><w:t xml:space=\"preserve\">Skolrapport</w:t>"), "{h}");
+    assert!(h.contains("<w:rPr><w:color w:val=\"666666\"/><w:sz w:val=\"18\"/><w:szCs w:val=\"18\"/></w:rPr><w:t xml:space=\"preserve\"> · Klass 9B</w:t>"), "{h}");
+    assert!(h.contains("<w:i/>") && h.contains("<w:u w:val=\"single\"/>"), "{h}");
+    // Sidnumret är ett fält med fetstil i alla sina körningar.
+    assert!(h.contains("<w:b/><w:color w:val=\"666666\"/><w:sz w:val=\"18\"/><w:szCs w:val=\"18\"/></w:rPr><w:fldChar w:fldCharType=\"begin\"/>"), "{h}");
+    assert!(!h.contains("**") && !h.contains("<u>"), "{h}");
+    let back = read(&out).unwrap();
+    let d = defaults(&back);
+    assert_eq!(d.header.as_deref(), Some("**Skolrapport** · Klass 9B|*{titel}*|<u>x</u> **{sida}**"), "{}", base_line(&back));
+    assert_eq!(d.header_style.size, Some(9.0));
+    assert!(!d.header_style.bold);
+}
+
+#[test]
+fn changed_text_keeps_mixed_formatting_and_untouched_parts_stay_byte_for_byte() {
+    let f = ftr(r#"<w:p><w:r><w:t xml:space="preserve">Sida </w:t></w:r><w:fldSimple w:instr=" PAGE "><w:r><w:rPr><w:b/></w:rPr><w:t>1</w:t></w:r></w:fldSimple></w:p>"#);
+    let bytes = doc_with(mixed_header(), f);
+    let l = read(&bytes).unwrap();
+    assert_eq!(defaults(&l).footer.as_deref(), Some("Sida **{sida}**"), "{}", base_line(&l));
+    // Orörd: delarna sparas byte för byte.
+    let same = write(&l.markdown, "t", &resolver(&l), l.source.as_ref()).unwrap().bytes;
+    for n in ["word/header1.xml", "word/footer1.xml"] {
+        assert_eq!(part(&same, n), part(&bytes, n), "{n}");
+    }
+    // Ändrad text: formatet följer med, den andra delen är orörd.
+    let md = l.markdown.replacen("Klass 9B", "Klass 9C", 1);
+    assert_ne!(md, l.markdown);
+    let out = write(&md, "t", &resolver(&l), l.source.as_ref()).unwrap().bytes;
+    assert_eq!(part(&out, "word/footer1.xml"), part(&bytes, "word/footer1.xml"));
+    let back = read(&out).unwrap();
+    assert_eq!(defaults(&back).header.as_deref(), Some("**Skolrapport** · Klass 9C"), "{}", base_line(&back));
+    assert_eq!(defaults(&back).footer.as_deref(), Some("Sida **{sida}**"));
+}
+
+#[test]
+fn literal_asterisks_in_a_header_survive_reading_and_writing() {
+    let h = hdr(r#"<w:p><w:r><w:t>5 * 3 *x* &lt;u&gt;</w:t></w:r></w:p>"#);
+    let l = read(&doc_with(h, ftr("<w:p/>"))).unwrap();
+    let t = defaults(&l).header.unwrap();
+    assert_eq!(crate::hf_inline::parse_inline(&t), [("5 * 3 *x* <u>".to_owned(), crate::hf::RunFmt::default())], "{t}");
+    let md = l.markdown.replacen("<u>", "<u>!", 1);
+    let out = write(&md, "t", &resolver(&l), l.source.as_ref()).unwrap().bytes;
+    let h = part(&out, "word/header2.xml");
+    assert!(h.contains("5 * 3 *x* &lt;u&gt;"), "{h}");
+}
+
+#[test]
+fn most_runs_colour_is_the_header_style_and_others_get_a_span() {
+    let rpr = |extra: &str| format!(r#"<w:rPr>{extra}<w:color w:val="595959"/><w:sz w:val="20"/></w:rPr>"#);
+    let h = hdr(&format!(
+        r#"<w:p><w:r>{}<w:t>Hållbar skola</w:t></w:r><w:r>{}<w:t xml:space="preserve">: avfall på </w:t></w:r><w:r><w:rPr><w:i/><w:color w:val="C00000"/><w:sz w:val="20"/></w:rPr><w:t>Ekbacke</w:t></w:r><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t xml:space="preserve"> skolan</w:t></w:r></w:p>"#,
+        rpr("<w:b/>"),
+        rpr("")
+    ));
+    let l = read(&doc_with(h, ftr("<w:p/>"))).unwrap();
+    let d = defaults(&l);
+    assert_eq!(d.header_style.color, Some([0x59, 0x59, 0x59]));
+    assert_eq!(d.header_style.size, Some(10.0));
+    let t = d.header.as_deref().unwrap();
+    let runs = crate::hf_inline::parse_inline(t);
+    let texts: Vec<(&str, bool, bool, Option<[u8; 3]>)> = runs.iter().map(|(x, f)| (x.as_str(), f.bold, f.italic, f.color)).collect();
+    // Utan färg betyder svart (Words "automatisk") när resten är grå.
+    assert_eq!(
+        texts,
+        [("Hållbar skola", true, false, None), (": avfall på ", false, false, None), ("Ekbacke", false, true, Some([0xC0, 0, 0])), (" ", false, false, None), ("skolan", false, false, Some([0, 0, 0]))],
+        "{t}"
+    );
+    // Skrivs tillbaka med samma utseende per körning.
+    let md = l.markdown.replacen("Ekbacke", "Ekbäcke", 1);
+    let out = write(&md, "t", &resolver(&l), l.source.as_ref()).unwrap().bytes;
+    let back = read(&out).unwrap();
+    assert_eq!(defaults(&back).header.as_deref(), Some(t.replacen("Ekbacke", "Ekbäcke", 1).as_str()), "{}", base_line(&back));
 }
