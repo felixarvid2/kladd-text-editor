@@ -108,6 +108,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Rubrik {level}: {text}", "Heading {level}: {text}"),
     ("Sammanfoga celler", "Merge Cells"),
     ("Sida {cur} av {total}", "Page {cur} of {total}"),
+    ("Sida {cur} av ca {total} (lägger ut dokumentet: {pct} %)", "Page {cur} of about {total} (laying out the document: {pct} %)"),
     ("Sidfot", "Footer"),
     ("Sidhuvud och sidfot", "Header and Footer"),
     ("Sidhuvud", "Header"),

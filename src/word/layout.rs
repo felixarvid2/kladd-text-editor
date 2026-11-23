@@ -23,6 +23,9 @@ use crate::theme::{self, Palette};
 
 #[path = "layout_notes.rs"]
 mod notes;
+#[path = "layout_lazy.rs"]
+mod lazy;
+pub use lazy::budget as lazy_budget;
 
 /// Punkter till pixlar vid zoom (96 dpi).
 /// Words standardavstånd mellan tabbstopp (0,5 tum).
@@ -108,8 +111,35 @@ struct Unit {
     used: u64,
 }
 
+/// Mätvärden från senaste omläggningen (för tester och `KLADD_TIMING`): träffar och missar i
+/// styckecachen och tid (ms) i varje steg, summerat över varven.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LayoutStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub varv: usize,
+    /// Stycken, fotnotsplan och gruppering.
+    pub plan_ms: f64,
+    /// Styckeloopen (nycklar, textformning av missar).
+    pub loop_ms: f64,
+    /// Sammanfogning av galleriet.
+    pub concat_ms: f64,
+    /// Sidindelning och fotnoter.
+    pub pages_ms: f64,
+    /// Tid (ms) som gick åt till att lägga ut stycken som inte fanns i cachen.
+    pub miss_ms: f64,
+    /// Stycken (grupper) som ersattes av platshållare, och alla grupper (stegvis utläggning).
+    pub stubs: usize,
+    pub groups: usize,
+    /// Första raden (i det sidindelade galleriet: radnummer före sidindelningen) som är en platshållare.
+    pub lazy_row: Option<usize>,
+}
+
 /// Allt som cachas för ett dokument.
 struct DocState {
+    stats: LayoutStats,
+    /// Senaste omläggningen blev inte klar (platshållare kvar): `frame` gäller inte.
+    partial: bool,
     /// Senast sedda texten: ändringsdetektorn är en jämförelse (memcmp), inte en hash.
     text: String,
     /// Räknas upp varje gång texten ändrats.
@@ -161,6 +191,8 @@ impl Cache {
         let st = self.docs.entry(doc_id).or_insert_with(|| DocState {
             text: text.to_owned(),
             rev: 0,
+            stats: LayoutStats::default(),
+            partial: false,
             analysis: Arc::new(markup::analyze(text)),
             tables: None,
             images: None,
@@ -208,6 +240,29 @@ impl Cache {
             st.pspecs = None;
         }
         st
+    }
+
+    /// Mätvärden från senaste omläggningen av dokumentet.
+    pub fn stats(&self, doc_id: u64) -> LayoutStats {
+        self.docs.get(&doc_id).map(|s| s.stats).unwrap_or_default()
+    }
+
+    /// Mätvärden och gränsen för det utlagda i senaste omläggningen (se `LayoutStats`).
+    pub fn lazy_row(&self, doc_id: u64) -> Option<usize> {
+        self.docs.get(&doc_id).filter(|s| s.partial).and_then(|s| s.stats.lazy_row)
+    }
+
+    /// Är dokumentets senaste utläggning ofullständig (stegvis utläggning pågår)?
+    pub fn partial(&self, doc_id: u64) -> bool {
+        self.docs.get(&doc_id).is_some_and(|s| s.partial)
+    }
+
+    /// Hur stor del (0..1) av dokumentet som är utlagt på riktigt.
+    pub fn progress(&self, doc_id: u64) -> f32 {
+        match self.docs.get(&doc_id) {
+            Some(s) if s.partial && s.stats.groups > 0 => 1.0 - s.stats.stubs as f32 / s.stats.groups as f32,
+            _ => 1.0,
+        }
     }
 
     /// Revisionsnummer: ändras exakt när texten ändrats sedan förra anropet.
@@ -317,6 +372,24 @@ impl Cache {
         wrap_width: f32,
         pages: Option<&super::pages::Geom>,
     ) -> Arc<Galley> {
+        self.galley_paged_lazy(ctx, doc_id, text, p, wrap_width, pages, None)
+    }
+
+    /// Som `galley_paged`, men med en tidsbudget för utläggningen av stycken som inte finns i
+    /// styckecachen (stegvis utläggning, se `layout_lazy`): är budgeten slut ersätts resten av
+    /// dokumentet av platshållare och `partial` blir sant. Anropa igen nästa bildruta tills det är
+    /// klart; då är galleriet detsamma som utan budget. Med `None` läggs allt ut direkt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn galley_paged_lazy(
+        &mut self,
+        ctx: &egui::Context,
+        doc_id: u64,
+        text: &str,
+        p: &Params,
+        wrap_width: f32,
+        pages: Option<&super::pages::Geom>,
+        budget: Option<std::time::Duration>,
+    ) -> Arc<Galley> {
         let ppp = ctx.pixels_per_point();
         // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
         let families = ctx.fonts(|f| f.families().len());
@@ -352,8 +425,9 @@ impl Cache {
             }
         }
 
-        let g = Arc::new(relayout(st, ctx, text, p, wrap_width, ppp, env, pages));
-        st.frame = Some((key, g.clone()));
+        let g = Arc::new(relayout(st, ctx, text, p, wrap_width, ppp, env, pages, budget));
+        // Ett ofullständigt galleri cachas inte: nästa bildruta lägger ut mer.
+        st.frame = if st.partial { None } else { Some((key, g.clone())) };
         g
     }
 
@@ -496,9 +570,15 @@ fn relayout(
     ppp: f32,
     env: u64,
     pages: Option<&super::pages::Geom>,
+    budget: Option<std::time::Duration>,
 ) -> Galley {
     use super::secpages::Balance;
-    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new());
+    st.stats = LayoutStats::default();
+    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new(), budget);
+    // Ofullständig: jämnandet av spalter görs när allt är utlagt.
+    if st.partial {
+        return g;
+    }
     let Some(geom) = pages.filter(|g| g.multi() && g.unequal_cols()) else { return g };
     let cands: Vec<(usize, super::secpages::SecRun)> = runs.iter().filter(|(s, _)| geom.balance_candidate(**s)).map(|(s, r)| (*s, *r)).collect();
     if cands.is_empty() {
@@ -512,7 +592,7 @@ fn relayout(
             break;
         }
         let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, (lo[s] + hi[s]) / 2.0))).collect();
-        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal);
+        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None);
         for (s, r) in &cands {
             let mid = (lo[s] + hi[s]) / 2.0;
             // Ryms allt på sista arket (inga fler arkbyten)?
@@ -525,7 +605,7 @@ fn relayout(
     }
     // Några px marginal: sidbrytningen avrundar raderna något annorlunda än uppskattningen.
     let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, hi[s] + 2.0))).collect();
-    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal).0
+    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None).0
 }
 
 /// Ett utläggningsvarv (se `relayout`); ger också hur varje avsnitt med olika breda spalter fyllde arken.
@@ -540,8 +620,11 @@ fn relayout_pass(
     env: u64,
     pages: Option<&super::pages::Geom>,
     balance: &super::secpages::Balance,
+    budget: Option<std::time::Duration>,
 ) -> (Galley, HashMap<usize, super::secpages::SecRun>) {
     st.tick += 1;
+    st.stats.varv += 1;
+    let t0 = std::time::Instant::now();
     let tick = st.tick;
     let a = st.analysis.clone();
     let grid = st.tables();
@@ -598,7 +681,22 @@ fn relayout_pass(
     // Olika breda spalter: spaltfyllnaden följs i förväg så att varje stycke får sin spalts bredd.
     let unequal = multi && pages.is_some_and(|g| g.unequal_cols());
     let mut csim = super::secpages::ColSim::with_balance(balance.clone());
+    st.stats.plan_ms += t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = std::time::Instant::now();
+    st.stats.groups = groups.len();
+    // Stegvis utläggning: när tiden för utlagda (inte cachade) stycken överstiger budgeten, och all övrig
+    // tid i varvet, ersätts stycken som saknas i cachen av platshållare.
+    let mut lazy = false;
+    let mut stubs = lazy::Stubs::default();
     for (pr, w, tbl) in groups.iter() {
+        if let (false, Some(b)) = (lazy, budget) {
+            let spent = st.stats.miss_ms;
+            let other = t0.elapsed().as_secs_f64() * 1000.0 - spent;
+            if stubs.ready() && spent > (b.as_secs_f64() * 1000.0).max(other) {
+                lazy = true;
+                st.stats.lazy_row = Some(row_no);
+            }
+        }
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
         let sec = if multi { super::sections::index_at(&a.sections, w.start) } else { 0 };
         let mut wrap_width = match pages {
@@ -620,7 +718,14 @@ fn relayout_pass(
         gp.iter_mut().for_each(|q| q.room = room);
         let note_def = defs.iter().find(|d| d.para == pr.start && !table);
         if let Some(d) = note_def {
-            note_layouts.push(notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d));
+            let tn = std::time::Instant::now();
+            let miss0 = st.units.len();
+            if let Some(nl) = notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d, lazy) {
+                note_layouts.push(nl);
+            }
+            if st.units.len() != miss0 {
+                st.stats.miss_ms += tn.elapsed().as_secs_f64() * 1000.0;
+            }
             gp[0].collapse = true;
         }
         let mut anchor: Option<(FloatSpec, FloatPlan)> = None;
@@ -681,9 +786,16 @@ fn relayout_pass(
             h.finish()
         };
         let laid_out: (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
+            st.stats.hits += 1;
             u.used = tick;
             (u.galleys.clone(), u.geom.clone())
+        } else if let Some(gs) = lazy.then(|| gp.iter().map(|q| stubs.para(q, text, wrap_width, &a, p, ppp)).collect::<Option<Vec<_>>>()).flatten() {
+            // Platshållare (ingen cachepost): rätt antal rader med uppskattad höjd.
+            st.stats.stubs += 1;
+            (Arc::new(gs), None)
         } else {
+            st.stats.misses += 1;
+            let tm = std::time::Instant::now();
             let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
             job.sections = build_sections(text, &a, p, &grid, w.clone());
             for s in &mut job.sections {
@@ -709,6 +821,7 @@ fn relayout_pass(
             });
             let gs = Arc::new(laid);
             st.units.insert(key, Unit { galleys: gs.clone(), geom: geom.clone(), used: tick });
+            st.stats.miss_ms += tm.elapsed().as_secs_f64() * 1000.0;
             (gs, geom)
         };
         // Hamnar stycket delvis i en smalare spalt läggs det ut en gång till med den bredden.
@@ -729,6 +842,9 @@ fn relayout_pass(
         }
         break laid_out;
         };
+        if !lazy && gp.len() == 1 {
+            stubs.note(&gp[0], text, &galleys);
+        }
         if let (true, Some(g), false) = (unequal, pages, in_box) {
             let hs: Vec<f32> = if table {
                 vec![galleys.iter().map(|lg| lg.rect.height()).sum()]
@@ -847,6 +963,9 @@ fn relayout_pass(
     }
     st.units.retain(|_, u| u.used == tick);
     st.float_starts = starts;
+    st.stats.loop_ms += t1.elapsed().as_secs_f64() * 1000.0;
+    st.partial = lazy;
+    let t2 = std::time::Instant::now();
 
     let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
     job.wrap.max_width = wrap_width;
@@ -857,6 +976,8 @@ fn relayout_pass(
     });
     let mut g = Galley::concat(Arc::new(job), &all, ppp);
     apply_pulls(&mut g, &pulls, &shifts, ppp);
+    st.stats.concat_ms += t2.elapsed().as_secs_f64() * 1000.0;
+    let t3 = std::time::Instant::now();
     let spec = match pages {
         Some(geom) if !note_layouts.is_empty() => notes::spec(&note_layouts, &g, text, &a, p.zoom, geom.text_h() * 0.5),
         _ => super::fnotes::NoteSpec::default(),
@@ -884,6 +1005,7 @@ fn relayout_pass(
     }
     st.geoms = Arc::new(geoms);
     st.notes = Arc::new(note_layouts);
+    st.stats.pages_ms += t3.elapsed().as_secs_f64() * 1000.0;
     (g, csim.runs)
 }
 

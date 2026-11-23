@@ -119,6 +119,12 @@ pub struct State {
     gtarget: Option<crate::grammar::Match>,
     /// (aktuell sida, antal sidor) från senaste bildrutan.
     pages: (usize, usize),
+    /// Stegvis utläggning (se `layout_lazy`): hur många bildrutor i rad som varit ofullständiga, om
+    /// platshållare syns (fyll i dem först), om allt måste läggas ut nu, och hur långt utläggningen kommit (%).
+    lazy_frames: u32,
+    lazy_boost: bool,
+    lazy_hurry: bool,
+    lazy_pct: Option<u32>,
     /// Öppen dialog "Sidinställningar".
     pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Öppen dialog "Sidhuvud och sidfot".
@@ -1186,6 +1192,27 @@ impl KladdApp {
 
             let matches = self.search_highlights();
             let scroll_to = self.scroll_to_char.take();
+            // Stora dokument läggs ut stegvis; en tangent eller ett hopp kräver ett komplett galleri.
+            let key_input = ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                            | egui::Event::Copy
+                            | egui::Event::Ime(_)
+                    )
+                })
+            });
+            let lazy_budget = layout::lazy_budget(
+                self.docs[self.active].text.len(),
+                self.wv.lazy_frames,
+                self.wv.lazy_boost,
+                scroll_to.is_some() || key_input || self.wv.lazy_hurry,
+            );
+            let mut lazy_next: (bool, bool) = (false, false);
             // En vald bild tar fokus från texten (annars skulle Delete/Backspace gå dit).
             let focus = std::mem::take(&mut self.focus_editor) && self.wv.img.selected.is_none();
             let mut imgs = std::mem::take(&mut self.wv.img);
@@ -1275,7 +1302,7 @@ impl KladdApp {
                     fonts_gen,
                 };
                 let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
-                    word.galley_paged(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width, Some(&geom))
+                    word.galley_paged_lazy(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width, Some(&geom), lazy_budget)
                 };
                 let min_h = geom.text_h();
                 let out = ui
@@ -1308,6 +1335,12 @@ impl KladdApp {
                 let galley = out.galley.clone();
                 let gpos = out.galley_pos;
                 let te_rect = out.response.rect;
+                // Ofullständig utläggning: platshållarna börjar vid `lazy_row`. Syns de i fönstret fylls de i först;
+                // syns bara platshållare (hopp långt fram) läggs allt ut direkt.
+                if let Some(front) = word.lazy_row(doc_id).and_then(|r| galley.rows.get(r)).map(|r| gpos.y + r.pos.y) {
+                    let clip = ui.clip_rect();
+                    lazy_next = (clip.bottom() >= front, clip.top() >= front);
+                }
                 let text = doc.text.as_str();
                 // Arken (med avsnitt olika stora, med spalter) från omläggningen som TextEdit just gjorde.
                 let origin_y = page_top + geom.top;
@@ -2008,6 +2041,16 @@ impl KladdApp {
             });
 
             self.wv.pages = page_pos;
+            if self.word.partial(doc_id) {
+                self.wv.lazy_frames = self.wv.lazy_frames.saturating_add(1);
+                (self.wv.lazy_boost, self.wv.lazy_hurry) = lazy_next;
+                self.wv.lazy_pct = Some((self.word.progress(doc_id) * 100.0) as u32);
+                ctx.request_repaint();
+            } else {
+                self.wv.lazy_frames = 0;
+                (self.wv.lazy_boost, self.wv.lazy_hurry) = (false, false);
+                self.wv.lazy_pct = None;
+            }
             self.wv.fn_pending = fn_pending;
             self.wv.fn_open_pending = fn_open_pending;
             self.wv.fn_edit = note_edit;
@@ -2235,7 +2278,10 @@ impl KladdApp {
                     self.open_grammar_dialog(false);
                 }
             }
-            label(ui, tf!("Sida {cur} av {total}", cur = cur, total = total));
+            match self.wv.lazy_pct {
+                Some(pct) => label(ui, tf!("Sida {cur} av ca {total} (lägger ut dokumentet: {pct} %)", cur = cur, total = total, pct = pct)),
+                None => label(ui, tf!("Sida {cur} av {total}", cur = cur, total = total)),
+            }
         });
     }
 }

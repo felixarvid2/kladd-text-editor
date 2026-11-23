@@ -94,7 +94,8 @@ pub(super) fn layout_def(
     ppp: f32,
     env: u64,
     d: &Def,
-) -> NoteLayout {
+    lazy: bool,
+) -> Option<NoteLayout> {
     let pv = Params {
         palette: p.palette,
         zoom: p.zoom,
@@ -123,6 +124,8 @@ pub(super) fn layout_def(
             u.used = tick;
             u.galleys[0].clone()
         }
+        // Stegvis utläggning: noter som inte är utlagda ännu hoppas över (de saknas på sidorna som ännu är platshållare).
+        None if lazy => return None,
         None => {
             let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
             job.sections = build_sections(text, a, &pv, grid, w.clone());
@@ -148,7 +151,7 @@ pub(super) fn layout_def(
             let wd = (pv.measure)(&ov.text, ov.font.clone());
             Some((ov, egui::pos2(at.x - wd, at.y)))
         });
-    NoteLayout { label: d.label.clone(), galley, line: d.line.clone(), body: d.body..d.line.end, indent, label_ov }
+    Some(NoteLayout { label: d.label.clone(), galley, line: d.line.clone(), body: d.body..d.line.end, indent, label_ov })
 }
 
 /// Underlaget till sidbrytningen: höjderna och raderna (i galleriet `g`, före sidbrytningen) som
