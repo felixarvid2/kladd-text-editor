@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "kladd"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -2432,6 +2432,7 @@ dependencies = [
  "krilla-svg",
  "libc",
  "lopdf",
+ "mermaid-svg",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "pulldown-cmark",
@@ -2666,6 +2667,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mermaid-svg"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0e905ac75d52a4d30692373beadd4bd4e09d8ea5275a3cb8e29a5f7ab4af62"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -1162,7 +1162,11 @@ impl PdfView {
         }
         if f.jump_pending && f.current.is_none() {
             let all_done = f.done >= f.matches.len();
-            let first_after = (cur_page..f.matches.len()).find(|&p| !f.matches[p].is_empty());
+            // Sidornas text kommer i godtycklig ordning: hoppa bara till en träff om alla sidor från den nuvarande
+            // fram till den är genomsökta, annars kan en tidigare sida få en träff senare (och fel träff blir aktuell).
+            let first_after = (cur_page..f.matches.len())
+                .take_while(|&p| f.searched[p])
+                .find(|&p| !f.matches[p].is_empty());
             let pick = first_after.or_else(|| if all_done { f.matches.iter().position(|m| !m.is_empty()) } else { None });
             if let Some(p) = pick {
                 f.current = Some((p, 0));
@@ -2360,6 +2364,26 @@ mod tests {
         let cur = v.find.as_ref().unwrap().current.unwrap();
         assert_eq!(v.find_status().current, list.iter().position(|x| *x == cur));
         assert_eq!(v.find_status().current, Some(2));
+    }
+
+    #[test]
+    fn forsta_traffen_valjs_aven_nar_sidornas_text_kommer_i_fel_ordning() {
+        let ctx = Context::default();
+        let mut v = open_view(&ctx, 3);
+        let page = |s: &str| {
+            let glyphs = s.chars().enumerate().map(|(i, c)| super::super::text::Glyph { text: c.to_string(), rect: Rect::from_min_size(pos2(10.0 + 8.0 * i as f32, 10.0), vec2(8.0, 12.0)) }).collect();
+            Arc::new(PageText::new(glyphs))
+        };
+        v.find_set("hitta", false, false);
+        // Sista sidans text kommer först: ingen träff blir aktuell förrän sidorna före den är genomsökta.
+        v.texts.insert(2, page("hitta tre"));
+        v.step_find();
+        assert_eq!(v.find.as_ref().unwrap().current, None);
+        v.texts.insert(0, page("hitta ett"));
+        v.texts.insert(1, page("inget"));
+        v.step_find();
+        assert_eq!(v.find.as_ref().unwrap().current, Some((0, 0)));
+        assert_eq!(v.find_status().current, Some(0));
     }
 
     /// Mätning: PDF med många sidor (`KLADD_BENCH_PDF_PAGES`, standard 1200).

@@ -27,6 +27,21 @@ fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
+/// Syntax-uppsättningen om den redan är inläst (väntar aldrig): kodblock i dokumentläget ritas
+/// ofärgade tills den finns (se `codehl`).
+pub(crate) fn syntaxes_if_ready() -> Option<&'static SyntaxSet> {
+    SYNTAXES.get()
+}
+
+pub(crate) fn syntaxes_ready() -> bool {
+    SYNTAXES.get().is_some()
+}
+
+/// Väntar tills syntaxerna är inlästa (exporter och tester).
+pub(crate) fn syntaxes_wait() {
+    syntaxes();
+}
+
 /// Läser in syntaxerna i en bakgrundstråd, så att de är klara när första kodfilen ska färgas
 /// och inte fördröjer första bilden.
 pub fn preload() {

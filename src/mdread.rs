@@ -140,6 +140,8 @@ pub fn render(
     // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
     // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
     let with_math = crate::math::preview::replace(&doc.text, ui.ctx(), 15.0, p.text, ui.available_width());
+    // ```mermaid-block som diagram (bilder i minnet); block som inte går att rita står kvar som kod.
+    let with_math = crate::mermaid::replace(&with_math, ui.ctx(), p.dark);
     let mut text = crate::preview::clean(&with_math);
     for (name, img) in &doc.images {
         let enc = name.replace(' ', "%20");

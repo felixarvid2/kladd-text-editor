@@ -95,17 +95,17 @@ men mättes inte (disken räckte inte till ett `--release`-bygge).
 
 ## Dokumentläge
 
-`word::incr` (`analyze_incremental`) tolkar efter en liten ändring (högst 4 kB, i dokument över 200 kB)
+`word::incr` (`analyze_incremental_with`) tolkar efter en liten ändring (högst 4 kB, i dokument över 200 kB)
 bara stycket med ändringen plus ett stycke på var sida. De yttre styckena är kanariefåglar: ger de inte
 exakt samma bitar som i den gamla analysen (något sträcker sig över styckegränsen) görs full analys.
-Kodstaket, fotnoter, referenslänkar, avsnitt och ändringar på första raden ger alltid full analys.
-Slumpade ändringar mot `markup::analyze` ingår som test. Tabeller, bilder och typsnitt återanvänds när
-fönstret inte rört dem.
+Tre tilda, oavslutade kommentarer, referenslänkar (när fönstret har hakparenteser), kodstaket som inte är
+välformade, ändringar på grundformatsraden och nya eller ändrade fotnotsetiketter och avsnittsrader ger full analys; se
+"Tangenttryck och öppning, andra omgången" nedan för vad som går inkrementellt. Slumpade ändringar mot
+`markup::analyze` ingår som test. Tabeller, bilder och typsnitt återanvänds när fönstret inte rört dem.
 
-Kvar: `relayout` går igenom alla stycken varje ändring (stycken ~50 ms, styckeloopen med nycklar ~180 ms,
-sammanfogning ~25 ms vid 2000 sidor), så att skriva på sida 1500 av 2000 ligger runt 300 ms, inte under
-16 ms. Nästa steg är ett galleri som bara lägger ut och fogar ihop sidorna nära vyn (och uppskattade höjder
-för resten), vilket kräver att `word/view.rs` slutar anta att galleriet täcker hela dokumentet.
+Efter en inkrementell analys återanvänder `word::layout_memo` styckena, fotnotsplanen, grupperna och
+cachenycklarna från förra omläggningen (se nedan), så att ett tangenttryck inte längre kostar tid i proportion till
+dokumentets längd i de steg som var dominerande.
 
 ## Öppna stora Word-dokument (100–400 sidor)
 
@@ -175,16 +175,103 @@ ordlistan läses i en bakgrundstråd), och styckecachen träffar: ett tecken ger
   avsnitt och trasig markup i dokumenten (`KLADD_FUZZ_SEEDS=150` kör fler frön). Fuzzningen hittade en gammal brist: en
   bit som sträckte sig över fönstrets kant gav en annan tolkning av kanten; den är rättad.
 
+### Tangenttryck och öppning, andra omgången
+
+Mätning: `bench_docx_open` skriver nu tiden för ett tecken på tio ställen (`KLADD_BENCH_PLACES=1` visar varje): början,
+25 %, mitten, 75 %, slutet av brödtexten, i en tabellcell, vid en fotnotsreferens, i stycket närmast
+fotnotsdefinitionerna, i första och i sista fotnotsdefinitionen. Geometrin är som i appen (`Geom::for_sections`,
+`edit_w`) och sidantalet under stegvis utläggning är det som statusraden visar. `bench_docx_keys`
+(`KLADD_BENCH_KEYS=antal`) skriver bara tangenttryck i mitten, för profilering (`valgrind --tool=callgrind` på
+testbinären; ett opt-level 2-bygge av kladd och egui med `--config profile.dev.package.<krate>.opt-level=2` räcker).
+Dokumenten är `gen-skolrapport.docx` upprepad 50, 75 och 100 gånger (202, 303 och 404 sidor, 325–650 kB Markdown).
+Siffrorna är medianen av 2–3 körningar på en delad 4-kärnig maskin (±30 %); opt-level 2 gäller bara kladd och egui med
+närmaste krater, resten är debug.
+
+| Mått (ms) | 202 sidor före / efter | 303 sidor före / efter | 404 sidor före / efter |
+|---|---|---|---|
+| Tangenttryck, median av 10 ställen, opt-level 2 | 17,5 / 7,0 | 34,0 / 8,7 | 56,1 / 11,2 |
+| Tangenttryck, sämsta av 10, opt-level 2 | 53,4 / 19,2 | 102,0 / 27,2 | 133,5 / 37,2 |
+| Tangenttryck, median av 10 ställen, debug | 186 / 32 | 337 / 49 | 524 / 68 |
+| Tangenttryck, sämsta av 10, debug | 261 / 79 | 479 / 115 | 677 / 163 |
+| Första bildrutan (första sidan syns), opt-level 2 | 85 / 98 | 143 / 130 | 182 / 161 |
+| Första bildrutan, debug | 288 / 257 | 482 / 391 | 540 / 488 |
+| Kall utläggning, allt i en bildruta, opt-level 2 | 536 / 550 | 712 / 696 | 1014 / 935 |
+| Stegvis tills allt är utlagt, opt-level 2 | 603 / 571 | 977 / 742 | 1216 / 941 |
+| Stegvis tills allt är utlagt, debug | 3448 / 2147 | 7055 / 3420 | 7897 / 5367 |
+
+Per ställe vid 404 sidor (opt-level 2, före / efter): början 51 / 19, 25 % 44 / 11, mitten 47 / 11, 75 % 43 / 10, slutet av
+brödtexten 131 / 10, i tabell 46 / 11, vid fotnotsreferens 48 / 10, närmast definitionerna 124 / 20, första definitionen
+126 / 37, sista definitionen 128 / 34. Tangenttrycket växer nu knappt med dokumentets längd i de steg som var dominerande;
+det som återstår är linjärt men med liten konstant (sidindelning och sammanfogning av galleriet, själva styckeloopen).
+Små dokument är inte långsammare (Markdown 30 kB / 55 kB, debug: tecken 22 / 28 ms före, 17 / 26 ms efter; markören byter
+rad 6 / 9 ms före, 1,5 / 2,9 ms efter; 600 kB opt-level 2: tecken 34 / 13,5 ms, markörbyte 22 / 6 ms).
+
+Vad som gjordes, i den ordning mätningen pekade ut (callgrind på 30 tangenttryck i ett 404-sidors dokument):
+
+- **Appen använde aldrig den inkrementella analysen.** `word_page` höll en `Arc<Analysis>` under hela bildrutan, så
+  `Cache::state` kunde inte uppdatera analysen på plats när TextEdit lade ut galleriet igen efter en ändring (`Arc::get_mut`
+  misslyckades) och gjorde full analys (80–185 ms debug) vid varje tangent. Referensen släpps nu före TextEdit och hämtas
+  om efter. Mätverktygen når inte det här (de håller ingen referens), så det syntes bara i appen (`KLADD_TIMING=1` skriver nu
+  *analys efter ändring: X ms (inkrementell/full)* och *omläggning: …* per ändring).
+- **Fotnoterna var kvadratiska.** `notes::spec` slog upp radnumret för varje fotnotsreferens med egui:s `layout_from_cursor`
+  (går igenom alla rader, ca hälften av tangenttrycket vid 404 sidor): nu en binärsökning över radernas slutlägen.
+  `has_def` i `incr` jämförde varje byteläge i hela texten (`windows` + `memcmp`) och söker nu bakifrån med `rfind`;
+  `layout_def` sökte i alla bitar efter etikettens bit och `plan` jämförde etiketter parvis; fotnotsdefinitionen för en
+  grupp hittades med en linjär sökning.
+- **Förberedelsen återanvänds** (`word/layout_memo.rs`): stycken (`paragraphs`), fotnotsplanen, grupperna och den statiska
+  delen av cachenyckeln (`unit_key_static`: text, bitar, markör) sparas från förra omläggningen. Efter en inkrementell analys
+  (som anger vilket område som ändrats, `Delta::we_old`/`we_new`) räknas bara fönster om (`paragraphs_in`): ändringen, markörens
+  gamla och nya rader (vidgade till bitarna som ingår i markörens rader) och en ruta som fönstret rör vid, med tre
+  kontrollstycken plus ett kantstycke på var sida. Kontrollstyckena jämförs med de gamla (annan luft, justering eller
+  radbrytning ger full omräkning), och reglerna för det som fönstret inte ser avvisar återanvändningen: fotnotsdefinitioner i
+  eller intill fönstret, ändrade fotnotsreferenser (`Delta::notes_changed`), öppna textrutor, matchande sökträffar, oavslutade
+  `<!--k:`-markörer (`pbox::scan` hoppar då över text som ett fönster inte ser), ändrad innehållsförteckning, mer än tre
+  fönster. Resten av styckena, grupperna och nycklarna flyttas bara (byteintervallen efter ändringen förskjuts).
+  Utläggningen av grupperna är oförändrad: `relayout_pass` går fortfarande igenom alla grupper, men utan att hasha texten, de
+  bitar som hör till den eller tolka om styckena. Tester (`layout_memo::tests`): slumpade ändringar och markörflyttar mot
+  full beräkning av stycken, fotnotsplan, grupper, nycklar och innehållsförteckning (`KLADD_FUZZ_SEEDS=400` körs), och
+  galleriet efter ändringar (`galley_after_edits_equals_fresh_cache`) mot en ny cache.
+- **Billigare hash och sökningar:** styckecachen använder en hasher som inte hashar nycklarna igen, `Stubs::note` räknar inte
+  tecken när allt ändå läggs ut, och styckenycklarna är delade i en statisk och en dynamisk del.
+- **Analysen i inläsningstråden:** `bigfiles` gör `markup::analyze` (80–185 ms debug) i tråden som läser dokumentet och lämnar
+  över den (`layout::Prepared`, kontrollerad mot texten) till `Cache::preload` innan fliken installeras; första
+  bildrutan hoppar över den.
+- **Färre fall av full analys** (`incr`, med fuzz): text i en fotnotsdefinition (etiketterna oförändrade), avsnittsrader i
+  fönstret som ändringen inte rör (avsnitten flyttas), en vanlig första rad (bara grundformatsraden ger full analys),
+  dokument med kodstaket så länge alla staket står först på en rad, är ett jämnt antal och fönstret ligger utanför ett
+  kodblock, och referenslänkar när fönstret saknar hakparenteser. De globala kontrollerna (tre tilda, referenslänkar,
+  oavslutade kommentarer, kodstaket) räknas nu per fönster (`incr::Facts`, uppdateras inkrementellt) i stället för att söka
+  igenom hela texten vid varje tangent. Fuzzningen med kodstaket och referenslänkar i dokumenten hittade en avvikelse mot
+  full analys för dokument med ett udda antal staket (en trasig `<div` efter ett oparat staket): de avvisas nu.
+- **Sidantal och platshållare:** platshållare kalibreras per styckeslag (brödtext, rubrik, lista, citat, kod, tabellrad;
+  `layout_lazy::Kind`) mot det som redan är utlagt, med synliga tecken (inte markup), radlängd per px radbredd (spalter och
+  indrag räknas rätt) och sista radens fyllnad. Platshållarna börjar först efter minst sex brödtextstycken. Under stegvis
+  utläggning räknar statusraden upp sidantalet från det utlagda (`Cache::estimated_pages`: sidor utlagda på riktigt delat
+  med den del av texten de utgör) i stället för platshållarnas egen sidindelning, som hoppar när spalter eller sidbrytningar
+  inte jämnats ut än (91–150 sidor för ett dokument på 120 sidor); efter 8 % visas *ca N* som i mätningen ligger inom 10 %
+  av slutvärdet (404 sidor: 404–441), före det visas bara förloppet. Sidor som bara är platshållare ritas med en diskret
+  *Läggs ut…*, och framkanten av det utlagda räknas från raderna före första platshållaren (en rad i en textruta kan ligga
+  högre upp). Test: `uppskattat_sidantal_ligger_nara_det_slutliga`.
+
 ### Kvar
 
-- Tangenttryck i ett stort dokument kostar fortfarande styckeloopens nycklar (0,1 ms per stycke i debug, `unit_key`
-  hashar hela styckets text och bitar), sidindelningen och sammanfogningen över hela galleriet: 100–300 ms i debug,
-  uppskattat en tiondel optimerat. Nästa steg är det som står ovan (galleri bara nära vyn).
-- Den inkrementella analysen avstår fortfarande vid referenslänkar, kodstaket, första raden, avsnittsrader i fönstret,
-  fotnotsdefinitioner och ändringar nära dem (4 kB), och när kontrollerna i fönstrets kant inte stämmer.
-- Platshållarnas höjd är en uppskattning (sidantalet i statusraden kan skilja några procent), och bildrutor med
-  platshållare ritas utan text för dem. Analysen av hela texten vid öppning (80–185 ms i debug) görs fortfarande i
-  första bildrutan; den skulle kunna göras i inläsningstråden.
+- Tangenttryck kostar fortfarande en genomgång av alla grupper (styckeloopen), `Galley::concat` och sidindelningen (~3 ms
+  var vid 404 sidor, opt-level 2): linjärt med liten konstant (uppskattat ca 50 ms vid 2000 sidor). Nästa steg är det som
+  står i tidigare avsnitt: återuppta utläggningen vid den ändrade gruppen med sparat tillstånd (sidposition, flytande bilder,
+  textrutor) och sluta när tillståndet stämmer med det gamla, och sidindela från den ändrade sidan.
+- Fotnotsdefinitioner står som ett enda stycke (en rad per definition, utan tomrad emellan): text i en definition är då ett
+  fönster på hela definitionsblocket (53 kB vid 404 sidor), så det blir inkrementell analys men full omräkning av
+  förberedelsen (34–37 ms opt-level 2). Ett stycke i brödtextens sista del intill definitionerna avvisas av
+  återanvändningen (20 ms): fotnotsplanen ändrar styckena kring definitionerna och kan inte räknas om i ett fönster.
+- Den inkrementella analysen avstår fortfarande vid ändrade fotnotsetiketter och -definitioner, referenslänkar med
+  hakparenteser i fönstret, kodstaket i dokument med udda antal staket eller staket mitt på en rad, tre tilda, ändringar
+  på grundformatsraden och när kontrollerna i fönstrets kant inte stämmer.
+- Stegvis utläggning kostar fortfarande en genomgång av alla grupper (och en platshållare per ej utlagd grupp) per
+  bildruta: i debug ca 150–200 ms per bildruta för 400 sidor (opt-level 2 ca en tiondel), så att fylla i hela dokumentet tar
+  längre i debug än den kalla utläggningen. Bildrutornas platshållare kunde cachas mellan bildrutorna.
+- Första sidan syns efter 0,16 s (opt-level 2) och 0,49 s (debug) för 404 sidor, räknat från att dokumentet är inläst;
+  läsningen av zip/XML (0,4–0,8 s) sker i bakgrundstråden. I debug går ca 0,35 s mellan inläst dokument och första
+  utläggningen (inte närmare undersökt) och förberedelsen av stycken tar ca 80 ms.
 - Bilder avkodas av egui:s bildinläsare och påverkar inte layouten förrän storleken är känd (`word_image` rensar då
   layoutcachen, en gång per bild), så ett dokument med hundratals bilder lägger ut om en gång i början.
 

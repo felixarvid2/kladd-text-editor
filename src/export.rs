@@ -426,6 +426,23 @@ fn map_events<'a>(
                 i = end + 1;
                 continue;
             }
+            // Kodblock: `<pre><code class="language-x">` med färgade `<span style>` (ser färgat ut utan extern CSS).
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let end = (i + 1..evs.len()).find(|&j| matches!(evs[j].0, Event::End(TagEnd::CodeBlock))).unwrap_or(evs.len() - 1);
+                let mut code = String::new();
+                for (e, _) in &evs[i + 1..end] {
+                    if let Event::Text(t) = e {
+                        code.push_str(t);
+                    }
+                }
+                let lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => crate::codehl::lang_of(info),
+                    pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                };
+                out.push(Event::Html(CowStr::from(code_html(&lang, &code))));
+                i = end + 1;
+                continue;
+            }
             Event::Start(Tag::Image { dest_url, title, id, link_type }) => {
                 let end = (i + 1..evs.len()).find(|&j| matches!(evs[j].0, Event::End(TagEnd::Image))).unwrap_or(evs.len() - 1);
                 if let Some(new) = cx.imgs.src(dest_url) {
@@ -509,6 +526,31 @@ fn map_events<'a>(
         i += 1;
     }
     out
+}
+
+/// Ett kodblock som HTML: `<pre><code class="language-x">`, med syntaxfärgen som inline-stil per token.
+fn code_html(lang: &str, code: &str) -> String {
+    let class = if lang.is_empty() { String::new() } else { format!(" class=\"language-{}\"", esc_attr(lang)) };
+    let hl = crate::codehl::tokens_wait(lang, code);
+    let colors = crate::codehl::CodeColors::paper();
+    let mut body = String::new();
+    for (range, c, bold, italic) in crate::codehl::segments(&hl, code) {
+        let piece = esc(&code[range]);
+        if c == crate::codehl::Class::Plain && !bold && !italic {
+            body.push_str(&piece);
+            continue;
+        }
+        let [r, g, b] = colors.rgb(c);
+        let mut style = format!("color:#{r:02x}{g:02x}{b:02x}");
+        if bold {
+            style.push_str(";font-weight:bold");
+        }
+        if italic {
+            style.push_str(";font-style:italic");
+        }
+        body.push_str(&format!("<span style=\"{style}\">{piece}</span>"));
+    }
+    format!("<pre><code{class}>{body}</code></pre>\n")
 }
 
 fn heading_n(l: HeadingLevel) -> u8 {

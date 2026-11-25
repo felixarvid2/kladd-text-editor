@@ -15,6 +15,7 @@ use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Rect, Stroke, Vec2};
 
 use super::anchor::{self, Anchor, PageCtx, Pos, VAt, Wrap};
+use super::codeblock;
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use super::pbox::{self, LineRule, PPr};
@@ -25,6 +26,8 @@ use crate::theme::{self, Palette};
 mod notes;
 #[path = "layout_lazy.rs"]
 mod lazy;
+#[path = "layout_memo.rs"]
+mod memo;
 pub use lazy::budget as lazy_budget;
 
 /// Punkter till pixlar vid zoom (96 dpi).
@@ -95,6 +98,26 @@ impl Hasher for Fx {
     }
 }
 
+/// Hasher för nycklar som redan är hashar (`u64`): slår upp utan att hasha om.
+#[derive(Default, Clone, Copy)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*b);
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type IdBuild = std::hash::BuildHasherDefault<IdHasher>;
+
 /// Snabb hash av en sträng (för cachenycklar).
 pub fn fast_hash(s: &str) -> u64 {
     let mut h = Fx::default();
@@ -133,6 +156,31 @@ pub struct LayoutStats {
     pub groups: usize,
     /// Första raden (i det sidindelade galleriet: radnummer före sidindelningen) som är en platshållare.
     pub lazy_row: Option<usize>,
+    /// Textens byte där platshållarna börjar (för uppskattningen av sidantalet).
+    pub lazy_byte: usize,
+    /// Styckena, grupperna och nycklarna återanvändes från förra omläggningen (`layout_memo`).
+    pub reused: bool,
+    /// Varför förra omläggningens stycken inte återanvändes (0 = ingen anledning, `memo::no`); för mätning.
+    pub memo_why: usize,
+}
+
+/// Markup-analysen av en text, gjord utanför gränssnittstråden (inläsningen av ett stort Word-dokument), så att den
+/// första bildrutan slipper den (`Cache::preload`).
+pub struct Prepared {
+    analysis: Analysis,
+    hash: u64,
+    len: usize,
+}
+
+impl Prepared {
+    pub fn new(text: &str) -> Self {
+        Self { analysis: markup::analyze(text), hash: fast_hash(text), len: text.len() }
+    }
+
+    /// Gäller analysen exakt den här texten?
+    pub fn matches(&self, text: &str) -> bool {
+        self.len == text.len() && self.hash == fast_hash(text)
+    }
 }
 
 /// Allt som cachas för ett dokument.
@@ -154,7 +202,16 @@ struct DocState {
     /// Hela galleriet för förra bildrutan, med nyckeln det byggdes med.
     frame: Option<(u64, Arc<Galley>)>,
     /// Utlagda stycken, nycklade på allt som påverkar dem.
-    units: HashMap<u64, Unit>,
+    units: HashMap<u64, Unit, IdBuild>,
+    /// Förra omläggningens stycken, grupper och nycklar (`layout_memo`) och texten de gäller för, samt området
+    /// som ändrats sedan dess (om analysen bara uppdaterats inkrementellt; annars är minnet ogiltigt).
+    memo: Option<memo::Memo>,
+    memo_text: String,
+    hull: Option<(usize, usize)>,
+    /// Förekomster i texten som gör att en ändring kan påverka hela analysen (`incr::Facts`), om kända.
+    facts: Option<super::incr::Facts>,
+    /// Fotnotsreferenser eller -definitioner har ändrats sedan `memo` byggdes.
+    notes_changed: bool,
     /// Tabellernas geometri i senaste omläggningen (absoluta byteintervall).
     geoms: Arc<Vec<TableGeom>>,
     tick: u64,
@@ -164,6 +221,8 @@ struct DocState {
     page_boxes: Arc<Vec<super::secpages::PageBox>>,
     /// Fotnoterna som ritas längst ned på sidorna i senaste utläggningen (se `fnotes`).
     notes: Arc<Vec<super::fnotes::NoteLayout>>,
+    /// Inhägnade kodblock med sin färgning (`codeblock`); görs om när texten ändrats.
+    code: Option<Arc<Vec<codeblock::Block>>>,
 }
 
 #[derive(Default)]
@@ -173,9 +232,42 @@ pub struct Cache {
 }
 
 impl DocState {
+    fn new(text: &str, analysis: Analysis) -> Self {
+        DocState {
+            text: text.to_owned(),
+            rev: 0,
+            stats: LayoutStats::default(),
+            partial: false,
+            analysis: Arc::new(analysis),
+            tables: None,
+            images: None,
+            headings: None,
+            pspecs: None,
+            fonts: None,
+            frame: None,
+            units: HashMap::default(),
+            memo: None,
+            memo_text: String::new(),
+            hull: None,
+            facts: None,
+            notes_changed: false,
+            geoms: Arc::default(),
+            tick: 0,
+            float_starts: Vec::new(),
+            page_boxes: Arc::default(),
+            notes: Arc::default(),
+            code: None,
+        }
+    }
+
     fn tables(&mut self) -> Arc<Vec<Table>> {
         let (text, a) = (&self.text, &self.analysis);
         self.tables.get_or_insert_with(|| Arc::new(tables(text, a))).clone()
+    }
+
+    fn code_blocks(&mut self) -> Arc<Vec<codeblock::Block>> {
+        let (text, a) = (&self.text, &self.analysis);
+        self.code.get_or_insert_with(|| Arc::new(codeblock::blocks(text, a))).clone()
     }
 
     fn images(&mut self) -> Arc<Vec<markup::ImageRef>> {
@@ -185,40 +277,34 @@ impl DocState {
 }
 
 impl Cache {
+    /// Registrerar en analys som gjorts i förväg (inläsningstråden) för `text`; ignoreras om den inte gäller texten
+    /// eller om dokumentet redan finns i cachen.
+    pub fn preload(&mut self, doc_id: u64, text: &str, pre: Prepared) {
+        if pre.matches(text) && !self.docs.contains_key(&doc_id) {
+            self.docs.insert(doc_id, DocState::new(text, pre.analysis));
+        }
+    }
+
     /// Håller dokumentets tillstånd i takt med texten. En ändring kostar en jämförelse av
     /// texten och en ny analys; är texten oförändrad görs ingenting.
     fn state(&mut self, doc_id: u64, text: &str) -> &mut DocState {
-        let st = self.docs.entry(doc_id).or_insert_with(|| DocState {
-            text: text.to_owned(),
-            rev: 0,
-            stats: LayoutStats::default(),
-            partial: false,
-            analysis: Arc::new(markup::analyze(text)),
-            tables: None,
-            images: None,
-            headings: None,
-            pspecs: None,
-            fonts: None,
-            frame: None,
-            units: HashMap::new(),
-            geoms: Arc::default(),
-            tick: 0,
-            float_starts: Vec::new(),
-            page_boxes: Arc::default(),
-            notes: Arc::default(),
-        });
+        let st = self.docs.entry(doc_id).or_insert_with(|| DocState::new(text, markup::analyze(text)));
         if st.text != text {
             // Stora dokument: tolka bara om stycket med ändringen (samma resultat som `analyze`) och
             // behåll tabeller, bilder och typsnitt som ändringen inte rört.
+            let t_an = std::time::Instant::now();
             let delta = match Arc::get_mut(&mut st.analysis) {
-                Some(a) => super::incr::analyze_incremental(&st.text, a, text),
+                Some(a) => super::incr::analyze_incremental_with(&st.text, a, text, &mut st.facts),
                 None => None,
             };
+            let incr = delta.is_some();
             st.text.clear();
             st.text.push_str(text);
             st.rev += 1;
             match delta {
                 Some(d) => {
+                    st.hull = Some(memo::compose_hull(st.hull, d.ws, d.we_old, d.we_new));
+                    st.notes_changed |= d.notes_changed;
                     if d.touched_table || st.tables.as_ref().is_some_and(|t| t.iter().any(|x| x.region.end > d.ws)) {
                         st.tables = None;
                     }
@@ -230,6 +316,9 @@ impl Cache {
                     }
                 }
                 None => {
+                    st.memo = None;
+                    st.hull = None;
+                    st.facts = None;
                     st.analysis = Arc::new(markup::analyze(text));
                     st.tables = None;
                     st.images = None;
@@ -238,6 +327,10 @@ impl Cache {
             }
             st.headings = None;
             st.pspecs = None;
+            st.code = None;
+            if crate::timing::enabled() {
+                crate::timing::mark(&format!("analys efter ändring: {:.1} ms ({})", t_an.elapsed().as_secs_f64() * 1000.0, if incr { "inkrementell" } else { "full" }));
+            }
         }
         st
     }
@@ -250,6 +343,29 @@ impl Cache {
     /// Mätvärden och gränsen för det utlagda i senaste omläggningen (se `LayoutStats`).
     pub fn lazy_row(&self, doc_id: u64) -> Option<usize> {
         self.docs.get(&doc_id).filter(|s| s.partial).and_then(|s| s.stats.lazy_row)
+    }
+
+    /// Underkanten (galleriets y) på det som är utlagt på riktigt under stegvis utläggning: platshållarna börjar efter den.
+    /// Raderna före första platshållaren avgör (en rad i en textruta kan ligga högre upp än den raden).
+    pub fn lazy_front(&self, doc_id: u64, g: &Galley) -> Option<f32> {
+        let row = self.lazy_row(doc_id)?;
+        Some(g.rows.get(..row)?.iter().map(|r| r.pos.y + r.row.size.y).fold(0.0, f32::max))
+    }
+
+    /// Uppskattat antal sidor under stegvis utläggning: sidorna som är utlagda på riktigt, delat med den del av texten
+    /// de utgör (platshållarnas egna höjder ger ryckiga sidantal, t.ex. för spalter som ännu inte jämnats ut).
+    /// `None` när utläggningen är klar eller för tidigt för en uppskattning.
+    pub fn estimated_pages(&self, doc_id: u64, text_len: usize, g: &Galley, boxes: &[super::secpages::PageBox]) -> Option<usize> {
+        let st = self.docs.get(&doc_id).filter(|s| s.partial)?;
+        let y = self.lazy_front(doc_id, g)?;
+        let frac = st.stats.lazy_byte as f32 / text_len.max(1) as f32;
+        if boxes.is_empty() || frac < 0.08 {
+            return None;
+        }
+        let i = super::secpages::page_index(boxes, y);
+        let b = &boxes[i];
+        let laid = i as f32 + ((y - b.text_top()) / (b.text_bottom() - b.text_top()).max(1.0)).clamp(0.0, 1.0);
+        Some(((laid / frac).round() as usize).max(i + 1))
     }
 
     /// Är dokumentets senaste utläggning ofullständig (stegvis utläggning pågår)?
@@ -278,6 +394,11 @@ impl Cache {
     /// Fotnoterna från senaste omläggningen av `text`: `PageBox::notes` pekar in i listan.
     pub fn notes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::fnotes::NoteLayout>> {
         self.state(doc_id, text).notes.clone()
+    }
+
+    /// Dokumentets inhägnade kodblock (färgningen läggs till när syntaxerna är inlästa).
+    pub fn code_blocks(&mut self, doc_id: u64, text: &str) -> Arc<Vec<codeblock::Block>> {
+        self.state(doc_id, text).code_blocks()
     }
 
     pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
@@ -452,42 +573,58 @@ impl Cache {
 }
 
 /// Hashar det som påverkar hur ett fönster av texten ser ut efter layout: texten, styckenas
-/// geometri, bitarna (relativt fönstret) och hur markören/sökträffarna träffar dem.
+/// geometri, bitarna (relativt fönstret) och hur markören/sökträffarna träffar dem. Delas i en statisk del
+/// (text, bitar, markör, träffar: `unit_key_static`, som `layout_memo` sparar mellan omläggningar) och en
+/// del för styckena (`unit_key_paras`, som ändras av flytande bilder och fotnotsdefinitioner under utläggningen).
 fn unit_key(env: u64, text: &str, a: &Analysis, p: &Params, w: &Range<usize>, paras: &[Para]) -> u64 {
+    unit_key_with(env, unit_key_static(text, a, p, w), w, paras)
+}
+
+fn unit_key_with(env: u64, skey: u64, w: &Range<usize>, paras: &[Para]) -> u64 {
     let mut h = Fx(env);
-    text[w.clone()].hash(&mut h);
+    skey.hash(&mut h);
+    unit_key_paras(&mut h, w, paras);
+    h.finish()
+}
+
+fn unit_key_paras(h: &mut Fx, w: &Range<usize>, paras: &[Para]) {
     for para in paras {
-        (para.range.start - w.start.min(para.range.start)).hash(&mut h);
-        para.range.len().hash(&mut h);
-        (para.align as u8).hash(&mut h);
+        (para.range.start - w.start.min(para.range.start)).hash(h);
+        para.range.len().hash(h);
+        (para.align as u8).hash(h);
         match para.list {
             Some(l) => {
-                1u8.hash(&mut h);
-                l.text_x.to_bits().hash(&mut h);
-                l.marker_chars.hash(&mut h);
+                1u8.hash(h);
+                l.text_x.to_bits().hash(h);
+                l.marker_chars.hash(h);
             }
-            None => 0u8.hash(&mut h),
+            None => 0u8.hash(h),
         }
-        para.image_w.to_bits().hash(&mut h);
-        para.collapse.hash(&mut h);
-        para.float.map(|f| (f.side, f.size.x.to_bits(), f.size.y.to_bits(), f.alone)).hash(&mut h);
-        para.reserve.map(f32::to_bits).hash(&mut h);
-        para.toc_h.to_bits().hash(&mut h);
-        (para.space_before.to_bits(), para.first_indent.to_bits()).hash(&mut h);
-        para.gap.map(f32::to_bits).hash(&mut h);
+        para.image_w.to_bits().hash(h);
+        para.collapse.hash(h);
+        para.float.map(|f| (f.side, f.size.x.to_bits(), f.size.y.to_bits(), f.alone)).hash(h);
+        para.reserve.map(f32::to_bits).hash(h);
+        para.toc_h.to_bits().hash(h);
+        (para.space_before.to_bits(), para.first_indent.to_bits()).hash(h);
+        para.gap.map(f32::to_bits).hash(h);
         match para.line {
-            Some(LineRule::Auto(v)) => (1u8, v.to_bits()).hash(&mut h),
-            Some(LineRule::Exact(v)) => (2u8, v.to_bits()).hash(&mut h),
-            Some(LineRule::AtLeast(v)) => (3u8, v.to_bits()).hash(&mut h),
-            None => 0u8.hash(&mut h),
+            Some(LineRule::Auto(v)) => (1u8, v.to_bits()).hash(h),
+            Some(LineRule::Exact(v)) => (2u8, v.to_bits()).hash(h),
+            Some(LineRule::AtLeast(v)) => (3u8, v.to_bits()).hash(h),
+            None => 0u8.hash(h),
         }
-        (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(&mut h);
+        (para.ind_left.to_bits(), para.ind_right.to_bits(), para.hang.to_bits()).hash(h);
         if let Some(f) = para.look.as_ref().and_then(|l| l.frame) {
-            (f.w.to_bits(), f.pl.to_bits(), f.pr.to_bits(), format!("{:?}", f.x)).hash(&mut h);
-            (para.room.0.to_bits(), para.room.1.to_bits()).hash(&mut h);
+            (f.w.to_bits(), f.pl.to_bits(), f.pr.to_bits(), format!("{:?}", f.x)).hash(h);
+            (para.room.0.to_bits(), para.room.1.to_bits()).hash(h);
         }
-        para.empty_h.map(f32::to_bits).hash(&mut h);
+        para.empty_h.map(f32::to_bits).hash(h);
     }
+}
+
+fn unit_key_static(text: &str, a: &Analysis, p: &Params, w: &Range<usize>) -> u64 {
+    let mut h = Fx(0);
+    text[w.clone()].hash(&mut h);
     // Tabellformatet (kommentarsraden före en tabell) ändrar utläggningen.
     if let Some((r, _)) = super::tablefmt::before(text, w.start) {
         text[r].hash(&mut h);
@@ -572,9 +709,83 @@ fn relayout(
     pages: Option<&super::pages::Geom>,
     budget: Option<std::time::Duration>,
 ) -> Galley {
-    use super::secpages::Balance;
     st.stats = LayoutStats::default();
-    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new(), budget);
+    let t0 = std::time::Instant::now();
+    let a = st.analysis.clone();
+    let grid = st.tables();
+    let cb = st.code_blocks();
+    let env = {
+        let mut h = Fx(env);
+        format!("{:?}", a.defaults).hash(&mut h);
+        h.finish()
+    };
+    // Det som gäller för återanvändning av förra omläggningens stycken och nycklar: allt utom texten.
+    let sig = {
+        let mut h = Fx(env);
+        pages.is_some().hash(&mut h);
+        if let Some(g) = pages {
+            g.hash_into(&mut h);
+        }
+        crate::review::comments_visible().hash(&mut h);
+        for img in st.images().iter() {
+            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        }
+        // Ett ```mermaid-block som ritas som diagram kollapsar sina rader (`paragraphs_in`); det ändras med markören
+        // och när diagrammet blivit ritat, inte bara med texten.
+        for b in cb.iter() {
+            diagram_height(b, text, p).map(f32::to_bits).hash(&mut h);
+        }
+        h.finish()
+    };
+    let prep = match st.memo.take() {
+        Some(m) if !st.notes_changed => memo::reuse(m, &st.memo_text, st.hull, st.rev, text, &a, p, sig, &grid, &cb),
+        Some(_) => None,
+        None => None,
+    };
+    let reused = prep.is_some();
+    #[cfg(test)]
+    {
+        st.stats.memo_why = memo::WHY.with(|w| w.borrow_mut().drain(..).last().unwrap_or(0));
+    }
+    let prep = prep.unwrap_or_else(|| memo::fresh(text, &a, p, pages.is_some(), &grid, &cb));
+    st.stats.plan_ms += t0.elapsed().as_secs_f64() * 1000.0;
+    st.stats.reused = reused;
+    drop(a);
+    let g = relayout_inner(st, ctx, text, p, wrap_width, ppp, env, pages, budget, &prep);
+    st.memo_text.clear();
+    st.memo_text.push_str(text);
+    st.hull = None;
+    st.notes_changed = false;
+    if crate::timing::enabled() {
+        crate::timing::mark(&format!(
+            "omläggning: {:.1} ms (förberedelse {:.1}, grupper {}, omlagda {}, platshållare {}, återanvänd förberedelse: {})",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            st.stats.plan_ms,
+            st.stats.groups,
+            st.stats.misses,
+            st.stats.stubs,
+            reused
+        ));
+    }
+    st.memo = Some(memo::Memo { sig, rev: st.rev, reveal: p.reveal.clone(), prep });
+    g
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relayout_inner(
+    st: &mut DocState,
+    ctx: &egui::Context,
+    text: &str,
+    p: &Params,
+    wrap_width: f32,
+    ppp: f32,
+    env: u64,
+    pages: Option<&super::pages::Geom>,
+    budget: Option<std::time::Duration>,
+    prep: &memo::Prep,
+) -> Galley {
+    use super::secpages::Balance;
+    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new(), budget, prep);
     // Ofullständig: jämnandet av spalter görs när allt är utlagt.
     if st.partial {
         return g;
@@ -592,7 +803,7 @@ fn relayout(
             break;
         }
         let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, (lo[s] + hi[s]) / 2.0))).collect();
-        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None);
+        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None, prep);
         for (s, r) in &cands {
             let mid = (lo[s] + hi[s]) / 2.0;
             // Ryms allt på sista arket (inga fler arkbyten)?
@@ -605,7 +816,7 @@ fn relayout(
     }
     // Några px marginal: sidbrytningen avrundar raderna något annorlunda än uppskattningen.
     let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, hi[s] + 2.0))).collect();
-    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None).0
+    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None, prep).0
 }
 
 /// Ett utläggningsvarv (se `relayout`); ger också hur varje avsnitt med olika breda spalter fyllde arken.
@@ -621,6 +832,7 @@ fn relayout_pass(
     pages: Option<&super::pages::Geom>,
     balance: &super::secpages::Balance,
     budget: Option<std::time::Duration>,
+    prep: &memo::Prep,
 ) -> (Galley, HashMap<usize, super::secpages::SecRun>) {
     st.tick += 1;
     st.stats.varv += 1;
@@ -628,16 +840,10 @@ fn relayout_pass(
     let tick = st.tick;
     let a = st.analysis.clone();
     let grid = st.tables();
-    let env = {
-        let mut h = Fx(env);
-        format!("{:?}", a.defaults).hash(&mut h);
-        h.finish()
-    };
-    let mut paras = paragraphs(text, &a, p);
-    // Fotnotsdefinitionerna ritas längst ned på sidan; i flödet blir de dolda rader.
-    let defs = if pages.is_some() { notes::plan(text, &a, &mut paras, p.zoom) } else { Vec::new() };
+    let cb = st.code_blocks();
+    // Styckena, fotnotsdefinitionerna (ritas längst ned på sidan; i flödet blir de dolda rader) och grupperna.
+    let (paras, defs, groups) = (&prep.paras, &prep.defs, &prep.groups);
     let mut note_layouts: Vec<super::fnotes::NoteLayout> = Vec::new();
-    let groups = group_paras(text, &paras, &grid);
     let min_h = px(p.zoom, a.defaults.size()) * 1.4;
 
     // Grupperna läggs ut i ordning: en flytande bild påverkar bredden på stycken efter den, och
@@ -688,13 +894,15 @@ fn relayout_pass(
     // tid i varvet, ersätts stycken som saknas i cachen av platshållare.
     let mut lazy = false;
     let mut stubs = lazy::Stubs::default();
-    for (pr, w, tbl) in groups.iter() {
+    let mut def_i = 0;
+    for (gi, (pr, w, tbl)) in groups.iter().enumerate() {
         if let (false, Some(b)) = (lazy, budget) {
             let spent = st.stats.miss_ms;
             let other = t0.elapsed().as_secs_f64() * 1000.0 - spent;
             if stubs.ready() && spent > (b.as_secs_f64() * 1000.0).max(other) {
                 lazy = true;
                 st.stats.lazy_row = Some(row_no);
+                st.stats.lazy_byte = w.start;
             }
         }
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
@@ -716,11 +924,14 @@ fn relayout_pass(
         // Marginalerna: en textruta får stå ut i dem (`Frame::span`).
         let room = pages.map_or((0.0, 0.0), |g| if multi { let s = g.sec(sec); (s.left, s.right) } else { (g.left, g.right) });
         gp.iter_mut().for_each(|q| q.room = room);
-        let note_def = defs.iter().find(|d| d.para == pr.start && !table);
+        while def_i < defs.len() && defs[def_i].para < pr.start {
+            def_i += 1;
+        }
+        let note_def = defs.get(def_i).filter(|d| d.para == pr.start && !table);
         if let Some(d) = note_def {
             let tn = std::time::Instant::now();
             let miss0 = st.units.len();
-            if let Some(nl) = notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d, lazy) {
+            if let Some(nl) = notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d, lazy, prep.skeys[gi]) {
                 note_layouts.push(nl);
             }
             if st.units.len() != miss0 {
@@ -775,7 +986,11 @@ fn relayout_pass(
         let mut by_cols = false;
         let (galleys, tgeom): (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = loop {
         let key = {
-            let mut h = Fx(unit_key(env, text, &a, p, w, &gp));
+            let mut h = Fx(unit_key_with(env, prep.skeys[gi], w, &gp));
+            codeblock::sig(&cb, text, w).hash(&mut h);
+            for b in codeblock::in_range(&cb, w) {
+                diagram_height(b, text, p).map(f32::to_bits).hash(&mut h);
+            }
             wrap_width.to_bits().hash(&mut h);
             if by_cols {
                 csim.state_key().hash(&mut h);
@@ -789,7 +1004,7 @@ fn relayout_pass(
             st.stats.hits += 1;
             u.used = tick;
             (u.galleys.clone(), u.geom.clone())
-        } else if let Some(gs) = lazy.then(|| gp.iter().map(|q| stubs.para(q, text, wrap_width, &a, p, ppp)).collect::<Option<Vec<_>>>()).flatten() {
+        } else if let Some(gs) = lazy.then(|| gp.iter().enumerate().map(|(k, q)| stubs.para(q, text, wrap_width, &a, p, ppp, table, k)).collect::<Option<Vec<_>>>()).flatten() {
             // Platshållare (ingen cachepost): rätt antal rader med uppskattad höjd.
             st.stats.stubs += 1;
             (Arc::new(gs), None)
@@ -797,7 +1012,7 @@ fn relayout_pass(
             st.stats.misses += 1;
             let tm = std::time::Instant::now();
             let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
-            job.sections = build_sections(text, &a, p, &grid, w.clone());
+            job.sections = build_sections(text, &a, p, &grid, w.clone(), &cb);
             for s in &mut job.sections {
                 s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
             }
@@ -842,8 +1057,15 @@ fn relayout_pass(
         }
         break laid_out;
         };
-        if !lazy && gp.len() == 1 {
-            stubs.note(&gp[0], text, &galleys);
+        if !lazy && budget.is_some() {
+            if table {
+                // En tabellrad är ett stycke med ett galleri per rad.
+                for (k, (q, lg)) in gp.iter().zip(galleys.iter()).enumerate() {
+                    stubs.note(q, text, &a, wrap_width, std::slice::from_ref(lg), true, k);
+                }
+            } else if gp.len() == 1 {
+                stubs.note(&gp[0], text, &a, wrap_width, &galleys, false, 0);
+            }
         }
         if let (true, Some(g), false) = (unequal, pages, in_box) {
             let hs: Vec<f32> = if table {
@@ -1610,7 +1832,8 @@ fn grid_table(text: &str, a: &Analysis, t: &Table, p: &Params, bld: &mut Builder
 
 pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
     let grid = tables(text, a);
-    let secs = build_sections(text, a, p, &grid, 0..text.len());
+    let cb = codeblock::blocks(text, a);
+    let secs = build_sections(text, a, p, &grid, 0..text.len(), &cb);
     LayoutJob { text: text.to_owned(), sections: secs, ..Default::default() }
 }
 
@@ -1628,13 +1851,38 @@ fn pieces_in<'a>(a: &'a Analysis, w: &Range<usize>) -> &'a [Piece] {
     &a.pieces[i..i + n]
 }
 
+/// Lägger `r` i sektioner med `fmt`, delat efter kodfärgningen `segs` (färg, fet, kursiv per token).
+fn push_code(bld: &mut Builder, r: Range<usize>, fmt: &TextFormat, segs: Option<&[codeblock::Seg]>, cc: &crate::codehl::CodeColors) {
+    let Some(segs) = segs else { return bld.push(r, fmt) };
+    let i = segs.partition_point(|sg| sg.range.end <= r.start);
+    let mut at = r.start;
+    for sg in segs[i..].iter().take_while(|sg| sg.range.start < r.end) {
+        let (a, b) = (sg.range.start.max(r.start), sg.range.end.min(r.end));
+        if at < a {
+            bld.push(at..a, fmt);
+        }
+        let mut f = fmt.clone();
+        f.color = cc.color(sg.class);
+        f.italics = f.italics || sg.italic;
+        if sg.bold {
+            f.font_id.family = theme::mono_medium();
+        }
+        bld.push(a..b, &f);
+        at = b;
+    }
+    if at < r.end {
+        bld.push(at..r.end, fmt);
+    }
+}
+
 /// Sektionerna (med byteoffset i hela texten) för fönstret `win`, som måste börja och sluta
 /// på radgränser (eller täcka hela tabeller). Samma kod bygger hela dokumentet och ett enskilt
 /// stycke; bitar som sticker ut ur fönstret beskärs men bedöms med sitt hela intervall.
-fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Range<usize>) -> Vec<LayoutSection> {
+fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Range<usize>, cb: &[codeblock::Block]) -> Vec<LayoutSection> {
     let bytes = text.as_bytes();
     let mut bld = Builder { secs: Vec::new(), cuts: BTreeSet::new(), marks: Vec::new(), lead: Vec::new(), win: win.clone() };
     let pcs = pieces_in(a, &win);
+    let code_colors = crate::codehl::CodeColors::from_palette(p.palette);
     // Tabeller är alltid rutnät, också med markören i dem: bara inline-markup i markörens cell
     // visas (via `reveal`), aldrig pipor eller avgränsarrad.
     for t in grid.iter().filter(|t| intersects(&t.region, &win)) {
@@ -1748,7 +1996,33 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
             continue;
         }
 
+        // Ett diagram (```mermaid) ersätter blocket: texten är dold och första tecknet reserverar diagrammets höjd
+        // (som en bild); vyn ritar diagrammet där (`codeui`).
+        if pc.block == Block::Code {
+            if let Some((b, h)) = codeblock::find(cb, r.start).and_then(|b| diagram_height(b, text, p).map(|h| (b, h))) {
+                let fam = FontFamily::Monospace;
+                if r.start == b.open.start {
+                    let first = text[r.clone()].chars().next().map_or(1, char::len_utf8);
+                    let mut f1 = hidden_format(fam.clone());
+                    f1.line_height = Some(h + px(p.zoom, CODE_PAD_PT) * 2.0);
+                    bld.push(r.start..r.start + first, &f1);
+                    if r.start + first < r.end {
+                        bld.push(r.start + first..r.end, &hidden_format(fam));
+                    }
+                } else {
+                    bld.push(r, &hidden_format(fam));
+                }
+                continue;
+            }
+        }
         let fmt = piece_format(pc, hide, grid_hdr, p, &a.defaults);
+        // Kodblock med känt språk: koden får färg per token (texten är densamma).
+        let code_segs = if pc.block == Block::Code && pc.code && !pc.markup {
+            codeblock::find_content(cb, r.start).map(|b| b.segs(text)).filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let code_segs = code_segs.as_deref().map(|v| v.as_slice());
         // Tomradsbrytningar blir egna sektioner med 8 pt radhöjd.
         let rc = r.start.max(win.start)..r.end.min(win.end);
         let mut start = rc.start;
@@ -1756,14 +2030,14 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
             let i = rc.start + off;
             if c == '\n' && (i == 0 || bytes[i - 1] == b'\n') {
                 if start < i {
-                    bld.push(start..i, &fmt);
+                    push_code(&mut bld, start..i, &fmt, code_segs, &code_colors);
                 }
                 bld.push(i..i + 1, &spacing_format(p.zoom));
                 start = i + 1;
             }
         }
         if start < rc.end {
-            bld.push(start..rc.end, &fmt);
+            push_code(&mut bld, start..rc.end, &fmt, code_segs, &code_colors);
         }
     }
 
@@ -1888,6 +2162,18 @@ fn is_float_line(text: &str, pc: &Piece) -> bool {
 
 /// Styckena i texten. En avslutande `\n` ger ett tomt sista stycke.
 fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
+    paragraphs_in(text, a, p, None, &codeblock::blocks(text, a))
+}
+
+/// Som `paragraphs`, men bara för styckena i `win` (byteintervall från ett styckes början till ett styckes slut,
+/// utan radbrytning). Styckena närmast kanterna kan få fel luft och radbrytningsstatus eftersom grannarna utanför
+/// fönstret saknas; anroparen (`layout_memo`) lägger kontrollstycken utanför det som används. `cb` är hela textens
+/// kodblock.
+fn paragraphs_in(text: &str, a: &Analysis, p: &Params, win: Option<Range<usize>>, cb: &[codeblock::Block]) -> Vec<Para> {
+    let (mut s, win_end, doc_start) = match &win {
+        Some(w) => (w.start, w.end, w.start == 0),
+        None => (0, usize::MAX, true),
+    };
     // 0 = vanligt stycke, 1 = dold öppningstagg/kommentar, 2 = dold stängningstagg.
     let mut tag: Vec<u8> = Vec::new();
     let mut out: Vec<Para> = Vec::new();
@@ -1895,7 +2181,6 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
     let mut toc_h: Option<f32> = None;
     // Formatmallarnas "luft efter" per stycke, flyttas till nästa synliga stycke nedan.
     let mut after: Vec<f32> = Vec::new();
-    let mut s = 0;
     loop {
         let e = text[s..].find('\n').map_or(text.len(), |i| s + i);
         let range = s..e;
@@ -2028,7 +2313,7 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
             tbox,
             tbox_end,
         });
-        if e >= text.len() {
+        if e >= text.len() || e >= win_end {
             break;
         }
         s = e + 1;
@@ -2071,9 +2356,43 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
     if let Some(o) = open {
         out[o].tbox = None;
     }
+    // Kodblock: luft ovanför första och under sista kodraden (rutan ritas i vyn, se `codeblock`).
+    let pad = px(p.zoom, CODE_PAD_PT);
+    let span = win.clone().unwrap_or(0..usize::MAX);
+    for b in codeblock::in_range(cb, &span).filter(|b| !b.content.is_empty()) {
+        let at = |out: &[Para], pos: usize| out.binary_search_by(|q| q.range.start.cmp(&pos)).ok();
+        // Ett diagram tar bara den första radens plats (höjden sätts i `build_sections`): resten kollapsar.
+        if diagram_height(b, text, p).is_some() {
+            let w = b.whole();
+            for q in out.iter_mut().filter(|q| q.range.start > w.start && q.range.start < w.end.max(w.start + 1)) {
+                q.collapse = true;
+            }
+            continue;
+        }
+        if let Some(i) = at(&out, b.content.start) {
+            out[i].space_before += pad;
+        }
+        if let Some(i) = b.close.as_ref().and_then(|c| at(&out, c.start)) {
+            out[i].space_before += pad;
+        }
+    }
     empty_looks(text, &mut out);
-    apply_looks(text, &mut out, &before0, &after, p.zoom);
+    let scan = &text[win.as_ref().map_or(0, |w| w.start)..win.as_ref().map_or(text.len(), |w| (w.end + 1).min(text.len()))];
+    apply_looks(scan, win.as_ref().map_or(0, |w| w.start), &mut out, &before0, &after, p.zoom, doc_start);
     out
+}
+
+/// Luft (pt) över och under koden i en kodruta.
+pub const CODE_PAD_PT: f32 = 4.0;
+
+/// Höjden (px) på diagrammet som ersätter ett ```mermaid-block, om det visas som diagram: vyn har ritat det
+/// (storleken finns bland bildstorlekarna) och markören står inte i blocket (då visas koden).
+fn diagram_height(b: &codeblock::Block, text: &str, p: &Params) -> Option<f32> {
+    let key = b.diagram_key(text)?;
+    if intersects(&p.reveal, &b.whole()) {
+        return None;
+    }
+    (p.image_size)(&key).map(|s| s.y)
 }
 
 /// `Para::look` för tomma stycken kommer ur deras egen markör.
@@ -2090,12 +2409,16 @@ fn empty_looks(text: &str, out: &mut [Para]) {
 /// Styckeutseendet (`pbox`): avstånd mellan stycken, radavstånd och indrag från markörerna
 /// `<!--k:pp …-->`. Avståndet läggs på den tomma raden mellan två stycken (`Para::gap`) och blir
 /// största av "efter" och "före" plus rutans luft; `before0`/`after` är formatmallarnas luft (px).
-fn apply_looks(text: &str, out: &mut [Para], before0: &[f32], after: &[f32], zoom: f32) {
-    if !text.contains(pbox::MARK) && !text.contains(pbox::EMPTY) {
+/// `scan` är texten som markörerna söks i (hela texten, eller fönstret) och `base` dess läge i dokumentet.
+/// `doc_start`: styckena börjar vid dokumentets början (det första innehållsstycket får då sin luft ovanför).
+#[allow(clippy::too_many_arguments)]
+fn apply_looks(scan: &str, base: usize, out: &mut [Para], before0: &[f32], after: &[f32], zoom: f32, doc_start: bool) {
+    if !scan.contains(pbox::MARK) && !scan.contains(pbox::EMPTY) {
         return;
     }
     let ppx = px(zoom, 1.0);
-    for spec in pbox::scan(text) {
+    for mut spec in pbox::scan(scan) {
+        spec.range = spec.range.start + base..spec.range.end + base;
         let mut i = out.partition_point(|q| q.range.start < spec.range.start);
         while i < out.len() && out[i].range.end <= spec.range.end {
             let q = &mut out[i];
@@ -2128,7 +2451,7 @@ fn apply_looks(text: &str, out: &mut [Para], before0: &[f32], after: &[f32], zoo
     }
     // Avståndet: för varje par av innehållsstycken med minst en tom rad emellan.
     let content: Vec<usize> = (0..out.len()).filter(|&i| !out[i].collapse && !out[i].range.is_empty()).collect();
-    if let Some(&f) = content.first() {
+    if let Some(&f) = content.first().filter(|_| doc_start) {
         if let Some(l) = out[f].look.clone() {
             let pad = if l.has_box() { l.pad_top() } else { 0.0 };
             out[f].space_before = (l.before.unwrap_or(0.0) + pad) * ppx;
@@ -4137,5 +4460,160 @@ mod tests {
             unit_key(0, t, &an, &p, &(start..t.len()), &[])
         };
         assert_ne!(key(&a), key(&b));
+    }
+
+    // ---------------------------------------------------------------- kodblock
+
+    const CODE_DOC: &str = "Före\n\n```rust\nfn main() {\n    let s = \"hej\"; // x\n}\n```\n\n```\nbara text\n```\n\nEfter\n";
+
+    fn code_params<'a>(pal: &'a Palette, reveal: Range<usize>) -> Params<'a> {
+        Params {
+            palette: pal,
+            zoom: 1.0,
+            reveal,
+            matches: &[],
+            image_size: &no_img,
+            measure: &|s: &str, _| s.len() as f32 * 7.0,
+            font_family: &fam,
+            fonts_gen: 0,
+        }
+    }
+
+    #[test]
+    fn code_block_is_colored_per_token_without_changing_the_text() {
+        crate::highlight::syntaxes_wait();
+        let pal = theme::palette(false);
+        let a = markup::analyze(CODE_DOC);
+        let job = layout_job(CODE_DOC, &a, &code_params(&pal, 0..0));
+        // Texten är oförändrad och sektionerna täcker den utan glapp.
+        assert_eq!(job.text, CODE_DOC);
+        let mut at = 0;
+        for s in &job.sections {
+            assert_eq!(s.byte_range.start.0, at);
+            at = s.byte_range.end.0;
+        }
+        assert_eq!(at, CODE_DOC.len());
+        let cc = crate::codehl::CodeColors::from_palette(&pal);
+        let kw = sec_at(&job, CODE_DOC.find("fn main").unwrap());
+        assert_eq!(kw.format.color, cc.color(crate::codehl::Class::Keyword));
+        let st = sec_at(&job, CODE_DOC.find("hej").unwrap());
+        assert_eq!(st.format.color, cc.color(crate::codehl::Class::Str));
+        let cm = sec_at(&job, CODE_DOC.find("// x").unwrap());
+        assert_eq!(cm.format.color, cc.color(crate::codehl::Class::Comment));
+        assert!(cm.format.italics);
+        // Monospace med blockets bakgrund; ett block utan språk är ofärgat.
+        assert_eq!(kw.format.font_id.family, FontFamily::Monospace);
+        let plain = sec_at(&job, CODE_DOC.find("bara text").unwrap());
+        assert_eq!(plain.format.color, pal.page_text);
+        // Inhägnadens rader är dold markup: utan markör i dem syns de inte.
+        let fence = sec_at(&job, CODE_DOC.find("```rust").unwrap());
+        assert_eq!(fence.format.color, Color32::TRANSPARENT);
+        // Med markören på raden visas de dämpade.
+        let at = CODE_DOC.find("```rust").unwrap();
+        let shown = layout_job(CODE_DOC, &a, &code_params(&pal, at..at + 7));
+        assert_eq!(sec_at(&shown, at).format.color, pal.page_markup);
+    }
+
+    #[test]
+    fn code_block_uses_the_light_syntax_colors_on_white_paper() {
+        crate::highlight::syntaxes_wait();
+        // Vita sidor i mörkt tema: koden färgas som i det ljusa temat.
+        let paper = theme::skymning().paper();
+        let a = markup::analyze(CODE_DOC);
+        let job = layout_job(CODE_DOC, &a, &code_params(&paper, 0..0));
+        let kw = sec_at(&job, CODE_DOC.find("fn main").unwrap());
+        assert_eq!(kw.format.color, theme::gryning().syntax.keyword);
+        // Mörkt tema utan vita sidor: mörka sidans färger.
+        let dark = theme::skymning();
+        let job = layout_job(CODE_DOC, &a, &code_params(&dark, 0..0));
+        let kw = sec_at(&job, CODE_DOC.find("fn main").unwrap());
+        assert_eq!(kw.format.color, dark.syntax.keyword);
+    }
+
+    #[test]
+    fn code_block_gets_air_above_and_below() {
+        let pal = theme::palette(false);
+        let a = markup::analyze(CODE_DOC);
+        let p = code_params(&pal, 0..0);
+        let paras = paragraphs(CODE_DOC, &a, &p);
+        let first = CODE_DOC.find("fn main").unwrap();
+        let close = CODE_DOC.find("```\n\n```\n").unwrap();
+        let sb = |at: usize| paras.iter().find(|q| q.range.start == at).unwrap().space_before;
+        assert!(sb(first) >= px(1.0, CODE_PAD_PT) - 0.01);
+        assert!(sb(close) >= px(1.0, CODE_PAD_PT) - 0.01);
+        // Raderna mitt i blocket får ingen extra luft.
+        assert!(sb(CODE_DOC.find("    let s").unwrap()) < 0.01);
+    }
+
+    #[test]
+    fn typing_in_another_paragraph_does_not_relayout_or_recolor_code() {
+        crate::highlight::syntaxes_wait();
+        let pal = theme::palette(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
+        let mut cache = Cache::default();
+        let mut run = |text: &str| -> usize {
+            let p = Params { measure: &measure, ..code_params(&pal, 0..0) };
+            let before: Vec<u64> = cache.docs.get(&1).map(|d| d.units.keys().copied().collect()).unwrap_or_default();
+            let out = ctx.run_ui(Default::default(), |_| {
+                cache.galley_paged(&ctx, 1, text, &p, 500.0, None);
+            });
+            std::mem::forget(out);
+            cache.docs[&1].units.keys().filter(|k| !before.contains(k)).count()
+        };
+        let text = CODE_DOC.replace("fn main()", "fn recolor_test()");
+        assert!(run(&text) > 5);
+        let runs = crate::codehl::runs();
+        let edited = text.replace("Före", "Före och mer");
+        let new_units = run(&edited);
+        assert!(new_units <= 2, "bara stycket som skrevs i ska läggas ut om, fick {new_units}");
+        assert_eq!(crate::codehl::runs(), runs, "oförändrade kodblock färgas inte om");
+        // Ändras koden läggs blocket ut om och färgas om.
+        let changed = edited.replace("\"hej\"", "\"hejdå\"");
+        assert!(run(&changed) >= 1);
+        assert_eq!(crate::codehl::runs(), runs + 1);
+    }
+
+    const MERMAID_DOC: &str = "Före\n\n```mermaid\ngraph TD\n    A --> B\n```\n\nEfter\n";
+
+    #[test]
+    fn mermaid_block_with_a_known_size_becomes_a_reserved_gap() {
+        let pal = theme::palette(false);
+        let a = markup::analyze(MERMAID_DOC);
+        let cb = codeblock::blocks(MERMAID_DOC, &a);
+        let key = cb[0].diagram_key(MERMAID_DOC).unwrap();
+        let size = |k: &str| (k == key).then(|| Vec2::new(200.0, 120.0));
+        let mk = |reveal: Range<usize>, with_size: bool| {
+            let p = Params {
+                palette: &pal,
+                zoom: 1.0,
+                reveal,
+                matches: &[],
+                image_size: if with_size { &size } else { &no_img },
+                measure: &|s: &str, _| s.len() as f32 * 7.0,
+                font_family: &fam,
+                fonts_gen: 0,
+            };
+            let paras = paragraphs_in(MERMAID_DOC, &a, &p, None, &cb);
+            let secs = build_sections(MERMAID_DOC, &a, &p, &[], 0..MERMAID_DOC.len(), &cb);
+            (paras, secs)
+        };
+        let open = MERMAID_DOC.find("```mermaid").unwrap();
+        let (paras, secs) = mk(0..0, true);
+        // Första tecknet reserverar diagrammets höjd; allt annat i blocket är dolt och kollapsar.
+        let first = secs.iter().find(|s| s.byte_range.start.0 == open).unwrap();
+        assert!(first.format.line_height.unwrap() >= 120.0);
+        let code = secs.iter().find(|s| s.byte_range.start.0 <= MERMAID_DOC.find("A --> B").unwrap() && MERMAID_DOC.find("A --> B").unwrap() < s.byte_range.end.0).unwrap();
+        assert_eq!(code.format.color, Color32::TRANSPARENT);
+        let collapsed: Vec<bool> = paras.iter().filter(|q| q.range.start > open && q.range.start < MERMAID_DOC.find("Efter").unwrap() - 2).map(|q| q.collapse).collect();
+        assert!(!collapsed.is_empty() && collapsed.iter().all(|c| *c), "{collapsed:?}");
+        // Texten är densamma.
+        // Står markören i blocket visas koden, och utan känd storlek (ej ritat än) likaså.
+        let (paras, secs) = mk(open + 3..open + 4, true);
+        assert!(paras.iter().all(|q| !q.collapse));
+        assert!(secs.iter().all(|s| s.format.line_height.unwrap_or(0.0) < 100.0));
+        let (paras, _) = mk(0..0, false);
+        assert!(paras.iter().all(|q| !q.collapse));
     }
 }

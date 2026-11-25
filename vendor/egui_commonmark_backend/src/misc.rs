@@ -656,6 +656,7 @@ impl CodeBlock {
                     &self.content,
                     &mut layout,
                     scroll_to_active_match,
+                    self.lang.as_deref(),
                 )
             })
             .inner;

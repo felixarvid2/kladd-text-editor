@@ -1,4 +1,6 @@
 pub mod anchor;
+pub mod codeblock;
+pub mod codeui;
 pub mod fontmap;
 pub mod fonts;
 pub mod grid;

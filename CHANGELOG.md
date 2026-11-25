@@ -4,6 +4,21 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.7.0] – 2026-11-25
+
+### Nytt
+
+- **Kodblock med syntaxfärgning och kopieringsknapp i dokumentläget och exporterna.** Ett ```` ```språk ````-block ritas i dokumentläget som en ruta med svag bakgrund, fast breddsteg och färger per token efter språket (rust, python, js/ts, json, toml, yaml, bash, c/c++, java, go, sql, html, css, xml, markdown med flera; okänt språk är ofärgat), med det ljusa temats färger på vita sidor och det mörka i mörkt tema utan vita sidor. Språknamnet står i hörnet och en kopieringsknapp (när musen är över blocket) kopierar koden utan inhägnaden och visar *Koden kopierades*. Färgningen använder samma syntect-uppsättning som textredigeraren (inläst i bakgrunden; ofärgat tills den finns), ändrar aldrig texten eller markörlägena och cachas per block, så att skrivning i ett annat stycke inte färgar om. PDF ritar kodblock med bakgrund och samma färger, `.docx` skriver kodformatet med färgade körningar (`w:color`) och språket i ett dolt bokmärke som läses tillbaka, `.odt` skriver `text:span`-färger och HTML/EPUB `<pre><code class="language-x">` med färgade `<span style>`. Orörda `.docx` och `.odt` sparas som förut byte för byte. Läsläget visar nu också språknamnet i blockets hörn. Se `docs/dev/dokumentlage.md`.
+- **`mermaid`-block ritas som diagram.** Flödesscheman, sekvens-, tillstånds-, klass-, ER- och cirkeldiagram med flera ritas av den rena Rust-crate:n `mermaid-svg` 0.7 (MIT, enda beroendet är `thiserror`; inget JavaScript eller C) i läsläget, i dokumentläget (koden visas när markören står i blocket) och som vektorbild i PDF. Ett block som inte går att rita visas som kod; `.docx`, `.odt`, HTML och EPUB behåller det som kodblock.
+- **Tangenttryck i stora Word-dokument är 5–10 gånger snabbare och växer knappt med dokumentets längd.** Efter en ändring räknas bara stycken, fotnotsplan, grupper och cachenycklar om i ett fönster kring ändringen och markören; resten från förra omläggningen förskjuts (`word/layout_memo.rs`, jämförs mot en full omräkning av slumpade ändringar i test). Fotnotsberäkningarna var kvadratiska (en linjär sökning i egui:s galleri för varje fotnotsreferens, och en genomsökning av hela texten för varje etikett) och är nu logaritmiska respektive bakifrån. Ett tecken i ett dokument på 404 sidor (`gen-skolrapport.docx` upprepad) tar 11 ms i stället för 56 ms i median över tio ställen (sämsta 37 ms, i fotnotsdefinitionerna; 133 ms före), och 68 ms i stället för 524 ms i ett debugbygge. Mätningar i `docs/dev/prestanda.md`.
+- **Färre fall av full analys i stora dokument.** Den inkrementella analysen gäller nu också text i en fotnotsdefinition, ändringar bredvid avsnittsrader, en vanlig första rad, dokument med välformade kodstaket (Word-dokument med kodstycken) och referenslänkar när fönstret saknar hakparenteser; de globala kontrollerna räknas per fönster och söker inte längre igenom hela texten vid varje tangent.
+- **Analysen av ett stort Word-dokument görs i inläsningstråden** i stället för i första bildrutan, och platshållarna under stegvis utläggning kalibreras per styckeslag (brödtext, rubrik, lista, citat, kod, tabellrad). Statusraden räknar upp sidantalet från det utlagda (inom 10 % av slutvärdet i mätningen) i stället för att visa platshållarnas ryckiga sidantal, och sidor som ännu inte lagts ut ritas med *Läggs ut…*. `KLADD_TIMING=1` skriver tiden för analys och omläggning per ändring.
+
+### Rättat
+
+- **Sökningen i PDF-visaren kunde hoppa till fel träff.** Sidornas text läses in i godtycklig ordning, och den första träffen valdes bland de sidor som råkade vara genomsökta, så en träff på sidan 3 kunde bli aktuell före träffarna på sidan 1. Nu väntar hoppet tills alla sidor fram till träffen är genomsökta.
+- **Den inkrementella analysen användes aldrig i dokumentläget i appen.** Bildrutan höll en referens till analysen medan TextEdit lade ut galleriet efter en ändring, så analysen kunde inte uppdateras på plats och hela texten tolkades om vid varje tangent (80–185 ms i debug för 400 sidor). Mätverktygen hade ingen sådan referens och visade det aldrig. Referensen släpps nu före TextEdit.
+
 ## [2.6.1] – 2026-11-23
 
 ### Nytt

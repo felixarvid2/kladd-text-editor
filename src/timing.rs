@@ -13,7 +13,7 @@ pub fn init() {
     START.get_or_init(Instant::now);
 }
 
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KLADD_TIMING").is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
