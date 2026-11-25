@@ -23,7 +23,9 @@ pub const MAX_MATCHES: usize = 50_000;
 const CHUNK: usize = 256 * 1024;
 const BUDGET: Duration = Duration::from_millis(6);
 
-pub type Loaded = Result<(Document, Option<BigView>), LoadError>;
+/// Ett inläst dokument: dokumentet, den stora textvyn (stora textfiler) och markup-analysen av texten (Word-dokument
+/// i dokumentläget), som görs i inläsningstråden så att första bildrutan inte väntar på den.
+pub type Loaded = Result<(Document, Option<BigView>, Option<crate::word::layout::Prepared>), LoadError>;
 
 /// En fil som läses in i bakgrunden.
 pub struct Loading {
@@ -155,7 +157,8 @@ impl State {
             let r = Document::load_with_progress(id, &p, pw.as_deref(), Some(&prog)).map(|doc| {
                 // Radindex och ordantal byggs här så att första bildrutan inte väntar på dem.
                 let big = (!doc.docx && !doc.pdf && bigtext::is_big(&doc.text)).then(|| BigView::new(&doc.text));
-                (doc, big)
+                let pre = (doc.docx && doc.word_view).then(|| crate::word::layout::Prepared::new(&doc.text));
+                (doc, big, pre)
             });
             let _ = tx.send(r);
             ctx2.request_repaint();
@@ -172,7 +175,7 @@ impl State {
             match self.loading[i].rx.try_recv() {
                 Ok(r) => {
                     let l = self.loading.remove(i);
-                    if let Ok((doc, view)) = &r {
+                    if let Ok((doc, view, _)) = &r {
                         match view {
                             // Skickas vidare i resultatet; registreras när fliken installeras.
                             Some(_) => {}
@@ -444,8 +447,11 @@ mod tests {
         }
         let (p, loaded) = done.pop().unwrap();
         assert_eq!(p, path);
-        let (doc, view) = loaded.ok().unwrap();
+        let (doc, view, pre) = loaded.ok().unwrap();
         assert!(view.is_none() && doc.docx && doc.word_view);
+        // Analysen gjordes i inläsningstråden och gäller texten.
+        let pre = pre.expect("förberedd analys");
+        assert!(pre.matches(&doc.text));
         assert_eq!(doc.text, direct.text);
         assert_eq!(doc.images.len(), direct.images.len());
         assert_eq!(doc.docx_dropped, direct.docx_dropped);

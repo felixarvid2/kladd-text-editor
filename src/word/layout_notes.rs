@@ -7,6 +7,7 @@ use super::*;
 use crate::word::fnotes::{NoteLayout, NoteSpec};
 
 /// En fotnotsdefinition som ritas längst ned på referenssidan i stället för sist i dokumentet.
+#[derive(Clone)]
 pub(super) struct Def {
     pub label: String,
     /// Styckets index.
@@ -29,6 +30,7 @@ pub(super) fn plan(text: &str, a: &Analysis, paras: &mut [Para], zoom: f32) -> V
     if !text.contains("[^") {
         return defs;
     }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let refs: BTreeSet<&str> = a
         .pieces
         .iter()
@@ -37,7 +39,7 @@ pub(super) fn plan(text: &str, a: &Analysis, paras: &mut [Para], zoom: f32) -> V
         .collect();
     for pc in &a.pieces {
         let Some(l) = pc.footnote_def.as_deref() else { continue };
-        if markup::is_endnote_label(l) || !refs.contains(l) || defs.iter().any(|d| d.label == l) {
+        if markup::is_endnote_label(l) || !refs.contains(l) || seen.contains(l) {
             continue;
         }
         let pi = paras.partition_point(|q| q.range.end < pc.range.start);
@@ -48,6 +50,7 @@ pub(super) fn plan(text: &str, a: &Analysis, paras: &mut [Para], zoom: f32) -> V
         if paras.get(pi + 1).is_some_and(|n| !n.range.is_empty() && is_continuation(text, a, n)) {
             continue;
         }
+        seen.insert(l);
         defs.push(Def { label: l.to_owned(), para: pi, line: q.range.clone(), body: (pc.range.end + 3).min(q.range.end) });
     }
     // Följer slutnoter (synliga definitioner) efter fotnoterna får den första luft över sig (skiljelinjen
@@ -95,6 +98,7 @@ pub(super) fn layout_def(
     env: u64,
     d: &Def,
     lazy: bool,
+    skey: u64,
 ) -> Option<NoteLayout> {
     let pv = Params {
         palette: p.palette,
@@ -114,7 +118,9 @@ pub(super) fn layout_def(
     q.page_break = false;
     q.col_break = false;
     let key = {
-        let mut h = Fx(unit_key(env, text, a, &pv, w, std::slice::from_ref(&q)));
+        // Den statiska nyckeln gäller så länge markören inte står i raden (här visas aldrig markup) och inga sökträffar finns.
+        let skey = if p.matches.is_empty() && !intersects(&p.reveal, w) { skey } else { unit_key_static(text, a, &pv, w) };
+        let mut h = Fx(unit_key_with(env, skey, w, std::slice::from_ref(&q)));
         (wrap_width.to_bits(), 0xF007u32).hash(&mut h);
         h.finish()
     };
@@ -141,9 +147,10 @@ pub(super) fn layout_def(
     let rel_chars = text[w.start..d.body.max(w.start)].chars().count();
     let indent = galley.pos_from_cursor(CCursor::new(rel_chars)).min.x;
     // Numret i dokumentets talformat: etiketten är dold i galleriet och numret ritas ovanpå.
-    let label_ov = a
-        .pieces
+    let first = a.pieces.partition_point(|pc| pc.range.end <= d.line.start);
+    let label_ov = a.pieces[first..]
         .iter()
+        .take_while(|pc| pc.range.start < d.line.end)
         .find(|pc| pc.footnote_def.as_deref() == Some(d.label.as_str()) && d.line.contains(&pc.range.start))
         .and_then(|pc| {
             let ov = note_label_ov(pc, a, &pv)?;
@@ -164,12 +171,25 @@ pub(super) fn spec(notes: &[NoteLayout], g: &Galley, text: &str, a: &Analysis, z
         cap,
     };
     let (mut byte, mut chars) = (0usize, 0usize);
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, n) in notes.iter().enumerate() {
+        index.entry(n.label.as_str()).or_insert(i);
+    }
+    // Raden som ett tecken ligger på: som `Galley::layout_from_cursor` (första raden som slutar vid eller efter
+    // tecknet), men med binärsökning (egui går igenom alla rader för varje anrop).
+    let mut row_ends: Vec<usize> = Vec::with_capacity(g.rows.len());
+    let mut start = 0usize;
+    for r in &g.rows {
+        row_ends.push(start + r.char_count_excluding_newline().0);
+        start += r.char_count_including_newline().0;
+    }
     for pc in &a.pieces {
         let Some(l) = pc.footnote_ref.as_deref() else { continue };
-        let Some(n) = notes.iter().position(|n| n.label == l) else { continue };
+        let Some(&n) = index.get(l) else { continue };
         chars += text[byte..pc.range.start].chars().count();
         byte = pc.range.start;
-        spec.refs.push((g.layout_from_cursor(CCursor::new(chars)).row, n));
+        let row = row_ends.partition_point(|e| *e < chars).min(row_ends.len().saturating_sub(1));
+        spec.refs.push((row, n));
     }
     spec.refs.sort_by_key(|r| r.0);
     spec

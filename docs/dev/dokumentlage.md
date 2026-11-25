@@ -506,15 +506,20 @@ Hur det fungerar:
   bredd och typsnittsgeneration. Efter en ändring läggs bara berörda stycken om; markören som
   byter rad berör två. Sedan fogas styckena ihop (`Galley::concat`) och sidbryts. Cachen
   rensas på stycken som inte användes i senaste bildrutan.
+- **Återanvänd förberedelse** (`word/layout_memo.rs`, stora dokument). Styckena (`Para`), fotnotsplanen,
+  grupperna och nyckelns statiska del sparas från förra omläggningen. Efter en inkrementell analys
+  (`incr::Delta` anger det ändrade området) räknas bara ett fönster kring ändringen och markörens rader om med
+  `paragraphs_in`, med kontrollstycken som jämförs mot de gamla; kan fönstret inte räknas om säkert (fotnotsdefinitioner,
+  öppna textrutor, trasiga `<!--k:`-markörer, sökträffar) räknas allt om. Testas mot full omräkning.
 - **Ritning.** Punkter, citatstreck, bilder, tabellkanter och våglinjer itereras bara för det
   som är synligt (bitarna slås upp med binärsökning från galleriets synliga tecken).
 - **Stavning.** Resultatet cachas per revision och per stycke.
 - **Textläge.** `highlight::Highlighter` sparar syntects tillstånd före varje rad. En ändring
   färgar om raderna från den ändrade tills tillståndet efter en rad är lika med det förra
   (då gäller resten av färgningen), och färdigt galleri cachas per revision och bredd.
-- **Analysen** (`markup::analyze`, ca 28 ms release / 85 ms debug för 600 KB) görs fortfarande
-  om för hela texten efter varje ändring; den är nu det som dominerar. Inkrementell analys per
-  block bedömdes osäker (spann och dividrar går över styckegränser) och är inte gjord.
+- **Analysen** (`markup::analyze`, ca 28 ms release / 85 ms debug för 600 KB) görs om för hela texten
+  efter en ändring i dokument under 200 kB; över det tolkas bara stycket med ändringen och dess grannar om
+  (`word/incr.rs`, kontrollerad mot full analys med slumpade ändringar).
 
 Testerna `incremental_layout_equals_full_layout` och `incremental_highlight_equals_full`
 kontrollerar att det inkrementella resultatet är identiskt med full omläggning efter

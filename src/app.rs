@@ -734,12 +734,16 @@ impl KladdApp {
     fn poll_big_loads(&mut self, ctx: &egui::Context) {
         for (path, result) in self.big.poll_loads(ctx) {
             match result {
-                Ok((doc, view)) => {
+                Ok((doc, view, pre)) => {
+                    crate::timing::mark("stor fil inläst i bakgrundstråden (med analys)");
                     // Redan öppnad under tiden (t.ex. dubbelklick två gånger): släng den nya.
                     if self.docs.iter().any(|d| d.path.as_deref() == Some(&path)) {
                         continue;
                     }
                     self.big.adopt(doc.id, view);
+                    if let Some(pre) = pre {
+                        self.word.preload(doc.id, &doc.text, pre);
+                    }
                     self.install_doc(ctx, doc, &path);
                     let id = self.docs[self.active].id;
                     if self.big.has_view(id) {

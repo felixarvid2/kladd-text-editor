@@ -191,5 +191,69 @@ fn redigering_under_pagaende_utlaggning_ger_ratt_galleri() {
     rig.frame(&text, Some(Duration::ZERO));
     assert!(rig.cache.partial(1));
     let (g, _) = until_done(&mut rig, &edited, Duration::ZERO);
-    assert!(*g == *all);
+    // Glyfernas strukturkoordinater (`uv_rect`) beror på i vilken ordning tecken lagts in i typsnittsatlasen: jämför
+    // utläggningen (rader, lägen och glyfer med läge, tecken och bredd).
+    assert!(same_layout(&g, &all), "galleriet efter ändring under utläggning skiljer sig");
+}
+
+/// Gen-skolrapporten (rubriker, tabeller, bilder, fotnoter, tvåspaltsavsnitt, textrutor) upprepad `n` gånger,
+/// med fotnotsetiketterna numrerade om.
+fn skolrapport(n: usize) -> String {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/docx/gen-skolrapport.docx")).unwrap();
+    let md = crate::docx::read(&bytes).unwrap().markdown;
+    let head_end = md.find('\n').unwrap() + 1;
+    let (head, body) = md.split_at(head_end);
+    let mut t = head.to_owned();
+    for k in 0..n {
+        t.push_str(&body.replace("[^", &format!("[^r{k}x")));
+        t.push('\n');
+    }
+    t
+}
+
+/// Det uppskattade sidantalet under den stegvisa utläggningen (`Cache::estimated_pages`: utlagda sidor delat med den
+/// del av texten de utgör) ska ligga nära det slutliga och inte hoppa mellan bildrutorna.
+#[test]
+fn uppskattat_sidantal_ligger_nara_det_slutliga() {
+    let text = skolrapport(16);
+    let mut rig = Rig::new();
+    let all = rig.frame(&text, None);
+    let a = markup::analyze(&text);
+    let geom = Geom::for_sections(1.0, &a.defaults, &a.sections);
+    let final_pages = match rig.cache.page_boxes(1, &text).len() {
+        0 => super::pages::page_count(&all, &geom),
+        n => n,
+    };
+    let mut rig = Rig::new();
+    let mut est = Vec::new();
+    let mut frames = 0;
+    for _ in 0..400 {
+        let g = rig.frame(&text, Some(Duration::ZERO));
+        frames += 1;
+        let boxes = rig.cache.page_boxes(1, &text);
+        if let Some(n) = rig.cache.estimated_pages(1, text.len(), &g, &boxes) {
+            est.push(n);
+        }
+        if !rig.cache.partial(1) {
+            break;
+        }
+    }
+    assert!(frames > 5 && est.len() > 5, "utläggningen ska ta flera bildrutor ({frames}) med uppskattning ({})", est.len());
+    let off = |n: usize| (n as f32 / final_pages as f32 - 1.0).abs();
+    assert!(est.iter().all(|n| off(*n) < 0.2), "uppskattningar {est:?} mot {final_pages} sidor");
+    assert!(off(est[0]) < 0.2);
+    assert!(est.windows(2).all(|w| (w[1] as f32 / w[0] as f32 - 1.0).abs() < 0.2), "hoppar mellan bildrutor: {est:?}");
+}
+
+/// Samma utläggning (rader, lägen, glyfer): `Galley ==` jämför också atlaskoordinater som beror på inläggningsordningen.
+fn same_layout(a: &Galley, b: &Galley) -> bool {
+    a.rows.len() == b.rows.len()
+        && a.rect == b.rect
+        && a.rows.iter().zip(&b.rows).all(|(x, y)| {
+            x.pos == y.pos
+                && x.row.size == y.row.size
+                && x.ends_with_newline == y.ends_with_newline
+                && x.row.glyphs.len() == y.row.glyphs.len()
+                && x.row.glyphs.iter().zip(&y.row.glyphs).all(|(g, h)| g.pos == h.pos && g.chr == h.chr && g.advance_width == h.advance_width)
+        })
 }

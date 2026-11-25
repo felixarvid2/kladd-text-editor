@@ -110,7 +110,8 @@ fn frame_lazy(
     let t = Instant::now();
     let a = c.analysis(1, text);
     let t_an = ms(t);
-    let geom = pages::Geom::new(1.0, &a.defaults);
+    // Som i appen: sidgeometri per avsnitt (arken kan ha olika storlek och spalter).
+    let geom = pages::Geom::for_sections(1.0, &a.defaults, &a.sections);
     let t = Instant::now();
     let _tabs = c.tables(1, text);
     let _fonts = c.fonts(1, text);
@@ -133,8 +134,16 @@ fn frame_lazy(
         font_family: &fam,
         fonts_gen: 0,
     };
-    let g = c.galley_paged_lazy(ctx, 1, text, &p, geom.text_w(), Some(&geom), budget);
-    pages::page_count(&g, &geom)
+    let g = c.galley_paged_lazy(ctx, 1, text, &p, geom.edit_w(), Some(&geom), budget);
+    // Som statusraden: under stegvis utläggning den uppräknade uppskattningen (0 = ingen än), annars det riktiga antalet.
+    let boxes = c.page_boxes(1, text);
+    if c.partial(1) {
+        c.estimated_pages(1, text.len(), &g, &boxes).unwrap_or(0)
+    } else if boxes.is_empty() {
+        pages::page_count(&g, &geom)
+    } else {
+        boxes.len()
+    }
 }
 
 fn in_ui(ctx: &egui::Context, f: impl FnOnce()) {
@@ -150,7 +159,8 @@ fn in_ui(ctx: &egui::Context, f: impl FnOnce()) {
 #[test]
 #[ignore]
 fn bench_document_mode() {
-    let text = big_markdown(600_000, 7);
+    let bytes = std::env::var("KLADD_BENCH_MD_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(600_000);
+    let text = big_markdown(bytes, 7);
     let ctx = egui::Context::default();
     theme::install_fonts(&ctx);
     // Värm upp typsnitten.
@@ -380,25 +390,52 @@ fn bench_docx_open() {
         pages_n = frame(&mut c, &ctx, &text, 0..0);
         res.push(("utläggning + sidindelning, kall (bildruta 1)".into(), ms(t)));
         stats.push(("kall", c.stats(1)));
-        // Ett tecken i ett stycke på åtta ställen i dokumentet, varje gång från den oförändrade texten.
-        let mut times = Vec::new();
-        for k in 1..=8usize {
-            let mut at = text.len() * k / 9;
+        // Ett tecken på tio ställen i dokumentet (varje gång från den oförändrade texten): början, 25 %, mitten, 75 %,
+        // slutet av brödtexten, i en tabell, i ett stycke med fotnotsreferens, i stycket närmast fotnotsdefinitionerna
+        // och i första respektive sista fotnotsdefinitionen.
+        let word_at = |from: usize| -> usize {
             // Första tecknet i ett ord i löpande text (inte i markup eller en etikett).
+            let mut at = from.min(text.len());
             while !text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic()) {
                 at += 1;
             }
+            at
+        };
+        let first_def = text.find("\n[^1]:").unwrap_or(text.len());
+        let mut places: Vec<(&str, usize)> = vec![
+            ("början", word_at(text.len() / 50)),
+            ("25 %", word_at(text.len() / 4)),
+            ("mitten", word_at(text.len() / 2)),
+            ("75 %", word_at(text.len() * 3 / 4)),
+            ("slutet av brödtexten", word_at(first_def.saturating_sub(3000))),
+        ];
+        if let Some(t) = text[text.len() / 2..].find("\n| ") {
+            places.push(("i tabell", text.len() / 2 + t + 3));
+        }
+        if let Some(r) = text[text.len() * 2 / 5..].find("[^") {
+            places.push(("vid fotnotsreferens", text.len() * 2 / 5 + r));
+        }
+        places.push(("närmast fotnotsdefinitionerna", word_at(first_def.saturating_sub(300))));
+        if first_def < text.len() {
+            places.push(("första fotnotsdefinitionen", word_at(first_def + 10)));
+            places.push(("sista fotnotsdefinitionen", word_at(text.rfind("\n[^").unwrap_or(0) + 10)));
+        }
+        let mut times = Vec::new();
+        for (k, (name, at)) in places.iter().enumerate() {
             let mut e = text.clone();
-            e.insert(at, 'x');
+            e.insert(*at, 'x');
             frame(&mut c, &ctx, &text, 0..0);
             let t = Instant::now();
             frame(&mut c, &ctx, &e, 0..0);
             times.push(ms(t));
             stats.push(("tecken", c.stats(1)));
+            if std::env::var_os("KLADD_BENCH_VERBOSE").is_some() || std::env::var_os("KLADD_BENCH_PLACES").is_some() {
+                eprintln!("    ställe {} ({name}): {:.1} ms, återanvänd {}, skäl {}", k + 1, times.last().unwrap(), c.stats(1).reused, c.stats(1).memo_why);
+            }
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        res.push(("tangenttryck: median av 8 ställen (hela bildrutan)".into(), times[times.len() / 2]));
-        res.push(("tangenttryck: sämsta av 8 ställen".into(), times[times.len() - 1]));
+        res.push((format!("tangenttryck: median av {} ställen (hela bildrutan)", times.len()), times[times.len() / 2]));
+        res.push((format!("tangenttryck: sämsta av {} ställen", times.len()), times[times.len() - 1]));
         let _ = (&edited, &first);
         frame(&mut c, &ctx, &text, 0..0);
         let t = Instant::now();
@@ -414,6 +451,7 @@ fn bench_docx_open() {
     in_ui(&ctx, || {});
     let mut c2 = layout::Cache::default();
     let (mut frames, mut worst, mut first, mut est) = (0u32, 0.0f64, 0.0f64, 0usize);
+    let mut ests: Vec<usize> = Vec::new();
     let t_all = Instant::now();
     in_ui(&ctx, || loop {
         let t = Instant::now();
@@ -424,6 +462,7 @@ fn bench_docx_open() {
             first = d;
             est = n;
         }
+        ests.push(n);
         worst = worst.max(d);
         frames += 1;
         if !c2.partial(1) {
@@ -431,7 +470,9 @@ fn bench_docx_open() {
         }
     });
     let all_ms = ms(t_all);
-    res.push((format!("stegvis: första bildrutan (uppskattat {est} sidor)"), first));
+    res.push((format!("stegvis: första bildrutan (uppskattat {est} sidor, 0 = ingen än)"), first));
+    let spread = |v: &[usize]| v.iter().copied().filter(|n| *n > 0).fold((usize::MAX, 0), |(lo, hi), n| (lo.min(n), hi.max(n)));
+    res.push((format!("stegvis: uppskattat sidantal {:?} (sista {})", spread(&ests), ests.last().copied().unwrap_or(0)), 0.0));
     res.push((format!("stegvis: längsta bildrutan ({frames} bildrutor)"), worst));
     res.push(("stegvis: summa tills allt är utlagt".into(), all_ms));
     println!("--- {path}: {} KB markdown, {} sidor", text.len() / 1000, pages_n);
@@ -443,6 +484,41 @@ fn bench_docx_open() {
             "  {n:<18} träffar {:>6} missar {:>6} varv {} | plan {:.0} loop {:.0} concat {:.0} sidor {:.0} ms",
             s.hits, s.misses, s.varv, s.plan_ms, s.loop_ms, s.concat_ms, s.pages_ms
         );
+        println!("    återanvänd förberedelse: {}", s.reused);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bara tangenttryck i mitten av ett stort Word-dokument, många gånger (för profilering med `valgrind --tool=callgrind`):
+/// `KLADD_BENCH_DOCX=sökväg KLADD_BENCH_KEYS=antal`.
+#[test]
+#[ignore]
+fn bench_docx_keys() {
+    let Ok(path) = std::env::var("KLADD_BENCH_DOCX") else { return };
+    let n: usize = std::env::var("KLADD_BENCH_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    let bytes = std::fs::read(&path).unwrap();
+    let text = crate::docx::read(&bytes).unwrap().markdown;
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    in_ui(&ctx, || {});
+    let mut c = layout::Cache::default();
+    in_ui(&ctx, || {
+        frame(&mut c, &ctx, &text, 0..0);
+        let mut at = text.len() / 2;
+        while !text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic()) {
+            at += 1;
+        }
+        let mut e = text.clone();
+        let t = Instant::now();
+        for k in 0..n {
+            // Tecknet in och ut om vartannat: texten ändras varje bildruta.
+            if k % 2 == 0 {
+                e.insert(at, 'x');
+            } else {
+                e.remove(at);
+            }
+            frame(&mut c, &ctx, &e, 0..0);
+        }
+        eprintln!("{n} tangenttryck: {:.2} ms per bildruta", ms(t) / n as f64);
+    });
 }

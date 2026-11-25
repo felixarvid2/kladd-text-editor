@@ -125,6 +125,8 @@ pub struct State {
     lazy_boost: bool,
     lazy_hurry: bool,
     lazy_pct: Option<u32>,
+    /// Uppskattat antal sidor medan dokumentet läggs ut (`Cache::estimated_pages`).
+    lazy_total: Option<usize>,
     /// Öppen dialog "Sidinställningar".
     pub(crate) page_dlg: Option<pages::PageDialog>,
     /// Öppen dialog "Sidhuvud och sidfot".
@@ -1271,6 +1273,7 @@ impl KladdApp {
             let mut table_fmt_act: Option<super::tableops::FormatOp> = None;
             let mut col_resize: Option<(usize, Vec<usize>)> = None;
             let mut page_pos = (1usize, 1usize);
+            let mut lazy_total: Option<usize> = None;
             let mut open_hf_dlg: Option<(bool, usize)> = None;
             let mut fn_jump: Option<usize> = None;
             let mut fn_pending = self.wv.fn_pending.take();
@@ -1284,6 +1287,9 @@ impl KladdApp {
             let mut pending_track: Option<crate::review::Tracked> = None;
             let mut code_copy: Option<String> = None;
 
+            // Frigör vår referens till analysen: annars kan `Cache::state` inte uppdatera den på plats (inkrementell
+            // analys) när TextEdit lägger ut galleriet igen efter en ändring. Den hämtas om efter TextEdit.
+            drop(analysis);
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id, crate::panes::salt())).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let origin = ui.cursor().min;
@@ -1350,11 +1356,12 @@ impl KladdApp {
                 let te_rect = out.response.rect;
                 // Ofullständig utläggning: platshållarna börjar vid `lazy_row`. Syns de i fönstret fylls de i först;
                 // syns bara platshållare (hopp långt fram) läggs allt ut direkt.
-                if let Some(front) = word.lazy_row(doc_id).and_then(|r| galley.rows.get(r)).map(|r| gpos.y + r.pos.y) {
+                if let Some(front) = word.lazy_front(doc_id, &galley).map(|y| gpos.y + y) {
                     let clip = ui.clip_rect();
                     lazy_next = (clip.bottom() >= front, clip.top() >= front);
                 }
                 let text = doc.text.as_str();
+                let analysis = word.analysis(doc_id, text);
                 // Arken (med avsnitt olika stora, med spalter) från omläggningen som TextEdit just gjorde.
                 let origin_y = page_top + geom.top;
                 let mut boxes = word.page_boxes(doc_id, text);
@@ -1569,6 +1576,24 @@ impl KladdApp {
                     let page_hf = hf_plan.page(&hf_pages, k, &hf_fields);
                     if let Some(footer) = super::headers::header_footer(ui, p, &geom.for_page(b), sheet, k, &page_hf, &analysis.defaults, hf_font.clone(), &|b, i| font_family(Some(analysis.defaults.font()), b, i), doc_id, z, &hf_imgs) {
                         open_hf_dlg = Some((footer, k));
+                    }
+                }
+                // Sidor som ännu bara är platshållare (stegvis utläggning): en diskret markering i stället för ett tomt ark.
+                if let Some(front) = word.lazy_front(doc_id, &galley).map(|y| gpos.y + y) {
+                    let label = t("Läggs ut…");
+                    for b in boxes.iter() {
+                        let sheet = b.rect(page_left, origin_y);
+                        let top = sheet.top().max(front);
+                        if sheet.bottom() < clip.top() || sheet.top() > clip.bottom() || sheet.bottom() - top < 48.0 {
+                            continue;
+                        }
+                        ui.painter().text(
+                            pos2(sheet.center().x, (top + sheet.bottom()) / 2.0),
+                            egui::Align2::CENTER_CENTER,
+                            &label,
+                            FontId::proportional(15.0 * z.max(0.6)),
+                            p.page_muted.gamma_multiply(0.7),
+                        );
                     }
                 }
                 // Fotnoterna längst ned på sina sidor.
@@ -1887,6 +1912,8 @@ impl KladdApp {
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
                 page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
+                // Under stegvis utläggning är platshållarnas sidantal för ryckigt: räkna upp från det utlagda i stället.
+                lazy_total = word.estimated_pages(doc_id, text.len(), &galley, &boxes);
 
                 // Röd våglinje under felstavade ord.
                 if !misspelled.is_empty() {
@@ -2076,6 +2103,7 @@ impl KladdApp {
                 self.wv.lazy_frames = self.wv.lazy_frames.saturating_add(1);
                 (self.wv.lazy_boost, self.wv.lazy_hurry) = lazy_next;
                 self.wv.lazy_pct = Some((self.word.progress(doc_id) * 100.0) as u32);
+                self.wv.lazy_total = lazy_total;
                 ctx.request_repaint();
             } else {
                 self.wv.lazy_frames = 0;
@@ -2310,7 +2338,10 @@ impl KladdApp {
                 }
             }
             match self.wv.lazy_pct {
-                Some(pct) => label(ui, tf!("Sida {cur} av ca {total} (lägger ut dokumentet: {pct} %)", cur = cur, total = total, pct = pct)),
+                Some(pct) => match self.wv.lazy_total {
+                    Some(total) => label(ui, tf!("Sida {cur} av ca {total} (lägger ut dokumentet: {pct} %)", cur = cur.min(total), total = total, pct = pct)),
+                    None => label(ui, tf!("Sida {cur} (lägger ut dokumentet: {pct} %)", cur = cur, pct = pct)),
+                },
                 None => label(ui, tf!("Sida {cur} av {total}", cur = cur, total = total)),
             }
         });
