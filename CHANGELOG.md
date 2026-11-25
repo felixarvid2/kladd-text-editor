@@ -16,6 +16,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ### Rättat
 
+- **Sökningen i PDF-visaren kunde hoppa till fel träff.** Sidornas text läses in i godtycklig ordning, och den första träffen valdes bland de sidor som råkade vara genomsökta, så en träff på sidan 3 kunde bli aktuell före träffarna på sidan 1. Nu väntar hoppet tills alla sidor fram till träffen är genomsökta.
 - **Den inkrementella analysen användes aldrig i dokumentläget i appen.** Bildrutan höll en referens till analysen medan TextEdit lade ut galleriet efter en ändring, så analysen kunde inte uppdateras på plats och hela texten tolkades om vid varje tangent (80–185 ms i debug för 400 sidor). Mätverktygen hade ingen sådan referens och visade det aldrig. Referensen släpps nu före TextEdit.
 
 ## [2.6.1] – 2026-11-23
