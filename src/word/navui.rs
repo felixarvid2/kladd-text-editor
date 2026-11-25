@@ -34,6 +34,22 @@ pub struct State {
     shown: Option<((u64, usize, String, u64), Arc<Vec<usize>>)>,
     /// Räknas upp när en rubrik fälls ihop eller ut.
     collapse_gen: u64,
+    /// Öppen dialog "Infoga innehållsförteckning".
+    pub toc_dlg: Option<TocDialog>,
+}
+
+/// Dialogens val: vad förteckningen listar och, för rubriker, vilka nivåer.
+pub struct TocDialog {
+    kind: nav::TocKind,
+    min: u8,
+    max: u8,
+}
+
+impl Default for TocDialog {
+    fn default() -> Self {
+        let d = nav::TocSpec::default();
+        Self { kind: d.kind, min: d.min, max: d.max }
+    }
 }
 
 const ROW_H: f32 = 26.0;
@@ -110,9 +126,71 @@ impl KladdApp {
         ctx.request_repaint();
     }
 
-    /// Infogar en innehållsförteckning vid markören.
-    pub(crate) fn insert_toc(&mut self, ctx: &egui::Context) {
-        self.word_edit(ctx, |t, s| nav::insert_toc(t, s.end));
+    /// Infoga → Innehållsförteckning: öppnar dialogen där nivåerna (eller en figur- och tabellförteckning) väljs.
+    pub(crate) fn insert_toc(&mut self, _ctx: &egui::Context) {
+        self.nav.toc_dlg = Some(TocDialog::default());
+    }
+
+    /// Dialogen "Infoga innehållsförteckning": slag och rubriknivåer; OK sätter in förteckningen vid markören.
+    pub(crate) fn toc_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(d) = self.nav.toc_dlg.as_mut() else { return };
+        let mut ok = None;
+        let modal = egui::Modal::new(Id::unique("kladd-toc-dialog"))
+            .backdrop_color(egui::Color32::from_black_alpha(if p.dark { 140 } else { 70 }))
+            .frame(
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.line))
+                    .corner_radius(14)
+                    .inner_margin(Margin::same(24))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(egui::RichText::new(t("Infoga innehållsförteckning")).font(FontId::new(17.0, theme::semibold())).color(p.text));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    for (k, name) in [(nav::TocKind::Headings, t("Innehåll")), (nav::TocKind::Figures, t("Figurer")), (nav::TocKind::Tables, t("Tabeller"))] {
+                        ui.selectable_value(&mut d.kind, k, name);
+                    }
+                });
+                ui.add_space(8.0);
+                if d.kind == nav::TocKind::Headings {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(t("Rubriknivåer")).color(p.muted));
+                        ui.add(egui::DragValue::new(&mut d.min).range(1..=6).speed(0.1));
+                        ui.label(egui::RichText::new(t("till")).color(p.muted));
+                        ui.add(egui::DragValue::new(&mut d.max).range(1..=6).speed(0.1));
+                    });
+                    d.max = d.max.max(d.min);
+                    d.min = d.min.min(d.max);
+                } else {
+                    ui.label(egui::RichText::new(t("Bildtexter som börjar med “Figur 1” eller “Tabell 1” tas med.")).color(p.muted).size(12.5));
+                }
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let b = egui::Button::new(egui::RichText::new(t("Infoga")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
+                        .fill(p.accent)
+                        .stroke(Stroke::NONE)
+                        .min_size(vec2(84.0, 32.0));
+                    if ui.add(b).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        ok = Some(true);
+                    }
+                    if ui.add(crate::app::quiet_button(t("Avbryt"), p).min_size(vec2(0.0, 32.0))).clicked() {
+                        ok = Some(false);
+                    }
+                });
+            });
+        if modal.should_close() && ok.is_none() {
+            ok = Some(false);
+        }
+        let Some(ok) = ok else { return };
+        let Some(d) = self.nav.toc_dlg.take() else { return };
+        if ok {
+            let spec = nav::TocSpec { min: d.min, max: d.max, kind: d.kind };
+            self.word_edit(ctx, |t, s| nav::insert_toc_spec(t, s.end, &spec));
+        }
     }
 
     /// Navigeringsfönstret: vänster sidopanel med rubrikerna som ett träd.
@@ -287,20 +365,23 @@ pub fn paint_toc(
     entries: &[&Heading],
     pages: &[usize],
     shown: usize,
+    heading: &'static str,
 ) -> Option<usize> {
     let (title_h, row_h, _) = nav::toc_metrics(z, d);
     let painter = ui.painter().clone();
     let title = FontId::new(px(z, 18.0), family(true));
-    painter.text(pos2(rect.left(), rect.top() + px(z, 2.0)), Align2::LEFT_TOP, "Innehåll", title, p.page_heading1);
+    painter.text(pos2(rect.left(), rect.top() + px(z, 2.0)), Align2::LEFT_TOP, t(heading), title, p.page_heading1);
     let size = px(z, d.size());
     let font = FontId::new(size, family(false));
     let mut y = rect.top() + title_h;
     if entries.is_empty() {
-        painter.text(pos2(rect.left(), y), Align2::LEFT_TOP, t("Inga rubriker i dokumentet"), font, p.page_muted);
+        painter.text(pos2(rect.left(), y), Align2::LEFT_TOP, t(if heading == "Innehåll" { "Inga rubriker i dokumentet" } else { "Inga poster i förteckningen" }), font, p.page_muted);
         return None;
     }
     let dot_w = painter.layout_no_wrap(". ".into(), font.clone(), Color32::WHITE).size().x.max(1.0);
     let mut clicked = None;
+    // Indraget räknas från den översta nivån som finns med (Words `TOC 2` osv. lämnas som de är i .docx).
+    let top_level = entries.iter().map(|h| h.level).min().unwrap_or(1);
     for (i, h) in entries.iter().take(shown).enumerate() {
         let row = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), row_h));
         y += row_h;
@@ -310,7 +391,7 @@ pub fn paint_toc(
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         let color: Color32 = if hovered { p.page_link } else { p.page_text };
-        let x = row.left() + f32::from(h.level - 1) * px(z, 14.0);
+        let x = row.left() + f32::from(h.level - top_level) * px(z, 14.0);
         let num = pages.get(i).map_or(String::new(), |n| n.to_string());
         let num_g = painter.layout_no_wrap(num, font.clone(), color);
         let mut job = LayoutJob::simple_singleline(h.text.clone(), font.clone(), color);

@@ -549,7 +549,7 @@ fn parse(text: &str) -> Parsed {
                     } else if super::pbox::parse_empty(t).is_some() {
                         // Tomt stycke (`<!--k:ep-->`): dold rad med ett styckes höjd, se `pbox`.
                         fill(&mut st, tr, |s| s.markup = true);
-                    } else if t == super::nav::TOC_LINE || super::tablefmt::is_comment(t) || crate::docx_tbox::is_mark(t) {
+                    } else if super::nav::is_toc_line(t) || super::tablefmt::is_comment(t) || crate::docx_tbox::is_mark(t) {
                         // Innehållsförteckningen (en dold rad som dokumentläget ersätter med rubrikerna)
                         // och tabellformatet före en tabell: dolda rader.
                         fill(&mut st, tr, |s| s.markup = true);

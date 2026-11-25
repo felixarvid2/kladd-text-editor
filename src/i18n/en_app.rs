@@ -123,7 +123,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Snabböppna…", "Quick Open…"),
     ("Stäng flik", "Close Tab"),
     ("Infoga bild…", "Insert Image…"),
-    ("Infoga innehållsförteckning", "Insert Table of Contents"),
+    ("Infoga innehållsförteckning…", "Insert Table of Contents…"),
     ("Sök", "Find"),
     ("Sök och ersätt", "Find and Replace"),
     ("Sök i filer…", "Find in Files…"),

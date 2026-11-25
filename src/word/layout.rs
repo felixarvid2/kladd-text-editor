@@ -2177,8 +2177,8 @@ fn paragraphs_in(text: &str, a: &Analysis, p: &Params, win: Option<Range<usize>>
     // 0 = vanligt stycke, 1 = dold öppningstagg/kommentar, 2 = dold stängningstagg.
     let mut tag: Vec<u8> = Vec::new();
     let mut out: Vec<Para> = Vec::new();
-    // Innehållsförteckningens höjd räknas först när en sådan rad hittas (beror på rubrikerna).
-    let mut toc_h: Option<f32> = None;
+    // Innehållsförteckningens höjd räknas först när en sådan rad hittas (beror på rubrikerna; en rad per förteckning).
+    let mut toc_heads: Option<Vec<super::nav::Heading>> = None;
     // Formatmallarnas "luft efter" per stycke, flyttas till nästa synliga stycke nedan.
     let mut after: Vec<f32> = Vec::new();
     loop {
@@ -2278,13 +2278,13 @@ fn paragraphs_in(text: &str, a: &Analysis, p: &Params, win: Option<Range<usize>>
             }
         }
         let collapse = tag.last() != Some(&0) || float.is_some_and(|f| f.alone);
-        let toc = if tag.last() != Some(&0) && t == super::nav::TOC_LINE {
-            Some(*toc_h.get_or_insert_with(|| {
-                let n = super::nav::toc_entries(&super::nav::headings(text, a)).len();
-                super::nav::toc_size_for(p.zoom, &a.defaults, n).1
-            }))
-        } else {
-            None
+        let toc = match super::nav::parse_toc(t).filter(|_| tag.last() != Some(&0)) {
+            Some(spec) => {
+                let heads = toc_heads.get_or_insert_with(|| super::nav::headings(text, a));
+                let n = super::nav::toc_items(text, heads, &spec).len();
+                Some(super::nav::toc_size_for(p.zoom, &a.defaults, n).1)
+            }
+            None => None,
         };
         let col_break = super::sections::is_column_break(t);
         let page_break = super::sections::is_page_break(t);
@@ -3068,6 +3068,10 @@ pub fn layout_galley_full(
 #[cfg(test)]
 #[path = "pbox_layout_tests.rs"]
 mod pbox_layout_tests;
+
+#[cfg(test)]
+#[path = "toc_pages_tests.rs"]
+mod toc_pages_tests;
 
 #[cfg(test)]
 mod tests {

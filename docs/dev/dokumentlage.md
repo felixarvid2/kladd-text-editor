@@ -428,12 +428,30 @@ Gemensamma format (alla moduler ska använda dessa):
     `fo:clip` (96 dpi antas). PDF: samma regler (`Layout::anchored_image`), beskärning med klippning.
   - Flytt med musen: dra i bildens mitt (inte ett handtag); `images::Act::Move` utförs via
     `word_edit` (ett ångra-steg). Esc och släpp utanför arken avbryter.
-- **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`. Dokumentläget ritar rubrikerna med
-  sidnummer (klickbara); Word skriver ett TOC-fält, ODT `text:table-of-content`, PDF/HTML/EPUB en
-  lista med rubrikerna.
-  Dokumentläget reserverar raden (`Para::toc_h`, höjd efter antalet H1–H3-rubriker, högst en sida)
-  och ritar posterna ovanpå (`navui::paint_toc`); sidnumret är rubrikens sida i det redan
-  sidbrutna galleriet, så en passage räcker. PDF gör två passager (`pdf_write::lay_out`).
+- **Innehållsförteckning**: en egen rad `<!-- kladd: toc -->`, med val `<!-- kladd: toc; levels: 2-4 -->` (rubriknivåer,
+  standard 1–3) eller `<!-- kladd: toc; kind: figures|tables -->` (figur- och tabellförteckning ur bildtexter, se
+  nedan); `nav::TocSpec` tolkar och skriver raden (`parse_toc`, `TocSpec::line`) och `nav::toc_items` ger posterna.
+  Dokumentläget ritar posterna med punktlinjer och sidnummer (klickbara); Word skriver ett TOC-fält
+  (`\o "A-B" \h \z \u`, för bildtexter `\h \z \c "Figur"`; `TocSpec::field_code`/`from_field_code`), ODT
+  `text:table-of-content` (`text:outline-level` = högsta nivån; `text:illustration-index`/`text:table-index` för
+  bildtexter), PDF punktlinjer och länkar, HTML/EPUB en nästlad lista.
+  Dokumentläget reserverar raden (`Para::toc_h`, höjd efter antalet poster, högst en sida)
+  och ritar posterna ovanpå (`navui::paint_toc`, en gång per förteckning med eget val); sidnumret är postens sida i det redan
+  sidbrutna galleriet, så en passage räcker. Ändras rubrikerna räknas höjden om (`layout_memo::toc_count` summerar
+  posterna i alla förteckningar), och sidnumren följer med utan egen cache. PDF gör två passager (`pdf_write::lay_out`);
+  bildtexter ("Figur 1: …", "Tabell 2. …", `nav::caption_kind`) förs då in bland rubrikerna med nivå `FIGURE_LEVEL`/`TABLE_LEVEL`.
+  Docx och odt får sina sidnummer ur samma utläggning (`pdf_write::toc_laid_pages` + `toc_pages_of`); ett Word-dokument
+  visar de sparade numren tills fältet uppdateras (F9), så `w:updateFields` (som ger frågan "uppdatera fält?" vid varje
+  öppning) skrivs bara när utläggningen inte gick att para ihop med posterna (`TOC_STALE_TAG`). Sidbrytningarna i
+  Word kan ge andra tal än Kladds utläggning när typsnitt eller radbrytningar skiljer; F9 i Word rättar det.
+  PDF-utläggningen (`pdf_write`) har samma vertikala mått som dokumentläget (Carlito, radhöjd 1,4/1,3, rubrikstorlekar
+  18/15/13/12/11 pt, 8 pt blankrad (`PARA_GAP`), `px_round`: raderna på hela bildpunkter, förteckningen som en rad enligt
+  `nav::toc_size`, `para_gap` lägger en blankrad som inte ryms överst på nästa sida). `word/toc_pages_tests.rs` jämför
+  rubrikernas sidor i vyn med `toc_laid_pages` (flera förteckningar, sidbrytningar, `gen-skolrapport`, olika teckenstorlekar).
+  Kända avvikelser: typsnitt som inte följer med (Georgia …), tabeller, bilder och dolda rader (avsnitt, sidbrytningar) har
+  inte kontrollerats rad för rad.
+  En förteckning i ett öppnat .docx behåller sitt XML tills rubrikerna ändras (enhetsnyckeln innehåller en kontrollsumma
+  över posterna, `docx::toc_unit_key`), då skrivs den om. Infoga → Innehållsförteckning… öppnar `navui::TocDialog`.
 - **Navigeringsfönster** (`word::nav`, `word::navui`): rubriker ur den cachade analysen
   (`layout::Cache::headings`, dokumentläget) eller en radskanning (`nav::headings_scan`, textläget)
   som görs om bara när texten ändrats.
@@ -1014,5 +1032,14 @@ vektorbild (`mermaid::image`/`resolve`, bildkälla `mermaid:<nyckel>`), och doku
 koden: vyn lägger diagrammets storlek bland bildstorlekarna (nyckel `Block::diagram_key`), `layout::build_sections`
 döljer blockets text och låter första tecknet reservera höjden, resten av raderna kollapsar och `codeui` ritar bilden.
 Står markören i blocket visas koden (som med bilder och formler). Ett block som inte går att rita står kvar som kod.
-`.docx`, `.odt`, HTML och EPUB behåller ```` ```mermaid ```` som kodblock (HTML/EPUB med `language-mermaid`).
+**Exporterna** skriver ett ritbart block som bild, med koden kvar så att det läses tillbaka som ```` ```mermaid ````:
+- `.docx` (`docx::Writer::picture`, anrop i `TagEnd::CodeBlock`): Word 2016+-bild, PNG-reserv i `a:blip` och SVG-filen i
+  `asvg:svgBlip` (`word/media/imageN.svg`), storlek som SVG:ns egen (begränsad till spaltbredden). Koden ligger i
+  `wp:docPr`/`pic:cNvPr` `descr` som `kladd-mermaid⏎<kod>` (radbrytningar som `&#10;`); `descr` överlever Word. Läsningen
+  (`docx::mermaid_code`) gör ett stycke som bara är en sådan bild till ett ```` ```mermaid ````-block och ändrar enhetens
+  beskrivning till `c|left`, så att orörda stycken sparas byte för byte som kodblock. Äldre läsare ser en vanlig bild.
+- `.odt` (`odt::W::image`, `TagEnd::CodeBlock`): `draw:frame` med SVG + PNG-reserv (som SVG-bilder) och koden i `svg:desc`
+  (samma prefix). Läsningen (`frame` + `emit`) gör ramen till ett kodblock (`MERMAID_MARK`).
+- HTML/EPUB (`export::map_events`): `<img src="mermaid:<nyckel>" data-mermaid="<kod>">`; bilden blir en SVG-data-URI i HTML
+  och `images/imgN.svg` i EPUB. Allt skrivs med ljust tema. Ett block som inte går att rita står kvar som kod (`language-mermaid`).
 

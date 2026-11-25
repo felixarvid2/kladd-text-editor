@@ -87,7 +87,7 @@ fn same_para(a: &Para, b: &Para) -> bool {
 }
 
 fn toc_count(text: &str, a: &Analysis) -> usize {
-    crate::word::nav::toc_entries(&crate::word::nav::headings(text, a)).len()
+    crate::word::nav::toc_total(text, &crate::word::nav::headings(text, a))
 }
 
 /// Bygger allt från grunden.

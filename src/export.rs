@@ -26,7 +26,8 @@ use crate::style::DocDefaults;
 use crate::word::markup;
 
 /// Platshållare för innehållsförteckningen medan texten byggs.
-const TOC_MARK: &str = "<!--kladd-toc-->";
+/// Platshållare för en innehållsförteckning (`<!--kladd-toc:MIN:MAX-->`), ersatt när rubrikerna är kända.
+const TOC_MARK: &str = "<!--kladd-toc:";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -267,7 +268,8 @@ impl<'r> Images<'r> {
             // Fjärrbilder och data-URI:er följer med i HTML; en e-bok ska vara självständig.
             return (self.mode == Mode::Html).then(|| raw.to_owned());
         }
-        let img = (self.resolve)(raw)?;
+        // Mermaid-diagram är bilder som ritats av Kladd själv (se `mermaid`).
+        let img = crate::mermaid::resolve(raw).or_else(|| (self.resolve)(raw))?;
         // SVG behåller sin vektorfil (data-URI i HTML, `images/imgN.svg` i EPUB), inte PNG-rastret.
         let (mut bytes, mut media, mut ext) = match &img.svg {
             Some(svg) => (svg.data.clone(), "image/svg+xml", "svg"),
@@ -439,7 +441,15 @@ fn map_events<'a>(
                     pulldown_cmark::CodeBlockKind::Fenced(info) => crate::codehl::lang_of(info),
                     pulldown_cmark::CodeBlockKind::Indented => String::new(),
                 };
-                out.push(Event::Html(CowStr::from(code_html(&lang, &code))));
+                // ```mermaid som SVG-bild (`<img>` med koden i `data-mermaid`) när det går att rita, annars som kod.
+                let diagram = crate::mermaid::is_lang(&lang).then(|| crate::mermaid::image(&code)).flatten();
+                match diagram {
+                    Some(key) => out.push(Event::Html(CowStr::from(format!(
+                        "<p align=\"center\"><img src=\"{key}\" alt=\"Diagram\" data-mermaid=\"{}\" /></p>\n",
+                        esc_attr(code.trim_end_matches('\n'))
+                    )))),
+                    None => out.push(Event::Html(CowStr::from(code_html(&lang, &code)))),
+                }
                 i = end + 1;
                 continue;
             }
@@ -496,9 +506,17 @@ fn map_events<'a>(
                 ))));
             }
             Event::Html(t) => {
-                let inner = t.trim().strip_prefix("<!--").and_then(|s| s.strip_suffix("-->")).map(str::trim);
-                if inner == Some("kladd: toc") {
-                    out.push(Event::Html(CowStr::from(format!("{TOC_MARK}\n"))));
+                if let Some(spec) = crate::word::nav::parse_toc(t.trim()) {
+                    use crate::word::nav::TocKind;
+                    let html = match spec.kind {
+                        TocKind::Headings => format!("{TOC_MARK}{}:{}-->\n", spec.min, spec.max),
+                        // Figur- och tabellförteckning: bildtexterna som en lista (utan sidnummer).
+                        kind => {
+                            let items: String = crate::word::nav::captions(src, kind).iter().map(|c| format!("<li>{}</li>", esc(&c.text))).collect();
+                            if items.is_empty() { String::new() } else { format!("<nav class=\"toc\"><p>{}</p><ul>{items}</ul></nav>\n", spec.title()) }
+                        }
+                    };
+                    out.push(Event::Html(CowStr::from(html)));
                 } else {
                     out.push(ev.clone());
                 }
@@ -875,8 +893,10 @@ fn render_chunk(
         html.push_str(&format!("<section class=\"footnotes\"{epub}>\n{foot}</section>\n"));
     }
 
-    if html.contains(TOC_MARK) {
-        html = html.replace(TOC_MARK, &toc_html(m, lay));
+    while let Some(at) = html.find(TOC_MARK) {
+        let end = html[at..].find("-->").map_or(html.len(), |e| at + e + 3);
+        let spec = html[at + TOC_MARK.len()..end.saturating_sub(3).max(at + TOC_MARK.len())].split_once(':').and_then(|(a, b)| Some((a.parse::<u8>().ok()?, b.parse::<u8>().ok()?)));
+        html.replace_range(at..end, &toc_html(m, lay, spec.unwrap_or((1, 3))));
     }
     for n in 1..=m.notes.len() {
         let key = format!("@@FN{n}@@");
@@ -889,11 +909,11 @@ fn render_chunk(
     fixer.process(&html, imgs)
 }
 
-fn toc_html(m: &Model, lay: &Layout) -> String {
+fn toc_html(m: &Model, lay: &Layout, (min, max): (u8, u8)) -> String {
     let items: Vec<(u8, String, String)> = m
         .headings
         .iter()
-        .filter(|h| !h.text.is_empty())
+        .filter(|h| !h.text.is_empty() && (min..=max).contains(&h.level))
         .map(|h| (h.level, esc(&h.text), format!("{}#{}", lay.file(h.chapter), h.id)))
         .collect();
     if items.is_empty() {
@@ -1288,7 +1308,8 @@ fn esc(s: &str) -> String {
 }
 
 fn esc_attr(s: &str) -> String {
-    esc(s).replace('"', "&quot;")
+    // Radbrytningar som teckenreferens, annars blir de blanksteg när attributet läses (XML).
+    esc(s).replace('"', "&quot;").replace('\r', "").replace('\n', "&#10;")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1695,6 +1716,37 @@ Slut & tecken < 5. Se [länk](https://exempel.se?a=1&b=2).\n\n\
         let c3 = String::from_utf8_lossy(&files["OEBPS/chapter-3.xhtml"]).into_owned();
         assert!(c3.contains("&amp;b=2") && c3.contains("&lt; 5"), "{c3}");
         assert_eq!(w.missing_images.len(), 1, "{:?}", w.missing_images);
+    }
+
+    const MERMAID_MD: &str = "# Kapitel\n\n```mermaid\ngraph TD\n    A[Start] --> B{Klart?}\n```\n\n```mermaid\ninte ett diagram\n```\n";
+
+    #[test]
+    fn mermaid_becomes_svg_image_with_code_in_data_attribute() {
+        // HTML: SVG som data-URI.
+        let w = html(MERMAID_MD, "x", &resolve).unwrap();
+        let h = String::from_utf8_lossy(&w.bytes).into_owned();
+        assert!(h.contains("src=\"data:image/svg+xml;base64,"), "{h}");
+        assert!(h.contains("data-mermaid=\"graph TD&#10;    A[Start] --&gt; B{Klart?}\""), "{h}");
+        assert!(h.contains("inte ett diagram") && h.contains("<pre>"), "det som inte går att rita är kvar som kod");
+        // EPUB: SVG-fil i images/, och sidan är välformad.
+        let w = epub(MERMAID_MD, "x", &resolve).unwrap();
+        let (_, files) = unzip(&w.bytes);
+        let svg = files.iter().find(|(n, _)| n.starts_with("OEBPS/images/") && n.ends_with(".svg")).expect("SVG-fil");
+        assert!(String::from_utf8_lossy(svg.1).contains("<svg"));
+        let c = String::from_utf8_lossy(&files["OEBPS/chapter-1.xhtml"]).into_owned();
+        assert!(c.contains("src=\"images/img1.svg\"") && c.contains("data-mermaid=\""), "{c}");
+        well_formed("OEBPS/chapter-1.xhtml", &files["OEBPS/chapter-1.xhtml"]);
+        let manifest = String::from_utf8_lossy(&files["OEBPS/content.opf"]).into_owned();
+        assert!(manifest.contains("image/svg+xml"), "{manifest}");
+    }
+
+    #[test]
+    fn toc_in_html_honours_levels_and_lists_captions() {
+        let md = "# Ett\n\n<!-- kladd: toc; levels: 2-3 -->\n\n<!-- kladd: toc; kind: figures -->\n\n## Två\n\n### Tre\n\n#### Fyra\n\nFigur 1: En bild\n";
+        let h = String::from_utf8_lossy(&html(md, "x", &resolve).unwrap().bytes).into_owned();
+        let toc = &h[h.find("<nav class=\"toc\">").unwrap()..h.find("</nav>").unwrap()];
+        assert!(toc.contains(">Två</a>") && toc.contains(">Tre</a>") && !toc.contains("Ett") && !toc.contains("Fyra"), "{toc}");
+        assert!(h.contains("<p>Figurförteckning</p><ul><li>Figur 1: En bild</li></ul>"), "{h}");
     }
 
     #[test]

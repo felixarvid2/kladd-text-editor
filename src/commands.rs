@@ -406,7 +406,7 @@ pub static ALL: &[Command] = &[
     Command::new("view.pdf_reload", "Läs om från disk", View, "", |e| e.pdf, |a, c| a.pdf_action(c, PdfAction::Reload)).scope(Scope::Pdf),
     // ---------------------------------------------------------------- Infoga
     Command::new("insert.image", "Infoga bild…", Insert, "Ctrl+Shift+I", |e| e.has_doc && !e.pdf, |a, c| a.request_insert_image(c)),
-    Command::new("insert.toc", "Infoga innehållsförteckning", Insert, "", |e| e.markdown && !e.pdf, |a, c| a.insert_toc(c)),
+    Command::new("insert.toc", "Infoga innehållsförteckning…", Insert, "", |e| e.markdown && !e.pdf, |a, c| a.insert_toc(c)),
     Command::new("insert.table", "Infoga tabell", Insert, "", |e| e.word, |a, c| a.word_edit(c, |t, s| markup::insert_table(t, s.end))).scope(Scope::Word),
     Command::new("insert.footnote", "Infoga fotnot", Insert, "Ctrl+Alt+F", |e| e.word, |a, c| a.word_footnote(c)).scope(Scope::Word),
     Command::new("insert.equation", "Ekvation", Insert, "", |e| e.word, |a, c| a.word_edit(c, |t, s| {
