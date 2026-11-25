@@ -2,6 +2,7 @@
 //! knappar via etikett i AccessKit-trädet. Ingen GPU, inget fönster och inga anrop mot nätet.
 //! Så skriver man ett test: `docs/dev/gransnittstester.md`.
 
+mod epub;
 mod harness;
 mod pdf;
 mod text;

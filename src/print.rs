@@ -258,6 +258,11 @@ impl KladdApp {
         if self.docs.is_empty() || self.print.dialog.is_some() {
             return;
         }
+        // En bok har ingen text att skriva ut; kopian gör det.
+        if self.epub_mode() {
+            self.notify(ctx, crate::i18n::t("Boken kan inte skrivas ut. Använd Redigera en kopia."), false);
+            return;
+        }
         self.print.dialog = Some(PrintDialog::new(ctx));
     }
 

@@ -10,7 +10,7 @@ Den fullständiga beskrivningen av Kladds funktioner. En kort översikt finns i 
 - **Versionshistorik** – varje sparning lagrar en version (gallras automatiskt). *Arkiv → Versionshistorik…* jämför med aktuell text och kan återställa en version eller öppna den i en ny flik.
 - **Mallar** – *Ny från mall…* (`Ctrl+Shift+N`) visar ett galleri med brev, rapport, mötesprotokoll, dagordning, CV, faktura, uppsats, anteckningar, README och tomma sidor, på svenska eller engelska. `{{platshållare}}` som namn och datum fylls i i ett formulär. *Spara som mall…* gör det aktuella dokumentet till en egen mall (under *Mina mallar*, i datakatalogens `mallar/`), och en .docx eller .odt kan importeras som mall. De inbyggda ligger som filer i `assets/templates/`.
 - **Vim-läge** – *Vim-läge* i huvudmenyn ger Vim-tangentbindningar i textläget (av som standard; inte i dokumentläget eller PDF). Lägena normal, infoga, markera (tecken, rad, block), ersätt och kommandorad (`:`), med antal, operatorer (`d c y > < gu gU ~`) och rörelser, textobjekt (`iw aw ip ap i" a" i( a( i[ i{ it` m.fl.), register (`"a`–`"z`, `"+` för urklipp), markeringar, `.`, ångra/gör om, sökning (`/ ? n N * #`) och makron (`q`/`@`). Kommandoraden har `:w :q :wq :x :q! :e fil`, `:s` och `:%s` med Rusts reguljära uttryck, `:<rad>`, `:set nu/nonu/wrap/nowrap`, `:noh` och `:sp`/`:vs` (delad vy). Blockmarkör i normalläget, läget och väntande kommando visas i statusraden. Kladds Ctrl-genvägar fungerar som vanligt utom de Vim använder i normalläget (`Ctrl+d`, `u`, `r`, `v`, `o`). Flera markörer är avstängda medan Vim-läget är på.
-- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), många kodformat och PDF. PDF:er visas i en PDF-visare, se [PDF](#pdf).
+- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), många kodformat och PDF. PDF:er visas i en PDF-visare, se [PDF](#pdf). E-böcker (`.epub`) öppnas i ett läsläge, se [EPUB](#epub).
 - **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
 - **Förlustfri Word-sparning** – Word-filer sparas med alla sina delar kvar, se [Word-dokument](#word-dokument).
@@ -284,6 +284,41 @@ En PDF är byggd för utskrift, inte för redigering. När du sparar en PDF som 
 
 Läsningen bygger på samma metoder som [PdfCraft](https://github.com/storytold/pdfcraft) och skrivningen på samma upplägg som [WordCraft](https://github.com/storytold/wordcraft) (båda MIT/Apache-2.0), med [lopdf](https://crates.io/crates/lopdf) och [krilla](https://crates.io/crates/krilla). Sidorna i PDF-visaren renderas med [hayro](https://github.com/LaurenzV/hayro) (MIT/Apache-2.0).
 
+## EPUB
+
+En `.epub` öppnas i ett läsläge för bara läsning, med ett gränssnitt som liknar andra e-boksläsare. Fliken heter bokens titel (filnamnet står som verktygstips) och boken öppnas där du slutade läsa; första gången står den vid början, där omslaget visas skalat så att det får plats i fönstret. Stora böcker läses in i bakgrunden med förlopp. Kopieringsskyddade böcker (DRM från Adobe eller Apple) går inte att öppna och ger felet *Boken är kopieringsskyddad (DRM) och kan inte öppnas*; typsnittsobfuskering räknas inte som skydd.
+
+**Läsytan.** Texten står i en centrerad spalt (cirka 70 tecken) med serifftypsnitt och luftiga marginaler. Kapitlen ritas ett i taget; är ett kapitel mycket långt delas det vid styckegränser och *Fortsätt ›* längst ner går vidare. I slutet av ett kapitel står *Nästa kapitel: …*. Rubriker, stycken, fet och kursiv text, länkar, bilder (aldrig uppskalade; SVG-bilder och SVG-omslag visas), listor (också nästlade), citat, kodblock, tabeller, linjer, upphöjd och nedsänkt text och definitionslistor visas; förlagets typsnitt och CSS används inte (Kladds typografi gäller). Längst upp står bokens och kapitlets titel (klicka för *Om boken*) och knapparna *Aa* och *Redigera en kopia*. Längst ner visar en tunn framstegslinje var du är, med streck vid kapitelgränserna (hovra för kapitlets namn, klicka för att hoppa dit, klicka mellan strecken för att hoppa i boken), *Kapitel 7 av 24 · 42 %* till vänster och *ca 9 min kvar i kapitlet* (230 ord i minuten) till höger. Statusraden visar *Bara läsning*, kapitlet, procent av boken och textstorleken.
+
+**Innehållsförteckning.** Den ligger i sidopanelen (`Ctrl+Skift+O`, samma som navigeringsfönstret för dokument): bokens egen förteckning (EPUB 3 `nav` eller EPUB 2 `toc.ncx`) nästlad efter nivå, med aktuell post markerad och inrullad; saknas den används kapitlens rubriker. Ett klick hoppar dit. Filer i bokens läsordning som är markerade `linear="no"` hoppas över i läsflödet men går att nå via länkar och förteckningen.
+
+**Länkar och fotnoter.** Länkar inom boken hoppar dit; `Alt+Vänster` går tillbaka och `Alt+Höger` framåt. Länkar utanför boken öppnas i webbläsaren. Ett klick på en fotnotsreferens (`epub:type="noteref"` eller en liten upphöjd siffra som länkar till en not) visar noten i en liten ruta med *Gå till noten* (och `Esc` stänger den); *Tillbaka* går då tillbaka dit du läste.
+
+**Sök.** `Ctrl+F` söker i alla kapitel. Fältet visar *träff av antal*, `Enter`/`Skift+Enter` (och `F3`/`Skift+F3`) går mellan träffarna även över kapitelgränser, träfflistan visar kapitel och sammanhang och ett klick hoppar dit, och träffarna markeras i texten. *Aa*-knappen i fältet (`Skilj på stora och små bokstäver`) gäller sökningen.
+
+**Typografi (Aa).** Textstorlek (`Ctrl++`, `Ctrl+-`, `Ctrl+0` för standard), typsnitt (Serif eller Sans), radavstånd (Kompakt, Normal, Luftig), spaltbredd (Smal, Normal, Bred) och sidfärg (Auto följer temat, Ljus, Sepia, Mörk) sparas i inställningarna och gäller alla böcker. Justerad text och förlagets typsnitt stöds inte än.
+
+**Om boken** (`Ctrl+I`, eller klicka på titeln): omslag, titel, författare, förlag, språk, utgivningsdatum, beskrivning, antal kapitel och ord samt uppskattad lästid.
+
+**Redigera en kopia** öppnar bokens text som ett nytt, osparat dokument (i dokumentläget, som *Redigera* för PDF) med bilderna med och bokens titel och författare överst. Boken själv ändras aldrig och sparas aldrig: *Spara* i boken visar ett meddelande, och i kopian kan du *Spara som* `.md`, `.docx` eller `.pdf`. Läget (kapitel och rullning) sparas per fil för de 100 senast lästa böckerna.
+
+| Kommando | Funktion |
+|---|---|
+| `Mellanslag` / `Page Down` | En skärm framåt (i slutet: nästa kapitel) |
+| `Skift+Mellanslag` / `Page Up` | En skärm bakåt (i början: föregående kapitel) |
+| `Upp` / `Ner` | Rulla |
+| `Home` / `End` | Början / slutet av delen |
+| `Ctrl+Home` / `Ctrl+End` | Bokens början / slut |
+| `[` / `]` eller `Alt+Upp` / `Alt+Ner` | Föregående / nästa kapitel |
+| `Alt+Vänster` / `Alt+Höger` | Tillbaka / framåt efter länkhopp |
+| `Ctrl+F` | Sök i boken |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Textstorlek |
+| `Ctrl+I` | Om boken |
+| `Ctrl+Skift+O` | Innehållsförteckning på/av |
+| `Esc` | Stäng sök, notruta eller Om boken |
+
+Klick i marginalen utanför spalten går en skärm bakåt (vänster) eller framåt (höger).
+
 ## Kortkommandon
 
 På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
@@ -319,6 +354,7 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Ctrl+Shift+>` / `Ctrl+Shift+<` (eller `Ctrl+]` / `Ctrl+[`) | Större / mindre text, ett steg (endast dokumentläge) |
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Byt mellan läsläge och redigering för Markdown |
+| `Mellanslag`, `[` / `]`, `Alt+Vänster`, `Ctrl+I` m.fl. | Läsläget för e-böcker, se [EPUB](#epub) |
 | `Ctrl+\` | Dela vyn i två rutor |
 | `Ctrl+Shift+\` | Dela vyn vågrätt |
 | `F6` | Byt aktiv ruta i delad vy |

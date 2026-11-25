@@ -26,3 +26,9 @@ Sökstödet (`regex`-funktionen) är påslaget i Cargo.toml.
 
 `elements::code_block` tar ett extra argument `lang` och ritar språket ur inhägnaden (` ```rust `) diskret
 till vänster om kopieringsikonen. Kopieringsknappen fanns redan i originalet.
+
+## Radavstånd (EPUB-läsläget)
+
+`Style::to_richtext` läser ett radavstånd (`LINE_FACTOR_ID`, gånger brödtextens storlek) ur `egui::Context::data`
+och sätter det som radhöjd på löptext (inte rubriker eller kod). Läsläget för EPUB lägger dit värdet; utan värde
+är allt som förut.

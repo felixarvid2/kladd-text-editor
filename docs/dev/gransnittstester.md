@@ -13,7 +13,7 @@ cargo test ui_tests::word -- --nocapture
 ## Så är det uppbyggt
 
 * `ui_tests` är en `#[cfg(test)]`-modul under `app.rs` (`#[path = "ui_tests/mod.rs"]`), så att den når
-  appens privata fält. Filerna: `harness.rs` (testmiljön), `text.rs`, `word.rs` och `pdf.rs`.
+  appens privata fält. Filerna: `harness.rs` (testmiljön), `text.rs`, `word.rs`, `pdf.rs` och `epub.rs`.
 * `Ui::new()` bygger appen med `KladdApp::new` utan sparad konfiguration. Inga biverkningar:
   * ingen enkelinstanssocket (`single_instance = false`),
   * ingen uppdateringskontroll (`auto_update_check = false`),

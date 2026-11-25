@@ -12,6 +12,7 @@ mod bigfiles;
 mod bigtext;
 mod codehl;
 mod doc;
+mod epub;
 mod docx;
 mod docx_notes;
 mod docx_para;
