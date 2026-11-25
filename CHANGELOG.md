@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.7.0] – 2026-11-25
+
 ### Nytt
 
 - **Kodblock med syntaxfärgning och kopieringsknapp i dokumentläget och exporterna.** Ett ```` ```språk ````-block ritas i dokumentläget som en ruta med svag bakgrund, fast breddsteg och färger per token efter språket (rust, python, js/ts, json, toml, yaml, bash, c/c++, java, go, sql, html, css, xml, markdown med flera; okänt språk är ofärgat), med det ljusa temats färger på vita sidor och det mörka i mörkt tema utan vita sidor. Språknamnet står i hörnet och en kopieringsknapp (när musen är över blocket) kopierar koden utan inhägnaden och visar *Koden kopierades*. Färgningen använder samma syntect-uppsättning som textredigeraren (inläst i bakgrunden; ofärgat tills den finns), ändrar aldrig texten eller markörlägena och cachas per block, så att skrivning i ett annat stycke inte färgar om. PDF ritar kodblock med bakgrund och samma färger, `.docx` skriver kodformatet med färgade körningar (`w:color`) och språket i ett dolt bokmärke som läses tillbaka, `.odt` skriver `text:span`-färger och HTML/EPUB `<pre><code class="language-x">` med färgade `<span style>`. Orörda `.docx` och `.odt` sparas som förut byte för byte. Läsläget visar nu också språknamnet i blockets hörn. Se `docs/dev/dokumentlage.md`.
