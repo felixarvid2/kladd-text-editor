@@ -290,7 +290,8 @@ enum Block {
     /// `look`: ram, fyllning och bredd ur `<!--k:pp …-->` (`word::pbox`).
     Para { spans: Vec<Span>, indent: f32, quote: u8, align: Align, look: Option<crate::word::pbox::PPr> },
     Item { spans: Vec<Span>, indent: f32, marker: String, quote: u8, align: Align },
-    Code { text: String, indent: f32 },
+    /// `lang`: språket i inhägnaden (för syntaxfärgningen), tomt utan.
+    Code { text: String, indent: f32, lang: String },
     /// `spans`: 1 vanlig cell, n sammanfogad, 0 täckt; `weights`: relativ kolumnbredd (streck).
     Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>>, fmt: Option<crate::word::tablefmt::TableFmt> },
     Rule,
@@ -434,6 +435,7 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut pending_marker: Option<String> = None;
     let mut code: Option<String> = None;
+    let mut code_lang = String::new();
     let mut image: Option<(String, String)> = None;
     let mut table: Option<Vec<Vec<Vec<Span>>>> = None;
     let mut row: Vec<Vec<Span>> = Vec::new();
@@ -529,9 +531,13 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     quote += 1;
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                     code = Some(String::new());
+                    code_lang = match kind {
+                        pulldown_cmark::CodeBlockKind::Fenced(info) => crate::codehl::lang_of(&info),
+                        pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                    };
                 }
                 Tag::List(start) => {
                     flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
@@ -582,9 +588,18 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                 }
                 TagEnd::CodeBlock => {
                     if let Some(c) = code.take() {
+                        // ```mermaid som diagram (vektorbild) när det går att rita, annars som kod.
+                        if crate::mermaid::is_lang(&code_lang) {
+                            if let Some(src) = crate::mermaid::image(&c) {
+                                code_lang.clear();
+                                blocks.push(Block::Image { src, alt: "diagram".to_owned(), indent: indent_now(&lists, quote), size: ImgSize::default(), align: Align::Center, float: None, place: ImgPlace::default() });
+                                continue;
+                            }
+                        }
                         blocks.push(Block::Code {
                             text: c.trim_end_matches('\n').to_owned(),
                             indent: indent_now(&lists, quote),
+                            lang: std::mem::take(&mut code_lang),
                         });
                     }
                 }
@@ -2147,26 +2162,46 @@ impl<'a> Layout<'a> {
         self.break_lines(spans, base, size, width).iter().map(|l| line_size(l, size) * LINE).sum()
     }
 
-    fn code(&mut self, text: &str, indent: f32) {
+    fn code(&mut self, text: &str, indent: f32, lang: &str) {
         self.clear_floats();
         let size = self.body * 0.86;
         let line_h = size * 1.45;
         let pad = 8.0;
         let w = self.cw - indent;
-        let mut lines = Vec::new();
-        for raw in text.split('\n') {
-            let raw = raw.replace('\t', "    ");
-            // Långa kodrader bryts på tecken.
-            let mut cur = String::new();
-            for c in raw.chars() {
-                cur.push(c);
-                if self.m.width(Face::Mono, size, &cur) > w - 2.0 * pad {
-                    let last = cur.pop().unwrap_or(' ');
-                    lines.push(std::mem::take(&mut cur));
-                    cur.push(last);
+        // Färgade bitar per rad (ljust tema på det ljusa kodfältet); långa rader bryts på tecken.
+        let colors = crate::codehl::CodeColors::paper();
+        let hl = crate::codehl::tokens_wait(lang, text);
+        let mut lines: Vec<Vec<(String, (u8, u8, u8))>> = vec![Vec::new()];
+        let mut line_text = String::new();
+        for (range, class, _bold, _italic) in crate::codehl::segments(&hl, text) {
+            let rgb = match class {
+                crate::codehl::Class::Plain => INK,
+                c => {
+                    let [r, g, b] = colors.rgb(c);
+                    (r, g, b)
+                }
+            };
+            for c in text[range].chars() {
+                if c == '\n' {
+                    lines.push(Vec::new());
+                    line_text.clear();
+                    continue;
+                }
+                if c == '\r' {
+                    continue;
+                }
+                let piece = if c == '\t' { "    ".to_owned() } else { c.to_string() };
+                if !line_text.is_empty() && self.m.width(Face::Mono, size, &format!("{line_text}{piece}")) > w - 2.0 * pad {
+                    lines.push(Vec::new());
+                    line_text.clear();
+                }
+                line_text.push_str(&piece);
+                let cur = lines.last_mut().expect("minst en rad");
+                match cur.last_mut() {
+                    Some((t, col)) if *col == rgb => t.push_str(&piece),
+                    _ => cur.push((piece, rgb)),
                 }
             }
-            lines.push(cur);
         }
         let mut i = 0;
         while i < lines.len() {
@@ -2178,10 +2213,14 @@ impl<'a> Layout<'a> {
             let h = chunk.len() as f32 * line_h + 2.0 * pad;
             let top = self.y;
             self.page().ops.push(Op::Rect { x, y: top, w, h, color: CODE_BG });
-            for (j, l) in chunk.iter().enumerate() {
-                if !l.is_empty() {
-                    let y = top + pad + j as f32 * line_h + size * 1.05;
-                    self.page().ops.push(Op::Text { x: x + pad, y, face: Face::Mono, size, text: l.clone(), color: INK, italic: false });
+            for (j, runs) in chunk.iter().enumerate() {
+                let y = top + pad + j as f32 * line_h + size * 1.05;
+                let mut rx = x + pad;
+                for (t, color) in runs {
+                    if !t.trim().is_empty() {
+                        self.page().ops.push(Op::Text { x: rx, y, face: Face::Mono, size, text: t.clone(), color: *color, italic: false });
+                    }
+                    rx += self.m.width(Face::Mono, size, t);
                 }
             }
             i += chunk.len();
@@ -2376,7 +2415,7 @@ impl<'a> Layout<'a> {
                     let next_is_item = matches!(blocks.get(bi + 1), Some(Block::Item { .. }));
                     self.y += if next_is_item { 2.0 } else { PARA_GAP };
                 }
-                Block::Code { text, indent } => self.code(text, *indent),
+                Block::Code { text, indent, lang } => self.code(text, *indent, lang),
                 Block::Table { rows, spans, weights, fmt } => self.table(rows, spans, weights.as_deref(), fmt.as_ref()),
                 Block::Rule => {
                     self.clear_floats();
@@ -2742,7 +2781,9 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let (blocks, notes) = parse_blocks_notes(markdown);
     let defaults = doc_defaults(markdown);
     crate::timing::lap("pdf: förberedelse (rensning, tolkning)");
-    let mut lay = lay_out(&blocks, &notes, &defaults, resolve);
+    // Mermaid-diagram är bilder som ritats av Kladd själv (se `mermaid`).
+    let resolve = |src: &str| crate::mermaid::resolve(src).or_else(|| resolve(src));
+    let mut lay = lay_out(&blocks, &notes, &defaults, &resolve);
 
     let fonts: HashMap<Face, Font> = FACES
         .into_iter()

@@ -961,3 +961,53 @@ Text i rutan<!--k:pp bdr="t=single:8:4:6E4BAA l=single:8:4:6E4BAA" shd="EDE7F6" 
 med ett textstycke). `sz` = stycketeckens storlek (`w:pPr/w:rPr/w:sz`), övrigt som `k:pp`. Layouten ger raden
 styckets höjd (`Para::empty_h`); skrivs som `<w:p><w:pPr>…</w:pPr></w:p>`. `<w:p/>` på toppnivå läses också. Stycken som
 bär `w:sectPr` eller spaltbrytning och Words slutstycke efter en avslutande tabell ger ingen rad.
+
+## Kodblock med syntaxfärgning (`codehl`, `word::codeblock`, `word::codeui`)
+
+Källtexten är oförändrad Markdown (```` ```rust ````…```` ``` ````); färgningen ändrar aldrig texten eller markörlägena.
+
+- `codehl.rs`: tokens (byteintervall + färgklass `Class`) för en kod och ett språk, med syntects grundsyntaxer (samma
+  uppsättning som `highlight.rs`, som läser in den i en bakgrundstråd vid start; tills den finns ger `tokens`
+  `Hl::Pending` och blocket ritas ofärgat, och vyn ritar om efter 60 ms). Klasserna är oberoende av tema; `CodeColors`
+  ger färg per klass (`from_palette` för sidan, `paper()` = ljust tema på vitt papper för PDF och filer). Språkalias
+  (`js`/`ts`/`jsx` → JavaScript, `py`, `sh`/`bash`/`zsh`, `c++`/`cpp`, `yml` …) och en liten egen färgning för TOML
+  (finns inte bland syntects grundsyntaxer). Okänt eller inget språk = ofärgat. Resultatet cachas på (språk, kod): att
+  skriva i ett annat stycke färgar inte om (`codehl::runs()` räknar färgningar i testerna).
+- `word/codeblock.rs`: `blocks(text, analysis)` hittar de inhägnade blocken ur analysens bitar (öppningsrad, kod, stängningsrad,
+  språk); `DocState::code` håller dem tills texten ändras. `Block::segs` ger färgade bitar (absoluta byteintervall) när
+  färgningen är klar. Enhetsnyckeln (`unit_key`) får `codeblock::sig` (kod, språk, om färgningen finns), så en rad i
+  ett block läggs om när något annat i blocket ändras men inte annars.
+- `layout::build_sections` delar kodens sektion efter tokens (`push_code`: färg, kursiv, medium vikt). Inhägnadens rader är
+  vanlig dold markup (syns dämpade när markören står på dem). `paragraphs_cb` lägger 4 pt luft över första och under sista
+  kodraden (`CODE_PAD_PT`).
+- `word/codeui.rs` ritar rutan (svag bakgrund `page_code_bg`, tunn kant) bakom texten, delad där en sidbrytning går
+  genom blocket (`spans`), språknamnet i övre högra hörnet och, när musen är över blocket, en kopieringsknapp som
+  kopierar koden utan inhägnaden, visar en bock och notisen *Koden kopierades*. På vita sidor i mörkt tema används det
+  ljusa temats syntaxfärger (`Palette::paper` bär `syntax`).
+
+### Kodblock i filformaten
+
+- **PDF** (`pdf_write.rs`): `Block::Code` har `lang`; raderna delas i färgade körningar (ljust tema) på den ljusa rutan.
+- **HTML/EPUB** (`export::code_html`): `<pre><code class="language-x">` med `<span style="color:#…">` per token (inga CSS-filer behövs).
+- **.docx**: stycket får formatet `Code` (Consolas, skuggning `F2F2F2`) och en körning per token med `w:color`. Språket sparas i ett
+  dolt bokmärke först i stycket, `<w:bookmarkStart w:id="880001" w:name="_kladdlang_rust"/><w:bookmarkEnd …/>`
+  (`codehl::lang_bookmark`: allt utom bokstäver och siffror skrivs `_` och två hexsiffror, `c++` blir `_kladdlang_c_2B_2B`;
+  namn som börjar med `_` är dolda i Word, `w:id` från 880 000 så att de inte krockar med Words egna). Läsningen tar bokmärket
+  till en dold körning (`<!--kladd-lang:rust-->`) som blir inhägnadens infosträng; utan bokmärke (Words egna kodstycken)
+  blir inhägnaden som förut. Färgerna läses inte (de följer av språket), så ett oförändrat block sparas som det var.
+- **.odt**: ett stycke per rad i `Preformatted_20_Text` med `text:span`-stilar (`fo:color`), och `<text:bookmark text:name="_kladdlang_rust"/>`
+  först i blockets första stycke (alltid, också utan språk: bokmärket skiljer intilliggande block åt, annars slås
+  två kodstycken ihop vid läsning). Ett stycke med bokmärke börjar ett nytt block; bokmärket följer med som språk.
+- Orörda `.docx`/`.odt` sparas som förut byte för byte (enheterna jämförs på Markdown-texten, som nu har språket i inhägnaden).
+
+### Mermaid
+
+` ```mermaid ` ritas som diagram med crate:n `mermaid-svg` 0.7 (MIT, ren Rust, enda beroendet `thiserror`; flödesscheman,
+sekvens-, tillstånds-, klass-, ER-, cirkel-, Gantt- och fler diagramtyper) via `src/mermaid.rs`: SVG → `imgfmt`
+(raster för visning, vektor i PDF). Läsläget byter blocket mot en bild i minnet (`mermaid::replace`), PDF ritar det som
+vektorbild (`mermaid::image`/`resolve`, bildkälla `mermaid:<nyckel>`), och dokumentläget ritar diagrammet i stället för
+koden: vyn lägger diagrammets storlek bland bildstorlekarna (nyckel `Block::diagram_key`), `layout::build_sections`
+döljer blockets text och låter första tecknet reservera höjden, resten av raderna kollapsar och `codeui` ritar bilden.
+Står markören i blocket visas koden (som med bilder och formler). Ett block som inte går att rita står kvar som kod.
+`.docx`, `.odt`, HTML och EPUB behåller ```` ```mermaid ```` som kodblock (HTML/EPUB med `language-mermaid`).
+

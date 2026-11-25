@@ -199,6 +199,8 @@ impl Palette {
             page_link: l.page_link,
             page_code_bg: l.page_code_bg,
             page_markup: l.page_markup,
+            // Kodblock på det vita arket färgas med det ljusa temats färger.
+            syntax: l.syntax,
             // Stavnings- och grammatikvågor och markeringen ska synas mot vitt.
             error: l.error,
             selection: rgba(0x2F7BC4, 80),

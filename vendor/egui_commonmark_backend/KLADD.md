@@ -21,3 +21,8 @@ Där finns också en lappad kopia av `egui_commonmark` 0.26.0 i `vendor/egui_com
   radbrytning (kolumnbredderna fördelas efter textlängd).
 
 Sökstödet (`regex`-funktionen) är påslaget i Cargo.toml.
+
+## Kodblock: språknamn (ej släppt)
+
+`elements::code_block` tar ett extra argument `lang` och ritar språket ur inhägnaden (` ```rust `) diskret
+till vänster om kopieringsikonen. Kopieringsknappen fanns redan i originalet.

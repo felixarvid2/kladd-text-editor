@@ -1711,6 +1711,9 @@ fn token_text(n: usize) -> String {
 }
 
 /// Lägger en markör som en rå körning i stycket.
+/// Första `w:id` för språkbokmärkena i kodstycken (se `codehl::lang_bookmark`), över Words egna nummer.
+const LANG_BOOKMARK_ID: u32 = 880_000;
+
 fn push_token(para: &mut Option<Para>, info: &mut BodyInfo, xml: &str) {
     let n = new_token(info, xml);
     let p = para.get_or_insert_with(Para::new);
@@ -2309,6 +2312,24 @@ fn parse_body(
                         let p = para.get_or_insert_with(Para::new);
                         p.runs.push(Run { text, fmt: Fmt::default(), link: None, raw: true });
                     }
+                    // Språkbokmärket i ett kodstycke (`codehl::lang_bookmark`): språket följer med som en dold körning
+                    // och bokmärket skrivs om av Kladd; slutet på det (vårt id-intervall) släpps.
+                    b"bookmarkStart"
+                        if empty
+                            && !in_run
+                            && para.as_ref().is_some_and(|p| p.kind == ParaKind::Code)
+                            && attr(e, b"name").and_then(|n| crate::codehl::lang_from_bookmark(&n)).is_some() =>
+                    {
+                        let lang = attr(e, b"name").and_then(|n| crate::codehl::lang_from_bookmark(&n)).unwrap_or_default();
+                        if let Some(p) = para.as_mut() {
+                            p.runs.push(Run { text: crate::codehl::lang_marker(&lang), fmt: Fmt::default(), link: None, raw: true });
+                        }
+                    }
+                    b"bookmarkEnd"
+                        if empty
+                            && !in_run
+                            && para.as_ref().is_some_and(|p| p.kind == ParaKind::Code)
+                            && attr(e, b"id").and_then(|v| v.parse::<u32>().ok()).is_some_and(|id| id > LANG_BOOKMARK_ID && id <= LANG_BOOKMARK_ID + 1_000_000) => {}
                     b"bookmarkStart" | b"bookmarkEnd" | b"commentRangeStart" | b"commentRangeEnd" | b"permStart" | b"permEnd"
                         if empty && !in_run && para.is_some() =>
                     {
@@ -3285,9 +3306,11 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                         out.push_str(&q);
                     }
                     (ParaKind::Code, None) => {
-                        let raw: String = p.runs.iter().map(|r| r.text.as_str()).collect();
+                        // Språket (dold körning, se `codehl::lang_bookmark`) blir inhägnadens infosträng.
+                        let lang = p.runs.iter().find_map(|r| r.raw.then(|| crate::codehl::parse_lang_marker(&r.text)).flatten()).unwrap_or("");
+                        let raw: String = p.runs.iter().filter(|r| !(r.raw && crate::codehl::parse_lang_marker(&r.text).is_some())).map(|r| r.text.as_str()).collect();
                         let fence = if raw.contains("```") { "~~~~" } else { "```" };
-                        let code = format!("{fence}\n{}\n{fence}", raw.trim_matches('\n'));
+                        let code = format!("{fence}{lang}\n{}\n{fence}", raw.trim_matches('\n'));
                         units.push(MdUnit { origin: p.origin, desc: format!("c|{}", align.as_attr()), key: norm(&code) });
                         out.push_str(&code);
                     }
@@ -3454,6 +3477,11 @@ struct Writer<'a> {
     title: Option<TitleKind>,
     table: Option<TableState>,
     in_code_block: bool,
+    /// Pågående kodblock: språket ur inhägnaden och koden hittills (färgas när blocket tar slut).
+    code_lang: String,
+    code_buf: String,
+    /// Antal skrivna språkbokmärken (för unika `w:id`).
+    n_lang: u32,
     /// Bild som håller på att läsas: (källa, alt-text).
     image: Option<(String, String)>,
     /// Inbäddade bilder: (relations-id, filnamn i word/media, data).
@@ -3545,6 +3573,9 @@ impl<'a> Writer<'a> {
             pending_tfmt: None,
             table: None,
             in_code_block: false,
+            code_lang: String::new(),
+            code_buf: String::new(),
+            n_lang: 0,
             image: None,
             media: Vec::new(),
             missing: Vec::new(),
@@ -3877,6 +3908,30 @@ impl<'a> Writer<'a> {
             _ => {
                 let d = if display { "$$" } else { "$" };
                 self.run(&format!("{d}{src}{d}"), false);
+            }
+        }
+    }
+
+    /// Skriver kodblocket som körningar i kodformatet, färgade per token (`w:color`). Texten är oförändrad.
+    fn flush_code(&mut self) {
+        let buf = std::mem::take(&mut self.code_buf);
+        let code = buf.strip_suffix('\n').unwrap_or(&buf);
+        let colors = crate::codehl::CodeColors::paper();
+        let hl = crate::codehl::tokens_wait(&self.code_lang, code);
+        for (range, class, _bold, italic) in crate::codehl::segments(&hl, code) {
+            let colored = class != crate::codehl::Class::Plain;
+            if colored {
+                self.spans.push(SpanStyle { color: Some(colors.rgb(class)), ..Default::default() });
+            }
+            if italic {
+                self.fmt.italic += 1;
+            }
+            self.run(&code[range], true);
+            if italic {
+                self.fmt.italic -= 1;
+            }
+            if colored {
+                self.spans.pop();
             }
         }
     }
@@ -4329,10 +4384,21 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     w.close_para();
                     w.quote += 1;
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     w.close_para();
                     w.in_code_block = true;
+                    w.code_lang = match kind {
+                        pulldown_cmark::CodeBlockKind::Fenced(info) => crate::codehl::lang_of(&info),
+                        pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                    };
+                    w.code_buf.clear();
                     w.open_para();
+                    // Språket sparas i ett dolt bokmärke först i stycket (se `lang_bookmark`).
+                    if let Some(name) = crate::codehl::lang_bookmark(&w.code_lang).filter(|_| !w.code_lang.is_empty()) {
+                        w.n_lang += 1;
+                        let id = LANG_BOOKMARK_ID + w.n_lang;
+                        w.body.push_str(&format!("<w:bookmarkStart w:id=\"{id}\" w:name=\"{name}\"/><w:bookmarkEnd w:id=\"{id}\"/>"));
+                    }
                 }
                 Tag::List(start) => {
                     w.close_para();
@@ -4477,6 +4543,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     w.quote = w.quote.saturating_sub(1);
                 }
                 TagEnd::CodeBlock => {
+                    w.flush_code();
                     // Ta bort en avslutande radbrytning i kodblocket.
                     if w.body.ends_with("<w:r><w:br/></w:r>") {
                         let n = w.body.len() - "<w:r><w:br/></w:r>".len();
@@ -4484,6 +4551,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     }
                     w.close_para();
                     w.in_code_block = false;
+                    w.code_lang.clear();
                 }
                 TagEnd::List(_) => {
                     w.close_para();
@@ -4545,8 +4613,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                 // Den osynliga tecknet-referensen framför en markör i radens början.
                 let t: CowStr<'_> = if t.contains('\u{200B}') { t.replace('\u{200B}', "").into() } else { t };
                 if w.in_code_block {
-                    let t = t.to_string();
-                    w.run(&t, true);
+                    w.code_buf.push_str(&t);
                 } else {
                     w.run(&t, false);
                 }

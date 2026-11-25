@@ -10,6 +10,7 @@ mod csv;
 mod autosave;
 mod bigfiles;
 mod bigtext;
+mod codehl;
 mod doc;
 mod docx;
 mod docx_notes;
@@ -45,6 +46,7 @@ mod lsp;
 mod mdread;
 mod macopen;
 mod menubar;
+mod mermaid;
 mod math;
 mod multicursor;
 mod palette;
@@ -66,6 +68,8 @@ mod workspace;
 mod find_files;
 mod git;
 mod git_ui;
+#[cfg(test)]
+mod code_export_tests;
 #[cfg(test)]
 mod corpus_tests;
 #[cfg(test)]

@@ -1085,6 +1085,18 @@ impl KladdApp {
                     hf_imgs.insert(src.clone(), (image_uri(&src, doc_id), info.size));
                 }
             }
+            // ```mermaid-block som diagram: ritas till raster och får visningsstorlek (aldrig bredare än spalten).
+            let code_blocks = self.word.code_blocks(doc_id, &self.docs[self.active].text);
+            for b in code_blocks.iter().filter(|b| crate::mermaid::is_lang(&b.lang)) {
+                let text = &self.docs[self.active].text;
+                let Some(key) = b.diagram_key(text) else { continue };
+                if let Some((_, (w, h))) = crate::mermaid::include(&ctx, b.code(text), p.dark, 2.0) {
+                    let sec = sections::index_at(&analysis.sections, b.open.start);
+                    let max_w = geom1.wrap_for(sec);
+                    let k = (max_w / w).min(1.0);
+                    sizes.insert(key, vec2(w * k * z, h * k * z));
+                }
+            }
             let image_size = |src: &str| sizes.get(src).copied();
             // Textbredd för tabellkolumner och listindrag. Mäts före och utanför layout_job, så
             // ingen fonts-lås hålls när det anropas.
@@ -1270,6 +1282,7 @@ impl KladdApp {
             let mut rv_before = rv.before.clone();
             let mut pane_act: Option<super::reviewui::PaneAct> = None;
             let mut pending_track: Option<crate::review::Tracked> = None;
+            let mut code_copy: Option<String> = None;
 
             ScrollArea::both().id_salt(("kladd-wscroll", doc_id, crate::panes::salt())).auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -1856,6 +1869,20 @@ impl KladdApp {
                     }
                 }
 
+                // Kodblockens rutor (bakom texten), språknamn och kopieringsknapp.
+                let code_blocks = word.code_blocks(doc_id, text);
+                let diagram = |b: &super::codeblock::Block| -> Option<(String, Vec2)> {
+                    let size = b.diagram_key(text).and_then(|k| sizes.get(&k).copied())?;
+                    let overlaps = reveal.start < b.whole().end && b.whole().start < reveal.end;
+                    (!overlaps).then(|| (crate::mermaid::uri(b.code(text), p.dark, 2.0), size))
+                };
+                let code_out = super::codeui::paint(ui, p, z, doc_id, text, &galley, gpos, &code_blocks, &vis, clip, &col_at, &diagram);
+                cell_fills.extend(code_out.fills);
+                code_copy = code_out.copy;
+                // Färgningen väntar på syntaxuppsättningen (läses in i bakgrunden): rita om när den finns.
+                if !crate::codehl::ready() && code_blocks.iter().any(|b| !b.lang.is_empty()) {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+                }
                 ui.painter().set(cell_fill_slot, cell_fills);
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
@@ -2040,6 +2067,10 @@ impl KladdApp {
                 }
             });
 
+            if let Some(code) = code_copy {
+                ctx.copy_text(code);
+                self.notify(&ctx, t("Koden kopierades"), false);
+            }
             self.wv.pages = page_pos;
             if self.word.partial(doc_id) {
                 self.wv.lazy_frames = self.wv.lazy_frames.saturating_add(1);

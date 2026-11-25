@@ -1113,6 +1113,11 @@ impl<'s, 'b> Rd<'s, 'b> {
                     self.review.open_ins = None;
                 }
             }
+            // Språket i ett kodblock (`codehl::lang_bookmark`) följer med som en dold körning (se `emit`).
+            "text:bookmark" if e.attr("text:name").and_then(crate::codehl::lang_from_bookmark).is_some() => {
+                let lang = e.attr("text:name").and_then(crate::codehl::lang_from_bookmark).unwrap_or_default();
+                runs.push(Self::marker_run(crate::codehl::lang_marker(&lang)));
+            }
             "text:soft-page-break" | "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:reference-mark"
             | "text:reference-mark-start" | "text:reference-mark-end" | "text:index-mark"
             | "text:index-mark-start" | "text:index-mark-end" | "text:changed-region" | "text:toc-mark"
@@ -1504,7 +1509,11 @@ impl<'s, 'b> Rd<'s, 'b> {
         }
     }
 
-    fn emit(&mut self, p: Para) {
+    fn emit(&mut self, mut p: Para) {
+        let lang_mark = |r: &Run| r.raw && crate::codehl::parse_lang_marker(&r.text).is_some();
+        // Språkmarkören hör bara hemma i ett kodstycke.
+        let lang_run = p.runs.iter().find(|r| lang_mark(r)).cloned();
+        p.runs.retain(|r| !lang_mark(r));
         self.flush_boxes();
         if p.kind == Kind::Rule {
             self.blocks.push(Block::Rule);
@@ -1520,7 +1529,8 @@ impl<'s, 'b> Rd<'s, 'b> {
                     .collect()
             };
             if let Some(Block::Para(last)) = self.blocks.last_mut() {
-                if last.kind == Kind::Code && last.list.is_none() {
+                // Ett kodstycke med språkmarkör börjar ett nytt block.
+                if last.kind == Kind::Code && last.list.is_none() && lang_run.is_none() {
                     let raw = code_text(&p);
                     let first = &mut last.runs[0];
                     first.text.push('\n');
@@ -1530,9 +1540,11 @@ impl<'s, 'b> Rd<'s, 'b> {
             }
             // Ett kodblock samlas i en enda körning.
             let raw = code_text(&p);
+            let mut runs = vec![Run { text: raw, fmt: Fmt::default(), link: None, raw: true }];
+            runs.extend(lang_run);
             self.blocks.push(Block::Para(Para {
                 kind: Kind::Code,
-                runs: vec![Run { text: raw, fmt: Fmt::default(), link: None, raw: true }],
+                runs,
                 align: Align::Left,
                 list: None,
             }));
@@ -1959,8 +1971,9 @@ fn render(blocks: &[Block], text_w: Option<f64>) -> String {
                         out.push_str(&q.join("\n"));
                     }
                     (Kind::Code, None) => {
+                        let lang = p.runs.get(1).and_then(|r| crate::codehl::parse_lang_marker(&r.text)).unwrap_or("");
                         let fence = if text.contains("```") { "~~~~" } else { "```" };
-                        out.push_str(&format!("{fence}\n{}\n{fence}", text.trim_matches('\n')));
+                        out.push_str(&format!("{fence}{lang}\n{}\n{fence}", text.trim_matches('\n')));
                     }
                     _ => {
                         let lines: Vec<String> = text.lines().map(escape_line_start).collect();
@@ -2487,6 +2500,9 @@ struct W<'a> {
     title: Option<TitleKind>,
     quote: u32,
     code: bool,
+    /// Pågående kodblock: språket ur inhägnaden och koden hittills (färgas när blocket tar slut).
+    code_lang: String,
+    code_buf: String,
     table: Option<WTable>,
     cell_style: bool,
     /// Tabellformatet (`<!-- kladd-tabell: … -->`) som väntar på tabellen efter det.
@@ -2608,6 +2624,8 @@ impl<'a> W<'a> {
             title: None,
             quote: 0,
             code: false,
+            code_lang: String::new(),
+            code_buf: String::new(),
             table: None,
             cell_style: false,
             pending_tfmt: None,
@@ -2956,6 +2974,50 @@ impl<'a> W<'a> {
         if self.link_open {
             self.body.push_str("</text:a>");
             self.link_open = false;
+        }
+    }
+
+    /// Skriver kodblocket: ett stycke per rad i `Preformatted_20_Text`, färgat per token med `text:span`-stilar
+    /// (texten är oförändrad). Språket sparas i ett dolt bokmärke först i blocket (`codehl::lang_bookmark`).
+    fn flush_code(&mut self) {
+        let buf = std::mem::take(&mut self.code_buf);
+        let code = buf.strip_suffix('\n').unwrap_or(&buf);
+        let colors = crate::codehl::CodeColors::paper();
+        let hl = crate::codehl::tokens_wait(&self.code_lang, code);
+        let segs = crate::codehl::segments(&hl, code);
+        let bookmark = crate::codehl::lang_bookmark(&self.code_lang);
+        let mut line_start = 0usize;
+        for (n, line) in code.split('\n').enumerate() {
+            let line_end = line_start + line.len();
+            self.open_para();
+            if let (0, Some(name)) = (n, &bookmark) {
+                self.body.push_str(&format!("<text:bookmark text:name=\"{}\"/>", esc(name)));
+            }
+            // Körningarna går via `run` med kodformatet av (annars får de inte egen stil).
+            self.code = false;
+            for (r, class, _bold, italic) in segs.iter().filter(|(r, ..)| r.start < line_end && r.end > line_start) {
+                let piece = &code[r.start.max(line_start)..r.end.min(line_end)];
+                let colored = *class != crate::codehl::Class::Plain;
+                if colored {
+                    self.spans.push(SpanStyle { color: Some(colors.rgb(*class)), ..Default::default() });
+                }
+                if *italic {
+                    self.italic += 1;
+                }
+                self.run(piece, false);
+                if *italic {
+                    self.italic -= 1;
+                }
+                if colored {
+                    self.spans.pop();
+                }
+            }
+            if segs.is_empty() {
+                self.run(line, false);
+            }
+            self.code = true;
+            self.close_para();
+            line_start = line_end + 1;
         }
     }
 
@@ -3598,9 +3660,14 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                     w.close_para();
                     w.quote += 1;
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     w.close_para();
                     w.code = true;
+                    w.code_lang = match kind {
+                        pulldown_cmark::CodeBlockKind::Fenced(info) => crate::codehl::lang_of(&info),
+                        pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                    };
+                    w.code_buf.clear();
                 }
                 Tag::List(start) => w.start_list(start),
                 Tag::Item => {
@@ -3733,7 +3800,11 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                     w.close_para();
                     w.quote = w.quote.saturating_sub(1);
                 }
-                TagEnd::CodeBlock => w.code = false,
+                TagEnd::CodeBlock => {
+                    w.flush_code();
+                    w.code = false;
+                    w.code_lang.clear();
+                }
                 TagEnd::List(_) => {
                     w.close_para();
                     w.body.push_str("</text:list>");
@@ -3783,14 +3854,7 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                     alt.push_str(&t);
                 }
             }
-            MdEvent::Text(t) if w.code => {
-                let t = t.strip_suffix('\n').unwrap_or(&t).to_owned();
-                for line in t.split('\n') {
-                    w.open_para();
-                    w.run(line, false);
-                    w.close_para();
-                }
-            }
+            MdEvent::Text(t) if w.code => w.code_buf.push_str(&t),
             MdEvent::Text(t) => w.run(&t, false),
             MdEvent::Code(t) => w.run(&t, true),
             MdEvent::Html(t) | MdEvent::InlineHtml(t) => w.html(&t),

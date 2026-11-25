@@ -196,6 +196,7 @@ pub fn code_block<'t>(
     text: &str,
     layouter: &'t mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> std::sync::Arc<egui::Galley>,
     scroll_to_active_match: Option<Range<usize>>,
+    lang: Option<&str>,
 ) -> (egui::Pos2, std::sync::Arc<egui::Galley>) {
     let mut text = text.strip_suffix('\n').unwrap_or(text);
 
@@ -238,6 +239,17 @@ pub fn code_block<'t>(
         frame_rect.right_top().x - spacing.icon_width * 0.5 - spacing.button_padding.x,
         frame_rect.right_top().y + spacing.button_padding.y * 2.0,
     );
+
+    // Kladd: the language name of the fence, discreetly left of the copy icon.
+    if let Some(lang) = lang.filter(|l| !l.is_empty()) {
+        ui.painter().text(
+            egui::pos2(position.x - spacing.icon_width - spacing.button_padding.x, position.y + 1.0),
+            egui::Align2::RIGHT_TOP,
+            lang,
+            egui::FontId::proportional(10.0),
+            ui.visuals().weak_text_color(),
+        );
+    }
 
     // Check if we should show ✔ instead of 🗐 if the text was copied and the mouse is hovered
     let persistent_id = ui.make_persistent_id(output.response.id);

@@ -174,6 +174,14 @@ Matematik skrivs med LaTeX-syntax: `$x^2$` mitt i en mening och `$$\int_0^1 f(x)
 
 I `.docx` sparas formlerna som Office Math (`m:oMath`) och formler i Word-dokument läses som LaTeX; formler Kladd inte kan uttrycka bevaras som de var. `.odt` får ett formelobjekt (MathML) med ersättningsbild, PDF ritar formlerna som konturer och HTML och EPUB får MathML.
 
+### Kodblock
+
+Ett inhägnat kodblock (```` ```rust ````…```` ``` ````) ritas i dokumentläget som en ruta med svag bakgrund och typsnitt med fast breddsteg, och koden färgas efter språket i inhägnaden: rust, python, js/ts, json, toml, yaml, bash, c/c++, java, go, sql, html, css, xml, markdown med flera (okänt språk eller inget språk ger ofärgad kod). Färgerna passar det vita arket (det ljusa temats), och i mörkt tema utan vita sidor används det mörka. Inhägnadens rader är dolda tills markören står på dem. Språknamnet står diskret i rutans övre högra hörn, och när musen är över rutan visas en **kopieringsknapp** som kopierar koden (utan inhägnaden) till urklipp och visar *Koden kopierades*. Färgningen ändrar aldrig texten, och den läses in i bakgrunden vid start så att dokumentet syns direkt (koden är ofärgad någon bråkdel av en sekund).
+
+Kodblocken följer med till exporterna: PDF ritar dem med bakgrund och samma färger, `.docx` skriver kodformatet med färgade körningar (språket sparas i ett dolt bokmärke och läses tillbaka), `.odt` skriver stycken med `text:span`-färger, och HTML/EPUB får `<pre><code class="language-x">` med färgade `<span>` (ser färgat ut utan extern CSS). I läsläget för Markdown finns kopieringsknappen sedan förut, och språknamnet visas nu i blockets hörn.
+
+**Mermaid**: ett block med språket `mermaid` ritas som diagram (flödesscheman, sekvens-, tillstånds-, klass-, ER- och cirkeldiagram med flera) i läsläget, i dokumentläget och som vektorbild i PDF. I dokumentläget visas koden när markören står i blocket (klicka på diagrammet för att redigera det). Ett block som inte går att rita visas som kod; i `.docx`, `.odt`, HTML och EPUB ligger det kvar som kodblock.
+
 ### Tabeller, bilder och inklistring
 
 Tabeller redigeras direkt i rutnätet. Tab och Shift+Tab flyttar mellan cellerna, och Tab i sista cellen lägger till en rad. Skuggning, ramar, bredd, justering, cellmarginaler och radhöjd från Word och LibreOffice visas som i originalet (tabeller utan ramar visas utan linjer) och följer med när du sparar; *Skugga celler* och *Ramar runt alla celler* / *Inga ramar* finns i högerklicksmenyn. När markören står i en tabell visar formateringsfältet knappar för att lägga till och ta bort rader och kolumner eller hela tabellen. Samma funktioner finns i högerklicksmenyn.

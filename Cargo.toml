@@ -46,6 +46,8 @@ quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 regex = "1"
+# ```mermaid-flödesscheman som SVG (ren Rust, MIT, enda beroendet är thiserror); ritas som diagram i läsläget, dokumentläget och PDF.
+mermaid-svg = "0.7"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 ureq = "3.5.2"
 sys-locale = "0.3.2"

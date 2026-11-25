@@ -128,7 +128,7 @@ pub(super) fn layout_def(
         None if lazy => return None,
         None => {
             let mut job = LayoutJob { text: text[w.clone()].to_owned(), ..Default::default() };
-            job.sections = build_sections(text, a, &pv, grid, w.clone());
+            job.sections = build_sections(text, a, &pv, grid, w.clone(), &[]);
             for s in &mut job.sections {
                 s.byte_range = ByteIndex(s.byte_range.start.0 - w.start)..ByteIndex(s.byte_range.end.0 - w.start);
             }
