@@ -1,6 +1,6 @@
 [package]
 name = "kladd"
-version = "2.7.0"
+version = "2.8.0"
 edition = "2024"
 description = "Kladd – en lugn och snygg texteditor för txt, Markdown och kod"
 authors = ["Felix"]

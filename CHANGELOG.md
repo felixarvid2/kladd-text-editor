@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.8.0] – 2026-11-25
+
 ### Nytt
 
 - **EPUB öppnas i ett läsläge.** En `.epub` (Arkiv → Öppna, dra och släpp eller kommandoraden) blir en flik som heter bokens titel och öppnas där du slutade läsa (omslaget första gången). Kapitlen ritas med läsläget för Markdown i en centrerad spalt med serifftext, rubriker, listor, tabeller, citat, kodblock och bilder (SVG-omslag också), och stora kapitel delas vid styckegränser så att rullningen går flytande. Bläddra med mellanslag och Page Down (Skift+mellanslag och Page Up bakåt, vidare till nästa kapitel i slutet), `[` och `]` eller `Alt+Upp`/`Alt+Ner` för kapitel, `Ctrl+Home`/`Ctrl+End`, `Alt+Vänster`/`Alt+Höger` efter länkhopp, och klick i marginalen. Innehållsförteckningen (EPUB 3 `nav`, EPUB 2 `toc.ncx` eller kapitlens rubriker) ligger i sidopanelen (`Ctrl+Skift+O`), `Ctrl+F` söker i hela boken med träfflista, fotnoter öppnas i en liten ruta med *Gå till noten*, framstegslinjen längst ner har streck vid kapitelgränserna och visar tid kvar, och *Aa* ställer in textstorlek, typsnitt, radavstånd, spaltbredd och sidfärg (Auto, Ljus, Sepia, Mörk). `Ctrl+I` visar *Om boken*. *Redigera en kopia* gör bokens text och bilder till ett nytt osparat dokument; boken sparas aldrig. Kopieringsskyddade (DRM) böcker ger ett tydligt fel. Se `docs/dev/epub.md`.
