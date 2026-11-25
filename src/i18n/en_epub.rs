@@ -1,0 +1,58 @@
+//! Engelska texter för EPUB-läsläget (`epub/`): läsvyn, sök, noter, Om boken och felmeddelanden.
+//! Texter som redan finns i andra tabeller (Innehåll, Textstorlek, Typsnitt, Radavstånd, Stäng …) delas med dem.
+
+pub const EN: &[(&str, &str)] = &[
+    // Felmeddelanden vid inläsning
+    ("Filen är inte en giltig EPUB (zip-arkivet kan inte läsas).", "The file is not a valid EPUB (the zip archive cannot be read)."),
+    ("EPUB-filen saknar META-INF/container.xml.", "The EPUB file has no META-INF/container.xml."),
+    ("EPUB-filen saknar paketfil (.opf).", "The EPUB file has no package file (.opf)."),
+    ("EPUB-filens paketfil (.opf) kan inte läsas.", "The EPUB package file (.opf) cannot be read."),
+    ("Boken har ingen text att läsa (tom läsordning).", "The book has no text to read (empty reading order)."),
+    ("Boken är kopieringsskyddad (DRM) och kan inte öppnas.", "The book is copy protected (DRM) and cannot be opened."),
+    // Läsvyn
+    ("Omslag", "Cover"),
+    ("Del {n}", "Part {n}"),
+    ("Fortsätt ›", "Continue ›"),
+    ("Nästa kapitel: {title} ›", "Next chapter: {title} ›"),
+    ("Slut på boken", "End of the book"),
+    ("Bara läsning", "Read only"),
+    ("Textstorlek {size}", "Text size {size}"),
+    ("Kapitel {n} av {count} · {pct} %", "Chapter {n} of {count} · {pct}%"),
+    ("ca {min} min kvar i kapitlet", "about {min} min left in the chapter"),
+    ("mindre än en minut kvar i kapitlet", "less than a minute left in the chapter"),
+    ("{pct} % av boken", "{pct}% of the book"),
+    ("Ingen innehållsförteckning", "No table of contents"),
+    // Överrad och typografi
+    ("Redigera en kopia", "Edit a copy"),
+    ("Öppna bokens text som ett nytt dokument som går att redigera (boken ändras inte)", "Open the text of the book as a new document you can edit (the book is not changed)"),
+    ("Typografi: textstorlek, typsnitt, radavstånd, spaltbredd och sidfärg", "Typography: text size, font, line spacing, column width and page color"),
+    ("Om boken (Ctrl+I)", "About the book (Ctrl+I)"),
+    ("Serif", "Serif"),
+    ("Sans", "Sans"),
+    ("Kompakt", "Compact"),
+    ("Luftig", "Airy"),
+    ("Spaltbredd", "Column width"),
+    ("Smal", "Narrow"),
+    ("Bred", "Wide"),
+    ("Sidfärg", "Page color"),
+    ("Auto", "Auto"),
+    ("Ljus", "Light"),
+    ("Sepia", "Sepia"),
+    ("Mörk", "Dark"),
+    // Sök, noter och Om boken
+    ("Sök i boken", "Search in the book"),
+    ("{cur} av {n}{more}", "{cur} of {n}{more}"),
+    ("Not", "Note"),
+    ("Gå till noten", "Go to the note"),
+    ("Utan titel", "Untitled"),
+    ("Förlag", "Publisher"),
+    ("Utgiven", "Published"),
+    ("Omfång", "Length"),
+    ("ca {h} timmar", "about {h} hours"),
+    ("ca {m} minuter", "about {m} minutes"),
+    ("{chapters} kapitel · {words} ord · {size} läsning", "{chapters} chapters · {words} words · {size} of reading"),
+    // Redigera en kopia och sparning
+    ("Kopian av boken är ett nytt dokument. Boken själv ändras inte.", "The copy of the book is a new document. The book itself is not changed."),
+    ("Boken sparas inte. Använd Redigera en kopia för att ändra texten.", "The book is never saved. Use Edit a copy to change the text."),
+    ("Boken kan inte skrivas ut. Använd Redigera en kopia.", "The book cannot be printed. Use Edit a copy."),
+];

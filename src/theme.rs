@@ -233,6 +233,9 @@ pub const PLEX_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/IBMPlexSan
 pub const PLEX_MONO: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
 pub const PLEX_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf");
 
+pub const CALADEA: &[u8] = include_bytes!("../assets/fonts/Caladea-Regular.ttf");
+pub const CALADEA_BOLD: &[u8] = include_bytes!("../assets/fonts/Caladea-Bold.ttf");
+
 pub const CARLITO: &[u8] = include_bytes!("../assets/fonts/Carlito-Regular.ttf");
 pub const CARLITO_BOLD: &[u8] = include_bytes!("../assets/fonts/Carlito-Bold.ttf");
 pub const CARLITO_ITALIC: &[u8] = include_bytes!("../assets/fonts/Carlito-Italic.ttf");
@@ -251,6 +254,14 @@ pub fn doc_font(bold: bool, italic: bool) -> FontFamily {
     )
 }
 
+/// Serifftypsnittet för EPUB-läsläget (Caladea, metriskt lika Cambria) och dess fetstil.
+pub fn serif() -> FontFamily {
+    FontFamily::Name("caladea".into())
+}
+pub fn serif_bold() -> FontFamily {
+    FontFamily::Name("caladea-bold".into())
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let data = [
@@ -259,6 +270,8 @@ pub fn install_fonts(ctx: &egui::Context) {
         (SEMIBOLD, PLEX_SANS_SEMIBOLD),
         ("plex-mono", PLEX_MONO),
         (MONO_MEDIUM, PLEX_MONO_MEDIUM),
+        ("caladea", CALADEA),
+        ("caladea-bold", CALADEA_BOLD),
         ("carlito", CARLITO),
         ("carlito-bold", CARLITO_BOLD),
         ("carlito-italic", CARLITO_ITALIC),
@@ -292,6 +305,8 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(mono_medium(), with_fallback(MONO_MEDIUM, &mono_fallback));
+    fonts.families.insert(serif(), with_fallback("caladea", &prop_fallback));
+    fonts.families.insert(serif_bold(), with_fallback("caladea-bold", &prop_fallback));
     fonts
         .families
         .insert(doc_font(false, false), with_fallback("carlito", &prop_fallback));

@@ -54,6 +54,8 @@ pub struct Document {
     pub pdf: bool,
     /// Sant om filen är en PDF som visas som sidor i PDF-visaren (inget Markdown, aldrig ändrad).
     pub pdfv: Option<Box<crate::pdfview::chrome::PdfTab>>,
+    /// Sant om filen är en EPUB-bok som visas i läsläget (ingen text, aldrig ändrad eller sparad).
+    pub epub: Option<Box<crate::epub::view::EpubTab>>,
     /// Meddelande att visa när filen har öppnats (t.ex. vad som inte kommer med).
     pub open_note: Option<String>,
     /// Innehåll i ett öppnat Word-dokument som Kladd inte kan spara tillbaka.
@@ -71,7 +73,7 @@ pub struct Document {
 
 /// Filtyper som visas i öppna/spara-dialogerna.
 pub const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "docx", "odt", "pdf", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
+    "txt", "md", "markdown", "docx", "odt", "pdf", "epub", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
     "yml", "html", "htm", "css", "scss", "xml", "svg", "sh", "bash", "zsh", "c", "h", "cpp",
     "hpp", "cc", "java", "kt", "go", "rb", "php", "lua", "sql", "ini", "conf", "cfg", "env",
     "csv", "tsv", "log", "tex", "rst", "org", "srt", "desktop", "service",
@@ -232,6 +234,7 @@ impl Document {
             word_view: false,
             pdf: false,
             pdfv: None,
+            epub: None,
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
@@ -326,6 +329,7 @@ impl Document {
             word_view: true,
             pdf: true,
             pdfv: None,
+            epub: None,
             open_note,
             docx_dropped: loaded.dropped,
             images: loaded.images,
@@ -368,8 +372,21 @@ impl Document {
         d
     }
 
+    /// En flik i EPUB-läsläget: ingen text, aldrig ändrad.
+    pub fn epub_tab(id: u64, path: &Path, tab: crate::epub::view::EpubTab) -> Self {
+        let mut d = Self::new_untitled(id, 0);
+        d.path = Some(path.to_path_buf());
+        d.epub = Some(Box::new(tab));
+        d
+    }
+
     fn load_bytes(id: u64, path: &Path, bytes: Vec<u8>, ext: &str) -> Result<Self, String> {
         let ext = ext.to_owned();
+        // En EPUB-bok öppnas i läsläget.
+        if ext == "epub" {
+            let book = crate::epub::Book::load(id, bytes)?;
+            return Ok(Self::epub_tab(id, path, crate::epub::view::EpubTab::new(book)));
+        }
         // Word-dokument känns igen på filändelsen och på innehållet (zip-signaturen).
         if is_word_ext(&ext) || (bytes.starts_with(b"PK\x03\x04") && ext == "doc") {
             let loaded = crate::docx::read(&bytes)?;
@@ -386,6 +403,7 @@ impl Document {
                 word_view: true,
                 pdf: false,
                 pdfv: None,
+                epub: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     crate::tf!("{name} innehåller {lost} som inte visas i Kladd", name = name, lost = join_sv(&loaded.dropped))
@@ -413,6 +431,7 @@ impl Document {
                 word_view: true,
                 pdf: false,
                 pdfv: None,
+                epub: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     crate::tf!("{name} innehåller {lost} som inte visas i Kladd", name = name, lost = join_sv(&loaded.dropped))
@@ -450,6 +469,7 @@ impl Document {
             word_view: false,
             pdf: false,
             pdfv: None,
+            epub: None,
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
@@ -584,6 +604,10 @@ impl Document {
     }
 
     pub fn title(&self) -> String {
+        // En bok heter sin titel (filnamnet står som verktygstips).
+        if let Some(t) = self.epub.as_ref().map(|e| e.title()).filter(|t| !t.trim().is_empty()) {
+            return t;
+        }
         match &self.path {
             Some(p) => p
                 .file_name()
@@ -617,6 +641,9 @@ impl Document {
         }
         if self.pdf || self.pdfv.is_some() {
             return "PDF".to_owned();
+        }
+        if self.epub.is_some() {
+            return "EPUB".to_owned();
         }
         let ext = self.extension();
         let name = match ext.as_str() {

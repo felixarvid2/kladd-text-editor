@@ -178,13 +178,25 @@ pub struct Style {
 /// (egui har ingen syntetisk fetstil). Se `src/mdread.rs` i Kladd.
 pub const BOLD_FAMILY_ID: &str = "egui_commonmark_bold_family";
 
+/// Kladd: id för radavståndet (gånger brödtextens storlek) i `egui::Context::data`. Läggs dit av EPUB-läsläget
+/// (`src/epub/view.rs`); utan värde används egui:s vanliga radhöjd.
+pub const LINE_FACTOR_ID: &str = "egui_commonmark_line_factor";
+
+fn line_factor(ui: &Ui) -> Option<f32> {
+    ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::unique(LINE_FACTOR_ID)))
+}
+
 fn bold_family(ui: &Ui) -> Option<egui::FontFamily> {
     ui.ctx().data(|d| d.get_temp::<egui::FontFamily>(egui::Id::unique(BOLD_FAMILY_ID)))
 }
 
 impl Style {
     pub fn to_richtext(&self, ui: &Ui, text: &str) -> RichText {
-        let text = self.to_richtext_inner(ui, text);
+        let mut text = self.to_richtext_inner(ui, text);
+        if let (Some(f), None, false) = (line_factor(ui), self.heading, self.code) {
+            let body = ui.style().text_styles.get(&TextStyle::Body).map_or(14.0, |d| d.size);
+            text = text.line_height(Some(body * f));
+        }
         let bold = self.strong || matches!(self.heading, Some(1..=3));
         match bold_family(ui) {
             Some(family) if bold && !self.code => text.family(family),

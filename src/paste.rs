@@ -103,16 +103,16 @@ pub fn insert(text: &str, sel: Range<usize>, md: &str) -> markup::Edit {
 // ============================================================== HTML-träd
 
 #[derive(Debug)]
-enum Node {
+pub(crate) enum Node {
     Text(String),
     El(El),
 }
 
 #[derive(Debug)]
-struct El {
-    tag: String,
-    attrs: Vec<(String, String)>,
-    kids: Vec<Node>,
+pub(crate) struct El {
+    pub(crate) tag: String,
+    pub(crate) attrs: Vec<(String, String)>,
+    pub(crate) kids: Vec<Node>,
 }
 
 const VOID: &[&str] = &[
@@ -126,7 +126,7 @@ impl El {
         El { tag: tag.to_owned(), attrs: Vec::new(), kids: Vec::new() }
     }
 
-    fn attr(&self, name: &str) -> Option<&str> {
+    pub(crate) fn attr(&self, name: &str) -> Option<&str> {
         self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
@@ -149,7 +149,7 @@ fn is_block(tag: &str) -> bool {
     )
 }
 
-fn parse(html: &str) -> El {
+pub(crate) fn parse(html: &str) -> El {
     let lower = html.to_ascii_lowercase();
     let b = html.as_bytes();
     let mut i = 0;
@@ -320,7 +320,7 @@ fn close(stack: &mut Vec<El>, name: &str) {
     }
 }
 
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     if !s.contains('&') {
         return s.to_owned();
     }
@@ -389,6 +389,61 @@ fn entity(name: &str) -> Option<char> {
         "uuml" => 'ü',
         "Uuml" => 'Ü',
         "szlig" => 'ß',
+        _ => return more_entities(name),
+    })
+}
+
+/// Fler namngivna tecken (resten av Latin-1 och vanliga typografiska tecken), för e-böcker och webbsidor.
+fn more_entities(name: &str) -> Option<char> {
+    const LATIN1: [&str; 96] = [
+        "nbsp", "iexcl", "cent", "pound", "curren", "yen", "brvbar", "sect", "uml", "copy", "ordf", "laquo", "not", "shy", "reg",
+        "macr", "deg", "plusmn", "sup2", "sup3", "acute", "micro", "para", "middot", "cedil", "sup1", "ordm", "raquo", "frac14",
+        "frac12", "frac34", "iquest", "Agrave", "Aacute", "Acirc", "Atilde", "Auml", "Aring", "AElig", "Ccedil", "Egrave",
+        "Eacute", "Ecirc", "Euml", "Igrave", "Iacute", "Icirc", "Iuml", "ETH", "Ntilde", "Ograve", "Oacute", "Ocirc", "Otilde",
+        "Ouml", "times", "Oslash", "Ugrave", "Uacute", "Ucirc", "Uuml", "Yacute", "THORN", "szlig", "agrave", "aacute", "acirc",
+        "atilde", "auml", "aring", "aelig", "ccedil", "egrave", "eacute", "ecirc", "euml", "igrave", "iacute", "icirc", "iuml",
+        "eth", "ntilde", "ograve", "oacute", "ocirc", "otilde", "ouml", "divide", "oslash", "ugrave", "uacute", "ucirc", "uuml",
+        "yacute", "thorn", "yuml",
+    ];
+    if let Some(i) = LATIN1.iter().position(|n| *n == name) {
+        return char::from_u32(160 + i as u32);
+    }
+    Some(match name {
+        "sbquo" => '‚',
+        "bdquo" => '„',
+        "dagger" => '†',
+        "Dagger" => '‡',
+        "permil" => '‰',
+        "lsaquo" => '‹',
+        "rsaquo" => '›',
+        "prime" => '′',
+        "Prime" => '″',
+        "larr" => '←',
+        "rarr" => '→',
+        "uarr" => '↑',
+        "darr" => '↓',
+        "minus" => '−',
+        "ensp" => '\u{2002}',
+        "emsp" => '\u{2003}',
+        "thinsp" => '\u{2009}',
+        "zwnj" => '\u{200c}',
+        "zwj" => '\u{200d}',
+        "OElig" => 'Œ',
+        "oelig" => 'œ',
+        "Scaron" => 'Š',
+        "scaron" => 'š',
+        "Yuml" => 'Ÿ',
+        "fnof" => 'ƒ',
+        "circ" => 'ˆ',
+        "tilde" => '˜',
+        "infin" => '∞',
+        "ne" => '≠',
+        "le" => '≤',
+        "ge" => '≥',
+        "asymp" => '≈',
+        "radic" => '√',
+        "sum" => '∑',
+        "hearts" => '♥',
         _ => return None,
     })
 }
