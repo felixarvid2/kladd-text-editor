@@ -4,6 +4,16 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **Bokmärken, understrykningar och anteckningar i EPUB-läsläget.** `Ctrl+D` eller bokmärkesknappen sätter (och tar bort) ett bokmärke på stället du läser. Markera text så visas en meny vid markeringen med fyra färger (gul, grön, blå, rosa), *Anteckning…* och *Kopiera*; understrykningen ritas som färgad bakgrund med ett litet märke när den har en anteckning, och ett klick på den öppnar menyn igen (byt färg, redigera, ta bort). Sidopanelen har flikarna *Innehåll*, *Bokmärken* och *Anteckningar* med kapitel, utdrag och anteckning, och *Exportera anteckningar…* (sidopanelen och Arkiv-menyn) ger Markdown med titel, författare, kapitelrubriker, citat och anteckningar som ett nytt osparat dokument. Posterna sparas per bok (bokens id ur OPF, sökvägen som reserv) i datamappen och aldrig i boken, förankras med kapitel, plats i kapitlets text och den markerade texten med omgivning så att de hittas igen efter omläggning, och har tak (2 000 per bok, 300 böcker).
+- **Justerad text och förlagets formatering i EPUB.** *Aa* har *Justerad text* (av som standard; rak högerkant med sista raden vänsterställd, länkar, fet stil, sökträffar och understrykningar fungerar) och *Förlagets formatering* (på som standard): `text-align` (centrerade titlar och scenbrytningar), `text-indent` (romanernas indrag, utan extra luft mellan stycken), `margin-left`, `font-variant: small-caps`, `font-style` och `font-weight` ur bokens CSS-filer, `<style>` och `style`-attribut (väljare: element, `.klass`, `element.klass`, `#id`, enkla efterkommande; inga färger, typsnitt eller absoluta storlekar). Stycken och rubriker som berörs ritas som ett enda galleri i `vendor/egui_commonmark` (`ViewExtras`).
+- **Bibliotek på startsidan.** De senast lästa EPUB-böckerna visas som omslag med titel, författare och framstegsstapel (klick öppnar där du slutade; högerklick: *Ta bort ur listan*, *Visa i filhanteraren*). Omslagsminiatyr och uppgifter sparas när boken öppnas; saknad fil visas nedtonad med *Filen hittades inte*.
+
+### Rättat
+
+- **Dubbelklick i läsläget för Markdown öppnade inte redigeringen första gången** i dokument som börjar med ett HTML-block (som `<p align="center">` i många README-filer): det fanns ingen blockposition före första stycket, så ingen rad hittades och dubbelklicket markerade bara ett ord. HTML-block, tabeller och linjer får nu egna positioner, och ett dubbelklick över första blocket öppnar redigeraren i början.
+
 ## [2.8.0] – 2026-11-25
 
 ### Nytt

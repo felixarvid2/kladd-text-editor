@@ -85,6 +85,8 @@ pub struct Env<'a> {
     pub lsp_panel: bool,
     /// Den aktiva Markdown-fliken visas i läsläget.
     pub md_reading: bool,
+    /// Den aktiva fliken är en bok (EPUB).
+    pub epub: bool,
 }
 
 impl<'a> Env<'a> {
@@ -109,6 +111,7 @@ impl<'a> Env<'a> {
             scm_open: app.git.scm && app.settings.workspace_panel,
             lsp_panel: app.lsp.ui.panel,
             md_reading: app.md_read_mode(),
+            epub: app.epub_mode(),
         }
     }
 
@@ -134,6 +137,7 @@ impl<'a> Env<'a> {
             scm_open: false,
             lsp_panel: false,
             md_reading: false,
+            epub: false,
         }
     }
 }
@@ -337,6 +341,7 @@ pub static ALL: &[Command] = &[
     Command::new("file.save_copy", "Spara kopia…", File, "Ctrl+Shift+S", |e| e.pdf, |a, c| a.request_save_copy(c, a.active)),
     Command::new("file.export_html", "Exportera som webbsida…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "html")),
     Command::new("file.export_epub", "Exportera som e-bok…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "epub")),
+    Command::new("file.export_notes", "Exportera anteckningar…", File, "", |e| e.epub, |a, c| a.epub_export_notes(c)),
     Command::new("file.print", "Skriv ut…", File, "Ctrl+P", |e| e.has_doc, |a, c| a.open_print(c)),
     Command::new("file.history", "Versionshistorik…", File, "", |e| e.has_path && !e.pdf, |a, c| a.open_history(c)),
     Command::new("file.open_folder", "Öppna mapp…", File, "", always, |a, c| a.request_folder(c)).sep(),

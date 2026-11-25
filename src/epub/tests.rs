@@ -387,3 +387,67 @@ fn bok_med_bara_icke_linjära_filer_och_bild_i_läsordningen_läses_ändå() {
     assert!(b.image("b.png").is_some());
     assert!(b.total_words > 0);
 }
+
+// ---------------------------------------------------------------- bokmärken, förlagets stil och bibliotek (2.9.0)
+
+/// En liten bok med id, en stilmall (centrerade titlar, indrag) och ett långt kapitel.
+fn styled_book(body: &str) -> Vec<u8> {
+    let opf = r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="other">urn:isbn:111</dc:identifier><dc:identifier id="bookid">urn:uuid:abc-123</dc:identifier>
+<dc:title>Stilboken</dc:title></metadata>
+<manifest><item id="css" href="style.css" media-type="text/css"/><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="c1"/></spine></package>"#;
+    let page = format!(
+        "<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>t</title><link rel=\"stylesheet\" href=\"style.css\"/>\
+         <style>.extra {{ text-align: right }}</style></head><body>{body}</body></html>"
+    );
+    zip_of(&[
+        ("META-INF/container.xml", CONTAINER.replace("OEBPS/content.opf", "content.opf").into_bytes()),
+        ("content.opf", opf.as_bytes().to_vec()),
+        ("style.css", b"h1 { text-align: center; font-variant: small-caps }\np { text-indent: 1.5em; margin: 0 }\np.first { text-indent: 0 }".to_vec()),
+        ("ch1.xhtml", page.into_bytes()),
+    ])
+}
+
+#[test]
+fn bokens_id_följer_paketets_unique_identifier_och_stilen_når_delarna() {
+    let b = Book::load(1, styled_book("<h1>Titel</h1><p class=\"first\">Första.</p><p>Andra.</p><p class=\"extra\">Höger.</p>")).unwrap();
+    assert_eq!(b.meta.identifier, "urn:uuid:abc-123", "id:t som unique-identifier pekar på, inte det första");
+    let sec = &b.sections[b.chapters[0].first_section];
+    let look = |needle: &str| sec.blocks.iter().find(|(p, _)| *p == sec.md.find(needle).unwrap()).map(|(_, l)| l.clone());
+    let h = look("# Titel").expect("rubrikens utseende från den länkade stilmallen");
+    assert_eq!((h.align, h.small_caps), (Some(css::Align::Center), true));
+    assert!(look("Första").is_none(), "p.first (text-indent: 0) vinner över p och ger inget särskilt utseende");
+    assert_eq!(look("Andra").unwrap().indent, 1.5);
+    assert_eq!(look("Höger").unwrap().align, Some(css::Align::Right), "<style> i sidan läses också");
+}
+
+#[test]
+fn bokmärkenas_plats_hittas_igen_oavsett_hur_kapitlet_delas_i_delar() {
+    use super::anchor::{bookmark_at, locate, make, resolve};
+    let mut body = String::from("<h1>Långt</h1>");
+    for i in 0..400 {
+        body.push_str(&format!("<p>Stycke nummer {i} med en del text som fyller ut raden och gör kapitlet långt nog att delas.</p>"));
+    }
+    let b = Book::load(2, styled_book(&body)).unwrap();
+    let ch = 0;
+    let md = b.chapter_md(ch);
+    assert!(b.chapters[ch].section_count >= 2, "kapitlet delas");
+    assert_eq!(md.len(), b.sections.iter().map(|s| s.md.len()).sum::<usize>());
+    // Markera en mening långt in och sätt ett bokmärke; båda går att slå upp i delen de ligger i.
+    let r = locate(&md, "Stycke nummer 333 med en del text", 0).unwrap();
+    let note = make(1, ch, &md, r.clone(), false);
+    let bm = bookmark_at(2, ch, &md, md.find("Stycke nummer 250").unwrap());
+    for (n, want) in [(&note, "Stycke nummer 333"), (&bm, "Stycke nummer 250")] {
+        let at = resolve(&md, n).unwrap();
+        let d = b.dest_in_chapter(ch, at.start).unwrap();
+        assert!(b.sections[d.section].md[d.byte..].starts_with(want), "{want}: {:?}", &b.sections[d.section].md[d.byte..d.byte + 30]);
+    }
+    // Delas kapitlet på ett annat sätt (annan gräns) hittas samma ställe: kapitlets text är densamma.
+    for limit in [3_000, 9_000, 50_000] {
+        let ranges = split_ranges(&md, limit);
+        let (si, rg) = ranges.iter().enumerate().find(|(_, rg)| rg.contains(&r.start)).unwrap();
+        assert!(md[rg.start..][r.start - rg.start..].starts_with("Stycke nummer 333"), "gräns {limit}, del {si}");
+        assert_eq!(rg.start + (r.start - rg.start), r.start);
+    }
+}

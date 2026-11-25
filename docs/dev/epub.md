@@ -1,4 +1,4 @@
-# EPUB-läsläget (2.8.0)
+# EPUB-läsläget (2.8.0, del 2 i 2.9.0)
 
 En `.epub` öppnas i ett läsläge för bara läsning. Fliken har ingen text och blir aldrig "ändrad":
 `Document::epub: Option<Box<EpubTab>>` (som `pdfv` för PDF). *Redigera en kopia* gör bokens text
@@ -17,6 +17,11 @@ mörk sida).
 | `mod.rs` | `Book::load`: bygger kapitel (`Chapter`), delar (`Section`), länkmål (`anchors`), noter, innehållsförteckning (`TocEntry`) och omslagssida; `split_ranges`, `unlink`, `plain_lines`, `to_markdown` |
 | `view.rs` | `EpubTab` (läge, historik, sök, notruta), ritning, tangenter, Aa-meny, sidopanel, statusrad, `Prefs` och `Memory` |
 | `glue.rs` | `impl KladdApp` (undermodul till `app`, som `commands.rs`): flikens sida, sidopanel, överlägg, lägesminne, *Redigera en kopia* |
+| `css.rs` | Förlagets formatering: förenklad CSS-tolk (`Sheet`), väljare, kaskad (`Computed`) och `BlockLook` |
+| `anchor.rs` | Bokmärken och understrykningar (`Note`): ren text ur Markdown med källpositioner (`plain_map`, `locate`), förankring som tål omläggning (`make`, `resolve`) och export |
+| `store.rs` | Biblioteket (`Store`, `BookRecord`) i `<data>/epub/bocker.json` och omslagsminiatyrer i `<data>/epub/omslag/` |
+| `selection.rs` | Insticksprogram som fångar `TextSelectionSettled` ur bildrutans utdata |
+| `view/annot.rs` | Menyn vid en markering, understrykningarna som `Mark`, listorna i sidopanelen |
 | `tests.rs` | Böcker byggda i testet (zip i minnet), tur och retur med `export::epub` |
 
 Gränssnittstester: `src/ui_tests/epub.rs`.
@@ -62,9 +67,56 @@ Gränssnittstester: `src/ui_tests/epub.rs`.
 - Genvägarna följer PDF-visaren där det går (`Alt+Vänster`/`Alt+Höger`, `Ctrl+F`, `F3`). `Ctrl+I`, `[`, `]` och mellanslag är
   fria i läsläget (redigerartangenterna är avstängda).
 
+## Förlagets formatering och justerad text (2.9.0)
+
+- **CSS** (`css.rs`): `Book::load` läser varje kapitels länkade stilmallar (`<link rel=stylesheet>`, högst 16 och 2 MB per fil, cachade per fil)
+  och `<style>` (tolken i `paste.rs` behåller inte `<style>`, så de plockas ur råtexten med `css::inline_styles`). Bara `text-align`,
+  `text-indent`, `margin-left`/`padding-left`/`margin`-genvägen, `font-variant: small-caps`, `font-style` och `font-weight` läses. Väljare:
+  element, `.klass`, `element.klass`, `#id` och efterkommande kedjor (högst fyra delar); allt med `>`, `+`, `~`, `[`, `:` hoppas över
+  (en regel som inte förstås ska aldrig ge fel utseende). Kaskaden följer specificitet och ordning; justering, indrag, små versaler, kursiv och
+  fetstil ärvs, vänstermarginaler summeras. `html.rs` håller en stack av element (`ElInfo`) och deras `Computed`.
+- **Fetstil och kursiv** (från CSS-klasser och `style`) bakas in i Markdown-texten (`**…**`, `*…*`) och går inte att slå av med *Förlagets
+  formatering*. **Justering, indrag, vänstermarginal och små versaler** bärs som osynliga markörer (samma markörer som länkmålen, id som börjar
+  med `\u{1}`) som `finish` gör om till `Converted::styles` (byteposition → `BlockLook`), och `Section::blocks` (delens egna positioner).
+  Små versaler gäller hela stycket eller rubriken, inte enstaka ord.
+- **Ritning**: vyn bygger varje bildruta en `ViewExtras` (justering, blockstilar om förlaget är på, understrykningar) som läggs i
+  `egui::Context::data` (`egui_commonmark_backend::misc::set_extras`). Den vendrade `egui_commonmark` ritar då ett stycke eller en rubrik på
+  översta nivån som ett enda galleri (en `LayoutJob` för hela blocket, `Pulldown::try_galley`) när blocket har blockstil, när justering är på
+  (brödtextstycken) eller när en markering rör det. Galleriet har `justify`/`halign` från egui (sista raden justeras inte), indrag som
+  `leading_space`, vänstermarginal som förskjutning, små versaler som versaler i 80 % storlek (byte-längden bevaras så att källpositioner
+  stämmer), länkar som färg (som den vanliga etikettvägen) med träffprov via `Galley::cursor_from_pos`, sökträffar och markeringar som bakgrunder, och
+  egui:s egen textmarkering (`LabelSelectionState::label_text_selection`). Innehåller blocket något annat (bild, formel, fotnotsreferens) ritas
+  det på det gamla sättet. Stycken med indrag som följer på ett stycke får ingen extra luft emellan. Listor, citat och tabeller ritas som förut
+  (utan justering).
+- Radbrytningen är egui:s (ingen avstavning): en smal spalt med långa ord kan ge stora luckor i justerad text.
+
+## Bokmärken, understrykningar och anteckningar (2.9.0)
+
+- **Data** (`anchor.rs`): `Note` har kapitel (index i `Book::chapters`), byteområde i kapitlets Markdown (delarna hopsatta, `Book::chapter_md`),
+  `raw` (Markdown-texten i området), `before`/`after` (32 byte omgivning), `quote` (ren text för listor), färg 0–3, anteckning. `resolve` använder
+  området om `raw` fortfarande står där, annars söks `raw` i kapitlet och träffen med mest lik omgivning (och därefter närmast det gamla stället)
+  väljs; ingen träff ger `None` (posten finns kvar i listan men ritas inte). Därför tål posterna ändrad delning i delar (`SECTION_LIMIT`),
+  ändrad textstorlek (påverkar inte Markdown) och texter som flyttats.
+- **Markering**: egui ger ingen åtkomst till markerad text i etiketter. `selection::Tap` är ett `egui::Plugin` vars `output_hook` läser
+  `OutputCommand::TextSelectionSettled(text)` och sparar texten och pekarens läge; nästa bildruta tar vyn (`selection::take`) och hittar
+  texten i delens Markdown med `anchor::locate` (blanksteg och versaler normaliseras; finns den på flera ställen väljs träffen närmast pekaren via
+  `line_points`). Då visas `AnnMenu`. Klick på en understrykning rapporteras av galleriet (`put_mark_hit`) och öppnar menyn för posten.
+  Understrykningar i listor, citat och tabeller ritas som bakgrund men går inte att klicka (de ritas inte som galleri).
+- **Bokmärke**: `Ctrl+D` (fritt i läsläget; flerpekaren i redigeraren är avstängd här). "Stället" är det som syns: finns ett bokmärke vars
+  plats ligger mellan översta synliga blocket och nederkanten tas det bort, annars sätts ett vid översta blockets början.
+- **Lagring** (`store.rs`): `<data>/epub/bocker.json` (`Store` → `BookRecord` med `Note`-lista), skriven via en tillfällig fil. Nyckel: OPF:s
+  `dc:identifier` som paketets `unique-identifier` pekar på (annars den första), reserv `path:{sökväg}`; en bok hittas via id eller sökväg så att
+  en flyttad fil behåller sina poster. Tak: 2 000 poster per bok (äldsta först) och 300 böcker (äldsta utan poster först). `KladdApp::library`
+  läses vid start; `epub_sync_notes` (glue) sparar när `EpubTab::take_dirty` är sant, och läget/framsteget sparas som `epub_memory`.
+- **Biblioteket**: `epub_restore` gör boken senast läst och sparar omslagsminiatyren (`store::save_cover`: PNG, 160 px hög, en fil per bok);
+  `epub_shelf` (glue) ritar de sex senast lästa på startsidan (`welcome` i `app.rs`). Saknad fil visas nedtonad. Menyn *Arkiv → Öppna senaste*
+  finns inte i Kladd (de senast öppnade syns på startsidan), så ingen sådan ändring gjordes.
+- **Export**: `anchor::export_markdown` (titel, författare, kapitelrubriker i läsordning, citat med `>`, anteckningar, bokmärken) öppnas som ett
+  nytt osparat dokument (`epub_export_notes`, kommandot `file.export_notes`).
+
 ## Senare (inte gjort)
 
-- Sidvis vy och tvåspaltsvy, bokmärken, understrykningar och anteckningar, helskärm, bildförstoring (klick på en bild).
-- Förlagets typsnitt och CSS (centrerade rubriker, versaler, initialer), justerad text.
-- Centrerade stycken (`text-align: center`) ritas vänsterställda.
+- Sidvis vy och tvåspaltsvy, helskärm, bildförstoring (klick på en bild).
+- Förlagets typsnitt, färger och initialer; små versaler för enstaka ord; avstavning.
+- Klick på understrykningar i listor, citat och tabeller.
 - Skriv ut och *Spara som* direkt från boken (nu via *Redigera en kopia*).

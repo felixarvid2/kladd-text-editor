@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use super::css::{BlockLook, Computed, Decl, ElInfo, Sheet, inline_decl};
 use super::read::{dir_of, has_scheme, local, plain_text, resolve};
 use crate::paste::{El, Node};
 
@@ -15,6 +16,8 @@ use crate::paste::{El, Node};
 const A_OPEN: char = '\u{E000}';
 const A_CLOSE: char = '\u{E001}';
 const HARD: char = '\u{E002}';
+/// Början på ett länkmåls id när markören i stället bär ett blockutseende (index i `Conv::looks`).
+const STYLE_TAG: char = '\u{1}';
 
 /// En länk till ett annat ställe i boken.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +38,8 @@ pub struct Env<'a> {
     pub canon: &'a dyn Fn(&str) -> Option<String>,
     /// Mål (`sökväg#id`) som fotnotsreferenser pekar på: deras text sparas som not.
     pub note_targets: &'a HashSet<String>,
+    /// Kapitlets stilmallar (förlagets formatering).
+    pub sheet: &'a Sheet,
 }
 
 #[derive(Default, Debug)]
@@ -49,6 +54,8 @@ pub struct Converted {
     pub notes: Vec<(String, String)>,
     /// Första rubriken.
     pub heading: Option<String>,
+    /// Förlagets blockstil: byteposition i `md` där blocket börjar och dess utseende.
+    pub styles: Vec<(usize, BlockLook)>,
 }
 
 /// Adressen en bild i arkivet visas med i läsläget. SVG ritas om till PNG och får `.png` på slutet.
@@ -133,9 +140,21 @@ pub fn scan_note_targets(root: &El, file: &str, canon: &dyn Fn(&str) -> Option<S
 // ------------------------------------------------------------------ omvandlingen
 
 pub fn convert(root: &El, env: &Env) -> Converted {
-    let mut c = Conv { env, out: Converted::default(), note_ids: Vec::new(), sup_depth: 0, script: None };
+    let mut c = Conv {
+        env,
+        out: Converted::default(),
+        note_ids: Vec::new(),
+        sup_depth: 0,
+        script: None,
+        stack: Vec::new(),
+        comp: vec![Computed::default()],
+        looks: Vec::new(),
+    };
     let body = find_body(root).unwrap_or(root);
+    let body_comp = c.push_el(body);
+    let _ = body_comp;
     let mut md = c.blocks(&body.kids);
+    c.pop_el();
     // Rubrikens eget id på <body>.
     if let Some(id) = body.attr("id") {
         md = format!("{A_OPEN}{id}{A_CLOSE}{md}");
@@ -165,6 +184,11 @@ struct Conv<'a, 'e> {
     sup_depth: u32,
     /// Upphöjt (true) eller nedsänkt (false) text.
     script: Option<bool>,
+    /// Elementen vi är inne i (för väljare) och vad kaskaden gav dem; `comp` har en post mer (rot).
+    stack: Vec<ElInfo>,
+    comp: Vec<Computed>,
+    /// Blockstilar som markörerna `\u{1}sN` pekar på.
+    looks: Vec<BlockLook>,
 }
 
 fn is_block_tag(tag: &str) -> bool {
@@ -411,10 +435,6 @@ fn url_enc(u: &str) -> String {
     out
 }
 
-fn style_has(e: &El, decl: &str) -> bool {
-    e.attr("style").is_some_and(|s| s.to_ascii_lowercase().replace(' ', "").contains(decl))
-}
-
 fn alt_text(t: &str) -> String {
     t.chars().filter(|c| !matches!(c, '[' | ']' | '\n' | '\r')).collect::<String>().trim().to_owned()
 }
@@ -436,6 +456,45 @@ impl Conv<'_, '_> {
             }
         }
         m
+    }
+
+    // ---------------------------------------------------------------- förlagets stil
+
+    /// Går in i ett element: kaskaden (stilmallar, sedan `style`-attributet) på det som ärvs.
+    fn push_el(&mut self, e: &El) -> Computed {
+        let info = ElInfo::of(e);
+        let parent = self.comp.last().cloned().unwrap_or_default();
+        let mut decl: Decl = if self.env.sheet.is_empty() { Decl::default() } else { self.env.sheet.declared(&info, &self.stack) };
+        if let Some(st) = e.attr("style") {
+            decl.merge(&inline_decl(st));
+        }
+        let c = parent.child(&decl);
+        self.stack.push(info);
+        self.comp.push(c.clone());
+        c
+    }
+
+    fn pop_el(&mut self) {
+        self.stack.pop();
+        if self.comp.len() > 1 {
+            self.comp.pop();
+        }
+    }
+
+    fn cur(&self) -> Computed {
+        self.comp.last().cloned().unwrap_or_default()
+    }
+
+    /// Ger blocket förlagets utseende (om det har något) som en osynlig markör först i texten.
+    fn styled(&mut self, text: String, comp: &Computed) -> String {
+        match comp.block_style() {
+            Some(look) if !visible_empty(&text) => {
+                let idx = self.looks.len();
+                self.looks.push(look);
+                format!("{A_OPEN}{STYLE_TAG}{idx}{A_CLOSE}{text}")
+            }
+            _ => text,
+        }
     }
 
     // ---------------------------------------------------------------- block
@@ -505,6 +564,8 @@ impl Conv<'_, '_> {
         }
         let text = self.paragraph(&raw);
         self.register_notes(None, &text);
+        let comp = self.cur();
+        let text = self.styled(text, &comp);
         Self::push_part(parts, pending, text);
     }
 
@@ -565,6 +626,12 @@ impl Conv<'_, '_> {
     }
 
     fn block_el(&mut self, e: &El, parts: &mut Vec<String>, pending: &mut String) {
+        let comp = self.push_el(e);
+        self.block_el_in(e, &comp, parts, pending);
+        self.pop_el();
+    }
+
+    fn block_el_in(&mut self, e: &El, comp: &Computed, parts: &mut Vec<String>, pending: &mut String) {
         let tag = local(&e.tag);
         let mark = self.marker(e);
         match tag {
@@ -586,22 +653,25 @@ impl Conv<'_, '_> {
                 }
                 let t = format!("{mark}{} {}", "#".repeat(level), text);
                 self.register_notes(Some(e), &t);
+                let t = self.styled(t, comp);
                 Self::push_part(parts, pending, t);
             }
             "p" | "address" | "summary" | "caption" | "figcaption" | "dt" => {
+                let bold = tag == "dt" || comp.bold;
                 let mut raw = String::new();
                 for k in &e.kids {
-                    self.inline_node(k, false, false, &mut raw);
+                    self.inline_node(k, bold, comp.italic, &mut raw);
                 }
                 let mut text = self.paragraph(&raw);
-                if tag == "dt" || style_has(e, "font-weight:bold") || style_has(e, "font-weight:700") {
+                if bold {
                     text = emph(text, "**");
                 }
-                if style_has(e, "font-style:italic") {
+                if comp.italic {
                     text = emph(text, "*");
                 }
                 let text = format!("{mark}{text}");
                 self.register_notes(Some(e), &text);
+                let text = self.styled(text, comp);
                 Self::push_part(parts, pending, text);
             }
             "ul" | "ol" => {
@@ -649,7 +719,10 @@ impl Conv<'_, '_> {
             }
             let mark = self.marker(li);
             let body = if local(&li.tag) == "li" {
-                self.blocks_ex(&li.kids, true)
+                self.push_el(li);
+                let b = self.blocks_ex(&li.kids, true);
+                self.pop_el();
+                b
             } else {
                 // Något annat än <li> i listan: som ett eget stycke.
                 self.blocks(std::slice::from_ref(k))
@@ -797,18 +870,21 @@ impl Conv<'_, '_> {
     }
 
     fn inline_el(&mut self, e: &El, bold: bool, italic: bool, out: &mut String) {
-        let tag = local(&e.tag);
         if is_skipped(e) {
             out.push_str(&self.marker(e));
             return;
         }
+        let comp = self.push_el(e);
+        self.inline_el_in(e, &comp, bold, italic, out);
+        self.pop_el();
+    }
+
+    fn inline_el_in(&mut self, e: &El, comp: &Computed, bold: bool, italic: bool, out: &mut String) {
+        let tag = local(&e.tag);
         let mark = self.marker(e);
         out.push_str(&mark);
-        let style_bold = || {
-            let s = e.attr("style").unwrap_or("").to_ascii_lowercase().replace(' ', "");
-            s.contains("font-weight:bold") || s.contains("font-weight:700") || s.contains("font-weight:800") || s.contains("font-weight:900")
-        };
-        let style_italic = || e.attr("style").unwrap_or("").to_ascii_lowercase().replace(' ', "").contains("font-style:italic");
+        let style_bold = || comp.bold;
+        let style_italic = || comp.italic;
         match tag {
             "br" => out.push(HARD),
             "img" => out.push_str(&self.image(e.attr("src"), e.attr("alt").unwrap_or(""))),
@@ -923,6 +999,7 @@ impl Conv<'_, '_> {
     fn finish(mut self, md: String) -> Converted {
         let mut text = String::with_capacity(md.len());
         let mut anchors = Vec::new();
+        let mut styles: Vec<(usize, BlockLook)> = Vec::new();
         let mut id = String::new();
         let mut inside = false;
         for c in md.chars() {
@@ -933,7 +1010,15 @@ impl Conv<'_, '_> {
                 }
                 A_CLOSE => {
                     if inside {
-                        anchors.push((std::mem::take(&mut id), text.len()));
+                        let id = std::mem::take(&mut id);
+                        match id.strip_prefix(STYLE_TAG).and_then(|n| n.parse::<usize>().ok()) {
+                            Some(n) => {
+                                if let Some(look) = self.looks.get(n) {
+                                    styles.push((text.len(), look.clone()));
+                                }
+                            }
+                            None => anchors.push((id, text.len())),
+                        }
                     }
                     inside = false;
                 }
@@ -947,13 +1032,18 @@ impl Conv<'_, '_> {
         for a in &mut anchors {
             a.1 = a.1.saturating_sub(cut);
         }
+        for st in &mut styles {
+            st.0 = st.0.saturating_sub(cut);
+        }
         let mut text = trimmed.trim_end().to_owned();
         text.push('\n');
         for a in &mut anchors {
             a.1 = a.1.min(text.len());
         }
+        styles.retain(|(b, _)| *b < text.len());
         self.out.md = text;
         self.out.anchors = anchors;
+        self.out.styles = styles;
         self.out
     }
 }
@@ -1014,6 +1104,7 @@ fn find_svg_image(e: &El, out: &mut Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epub::css;
     use crate::paste::parse;
 
     fn conv(html: &str) -> Converted {
@@ -1021,10 +1112,47 @@ mod tests {
     }
 
     fn conv_with(html: &str, notes: &HashSet<String>) -> Converted {
+        conv_full(html, notes, &Sheet::default())
+    }
+
+    fn conv_css(html: &str, css: &str) -> Converted {
+        conv_full(html, &HashSet::new(), &Sheet::parse(css))
+    }
+
+    fn conv_full(html: &str, notes: &HashSet<String>, sheet: &Sheet) -> Converted {
         let known = ["OEBPS/a.xhtml", "OEBPS/b.xhtml", "OEBPS/img/p 1.png", "OEBPS/cover.svg"];
         let canon = |p: &str| known.iter().find(|k| k.eq_ignore_ascii_case(p)).map(|k| (*k).to_owned());
-        let env = Env { doc_id: 7, chapter: 2, file: "OEBPS/a.xhtml", canon: &canon, note_targets: notes };
+        let env = Env { doc_id: 7, chapter: 2, file: "OEBPS/a.xhtml", canon: &canon, note_targets: notes, sheet };
         convert(&parse(html), &env)
+    }
+
+    #[test]
+    fn förlagets_stil_blir_blockutseende_vid_rätt_byteposition() {
+        let c = conv_css(
+            "<body><h2 class=\"t\">Kapitel I</h2><p>Första.</p><p class=\"s\">Andra stycket.</p><div class=\"c\"><p>* * *</p></div><p class=\"i\">Kursiv text</p></body>",
+            "h2.t { text-align: center; font-variant: small-caps }\np { text-indent: 1.5em; margin: 0 }\n.c p { text-align: center; text-indent: 0 }\n.i { font-style: italic }\np.s { margin-left: 2em }",
+        );
+        let at = |needle: &str| c.md.find(needle).unwrap();
+        let look = |b: usize| c.styles.iter().find(|(p, _)| *p == b).map(|(_, l)| l.clone());
+        let h = look(at("## Kapitel")).expect("rubrikens utseende");
+        assert_eq!((h.align, h.small_caps), (Some(css::Align::Center), true));
+        assert_eq!(look(at("Första")).unwrap().indent, 1.5);
+        let s = look(at("Andra")).unwrap();
+        assert_eq!((s.indent, s.margin_left), (1.5, 2.0));
+        let star = look(at("\\* \\* \\*")).unwrap();
+        assert_eq!((star.align, star.indent), (Some(css::Align::Center), 0.0), "ärver justering från div.c");
+        assert!(c.md.contains("*Kursiv text*"), "font-style från klassen blir kursiv: {:?}", c.md);
+        assert!(c.styles.iter().all(|(b, _)| *b < c.md.len()), "{:?}", c.styles);
+        // Markörerna syns inte i texten.
+        assert!(!c.md.contains('\u{1}') && !c.md.contains('\u{e000}'));
+    }
+
+    #[test]
+    fn utan_stilmall_ingen_blockstil_och_inline_style_gäller() {
+        let c = conv("<body><p>Vanligt</p><p style=\"text-align:center\">Mitten</p></body>");
+        assert_eq!(c.styles.len(), 1);
+        assert_eq!(c.styles[0].0, c.md.find("Mitten").unwrap());
+        assert_eq!(c.styles[0].1.align, Some(css::Align::Center));
     }
 
     #[test]

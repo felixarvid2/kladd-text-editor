@@ -3,8 +3,12 @@
 //! innehållsförteckning, länkmål och noter. Ritningen och tangenterna finns i `view.rs`, designen i
 //! `docs/dev/epub.md`.
 
+pub mod anchor;
+pub mod css;
 pub mod html;
 pub mod read;
+pub mod selection;
+pub mod store;
 pub mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +25,8 @@ use crate::paste::{El, parse};
 pub const SECTION_LIMIT: usize = 24_000;
 /// Antal extra filer (utanför läsordningen) som tas med som länkmål, som mest.
 const MAX_EXTRA: usize = 64;
+/// Största stilmall (byte) som läses; större hoppas över.
+const MAX_CSS: usize = 2_000_000;
 
 /// Ett ställe i boken: del och byteposition i delens Markdown.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
@@ -54,6 +60,10 @@ pub struct Section {
     pub cover: Option<String>,
     /// Ord i böckerna före delen (för framsteg).
     pub words_before: usize,
+    /// Byteposition i kapitlets Markdown där delen börjar (förankring av bokmärken och understrykningar).
+    pub offset: usize,
+    /// Förlagets blockstil: byteposition i delens Markdown och utseende.
+    pub blocks: Vec<(usize, css::BlockLook)>,
 }
 
 #[derive(Clone, Debug)]
@@ -267,12 +277,13 @@ impl Book {
         }
 
         // Träd för alla kapitel; ingång 1 samlar vilka mål fotnotsreferenser pekar på.
-        let mut roots: Vec<(String, El)> = Vec::new();
+        let mut roots: Vec<(String, (El, css::Sheet))> = Vec::new();
         let mut note_targets = HashSet::new();
+        let mut css_cache: HashMap<String, css::Sheet> = HashMap::new();
         for (p, _) in &order {
-            let root = load_page(&mut ar, p);
+            let (root, sheet) = load_page(&mut ar, p, &mut css_cache);
             html::scan_note_targets(&root, p, &canon, &mut note_targets);
-            roots.push((p.clone(), root));
+            roots.push((p.clone(), (root, sheet)));
         }
 
         // Ingång 2: kapitlen till Markdown. Filer som länkas men inte ligger i läsordningen (noter) tas med efteråt.
@@ -281,22 +292,22 @@ impl Book {
         let mut queue: Vec<(String, bool)> = order.clone();
         let mut qi = 0;
         let mut extra = 0;
-        let mut root_map: HashMap<String, El> = roots.into_iter().collect();
+        let mut root_map: HashMap<String, (El, css::Sheet)> = roots.into_iter().collect();
         while qi < queue.len() {
             let (path, linear) = queue[qi].clone();
             qi += 1;
             if !done.insert(path.clone()) {
                 continue;
             }
-            let root = match root_map.remove(&path) {
+            let (root, sheet) = match root_map.remove(&path) {
                 Some(r) => r,
                 None => {
-                    let r = load_page(&mut ar, &path);
-                    html::scan_note_targets(&r, &path, &canon, &mut note_targets);
+                    let r = load_page(&mut ar, &path, &mut css_cache);
+                    html::scan_note_targets(&r.0, &path, &canon, &mut note_targets);
                     r
                 }
             };
-            let env = html::Env { doc_id: uid, chapter: convs.len(), file: &path, canon: &canon, note_targets: &note_targets };
+            let env = html::Env { doc_id: uid, chapter: convs.len(), file: &path, canon: &canon, note_targets: &note_targets, sheet: &sheet };
             let out = html::convert(&root, &env);
             for l in &out.links {
                 if extra < MAX_EXTRA && !done.contains(&l.path) && !queue.iter().any(|(p, _)| *p == l.path) {
@@ -338,6 +349,8 @@ impl Book {
                 link_dests: Vec::new(),
                 cover: Some(cv.clone()),
                 words_before: 0,
+                offset: 0,
+                blocks: Vec::new(),
             });
             headings.push(None);
         }
@@ -350,7 +363,18 @@ impl Book {
                 let images: Vec<String> = c.out.images.iter().filter(|p| md.contains(&html::image_uri(uid, p))).cloned().collect();
                 let link_dests = link_dests_of(&md);
                 let cover_page = cover_only(&md, &images);
-                sections.push(Section { chapter: ch, words: md.split_whitespace().count(), md, images, link_dests, cover: cover_page, words_before: 0 });
+                let blocks = c.out.styles.iter().filter(|(b, _)| *b >= r.start && *b < r.end).map(|(b, l)| (b - r.start, l.clone())).collect();
+                sections.push(Section {
+                    chapter: ch,
+                    words: md.split_whitespace().count(),
+                    md,
+                    images,
+                    link_dests,
+                    cover: cover_page,
+                    words_before: 0,
+                    offset: r.start,
+                    blocks,
+                });
             }
             for (id, byte) in &c.out.anchors {
                 let si = ranges.iter().position(|r| *byte >= r.start && *byte < r.end).unwrap_or(ranges.len() - 1);
@@ -478,6 +502,25 @@ impl Book {
         self.chapters.iter().find(|c| c.linear && !c.path.is_empty()).map(|c| c.title.clone()).unwrap_or_default()
     }
 
+    /// Kapitlets hela Markdown (delarna hopsatta). Bokmärken och understrykningar pekar in i den.
+    pub fn chapter_md(&self, ch: usize) -> String {
+        let Some(c) = self.chapters.get(ch) else { return String::new() };
+        self.sections[c.first_section..c.first_section + c.section_count].iter().map(|s| s.md.as_str()).collect()
+    }
+
+    /// Stället (del och byte i delen) för en byteposition i kapitel `ch`s Markdown.
+    pub fn dest_in_chapter(&self, ch: usize, byte: usize) -> Option<Dest> {
+        let c = self.chapters.get(ch)?;
+        let secs = &self.sections[c.first_section..c.first_section + c.section_count];
+        let i = secs.iter().rposition(|s| s.offset <= byte).unwrap_or(0);
+        Some(Dest { section: c.first_section + i, byte: byte.saturating_sub(secs[i].offset).min(secs[i].md.len()) })
+    }
+
+    /// Kapitlens (index, titel) i läsordning.
+    pub fn chapter_titles(&self) -> Vec<(usize, String)> {
+        self.linear_chapters().into_iter().map(|c| (c, self.chapters[c].title.clone())).collect()
+    }
+
     /// Kapitlen i den löpande läsordningen (index i `chapters`).
     pub fn linear_chapters(&self) -> Vec<usize> {
         self.chapters.iter().enumerate().filter(|(_, c)| c.linear).map(|(i, _)| i).collect()
@@ -576,13 +619,36 @@ fn link_dests_of(md: &str) -> Vec<String> {
     out
 }
 
-/// Läser en sida (eller en bild i läsordningen) som träd.
-fn load_page(ar: &mut Archive, path: &str) -> El {
+/// Läser en sida (eller en bild i läsordningen) som träd och stilmallen som gäller den.
+fn load_page(ar: &mut Archive, path: &str, cache: &mut HashMap<String, css::Sheet>) -> (El, css::Sheet) {
     if is_image_path(path) {
         let name = path.rsplit('/').next().unwrap_or(path);
-        return parse(&format!("<body><p><img src=\"{}\"/></p></body>", name.replace('"', "")));
+        return (parse(&format!("<body><p><img src=\"{}\"/></p></body>", name.replace('"', ""))), css::Sheet::default());
     }
-    parse(&ar.read_text(path).unwrap_or_default())
+    let raw = ar.read_text(path).unwrap_or_default();
+    let root = parse(&raw);
+    let mut sheet = css::Sheet::default();
+    // Länkade stilmallar (i ordning) och sedan `<style>` i sidan.
+    let mut hrefs: Vec<String> = Vec::new();
+    read::each(&root, &mut |e| {
+        if read::local(&e.tag) == "link" && e.attr("rel").is_some_and(|r| r.to_ascii_lowercase().contains("stylesheet")) {
+            if let Some(h) = e.attr("href").filter(|h| !read::has_scheme(h)) {
+                hrefs.push(read::resolve(read::dir_of(path), h).0);
+            }
+        }
+    });
+    for h in hrefs.into_iter().take(16) {
+        let key = h.to_lowercase();
+        if !cache.contains_key(&key) {
+            let text = ar.read_text(&h).filter(|t| t.len() <= MAX_CSS).unwrap_or_default();
+            cache.insert(key.clone(), css::Sheet::parse(&text));
+        }
+        sheet.extend(&cache[&key]);
+    }
+    for st in css::inline_styles(&raw).into_iter().take(16) {
+        sheet.add(&st);
+    }
+    (root, sheet)
 }
 
 #[cfg(test)]

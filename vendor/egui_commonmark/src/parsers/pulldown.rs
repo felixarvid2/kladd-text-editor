@@ -6,6 +6,7 @@ use crate::{CommonMarkCache, CommonMarkOptions};
 
 #[cfg(feature = "regex")]
 use egui::RichText;
+use egui::text::LayoutJob;
 use egui::{self, Id, Pos2, TextStyle, Ui};
 
 use crate::List;
@@ -106,6 +107,8 @@ pub struct CommonMarkViewerInternal {
     /// `event_text` calls during this render pass. Flushed into
     /// `SearchCache` [`CommonMarkCache`] at the end of `show()` (non-scrollable path only).
     search_match_ys_scratch: Vec<(usize, f32)>,
+    /// Kladd: den förra händelsen var slutet på ett stycke (för att hålla ihop indragna stycken).
+    last_end_para: bool,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -134,6 +137,7 @@ impl CommonMarkViewerInternal {
             want_scroll_to_active_match: false,
             content_origin_y: 0.0,
             search_match_ys_scratch: Vec::new(),
+            last_end_para: false,
         }
     }
 }
@@ -311,14 +315,21 @@ impl CommonMarkViewerInternal {
             let start_position = ui.next_widget_position();
 
             // Kladd: var varje block börjar, för dubbelklick och rullningssynk.
+            // HTML-block, tabeller och linjer räknas också: ett dokument som börjar med en HTML-block
+            // (`<p align="center">`) hade annars ingen position förrän första stycket, och dubbelklicket
+            // där hittade ingen rad.
             if matches!(
                 e,
-                pulldown_cmark::Event::Start(
-                    pulldown_cmark::Tag::Paragraph
-                        | pulldown_cmark::Tag::Heading { .. }
-                        | pulldown_cmark::Tag::CodeBlock(_)
-                        | pulldown_cmark::Tag::Item
-                )
+                pulldown_cmark::Event::Rule
+                    | pulldown_cmark::Event::Start(
+                        pulldown_cmark::Tag::Paragraph
+                            | pulldown_cmark::Tag::Heading { .. }
+                            | pulldown_cmark::Tag::CodeBlock(_)
+                            | pulldown_cmark::Tag::Item
+                            | pulldown_cmark::Tag::HtmlBlock
+                            | pulldown_cmark::Tag::Table(_)
+                            | pulldown_cmark::Tag::DefinitionListTitle
+                    )
             ) {
                 viewer_cache(cache, &line_sid)
                     .line_points
@@ -826,12 +837,400 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         max_width: f32,
     ) {
+        let prev_end_para = std::mem::replace(&mut self.last_end_para, matches!(event, pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Paragraph)));
+        if self.try_galley(ui, events, &event, &src_span, cache, options, max_width, prev_end_para) {
+            return;
+        }
         self.event(ui, event, src_span, cache, options, max_width);
 
         self.def_list_def_wrapping(events, max_width, cache, options, ui);
         self.item_list_wrapping(events, max_width, cache, options, ui);
         self.table(events, cache, options, ui, max_width);
         self.blockquote(events, max_width, cache, options, ui);
+    }
+
+    /// Kladd: ritar ett stycke eller en rubrik som ett enda galleri när läsläget för EPUB vill det (justerad text,
+    /// förlagets blockstil eller markeringar i blocket). Ger sant om blocket är ritat.
+    #[allow(clippy::too_many_arguments)]
+    fn try_galley<'e>(
+        &mut self,
+        ui: &mut Ui,
+        events: &mut Peekable<impl Iterator<Item = EventIteratorItem<'e>>>,
+        event: &pulldown_cmark::Event,
+        src_span: &Range<usize>,
+        cache: &mut CommonMarkCache,
+        options: &CommonMarkOptions,
+        max_width: f32,
+        prev_end_para: bool,
+    ) -> bool {
+        let (heading, is_para) = match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Paragraph) => (None, true),
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Heading { level, .. }) => (Some(*level), false),
+            _ => return false,
+        };
+        if self.list.is_inside_a_list()
+            || self.is_blockquote
+            || self.is_table
+            || self.link.is_some()
+            || self.image.is_some()
+            || self.code_block.is_some()
+            || self.def_list.is_def_list_def
+        {
+            return false;
+        }
+        let Some(extras) = current_extras(ui) else { return false };
+        let style = extras.blocks.get(&src_span.start).cloned();
+        if style.is_none() && !(is_para && extras.justify) && !extras.marks_in(src_span) {
+            return false;
+        }
+        let style = style.unwrap_or_default();
+        let evs = delayed_events(events, |end| {
+            matches!(end, pulldown_cmark::TagEnd::Paragraph | pulldown_cmark::TagEnd::Heading(_))
+        });
+        if self.galley_block(ui, heading, &evs, src_span, cache, options, &extras, &style, prev_end_para) {
+            self.last_end_para = is_para;
+            return true;
+        }
+        // Något i blocket går inte att lägga i ett galleri (bild, formel …): rita det på vanligt sätt.
+        self.event(ui, event.clone(), src_span.clone(), cache, options, max_width);
+        let mut it = evs.into_iter().enumerate().peekable();
+        while let Some((_, (e, sp))) = it.next() {
+            self.process_event(ui, &mut it, e, sp, cache, options, max_width);
+        }
+        true
+    }
+
+    /// Kladd: den aktuella textstorleken (brödtext eller rubrik) för små versaler.
+    fn current_size(&self, ui: &Ui) -> f32 {
+        let body = ui.style().text_styles.get(&TextStyle::Body).map_or(14.0, |d| d.size);
+        let Some(level) = self.text_style.heading else { return body };
+        let max = ui.style().text_styles.get(&TextStyle::Heading).map_or(32.0, |d| d.size);
+        let diff = max - body;
+        match level {
+            0 => max,
+            1 => body + diff * 0.668,
+            2 => body + diff * 0.501,
+            3 => body + diff * 0.334,
+            4 => body + diff * 0.167,
+            _ => body + diff * 0.167,
+        }
+    }
+
+    /// Kladd: lägger en textbit (med nuvarande stil) i galleriet. Med `small_caps` ritas gemener som
+    /// versaler i mindre storlek (byte-längden är oförändrad så att källpositionerna stämmer).
+    #[allow(clippy::too_many_arguments)]
+    fn galley_push(
+        &self,
+        ui: &Ui,
+        job: &mut LayoutJob,
+        pieces: &mut Vec<(Range<usize>, Range<usize>)>,
+        text: &str,
+        span: &Range<usize>,
+        small_caps: bool,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let valign = ui.text_valign();
+        let mut add = |job: &mut LayoutJob, t: &str, lower: bool, off: usize| {
+            if t.is_empty() {
+                return;
+            }
+            let mut rich = self.text_style.to_richtext(ui, t);
+            if lower {
+                rich = rich.size(self.current_size(ui) * 0.8);
+            }
+            let from = job.text.len();
+            rich.append_to(job, ui.style(), egui::FontSelection::Default, valign);
+            let start = span.start.saturating_add(off).min(span.end.max(span.start));
+            pieces.push((from..job.text.len(), start..span.end.max(start)));
+        };
+        if !small_caps {
+            add(job, text, false, 0);
+            return;
+        }
+        let mut run = String::new();
+        let mut run_lower = false;
+        let mut off = 0;
+        let mut run_off = 0;
+        for ch in text.chars() {
+            let lower = ch.is_lowercase();
+            if !run.is_empty() && lower != run_lower {
+                let t = if run_lower { upper_same_len(&run) } else { run.clone() };
+                add(job, &t, run_lower, run_off);
+                run.clear();
+                run_off = off;
+            }
+            if run.is_empty() {
+                run_off = off;
+                run_lower = lower;
+            }
+            run.push(ch);
+            off += ch.len_utf8();
+        }
+        if !run.is_empty() {
+            let t = if run_lower { upper_same_len(&run) } else { run };
+            add(job, &t, run_lower, run_off);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn galley_block(
+        &mut self,
+        ui: &mut Ui,
+        heading: Option<HeadingLevel>,
+        evs: &[(pulldown_cmark::Event<'_>, Range<usize>)],
+        block_span: &Range<usize>,
+        cache: &mut CommonMarkCache,
+        options: &CommonMarkOptions,
+        extras: &ViewExtras,
+        style: &BlockStyle,
+        prev_end_para: bool,
+    ) -> bool {
+        use pulldown_cmark::{Event, Tag, TagEnd};
+        // Går allt att lägga i ett galleri?
+        let simple = evs.iter().all(|(e, _)| {
+            matches!(
+                e,
+                Event::Text(_)
+                    | Event::Code(_)
+                    | Event::InlineHtml(_)
+                    | Event::SoftBreak
+                    | Event::HardBreak
+                    | Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Superscript | Tag::Subscript)
+                    | Event::End(
+                        TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link | TagEnd::Superscript | TagEnd::Subscript | TagEnd::Paragraph | TagEnd::Heading(_)
+                    )
+            )
+        });
+        if !simple {
+            return false;
+        }
+
+        let level_idx = heading.map(|l| match l {
+            HeadingLevel::H1 => 0,
+            HeadingLevel::H2 => 1,
+            HeadingLevel::H3 => 2,
+            HeadingLevel::H4 => 3,
+            HeadingLevel::H5 => 4,
+            HeadingLevel::H6 => 5,
+        });
+        let body = ui.style().text_styles.get(&TextStyle::Body).map_or(14.0, |d| d.size);
+        let tight = style.indent > 0.0 && prev_end_para && heading.is_none();
+        if heading.is_some() {
+            newline(ui);
+            self.text_style.heading = level_idx;
+        } else if !tight {
+            self.line.try_insert_start(ui);
+        }
+
+        let mut job = LayoutJob::default();
+        let mut pieces: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+        let mut links: Vec<(Range<usize>, String)> = Vec::new();
+        let mut cur_link: Option<(usize, String)> = None;
+        for (e, span) in evs {
+            match e {
+                Event::Text(t) | Event::InlineHtml(t) => self.galley_push(ui, &mut job, &mut pieces, t, span, style.small_caps),
+                Event::Code(t) => {
+                    self.text_style.code = true;
+                    self.galley_push(ui, &mut job, &mut pieces, t, span, false);
+                    self.text_style.code = false;
+                }
+                Event::SoftBreak => {
+                    let at = span.start..span.start;
+                    self.galley_push(ui, &mut job, &mut pieces, " ", &at, false);
+                }
+                Event::HardBreak => {
+                    let at = span.start..span.start;
+                    self.galley_push(ui, &mut job, &mut pieces, "\n", &at, false);
+                }
+                Event::Start(Tag::Emphasis) => self.text_style.emphasis = true,
+                Event::Start(Tag::Strong) => self.text_style.strong = true,
+                Event::Start(Tag::Strikethrough) => self.text_style.strikethrough = true,
+                Event::End(TagEnd::Emphasis) => self.text_style.emphasis = false,
+                Event::End(TagEnd::Strong) => self.text_style.strong = false,
+                Event::End(TagEnd::Strikethrough) => self.text_style.strikethrough = false,
+                Event::Start(Tag::Link { dest_url, .. }) => cur_link = Some((job.text.len(), dest_url.to_string())),
+                Event::End(TagEnd::Link) => {
+                    if let Some((from, dest)) = cur_link.take() {
+                        if from < job.text.len() {
+                            links.push((from..job.text.len(), dest));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if heading.is_some() {
+            self.text_style.heading = None;
+        }
+        // Länkar: länkfärg (som den vanliga etikettvägen; ingen ständig understrykning, den hamnar långt under raden).
+        let link_color = ui.visuals().hyperlink_color;
+        let link_ranges: Vec<(Range<usize>, ())> = links.iter().map(|(r, _)| (r.clone(), ())).collect();
+        egui_commonmark_backend::search::format_ranges(&mut job, &link_ranges, |f, _| {
+            f.color = link_color;
+        });
+        // Markeringar och sökträffar som bakgrunder.
+        let mut mark_hits: Vec<(usize, Range<usize>)> = Vec::new();
+        let mut mark_colors: Vec<(Range<usize>, egui::Color32)> = Vec::new();
+        for (jr, sr) in &pieces {
+            let len = jr.end - jr.start;
+            for (mi, m) in extras.marks.iter().enumerate() {
+                if m.range.start < sr.end.max(sr.start + len) && m.range.end > sr.start {
+                    let a = m.range.start.saturating_sub(sr.start).min(len);
+                    let b = m.range.end.saturating_sub(sr.start).min(len);
+                    if a < b {
+                        mark_hits.push((mi, jr.start + a..jr.start + b));
+                        mark_colors.push((jr.start + a..jr.start + b, m.color));
+                    }
+                }
+            }
+        }
+        egui_commonmark_backend::search::apply_mark_colors(&mut job, &mark_colors);
+        #[cfg(feature = "regex")]
+        let mut search_ivs: Vec<(Range<usize>, bool)> = Vec::new();
+        #[cfg(feature = "regex")]
+        let mut search_global: Vec<usize> = Vec::new();
+        #[cfg(feature = "regex")]
+        {
+            let vc = viewer_cache(cache, &options.source_id.unwrap_or(Id::NULL));
+            let sc = &vc.search_cache;
+            let ranges = sc.search_ranges();
+            if !ranges.is_empty() {
+                for (jr, sr) in &pieces {
+                    let len = jr.end - jr.start;
+                    let local = search_intervals(ranges, sc.active_search_range(), sr, len);
+                    let idxs: Vec<usize> = ranges
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| r.start < r.end && r.start < sr.end && r.end > sr.start)
+                        .map(|(i, _)| i)
+                        .collect();
+                    for (k, (r, active)) in local.into_iter().enumerate() {
+                        search_ivs.push((jr.start + r.start..jr.start + r.end, active));
+                        search_global.push(idxs.get(k).copied().unwrap_or(0));
+                    }
+                }
+                search_ivs.sort_by_key(|(r, _)| r.start);
+            }
+        }
+        #[cfg(feature = "regex")]
+        if !search_ivs.is_empty() {
+            egui_commonmark_backend::search::apply_search_highlights(
+                &mut job,
+                &search_ivs,
+                options.search_match_bg(ui),
+                options.search_active_match_bg(ui),
+            );
+        }
+
+        // Layout.
+        let align = style.align.unwrap_or(if heading.is_none() && extras.justify { BlockAlign::Justify } else { BlockAlign::Left });
+        let avail = ui.available_width().max(80.0);
+        let ml = (style.margin_left * body).clamp(0.0, avail * 0.6);
+        let text_w = (avail - ml).max(60.0);
+        if style.indent > 0.0 && matches!(align, BlockAlign::Left | BlockAlign::Justify) {
+            if let Some(first) = job.sections.first_mut() {
+                first.leading_space = style.indent * body;
+            }
+        }
+        job.wrap.max_width = text_w;
+        job.halign = match align {
+            BlockAlign::Center => egui::Align::Center,
+            BlockAlign::Right => egui::Align::RIGHT,
+            _ => egui::Align::LEFT,
+        };
+        job.justify = false;
+        if align == BlockAlign::Justify {
+            // egui:s egen justering (`LayoutJob::justify`) tar bort radens inledande blanksteg och därmed indraget
+            // på första raden, så mellanrummen fördelas här i stället.
+            job = justify_job(ui, job, text_w);
+        }
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        let selectable = ui.style().interaction.selectable_labels;
+        let mut sense = egui::Sense::click();
+        if selectable {
+            sense = egui::Sense::click_and_drag();
+            sense -= egui::Sense::FOCUSABLE;
+        }
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(avail, galley.size().y.max(1.0)), sense);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, ui.is_enabled(), galley.text()));
+        let left = rect.left() + ml;
+        let pos = match align {
+            BlockAlign::Center => egui::pos2(left + text_w / 2.0, rect.top()),
+            BlockAlign::Right => egui::pos2(rect.right(), rect.top()),
+            _ => egui::pos2(left, rect.top()),
+        };
+
+        // Sökträffarnas lägen (för rullning och aktuell träff).
+        #[cfg(feature = "regex")]
+        if !search_ivs.is_empty() {
+            let content_origin_y = self.content_origin_y;
+            for (i, (r, active)) in search_ivs.iter().enumerate() {
+                if let Some(rc) = highlight_rect_for_byte_range(&galley, pos, r.clone()) {
+                    self.search_match_ys_scratch.push((search_global.get(i).copied().unwrap_or(0), rc.min.y - content_origin_y));
+                    if *active && self.want_scroll_to_active_match {
+                        ui.scroll_to_rect(rc, Some(egui::Align::Center));
+                        self.want_scroll_to_active_match = false;
+                    }
+                }
+            }
+        }
+
+        if ui.is_rect_visible(rect) {
+            let color = ui.style().visuals.text_color();
+            if selectable {
+                egui::text_selection::LabelSelectionState::label_text_selection(ui, &response, pos, galley.clone(), color, egui::Stroke::NONE);
+            } else {
+                ui.painter().add(egui::epaint::TextShape::new(pos, galley.clone(), color));
+            }
+            // Anteckningsmärke efter varje markering som har en anteckning.
+            for (mi, m) in extras.marks.iter().enumerate() {
+                if !m.note || !block_span.contains(&m.range.end.saturating_sub(1)) {
+                    continue;
+                }
+                if let Some((_, jr)) = mark_hits.iter().filter(|(i, _)| *i == mi).max_by_key(|(_, r)| r.end) {
+                    if let Some(rc) = highlight_rect_for_byte_range(&galley, pos, jr.clone()) {
+                        let c = egui::pos2(rc.right() + 5.0, rc.top() + 5.0);
+                        ui.painter().circle_filled(c, 3.5, extras.note_color);
+                    }
+                }
+            }
+        }
+
+        // Klick: länk eller markering under pekaren.
+        if let Some(ptr) = response.hover_pos().or_else(|| response.interact_pointer_pos()) {
+            if let Some(ci) = galley_char_at(&galley, pos, ptr) {
+                let text = &galley.job.text;
+                let byte = text.char_indices().nth(ci).map_or(text.len(), |(b, _)| b);
+                let link = links.iter().find(|(r, _)| r.start <= byte && byte < r.end).map(|(_, d)| d.clone());
+                let mark = mark_hits.iter().find(|(_, r)| r.start <= byte && byte < r.end).map(|(i, _)| *i);
+                if link.is_some() || mark.is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if response.clicked() {
+                    if let Some(dest) = link {
+                        self.galley_link(ui, cache, options, dest);
+                    } else if let Some(mi) = mark {
+                        put_mark_hit(ui.ctx(), (mi, ptr));
+                    }
+                }
+            }
+        }
+
+        self.line.try_insert_end(ui);
+        true
+    }
+
+    /// Kladd: klick på en länk i ett galleri (samma som `Link::end`).
+    fn galley_link(&mut self, ui: &mut Ui, cache: &mut CommonMarkCache, options: &CommonMarkOptions, dest: String) {
+        if cache.link_hooks().contains_key(&dest) {
+            cache.link_hooks_mut().insert(dest, true);
+        } else if options.enable_scroll_to_heading && dest.starts_with('#') {
+            self.deferred_scroll_to_heading = Some(dest[1..].to_owned());
+        } else {
+            ui.ctx().open_url(egui::OpenUrl::same_tab(dest));
+        }
     }
 
     fn def_list_def_wrapping<'e>(
@@ -1929,6 +2328,132 @@ mod perf_tests {
 
 /// Kladd: kolumnbredder för en tabell så att den får plats på `avail`. Korta kolumner får sin
 /// naturliga bredd och de långa delar på resten (och radbryts).
+/// Kladd: justerar ett stycke genom att lägga extra bokstavsavstånd vid blankstegen i varje rad utom den sista
+/// (och rader som slutar med en hård radbrytning), så att raden fyller `wrap_w`. Radbrytningarna tas ur en första
+/// utläggning utan justering; indraget (`leading_space` på första sektionen) bevaras. Texten ändras inte.
+fn justify_job(ui: &Ui, job: LayoutJob, wrap_w: f32) -> LayoutJob {
+    struct Plan {
+        row: usize,
+        a: usize,
+        b: usize,
+        /// Glyfindex för blankstegen mitt i raden och deras byteområde.
+        spaces: Vec<(usize, Range<usize>)>,
+        /// Önskad högerkant för sista ordet.
+        end_x: f32,
+        /// Extra bildpunkter per blanksteg hittills.
+        units: Vec<usize>,
+    }
+    let layout = |j: &LayoutJob| ui.fonts_mut(|f| f.layout_job(j.clone()));
+    let mut job = job;
+    let first = layout(&job);
+    if first.rows.len() < 2 {
+        return job;
+    }
+    // egui radbryter först när ordet och blankstegen efter det ryms: tillåt ett blanksteg extra, så att sista ordet
+    // på en justerad rad kan sluta exakt vid `wrap_w` (blankstegen sticker ut utanför kanten och syns inte).
+    let space_w = first.rows.iter().flat_map(|r| r.row.glyphs.iter()).find(|g| g.chr == ' ').map_or(0.0, |g| g.logical_rect().width());
+    job.wrap.max_width = wrap_w + space_w;
+    let galley = layout(&job);
+    let n_rows = galley.rows.len();
+    if n_rows < 2 {
+        return job;
+    }
+    let chars: Vec<(usize, char)> = job.text.char_indices().collect();
+    let pixel = 1.0 / ui.pixels_per_point().max(0.5);
+    let mut plans: Vec<Plan> = Vec::new();
+    let mut ci = 0usize;
+    for (ri, pr) in galley.rows.iter().enumerate() {
+        let gl = &pr.row.glyphs;
+        if ri + 1 < n_rows && !pr.ends_with_newline {
+            let a = gl.iter().position(|g| !g.chr.is_whitespace());
+            let b = gl.iter().rposition(|g| !g.chr.is_whitespace());
+            if let (Some(a), Some(b)) = (a, b) {
+                let in_sync = (a..=b).all(|i| chars.get(ci + i).map(|c| c.1) == Some(gl[i].chr));
+                let spaces: Vec<(usize, Range<usize>)> = (a + 1..b)
+                    .filter(|i| gl[*i].chr.is_whitespace())
+                    .map(|i| {
+                        // egui lägger bokstavsavståndet före varje tecken i sektionen, så blankstegets egen sektion
+                        // vidgar mellanrummet före det.
+                        let (byte, ch) = chars[ci + i];
+                        (i, byte..byte + ch.len_utf8())
+                    })
+                    .collect();
+                if in_sync && !spaces.is_empty() {
+                    let n = spaces.len();
+                    plans.push(Plan { row: ri, a, b, spaces, end_x: wrap_w - 1.5, units: vec![0; n] });
+                }
+            }
+        }
+        ci += pr.char_count_including_newline().0;
+    }
+    let apply = |plans: &[Plan]| -> LayoutJob {
+        let mut gaps: Vec<(Range<usize>, f32)> = Vec::new();
+        for p in plans {
+            for (k, (_, r)) in p.spaces.iter().enumerate() {
+                if p.units[k] > 0 {
+                    gaps.push((r.clone(), p.units[k] as f32 * pixel));
+                }
+            }
+        }
+        let mut j = job.clone();
+        egui_commonmark_backend::search::format_ranges(&mut j, &gaps, |f, e| f.extra_letter_spacing = *e);
+        j
+    };
+    // Fördelar `units` hela bildpunkter jämnt över radens blanksteg.
+    fn spread(p: &mut Plan, units: usize) {
+        let k = p.spaces.len();
+        let (base, rem) = (units / k, units % k);
+        for n in 0..k {
+            p.units[n] += base + ((n + 1) * rem / k - n * rem / k);
+        }
+    }
+    // Några varv: utläggningen avrundar glyfernas lägen, så det som saknas mäts om och fylls på.
+    let mut current = galley;
+    for _ in 0..5 {
+        let mut changed = false;
+        for p in &mut plans {
+            let gl = &current.rows[p.row].row.glyphs;
+            let (Some(first), Some(last)) = (gl.get(p.a), gl.get(p.b)) else { continue };
+            let natural_end = last.logical_rect().max.x;
+            let _ = first;
+            let units = ((p.end_x - natural_end) / pixel).floor();
+            if units >= 1.0 {
+                spread(p, units as usize);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        let next = layout(&apply(&plans));
+        // Andra radbrytningar än i första utläggningen: lämna justeringen som den var.
+        if next.rows.len() != n_rows {
+            break;
+        }
+        current = next;
+    }
+    apply(&plans)
+}
+
+/// Kladd: versaler med samma byte-längd som originalet (tecken som skulle ändra längd, som ß, lämnas).
+fn upper_same_len(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut up = c.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(u), None) if u.len_utf8() == c.len_utf8() => u,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Kladd: tecknet (index) under `ptr` i ett galleri som ritats vid `pos`, om pekaren är över en textrad.
+fn galley_char_at(galley: &std::sync::Arc<egui::Galley>, pos: Pos2, ptr: Pos2) -> Option<usize> {
+    let hit = galley.rows.iter().any(|r| r.rect().translate(pos.to_vec2()).contains(ptr));
+    hit.then(|| galley.cursor_from_pos(ptr - pos).index.0)
+}
+
 fn table_column_widths(chars: &[usize], avail: f32, char_w: f32) -> Vec<f32> {
     const PAD: f32 = 18.0 + 8.0;
     const MIN: f32 = 72.0;

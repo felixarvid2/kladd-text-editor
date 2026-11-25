@@ -219,9 +219,9 @@ pub fn render(
         let hand = ui.ctx().output(|o| o.cursor_icon) == egui::CursorIcon::PointingHand;
         if !hand && out.toggled.is_none() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()).filter(|p| ui.clip_rect().contains(*p)) {
-                if let Some(at) = line_at(points, pos.y - rect.top()) {
-                    out.dbl = Some(to_doc_offset(&text, &doc.text, at));
-                }
+                // Över första blocket (eller innan något block har ritats) öppnas redigeraren i början.
+                let at = line_at(points, pos.y - rect.top()).unwrap_or(0);
+                out.dbl = Some(to_doc_offset(&text, &doc.text, at));
             }
         }
     }

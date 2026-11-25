@@ -103,6 +103,8 @@ impl Ui {
                 crate::i18n::set_lang(crate::i18n::Lang::Sv);
                 // Aldrig någon uppdateringskontroll i testerna.
                 app.settings.auto_update_check = false;
+                // Biblioteket och bokmärkena läses ur en delad testkatalog: börja alltid tomt.
+                app.library = Default::default();
                 for f in &files {
                     app.open_path(&cc.egui_ctx, f);
                 }

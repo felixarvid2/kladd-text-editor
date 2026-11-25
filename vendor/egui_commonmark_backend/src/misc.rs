@@ -182,6 +182,94 @@ pub const BOLD_FAMILY_ID: &str = "egui_commonmark_bold_family";
 /// (`src/epub/view.rs`); utan värde används egui:s vanliga radhöjd.
 pub const LINE_FACTOR_ID: &str = "egui_commonmark_line_factor";
 
+/// Kladd: id i `egui::Context::data` för ett `Arc<ViewExtras>` (justering, förlagets blockstil och markeringar).
+/// Läggs dit av EPUB-läsläget (`src/epub/view.rs`) före varje visning; utan värde är allt som förut.
+pub const EXTRAS_ID: &str = "egui_commonmark_kladd_extras";
+
+/// Kladd: id för det som klickades senast bland markeringarna: `(index i ViewExtras::marks, skärmposition)`.
+/// Läsläget tar värdet (och tömmer det) efter visningen.
+pub const MARK_HIT_ID: &str = "egui_commonmark_kladd_mark_hit";
+
+/// Kladd: radjustering i ett stycke.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+/// Kladd: hur ett stycke eller en rubrik ritas när förlagets formatering gäller (se `src/epub/css.rs`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockStyle {
+    /// `None`: standard (vänsterställt, eller justerat om `ViewExtras::justify`).
+    pub align: Option<BlockAlign>,
+    /// Första radens indrag (gånger brödtextens storlek).
+    pub indent: f32,
+    /// Indrag från vänster för hela blocket (gånger brödtextens storlek).
+    pub margin_left: f32,
+    pub small_caps: bool,
+}
+
+/// Kladd: en färgad markering (understrykning) i käll-Markdown, med eventuellt anteckningsmärke.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    pub range: Range<usize>,
+    pub color: egui::Color32,
+    pub note: bool,
+}
+
+/// Kladd: tillägg för läsläget för EPUB. Block som berörs ritas som ett enda galleri (en `LayoutJob`) så att
+/// de kan justeras, centreras och få markeringar och anteckningsmärken.
+#[derive(Clone, Debug, Default)]
+pub struct ViewExtras {
+    /// Justera brödtextstycken (de som inte har egen justering).
+    pub justify: bool,
+    /// Förlagets blockstil per blockets startbyte i källtexten.
+    pub blocks: HashMap<usize, BlockStyle>,
+    pub marks: Vec<Mark>,
+    /// Färgen på anteckningsmärket.
+    pub note_color: egui::Color32,
+}
+
+impl ViewExtras {
+    /// Berörs blocket `span` av en markering?
+    pub fn marks_in(&self, span: &Range<usize>) -> bool {
+        self.marks.iter().any(|m| m.range.start < span.end && m.range.end > span.start)
+    }
+}
+
+fn extras(ui: &Ui) -> Option<std::sync::Arc<ViewExtras>> {
+    ui.ctx().data(|d| d.get_temp::<std::sync::Arc<ViewExtras>>(egui::Id::unique(EXTRAS_ID)))
+}
+
+/// Sätter (eller tar bort) tilläggen för nästa visning.
+pub fn set_extras(ctx: &egui::Context, e: Option<std::sync::Arc<ViewExtras>>) {
+    ctx.data_mut(|d| match e {
+        Some(e) => {
+            d.insert_temp(egui::Id::unique(EXTRAS_ID), e);
+        }
+        None => {
+            d.remove_temp::<std::sync::Arc<ViewExtras>>(egui::Id::unique(EXTRAS_ID));
+        }
+    });
+}
+
+/// Tilläggen som gäller nu (för parsern).
+pub fn current_extras(ui: &Ui) -> Option<std::sync::Arc<ViewExtras>> {
+    extras(ui)
+}
+
+/// Läser och tömmer den senast klickade markeringen.
+pub fn take_mark_hit(ctx: &egui::Context) -> Option<(usize, egui::Pos2)> {
+    ctx.data_mut(|d| d.remove_temp::<(usize, egui::Pos2)>(egui::Id::unique(MARK_HIT_ID)))
+}
+
+pub fn put_mark_hit(ctx: &egui::Context, hit: (usize, egui::Pos2)) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(MARK_HIT_ID), hit));
+}
+
 fn line_factor(ui: &Ui) -> Option<f32> {
     ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::unique(LINE_FACTOR_ID)))
 }
