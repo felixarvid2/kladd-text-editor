@@ -23,46 +23,67 @@ fn is_continuation(text: &str, a: &Analysis, q: &Para) -> bool {
     a.pieces.get(first).is_some_and(|pc| pc.block == Block::Footnote) && !text[q.range.clone()].starts_with("[^")
 }
 
+/// Etiketterna som har en referens (utom slutnoter): bara deras definitioner lämnar flödet.
+pub(super) fn ref_labels(a: &Analysis) -> BTreeSet<String> {
+    a.pieces.iter().filter_map(|pc| pc.footnote_ref.as_deref()).filter(|l| !markup::is_endnote_label(l)).map(str::to_owned).collect()
+}
+
+/// Fotnotsdefinitionerna som stycket `q` (följt av `next`) är, i textordning: (etikett, där texten efter `[^n]: ` börjar).
+/// Allt i `plan` utom regeln att bara den första definitionen för en etikett räknas.
+pub(super) fn defs_of<'a>(text: &str, a: &'a Analysis, q: &Para, next: Option<&Para>, refs: &BTreeSet<String>) -> Vec<(&'a str, usize)> {
+    let mut out = Vec::new();
+    if q.range.is_empty() || !text[q.range.clone()].starts_with("[^") {
+        return out;
+    }
+    for pc in pieces_in(a, &q.range) {
+        let Some(l) = pc.footnote_def.as_deref() else { continue };
+        if markup::is_endnote_label(l) || !refs.contains(l) || !(q.range.start <= pc.range.start && pc.range.end <= q.range.end) {
+            continue;
+        }
+        if next.is_some_and(|n| !n.range.is_empty() && is_continuation(text, a, n)) {
+            continue;
+        }
+        out.push((l, (pc.range.end + 3).min(q.range.end)));
+    }
+    out
+}
+
+/// Resultatet av `plan`: definitionerna och det som `layout_memo` behöver för att kunna räkna om planen i ett fönster.
+pub(super) struct Plan {
+    pub defs: Vec<Def>,
+    /// Etiketterna med referens (`ref_labels`).
+    pub refs: BTreeSet<String>,
+    /// Stycket (första synliga slutnoten efter fotnoterna) som fick luft över sig.
+    pub gap: Option<usize>,
+    /// Alla stycken efter den sista definitionen är tomma (och hopkrympta).
+    pub trailing: bool,
+}
+
 /// Fotnotsdefinitionerna (inte slutnoterna) som har en referens. Tomma stycken närmast dem hoppas
 /// också ur flödet, så att de inte tar en sida i anspråk.
-pub(super) fn plan(text: &str, a: &Analysis, paras: &mut [Para], zoom: f32) -> Vec<Def> {
-    let mut defs: Vec<Def> = Vec::new();
+pub(super) fn plan(text: &str, a: &Analysis, paras: &mut [Para], zoom: f32) -> Plan {
+    let mut out = Plan { defs: Vec::new(), refs: BTreeSet::new(), gap: None, trailing: false };
     if !text.contains("[^") {
-        return defs;
+        return out;
     }
+    let refs = ref_labels(a);
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let refs: BTreeSet<&str> = a
-        .pieces
-        .iter()
-        .filter_map(|pc| pc.footnote_ref.as_deref())
-        .filter(|l| !markup::is_endnote_label(l))
-        .collect();
-    for pc in &a.pieces {
-        let Some(l) = pc.footnote_def.as_deref() else { continue };
-        if markup::is_endnote_label(l) || !refs.contains(l) || seen.contains(l) {
-            continue;
+    let mut defs: Vec<Def> = Vec::new();
+    for pi in 0..paras.len() {
+        let q = &paras[pi];
+        for (l, body) in defs_of(text, a, q, paras.get(pi + 1), &refs) {
+            if seen.insert(l) {
+                defs.push(Def { label: l.to_owned(), para: pi, line: q.range.clone(), body });
+            }
         }
-        let pi = paras.partition_point(|q| q.range.end < pc.range.start);
-        let Some(q) = paras.get(pi) else { continue };
-        if !(q.range.start <= pc.range.start && pc.range.end <= q.range.end) || !text[q.range.clone()].starts_with("[^") {
-            continue;
-        }
-        if paras.get(pi + 1).is_some_and(|n| !n.range.is_empty() && is_continuation(text, a, n)) {
-            continue;
-        }
-        seen.insert(l);
-        defs.push(Def { label: l.to_owned(), para: pi, line: q.range.clone(), body: (pc.range.end + 3).min(q.range.end) });
     }
     // Följer slutnoter (synliga definitioner) efter fotnoterna får den första luft över sig (skiljelinjen
     // ritas där), eftersom tomraden före fotnoterna är hopkrympt.
     let last = defs.iter().map(|d| d.para).max();
     if let Some(last) = last {
-        let next = (last + 1..paras.len()).find(|&i| {
-            let q = &paras[i];
-            !q.range.is_empty() && text[q.range.clone()].starts_with("[^") && !q.collapse
-        });
-        if let Some(i) = next {
-            paras[i].space_before += px(zoom, 12.0);
+        out.gap = (last + 1..paras.len()).find(|&i| gap_candidate(text, &paras[i]));
+        if let Some(i) = out.gap {
+            paras[i].space_before += gap_space(zoom);
         }
     }
     for d in &defs {
@@ -74,12 +95,25 @@ pub(super) fn plan(text: &str, a: &Analysis, paras: &mut [Para], zoom: f32) -> V
     }
     if let Some(last) = defs.iter().map(|d| d.para).max() {
         if paras[last + 1..].iter().all(|q| q.range.is_empty()) {
+            out.trailing = true;
             for q in &mut paras[last + 1..] {
                 q.collapse = true;
             }
         }
     }
-    defs
+    out.defs = defs;
+    out.refs = refs;
+    out
+}
+
+/// Kan stycket vara den första synliga slutnoten efter fotnoterna (som får luft över sig, se `plan`)?
+pub(super) fn gap_candidate(text: &str, q: &Para) -> bool {
+    !q.range.is_empty() && text[q.range.clone()].starts_with("[^") && !q.collapse
+}
+
+/// Luften över den första slutnoten efter fotnoterna (se `plan`).
+pub(super) fn gap_space(zoom: f32) -> f32 {
+    px(zoom, 12.0)
 }
 
 /// Definitionens text som den ser ut längst ned på sidan: nummer och text, utan markup.

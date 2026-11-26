@@ -141,6 +141,7 @@ pub fn paginate_notes(
     let mut prev_bottom = f32::NEG_INFINITY;
     let mut float_bottom = f32::NEG_INFINITY;
     let mut next_group = 0;
+    let mut float_at = FloatAt::new(floats);
     let mut i = 0;
     while i < g.rows.len() {
         while next_group < groups.len() && groups[next_group].start < i {
@@ -156,7 +157,7 @@ pub fn paginate_notes(
             y1 = y1.max(pr.pos.y + pr.row.size.y);
         }
         let h = y1 - y0;
-        let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
+        let fh = float_at.at(i);
         let top = y0 + shift;
         let page_top = page as f32 * stride;
         let forced = breaks.binary_search(&i).is_ok();
@@ -188,6 +189,35 @@ pub fn paginate_notes(
         g.mesh_bounds |= pr.row.visuals.mesh_bounds.translate(pr.pos.to_vec2());
     }
     flow.finish()
+}
+
+/// Bildhöjderna i `floats` (rad, höjd) för frågor i stigande radordning: samma svar som den första posten för raden i
+/// listan, utan att gå igenom hela listan för varje rad (det blev kvadratiskt i dokument med tusentals bilder och rutor).
+pub(crate) struct FloatAt {
+    v: Vec<(usize, f32)>,
+    i: usize,
+}
+
+impl FloatAt {
+    pub(crate) fn new(floats: &[(usize, f32)]) -> Self {
+        let mut v = floats.to_vec();
+        // Stabil sortering: bland poster för samma rad kommer den första i listan först.
+        v.sort_by_key(|f| f.0);
+        FloatAt { v, i: 0 }
+    }
+
+    /// Fortsätter från rad `row` (som om alla rader före den redan frågats).
+    pub(crate) fn seek(&mut self, row: usize) {
+        self.i = self.v.partition_point(|f| f.0 < row);
+    }
+
+    /// Höjden för raden `row` (0 om ingen); `row` får inte minska mellan anropen.
+    pub(crate) fn at(&mut self, row: usize) -> f32 {
+        while self.i < self.v.len() && self.v[self.i].0 < row {
+            self.i += 1;
+        }
+        self.v.get(self.i).filter(|f| f.0 == row).map_or(0.0, |f| f.1)
+    }
 }
 
 /// Antal sidor i ett paginerat galleri (minst 1).

@@ -334,6 +334,40 @@ pub fn toc_metrics(z: f32, d: &DocDefaults) -> (f32, f32, f32) {
 }
 
 /// Rubrikerna som tas med i innehållsförteckningen.
+/// Det i bitarna `pieces` (ett fönster mellan stycken i `text`) som kan komma med i en innehållsförteckning: antalet
+/// rubriker per nivå (1–9) och antalet bildtexter för figurer och tabeller. Förteckningens höjd beror bara på antalet
+/// poster, och så länge detta är oförändrat i fönstret är antalet poster oförändrat för alla förteckningar (vilka nivåer
+/// och slag de än har).
+pub fn toc_sig_in(text: &str, pieces: &[super::markup::Piece]) -> [usize; 11] {
+    let mut sig = [0usize; 11];
+    let mut open = false;
+    for pc in pieces {
+        let Block::Heading(level) = pc.block else {
+            open = false;
+            continue;
+        };
+        if !open {
+            sig[(level as usize).clamp(1, 9) - 1] += 1;
+            open = true;
+        }
+        if text.get(pc.range.clone()).is_some_and(|b| b.ends_with('\n')) {
+            open = false;
+        }
+    }
+    if let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
+        if let Some(w) = text.get(first.range.start..last.range.end.min(text.len())) {
+            sig[9] = captions(w, TocKind::Figures).len();
+            sig[10] = captions(w, TocKind::Tables).len();
+        }
+    }
+    sig
+}
+
+/// Hur mycket det som kan komma med i en innehållsförteckning skiljer mellan två fönster (`toc_sig_in`); 0 = inget.
+pub fn toc_sig_diff(a: &[usize; 11], b: &[usize; 11]) -> isize {
+    a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).sum::<usize>() as isize
+}
+
 #[cfg(test)]
 pub fn toc_entries(h: &[Heading]) -> Vec<&Heading> {
     h.iter().filter(|x| x.level <= TOC_MAX_LEVEL).collect()

@@ -522,13 +522,23 @@ Hur det fungerar:
   stycke). Nyckeln är styckets text, dess bitar (relativt styckets början), geometri
   (justering, listindrag), markörens träff och sökträffar, plus parametrar som zoom, tema,
   bredd och typsnittsgeneration. Efter en ändring läggs bara berörda stycken om; markören som
-  byter rad berör två. Sedan fogas styckena ihop (`Galley::concat`) och sidbryts. Cachen
-  rensas på stycken som inte användes i senaste bildrutan.
+  byter rad berör två. Sedan fogas styckena ihop (som `Galley::concat`) och sidbryts. Cachen
+  rensas på stycken som inte användes i senaste bildrutan (efter ett återupptaget varv bara på de ersatta styckena).
 - **Återanvänd förberedelse** (`word/layout_memo.rs`, stora dokument). Styckena (`Para`), fotnotsplanen,
   grupperna och nyckelns statiska del sparas från förra omläggningen. Efter en inkrementell analys
   (`incr::Delta` anger det ändrade området) räknas bara ett fönster kring ändringen och markörens rader om med
-  `paragraphs_in`, med kontrollstycken som jämförs mot de gamla; kan fönstret inte räknas om säkert (fotnotsdefinitioner,
-  öppna textrutor, trasiga `<!--k:`-markörer, sökträffar) räknas allt om. Testas mot full omräkning.
+  `paragraphs_in`, med kontrollstycken som jämförs mot de gamla. Fotnotsplanen räknas om i fönstret (`plan_window`:
+  definitionerna i fönstret ska ha samma etiketter som förut), grupperna görs om bara kring fönstren (`regroup`) och
+  antalet rubriker i innehållsförteckningen kommer från analysen (`Delta::toc_delta`). Kan fönstret inte räknas om säkert
+  (ändrade definitioner, flera fönster nära fotnoterna, trasiga `<!--k:`-markörer, sökträffar) räknas allt om. Testas mot
+  full omräkning.
+- **Återupptagen utläggning** (`word/layout_resume.rs`, stora dokument). Varvet över grupperna sparar tillståndet före
+  varje grupp (läge, flytande bilder, öppen textruta, sidsimulering) och vad den lade till. Nästa varv börjar vid den första
+  ändrade gruppen; när tillståndet före en oförändrad grupp är exakt detsamma som förra gången tas resten av sträckan
+  (flyttad i rader och byte) från förra varvet. Sammanfogningen räknar som `Galley::concat` men bara över de ändrade
+  grupperna, och sidindelningen (ett avsnitt) återupptas från tillståndet före sidan med den första ändrade raden tills en
+  ny sida börjar med samma tillstånd som förut; raderna efter behåller sina lägen i förra galleriet. Ändras höjden så att
+  allt efter flyttas görs hela varvet. Testas mot en cache som alltid gör hela varvet och mot en ny cache.
 - **Ritning.** Punkter, citatstreck, bilder, tabellkanter och våglinjer itereras bara för det
   som är synligt (bitarna slås upp med binärsökning från galleriets synliga tecken).
 - **Stavning.** Resultatet cachas per revision och per stycke.
@@ -537,7 +547,8 @@ Hur det fungerar:
   (då gäller resten av färgningen), och färdigt galleri cachas per revision och bredd.
 - **Analysen** (`markup::analyze`, ca 28 ms release / 85 ms debug för 600 KB) görs om för hela texten
   efter en ändring i dokument under 200 kB; över det tolkas bara stycket med ändringen och dess grannar om
-  (`word/incr.rs`, kontrollerad mot full analys med slumpade ändringar).
+  (`word/incr.rs`, kontrollerad mot full analys med slumpade ändringar). I ett block av fotnotsdefinitioner utan tomrader
+  (så skriver Word-läsaren dem) är fönstret definitionen med ändringen och en definition på var sida (`def_window`).
 
 Testerna `incremental_layout_equals_full_layout` och `incremental_highlight_equals_full`
 kontrollerar att det inkrementella resultatet är identiskt med full omläggning efter

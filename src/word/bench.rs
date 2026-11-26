@@ -430,7 +430,19 @@ fn bench_docx_open() {
             times.push(ms(t));
             stats.push(("tecken", c.stats(1)));
             if std::env::var_os("KLADD_BENCH_VERBOSE").is_some() || std::env::var_os("KLADD_BENCH_PLACES").is_some() {
-                eprintln!("    ställe {} ({name}): {:.1} ms, återanvänd {}, skäl {}", k + 1, times.last().unwrap(), c.stats(1).reused, c.stats(1).memo_why);
+                let st = c.stats(1);
+                eprintln!(
+                    "    ställe {} ({name}): {:.1} ms, återanvänd {}, skäl {}, återupptagen {} | plan {:.1} loop {:.1} concat {:.1} sidor {:.1} ms",
+                    k + 1,
+                    times.last().unwrap(),
+                    st.reused,
+                    st.memo_why,
+                    st.resumed,
+                    st.plan_ms,
+                    st.loop_ms,
+                    st.concat_ms,
+                    st.pages_ms
+                );
             }
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -508,17 +520,24 @@ fn bench_docx_keys() {
         while !text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic()) {
             at += 1;
         }
-        let mut e = text.clone();
         let t = Instant::now();
-        for k in 0..n {
-            // Tecknet in och ut om vartannat: texten ändras varje bildruta.
-            if k % 2 == 0 {
-                e.insert(at, 'x');
-            } else {
-                e.remove(at);
-            }
-            frame(&mut c, &ctx, &e, 0..0);
-        }
+        keys_loop(&mut c, &ctx, &text, at, n);
         eprintln!("{n} tangenttryck: {:.2} ms per bildruta", ms(t) / n as f64);
     });
+}
+
+/// Tangenttrycken i `bench_docx_keys`, i en egen funktion så att profileringen kan begränsas till dem
+/// (`valgrind --tool=callgrind --collect-atstart=no --toggle-collect='*keys_loop*'`).
+#[inline(never)]
+fn keys_loop(c: &mut layout::Cache, ctx: &egui::Context, text: &str, at: usize, n: usize) {
+    let mut e = text.to_owned();
+    for k in 0..n {
+        // Tecknet in och ut om vartannat: texten ändras varje bildruta.
+        if k % 2 == 0 {
+            e.insert(at, 'x');
+        } else {
+            e.remove(at);
+        }
+        frame(c, ctx, &e, 0..0);
+    }
 }

@@ -624,6 +624,7 @@ pub fn paginate_sections(
     // Underkanten (i layoutens egna koordinater) på raden/gruppen som placerades senast: ett avstånd som layouten
     // lagt in mellan två rader (en ruta eller bild över hela bredden som texten hoppar förbi) bevaras.
     let mut prev_raw = f32::NEG_INFINITY;
+    let mut float_at = super::pages::FloatAt::new(floats);
     let mut i = 0;
     while i < n_rows {
         while next_ov < overlay.len() && overlay[next_ov].start < i {
@@ -649,7 +650,7 @@ pub fn paginate_sections(
         }
         let h = y1 - y0;
         let skip = |col_y: f32, region_top: f32| if col_y > region_top + eps && prev_raw.is_finite() { (y0 - prev_raw).max(0.0) } else { 0.0 };
-        let fh = floats.iter().find(|f| f.0 == i).map_or(0.0, |f| f.1);
+        let fh = float_at.at(i);
         let sec = row_sec.get(i).map_or(0, |s| *s as usize);
 
         // Nytt avsnitt: ny sida, eller (löpande) vidare på samma sida.

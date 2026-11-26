@@ -28,6 +28,8 @@ mod notes;
 mod lazy;
 #[path = "layout_memo.rs"]
 mod memo;
+#[path = "layout_resume.rs"]
+mod resume;
 pub use lazy::budget as lazy_budget;
 
 /// Punkter till pixlar vid zoom (96 dpi).
@@ -162,6 +164,10 @@ pub struct LayoutStats {
     pub reused: bool,
     /// Varför förra omläggningens stycken inte återanvändes (0 = ingen anledning, `memo::no`); för mätning.
     pub memo_why: usize,
+    /// Sammanfogningen och sidindelningen återupptogs från förra omläggningen (`resume`).
+    pub resumed: bool,
+    /// Varför det inte gick att återuppta (0 = ingen anledning; `resume::Fast::start` och `finish_fast`); för mätning.
+    pub resume_why: usize,
 }
 
 /// Markup-analysen av en text, gjord utanför gränssnittstråden (inläsningen av ett stort Word-dokument), så att den
@@ -195,6 +201,8 @@ struct DocState {
     analysis: Arc<Analysis>,
     tables: Option<Arc<Vec<Table>>>,
     images: Option<Arc<Vec<markup::ImageRef>>>,
+    /// Bildernas storleksnycklar (`images::size_key`), i samma ordning som `images`.
+    image_keys: Option<Arc<Vec<String>>>,
     headings: Option<Arc<Vec<super::nav::Heading>>>,
     /// Stycken med styckeutseende (`<!--k:pp …-->`) och rutorna de bildar, se `pbox`.
     pspecs: Option<Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)>>,
@@ -207,11 +215,15 @@ struct DocState {
     /// som ändrats sedan dess (om analysen bara uppdaterats inkrementellt; annars är minnet ogiltigt).
     memo: Option<memo::Memo>,
     memo_text: String,
+    /// Minnet gäller `text` (som då inte kopieras till `memo_text`): sant efter en omläggning tills texten ändras.
+    memo_same: bool,
     hull: Option<(usize, usize)>,
     /// Förekomster i texten som gör att en ändring kan påverka hela analysen (`incr::Facts`), om kända.
     facts: Option<super::incr::Facts>,
     /// Fotnotsreferenser eller -definitioner har ändrats sedan `memo` byggdes.
     notes_changed: bool,
+    /// Summan av ändringarna i det som kan komma med i en innehållsförteckning sedan `memo` byggdes (`incr::Delta::toc_delta`).
+    toc_delta: isize,
     /// Tabellernas geometri i senaste omläggningen (absoluta byteintervall).
     geoms: Arc<Vec<TableGeom>>,
     tick: u64,
@@ -223,6 +235,8 @@ struct DocState {
     notes: Arc<Vec<super::fnotes::NoteLayout>>,
     /// Inhägnade kodblock med sin färgning (`codeblock`); görs om när texten ändrats.
     code: Option<Arc<Vec<codeblock::Block>>>,
+    /// Förra utläggningsvarvet, för att kunna återuppta nästa (`resume`).
+    trace: Option<resume::Trace>,
 }
 
 #[derive(Default)]
@@ -241,6 +255,7 @@ impl DocState {
             analysis: Arc::new(analysis),
             tables: None,
             images: None,
+            image_keys: None,
             headings: None,
             pspecs: None,
             fonts: None,
@@ -248,15 +263,18 @@ impl DocState {
             units: HashMap::default(),
             memo: None,
             memo_text: String::new(),
+            memo_same: false,
             hull: None,
             facts: None,
             notes_changed: false,
+            toc_delta: 0,
             geoms: Arc::default(),
             tick: 0,
             float_starts: Vec::new(),
             page_boxes: Arc::default(),
             notes: Arc::default(),
             code: None,
+            trace: None,
         }
     }
 
@@ -273,6 +291,15 @@ impl DocState {
     fn images(&mut self) -> Arc<Vec<markup::ImageRef>> {
         let a = &self.analysis;
         self.images.get_or_insert_with(|| Arc::new(a.pieces.iter().filter_map(|pc| pc.image.clone()).collect())).clone()
+    }
+
+    /// Storleksnycklarna för bilderna (bildernas storlek ingår i nycklarna för hela galleriet).
+    fn image_keys(&mut self) -> Arc<Vec<String>> {
+        if self.image_keys.is_none() || self.images.is_none() {
+            let keys = self.images().iter().map(super::images::size_key).collect();
+            self.image_keys = Some(Arc::new(keys));
+        }
+        self.image_keys.clone().unwrap_or_default()
     }
 }
 
@@ -298,6 +325,10 @@ impl Cache {
                 None => None,
             };
             let incr = delta.is_some();
+            // Den gamla texten behövs för minnet (`memo`): byt buffert i stället för att kopiera den efter varje omläggning.
+            if std::mem::take(&mut st.memo_same) {
+                std::mem::swap(&mut st.memo_text, &mut st.text);
+            }
             st.text.clear();
             st.text.push_str(text);
             st.rev += 1;
@@ -305,11 +336,37 @@ impl Cache {
                 Some(d) => {
                     st.hull = Some(memo::compose_hull(st.hull, d.ws, d.we_old, d.we_new));
                     st.notes_changed |= d.notes_changed;
-                    if d.touched_table || st.tables.as_ref().is_some_and(|t| t.iter().any(|x| x.region.end > d.ws)) {
+                    st.toc_delta += d.toc_delta;
+                    // Tabellerna efter fönstret flyttas med texten (de före är oförändrade); rör fönstret en tabell, eller
+                    // börjar en direkt efter det (raden före kan ha ändrat formatet), byggs de om.
+                    let dd = d.we_new as isize - d.we_old as isize;
+                    if d.touched_table || st.tables.as_ref().is_some_and(|t| t.iter().any(|x| x.region.end > d.ws && x.region.start <= d.we_old)) {
                         st.tables = None;
+                    } else if let Some(t) = st.tables.as_mut().filter(|_| dd != 0) {
+                        let mv = |x: usize| (x as isize + dd) as usize;
+                        for x in Arc::make_mut(t).iter_mut().filter(|x| x.region.start > d.we_old) {
+                            x.region = mv(x.region.start)..mv(x.region.end);
+                            for r in &mut x.rows {
+                                r.line = mv(r.line.start)..mv(r.line.end);
+                            }
+                        }
                     }
                     if !d.same_images {
                         st.images = None;
+                        st.image_keys = None;
+                    }
+                    // Kodblocken efter fönstret flyttas med texten (ett staket i fönstret ger full analys); rör fönstret
+                    // ett block byggs de om.
+                    match st.code.as_mut().and_then(Arc::get_mut) {
+                        Some(v) if !v.iter().any(|b| b.whole().end >= d.ws && b.whole().start <= d.we_old) => {
+                            let mv = |x: usize| (x as isize + dd) as usize;
+                            for b in v.iter_mut().filter(|b| b.open.start > d.we_old) {
+                                b.open = mv(b.open.start)..mv(b.open.end);
+                                b.content = mv(b.content.start)..mv(b.content.end);
+                                b.close = b.close.as_ref().map(|c| mv(c.start)..mv(c.end));
+                            }
+                        }
+                        _ => st.code = None,
                     }
                     if st.fonts.as_ref().is_some_and(|f| !d.fonts.is_subset(f)) {
                         st.fonts = None;
@@ -322,12 +379,13 @@ impl Cache {
                     st.analysis = Arc::new(markup::analyze(text));
                     st.tables = None;
                     st.images = None;
+                    st.image_keys = None;
+                    st.code = None;
                     st.fonts = None;
                 }
             }
             st.headings = None;
             st.pspecs = None;
-            st.code = None;
             if crate::timing::enabled() {
                 crate::timing::mark(&format!("analys efter ändring: {:.1} ms ({})", t_an.elapsed().as_secs_f64() * 1000.0, if incr { "inkrementell" } else { "full" }));
             }
@@ -536,8 +594,8 @@ impl Cache {
             g.hash_into(&mut h);
         }
         // Bildstorlekar kan bli kända först efter att bilden lästs in.
-        for img in st.images().iter() {
-            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        for k in st.image_keys().iter() {
+            (p.image_size)(k).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
         }
         let key = h.finish();
         if let Some((k, g)) = &st.frame {
@@ -727,8 +785,8 @@ fn relayout(
             g.hash_into(&mut h);
         }
         crate::review::comments_visible().hash(&mut h);
-        for img in st.images().iter() {
-            (p.image_size)(&super::images::size_key(img)).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
+        for k in st.image_keys().iter() {
+            (p.image_size)(k).map(|s| (s.x.to_bits(), s.y.to_bits())).hash(&mut h);
         }
         // Ett ```mermaid-block som ritas som diagram kollapsar sina rader (`paragraphs_in`); det ändras med markören
         // och när diagrammet blivit ritat, inte bara med texten.
@@ -738,7 +796,10 @@ fn relayout(
         h.finish()
     };
     let prep = match st.memo.take() {
-        Some(m) if !st.notes_changed => memo::reuse(m, &st.memo_text, st.hull, st.rev, text, &a, p, sig, &grid, &cb),
+        Some(m) if !st.notes_changed => {
+            let old_text = if st.memo_same { text } else { st.memo_text.as_str() };
+            memo::reuse(m, old_text, st.hull, st.rev, text, &a, p, sig, &grid, &cb, Some(st.toc_delta))
+        }
         Some(_) => None,
         None => None,
     };
@@ -751,20 +812,22 @@ fn relayout(
     st.stats.plan_ms += t0.elapsed().as_secs_f64() * 1000.0;
     st.stats.reused = reused;
     drop(a);
-    let g = relayout_inner(st, ctx, text, p, wrap_width, ppp, env, pages, budget, &prep);
-    st.memo_text.clear();
-    st.memo_text.push_str(text);
+    let g = relayout_inner(st, ctx, text, p, wrap_width, ppp, env, pages, budget, &prep, sig);
+    st.memo_same = true;
     st.hull = None;
     st.notes_changed = false;
+    st.toc_delta = 0;
     if crate::timing::enabled() {
         crate::timing::mark(&format!(
-            "omläggning: {:.1} ms (förberedelse {:.1}, grupper {}, omlagda {}, platshållare {}, återanvänd förberedelse: {})",
+            "omläggning: {:.1} ms (förberedelse {:.1}, grupper {}, omlagda {}, platshållare {}, återanvänd förberedelse: {}, återupptagen: {} ({}))",
             t0.elapsed().as_secs_f64() * 1000.0,
             st.stats.plan_ms,
             st.stats.groups,
             st.stats.misses,
             st.stats.stubs,
-            reused
+            reused,
+            st.stats.resumed,
+            st.stats.resume_why
         ));
     }
     st.memo = Some(memo::Memo { sig, rev: st.rev, reveal: p.reveal.clone(), prep });
@@ -783,9 +846,10 @@ fn relayout_inner(
     pages: Option<&super::pages::Geom>,
     budget: Option<std::time::Duration>,
     prep: &memo::Prep,
+    sig: u64,
 ) -> Galley {
     use super::secpages::Balance;
-    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new(), budget, prep);
+    let (g, runs) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &Balance::new(), budget, prep, sig);
     // Ofullständig: jämnandet av spalter görs när allt är utlagt.
     if st.partial {
         return g;
@@ -803,7 +867,7 @@ fn relayout_inner(
             break;
         }
         let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, (lo[s] + hi[s]) / 2.0))).collect();
-        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None, prep);
+        let (_, run) = relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None, prep, sig);
         for (s, r) in &cands {
             let mid = (lo[s] + hi[s]) / 2.0;
             // Ryms allt på sista arket (inga fler arkbyten)?
@@ -816,7 +880,7 @@ fn relayout_inner(
     }
     // Några px marginal: sidbrytningen avrundar raderna något annorlunda än uppskattningen.
     let bal: Balance = cands.iter().map(|(s, r)| (*s, (r.sheets, hi[s] + 2.0))).collect();
-    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None, prep).0
+    relayout_pass(st, ctx, text, p, wrap_width, ppp, env, pages, &bal, None, prep, sig).0
 }
 
 /// Ett utläggningsvarv (se `relayout`); ger också hur varje avsnitt med olika breda spalter fyllde arken.
@@ -833,7 +897,9 @@ fn relayout_pass(
     balance: &super::secpages::Balance,
     budget: Option<std::time::Duration>,
     prep: &memo::Prep,
+    sig: u64,
 ) -> (Galley, HashMap<usize, super::secpages::SecRun>) {
+    use resume::{BoxSt, FloatBox};
     st.tick += 1;
     st.stats.varv += 1;
     let t0 = std::time::Instant::now();
@@ -843,43 +909,21 @@ fn relayout_pass(
     let cb = st.code_blocks();
     // Styckena, fotnotsdefinitionerna (ritas längst ned på sidan; i flödet blir de dolda rader) och grupperna.
     let (paras, defs, groups) = (&prep.paras, &prep.defs, &prep.groups);
-    let mut note_layouts: Vec<super::fnotes::NoteLayout> = Vec::new();
     let min_h = px(p.zoom, a.defaults.size()) * 1.4;
 
     // Grupperna läggs ut i ordning: en flytande bild påverkar bredden på stycken efter den, och
     // hur högt dessa är avgör var bilden slutar.
-    struct FloatBox {
-        side: Side,
-        w: f32,
-        top: f32,
-        bottom: f32,
-    }
     let mut active: Vec<FloatBox> = Vec::new();
     // Förankrade textrutor med omflöde: stycken i rutan tar ingen höjd (`y`), efter rutan dras texten upp
     // till rutans överkant (`pulls`: första raden som dras upp, höjd) och rutans rader flyttas till sitt läge
     // (`shifts`: rader, förskjutning). Se `apply_pulls`.
-    struct BoxSt {
-        tb: TBox,
-        content_h: f32,
-        first_row: usize,
-    }
     let mut boxst: Option<BoxSt> = None;
-    let mut pulls: Vec<(usize, f32)> = Vec::new();
-    let mut shifts: Vec<(Range<usize>, f32)> = Vec::new();
-    let mut box_rows: Vec<Range<usize>> = Vec::new();
     let mut y = 0.0f32;
     let mut row_no = 0usize;
-    let mut anchors: Vec<(usize, f32)> = Vec::new();
-    let mut starts: Vec<(usize, Float, usize)> = Vec::new();
-    let mut all: Vec<Arc<Galley>> = Vec::new();
-    let mut geoms: Vec<TableGeom> = Vec::new();
-    let mut geom_rows: Vec<usize> = Vec::new();
-    let mut row_groups: Vec<Range<usize>> = Vec::new();
+    // Det varvet lägger till grupp för grupp (gallerier, ankare, tabeller, fotnoter …), se `resume::Out`.
+    let mut out = resume::Out::default();
     // Avsnitt och spaltbrytningar per rad (för dokument med avsnitt).
     let multi = pages.is_some_and(|g| g.multi());
-    let mut row_sec: Vec<u32> = Vec::new();
-    let mut col_breaks: Vec<usize> = Vec::new();
-    let mut page_breaks: Vec<usize> = Vec::new();
     let page_wrap = wrap_width;
     // Uppskattad sidbrytning (som `pages::paginate`) så att bilder som placeras mot sidan eller
     // marginalen vet var på arket stycket ligger.
@@ -895,7 +939,61 @@ fn relayout_pass(
     let mut lazy = false;
     let mut stubs = lazy::Stubs::default();
     let mut def_i = 0;
-    for (gi, (pr, w, tbl)) in groups.iter().enumerate() {
+    // Återupptaget varv (`resume`): förra varvets tillstånd och listor fram till den första ändrade gruppen, och sträckor
+    // av oförändrade grupper som tas från förra varvet när tillståndet före dem är detsamma som då.
+    let resumable = balance.is_empty() && !unequal;
+    let psig = resume::pass_sig(sig, wrap_width, ppp, multi);
+    let mut rec = resume::Rec::with_capacity(groups.len(), sim.is_some());
+    let mut fast = if resumable { resume::Fast::start(st, prep, psig, &mut out, &mut rec) } else { None };
+    st.trace = None;
+    // Utan budget i ett återupptaget varv: bara de ändrade grupperna läggs ut.
+    let budget = if fast.is_some() { None } else { budget };
+    let mut gi = 0;
+    let mut replaced_done = 0usize;
+    let mut fresh_keys: Vec<u64> = Vec::new();
+    if let Some(f) = &fast {
+        let d0 = f.d0;
+        row_no = f.old.rec.row[d0];
+        f.restore_at(d0, &mut y, &mut sim, &mut active, &mut boxst, row_no);
+        st.stats.hits += d0;
+        gi = d0;
+        replaced_done = d0;
+    }
+    // Oförändrade grupper i följd som inte haft samma tillstånd som förut (höjden har ändrats): blir de många ges det
+    // återupptagna varvet upp och resten görs som ett vanligt.
+    let mut misses_in_row = 0usize;
+    let was_fast = fast.is_some();
+    while gi < groups.len() {
+        let mut give_up = false;
+        if let Some(f) = fast.as_mut() {
+            if let Some(gj) = f.old_of(prep, gi).filter(|&gj| gj >= replaced_done) {
+                if f.matches(gj, y, sim.as_ref(), &active, boxst.as_ref(), row_no) {
+                    misses_in_row = 0;
+                    let len = f.run_len(prep, gi, gj);
+                    f.replaced_upto(gj, &mut replaced_done);
+                    let db = groups[gi].1.start as isize - f.old.rec.wstart[gj] as isize;
+                    row_no = f.splice(&mut out, &mut rec, gi, gj, len, row_no, db, multi);
+                    replaced_done = gj + len;
+                    f.restore_at(gj + len, &mut y, &mut sim, &mut active, &mut boxst, row_no);
+                    st.stats.hits += len;
+                    gi += len;
+                    continue;
+                }
+                misses_in_row += 1;
+                give_up = misses_in_row > 64;
+            }
+        }
+        if give_up {
+            if let Some(f) = fast.take() {
+                f.abandon(&mut rec, gi, &mut st.units, tick);
+                rec.fast = false;
+                st.stats.resume_why = 30;
+            }
+        }
+        let (pr, w, tbl) = &groups[gi];
+        rec.state(gi, y, sim.as_ref(), &active, boxst.as_ref(), row_no, out.counts());
+        rec.begin(w.start);
+        let mut used_key: u64;
         if let (false, Some(b)) = (lazy, budget) {
             let spent = st.stats.miss_ms;
             let other = t0.elapsed().as_secs_f64() * 1000.0 - spent;
@@ -932,7 +1030,7 @@ fn relayout_pass(
             let tn = std::time::Instant::now();
             let miss0 = st.units.len();
             if let Some(nl) = notes::layout_def(st, ctx, text, &a, p, &grid, w, &paras[pr.start], page_wrap, ppp, env, d, lazy, prep.skeys[gi]) {
-                note_layouts.push(nl);
+                out.notes.push(nl);
             }
             if st.units.len() != miss0 {
                 st.stats.miss_ms += tn.elapsed().as_secs_f64() * 1000.0;
@@ -1000,6 +1098,7 @@ fn relayout_pass(
             }
             h.finish()
         };
+        used_key = key;
         let laid_out: (Arc<Vec<Arc<Galley>>>, Option<Arc<TableGeom>>) = if let Some(u) = st.units.get_mut(&key) {
             st.stats.hits += 1;
             u.used = tick;
@@ -1077,30 +1176,30 @@ fn relayout_pass(
         }
         if multi {
             let n: usize = galleys.iter().map(|g| g.rows.len()).sum();
-            row_sec.extend(std::iter::repeat(sec as u32).take(n));
+            out.row_sec.extend(std::iter::repeat(sec as u32).take(n));
         }
         {
             let mut r = row_no;
             for (q, lg) in gp.iter().zip(galleys.iter()) {
                 if multi && q.col_break {
-                    col_breaks.push(r);
+                    out.col_breaks.push(r);
                 }
                 if q.page_break {
-                    page_breaks.push(r);
+                    out.page_breaks.push(r);
                 }
                 r += lg.rows.len();
             }
         }
         if let Some(g) = &tgeom {
-            geoms.push(g.abs(w.start));
-            geom_rows.push(row_no);
+            out.geoms.push(g.abs(w.start));
+            out.geom_rows.push(row_no);
             for lg in galleys.iter().filter(|lg| lg.rows.len() > 1) {
                 let _ = lg;
             }
             let mut r = row_no;
             for lg in galleys.iter() {
                 if lg.rows.len() > 1 {
-                    row_groups.push(r..r + lg.rows.len());
+                    out.row_groups.push(r..r + lg.rows.len());
                 }
                 r += lg.rows.len();
             }
@@ -1108,10 +1207,10 @@ fn relayout_pass(
         if let Some((f, pl)) = anchor {
             // Sidbrytningen räknar bilden som en rad av dess höjd (om den ligger vid stycket).
             if pl.side.is_some() && (f.anchor.is_none() || (pl.para_rel && pl.top > -0.5)) {
-                anchors.push((row_no, f.size.y + pl.top.max(0.0)));
+                out.anchors.push((row_no, f.size.y + pl.top.max(0.0)));
             }
             if let Some(pc) = pieces_in(&a, &gp[0].range).iter().find(|pc| pc.image.as_ref().is_some_and(|i| i.align.is_some())) {
-                starts.push((pc.range.start, f.side, row_no));
+                out.starts.push((pc.range.start, f.side, row_no));
             }
             if let Some(side) = pl.side {
                 active.push(FloatBox { side, w: pl.w, top: y + pl.top, bottom: y + pl.bottom });
@@ -1152,15 +1251,15 @@ fn relayout_pass(
                 active.push(FloatBox { side, w: plan.w, top: y + top - a.dist[0] - (min_h - 1.0).max(0.0), bottom: y + top + h_z + a.dist[2] });
             }
             if b.first_row <= row_no {
-                pulls.push((row_no, b.content_h));
-                shifts.push((b.first_row..row_no, top));
+                out.pulls.push((row_no, b.content_h));
+                out.shifts.push((b.first_row..row_no, top));
                 if multi {
-                    box_rows.push(b.first_row..row_no);
+                    out.box_rows.push(b.first_row..row_no);
                 } else if b.first_row < row_no {
-                    row_groups.push(b.first_row..row_no);
+                    out.row_groups.push(b.first_row..row_no);
                 }
             }
-            anchors.push((row_no + close_rows, h_z + top));
+            out.anchors.push((row_no + close_rows, h_z + top));
         }
         row_no += close_rows;
         if let (true, Some(b)) = (opened, boxst.as_mut()) {
@@ -1181,53 +1280,211 @@ fn relayout_pass(
                 y += gh;
             }
         }
-        all.extend(galleys.iter().cloned());
+        out.all.extend(galleys.iter().cloned());
+        if let Some(k) = rec.key.last_mut() {
+            *k = used_key;
+        }
+        if fast.is_some() {
+            fresh_keys.push(used_key);
+        }
+        gi += 1;
     }
-    st.units.retain(|_, u| u.used == tick);
-    st.float_starts = starts;
+    rec.state(groups.len(), y, sim.as_ref(), &active, boxst.as_ref(), row_no, out.counts());
+    if let Some(f) = fast.as_mut() {
+        // Bara de ersatta gruppernas poster släpps (resten av styckecachen har inte gåtts igenom).
+        let n_old = f.old.rec.key.len();
+        f.replaced_upto(n_old, &mut replaced_done);
+        for k in &f.replaced {
+            if !fresh_keys.contains(k) {
+                st.units.remove(k);
+            }
+        }
+    }
+    if !was_fast {
+        st.units.retain(|_, u| u.used == tick);
+    } else if st.units.len() > 2 * groups.len() + 4096 {
+        // Blir cachen ändå för stor rensas den som i ett vanligt varv.
+        for k in &rec.key {
+            if let Some(u) = st.units.get_mut(k) {
+                u.used = tick;
+            }
+        }
+        st.units.retain(|_, u| u.used == tick);
+    }
+    if let Some(f) = fast.as_mut() {
+        f.finish_rec(&mut rec, groups.len());
+    }
     st.stats.loop_ms += t1.elapsed().as_secs_f64() * 1000.0;
     st.partial = lazy;
     let t2 = std::time::Instant::now();
 
-    let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
+    // Texten fylls i när galleriet byggs (ett återupptaget varv återanvänder det gamla galleriets buffert).
+    let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
     job.sections.push(LayoutSection {
         leading_space: 0.0,
         byte_range: ByteIndex(0)..ByteIndex(text.len()),
         format: TextFormat::default(),
     });
-    let mut g = Galley::concat(Arc::new(job), &all, ppp);
-    apply_pulls(&mut g, &pulls, &shifts, ppp);
+    let single = !multi && !lazy;
+    // Återupptagen sammanfogning och sidindelning (ett avsnitt med sidor): bara de ändrade sidorna.
+    let old_frame = st.frame.take();
+    if let (Some(f), Some(geom), true) = (fast.as_mut(), pages, single) {
+        match resume::finish_fast(f, &out, &rec, groups, text, &a, p.zoom, geom, ppp, wrap_width, job, old_frame) {
+            Ok((g, pt, touched)) => {
+                st.stats.concat_ms += t2.elapsed().as_secs_f64() * 1000.0;
+                st.stats.resumed = true;
+                // Arken: bara fotnoterna på de omräknade sidorna ändras om antalet sidor är detsamma.
+                let count = super::pages::page_count(&g, geom);
+                let pout = &pt.pout;
+                let fill = |b: &mut super::secpages::PageBox, k: usize| {
+                    let x = pout.get(k);
+                    b.notes = x.map(|x| x.notes.clone()).unwrap_or_default();
+                    b.reserved = x.map_or(0.0, |x| x.reserved);
+                };
+                match Arc::get_mut(&mut st.page_boxes).filter(|b| b.len() == count && touched.end != usize::MAX) {
+                    Some(boxes) => {
+                        for k in touched.start.min(count)..touched.end.min(count) {
+                            fill(&mut boxes[k], k);
+                        }
+                    }
+                    None => {
+                        let mut boxes = geom.uniform_boxes(count);
+                        for (k, b) in boxes.iter_mut().enumerate() {
+                            fill(b, k);
+                        }
+                        st.page_boxes = Arc::new(boxes);
+                    }
+                }
+                st.geoms = Arc::new(std::mem::take(&mut out.geoms));
+                st.notes = Arc::new(std::mem::take(&mut out.notes));
+                st.float_starts = std::mem::take(&mut out.starts);
+                st.trace = Some(resume::Trace { sig: psig, rev: st.rev, rec, out, page: Some(pt) });
+                return (g, csim.runs);
+            }
+            Err((j, why)) => {
+                job = j;
+                st.stats.resume_why = why;
+            }
+        }
+    }
+    let n = groups.len();
+    // Sammanfogningen (som `Galley::concat`), grupp för grupp.
+    let mut rows: Vec<egui::epaint::text::PlacedRow> = Vec::with_capacity(row_no);
+    let mut g_rect: Vec<Rect> = Vec::with_capacity(n + 1);
+    let mut g_chars: Vec<usize> = Vec::with_capacity(n + 1);
+    let (mut g_nv, mut g_ni, mut g_el): (Vec<u32>, Vec<u32>, Vec<bool>) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut rect = Rect::ZERO;
+    let mut mesh = Rect::NOTHING;
+    let (mut nv, mut ni, mut elided, mut chars) = (0usize, 0usize, false, 0usize);
+    for gi in 0..n {
+        let r0 = rows.len();
+        g_rect.push(rect);
+        g_chars.push(chars);
+        let (r, v, i, e) = resume::concat_group(&out.all[rec.gall[gi]..rec.gall[gi + 1]], rect, ppp, gi + 1 == n, &mut rows);
+        rect = r;
+        g_nv.push(v as u32);
+        g_ni.push(i as u32);
+        g_el.push(e);
+        nv += v;
+        ni += i;
+        elided |= e;
+        for pr in &rows[r0..] {
+            mesh |= pr.row.visuals.mesh_bounds.translate(pr.pos.to_vec2());
+            chars += pr.char_count_including_newline().0;
+        }
+    }
+    g_rect.push(rect);
+    g_chars.push(chars);
+    if job.text.len() != text.len() {
+        job.text = text.to_owned();
+    }
+    let mut g = resume::galley_from(job, rows, resume::round_rect(rect, wrap_width), mesh, nv, ni, elided, ppp);
+    apply_pulls(&mut g, &out.pulls, &out.shifts, ppp);
+    let g_urect: Vec<Rect> = if out.pulls.is_empty() { Vec::new() } else { (0..n).map(|gi| resume::rect_of(&g.rows[rec.row[gi]..rec.row[gi + 1]])).collect() };
     st.stats.concat_ms += t2.elapsed().as_secs_f64() * 1000.0;
     let t3 = std::time::Instant::now();
     let spec = match pages {
-        Some(geom) if !note_layouts.is_empty() => notes::spec(&note_layouts, &g, text, &a, p.zoom, geom.text_h() * 0.5),
+        Some(geom) if !out.notes.is_empty() => {
+            let all = &out.all;
+            let gall = &rec.gall;
+            resume::spec(
+                &out.notes,
+                groups,
+                &|gi| (g_chars[gi], rec.row[gi]),
+                &|gi, k| resume::row_counts(&all[gall[gi]..gall[gi + 1]], gi + 1 == n, k),
+                text,
+                &a,
+                p.zoom,
+                geom.text_h() * 0.5,
+                g.rows.len(),
+            )
+        }
         _ => super::fnotes::NoteSpec::default(),
     };
+    let mut page_trace = None;
     match pages {
         Some(geom) if multi => {
-            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &anchors, &row_groups, &row_sec, &col_breaks, &page_breaks, &spec, balance, &box_rows);
+            let paged = super::secpages::paginate_sections(&mut g, geom, ppp, &out.anchors, &out.row_groups, &out.row_sec, &out.col_breaks, &out.page_breaks, &spec, balance, &out.box_rows);
             // Tabellernas kolumnkanter följer med raderna i sidled.
-            for (t, r) in geoms.iter_mut().zip(&geom_rows) {
+            for (t, r) in out.geoms.iter_mut().zip(&out.geom_rows) {
                 let dx = paged.dx.get(*r).copied().unwrap_or(0.0);
                 t.col_x.iter_mut().for_each(|x| *x += dx);
             }
             st.page_boxes = Arc::new(paged.boxes);
         }
         Some(geom) => {
-            let pn = super::pages::paginate_notes(&mut g, geom, ppp, &anchors, &row_groups, &page_breaks, &spec);
+            let (pn, snaps, pb, fb) = if g.rows.is_empty() {
+                (Vec::new(), Vec::new(), f32::NEG_INFINITY, f32::NEG_INFINITY)
+            } else {
+                resume::paginate_all(&mut g, geom, ppp, &out.anchors, &out.row_groups, &out.page_breaks, &spec)
+            };
+            let mut g_fmesh: Vec<Rect> = Vec::with_capacity(n);
+            if !g.rows.is_empty() {
+                g.rect.max.y = g.rect.max.y.max(pb).max(fb);
+                let mut m = Rect::NOTHING;
+                for gi in 0..n {
+                    g_fmesh.push(resume::mesh_of(&g.rows[rec.row[gi]..rec.row[gi + 1]]));
+                    m |= g_fmesh[gi];
+                }
+                g.mesh_bounds = m;
+            }
             let mut boxes = geom.uniform_boxes(super::pages::page_count(&g, geom));
-            for (b, n) in boxes.iter_mut().zip(pn) {
-                b.notes = n.notes;
+            for (b, n) in boxes.iter_mut().zip(&pn) {
+                b.notes = n.notes.clone();
                 b.reserved = n.reserved;
             }
             st.page_boxes = Arc::new(boxes);
+            if !lazy {
+                page_trace = Some(resume::PageTrace {
+                    rect: g_rect,
+                    chars: g_chars,
+                    urect: g_urect,
+                    fmesh: g_fmesh,
+                    nv: g_nv,
+                    ni: g_ni,
+                    elided: g_el,
+                    snaps,
+                    pout: pn,
+                    end: (pb, fb),
+                    spec,
+                    pulls: out.pulls.clone(),
+                    sums: Vec::new(),
+                });
+                if let Some(pt) = page_trace.as_mut() {
+                    pt.sums = resume::sums_of(&pt.nv, &pt.ni, &pt.elided, &pt.fmesh, &pt.urect);
+                }
+            }
         }
         None => st.page_boxes = Arc::default(),
     }
-    st.geoms = Arc::new(geoms);
-    st.notes = Arc::new(note_layouts);
+    st.geoms = Arc::new(std::mem::take(&mut out.geoms));
+    st.notes = Arc::new(std::mem::take(&mut out.notes));
+    st.float_starts = std::mem::take(&mut out.starts);
     st.stats.pages_ms += t3.elapsed().as_secs_f64() * 1000.0;
+    if resumable && !lazy {
+        st.trace = Some(resume::Trace { sig: psig, rev: st.rev, rec, out, page: page_trace });
+    }
     (g, csim.runs)
 }
 
@@ -1240,12 +1497,23 @@ fn apply_pulls(g: &mut Galley, pulls: &[(usize, f32)], shifts: &[(Range<usize>, 
     let round = |v: f32| (v * ppp).round() / ppp;
     let mut cum = 0.0f32;
     let mut next = 0;
+    // Rutornas radintervall ligger i stigande ordning utan överlapp (en ruta i taget): gå igenom dem i takt med raderna
+    // i stället för att söka i alla för varje rad. Annars som förut (första intervallet som innehåller raden).
+    let ordered = shifts.windows(2).all(|w| w[0].0.end <= w[1].0.start);
+    let mut sh = 0;
     for (i, r) in g.rows.iter_mut().enumerate() {
         while next < pulls.len() && pulls[next].0 <= i {
             cum += pulls[next].1;
             next += 1;
         }
-        let dy = shifts.iter().find(|(rg, _)| rg.contains(&i)).map_or(0.0, |(_, d)| *d);
+        let dy = if ordered {
+            while sh < shifts.len() && shifts[sh].0.end <= i {
+                sh += 1;
+            }
+            shifts.get(sh).filter(|(rg, _)| rg.contains(&i)).map_or(0.0, |(_, d)| *d)
+        } else {
+            shifts.iter().find(|(rg, _)| rg.contains(&i)).map_or(0.0, |(_, d)| *d)
+        };
         r.pos.y = round(r.pos.y - cum + dy);
     }
     let mut rect = Rect::ZERO;
@@ -2131,7 +2399,7 @@ struct Para {
 }
 
 /// En förankrad textruta ur öppningsraden: ankare, bredd och fast höjd (px vid 100 %).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct TBox {
     anchor: Anchor,
     w: f32,
