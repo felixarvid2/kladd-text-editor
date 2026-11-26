@@ -98,10 +98,12 @@ men mättes inte (disken räckte inte till ett `--release`-bygge).
 `word::incr` (`analyze_incremental_with`) tolkar efter en liten ändring (högst 4 kB, i dokument över 200 kB)
 bara stycket med ändringen plus ett stycke på var sida. De yttre styckena är kanariefåglar: ger de inte
 exakt samma bitar som i den gamla analysen (något sträcker sig över styckegränsen) görs full analys.
-Tre tilda, oavslutade kommentarer, referenslänkar (när fönstret har hakparenteser), kodstaket som inte är
-välformade, ändringar på grundformatsraden och nya eller ändrade fotnotsetiketter och avsnittsrader ger full analys; se
-"Tangenttryck och öppning, andra omgången" nedan för vad som går inkrementellt. Slumpade ändringar mot
-`markup::analyze` ingår som test. Tabeller, bilder och typsnitt återanvänds när fönstret inte rört dem.
+Oavslutade kommentarer, kodstaket i fönstret eller där det inte går att avgöra om de är staket (i en lista eller ett
+citat), referenslänkar som inte är enkla (när fönstret har hakparenteser), ändringar på grundformatsraden, ändrade
+avsnittsrader och nya eller borttagna fotnotsdefinitioner med referenser utanför fönstret ger full analys; se
+"Tangenttryck och öppning, andra omgången" och "fjärde omgången" nedan för vad som går inkrementellt. Slumpade ändringar mot
+`markup::analyze` ingår som test. Tabeller, bilder, typsnitt och styckenas utseende (`<!--k:pp`) återanvänds när fönstret
+inte rört dem.
 
 Efter en inkrementell analys återanvänder `word::layout_memo` styckena, fotnotsplanen, grupperna och
 cachenycklarna från förra omläggningen (se nedan), så att ett tangenttryck inte längre kostar tid i proportion till
@@ -332,6 +334,8 @@ varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3
 
 ### Kvar
 
+(Delvis åtgärdat i fjärde omgången nedan: ändringsräknaren, höjdändringar, färre fall av full analys och stegvis utläggning.)
+
 - Tangenttrycket växer fortfarande med dokumentet (3,1 gånger från 404 till 2021 sidor i opt-level 2), med små konstanter:
   varje anrop till `Cache` jämför hela texten med sin kopia (memcmp; bänken och vyn gör det fyra–fem gånger per bildruta,
   ca 0,15 ms vardera vid 3,3 MB), den inkrementella analysen flyttar alla bitar efter fönstret (`Piece` är stor, ca 0,7 ms),
@@ -347,6 +351,176 @@ varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3
   definition), referenslänkar med hakparenteser i fönstret, kodstaket i dokument med udda antal staket eller staket mitt på
   en rad, tre tilda och ändringar på grundformatsraden. Sökträffar ger full omräkning av förberedelsen.
 - Stegvis utläggning, första sidan och bilder som i förra omgången (nedan).
+
+### Höjdändringar, färre jämförelser och stegvis utläggning, fjärde omgången
+
+Mätning: `bench_docx_place` (ny, ignorerat test i `src/word/bench.rs`) skriver ett tecken in och ut om vartannat på ett av de
+tio ställena (`KLADD_BENCH_PLACE=1..10`, `KLADD_BENCH_KEYS=20`) och ger medianen av 20 bildrutor: en varm slinga, inte ett enda
+tangenttryck per ställe som i tabellerna ovan, så siffrorna är inte direkt jämförbara med förra omgångens. `KLADD_BENCH_TEXT`
+skriver något annat än ett tecken, `KLADD_BENCH_PRE` lägger ett stycke först i dokumentet (för fallen där analysen avstod) och
+`KLADD_BENCH_VIEW=1` hämtar också det vyn hämtar ur cachen varje bildruta (rubriker, styckerutor). Profilering med
+`valgrind --tool=callgrind --toggle-collect='*place_loop*'`. Dokumenten är som förra omgången `gen-skolrapport.docx` upprepad
+100 och 500 gånger (404 och 2021 sidor). Opt-level 2 för kladd, egui, epaint, emath, ecolor, harfrust, skrifa och read-fonts,
+övrigt debug; dev-profilen har kvar `debug_assertions`, men bänken slår av de nya kontrollerna över hela dokumentet som bara
+görs i debugbyggen (`layout::CHECKS`: att texten med en `Seen` är cachens och att texten utanför det ändrade området är
+densamma i `layout_memo`), så siffrorna efter motsvarar ett optimerat bygge. Delad 4-kärnig maskin med belastning 2–10:
+skillnader under ca 15 % är brus.
+
+| Tangenttryck, opt-level 2, median av 20 (ms) | 404 sidor före / efter | 2021 sidor före / efter |
+|---|---|---|
+| 1 början (raden bryts om: höjden ändras) | 11,8 / 5,1 | 4,5 / 2,6 |
+| 2 25 % | 8,5 / 2,4 | 3,9 / 2,1 |
+| 3 mitten | 0,80 / 0,57 | 3,5 / 1,7 |
+| 4 75 % | 1,13 / 0,87 | 2,6 / 1,4 |
+| 5 slutet av brödtexten | 0,55 / 0,42 | 2,9 / 1,2 |
+| 6 i tabell | 1,22 / 1,37 | 6,1 / 3,8 |
+| 7 vid fotnotsreferens | 0,83 / 0,69 | 107,5 / 2,3 |
+| 8 närmast fotnotsdefinitionerna | 0,92 / 0,52 | 3,4 / 1,9 |
+| 9 första fotnotsdefinitionen | 0,62 / 0,49 | 3,7 / 1,8 |
+| 10 sista fotnotsdefinitionen | 0,41 / 0,29 | 2,5 / 1,2 |
+| **Median av de tio** | **0,88 / 0,63** | **3,58 / 1,89** |
+| **Sämsta** | **11,8 / 5,1** | **107,5 / 3,8** |
+| Med vyns hämtningar (`KLADD_BENCH_VIEW`, mätt innan rubrikerna lästes om bara i fönstret), ställe 1 / 3 | – | – / 4,1 och 2,6 |
+| Oförändrad bildruta (`bench_docx_open`) | 0,1 / 0,0 | 1,4–1,5 / 0,2–0,3 |
+| Kall utläggning, allt i en bildruta | 427–434 / 402–431 | 1975–2042 / 1616–1735 |
+| Stegvis: första bildrutan | 172–185 / 140–141 | 934–966 / 704–821 |
+| Stegvis tills allt är utlagt | 490–522 / 408–417 | 2643–2741 / 1901–1997 |
+
+Rubrikerna i fönstret (`headings_patch`) och rättelsen i vyn kom efter den sista mätningen i opt-level 2 och syns inte i
+tabellen. Debug (404 sidor, `bench_docx_open`, ett tangenttryck per ställe): median 6,1–7,0 / 6,0–6,2 ms, sämsta 76–77 / 53–70 ms;
+kall utläggning 2,79–2,96 / 2,79–2,91 s, stegvis tills allt är utlagt 3,82–4,25 / 3,29–3,31 s (22 bildrutor).
+
+Fall där den inkrementella analysen avstod förut (debug, 404 sidor, hela tangenttrycket, median av 6): ett tecken i ett
+dokument med ett kodstaket mitt i en rad någonstans 317 / 2,3 ms, med ett `~~~`-staket 280 / 3,6 ms, `[namn]` i ett dokument
+med en referenslänk 317 / 4,0 ms; en ny fotnotsdefinition (`\n[^ny]: Ny fotnot.` i sista definitionen) 375 / 292 ms
+(analysen är nu inkrementell, men fotnotsplanen har ändrats, så förberedelsen och varvet görs hela).
+
+Små dokument är inte långsammare (`bench_document_mode`, ett tecken i mitten, opt-level 2, tre körningar): 30 kB 5,4–5,8 /
+5,7–6,3 ms (brus), 55 kB 10,2–10,8 / 8,9–9,3 ms, 600 kB 6,5–7,1 / 3,2–4,1 ms; markören byter rad i 600 kB 2,4–2,6 / 0,2–0,3 ms.
+Debug: 30 kB 22,5 / 15,7 ms, 55 kB 30,8 / 25,4 ms.
+
+Målen: sämsta tangenttrycket vid 404 sidor är 5,1 ms (mål 5, inte riktigt nått; bästa av 20 4,8 ms), tangenttrycket vid 2021
+sidor är 1,89 / 0,63 = 3,0 gånger det vid 404 sidor (mål 2; förut 4,1), och stegvis utläggning av 404 sidor är i opt-level 2 lika
+snabb som den kalla (408–417 mot 402–431 ms) men i debug fortfarande ca 15 % långsammare (förut ca 40 %); se *Kvar*.
+
+Vad som gjordes, i den ordning mätningen pekade ut:
+
+- **Innehållsförteckningar i fönstret.** Det sämsta tangenttrycket vid 2021 sidor (ställe 7, 108 ms) och en stor del av de
+  sämsta vid 404 sidor var `toc_count`: varje upprepning av skolrapporten har en förteckning, och när ett fönster rörde en
+  räknades alla förteckningars poster om med en kopia av alla rubriker per förteckning (kvadratiskt). Nu räknas posterna utan
+  kopior (`nav::toc_total`), och är rubrikerna som kan komma med oförändrade (`Delta::toc_delta == 0`) och förteckningens rad
+  densamma återanvänds både antalet och radens höjd (`paragraphs_toc` med kända höjder).
+- **Höjdändring utan att lägga ut resten** (förslag 1, `layout_resume.rs`). Ändras höjden blir tillståndet före de följande
+  grupperna aldrig detsamma som förut, och efter 64 grupper gavs det återupptagna varvet upp. Nu sparar varvet för varje grupp
+  om den beror på sitt läge (`Rec::plain`: inga flytande bilder eller textrutor före, i eller efter den, ingen bild i stycket);
+  en sträcka sådana grupper tas från förra varvet förskjuten (`Fast::splice_shifted`): gruppernas gallerier, ankare, tabeller och
+  fotnoter är desamma, och bara läget (`y`) och sidsimuleringen förs fram grupp för grupp och rad för rad med exakt samma
+  räkneordning som i varvet, så att resultatet blir detsamma bit för bit. Att bara flytta lägena med skillnaden går inte i
+  flyttal (avrundningen beror på storleken, särskilt med skalning 125 % och 150 %), så sammanfogningen och sidindelningen räknas
+  om från den ändrade raden till slutet, men utan att lägga ut, hasha eller slå upp något: raderna sammanfogas en gång
+  (`FlatRows::pre`) och flyttas till det nya galleriet, fotnotsreferenserna i förskjutna sträckor flyttas bara, och
+  ritytornas summor görs om per block. Sidindelningen återupptas fortfarande bara där tillståndet åter blir detsamma.
+  Sammanfogningen jämför bara rektangelns y (galleriets bredd följs per grupp, `PageTrace::xr`), så att en rad som blir bredare
+  inte längre ger full sammanfogning (det var ställe 2). Dokument utan fotnoter återupptogs aldrig sidindelningen för (luften och
+  taket för fotnoterna var noll i den fullständiga vägen); nu sätts de alltid.
+- **Ändringsräknare i stället för textjämförelse** (förslag 2). `Cache::seen(id, text)` jämför texten en gång och ger en
+  `Seen` med en stämpel (unik i hela programmet, ny vid varje ändring); `Cache`:s metoder tar `&str` eller `&Seen` (`DocText`)
+  och litar på stämpeln så länge texten lånas (lånekontrollen garanterar att den inte ändras). Vyn använder den för alla
+  hämtningar efter TextEdit (åtta jämförelser av hela texten per bildruta blir en), mätverktyget för hela bildrutan. Före
+  TextEdit lånar vyn `self` på andra sätt mellan anropen, där är det kvar som förut. Kontrollen av att texten utanför det
+  ändrade området är densamma (`layout_memo::reuse`) görs bara i debugbyggen när området kommer från en enda inkrementell
+  analys (som själv jämför texterna); ett område som satts samman av flera ändringar före en omläggning kontrolleras alltid. Kontrollstyckena jämförs fält för fält (`same_para`) i stället för som `format!("{:?}")`,
+  och första ändrade gruppen räknas fram när grupperna görs om (`Prep::first_new`) i stället för att sökas.
+- **Färre fall av full analys** (förslag 6, `incr.rs`). En ny, borttagen eller omdöpt fotnotsdefinition i fönstret går när
+  ingen referens till etiketten finns utanför det; kodstaket räknas per rad (först på raden, osäkert i en lista eller ett citat,
+  eller mitt i en rad, som inte är något staket), `~~~` följs som ``` och fönstret avgörs ligga utanför ett kodblock genom att
+  följa staketen som CommonMark (`in_fenced_block`), så att ett dokument med ett staket mitt i en rad eller ett `~~~`-block inte
+  längre ger full analys vid varje tangent; och fönster med hakparenteser i dokument med referenslänkar tolkas med dokumentets
+  definitioner efter sig när alla är enkla (`link_defs_of`). Grundformatsraden ger fortfarande full analys: en ändring där
+  ändrar cachenycklarna för alla stycken, så omläggningen efteråt är full ändå. Fuzzningen med de nya ändringarna hittade två
+  gamla avvikelser mot full analys: en referens vars definitionsrad inte är någon definition (mitt i ett stycke) togs för giltig
+  (nu krävs en riktig definition i den gamla analysen, `has_def_outside`), och en HTML-tagg med ett citattecken utan sin like
+  kan fortsätta långt efter fönstret (`open_tag` ger full analys).
+- **Stegvis utläggning** (förslag 9). Förut var varje bildruta under den stegvisa utläggningen ett helt varv (en nyckel och en
+  uppslagning per grupp och en platshållare per grupp som inte lagts ut). Nu sparas varvet också när det är ofullständigt
+  (`Trace::stub_from`, `Rec::stub`), platshållarnas kalibrering följer med mellan bildrutorna och fryses (`Stubs::freeze`, görs om
+  när det utlagda har fördubblats) och nästa bildruta återupptar varvet: grupperna före gränsen tas från förra varvet, nya
+  grupper läggs ut inom budgeten och platshållarna för resten tas förskjutna från förra varvet när kalibreringen är densamma.
+  Sammanfogningen och sidindelningen återupptas också under den stegvisa utläggningen (det ofullständiga galleriet sparas,
+  `partial_galley`). Medan fotnotsdefinitionerna läggs ut ändras antalet noter och de bildrutorna gör sammanfogningen hela.
+- **Mindre per tangent i vyn:** styckenas utseende (`pbox::scan` över hela texten vid varje ändring, ca 6,5 ms i debug vid 404
+  sidor) och rubrikerna läses om bara i fönstret och flyttas efter det (`pspecs_patch`, `headings_patch`), och notregistret i
+  sammanfogningen byggs bara när många referenser söks.
+
+Prov: `layout::resume::tests` med förskjutna sträckor, sidbrytningar, flytande bilder och textrutor, med skalning 125 % och 150 %
+i vart annat frö, `Fast::abandon` efter förskjutna sträckor i vartannat frö och, i provet med avsnitt, olika breda spalter;
+`lazy_tests::stegvis_utlaggning_aterupptar_forra_varvet` (återupptagna bildrutor och samma galleri, sidor och fotnoter som när
+allt läggs ut direkt); `layout_memo` med `toc_delta` (förteckningens höjd) och `paragraph_looks_follow_incremental_edits`
+(styckenas utseende och rubrikerna mot en hel omläsning); `incr` med nya definitioner, staket mitt i rader, `~~~` och
+referenslänkar. Alla med `KLADD_FUZZ_SEEDS=300`.
+
+I appen (`KLADD_TIMING=1`, 404 sidor, debug, samtidigt som annat byggdes på maskinen): den stegvisa utläggningen återupptog
+varje bildruta utom de sista fem (fotnotsdefinitionerna); ett tecken gav en omläggning på 5–7 ms (hela bildrutan 80–110 ms,
+se *Kvar*), Enter 30 ms, Backspace över en styckegräns 29 ms, ångra 29–33 ms, alla återupptagna och med förskjutna sträckor;
+en inklistring på 5 kB (över gränsen för den inkrementella analysen) gav full analys (169 ms) och en omläggning på 148 ms, och
+tecknet efter 17 ms. Att ångra inklistringen kraschade vyn (också före den här omgången): rubrikerna hämtas före TextEdit och
+användes efter den med den ändrade texten, så att ett gammalt byteläge hamnade mitt i ett tecken. Rubrikerna hämtas nu om
+efter en ändring, och omvandlingen från byte till tecken tål ett läge mitt i ett tecken.
+
+#### Brödtext i `<div>`-block (efter integrationen)
+
+Word-läsaren skriver justerad, centrerad och högerställd text som `<div align="…">`-block, ofta över många stycken. Ett
+fönster mitt i ett sådant block, där taggarna ligger utanför fönstret, gav full analys (`incr`, skäl 19: bitarna har blockets
+justering men fönstret ser inte taggarna; skäl 16: fönstret har en tagg utan sin like och blocket är för stort för att vidgas
+till) och därmed full förberedelse och ett helt varv. Nu tolkas fönstret inslaget i likadana block som de det ligger i
+(`DivCtx`: justeringen före fönstret och efter varje stängning utan par läses ur den gamla analysen, taggarna utan par i
+fönstret ska vara desamma efter ändringen och ha varit parade i hela texten), så att det får samma justering och samma parning
+som i hela texten. Små block tas fortfarande med hela i fönstret.
+
+| Mått | Före / efter |
+|---|---|
+| Ett tecken i justerad brödtext ("februari och mars.", 404 sidor), opt-level 2 | 97 / 0,8–1,0 ms |
+| Samma, debug | 254 / 3,3 ms |
+| Ställen med inkrementell analys, 400 ord jämnt fördelade, `gen-skolrapport` ×100 (i justerade block) | 367 / 375 (164 / 172 av 172) |
+| Samma, `gen-nyhetsbrev` ×150 | 299 / 384 (223 / 297 av 302) |
+
+Mätt med det ignorerade provet `incr::tests::bench_incr_coverage` (`KLADD_BENCH_MD=fil.md`, Markdown dumpad med
+`KLADD_BENCH_DUMP`) och `bench_docx_place` med `KLADD_BENCH_FIND`. Nästlade block, block med `style="text-align: …"`, `<div>`
+utan justering och listor och citat i ett block går nu inkrementellt. Det som fortfarande avstår: en ändring i själva en
+tagg utan sin like i fönstret (taggarna ska vara desamma), kanterna (skäl 10, 24 av 400 i `gen-skolrapport`: raden efter
+ändringen tolkas annorlunda, t.ex. vid en ändring alldeles före en textruta) och avsnittsrader (skäl 3). I appen (`KLADD_TIMING=1`,
+404 sidor, debug) gav skrivning i justerad brödtext inkrementell analys (1,5–7 ms) och återupptagen omläggning.
+
+Prov: `incr::tests::text_inside_div_blocks_keeps_the_incremental_path` (stycken mitt i stora och nästlade block, listor och
+citat i ett block, ändringar i och runt taggarna mot `analyze`), rika dokument i `incr`-fuzzen, `layout_memo` och
+`layout::resume` med block över flera stycken, ibland nästlade; alla med `KLADD_FUZZ_SEEDS=300`. Fuzzen av förberedelsen
+(`reuse` direkt med ett område) hoppar nu över ändringar där bitarna utanför området har ändrats, som den inkrementella
+analysen aldrig ger ett område för (en ändring i en tagg som parar ihop taggarna annorlunda långt bort).
+
+#### Kvar
+
+- Tangenttrycket vid 2021 sidor är 3,0 gånger det vid 404 sidor. Det som återstår och växer med dokumentet (callgrind, 2021
+  sidor, mitten, per tangent): grupperna flyttas när de görs om (`regroup`, ca 1 M instruktioner), den inkrementella analysen
+  flyttar alla bitar efter fönstret (ca 1 M), det återupptagna varvet flyttar förra varvets listor två gånger (`Fast::start` och
+  `splice`: fotnoternas `NoteLayout`, tabellernas `TableGeom` och gallerierna, ca 1,1 M), de täta listorna per grupp lappas och
+  justeras (`finish_rec`, `finish_fast`), och texten kopieras två gånger (cachens kopia och galleriets). Relativa lägen
+  (förslag 3: en förskjutning som tillämpas lat för bitar, stycken, grupper och listorna) skulle ta bort det mesta, men kräver
+  att alla som läser `Analysis::pieces`, `Prep` och `Out` gör det genom en förskjutning; det har inte gjorts i den här omgången.
+- En höjdändring vid 404 sidor tar ca 5 ms, nästan allt i sammanfogningen och sidindelningen av raderna efter ändringen. De
+  räknas om exakt; att i stället flytta dem med skillnaden kräver att lägena räknas i hela bildpunkter (eller med heltal) i både
+  den fullständiga och den återupptagna vägen, vilket ändrar avrundningen mot i dag.
+- Dokument med flera avsnitt (förslag 5) återupptar bara varvet över grupperna och gör sammanfogningen och sidindelningen
+  (`paginate_sections`) hela, och med olika breda spalter görs allt hela och flera gånger (spaltutjämningen). Mätt med
+  `gen-nyhetsbrev.docx` upprepad 150 gånger (tre spalter med olika bredd): 84 / 86 ms per tecken i debug, oförändrat. Att
+  återuppta `paginate_sections` kräver ett sparat tillstånd per ark (spalt, avsnitt, enheterna på arket för utjämningen,
+  fotnoterna) och att utjämningens varv också återupptas.
+- I appen kostar resten av bildrutan mer än omläggningen: i debug ca 75–80 ms per tecken vid 404 sidor mot 4–6 ms för
+  omläggningen (`KLADD_TIMING` skriver nu också hela bildrutan med ändring). Före TextEdit jämförs texten fortfarande sju gånger
+  per bildruta (vyn lånar `self` mellan anropen), och debugbyggen jämför den med flit också för varje `Seen`.
+- En ny fotnotsdefinition eller ändrade fotnotsreferenser ger full förberedelse och ett helt varv (fotnotsplanen), och en ändring i
+  en tabell bygger om alla tabeller (ställe 6).
+- Stegvis utläggning i debug är ca 15 % långsammare än den kalla: varje bildruta för fram lägena över resten av dokumentet
+  (förskjutna platshållare, sammanfogning och sidindelning), och medan fotnotsdefinitionerna läggs ut görs sammanfogningen hela.
 
 ### Kvar efter andra omgången
 
@@ -364,12 +538,82 @@ varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3
 - Bilder avkodas av egui:s bildinläsare och påverkar inte layouten förrän storleken är känd (`word_image` rensar då
   layoutcachen, en gång per bild), så ett dokument med hundratals bilder lägger ut om en gång i början.
 
+## Läsläget (Markdown och EPUB), 2.10
+
+Mätt med `markdown_large_frame_time` (`KLADD_BENCH_MD_KB=24,100,400,4900`, `src/ui_tests/text.rs`) och
+`epub_large_chapter_frame_time` (`src/ui_tests/epub.rs`): CPU-tid per `ui.h.step()` i kittest, debugbygge, delad 4-kärnig
+maskin (±30 %). Markdown-filen har rubriker, stycken med formatering, listor, kodblock, tabeller, uppgiftslistor och citat.
+
+| Fall (debug) | Före | Efter |
+|---|---|---|
+| Markdown 24 kB, stilla / rullning | 158 / 159 ms | 7 / 9 ms |
+| Markdown 100 kB | 665 / 670 ms | 9 / 9 ms |
+| Markdown 400 kB | ca 2,7 s (linjärt, ej körd hela vägen) | 18 / 19 ms |
+| Markdown 5 MB (öppnades inte i läsläget) | ca 33 s (uppskattat, 6,5 ms/kB) | 6,3 / 6,3 ms (de ritade blocken ca 4,5 ms) |
+| EPUB-kapitel 400 kB (18 delar) | 23 ms | 4,1 ms (en del) |
+
+Före 2.10 ritade `egui_commonmark` hela texten varje bildruta (och förbehandlingen med formler, diagram, HTML och rubrik-id
+gjordes om varje bildruta), så kostnaden växte linjärt med storleken: 6,5 ms/kB. Därför delades EPUB-kapitel vid 24 kB och `.md`-filer
+från 5 MB öppnades inte i läsläget.
+
+**Vad som gjordes** (`src/mdwin.rs`, `vendor/egui_commonmark`):
+- Texten delas i toppnivåblock (`split`, samma `pulldown-cmark`-flaggor som visningen). `CommonMarkViewer::show_slice` ritar ett
+  block med källpositioner räknade i hela texten, så sökträffar, markeringar, kryssrutor och blockstil fungerar oförändrat. Länk- och
+  fotnotsdefinitioner långt från blocket läggs efter det, och nästa block läses fram (ritas inte) så att listor och tabeller ser
+  samma efterföljande händelser som i en helritning.
+- `Win::show` ritar bara blocken i `ui.clip_rect()`; varje blocks höjd mäts när det ritas och blocken sätts på sin uträknade plats.
+  Ej ritade block har en uppskattad höjd ur textlängden, som räknas om efter 4, 32 och 256 kB uppmätt text. Dokument under 64 kB
+  ritas helt första bildrutan så att alla höjder är exakta (ingen uppskattning, samma rullningslist som förut).
+- När ett block ovanför det man tittar på får sin riktiga höjd (eller uppskattningen räknas om) flyttas rullningen lika mycket och
+  bildrutan ritas om (`request_discard`), så texten står still. Hopp till en rubrik (länk, navigeringsfönstret) och till sökträffen
+  rullar först till blockets uppskattade plats och sedan exakt när blocket ritats.
+- Texten förbehandlas en gång per version (`MdState::prep`) i stället för varje bildruta; ordantalet i statusraden räknas om bara
+  när texten ändrats; översättningen av översta positionen till dokumentets text görs bara när positionen ändras.
+- `CommonMarkCache::line_points` fylls med punkter för blocken nära det synliga (dubbelklick, rullningssynk, EPUB-understrykningar);
+  `Win::y_of_byte` ger blockets överkant för hopp (`Jump::Byte`). Sökträffarnas läge ges av `sync_search_layout`.
+- `.md`-filer över 5 MB öppnas nu i läsläget (Redigera ger den stora textvyn som förut).
+
+**Kontroller**: `blocken_hamnar_som_i_en_helritning` och `ritade_block_ser_ut_som_i_helritningen` (`mdwin::tests`) jämför blockens
+överkanter, texter och galleriformer med en helritning (listor, kod, tabeller, citat, HTML, fotnoter, regler);
+`stor_text_ritar_bara_det_synliga_och_hamnar_som_i_en_helritning` rullar genom en text på 190 kB (som mest 60 block ritas per
+bildruta) och jämför alla överkanter med en helritning efteråt.
+
+**Kvar**: ritningen av de synliga blocken kostar ca 0,5 ms per block i debug (egui:s textutläggning); mer än så kräver att
+galleriet cachas mellan bildrutor. Höjden på ej ritade block är en uppskattning, så rullningslisten kan hoppa lite i stora texter;
+sparade lägen i EPUB använder källpositionen (`Memory::byte`) i stället för andelen av uppskattad höjd.
+
 ## PDF-visaren
 
 Layouten (`build_layout`) är O(sidor) med binärsökning, miniatyrpanelen är virtualiserad och texturcachen har
-tak (256 MB, 240 miniatyrer). Nytt: textlagren (`PageText`, ~0,2 MB per sida) har tak (`MAX_TEXT_PAGES` = 160)
+tak (160 MB, 240 miniatyrer). Nytt: textlagren (`PageText`, ~0,2 MB per sida) har tak (`MAX_TEXT_PAGES` = 160)
 och släpps långt från vyn; sidor som redan sökts hämtas inte om, den aktuella träffens sida hämtas vid behov
 och "markera allt" behåller allt. `find_status` bygger inte längre träfflistan varje bildruta.
+
+### Rullning i en stor PDF, 2.10
+
+Mätt med `pdf_scroll_bench` (`KLADD_BENCH_PDF_PAGES=1200`, `pdfview/view.rs`; 1863 sidor, fönster 900x700, 16 ms mellan bildrutor, tre
+körningar, debug): "promenad" 60 px per bildruta och "snabb" 700 px per bildruta (som att dra i rullningslisten). Tomma = en sida i
+bild utan någon bild alls; grova = bild i fel skala.
+
+| Fall | Före | Efter |
+|---|---|---|
+| Promenad: bildruta medel / p95 | 0,7–0,9 / 1,5–3,4 ms | 0,9–1,0 / 1,9–4,0 ms (brus; visaren är inte flaskhalsen) |
+| Promenad: tomma / grova sidor i bild (av 617) | 0 / 0 | 0 / 0 |
+| Snabb: bildruta medel | 0,6–0,9 ms | 0,6–1,1 ms |
+| Snabb: tomma sidor i bild (av 248) | 153–196 | 0–83 (resten visas grovt), grova 108–191 |
+| Snabb: skarp efter stopp | 0,6–0,9 s | 0,6–1,0 s (oförändrat: hayro-renderingen) |
+| Snabb: texturer i minnet | 33–34 st, 137–141 MB | 34–36 st, 97–109 MB |
+| Toppminne (process) | 105–108 MB | 107–111 MB |
+
+**Vad som gjordes** (`pdfview/view.rs`): rullhastigheten och riktningen mäts (`track_scroll`); förrenderingen tar fler sidor i
+rullningsriktningen (4 framåt, 1 bakåt, annars 2/2); rullar vyn snabbare än tio vyhöjder per sekund (`FAST_SCROLL`, motorn hinner
+inte med skarpa sidor) renderas sidor som saknar bild i 35 % av skalan (snabbt att rita) och byts mot skarpa 140 ms efter att
+rullningen stannat; en grov bild som kommer efter en skarp ersätter den inte; texturcachen har tak 160 MB (förut 256 MB) och släpper
+aldrig synliga eller förrenderade sidor. Promenad (under tröskeln) är oförändrad.
+
+**Kvar**: tiden till skarp bild efter en snabb rullning ändrades inte mätbart: den bestäms av hur snabbt hayro renderar de synliga
+sidorna (en tråd per sida), och renderingar som redan pågått kan inte avbrytas. Ett snabbare spår kräver avbrytbar rendering eller
+bandvis rendering av en sida.
 
 ## PDF-export (`pdf_write.rs`)
 
@@ -418,7 +662,323 @@ Vad som tog tid och vad som gjordes:
 - Återstår: formningen och krillas `draw_glyphs` är nu det mesta av tiden (~3 s för 125 000 textkörningar);
   PDF-exporten körs fortfarande på gränssnittstråden (Arkiv → Spara som PDF och utskrift).
 
+## Öppning, gapet efter inläsningen, uppstart och PDF-trådar (2.10)
+
+Mätt i optimerat läge (opt-level 2 för hela beroendeträdet i en egen målkatalog), median av 9 körningar, omväxlande
+före- och efterbygget, på en delad 4-kärnig maskin med andra byggen igång (lastsnitt 4–10, så siffrorna varierar
+±25 %; ordningen mellan före och efter är stabil). Testdokument: `gen-skolrapport.docx` upprepad 100 respektive 300
+gånger (`wave-view/gen-stor-docx.py`; 404 sidor/3 MB XML och 1 212 sidor/9 MB XML, lagrade eller packade), och
+samma dokument som `.odt` (skrivet av Kladd, 10 MB `content.xml`). `bench_docx_read` (ny, ignorerad) läser en fil
+`KLADD_BENCH_READS` gånger och skriver median och minimum; `KLADD_TIMING=1` skriver delsteg (`docx: …`, `odt: …`).
+
+### 7. Läsning av Word och ODT
+
+| Fall | Före (median / minst) | Efter (median / minst) |
+|---|---|---|
+| `.docx` 404 sidor, 3 MB XML, lagrad | 141 / 133 ms | 74 / 71 ms |
+| `.docx` 404 sidor, packad (66 kB) | 156 / 136 ms | 84 / 79 ms |
+| `.docx` 1 212 sidor, 9 MB XML, packad (149 kB) | 829 / 769 ms | 294 / 267 ms |
+| `.odt` 10 MB `content.xml` | 229 / 211 ms | 162 / 145 ms |
+
+Delsteg för 404 sidor (före → efter): `collect_parts` (källans delar för den källbevarande sparningen) 57–92 ms →
+0 på huvudtråden, tolkningen av brödtexten (`parse_body`, 64 ms) är nu den dominerande och enda stora delen; 1 212 sidor:
+förteckningsnycklarna 500 ms → 49 ms.
+
+- **Källans delar i egen tråd.** `collect_parts` packar upp alla filer i paketet (bilder, XML) och behövs först allra
+  sist (`Source::parts`); den körs nu i en egen tråd (`std::thread::scope`, egen `ZipArchive` över samma byte, samma
+  gränser och samma resultat) medan resten läses. I ett dokument med stora foton är det den största enskilda kostnaden.
+  Bilderna som dokumentet visar packas fortfarande upp bara om de används (`pkg.part_bytes`).
+- **Förteckningsnycklarna** (`toc_unit_key`) sökte fram rubrikerna i hela texten en gång per förteckning; nu delas
+  sökningen av alla förteckningar (ett dokument har oftast en, mätdokumentet 300).
+- **Fot- och slutnoter** tolkas i egna trådar (`read_footnotes` delades i `raw_footnotes`, som läser ur paketet, och
+  tolkningen) medan brödtexten tolkas; fel vid uppackningen visas efter brödtextens, som förut.
+- **XML-delarna** (`Package::part`, `Pkg::text`) blir `String` utan kopia när de är giltig UTF-8.
+- **ODT:** `office:text` i `content.xml` tolkas på upp till 8 trådar (`parse_xml_par`): en lätt skanning
+  (`text_children`, hanterar citattecken i attribut, kommentarer, CDATA och processinstruktioner) hittar barnens
+  starttaggar, skelettet (allt utom barnen) tolkas för sig och bitarna sätts in i `office:text`. Ger skanningen eller
+  någon bit upp, eller har dokumentet en annan form, tolkas det i ett stycke med samma fel som förut. Testat mot den
+  sekventiella tolkningen (`odt_par_tests.rs`: träden jämförs för olika innehåll, trådantal och felfall). XML-träden
+  rivs i en bakgrundstråd (10 % av tiden).
+- **Bilder, formatmallar och sidhuvud** mättes: under 2 ms vardera i testdokumenten (som har en bild; inte mätt med många foton). Resten av `docx::read` är en
+  platt profil (`callgrind`: ingen funktion över 6 % utom `quick_xml` själv och minnesallokering); `parse_body` bär
+  global ordning (fotnotsnummer, markörnummer, ändringsnummer, bildplatshållare) och delades inte.
+
+### 8. Gapet efter inläsningen
+
+Orsaken var två saker i första bildrutan efter att dokumentet installerats, inte teckensnitt, stavning, rubrikträd
+eller historik (alla under 1 ms):
+
+1. `word_image` anropade `Cache::forget` så fort en bilds storlek blev känd ("layoutcachen nycklar inte på
+   bildstorlekar"), och det händer i första bildrutan. Det kastade den färdiga analysen som inläsningstråden gjort
+   (`Prepared`) och tvingade fram en ny `markup::analyze` (ca 60 ms i opt, 0,3 s i debug) mitt i bildrutan. Nu
+   behåller `Cache::images_sized` allt när inget lagts ut än; efter en utläggning kasseras det som förut.
+2. Statusraden räknade orden i hela dokumentet i varje bildruta (`markup::count` bygger en kopia av hela texten):
+   ca 5 ms per bildruta vid 650 kB. Ordantalet cachas nu på (flik, textlängd, texthash).
+
+| Mått | Före | Efter |
+|---|---|---|
+| Färdig inläsning → första sidan klar, 404 sidor (3 MB lagrad) | 186 ms (173–195) | 69 ms (64–106) |
+| Samma, `.docx` packat till 66 kB | 572 ms | 102 ms |
+| Ordräkning i statusraden, per bildruta (404 sidor) | ca 5 ms | cachas; kvar är hashen av texten (ca 0,1 ms, uppskattad, inte mätt i appen) |
+
+(Siffrorna inkluderar själva utläggningen, 50–60 ms.) En ändring av ett Word-dokument med redan utlagda sidor
+kasserar cachen som förut (`images_sized` gör `forget` när något lagts ut).
+
+### 10. Uppstart
+
+`KLADD_TIMING=1`, tom miljö, `--new-window`, Xvfb med programvaru-GL, median av 5:
+
+| Steg (tom start, ms sedan processstart) | Före | Efter |
+|---|---|---|
+| `main` till `run_native` (argument, enkelinstans, ikon) | 0,5 | 0,5 |
+| winit, X11, GL-kontext (Mesa/llvmpipe), eframe | 64–79 | 64–79 (utanför Kladd; `strace` visar bara bibliotek, X11 och Mesa) |
+| `KladdApp::new` (typsnitt, stilar, inställningar, återställning, syntaxer, bibliotek, enkelinstans-socket) | 1,0 | 1,0 |
+| första `logic()` och `ui()` till första bilden | 2–6 | 2–6 |
+| **Första bilden: tom start** | 80 | 79 |
+| Första bilden: textfil / Markdown-fil | 79–126 / 76–85 | 79–86 / 71–95 (brus) |
+| **Första bilden: `.docx` 66 kB packat (3 MB XML)** | **386 (minst 321)** | **96 (minst 77)** |
+| Första bilden: `.docx` 3 MB lagrad (läses redan i bakgrunden) | 128 | 143 (brus) |
+
+Allt som kan skjutas upp var redan uppskjutet förra omgången (typsnitt, stavning, syntaxer, uppdateringskontroll).
+Det som återstår av Kladds del före första bilden är under 10 ms, resten är ramverk och drivrutiner. Enda ändringen:
+Word- och ODT-filer som är små packade men har över 1 MB XML (`WORD_BACKGROUND_UNPACKED_BYTES`, ur zip-katalogen utan
+att packa upp något) läses nu i bakgrunden i stället för att hålla första bilden (tid till första sidan är oförändrad
+inom bruset). Mätningar utan ändring: typsnittsskanning (`fontdb`/`fc-match`) sker först när ett dokument kräver ett
+typsnitt som inte är inbyggt; `install_fonts` tar under 0,1 ms.
+
+### 13. PDF-export på flera trådar
+
+| Fall (opt-level 2) | Före | Efter |
+|---|---|---|
+| 321 sidor (`pdf_bench`, 40 upprepningar), median / minst | 0,60 / 0,56 s | 0,51 / 0,46 s |
+| 641 sidor (80 upprepningar) | 1,12 s | 0,93 s |
+| 81 sidor (10 upprepningar) | 0,16 s | 0,13 s |
+
+PDF:erna är byte för byte lika före och efter (`cmp` på 81, 321 och 641 sidor, och testet
+`threaded_shaping_gives_the_same_bytes` jämför flertrådad och enkeltrådad formning).
+
+Profilen (`callgrind`, huvudtråden + arbetstrådar): formningen (rustybuzz) var 40 % av instruktionerna och låg redan
+på trådar men i grupper som huvudtråden väntade på; krillas ritning (`draw_glyphs`) 17 %, komprimeringen av varje
+sidas innehållsström i `Page::drop` 17 %, utläggningen 16 %. Nu formas grupperna om 32 sidor av upp till sju
+arbetstrådar (var och en med egna typsnittsytor och formningsplaner som återanvänds för alla grupper) medan
+huvudtråden ritar de redan formade sidorna i ordning (`ShapeQueue`; arbetstrådarna ligger högst `2·trådar + 2` grupper
+före). Formningens väntetid på huvudtråden gick från hela formningstiden till 75–130 ms av 0,5 s.
+
+Det som återstår är enkeltrådat och kan inte delas utan att ändra krilla: `Document` och `Surface` är `&mut`,
+glyfregistreringen och sidornas objektnummer beror på ordningen (byte för byte-kravet), och `Page::finish`
+komprimerar på huvudtråden. krillas `rayon`-funktion lades inte till (rayon finns inte i beroendeträdet). Utläggningen
+(16 %) är sekventiell av samma skäl: varje avsnitt börjar där förra slutade. Små dokument (under 32 sidor eller 400
+texter) formas som förut på huvudtråden.
+
 ## Stavning och grammatik
 
 Körs bara i dokumentläget, som redan bara kontrollerar ändrade stycken (`misspelled_cached`); grammatiken
 skickar bara ändrade stycken. Oförändrat.
+
+## Sökträffar som lager, ångra-minne och ingen omritning i vila
+
+Tre saker som hör ihop: sökningen får inte lägga om dokumentet, ångra-historiken får inte vara en kopia av texten
+per steg, och appen ska inte rita om när ingenting händer. Mätt på samma maskin (delad, 4 kärnor, ±30 %),
+opt-level 2 för kladd och egui, medianer. Dokumenten är `gen-skolrapport.docx` upprepad 100 och 500 gånger
+(404 och 2021 sidor, `scratchpad/wave-view/gen-stor-docx.py`).
+
+### 4. Sökträffar som lager
+
+Mått: ett tecken in eller ut med sökningen öppen (analys, `search::search_doc`, `search::highlights`, galleri, och efter
+ändringen också lagret för fönstret), och "nästa träff" (bara aktuell träff byts). `bench_docx_search`
+(`KLADD_BENCH_DOCX=sökväg [KLADD_BENCH_FIND=ord] cargo test -- --ignored bench_docx_search --nocapture`), sökning på "och".
+
+| Mått (ms) | 404 sidor (3 000 träffar) före / efter | 2021 sidor (15 000 träffar) före / efter |
+|---|---|---|
+| Tangent utan sökning | 0,9 / 0,9 | 3,2 / 3,5 |
+| Tangent med sökningen öppen | 41,5 / 8,6 | 511 / 51,6 |
+| varav analys + `search_doc` | 7,0 / 7,2 | 43 / 43 |
+| Nästa träff (bara aktuell träff byts) | 34,6 / 0,08 | 497 / 0,47 |
+
+`Params::matches` var en del av utläggningen (`layout.rs`): nyckeln för bildrutan, för varje stycke och för minnet i
+`layout_memo::reuse` innehöll träffarna, så med sökningen öppen lades allt om för varje tangent och för varje byte av
+aktuell träff. Träffarna är nu borta ur `Params` och ritas av `word/matchlayer.rs` som ett lager mellan
+cellskuggningen och texten: rektanglarna byggs ur galleriets glyfer för raderna i fönstret (±300 px) på samma sätt som epaints
+`add_row_backgrounds` (en rektangel per följd glyfer med samma över- och underkant, en pixel vidgad, avrundad till hela
+pixlar), så att utseendet är detsamma. Skärmbilder före och efter (404-sidors rapport, ljust och mörkt, sökning på "och" med
+aktuell träff, i brödtext, listor, tabeller, fotnoter och textrutor, och med markering över träffarna) är pixel för pixel lika
+utom markörens blink (högst 46 bildpunkter).
+
+Kvar: det som återstår av tangenten är sökningen själv (`search_doc` går igenom hela texten för varje ändring, 7 ms vid 404 och 43 ms
+vid 2021 sidor) och `fast_hash` av hela texten för sökcachen i `search_results`. En inkrementell sökning är nästa steg.
+
+Ändrat utseende: text som har en egen bakgrund (markerad text, inline-kod, kommentarsområden) har förut fått träffens färg i stället för sin
+egen. Ett lager bakom texten kan inte ersätta den, så där ritas träffen ovanpå (med sin genomskinliga färg): träffen syns, men över den egna
+färgen. Alla andra träffar är oförändrade.
+
+Textläget (`highlight.rs`) fick inget lager: `bench_text_search` (300 kB Markdown, 818 träffar) ger 12,4 ms för en tangent med träffar
+mot 10,2 ms utan, och 8,9 ms för nästa träff (en tangent utan träffar tar lika lång tid, egui lägger ut stycke för stycke och
+återanvänder oförändrade). Vinsten vore högst 2 ms, så ingen ändring. Läsläget (Markdown och EPUB) målar träffarna med
+`egui_commonmark`s egna sökfärger och har ingen utläggning med träffar i.
+
+### 14. Minne i stora dokument
+
+Mått: `VmRSS`/`VmHWM` ur `/proc/<pid>/status` för det riktiga programmet i Xvfb (`.docx` öppnat, markören i slutet, 20 skurar om 5
+tecken med 1,3 s mellan (egui sparar en ångra-punkt först när texten stått stilla en sekund, så 100 tangenter i ett svep ger bara
+en eller två punkter), därefter 20 gånger Ctrl+Z).
+
+| RSS (MB) | 404 sidor före / efter | 2021 sidor före / efter |
+|---|---|---|
+| Efter öppning | 266,8 / 269,5 | 549,2 / 548,6 |
+| Efter 100 tangenttryck | 294,2 / 278,4 | 648,5 / 592,1 |
+| Efter 20 ångra | 294,2 / 278,8 | 648,5 / 592,1 |
+| Tillväxt av 100 tangenttryck | 27,4 / 8,9 | 99,3 / 43,5 |
+
+Kopior av texten: själva `String` (1), `DocState::text` i `word::layout::Cache` (1), galleriets `LayoutJob::text` (1–2 medan nästa lagts
+ut), `memo_text` (1, bara mellan en ändring och nästa omläggning), egui:s ångra-historik (**en hel kopia per ångra-punkt, upp till 100,
+plus en för texten som håller på att ändras och en per gör om-steg**), och `Document::docx_source` (originalpaketet, delas som `Arc`).
+Autosparning, återställning och historiken sparar bara hashar eller skriver direkt till disk; sökningen sparar träffar, inte text.
+Ångra-historiken var alltså det enda som växte med antalet steg (3,3 MB per punkt vid 2021 sidor, 330 MB vid 100 punkter) och
+`TextEditState::undoer()` klonade dessutom hela historiken vid varje Ctrl+Z i menyn.
+
+`src/undo.rs` ersätter den: fälten i dokumentläget och textläget tar Ctrl+Z, Ctrl+Y och Ctrl+Skift+Z ur indata innan `TextEdit`
+ser dem och använder en egen historik med egui:s regler (100 punkter, en punkt efter en sekunds stillhet eller var 30:e sekund i
+ständig ändring, samma ångra/gör om-logik) men som sparar ändringar: bara den senaste punkten är en hel text, varje äldre är ändringen
+(gemensamt början och slut, det som skilde i mitten) som tar tillbaka den. Texten som håller på att ändras jämförs med längd och hash
+i stället för en kopia. egui:s egen historik töms efter varje bildruta. `tests::som_egui` kör slumpade anrop (läge, tid, ångra, gör om,
+tillägg) mot egui:s `Undoer` och jämför varje resultat (`KLADD_FUZZ_SEEDS`); ångra, gör om och Ctrl+Skift+Z ger pixel för pixel samma
+skärmbilder som förut i både dokumentläget och textläget.
+
+Kvar: efter 100 tangenttryck har RSS fortfarande växt 9 respektive 44 MB, och toppen (`VmHWM` 873 MB vid 2021 sidor) är densamma. Det
+är inte ångra-historiken (hela historiken är nu cirka en kopia av texten). Troligen är det utläggningen (galleriet byggs om medan det
+förra finns kvar, utlagda stycken i `Cache::units`), men det är inte undersökt: det ligger i `word::layout::Cache`, som hör till
+den som arbetar med utläggningen.
+
+### 15. Ingen omritning i vila
+
+Mått: bildrutor per sekund (`KLADD_TIMING=1` skriver `bildrutor: N på T s` och vad som begärde dem, fil:rad, var femte sekund) och CPU-tid
+(`utime + stime` ur `/proc/<pid>/stat`) under 30 s i vila, fönstret med och utan fokus (ett annat fönster har fokus), för den tomma
+fliken, en textfil, ett Word-dokument i dokumentläget (`gen-skolrapport.docx`, 4 sidor), Markdown i läsläget, EPUB, PDF och CSV. Skripten ligger inte i
+repot; mätningen är `idle.sh` (starta, vänta, läs `/proc`).
+
+| Vy | Före: bildrutor/s, CPU ms/s (fokus / inget fokus) | Efter: bildrutor/s, CPU ms/s (fokus / inget fokus) |
+|---|---|---|
+| Tom flik | 98 / 134 fps, 761 / 1190 | 1,9 / 0,05 fps, 19 / 0 |
+| Textfil | 163 / 174 fps, 1432 / 1449 | 2,1 / 0,05 fps, 22 / 0 |
+| Dokumentläge | 101 / 80 fps, 1819 / 1255 | 2,1 / 0,05 fps, 44 / 0 |
+| Läsläge | 129 / 96 fps, 1421 / 982 | 0,15 / 0,05 fps, 0 / 0 |
+| EPUB | 142 / 91 fps, 1369 / 946 | 0,15 / 0,05 fps, 0 / 0 |
+| PDF | 32 / 42 fps, 978 / 1144 | 1,06 / 0,05 fps, 39 / 1 |
+| CSV | 170 / 109 fps, 1577 / 1194 | 0,15 / 0,05 fps, 0 / 0 |
+
+(Före ritades appen om 80–170 gånger i sekunden med en kärna på 100 % i alla vyer; maskinen var delad, så
+CPU-talen före är osäkra uppåt.) Orsaken var en rad: `Lsp::poll_ops` (`lsp/mod.rs`) anropade `ctx.request_repaint()` varje
+bildruta, också utan väntande anrop, och kördes från `logic()` i varje vy. Nu begärs en bildruta bara när ett svar kommit. Det som
+är kvar i vila är det som behövs: markörens blink (2 bildrutor/s, bara med fokus; egui:s eget), återställningsfilen var 30:e sekund
+och i PDF-fliken filkontrollen en gång i sekunden (39 ms CPU per bildruta, bara med fokus).
+
+Fler källor som gjordes villkorade (hittade genom att gå igenom varje `request_repaint`):
+
+- Välkomstsidans blinkande markör ritade om 2 gånger/s också utan fokus; den står nu still utan fokus.
+- PDF-flikens filkontroll (`pdf_frame`), arbetsmappens uppdatering (`workspace_refresh`, var 3:e sekund) och git-statusen (`git_ui`,
+  var 15:e sekund) begärde en bildruta utan fokus fast de inte gör något då; de väntar nu tills fokus kommer tillbaka (då är
+  kontrollen förfallen och görs direkt).
+- Stavningskontrollen (`word/view.rs`) begärde en bildruta var 120:e ms för alltid när språket saknar ordlista (`ready()` blir
+  aldrig sann); nu bara medan ordlistan läses in (`Speller::loading`).
+- En bild som inte gick att läsa in (saknad eller trasig bild i sidhuvud, ett Mermaid-diagram som inte kan ritas) gjorde att
+  `request_repaint()` begärdes varje bildruta (sidhuvudet) respektive var 50:e ms (kodblock) för alltid; nu bara medan bilden
+  verkligen läses in (`images::image_pending`).
+- Ingen av de övriga (`request_repaint` efter dialoger, kanaler och drag) körs utan en händelse.
+
+Utanför mätningen: uppdateringskontrollen, språkservern (en bildruta per 100 ms bara medan anrop väntar) och inläsningar (100 ms bara
+medan de pågår) är redan villkorade.
+
+## Prestandaprov i CI och snabbare release-bygge (2.10)
+
+### Prestandaprov i CI (instruktionsräkning)
+
+Mål: en ändring som gör Kladd märkbart långsammare ska synas i pull requesten, utan falsklarm från brusiga delade CI-maskiner.
+Tid duger inte (±30 % mellan körningar på samma maskin, se ovan), så proven räknar **instruktioner** med
+`valgrind --tool=callgrind`. Arbetsflödet `.github/workflows/perf.yml` bygger och mäter PR:ens kod och basgrenens i samma
+jobb och jämför (`perf/compare.py`): fel om något prov ökar mer än 10 %, varning över 3 %, tabell i jobbets sammanfattning.
+Allt om proven, hur man kör dem lokalt och hur man lägger till ett prov står i `perf/README.md`.
+
+Basen byggs i samma jobb i stället för att jämföras mot en incheckad baslinje (`perf/baseline.json`): instruktionsantalet
+beror på kompilatorversion, libc och valgrind, och `dtolnay/rust-toolchain@stable` flyttar sig, så en baslinje skulle ge
+falsklarm vid varje verktygsuppdatering och kräva underhåll vid varje avsiktlig ändring. Kostnaden är ett bygge till
+(beroendena delas, så bara Kladd själv byggs om). På `main` mäts bara versionen själv, vilket värmer cachen som PR-jobben bygger på.
+Samma prov läggs över basen (`perf/overlay.sh`) så att båda mäts med exakt samma prov; går basen inte att bygga med dem
+(som `main` före den här ändringen) visas bara PR:ens siffror och en varning, jobbet stoppas inte.
+
+Proven (`src/perfci.rs`, `#[ignore]`, indata genereras av Kladds egna skrivare med fasta frön, inget nätverk):
+
+| Prov | Instruktioner (opt-level 2) | Vad |
+|---|--:|---|
+| `perfci_docx_read_mt` | 270 M | läsa ett .docx på ~100 sidor (trådar: hela processen) |
+| `perfci_odt_read_mt` | 164 M | läsa ett .odt |
+| `perfci_docx_open` | 1 613 M | analys och kall utläggning med sidindelning |
+| `perfci_docx_keys` | 30 M | ett tecken på fem ställen (inkrementellt) |
+| `perfci_docx_search` | 285 M | åtta tangenttryck med sökningen öppen ("och") |
+| `perfci_md_read` | 221 M | läsläget, 400 kB Markdown: stilla, rullning, mitt i filen |
+| `perfci_pdf_export_mt` | 579 M | PDF-export av ett medelstort dokument (trådar) |
+
+Provet slår på räkningen bara kring själva mätningen (callgrind-förfrågan, `CALLGRIND_TOGGLE_COLLECT`), så att uppvärmning och
+kall utläggning före tangenttrycken inte späder ut dem. `--toggle-collect='*funktion*'` provades först men missade
+funktioner med stor stackram (noll instruktioner räknades i vissa byggen), därför förfrågan. Callgrinds räkning gäller bara den
+tråd som slår på den: prov som använder arbetstrådar (läsning av docx/odt, PDF-export) räknas för hela processen (`_mt`).
+
+Mätt spridning: två körningar av samma kod (och samma kod i två olika trädkopior) skiljer sig 0,00–0,15 % för alla prov, också de
+med trådar; gränsen 10 % har alltså mycket god marginal och 3 % gör varningen användbar. Hela
+mätningen tar 20–25 s per version (4 samtidiga valgrind-körningar); byggena är det som tar tid. En avsiktlig försämring
+(extra uppackning i `docx::read`) gav +4,25 % på `perfci_docx_read_mt` och 0,0 % på de andra proven. Basen jämförd mot sig själv (PR-trädet
+mot en annan kopia av samma commit) gav -0,14 … 0,00 %.
+
+### Allokerare och PGO: vad som mättes
+
+Mätt med `cargo test --release` (profilen `[profile.release]`: opt-level 3, thin LTO, codegen-units 1) i en egen målkatalog,
+Linux x86_64, delad 4-kärnig maskin. Proven är de ignorerade bänkarna mot ett .docx på 100 × skolrapporten (~400 sidor, 3 MB):
+`bench_docx_open`, `bench_docx_keys` (200 tangenter), `bench_docx_search`, `bench_docx_read`, `pdf_bench` (40 upprepningar),
+`bench_document_mode`, `markdown_large_frame_time` (400 kB) och `epub_large_chapter_frame_time`. Varje siffra är medianen av 7
+körningar där versionerna körts omväxlande; tid är hela processens klocktid (inkl. start och att bygga indata), minne
+högsta resident-minne. Systemversionens tid driver 5–8 % mellan olika omgångar, så skillnader under ~5 % är brus.
+
+**mimalloc** (`#[global_allocator]`, MIT, C-beroende via `cc`) mot systemets allokerare (glibc):
+
+| Bänk | system: tid / minne | mimalloc: tid / minne | tid | minne |
+|---|---|---|--:|--:|
+| `bench_docx_open` | 0,77 s / 200 MB | 0,57 s / 298 MB | -26 % | +49 % |
+| `bench_docx_keys` | 0,38 s / 102 MB | 0,32 s / 160 MB | -16 % | +57 % |
+| `bench_docx_search` | 1,34 s / 104 MB | 1,11 s / 164 MB | -17 % | +58 % |
+| `pdf_bench` | 0,39 s / 61 MB | 0,35 s / 86 MB | -10 % | +41 % |
+| `bench_docx_read` | 0,50 s / 47 MB | 0,38 s / 88 MB | -24 % | +87 % |
+| `bench_document_mode` | 0,56 s / 178 MB | 0,46 s / 222 MB | -18 % | +25 % |
+| `markdown_large_frame_time` | 0,08 s / 37 MB | 0,07 s / 67 MB | (brus) | +81 % |
+| `epub_large_chapter_frame_time` | 0,05 s / 33 MB | 0,04 s / 54 MB | (brus) | +64 % |
+
+Vinsten är tydlig (10–26 % på alla bänkar som tar mer än en kvarts sekund), men resident-minnet växer med 25–90 MB (25–90 %) och
+mimalloc behåller frigjort minne i stället för att lämna tillbaka det. Inställningarna som får tillbaka minnet
+(`MIMALLOC_PURGE_DELAY=0`, `MIMALLOC_PURGE_DECOMMITS=1`, `MIMALLOC_ARENA_EAGER_COMMIT=0`) tar också bort vinsten
+(`bench_docx_open` 0,74 s och 204 MB mot 0,72 s och 200 MB för systemet). **Avstår**: kravet var tydlig vinst *och* att minnet inte växer märkbart, och
+det sista uppfylls inte (Kladd är ett program som ofta står öppet med stora dokument). Om minnet börjar spela mindre roll är
+`#[global_allocator]` med `mimalloc` en rad plus ett beroende, och siffrorna ovan är utgångspunkten.
+
+**PGO** (`-Cprofile-generate`, träning med `perfci_*`-proven, `llvm-profdata merge`, `-Cprofile-use`; träningen kördes på
+de små CI-dokumenten, mätningen på de stora):
+
+| Bänk | utan PGO | med PGO | tid |
+|---|--:|--:|--:|
+| `bench_docx_open` | 0,72 s | 0,68 s | -6 % |
+| `bench_docx_keys` | 0,41 s | 0,40 s | -2 % (brus) |
+| `bench_docx_search` | 1,34 s | 1,36 s | +1 % (brus) |
+| `pdf_bench` | 0,35 s | 0,32 s | -9 % |
+| `bench_docx_read` | 0,53 s | 0,45 s | -15 % |
+| `bench_document_mode` | 0,61 s | 0,61 s | 0 % |
+
+Minnet oförändrat eller 2–4 MB lägre. Vinsten är tydlig bara för inläsning och PDF-export (de vägar som mest är rak kod i
+tolkarna); tangenttryck, sökning och utläggning, där tiden går åt i egui/epaint och i dokumentlayouten, ändras inte. Byggkostnaden är
+stor: PGO kräver ett instrumenterat bygge, en träningskörning och ett bygge till per mål (provbygget tog 11 minuter i stället
+för 7), i alla fyra release-jobben, plus `llvm-tools-preview` och en reserv för varje mål; profilen från testbinären måste
+dessutom stämma med programbinären (inte provat). **Avstår**: vinsten är under tröskeln på de vägar användaren känner av mest och
+priset i CI-tid och underhåll är högt.
+
+**`[profile.release]`**: `lto = "fat"` mot `thin` gav 0–7 % (`bench_docx_keys` 0,47 → 0,39 s, övriga inom ±4 %; systemversionen
+drev 0,72 → 0,75 s mellan omgångarna), alltså inom bruset, och ett längre bygge: ingen ändring. `panic = "abort"` går inte:
+`catch_unwind` används i `src/pdfview/forms.rs` (formulärvärden i trasiga PDF-filer ska ge ett felmeddelande, inte krascha).
+
+Det som skulle löna sig härnäst är inte byggflaggor utan att minska allokeringarna i läsning och utläggning (mimalloc visar att
+10–25 % av tiden går åt i allokeraren).

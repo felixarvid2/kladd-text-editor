@@ -43,7 +43,6 @@ impl Rig {
                 palette: &pal,
                 zoom: 1.0,
                 reveal: 0..0,
-                matches: &[],
                 image_size: &img,
                 measure: &measure,
                 font_family: &fam,
@@ -106,6 +105,47 @@ fn stegvis_utlaggning_ger_samma_galleri_som_allt_pa_en_gang() {
     assert!(*g == *all, "galleriet efter stegvis utläggning skiljer sig från det som lades ut direkt");
     // Sidorna och fotnoterna också.
     assert_eq!(rig.cache.page_boxes(1, &text).len(), Rig::new().cache_boxes(&text));
+}
+
+/// Utan avsnitt (ett avsnitt med sidor): varje bildruta under den stegvisa utläggningen återupptar förra varvet, lägger
+/// bara ut de nya grupperna och tar platshållarna för resten förskjutna från förra varvet (`resume`), och resultatet blir
+/// ändå detsamma som när allt läggs ut direkt.
+#[test]
+fn stegvis_utlaggning_aterupptar_forra_varvet() {
+    let text: String = document(320).lines().filter(|l| !l.contains("avsnitt")).map(|l| format!("{l}\n")).collect();
+    let all = Rig::new().frame(&text, None);
+    let mut rig = Rig::new();
+    let (mut resumed, mut shifted, mut frames, mut made, mut stubs) = (0, 0, 0, 0, 0);
+    let g = loop {
+        let g = rig.frame(&text, Some(Duration::ZERO));
+        frames += 1;
+        let st = rig.cache.stats(1);
+        resumed += usize::from(st.resumed);
+        shifted += st.shifted;
+        if frames > 1 {
+            made += st.stubs_made;
+            stubs += st.stubs;
+        }
+        if !rig.cache.partial(1) {
+            break g;
+        }
+        assert!(frames < 2000);
+    };
+    assert!(frames > 3, "budgeten ska ha delat upp utläggningen ({frames} bildrutor)");
+    // Medan fotnotsdefinitionerna läggs ut ändras antalet noter, då görs sammanfogningen och sidindelningen hela.
+    assert!(resumed * 4 >= frames * 3, "bara {resumed} av {frames} bildrutor återupptog förra varvet");
+    // Efter första bildrutan görs platshållarna bara om när kalibreringen frysts på nytt (några få gånger).
+    assert!(made * 4 < stubs, "{made} nya platshållare av {stubs}");
+    let _ = shifted;
+    assert!(*g == *all, "galleriet efter stegvis utläggning skiljer sig från det som lades ut direkt");
+    let boxes = rig.cache.page_boxes(1, &text);
+    let mut fresh = Rig::new();
+    fresh.frame(&text, None);
+    let want = fresh.cache.page_boxes(1, &text);
+    assert_eq!(boxes.len(), want.len());
+    for (a, b) in boxes.iter().zip(want.iter()) {
+        assert_eq!((a.top, &a.notes, a.reserved), (b.top, &b.notes, b.reserved));
+    }
 }
 
 impl Rig {
@@ -256,4 +296,21 @@ fn same_layout(a: &Galley, b: &Galley) -> bool {
                 && x.row.glyphs.len() == y.row.glyphs.len()
                 && x.row.glyphs.iter().zip(&y.row.glyphs).all(|(g, h)| g.pos == h.pos && g.chr == h.chr && g.advance_width == h.advance_width)
         })
+}
+
+/// Första bildrutan efter öppning: när bilderna blir kända behålls analysen (den tolkas inte om); efter en
+/// utläggning kasseras allt som förr.
+#[test]
+fn image_sizes_keep_the_analysis_until_something_is_laid_out() {
+    let text = document(30);
+    let mut rig = Rig::new();
+    let before = rig.cache.analysis(1, &text);
+    rig.cache.images_sized(1);
+    assert!(Arc::ptr_eq(&before, &rig.cache.analysis(1, &text)), "analysen tolkades om före första utläggningen");
+    rig.frame(&text, None);
+    let laid = rig.cache.analysis(1, &text);
+    rig.cache.images_sized(1);
+    assert!(!Arc::ptr_eq(&laid, &rig.cache.analysis(1, &text)), "utläggningen kasserades inte");
+    // Okänt dokument: inget att göra.
+    rig.cache.images_sized(99);
 }

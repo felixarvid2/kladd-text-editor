@@ -152,10 +152,15 @@ pub struct Heading {
 
 /// Rubrikerna i ett dokument, från den färdiga analysen (dokumentläget).
 pub fn headings(text: &str, a: &Analysis) -> Vec<Heading> {
+    headings_in(text, &a.pieces)
+}
+
+/// Som `headings`, för en följd av bitar (som börjar vid ett styckes början, se `layout::Cache`).
+pub fn headings_in(text: &str, pieces: &[super::markup::Piece]) -> Vec<Heading> {
     let mut out: Vec<Heading> = Vec::new();
     // Pågående rubrik: den slutar vid en radbrytning eller när biten inte är en rubrik.
     let mut open = false;
-    for pc in &a.pieces {
+    for pc in pieces {
         let Block::Heading(level) = pc.block else {
             open = false;
             continue;
@@ -403,7 +408,14 @@ pub fn caption_kind(plain: &str) -> Option<TocKind> {
 
 /// Antalet poster i alla förteckningar i dokumentet (för att veta när layouten måste göras om).
 pub fn toc_total(text: &str, h: &[Heading]) -> usize {
-    toc_specs(text).iter().map(|(_, s)| toc_items(text, h, s).len()).sum()
+    // Räknas utan att kopiera rubrikerna (ett dokument kan ha många förteckningar och tusentals rubriker).
+    toc_specs(text)
+        .iter()
+        .map(|(_, s)| match s.kind {
+            TocKind::Headings => h.iter().filter(|x| (s.min..=s.max).contains(&x.level)).count(),
+            _ => toc_items(text, h, s).len(),
+        })
+        .sum()
 }
 
 /// Stycken som är bildtexter av slaget `kind` (se `caption_kind`). Kodblock hoppas över.

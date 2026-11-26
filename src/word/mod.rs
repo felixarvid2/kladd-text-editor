@@ -9,6 +9,7 @@ pub mod incr;
 pub mod images;
 pub mod layout;
 pub mod markup;
+pub mod matchlayer;
 pub mod nav;
 pub mod notefmt;
 pub mod notesui;
@@ -31,6 +32,8 @@ pub mod sections;
 pub mod view;
 #[cfg(test)]
 pub mod bench;
+#[cfg(test)]
+mod bench_search;
 #[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]

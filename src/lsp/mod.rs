@@ -761,14 +761,20 @@ impl Lsp {
 
     fn poll_ops(&mut self, ctx: &egui::Context, docs: &[Document]) {
         let ops = std::mem::take(&mut self.ops);
+        // Bara när något svar kom behövs en ny bild (annars ritades appen om varje bildruta, också i vila).
+        let mut answered = false;
         for mut op in ops {
             let res = match op.req.poll() {
                 Poll::Pending => {
                     self.ops.push(op);
                     continue;
                 }
-                Poll::Ready(r) => r,
+                Poll::Ready(r) => {
+                    answered = true;
+                    r
+                }
                 Poll::Timeout => {
+                    answered = true;
                     if !op.kind.silent() {
                         self.note(crate::i18n::t("Språkservern svarade inte i tid.").to_owned(), true);
                     }
@@ -790,7 +796,9 @@ impl Lsp {
                 }
             }
         }
-        ctx.request_repaint();
+        if answered {
+            ctx.request_repaint();
+        }
     }
 
     fn finish(&mut self, d: &Document, op: Op, v: Value) {

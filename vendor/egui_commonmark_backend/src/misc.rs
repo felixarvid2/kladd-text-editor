@@ -1384,6 +1384,42 @@ impl CommonMarkCache {
         self.viewers.get(id).map(|vc| vc.line_points.as_slice()).unwrap_or_default()
     }
 
+    /// Kladd: punkterna för blocket som senast ritades med `show_slice` (y från blockets överkant).
+    pub fn slice_points(&self, id: &Id) -> &[(usize, f32)] {
+        self.viewers.get(id).map(|vc| vc.slice_points.as_slice()).unwrap_or_default()
+    }
+
+    /// Kladd: ersätter blockpositionerna (se [`line_points`](Self::line_points)) med de som läsläget håller reda på
+    /// när det bara ritar de block som syns.
+    pub fn set_line_points(&mut self, id: &Id, points: Vec<(usize, f32)>) {
+        viewer_cache(self, id).line_points = points;
+    }
+
+    /// Kladd: rubrik-id:t som visningen ska rulla till (satt av en länk eller av `scroll_to_heading`).
+    pub fn heading_target(&self, id: &Id) -> Option<String> {
+        self.viewers.get(id)?.scroll_to_id_target().map(ToOwned::to_owned)
+    }
+
+    /// Kladd: blockens lägen (källområde, överkant, underkant) och synlig del, så att en ny sökning
+    /// börjar vid det som syns även när bara en del av dokumentet är ritad.
+    pub fn set_block_layout(&mut self, id: &Id, blocks: impl Iterator<Item = (Range<usize>, f32, f32)>, top_y: f32, height: f32) {
+        let vc = viewer_cache(self, id);
+        vc.split_points.clear();
+        vc.split_points.extend(blocks.enumerate().map(|(i, (r, a, b))| crate::pulldown::SplitPoint {
+            event_index: i,
+            vstart: egui::pos2(0.0, a),
+            vend: egui::pos2(0.0, b),
+            src_span: r,
+        }));
+        #[cfg(feature = "regex")]
+        {
+            vc.search_cache.last_viewport_top_y = top_y;
+            vc.search_cache.last_viewport_height = height;
+        }
+        #[cfg(not(feature = "regex"))]
+        let _ = (top_y, height);
+    }
+
     #[cfg(feature = "regex")]
     pub fn search_cache_mut(&mut self, id: &Id) -> &mut crate::pulldown::SearchCache {
         &mut viewer_cache(self, id).search_cache

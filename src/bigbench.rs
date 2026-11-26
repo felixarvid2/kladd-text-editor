@@ -315,7 +315,6 @@ fn bigbench_document_pages() {
                 palette: &pal,
                 zoom: 1.0,
                 reveal: reveal.clone(),
-                matches: &[],
                 image_size: &img,
                 measure: &m,
                 font_family: &fam,

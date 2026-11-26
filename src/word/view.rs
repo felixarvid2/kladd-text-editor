@@ -110,6 +110,8 @@ enum SpellAct {
 pub struct State {
     pub(crate) images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
+    /// Ordantalet i statusraden för (flik, textlängd, texthash): räknas om bara när texten ändrats.
+    words: Option<((u64, usize, u64), usize)>,
     /// Vald bild, pågående storleksändring.
     pub(crate) img: images::State,
     /// Vald textruta, pågående flytt eller storleksändring.
@@ -157,8 +159,6 @@ impl State {
         self.img.deselect();
     }
 }
-
-type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
 
 enum BarAct {
     Inline(Inline),
@@ -305,9 +305,7 @@ impl KladdApp {
         let edit = f(&doc.text, sel);
         if edit.text != doc.text {
             // Spara läget före ändringen som ett eget ångra-steg.
-            let mut undoer = state.undoer();
-            undoer.add_undo(&(before, doc.text.clone()));
-            state.set_undoer(undoer);
+            crate::undo::add_undo(ctx, id, &before, &doc.text);
             doc.text = edit.text;
             doc.on_edited();
         }
@@ -346,15 +344,7 @@ impl KladdApp {
         let id = editor_id(doc.id);
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
         let cur_range = state.cursor.char_range().unwrap_or(CCursorRange::one(CCursor::new(0)));
-        let mut undoer = state.undoer();
-        let cur = (cur_range, doc.text.clone());
-        let step = |u: &mut Undoer, c: &_| if redo { u.redo(c) } else { u.undo(c) }.cloned();
-        let mut res = step(&mut undoer, &cur);
-        // Samma text men annan markör räknas som ett eget steg; hoppa över det.
-        if res.as_ref().is_some_and(|(_, t)| *t == cur.1) {
-            res = step(&mut undoer, &cur);
-        }
-        state.set_undoer(undoer);
+        let res = crate::undo::step(ctx, id, redo, &cur_range, &doc.text);
         if let Some((range, text)) = res {
             doc.text = text;
             doc.on_edited();
@@ -967,7 +957,7 @@ impl KladdApp {
         self.wv.images.insert(key, info);
         if known {
             // Layoutcachen nycklar inte på bildstorlekar.
-            self.word.forget(self.docs[self.active].id);
+            self.word.images_sized(self.docs[self.active].id);
         }
     }
 
@@ -1006,6 +996,8 @@ impl KladdApp {
 
     /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
+        // `KLADD_TIMING=1`: hela dokumentlägets bildruta (texten ändrad) skrivs ut, inte bara omläggningen.
+        let t_frame = std::time::Instant::now();
         self.word_initial_caret(ui.ctx());
         let paper = if self.settings.white_paper { p.paper() } else { *p };
         let p = &paper;
@@ -1146,7 +1138,8 @@ impl KladdApp {
                                 Some(SpellCache { doc_id, rev, generation: gen_, ranges: Arc::new(found), per_range });
                         }
                         misspelled = self.wv.spell.as_ref().map(|c| c.ranges.clone()).unwrap_or_default();
-                    } else {
+                    } else if sp.loading() {
+                        // Ordlistan läses in: rita om när den är klar (utan ordlista för språket väntar vi inte).
                         ctx.request_repaint_after(std::time::Duration::from_millis(120));
                     }
                 }
@@ -1305,6 +1298,8 @@ impl KladdApp {
                 let mut behind_shapes: Vec<Shape> = Vec::new();
                 // Cellskuggning ligger ovanpå arket men bakom texten.
                 let cell_fill_slot = ui.painter().add(Shape::Noop);
+                // Sökträffarna ligger över cellskuggningen och under texten (se `matchlayer`).
+                let match_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
                     pos2(page_left + geom.origin_x(), page_top + geom.top),
@@ -1314,7 +1309,6 @@ impl KladdApp {
                     palette: p,
                     zoom: z,
                     reveal: reveal.clone(),
-                    matches: &matches,
                     image_size: &image_size,
                     measure: &measure,
                     font_family: &font_family,
@@ -1324,6 +1318,17 @@ impl KladdApp {
                     word.galley_paged_lazy(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width, Some(&geom), lazy_budget)
                 };
                 let min_h = geom.text_h();
+                // Ångra och gör om med ändringshistoriken (egui:s egen sparar en hel kopia av texten per steg).
+                let range_before = TextEditState::load(&ctx, id).and_then(|s| s.cursor.char_range()).unwrap_or_default();
+                let mut undone: Option<egui::text::CCursorRange> = None;
+                if let Some((r, t)) = crate::undo::before_show(&ctx, id, ui.memory(|m| m.has_focus(id)), &range_before, &doc.text) {
+                    doc.text = t;
+                    if let Some(mut s) = TextEditState::load(&ctx, id) {
+                        s.cursor.set_char_range(Some(r));
+                        s.store(&ctx, id);
+                    }
+                    undone = Some(r);
+                }
                 let out = ui
                     .scope_builder(UiBuilder::new().max_rect(text_rect), |ui| {
                         TextEdit::multiline(&mut doc.text)
@@ -1339,7 +1344,13 @@ impl KladdApp {
                     })
                     .inner;
 
-                if out.response.changed() {
+                crate::undo::after_show(&ctx, id, &out.cursor_range.unwrap_or(range_before), &doc.text);
+                // Som egui:s eget ångra: markören som ångra eller gör om lämnade ska synas.
+                if let Some(r) = undone {
+                    let c = out.galley.pos_from_cursor(r.primary).translate(out.galley_pos.to_vec2()).expand(1.5);
+                    ui.scroll_to_rect(c, None);
+                }
+                if out.response.changed() || undone.is_some() {
                     doc.on_edited();
                     edited = true;
                     // Spåra ändringar: skrivet blir infogat och raderat blir struket.
@@ -1360,11 +1371,15 @@ impl KladdApp {
                     let clip = ui.clip_rect();
                     lazy_next = (clip.bottom() >= front, clip.top() >= front);
                 }
-                let text = doc.text.as_str();
-                let analysis = word.analysis(doc_id, text);
+                // Texten jämförs med layoutcachens kopia en gång; anropen nedan slipper jämförelsen (`layout::Seen`).
+                let seen = word.seen(doc_id, doc.text.as_str());
+                let text = seen.text();
+                // Rubrikerna hämtades före TextEdit: har texten ändrats sedan dess gäller de inte längre.
+                let heads = if edited { word.headings(doc_id, &seen) } else { heads };
+                let analysis = word.analysis(doc_id, &seen);
                 // Arken (med avsnitt olika stora, med spalter) från omläggningen som TextEdit just gjorde.
                 let origin_y = page_top + geom.top;
-                let mut boxes = word.page_boxes(doc_id, text);
+                let mut boxes = word.page_boxes(doc_id, &seen);
                 if boxes.is_empty() {
                     boxes = Arc::new(geom.uniform_boxes(pages::page_count(&galley, &geom)));
                 }
@@ -1374,7 +1389,7 @@ impl KladdApp {
                     if geom.multi() { secpages::column_at(&boxes, geom.origin_x(), x, y) } else { (0.0, text_w) }
                 };
                 // Tabeller: kolumnkanter att dra i, pekarens träffyta och markören i cellens innehåll.
-                let tview = if edited { None } else { word.table_view(doc_id, text) };
+                let tview = if edited { None } else { word.table_view(doc_id, &seen) };
                 let mut vtabs: Vec<VisTable> = Vec::new();
                 let mut drag_preview: Option<(f32, f32, f32)> = None;
                 let mut on_edge = false;
@@ -1442,7 +1457,7 @@ impl KladdApp {
                 // Fotnoter: skiljelinje över definitionerna som står sist (de som inte ritas längst ned på sin
                 // sida); numret är en länk mellan referens och definition.
                 if text.contains("[^") {
-                    let notes = word.notes(doc_id, text);
+                    let notes = word.notes(doc_id, &seen);
                     let collapsed = |b: usize| notes.iter().any(|n| n.line.start <= b && b < n.line.end.max(n.line.start + 1));
                     let area = markup::footnote_area_start(text, &analysis).and_then(|s| {
                         if !collapsed(s) {
@@ -1524,7 +1539,7 @@ impl KladdApp {
                 ui.painter().set(shadow_slot, shadows);
                 ui.painter().set(page_slot, sheets);
                 if !edited {
-                    let pb = word.para_boxes(doc_id, text);
+                    let pb = word.para_boxes(doc_id, &seen);
                     if !pb.1.is_empty() {
                         let vis = {
                             let lo = galley.cursor_from_pos(vec2(0.0, clip.top() - gpos.y - 300.0)).index.0;
@@ -1597,7 +1612,7 @@ impl KladdApp {
                     }
                 }
                 // Fotnoterna längst ned på sina sidor.
-                let page_notes = word.notes(doc_id, text);
+                let page_notes = word.notes(doc_id, &seen);
                 if !page_notes.is_empty() {
                     let env = super::notesui::Env {
                         palette: p,
@@ -1741,7 +1756,7 @@ impl KladdApp {
                             let ci = conv.at(pc.range.start);
                             let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
                             // Flytande bild: vid textkanten, på radens höjd (raden själv har ingen höjd).
-                            let side = word.float_side(doc_id, text, pc.range.start);
+                            let side = word.float_side(doc_id, &seen, pc.range.start);
                             {
                                 let uri = image_uri(&img.src, doc_id);
                                 let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
@@ -1897,7 +1912,7 @@ impl KladdApp {
                 }
 
                 // Kodblockens rutor (bakom texten), språknamn och kopieringsknapp.
-                let code_blocks = word.code_blocks(doc_id, text);
+                let code_blocks = word.code_blocks(doc_id, &seen);
                 let diagram = |b: &super::codeblock::Block| -> Option<(String, Vec2)> {
                     let size = b.diagram_key(text).and_then(|k| sizes.get(&k).copied())?;
                     let overlaps = reveal.start < b.whole().end && b.whole().start < reveal.end;
@@ -1911,6 +1926,20 @@ impl KladdApp {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
                 }
                 ui.painter().set(cell_fill_slot, cell_fills);
+                // Sökträffar som lager ovanpå galleriet: de ingår inte i utläggningen, så att den kan återanvändas.
+                if !matches.is_empty() {
+                    let layer = super::matchlayer::build(
+                        &galley,
+                        text,
+                        &matches,
+                        gpos.to_vec2(),
+                        clip.top() - gpos.y - 300.0,
+                        clip.bottom() - gpos.y + 300.0,
+                        p,
+                    );
+                    ui.painter().set(match_slot, Shape::Vec(layer.behind));
+                    painter.extend(layer.over);
+                }
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
                 page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
@@ -2101,6 +2130,9 @@ impl KladdApp {
                 self.notify(&ctx, t("Koden kopierades"), false);
             }
             self.wv.pages = page_pos;
+            if edited && crate::timing::enabled() {
+                crate::timing::mark(&format!("dokumentläge, bildruta med ändring: {:.1} ms", t_frame.elapsed().as_secs_f64() * 1000.0));
+            }
             if self.word.partial(doc_id) {
                 self.wv.lazy_frames = self.wv.lazy_frames.saturating_add(1);
                 (self.wv.lazy_boost, self.wv.lazy_hurry) = lazy_next;
@@ -2223,8 +2255,17 @@ impl KladdApp {
     /// Statusradens högra del i dokumentläget (läggs ut från höger till vänster).
     pub(crate) fn word_status(&mut self, ui: &mut Ui, p: &Palette, font: &FontId) {
         let Some(doc) = self.docs.get(self.active) else { return };
-        let analysis = self.word.analysis(doc.id, &doc.text);
-        let (words, _) = markup::count(&doc.text, &analysis);
+        // Ordräkningen går igenom hela texten: görs bara när texten ändrats, inte i varje bildruta.
+        let key = (doc.id, doc.text.len(), layout::fast_hash(&doc.text));
+        let words = match self.wv.words {
+            Some((k, w)) if k == key => w,
+            _ => {
+                let analysis = self.word.analysis(doc.id, &doc.text);
+                let w = markup::count(&doc.text, &analysis).0;
+                self.wv.words = Some((key, w));
+                w
+            }
+        };
         let (cur, total) = self.wv.pages;
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
         let label = |ui: &mut Ui, s: String| {
@@ -2369,7 +2410,12 @@ impl<'a> ByteToChar<'a> {
     }
 
     fn at(&mut self, b: usize) -> usize {
-        let b = b.min(self.text.len());
+        // Ett läge från före en ändring i samma bildruta (stavnings- och grammatikträffar, eller rubriker när TextEdit
+        // ångrar själv) kan hamna mitt i ett tecken: aldrig mitt i ett tecken.
+        let mut b = b.min(self.text.len());
+        while !self.text.is_char_boundary(b) {
+            b -= 1;
+        }
         if b < self.b {
             self.b = 0;
             self.c = 0;

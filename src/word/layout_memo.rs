@@ -29,6 +29,8 @@ pub(super) struct Prep {
     /// förberedelsen återanvändes från förra omläggningen (`from_rev`); annars tom. Se `resume`.
     pub from: Vec<u32>,
     pub from_rev: u64,
+    /// Första gruppen `i` där `from[i] != i` (eller antalet grupper), så att den inte behöver sökas.
+    pub first_new: usize,
     /// Styckena som öppnar eller stänger en textruta (index, stigande): fönstren vidgas till hela rutor.
     pub marks: Vec<usize>,
 }
@@ -98,8 +100,46 @@ fn broken_marker(w: &str) -> bool {
     w.match_indices("<!--").any(|(i, _)| !w[i..].split('\n').next().unwrap_or("").contains("-->"))
 }
 
+/// Är styckena exakt lika (talen jämförs bit för bit, som om de skrivits ut)? Används för kontrollstyckena.
 fn same_para(a: &Para, b: &Para) -> bool {
-    format!("{a:?}") == format!("{b:?}")
+    let f = |x: f32, y: f32| x.to_bits() == y.to_bits();
+    let of = |x: Option<f32>, y: Option<f32>| x.map(f32::to_bits) == y.map(f32::to_bits);
+    a.range == b.range
+        && a.align == b.align
+        && match (a.list, b.list) {
+            (Some(x), Some(y)) => f(x.text_x, y.text_x) && x.marker_chars == y.marker_chars,
+            (None, None) => true,
+            _ => false,
+        }
+        && f(a.image_w, b.image_w)
+        && a.collapse == b.collapse
+        && match (a.float, b.float) {
+            (Some(x), Some(y)) => x.side == y.side && x.anchor == y.anchor && f(x.size.x, y.size.x) && f(x.size.y, y.size.y) && x.alone == y.alone,
+            (None, None) => true,
+            _ => false,
+        }
+        && of(a.reserve, b.reserve)
+        && f(a.toc_h, b.toc_h)
+        && f(a.space_before, b.space_before)
+        && f(a.first_indent, b.first_indent)
+        && a.col_break == b.col_break
+        && a.page_break == b.page_break
+        && match (&a.look, &b.look) {
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y) || x == y,
+            (None, None) => true,
+            _ => false,
+        }
+        && of(a.gap, b.gap)
+        && a.line == b.line
+        && f(a.ind_left, b.ind_left)
+        && f(a.ind_right, b.ind_right)
+        && f(a.hang, b.hang)
+        && f(a.ppx, b.ppx)
+        && f(a.room.0, b.room.0)
+        && f(a.room.1, b.room.1)
+        && of(a.empty_h, b.empty_h)
+        && a.tbox == b.tbox
+        && a.tbox_end == b.tbox_end
 }
 
 fn toc_count(text: &str, a: &Analysis) -> usize {
@@ -118,7 +158,7 @@ pub(super) fn fresh(text: &str, a: &Analysis, p: &Params, planned: bool, grid: &
         None => (Vec::new(), BTreeSet::new(), None, false),
     };
     let marks = marks_of(&paras);
-    Prep { paras, defs, groups, skeys, toc_n, planned, refs, gap, trailing, from: Vec::new(), from_rev: 0, marks }
+    Prep { paras, defs, groups, skeys, toc_n, planned, refs, gap, trailing, from: Vec::new(), from_rev: 0, first_new: 0, marks }
 }
 
 /// Styckena efter en omräkning av fönstret `lo..=hi` (gamla index) som gav `w`: stycken före fönstret, fönstret och
@@ -344,6 +384,7 @@ fn regroup(prep: &mut Prep, spliced: &[(usize, usize, usize)], text: &str, a: &A
         skeys.splice(g0..g1, keys);
         groups.splice(g0..g1, made);
     }
+    prep.first_new = segs.first().map_or(groups.len(), |s| s.0);
     prep.groups = groups;
     prep.skeys = skeys;
     prep.from = from;
@@ -375,8 +416,9 @@ pub(super) fn reuse(
     grid: &[Table],
     cb: &[codeblock::Block],
     toc_delta: Option<isize>,
+    composed: bool,
 ) -> Option<Prep> {
-    if m.sig != sig || !p.matches.is_empty() {
+    if m.sig != sig {
         return no(1);
     }
     let mut prep = m.prep;
@@ -384,6 +426,7 @@ pub(super) fn reuse(
     prep.from_rev = m.rev;
     if !changed && p.reveal == m.reveal {
         prep.from = (0..prep.groups.len() as u32).collect();
+        prep.first_new = prep.groups.len();
         return Some(prep);
     }
     let delta = text.len() as isize - old_text.len() as isize;
@@ -394,8 +437,15 @@ pub(super) fn reuse(
         if hs > he_new || he_new > text.len() || hs > he_old || he_old > old_text.len() {
             return no(2);
         }
-        // Kontroll: utanför området är texten verkligen densamma.
-        if old_text.as_bytes()[..hs] != text.as_bytes()[..hs] || old_text.as_bytes()[he_old..] != text.as_bytes()[he_new..] {
+        // Kontroll: utanför området är texten verkligen densamma. Ett område från en enda inkrementell analys (som själv
+        // jämför texterna) kontrolleras bara i debugbyggen, och där är en avvikelse ett fel; ett område som satts samman av
+        // flera ändringar sedan förra omläggningen (ovanligt) kontrolleras alltid.
+        #[cfg(debug_assertions)]
+        let checks = CHECKS.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        let checks = false;
+        if (composed || checks) && (old_text.as_bytes()[..hs] != text.as_bytes()[..hs] || old_text.as_bytes()[he_old..] != text.as_bytes()[he_new..]) {
+            assert!(!checks, "texten utanför det ändrade området {hs}..{he_new} har ändrats");
             return no(3);
         }
         Some((hs, he_old, he_new))
@@ -549,10 +599,21 @@ pub(super) fn reuse(
             return no(11);
         }
     }
-    // Räkna om fönstren.
+    // Räkna om fönstren. Är rubrikerna som kan komma med i en förteckning desamma (`toc_delta`) har en förteckning i
+    // fönstret samma höjd som förut, om raden är densamma.
+    let mut toc_known: Vec<(String, f32)> = Vec::new();
+    if toc_delta == Some(0) {
+        for r in &regions {
+            for q in prep.paras[r.lo..=r.hi].iter().filter(|q| q.toc_h > 0.0) {
+                if let Some(t) = old_text.get(q.range.clone()) {
+                    toc_known.push((t.trim().to_owned(), q.toc_h));
+                }
+            }
+        }
+    }
     let mut news: Vec<Vec<Para>> = Vec::new();
     for (_, new) in &wins {
-        news.push(paragraphs_in(text, a, p, Some(new.clone()), cb));
+        news.push(paragraphs_toc(text, a, p, Some(new.clone()), cb, &toc_known));
     }
     // Fotnotsplanen har sammanhang som fönstret inte ser: ett fönster med eller nära definitioner (även tomma stycken
     // fram till en definition) eller efter den sista räknar om planen i fönstret (`plan_window`). Det görs bara för ett
@@ -594,7 +655,7 @@ pub(super) fn reuse(
     // De insatta styckena per fönster (gamla index): första, antal gamla och antal nya.
     let mut spliced: Vec<(usize, usize, usize)> = Vec::new();
     // Innehållsförteckningens rad i de gamla och de nya styckena i fönstren.
-    let (mut toc_old, mut toc_new) = (false, false);
+    let (mut toc_old, mut toc_new) = (Vec::new(), Vec::new());
     let he_old_shift = |x: usize| match edit {
         Some((_, he_old, _)) if x >= he_old => (x as isize + delta) as usize,
         _ => x,
@@ -637,8 +698,12 @@ pub(super) fn reuse(
         if !r.edit && new_n != old_n {
             return no(17);
         }
-        toc_old |= prep.paras[lo_t..=hi_t].iter().any(|q| q.toc_h > 0.0);
-        toc_new |= w[from..to].iter().any(|q| q.toc_h > 0.0);
+        // Styckena efter de ändrade har redan flyttats (nya lägen), de övriga står i den gamla texten.
+        for (k, q) in prep.paras[lo_t..=hi_t].iter().enumerate().filter(|(_, q)| q.toc_h > 0.0) {
+            let src = if b_edit.is_some_and(|b| lo_t + k > b) && delta != 0 { text } else { old_text };
+            toc_old.push(src.get(q.range.clone()).unwrap_or("").trim().to_owned());
+        }
+        toc_new.extend(w[from..to].iter().filter(|q| q.toc_h > 0.0).map(|q| text[q.range.clone()].trim().to_owned()));
         prep.paras.splice(lo_t..=hi_t, w[from..to].iter().cloned());
         dn.push((hi_t, new_n as isize - old_n as isize));
         spliced.push((lo_t, old_n, new_n));
@@ -664,7 +729,7 @@ pub(super) fn reuse(
         prep.gap = prep.gap.map(shift);
     }
     // Innehållsförteckningen kan ha tillkommit eller försvunnit i ett fönster (annars är antalet rubriker oförändrat).
-    if toc_old || toc_new || toc_delta.is_none() {
+    if toc_old != toc_new || toc_delta.is_none() {
         prep.toc_n = prep.paras.iter().any(|q| q.toc_h > 0.0).then(|| toc_count(text, a));
     }
     spliced.reverse();
@@ -719,6 +784,7 @@ pub(super) fn reuse(
         from.push(if key.is_some() { j as u32 } else { u32::MAX });
         skeys.push(key.unwrap_or_else(|| unit_key_static(text, a, p, w)));
     }
+    prep.first_new = from.iter().enumerate().position(|(i, &j)| j as usize != i).unwrap_or(from.len());
     prep.groups = groups;
     prep.skeys = skeys;
     prep.from = from;
@@ -747,7 +813,16 @@ mod tests {
         let words = ["alfa", "beta", "gamma", "delta", "åäö", "text", "rad", "stycke", "dokument", "sida"];
         let mut s = String::from("<!-- kladd: sida=a4; h1: \"Calibri\" 20pt -->\n\n");
         let mut notes = 0;
+        // `<div>`-block över flera stycken, ibland nästlade (Word-läsarens justerade och centrerade text).
+        let mut depth = 0;
         for i in 0..paras {
+            if depth < 2 && r.below(12) == 0 {
+                s.push_str(["<div align=\"justify\">\n\n", "<div align=\"center\">\n\n", "<div>\n\n"][r.below(3)]);
+                depth += 1;
+            } else if depth > 0 && r.below(8) == 0 {
+                s.push_str("</div>\n\n");
+                depth -= 1;
+            }
             let kind = r.below(24);
             let mut line = String::new();
             for _ in 0..(3 + r.below(40)) {
@@ -780,6 +855,9 @@ mod tests {
             if i == paras / 5 {
                 s.push_str("<!-- kladd: toc -->\n\n");
             }
+        }
+        for _ in 0..depth {
+            s.push_str("</div>\n\n");
         }
         if word {
             for n in 1..=notes {
@@ -894,7 +972,6 @@ mod tests {
                 palette: &pal,
                 zoom: 1.0,
                 reveal,
-                matches: &[],
                 image_size: &img,
                 measure: &measure,
                 font_family: &fam,
@@ -935,7 +1012,31 @@ mod tests {
                 fell_back += 1;
                 continue;
             }
-            match reuse(memo, &old, Some(hull), rev, &text, &an, &pn, 7, &gn, &cn, None) {
+            // Den inkrementella analysen ger bara ett område om bitarna utanför det är desamma (t.ex. inte när en ändring i
+            // en `<div>`-tagg parar ihop taggarna på ett annat sätt långt bort); samma förutsättning här.
+            let outside = |a: &Analysis, len: usize, he: usize| -> Vec<(bool, crate::style::Align, Block)> {
+                let mut v = Vec::with_capacity(len);
+                for p in &a.pieces {
+                    for b in p.range.clone() {
+                        if b < hull.0 || b >= he {
+                            v.push((p.markup, p.align, p.block));
+                        }
+                    }
+                }
+                v
+            };
+            let d = text.len() as isize - old.len() as isize;
+            if outside(&ao, old.len(), (hull.1 as isize - d) as usize) != outside(&an, text.len(), hull.1) {
+                WHY.with(|w| w.borrow_mut().push(98));
+                continue;
+            }
+            // Ändringen i det som kan komma med i en innehållsförteckning (som den inkrementella analysen ger), i hälften av
+            // stegen: med 0 återanvänds förteckningens höjd och antal (`toc_known`).
+            let toc_delta = (step % 2 == 0).then(|| {
+                use crate::word::nav::{toc_sig_diff, toc_sig_in};
+                toc_sig_diff(&toc_sig_in(&text, &an.pieces), &toc_sig_in(&old, &ao.pieces))
+            });
+            match reuse(memo, &old, Some(hull), rev, &text, &an, &pn, 7, &gn, &cn, toc_delta, step % 3 == 0) {
                 Some(inc) => {
                     same(&inc, &full, &format!("seed {seed} steg {step} ch {ch:?} hull {hull:?} rv {:?}->{:?} | grupp ~ ", po.reveal, pn.reveal));
                     reused += 1;
@@ -956,7 +1057,14 @@ mod tests {
             back += b;
         }
         // De flesta ändringar ligger långt från fotnotsdefinitioner och rutor och ska gå att återanvända.
-        assert!(reused > 2 * back, "återanvändes {reused}, full omräkning {back}");
+        let why = WHY.with(|w| {
+            let mut c = std::collections::BTreeMap::new();
+            for x in w.borrow_mut().drain(..) {
+                *c.entry(x).or_insert(0) += 1;
+            }
+            c
+        });
+        assert!(reused > 2 * back, "återanvändes {reused}, full omräkning {back} (skäl {why:?})");
     }
 
     /// Ändringar i och nära fotnotsdefinitionerna (Word-dialekten, ett block utan tomrader): planen räknas om i
@@ -1020,6 +1128,42 @@ mod tests {
         assert!(reused > seeds as usize * 6, "återanvändes bara {reused} gånger");
     }
 
+    /// Styckenas utseende (`<!--k:pp …-->`) och rubrikerna efter inkrementella ändringar (läses om bara i fönstret,
+    /// `pspecs_patch` och `headings_patch`) ska vara desamma som när hela texten läses.
+    #[test]
+    fn paragraph_looks_follow_incremental_edits() {
+        incr::MIN_OVERRIDE.with(|m| m.set(Some(1000)));
+        let seeds = std::env::var("KLADD_FUZZ_SEEDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(3, |n| (n / 10).max(3));
+        let mut patched = 0;
+        for seed in 0..seeds {
+            let mut r = Rng(3001 + seed * 17);
+            let mut text = doc_with(&mut r, 160, seed % 2 == 0, seed % 3 == 0);
+            let mut cache = Cache::default();
+            let _ = (cache.para_boxes(1, &text), cache.headings(1, &text));
+            for step in 0..60 {
+                edit_near(&mut r, &mut text, seed % 3 == 0);
+                if r.below(3) == 0 {
+                    text.insert_str(spot(&mut r, &text, false), "<!--k:pp bdr=\"t=single:8:4:156082\" shd=\"E8F1F5\"-->");
+                }
+                let got = cache.para_boxes(1, &text);
+                patched += usize::from(cache.docs.get(&1).is_some_and(|d| d.facts.is_some()));
+                let specs = if text.contains(pbox::MARK) { pbox::scan(&text) } else { Vec::new() };
+                let runs = pbox::box_runs(&text, &specs);
+                let f = |v: &[pbox::ParaSpec]| v.iter().map(|s| (s.range.clone(), format!("{:?}", s.pp))).collect::<Vec<_>>();
+                assert_eq!(f(&got.0), f(&specs), "seed {seed} steg {step}: styckenas utseende");
+                let g = |v: &[pbox::BoxRun]| v.iter().map(|b| (b.specs.clone(), b.range.clone())).collect::<Vec<_>>();
+                assert_eq!(g(&got.1), g(&runs), "seed {seed} steg {step}: rutorna");
+                // Rubrikerna flyttas och räknas om i fönstret på samma sätt.
+                let heads = cache.headings(1, &text);
+                let want = crate::word::nav::headings(&text, &markup::analyze(&text));
+                let h = |v: &[crate::word::nav::Heading]| v.iter().map(|x| (x.level, x.text.clone(), x.start)).collect::<Vec<_>>();
+                assert_eq!(h(&heads), h(&want), "seed {seed} steg {step}: rubriker");
+            }
+        }
+        incr::MIN_OVERRIDE.with(|m| m.set(None));
+        assert!(patched > 0, "ingen inkrementell ändring");
+    }
+
     /// En förteckning med egna nivåer eller över bildtexter: en ny rubrik på en nivå utanför 1–3 eller en ny bildtext
     /// ändrar förteckningens höjd, så förberedelsen får inte återanvändas med den gamla höjden.
     #[test]
@@ -1036,7 +1180,7 @@ mod tests {
             let geom = pages::Geom::for_sections(1.0, &a0.defaults, &a0.sections);
             let mut cache = Cache::default();
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, egui::Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal: 0..0, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal: 0..0, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             for step in 0..3 {
                 if step > 0 {
                     // Ersätt ett stycke mitt i dokumentet med en ny post (styckegränserna är kvar).
@@ -1080,9 +1224,14 @@ mod tests {
             if step > 0 {
                 edit_near(&mut r, &mut text, word);
             }
+            // Ibland två ändringar före en omläggning: analysen följer den första (området sätts samman av två).
+            if step % 3 == 2 {
+                let _ = cache.analysis(1, &text);
+                edit_near(&mut r, &mut text, word);
+            }
             let reveal = if step % 4 == 1 { crate::word::tables::reveal_range(&text, text.len() / 2..text.len() / 2) } else { 0..0 };
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, egui::Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             let out = ctx.run_ui(Default::default(), |_| {
                 let g = cache.galley_paged(&ctx, 1, &text, &p, geom.edit_w(), Some(&geom));
                 reused += usize::from(cache.stats(1).reused);

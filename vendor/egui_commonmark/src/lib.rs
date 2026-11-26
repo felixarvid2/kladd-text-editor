@@ -417,6 +417,36 @@ impl<'f> CommonMarkViewer<'f> {
         self.show_mut(ui, cache, text)
     }
 
+    /// Kladd: förbereder en bildruta där blocken ritas med [`show_slice`](Self::show_slice) (nollställer
+    /// länkkrokarna). Anropas en gång per bildruta, före första blocket.
+    pub fn begin_frame(cache: &mut CommonMarkCache, ctx: &egui::Context) {
+        egui_commonmark_backend::prepare_show(cache, ctx);
+    }
+
+    /// Kladd: ritar ett enda toppnivåblock av `text` (se [`SliceArgs`]). Källpositioner i sök, markeringar och
+    /// kryssrutor är räknade i hela texten, och `CommonMarkCache::line_points` fylls med blockets egna
+    /// positioner (y från blockets överkant). Anropa [`begin_frame`](Self::begin_frame) först.
+    pub fn show_slice(
+        mut self,
+        id: egui::Id,
+        ui: &mut egui::Ui,
+        cache: &mut CommonMarkCache,
+        text: &str,
+        args: &SliceArgs,
+    ) -> SliceOut {
+        self.options.source_id = Some(id);
+        self.options.mutable = args.mutable;
+        let (inner, toggled, scrolled_to_match, image_loading, pitch) =
+            parsers::pulldown::CommonMarkViewerInternal::new().show_slice(ui, cache, &self.options, text, args);
+        SliceOut {
+            response: inner.response,
+            toggled: toggled.into_iter().map(|e| (e.span, e.checked)).collect(),
+            scrolled_to_match,
+            image_loading,
+            pitch,
+        }
+    }
+
     /// Shows markdown inside a [`ScrollArea`].
     /// This function is much more performant than just calling [`show`] inside a [`ScrollArea`],
     /// because it only renders elements that are visible.
@@ -444,6 +474,41 @@ impl<'f> CommonMarkViewer<'f> {
             text,
         );
     }
+}
+
+/// Kladd: vad ett block i [`CommonMarkViewer::show_slice`] ska ritas med.
+#[derive(Clone, Debug, Default)]
+pub struct SliceArgs {
+    /// Blockets byteområde i hela texten (från radens början).
+    pub range: std::ops::Range<usize>,
+    /// Slutet på nästa block (eller `range.end`): läses fram så att listor, tabeller och citat ser samma
+    /// efterföljande händelser som i en helritning, men ritas inte.
+    pub ahead: usize,
+    /// Länkdefinitioner (`[a]: url`) ur resten av texten, som läggs efter blocket så att länkar går att lösa upp.
+    pub refs: String,
+    /// Första respektive sista blocket i dokumentet (avståndet före första och efter sista saknas).
+    pub first: bool,
+    pub last: bool,
+    /// Föregående block är ett stycke (för indragna stycken som hålls ihop).
+    pub prev_para: bool,
+    /// Rulla till den aktiva sökträffen om den ligger i blocket.
+    pub want_match: bool,
+    /// Kryssrutor går att bocka av.
+    pub mutable: bool,
+}
+
+/// Kladd: resultatet av [`CommonMarkViewer::show_slice`].
+pub struct SliceOut {
+    pub response: egui::Response,
+    /// Kryssrutor som klickades: källområdet för `[ ]`/`[x]` och det nya värdet.
+    pub toggled: Vec<(std::ops::Range<usize>, bool)>,
+    /// Rullningen till den aktiva träffen gjordes i blocket.
+    pub scrolled_to_match: bool,
+    /// En bild i blocket är inte inläst än (höjden är då inte slutgiltig).
+    pub image_loading: bool,
+    /// Avståndet från blockets överkant till där nästa block börjar i en helritning (inte alltid samma som
+    /// blockets höjd: radbrytningen efter blocket och före nästa delar en rad).
+    pub pitch: f32,
 }
 
 pub(crate) struct ListLevel {

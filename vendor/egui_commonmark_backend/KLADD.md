@@ -47,3 +47,11 @@ galleri. `egui_commonmark::parsers::pulldown` (`try_galley`, `galley_block`) sam
 länkar (färg, träffprov med `Galley::cursor_from_pos`, samma länkhakar som förut), sökträffar och `Mark`-bakgrunder, ett
 anteckningsmärke efter markeringar med anteckning, och egui:s textmarkering. Klick på en markering lämnas i `MARK_HIT_ID` (`take_mark_hit`).
 Block med bild, formel, fotnotsreferens eller HTML ritas på det gamla sättet. Utan `ViewExtras` är allt som förut.
+
+## Block för block (läsläget, 2.10)
+
+`egui_commonmark::CommonMarkViewer::show_slice` (`SliceArgs`, `SliceOut`, `begin_frame`) ritar ett enda toppnivåblock av en text med
+källpositioner räknade i hela texten, för `src/mdwin.rs` som bara ritar de synliga blocken. Blocket tolkas för sig (`Parser` över
+`text[range.start..ahead]` med positionerna förskjutna), nästa block läses fram men ritas inte, länk- och fotnotsdefinitioner läggs
+efter blocket, och avståndet till föregående block är det en helritning ger (första blocket saknar start-radbrytning, sista slut-).
+Backenden har `ViewerCache::slice_points`, `CommonMarkCache::{slice_points, set_line_points, heading_target, set_block_layout}`.

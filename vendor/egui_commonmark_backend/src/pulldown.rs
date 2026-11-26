@@ -335,6 +335,8 @@ pub struct ViewerCache {
     /// tabellrad, i ritordning; görs om vid varje ritning. Ger "vilken källrad ligger vid y" för
     /// dubbelklick och rullningssynk, även inne i listor och tabeller (som `split_points` hoppar över).
     pub line_points: Vec<(usize, f32)>,
+    /// Kladd: som `line_points` men för ett enda block ritat med `show_slice` (y från blockets överkant).
+    pub slice_points: Vec<(usize, f32)>,
     /// Keyboard / programmatic scroll delta applied inside the next
     /// `show_scrollable` call and then cleared.
     pub pending_scroll_delta: egui::Vec2,

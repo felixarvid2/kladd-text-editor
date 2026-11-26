@@ -142,6 +142,11 @@ pub(super) struct Rec {
     pub gall: Vec<usize>,
     pub wstart: Vec<usize>,
     pub key: Vec<u64>,
+    /// Gruppen beror inte på sitt läge (`y`, sidsimuleringen): inga flytande bilder eller textrutor före, i eller efter
+    /// den. En sträcka sådana grupper kan tas från förra varvet förskjuten i y (`Fast::splice_shifted`).
+    pub plain: Vec<bool>,
+    /// Gruppen är en platshållare (stegvis utläggning).
+    pub stub: Vec<bool>,
     /// Längderna på listorna före gruppen, där de ändrats.
     pub cnt: Vec<(u32, Counts)>,
     /// Återupptaget varv: listorna får bara de ändrade grupperna (sätts ihop i `Fast::finish_rec`).
@@ -161,6 +166,8 @@ impl Rec {
             gall: Vec::with_capacity(n + 1),
             wstart: Vec::with_capacity(n),
             key: Vec::with_capacity(n),
+            plain: Vec::with_capacity(n),
+            stub: Vec::with_capacity(n),
             cnt: Vec::new(),
             fast: false,
             last_state: None,
@@ -196,6 +203,8 @@ impl Rec {
     pub fn begin(&mut self, wstart: usize) {
         self.wstart.push(wstart);
         self.key.push(0);
+        self.plain.push(false);
+        self.stub.push(false);
     }
 }
 
@@ -209,6 +218,10 @@ pub(super) struct Trace {
     pub out: Out,
     /// Sammanfogning och sidindelning (bara för dokument med ett avsnitt och sidor).
     pub page: Option<PageTrace>,
+    /// Stegvis utläggning: grupperna från `stub_from` kan vara platshållare (gjorda med kalibreringen `stub_key`); utan
+    /// platshållare antalet grupper.
+    pub stub_from: usize,
+    pub stub_key: u64,
 }
 
 impl Trace {
@@ -240,6 +253,8 @@ pub(super) struct PageTrace {
     pub nv: Vec<u32>,
     pub ni: Vec<u32>,
     pub elided: Vec<bool>,
+    /// Gruppens rader i x (minsta och största, se `concat_group`).
+    pub xr: Vec<[f32; 2]>,
     /// Tillståndet före den första raden på varje sida.
     pub snaps: Vec<PSnap>,
     pub pout: Vec<PageNotes>,
@@ -262,15 +277,21 @@ pub(super) struct Sum {
     pub el: bool,
     pub mesh: Rect,
     pub urect: Rect,
+    pub x: [f32; 2],
 }
 
+pub(super) const SUM0: Sum = Sum { nv: 0, ni: 0, el: false, mesh: Rect::NOTHING, urect: Rect::NOTHING, x: [f32::INFINITY, f32::NEG_INFINITY] };
+
 /// Summan för grupperna `r`.
-pub(super) fn sum_of(nv: &[u32], ni: &[u32], el: &[bool], fmesh: &[Rect], urect: &[Rect], r: Range<usize>) -> Sum {
-    let mut s = Sum { nv: 0, ni: 0, el: false, mesh: Rect::NOTHING, urect: Rect::NOTHING };
+pub(super) fn sum_of(nv: &[u32], ni: &[u32], el: &[bool], fmesh: &[Rect], urect: &[Rect], xr: &[[f32; 2]], r: Range<usize>) -> Sum {
+    let mut s = SUM0;
     for g in r {
         s.nv += nv[g] as usize;
         s.ni += ni[g] as usize;
         s.el |= el[g];
+        if let Some(x) = xr.get(g) {
+            s.x = [s.x[0].min(x[0]), s.x[1].max(x[1])];
+        }
         s.mesh |= fmesh.get(g).copied().unwrap_or(Rect::NOTHING);
         if let Some(u) = urect.get(g) {
             s.urect |= *u;
@@ -280,8 +301,8 @@ pub(super) fn sum_of(nv: &[u32], ni: &[u32], el: &[bool], fmesh: &[Rect], urect:
 }
 
 /// Summorna för alla grupper, `CHUNK` i taget.
-pub(super) fn sums_of(nv: &[u32], ni: &[u32], el: &[bool], fmesh: &[Rect], urect: &[Rect]) -> Vec<Sum> {
-    (0..nv.len().div_ceil(CHUNK)).map(|k| sum_of(nv, ni, el, fmesh, urect, k * CHUNK..((k + 1) * CHUNK).min(nv.len()))).collect()
+pub(super) fn sums_of(nv: &[u32], ni: &[u32], el: &[bool], fmesh: &[Rect], urect: &[Rect], xr: &[[f32; 2]]) -> Vec<Sum> {
+    (0..nv.len().div_ceil(CHUNK)).map(|k| sum_of(nv, ni, el, fmesh, urect, xr, k * CHUNK..((k + 1) * CHUNK).min(nv.len()))).collect()
 }
 
 /// Sidindelningens tillstånd före den första raden (gruppen av rader) på en sida.
@@ -406,6 +427,9 @@ pub(super) struct Run {
     /// Listornas längder före sträckan, nu och förut.
     pub cbase: Counts,
     pub c0: Counts,
+    /// Sträckan ligger på ett annat y än förut (`Fast::splice_shifted`): grupperna och deras rader är desamma, men lägena
+    /// (tillståndet före varje grupp, sammanfogningen och sidindelningen) räknas om.
+    pub shifted: bool,
 }
 
 /// Som `patch_dense` för glesa listor (grupp, värde) i gruppordning: posterna i sträckorna flyttas (`adj` och nytt
@@ -468,10 +492,20 @@ fn patch_dense<T: Clone>(v: &mut Vec<T>, runs: &[Run], n_old: usize, n_new: usiz
     }
 }
 
-// Prov: slår av återupptagningen (för en jämförelsecache som alltid gör hela varvet).
+// Prov: slår av återupptagningen (för en jämförelsecache som alltid gör hela varvet), och antalet grupper i följd som
+// inte går att ta från förra varvet innan det ges upp (`GIVE_UP`, för att prova `Fast::abandon`).
 #[cfg(test)]
 thread_local! {
     pub static OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static GIVE_UP: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
+}
+
+/// Antal oförändrade grupper i följd som inte kunde tas från förra varvet innan det återupptagna varvet ges upp.
+pub(super) fn give_up_after() -> usize {
+    #[cfg(test)]
+    return GIVE_UP.with(|g| g.get());
+    #[cfg(not(test))]
+    64
 }
 
 /// Ett återupptaget varv.
@@ -486,12 +520,16 @@ pub(super) struct Fast {
     pub runs: Vec<Run>,
     /// Gamla grupper som ersatts (deras cacheposter släpps om de inte används igen).
     pub replaced: Vec<u64>,
+    /// Förra varvet var ofullständigt: gamla grupper från `stub_from` kan vara platshållare. De tas bara från förra varvet
+    /// när också det här varvet har gått över till platshållare och kalibreringen är densamma (`stubs_ok`).
+    pub stub_from: usize,
+    pub stubs_ok: bool,
 }
 
 impl Fast {
     /// Börjar ett återupptaget varv om förra varvet passar (samma parametrar, förberedelsen återanvänd från just det).
     /// `out` och `rec` får förra varvets listor och tillstånd fram till den första ändrade gruppen.
-    pub fn start(st: &mut DocState, prep: &memo::Prep, sig: u64, out: &mut Out, rec: &mut Rec) -> Option<Fast> {
+    pub fn start(st: &mut DocState, prep: &memo::Prep, sig: u64, out: &mut Out, rec: &mut Rec, stub_key: u64) -> Option<Fast> {
         let Some(mut old) = st.trace.take() else {
             st.stats.resume_why = 1;
             return None;
@@ -513,7 +551,13 @@ impl Fast {
             };
             return None;
         }
-        let d0 = prep.from.iter().enumerate().position(|(i, &j)| j as usize != i).unwrap_or(prep.from.len()).min(n_old);
+        let stub_from = old.stub_from.min(n_old);
+        #[cfg(debug_assertions)]
+        if CHECKS.load(std::sync::atomic::Ordering::Relaxed) {
+            assert_eq!(prep.first_new, prep.from.iter().enumerate().position(|(i, &j)| j as usize != i).unwrap_or(prep.from.len()));
+        }
+        let d0 = prep.first_new.min(prep.from.len()).min(n_old).min(stub_from);
+        let stubs_ok = old.stub_key == stub_key;
         // Listorna som lämnats till vyn (tabellernas geometri, fotnoterna, bildernas lägen) tas tillbaka.
         old.out.geoms = Arc::try_unwrap(std::mem::take(&mut st.geoms)).unwrap_or_else(|a| (*a).clone());
         old.out.notes = Arc::try_unwrap(std::mem::take(&mut st.notes)).unwrap_or_else(|a| (*a).clone());
@@ -545,15 +589,30 @@ impl Fast {
         // Inspelningen fram till den första ändrade gruppen är densamma som förut. De täta listorna (en post per grupp) får
         // bara de ändrade grupperna under varvet och sätts ihop med de gamla efteråt (`finish_rec`); de glesa byggs i ordning.
         rec.fast = true;
-        let runs = if d0 > 0 { vec![Run { gi: 0, gj: 0, len: d0, rows: 0..r0, old_row: 0, da: 0, db: 0, cbase: c, c0: c }] } else { Vec::new() };
+        let runs = if d0 > 0 { vec![Run { gi: 0, gj: 0, len: d0, rows: 0..r0, old_row: 0, da: 0, db: 0, cbase: c, c0: c, shifted: false }] } else { Vec::new() };
         let n_old_rows = old.rec.row[n_old];
-        Some(Fast { old, n_old, n_old_rows, tail, d0, runs, replaced: Vec::new() })
+        Some(Fast { old, n_old, n_old_rows, tail, d0, runs, replaced: Vec::new(), stub_from, stubs_ok })
     }
 
-    /// Den gamla grupp som ny grupp `gi` motsvarar, om den är oförändrad.
-    pub fn old_of(&self, prep: &memo::Prep, gi: usize) -> Option<usize> {
+    /// Den gamla grupp som ny grupp `gi` motsvarar, om den är oförändrad (och inte en platshållare som ska läggas ut nu,
+    /// se `limit`).
+    pub fn old_of(&self, prep: &memo::Prep, gi: usize, lazy: bool) -> Option<usize> {
         let j = *prep.from.get(gi)? as usize;
-        (j < self.old.n()).then_some(j)
+        (j < self.limit(lazy)).then_some(j)
+    }
+
+    /// Gamla grupper före den här gränsen kan tas från förra varvet: platshållarna bara när också det här varvet gjort
+    /// platshållare (`lazy`) med samma kalibrering.
+    pub fn limit(&self, lazy: bool) -> usize {
+        if lazy && self.stubs_ok { self.old.n() } else { self.stub_from }
+    }
+
+    /// Antal gamla platshållare bland grupperna `gj..gj+len` (för förloppet).
+    pub fn stubs_in(&self, gj: usize, len: usize) -> usize {
+        if gj + len <= self.stub_from {
+            return 0;
+        }
+        self.old.rec.stub.get(gj..gj + len).map_or(0, |v| v.iter().filter(|&&x| x).count())
     }
 
     /// Är tillståndet nu detsamma som före gammal grupp `gj`?
@@ -571,35 +630,50 @@ impl Fast {
     pub fn abandon(self, rec: &mut Rec, upto: usize, units: &mut HashMap<u64, Unit, IdBuild>, tick: u64) {
         let old = &self.old.rec;
         let mut n = Rec::with_capacity(upto, rec.has_sim);
-        let (mut g, mut pk) = (0usize, 0usize);
-        let take_patch = |n: &mut Rec, pk: usize| {
-            n.y.push(rec.y[pk]);
+        // `pk`: nästa post i de listor som bara de nya grupperna har; `py`: i `y`/`sim`, som också de förskjutna
+        // sträckorna har.
+        let (mut g, mut pk, mut py) = (0usize, 0usize, 0usize);
+        let take_patch = |n: &mut Rec, pk: usize, py: usize| {
+            n.y.push(rec.y[py]);
             if rec.has_sim {
-                n.sim.push(rec.sim[pk]);
+                n.sim.push(rec.sim[py]);
             }
             n.row.push(rec.row[pk]);
             n.gall.push(rec.gall[pk]);
             n.wstart.push(rec.wstart[pk]);
             n.key.push(rec.key[pk]);
+            n.plain.push(rec.plain[pk]);
+            n.stub.push(rec.stub[pk]);
         };
         let mut sparse_cnt: Vec<(u32, Counts)> = Vec::new();
         let mut sparse_extra: Vec<(u32, Box<Extra>)> = Vec::new();
         for r in &self.runs {
             while g < r.gi {
-                take_patch(&mut n, pk);
+                take_patch(&mut n, pk, py);
                 pk += 1;
+                py += 1;
                 g += 1;
             }
             let (dr, dg) = (r.rows.start as isize - r.old_row as isize, r.gi as isize - r.gj as isize);
             let s = r.gj..r.gj + r.len;
-            n.y.extend_from_slice(&old.y[s.clone()]);
-            if old.has_sim {
-                n.sim.extend_from_slice(&old.sim[s.clone()]);
+            if r.shifted {
+                n.y.extend_from_slice(&rec.y[py..py + r.len]);
+                if old.has_sim {
+                    n.sim.extend_from_slice(&rec.sim[py..py + r.len]);
+                }
+                py += r.len;
+            } else {
+                n.y.extend_from_slice(&old.y[s.clone()]);
+                if old.has_sim {
+                    n.sim.extend_from_slice(&old.sim[s.clone()]);
+                }
             }
             n.row.extend(old.row[s.clone()].iter().map(|&x| mv(x, dr)));
             n.gall.extend(old.gall[s.clone()].iter().map(|&x| mv(x, r.da)));
             n.wstart.extend(old.wstart[s.clone()].iter().map(|&x| mv(x, r.db)));
             n.key.extend_from_slice(&old.key[s.clone()]);
+            n.plain.extend_from_slice(&old.plain[s.clone()]);
+            n.stub.extend_from_slice(&old.stub[s.clone()]);
             for k in &old.key[s.clone()] {
                 if let Some(u) = units.get_mut(k) {
                     u.used = tick;
@@ -612,8 +686,9 @@ impl Fast {
             g += r.len;
         }
         while g < upto {
-            take_patch(&mut n, pk);
+            take_patch(&mut n, pk, py);
             pk += 1;
+            py += 1;
             g += 1;
         }
         sparse_cnt.extend(std::mem::take(&mut rec.cnt));
@@ -626,9 +701,10 @@ impl Fast {
     }
 
     /// Hur många grupper från `gi` (= gamla `gj`) som är oförändrade i följd.
-    pub fn run_len(&self, prep: &memo::Prep, gi: usize, gj: usize) -> usize {
+    pub fn run_len(&self, prep: &memo::Prep, gi: usize, gj: usize, lazy: bool) -> usize {
+        let lim = self.limit(lazy);
         let mut n = 0;
-        while gi + n < prep.groups.len() && gj + n < self.old.n() && prep.from[gi + n] as usize == gj + n {
+        while gi + n < prep.groups.len() && gj + n < lim && prep.from[gi + n] as usize == gj + n {
             n += 1;
         }
         n
@@ -669,7 +745,52 @@ impl Fast {
             n
         }));
         let row_end = mv(r.row[gj + len], dr);
-        self.runs.push(Run { gi, gj, len, rows: row_no..row_end, old_row: r.row[gj], da, db, cbase: Counts { all: 0, ..base }, c0: Counts { all: 0, ..c0 } });
+        self.runs.push(Run { gi, gj, len, rows: row_no..row_end, old_row: r.row[gj], da, db, cbase: Counts { all: 0, ..base }, c0: Counts { all: 0, ..c0 }, shifted: false });
+        row_end
+    }
+
+    /// Hur många oförändrade grupper från `gi` (= gamla `gj`) i följd som inte beror på sitt läge (`Rec::plain`).
+    pub fn plain_len(&self, prep: &memo::Prep, gi: usize, gj: usize, lazy: bool) -> usize {
+        let plain = &self.old.rec.plain;
+        let lim = self.limit(lazy);
+        let mut n = 0;
+        while gi + n < prep.groups.len() && gj + n < lim && prep.from[gi + n] as usize == gj + n && plain.get(gj + n).copied().unwrap_or(false) {
+            n += 1;
+        }
+        n
+    }
+
+    /// Som `splice`, men tillståndet före sträckan är ett annat än förut (bara `y` och sidsimuleringen; inga flytande bilder
+    /// eller öppna textrutor, och grupperna beror inte på sitt läge). Gruppernas utläggning är densamma; `y` och
+    /// sidsimuleringen förs fram grupp för grupp precis som i utläggningsvarvet (samma räkneordning, så att resultatet blir
+    /// detsamma bit för bit) och spelas in. Ger raden efter sträckan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn splice_shifted(&mut self, out: &mut Out, rec: &mut Rec, gi: usize, gj: usize, len: usize, row_no: usize, db: isize, multi: bool, y: &mut f32, sim: &mut Option<PageSim>) -> usize {
+        let a0 = out.all.len();
+        let row_end = self.splice(out, rec, gi, gj, len, row_no, db, multi);
+        if let Some(r) = self.runs.last_mut() {
+            r.shifted = true;
+        }
+        let old = &self.old.rec;
+        let base = old.gall[gj];
+        for g in gj..gj + len {
+            rec.y.push(*y);
+            if rec.has_sim {
+                rec.sim.push(sim.as_ref().map_or((0, 0), |s| (s.page as u32, s.shift.to_bits())));
+            }
+            let galleys = &out.all[a0 + old.gall[g] - base..a0 + old.gall[g + 1] - base];
+            if let Some(sm) = sim.as_mut() {
+                let mut gy = *y;
+                for g in galleys.iter() {
+                    for r in &g.rows {
+                        sm.place(gy + r.pos.y, r.row.size.y);
+                    }
+                    gy += g.rect.height();
+                }
+            }
+            let gh: f32 = galleys.iter().map(|g| g.rect.height()).sum();
+            *y += gh;
+        }
         row_end
     }
 
@@ -684,22 +805,29 @@ impl Fast {
     /// `rec` har fått under varvet, med en sista post för slutet).
     pub fn finish_rec(&mut self, rec: &mut Rec, n_new: usize) {
         let n_old = self.old.n();
-        let last_covers = self.runs.last().is_some_and(|r| r.gj + r.len == n_old && r.gi + r.len == n_new);
+        let covers = |runs: &[Run]| runs.last().is_some_and(|r| r.gj + r.len == n_old && r.gi + r.len == n_new);
+        let last_covers = covers(&self.runs);
+        // `y` och sidsimuleringen är nya för de förskjutna sträckorna (de spelades in under varvet): bara de exakta
+        // sträckorna tas från förra varvet.
+        let exact: Vec<Run> = self.runs.iter().filter(|r| !r.shifted).cloned().collect();
+        let exact_covers = covers(&exact);
         let old = &mut self.old.rec;
         let runs = &self.runs;
         let (mut y, mut sim, mut row, mut gall) = (std::mem::take(&mut rec.y), std::mem::take(&mut rec.sim), std::mem::take(&mut rec.row), std::mem::take(&mut rec.gall));
-        if last_covers {
+        if exact_covers {
             y.pop();
             sim.pop();
+        }
+        if last_covers {
             row.pop();
             gall.pop();
         }
         let mut v = std::mem::take(&mut old.y);
-        patch_dense(&mut v, runs, n_old, n_new, 1, y, |_, _| {}, |_| 0);
+        patch_dense(&mut v, &exact, n_old, n_new, 1, y, |_, _| {}, |_| 0);
         rec.y = v;
         if rec.has_sim {
             let mut v = std::mem::take(&mut old.sim);
-            patch_dense(&mut v, runs, n_old, n_new, 1, sim, |_, _| {}, |_| 0);
+            patch_dense(&mut v, &exact, n_old, n_new, 1, sim, |_, _| {}, |_| 0);
             rec.sim = v;
         }
         let mut v = std::mem::take(&mut old.row);
@@ -714,6 +842,12 @@ impl Fast {
         let mut v = std::mem::take(&mut old.key);
         patch_dense(&mut v, runs, n_old, n_new, 0, std::mem::take(&mut rec.key), |_, _| {}, |_| 0);
         rec.key = v;
+        let mut v = std::mem::take(&mut old.plain);
+        patch_dense(&mut v, runs, n_old, n_new, 0, std::mem::take(&mut rec.plain), |_, _| {}, |_| 0);
+        rec.plain = v;
+        let mut v = std::mem::take(&mut old.stub);
+        patch_dense(&mut v, runs, n_old, n_new, 0, std::mem::take(&mut rec.stub), |_, _| {}, |_| 0);
+        rec.stub = v;
         let mut v = std::mem::take(&mut old.cnt);
         patch_sparse(&mut v, runs, n_old, n_new, 1, std::mem::take(&mut rec.cnt), |c, r| {
             if r.cbase == r.c0 {
@@ -742,15 +876,19 @@ impl Fast {
 
 /// `Galley::concat` för en grupps gallerier, från rektangeln `rect` (allt före gruppen): radernas lägen läggs till
 /// `rows`. `last`: gruppen är dokumentets sista. Ger rektangeln efter gruppen och gruppens hörn, index och `elided`.
-pub(super) fn concat_group(galleys: &[Arc<Galley>], mut rect: Rect, ppp: f32, last: bool, rows: &mut Vec<PlacedRow>) -> (Rect, usize, usize, bool) {
+pub(super) fn concat_group(galleys: &[Arc<Galley>], mut rect: Rect, ppp: f32, last: bool, rows: &mut Vec<PlacedRow>) -> (Rect, usize, usize, bool, [f32; 2]) {
     let (mut nv, mut ni, mut el) = (0, 0, false);
+    // Radernas utsträckning i x (som de läggs till rektangeln): galleriets bredd räknas av dem i ett återupptaget varv.
+    let mut x = [f32::INFINITY, f32::NEG_INFINITY];
     for (i, galley) in galleys.iter().enumerate() {
         let offset = rect.height();
         let is_last_galley = last && i + 1 == galleys.len();
         for (row_idx, placed_row) in galley.rows.iter().enumerate() {
             let new_pos = placed_row.pos + offset * egui::Vec2::Y;
             let new_pos = new_pos.round_to_pixels(ppp);
-            rect |= Rect::from_min_size(new_pos, placed_row.size);
+            let rr = Rect::from_min_size(new_pos, placed_row.size);
+            rect |= rr;
+            x = [x[0].min(rr.min.x), x[1].max(rr.max.x)];
             let is_last_row_in_galley = row_idx + 1 == galley.rows.len();
             let mut row = Arc::clone(&placed_row.row);
             // Som `Galley::round_output_to_gui` (görs efter rektangeln).
@@ -764,7 +902,7 @@ pub(super) fn concat_group(galleys: &[Arc<Galley>], mut rect: Rect, ppp: f32, la
         ni += galley.num_indices;
         el |= galley.elided;
     }
-    (rect, nv, ni, el)
+    (rect, nv, ni, el, x)
 }
 
 /// Rektangeln som `Galley::round_output_to_gui` ger.
@@ -1065,8 +1203,8 @@ impl<'a> Pager<'a> {
         let page_top = self.page as f32 * self.stride;
         let forced = self.breaks.binary_search(&i).is_ok();
         self.flow.enter(self.page);
-        let need = self.flow.need(i..end).1;
-        let limit = page_top + self.text_h - self.flow.reserved - need;
+        let mut need = self.flow.need(i..end);
+        let limit = page_top + self.text_h - self.flow.reserved - need.1;
         if i == 0 {
             self.snaps.push(self.state(0));
         }
@@ -1081,8 +1219,10 @@ impl<'a> Pager<'a> {
             let ppp = self.ppp;
             self.shift = ((self.page as f32 * self.stride - y0) * ppp).round() / ppp;
             self.flow.enter(self.page);
+            // Ny sida: noterna på den är andra (behovet räknas om).
+            need = self.flow.need(i..end);
         }
-        let (new, extra) = self.flow.need(i..end);
+        let (new, extra) = need;
         self.flow.commit(new, extra);
         self.prev_bottom = y0 + self.shift + h;
         if fh > 0.0 {
@@ -1152,18 +1292,42 @@ pub(super) struct FlatRows<'a> {
     pub cur: usize,
     pub first: usize,
     pub rows: Vec<PlacedRow>,
+    /// De ändrade gruppernas rader, redan sammanfogade (`pre`), i sträckor (första nya rad, index i `pre`, antal). Varje
+    /// rad hämtas en gång (`take`), så den flyttas till det nya galleriet i stället för att kopieras.
+    pub pre: Vec<Option<PlacedRow>>,
+    pub segs: &'a [(usize, usize, usize)],
+    pub seg: usize,
 }
 
 impl FlatRows<'_> {
+    /// Index i `pre` för rad `r`, om den finns där (raderna ska komma i stigande ordning).
+    fn pre_index(&mut self, r: usize) -> Option<usize> {
+        while self.seg < self.segs.len() && self.segs[self.seg].0 + self.segs[self.seg].2 <= r {
+            self.seg += 1;
+        }
+        self.segs.get(self.seg).filter(|x| x.0 <= r).map(|&(r0, i0, _)| i0 + r - r0)
+    }
+
+    /// Rad `r` för det nya galleriet: flyttad ur `pre` eller kopierad (efter `at` för samma rad).
+    pub fn take(&mut self, r: usize) -> PlacedRow {
+        match self.pre_index(r).and_then(|i| self.pre[i].take()) {
+            Some(pr) => pr,
+            None => self.at(r).clone(),
+        }
+    }
+
     /// Rad `r` (raderna ska komma i stigande ordning).
     pub fn at(&mut self, r: usize) -> &PlacedRow {
+        if let Some(i) = self.pre_index(r).filter(|&i| self.pre[i].is_some()) {
+            return self.pre[i].as_ref().expect("raden finns");
+        }
         if self.cur == usize::MAX || r >= self.first + self.rows.len() || r < self.first {
             let mut gi = self.row.partition_point(|&x| x <= r).saturating_sub(1).min(self.n_groups - 1);
             while gi + 1 < self.n_groups && self.row[gi + 1] <= r {
                 gi += 1;
             }
             self.rows.clear();
-            concat_group(&self.all[self.gall[gi]..self.gall[gi + 1]], self.rect[gi], self.ppp, gi + 1 == self.n_groups, &mut self.rows);
+            let _ = concat_group(&self.all[self.gall[gi]..self.gall[gi + 1]], self.rect[gi], self.ppp, gi + 1 == self.n_groups, &mut self.rows);
             if !self.pulls_empty {
                 let first = self.row[gi];
                 for (k, pr) in self.rows.iter_mut().enumerate() {
@@ -1240,39 +1404,63 @@ pub(super) fn finish_fast(
     let mut p_nv: Vec<u32> = Vec::new();
     let mut p_ni: Vec<u32> = Vec::new();
     let mut p_el: Vec<bool> = Vec::new();
+    let mut p_x: Vec<[f32; 2]> = Vec::new();
     let mut dcs: Vec<isize> = Vec::with_capacity(f.runs.len());
     let mut rect = Rect::ZERO;
     let mut chars = 0usize;
     let mut dirty: Vec<Range<usize>> = Vec::new();
     let mut dirty_groups: Vec<usize> = Vec::new();
     let mut pulls = Pulls::new(&out.pulls, &out.shifts);
+    // De ändrade gruppernas rader efter sammanfogningen (och textrutornas drag), för sidindelningen (`FlatRows::pre`).
     let mut tmp: Vec<PlacedRow> = Vec::new();
+    let mut segs: Vec<(usize, usize, usize)> = Vec::new();
+    // Sträckorna vars rader står kvar (samma lägen före sidindelningen som förut). En förskjuten sträcka, eller en vars
+    // rektangel (i y) eller drag från textrutorna inte är desamma som förut, räknas om grupp för grupp som de ändrade.
+    let mut kept: Vec<Run> = Vec::with_capacity(f.runs.len());
+    // Grupperna som inte finns i någon sträcka (nya eller ändrade): bara deras fotnoter och referenser kan ha ändrats.
+    let mut fresh_groups: Vec<usize> = Vec::new();
+    let mut moved_until = 0usize;
+    let same_y = |a: &Rect, b: &Rect| a.min.y.to_bits() == b.min.y.to_bits() && a.max.y.to_bits() == b.max.y.to_bits();
+    if let Some(r) = f.runs.iter().find(|r| r.shifted || r.gi > 0) {
+        tmp.reserve(n_rows.saturating_sub(r.rows.start.min(rec.row[r.gi])));
+    }
     let mut runs = f.runs.iter().peekable();
     let mut gi = 0;
     while gi < n {
         if let Some(run) = runs.next_if(|r| r.gi == gi) {
             let j = run.gj;
-            if op.rect[j] != rect || cum_at(&out.pulls, run.rows.start) != cum_at(&op.pulls, run.old_row) {
-                return Err((job, 23));
+            // Sista gruppen får ingen radbrytning efter sista raden: en sträcka som slutade dokumentet förut ska göra det nu.
+            let ends_same = (j + run.len == n_old) == (gi + run.len == n);
+            if !run.shifted && ends_same && same_y(&op.rect[j], &rect) && cum_at(&out.pulls, run.rows.start) == cum_at(&op.pulls, run.old_row) {
+                let dc = chars as isize - op.chars[j] as isize;
+                dcs.push(dc);
+                rect = op.rect[j + run.len];
+                chars = mv(op.chars[j + run.len], dc);
+                gi += run.len;
+                kept.push(run.clone());
+                continue;
             }
-            let dc = chars as isize - op.chars[j] as isize;
-            dcs.push(dc);
-            rect = op.rect[j + run.len];
-            chars = mv(op.chars[j + run.len], dc);
-            gi += run.len;
-            continue;
+            moved_until = gi + run.len;
+        }
+        if gi >= moved_until {
+            fresh_groups.push(gi);
         }
         p_rect.push(rect);
         p_chars.push(chars);
-        tmp.clear();
-        let (r, v, i, e) = concat_group(&out.all[rec.gall[gi]..rec.gall[gi + 1]], rect, ppp, gi + 1 == n, &mut tmp);
+        let t0 = tmp.len();
+        let (r, v, i, e, x) = concat_group(&out.all[rec.gall[gi]..rec.gall[gi + 1]], rect, ppp, gi + 1 == n, &mut tmp);
         rect = r;
         p_nv.push(v as u32);
         p_ni.push(i as u32);
         p_el.push(e);
+        p_x.push(x);
         let first = rec.row[gi];
+        match segs.last_mut() {
+            Some(l) if l.0 + l.2 == first => l.2 += tmp.len() - t0,
+            _ => segs.push((first, t0, tmp.len() - t0)),
+        }
         let mut u = Rect::NOTHING;
-        for (k, pr) in tmp.iter_mut().enumerate() {
+        for (k, pr) in tmp[t0..].iter_mut().enumerate() {
             chars += pr.char_count_including_newline().0;
             if !pulls_empty {
                 pr.pos.y = pulls.y(first + k, pr.pos.y, ppp);
@@ -1284,16 +1472,19 @@ pub(super) fn finish_fast(
         }
         dirty_groups.push(gi);
         if rec.row[gi + 1] > first {
-            dirty.push(first..rec.row[gi + 1]);
+            match dirty.last_mut() {
+                Some(l) if l.end == first => l.end = rec.row[gi + 1],
+                _ => dirty.push(first..rec.row[gi + 1]),
+            }
         }
         gi += 1;
     }
-    let last_covers = f.runs.last().is_some_and(|r| r.gj + r.len == n_old && r.gi + r.len == n);
+    let last_covers = kept.last().is_some_and(|r| r.gj + r.len == n_old && r.gi + r.len == n);
     if !last_covers {
         p_rect.push(rect);
         p_chars.push(chars);
     }
-    let runs_v = &f.runs;
+    let runs_v = &kept;
     let dc_of = |r: &Run| runs_v.iter().position(|x| x.gi == r.gi).map_or(0, |k| dcs[k]);
     let mut rect_v = std::mem::take(&mut op.rect);
     patch_dense(&mut rect_v, runs_v, n_old, n, 1, p_rect, |_, _| {}, |_| 0);
@@ -1309,6 +1500,8 @@ pub(super) fn finish_fast(
     patch_dense(&mut ni_v, runs_v, n_old, n, 0, p_ni, |_, _| {}, |_| 0);
     let mut el_v = std::mem::take(&mut op.elided);
     patch_dense(&mut el_v, runs_v, n_old, n, 0, p_el, |_, _| {}, |_| 0);
+    let mut x_v = std::mem::take(&mut op.xr);
+    patch_dense(&mut x_v, runs_v, n_old, n, 0, p_x, |_, _| {}, |_| 0);
     let n_dirty = dirty_groups.len();
     let mut fmesh_v = std::mem::take(&mut op.fmesh);
     patch_dense(&mut fmesh_v, runs_v, n_old, n, 0, vec![Rect::NOTHING; n_dirty], |_, _| {}, |_| 0);
@@ -1321,8 +1514,21 @@ pub(super) fn finish_fast(
         return Err((job, 24));
     }
     let mut changed_notes: Vec<usize> = Vec::new();
-    for &g in &dirty_groups {
-        let (n0, n1) = (sparse_at(&rec.cnt, g).map_or(0, |c| c.notes), sparse_at(&rec.cnt, g + 1).map_or(0, |c| c.notes));
+    // Antalet noter före en grupp (glesa poster i `rec.cnt`), i stigande gruppordning.
+    let mut cnt_at = {
+        let mut k = 0usize;
+        move |g: usize| -> usize {
+            while k < rec.cnt.len() && rec.cnt[k].0 as usize <= g {
+                k += 1;
+            }
+            if k > 0 && rec.cnt[k - 1].0 as usize > g {
+                k = rec.cnt.partition_point(|e| e.0 as usize <= g);
+            }
+            k.checked_sub(1).map_or(0, |i| rec.cnt[i].1.notes)
+        }
+    };
+    for &g in &fresh_groups {
+        let (n0, n1) = (cnt_at(g), cnt_at(g + 1));
         for i in n0..n1.min(out.notes.len()) {
             let h = out.notes[i].galley.rect.height() + px(zoom, 2.0);
             if h.to_bits() != heights[i].to_bits() {
@@ -1336,14 +1542,16 @@ pub(super) fn finish_fast(
         return Err((job, 25));
     }
     // De gamla referensernas rader räknas om till nya (de i ersatta grupper tas bort och noteras), på plats.
+    // Sträckor som räknats om (förskjutna) har samma rader som förut: deras referenser flyttas också bara.
     let mut old_dirty_notes: Vec<usize> = Vec::new();
     {
+        let all_runs = &f.runs;
         let mut k = 0;
         spec.refs.retain_mut(|x| {
-            while k < f.runs.len() && f.runs[k].old_row + f.runs[k].rows.len() <= x.0 {
+            while k < all_runs.len() && all_runs[k].old_row + all_runs[k].rows.len() <= x.0 {
                 k += 1;
             }
-            match f.runs.get(k).filter(|r| r.old_row <= x.0) {
+            match all_runs.get(k).filter(|r| r.old_row <= x.0) {
                 Some(r) => {
                     x.0 = r.rows.start + (x.0 - r.old_row);
                     true
@@ -1361,22 +1569,33 @@ pub(super) fn finish_fast(
         let mut index: Option<HashMap<&str, usize, std::hash::BuildHasherDefault<Fx>>> = None;
         let all = &out.all;
         let gall = &rec.gall;
-        for &g in &dirty_groups {
+        // Grupperna kommer i stigande ordning: sökningen bland bitarna börjar där den förra slutade.
+        let mut i0 = 0usize;
+        let mut searched = 0usize;
+        for &g in &fresh_groups {
             let w = &groups[g].1;
-            let i0 = a.pieces.partition_point(|pc| pc.range.end <= w.start);
+            i0 += a.pieces[i0..].partition_point(|pc| pc.range.end <= w.start);
             for pc in a.pieces[i0..].iter().take_while(|pc| pc.range.start < w.end) {
                 let Some(l) = pc.footnote_ref.as_deref() else { continue };
                 if pc.range.start < w.start {
                     continue;
                 }
-                let index = index.get_or_insert_with(|| {
-                    let mut m: HashMap<&str, usize, std::hash::BuildHasherDefault<Fx>> = HashMap::default();
-                    for (i, x) in out.notes.iter().enumerate() {
-                        m.entry(x.label.as_str()).or_insert(i);
-                    }
-                    m
-                });
-                let Some(&k) = index.get(l) else { continue };
+                // Den första noten med etiketten: för några få referenser räcker en genomgång av noterna (billigare än
+                // att bygga ett register över tusentals noter vid varje tangent).
+                searched += 1;
+                let found = if searched <= 8 {
+                    out.notes.iter().position(|x| x.label == l)
+                } else {
+                    let index = index.get_or_insert_with(|| {
+                        let mut m: HashMap<&str, usize, std::hash::BuildHasherDefault<Fx>> = HashMap::default();
+                        for (i, x) in out.notes.iter().enumerate() {
+                            m.entry(x.label.as_str()).or_insert(i);
+                        }
+                        m
+                    });
+                    index.get(l).copied()
+                };
+                let Some(k) = found else { continue };
                 let chars0 = chars_v[g] + text[w.start..pc.range.start].chars().count();
                 let (mut cs, mut r, mut gg, mut kk) = (chars_v[g], rec.row[g], g, 0);
                 let row = loop {
@@ -1415,8 +1634,8 @@ pub(super) fn finish_fast(
     }
     // Nya rader -> gamla rader för de oförändrade sträckorna.
     let to_old = |r: usize| -> Option<usize> {
-        let k = f.runs.partition_point(|x| x.rows.start <= r).checked_sub(1)?;
-        let x = &f.runs[k];
+        let k = kept.partition_point(|x| x.rows.start <= r).checked_sub(1)?;
+        let x = &kept[k];
         (r < x.rows.end).then(|| x.old_row + (r - x.rows.start))
     };
     let mut changes = dirty.clone();
@@ -1442,20 +1661,22 @@ pub(super) fn finish_fast(
         cur: usize::MAX,
         first: 0,
         rows: Vec::new(),
+        pre: std::mem::take(&mut tmp).into_iter().map(Some).collect(),
+        segs: &segs,
+        seg: 0,
     };
     let mut pos = 0usize;
     let mut end = op.end;
     let mut k = 0usize;
     let (mut ys, mut hs) = (Vec::new(), Vec::new());
-    let mut unit: Vec<PlacedRow> = Vec::new();
     while k < changes.len() {
         let c0 = changes[k].start.max(pos);
         // Senaste sparade tillståndet i den oförändrade sträckan mellan `pos` och `c0` (före rad 0: början).
         let mut best: Option<PSnap> = None;
-        if let Some(o_hi) = last_mapped(&f.runs, c0) {
+        if let Some(o_hi) = last_mapped(&kept, c0) {
             let si = op.snaps.partition_point(|x| x.row <= o_hi);
             for x in op.snaps[..si].iter().rev() {
-                match to_new(&f.runs, x.row) {
+                match to_new(&kept, x.row) {
                     Some(rn) if rn >= pos && rn <= c0 => {
                         best = Some(PSnap { row: rn, ..x.clone() });
                         break;
@@ -1477,7 +1698,7 @@ pub(super) fn finish_fast(
         let first_end = changes[k].end;
         let mut i = rn;
         let mut conv = None;
-        let mut new_rows: Vec<PlacedRow> = Vec::new();
+        let mut new_rows: Vec<PlacedRow> = Vec::with_capacity(flat.pre.len().min(n_rows - rn) + 64);
         while i < n_rows {
             while k < changes.len() && changes[k].end <= i {
                 k += 1;
@@ -1496,16 +1717,16 @@ pub(super) fn finish_fast(
             let e = pager.unit_end(i, n_rows);
             ys.clear();
             hs.clear();
-            unit.clear();
+            let base = new_rows.len();
             for r in i..e {
                 let pr = flat.at(r);
                 ys.push(pr.pos.y);
                 hs.push(pr.row.size.y);
-                unit.push(pr.clone());
+                new_rows.push(flat.take(r));
             }
             let shift = pager.place(i, e, &ys, &hs);
-            for pr in unit.drain(..) {
-                new_rows.push(PlacedRow { pos: pos2(pr.pos.x, pr.pos.y + shift), ..pr });
+            for pr in &mut new_rows[base..] {
+                pr.pos.y += shift;
             }
             i = e;
         }
@@ -1563,10 +1784,10 @@ pub(super) fn finish_fast(
     {
         let mut k = 0;
         snaps.retain_mut(|x| {
-            while k < f.runs.len() && f.runs[k].old_row + f.runs[k].rows.len() <= x.row {
+            while k < kept.len() && kept[k].old_row + kept[k].rows.len() <= x.row {
                 k += 1;
             }
-            match f.runs.get(k).filter(|r| r.old_row <= x.row) {
+            match kept.get(k).filter(|r| r.old_row <= x.row) {
                 Some(r) => {
                     x.row = r.rows.start + (x.row - r.old_row);
                     true
@@ -1579,16 +1800,21 @@ pub(super) fn finish_fast(
         let (s0, s1) = (snaps.partition_point(|x| x.row < new.start), snaps.partition_point(|x| x.row < new.end));
         snaps.splice(s0..s1, std::mem::take(new_snaps));
     }
-    // Ritytor för grupper med omräknade rader.
+    // Ritytor för grupper med omräknade rader (en gång per grupp: fönstren och de ändrade grupperna överlappar oftast).
+    let mut meshed_to = 0usize;
     for (_, new, _, _) in &windows {
-        let mut g = rec.row.partition_point(|&x| x <= new.start).saturating_sub(1);
+        let mut g = rec.row.partition_point(|&x| x <= new.start).saturating_sub(1).max(meshed_to);
         while g < n && rec.row[g] < new.end {
             fmesh_v[g] = mesh_of(&rows[rec.row[g]..rec.row[g + 1]]);
             g += 1;
         }
+        meshed_to = meshed_to.max(g);
     }
+    let in_window = |g: usize| windows.iter().any(|(_, new, _, _)| rec.row[g] >= new.start && rec.row[g + 1] <= new.end && new.start < new.end);
     for &g in &dirty_groups {
-        fmesh_v[g] = mesh_of(&rows[rec.row[g]..rec.row[g + 1]]);
+        if windows.len() > 4 || !in_window(g) {
+            fmesh_v[g] = mesh_of(&rows[rec.row[g]..rec.row[g + 1]]);
+        }
     }
     // Summorna: om för de block av grupper som ändrats (alla efter den första ändringen om antalet grupper ändrats).
     let mut sums = std::mem::take(&mut op.sums);
@@ -1599,35 +1825,43 @@ pub(super) fn finish_fast(
         sums.truncate((first_changed / CHUNK).min(sums.len()));
         redo.extend(sums.len()..n_chunks);
     } else {
-        redo.extend(dirty_groups.iter().map(|g| g / CHUNK));
+        let mut mark = vec![false; n_chunks];
+        for g in &dirty_groups {
+            mark[g / CHUNK] = true;
+        }
         for (_, new, _, _) in &windows {
             let g0 = rec.row.partition_point(|&x| x <= new.start).saturating_sub(1);
             let g1 = rec.row.partition_point(|&x| x < new.end).min(n);
-            redo.extend(g0 / CHUNK..=(g1.saturating_sub(1) / CHUNK).max(g0 / CHUNK));
+            for m in &mut mark[(g0 / CHUNK).min(n_chunks)..=(g1.saturating_sub(1) / CHUNK).max(g0 / CHUNK).min(n_chunks.saturating_sub(1))] {
+                *m = true;
+            }
         }
-        redo.sort_unstable();
-        redo.dedup();
+        redo.extend((0..n_chunks).filter(|&k| mark[k]));
     }
-    sums.resize(n_chunks, Sum { nv: 0, ni: 0, el: false, mesh: Rect::NOTHING, urect: Rect::NOTHING });
+    sums.resize(n_chunks, SUM0);
     for k in redo {
         if k < n_chunks {
-            sums[k] = sum_of(&nv_v, &ni_v, &el_v, &fmesh_v, &urect_v, k * CHUNK..((k + 1) * CHUNK).min(n));
+            sums[k] = sum_of(&nv_v, &ni_v, &el_v, &fmesh_v, &urect_v, &x_v, k * CHUNK..((k + 1) * CHUNK).min(n));
         }
     }
     let (mut nv, mut ni, mut el) = (0usize, 0usize, false);
     let mut mesh = Rect::NOTHING;
     let mut u = Rect::ZERO;
+    let mut xs = [0.0f32, 0.0f32];
     for x in &sums {
         nv += x.nv;
         ni += x.ni;
         el |= x.el;
         mesh |= x.mesh;
         u |= x.urect;
+        xs = [xs[0].min(x.x[0]), xs[1].max(x.x[1])];
     }
-    let mut r = if pulls_empty { round_rect(rect_v[n], wrap_width) } else { u };
+    // Rektangeln som sammanfogningen ger: y från den sista gruppen, x från alla rader (från noll, som `Rect::ZERO`).
+    let full = Rect::from_min_max(pos2(xs[0], rect_v[n].min.y), pos2(xs[1], rect_v[n].max.y));
+    let mut r = if pulls_empty { round_rect(full, wrap_width) } else { u };
     r.max.y = r.max.y.max(end.0).max(end.1);
     let g = galley_from(job, rows, r, mesh, nv, ni, el, ppp);
-    let pt = PageTrace { rect: rect_v, chars: chars_v, urect: urect_v, fmesh: fmesh_v, nv: nv_v, ni: ni_v, elided: el_v, snaps, pout, end, spec, pulls: out.pulls.clone(), sums };
+    let pt = PageTrace { rect: rect_v, chars: chars_v, urect: urect_v, fmesh: fmesh_v, nv: nv_v, ni: ni_v, elided: el_v, xr: x_v, snaps, pout, end, spec, pulls: out.pulls.clone(), sums };
     Ok((g, pt, touched))
 }
 
@@ -1677,7 +1911,16 @@ mod tests {
         let words = ["alfa", "beta", "gamma", "delta", "åäö", "text", "rad", "stycke", "dokument", "sida", "ord"];
         let mut s = String::from("<!-- kladd: sida=a5 -->\n\n");
         let mut notes = 0;
+        // Brödtext i `<div>`-block över flera stycken, ibland nästlade.
+        let mut depth = 0;
         for i in 0..paras {
+            if depth < 2 && r.below(12) == 0 {
+                s.push_str(["<div align=\"justify\">\n\n", "<div align=\"center\">\n\n"][r.below(2)]);
+                depth += 1;
+            } else if depth > 0 && r.below(8) == 0 {
+                s.push_str("</div>\n\n");
+                depth -= 1;
+            }
             let mut line = String::new();
             for _ in 0..(3 + r.below(60)) {
                 let w = words[r.below(words.len())];
@@ -1701,9 +1944,14 @@ mod tests {
                 }
                 10 if sections && r.below(4) == 0 => s.push_str("<!-- kladd: avsnitt; columns: 2; type: continuous -->"),
                 11 => s.push_str("<!--k:ep-->"),
+                // Olika breda spalter (utjämnas, inget återupptaget varv).
+                12 if sections && r.below(6) == 0 => s.push_str("<!-- kladd: avsnitt; columns: 2; column-gap: 10mm; column-widths: 60mm 30mm; type: continuous -->"),
                 _ => s.push_str(&line),
             }
             s.push_str("\n\n");
+        }
+        for _ in 0..depth {
+            s.push_str("</div>\n\n");
         }
         for n in 1..=notes {
             s.push_str(&format!("[^{n}]: Fotnot {n} med *text* och mer text"));
@@ -1772,16 +2020,21 @@ mod tests {
 
     /// Slumpade ändringar: galleriet, sidorna och fotnoterna ska bli exakt desamma som när hela varvet görs (en cache
     /// utan återupptagning), och ibland som i en helt ny cache. Ger hur många gånger sidindelningen återupptogs.
-    fn resumed_equals_full(seed: u64, paras: usize, steps: usize, sections: bool) -> (usize, usize) {
+    /// `ppp` = skalningen: utom vid 1 (eller en tvåpotens) avrundas lägena till bråkdelar av en punkt.
+    fn resumed_equals_full(seed: u64, paras: usize, steps: usize, sections: bool, ppp: f32) -> (usize, usize, usize) {
         incr::MIN_OVERRIDE.with(|m| m.set(Some(1000)));
         let pal = theme::palette(false);
         let img = |k: &str| Some(if k.contains("b.png") { egui::vec2(80.0, 60.0) } else { egui::vec2(100.0, 120.0) });
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
+        if ppp != 1.0 {
+            ctx.set_zoom_factor(ppp);
+            std::mem::forget(ctx.run_ui(Default::default(), |_| {}));
+        }
         let mut r = Rng(seed);
         let mut text = doc(&mut r, paras, sections);
         let (mut c, mut control) = (Cache::default(), Cache::default());
-        let (mut resumed, mut gave_up) = (0, 0);
+        let (mut resumed, mut gave_up, mut shifted) = (0, 0, 0);
         let mut at = 0;
         for step in 0..steps {
             if step > 0 {
@@ -1794,11 +2047,13 @@ mod tests {
             let a0 = markup::analyze(&text);
             let geom = pages::Geom::for_sections(1.0, &a0.defaults, &a0.sections);
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, egui::Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             let out = ctx.run_ui(Default::default(), |_| {
+                assert_eq!(ctx.pixels_per_point(), ppp);
                 let g = c.galley_paged(&ctx, 1, &text, &p, geom.edit_w(), Some(&geom));
                 resumed += usize::from(c.stats(1).resumed);
                 gave_up += usize::from(c.stats(1).resume_why == 30);
+                shifted += c.stats(1).shifted;
                 let got = shape(&mut c, &g, &text);
                 OFF.with(|o| o.set(true));
                 let f = control.galley_paged(&ctx, 1, &text, &p, geom.edit_w(), Some(&geom));
@@ -1818,20 +2073,27 @@ mod tests {
             std::mem::forget(out);
         }
         incr::MIN_OVERRIDE.with(|m| m.set(None));
-        (resumed, gave_up)
+        (resumed, gave_up, shifted)
     }
 
     #[test]
     fn resumed_layout_equals_full_layout() {
         let seeds = std::env::var("KLADD_FUZZ_SEEDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(3, |n| (n / 10).max(3));
-        let (mut resumed, mut gave_up) = (0, 0);
+        let (mut resumed, mut gave_up, mut shifted) = (0, 0, 0);
         for seed in 0..seeds {
-            let (r, g) = resumed_equals_full(9001 + seed * 7, 140, 30, false);
+            // Vartannat frö ger upp det återupptagna varvet tidigt (`Fast::abandon`, också efter förskjutna sträckor).
+            GIVE_UP.with(|g| g.set(if seed % 2 == 1 { 0 } else { 64 }));
+            // Ibland en skalning som inte är en tvåpotens (125 %, 150 %).
+            let ppp = [1.0, 1.25, 1.0, 1.5][seed as usize % 4];
+            let (r, g, s) = resumed_equals_full(9001 + seed * 7, 140, 30, false, ppp);
             resumed += r;
             gave_up += g;
+            shifted += s;
         }
+        GIVE_UP.with(|g| g.set(64));
         assert!(resumed > seeds as usize * 5, "återupptogs bara {resumed} gånger");
-        // Ändringar som ändrar höjden ger upp det återupptagna varvet (`Fast::abandon`): den vägen provas också.
+        // Ändringar som ändrar höjden tar resten förskjutet från förra varvet (`splice_shifted`), och ibland ges varvet upp.
+        assert!(shifted > 0, "inga förskjutna sträckor");
         assert!(gave_up > 0, "inget varv gavs upp");
     }
 
@@ -1839,7 +2101,7 @@ mod tests {
     fn resumed_layout_with_sections_equals_full_layout() {
         let seeds = std::env::var("KLADD_FUZZ_SEEDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(2, |n| (n / 15).max(2));
         for seed in 0..seeds {
-            resumed_equals_full(31337 + seed * 13, 120, 24, true);
+            let _ = resumed_equals_full(31337 + seed * 13, 120, 24, true, if seed % 2 == 1 { 1.25 } else { 1.0 });
         }
     }
 }

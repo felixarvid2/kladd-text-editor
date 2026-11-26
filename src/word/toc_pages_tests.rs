@@ -25,7 +25,7 @@ fn view_pages(text: &str) -> Vec<(String, usize)> {
     for _ in 0..2 {
         let r = ctx.run_ui(Default::default(), |_| {
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal: 0..0, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal: 0..0, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             let g = cache.galley_paged(&ctx, 1, text, &p, geom.edit_w(), Some(&geom));
             let boxes = cache.page_boxes(1, text);
             out = nav::headings(text, &a)

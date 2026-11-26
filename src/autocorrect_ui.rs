@@ -58,9 +58,7 @@ pub(crate) fn run_in_editor(ctx: &Context, id: Id, text: &mut String, cfg: &Conf
     }
     let Some(fix) = autocorrect::on_typed(text, caret, cfg, lang) else { return false };
     let before = (CCursorRange::one(CCursor::new(range.primary.index.0)), text.clone());
-    let mut undoer = state.undoer();
-    undoer.add_undo(&before);
-    state.set_undoer(undoer);
+    crate::undo::add_undo(ctx, id, &before.0, &before.1);
     let (new_text, new_caret) = fix.apply(text, caret);
     *text = new_text;
     state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(byte_to_char(text, new_caret)))));
@@ -245,28 +243,27 @@ mod tests {
             let mut s = TextEditState::load(&self.ctx, self.id).unwrap_or_default();
             let ci = s.cursor.char_range().unwrap().primary.index.0;
             let b = char_to_byte(&self.text, ci);
-            let mut undoer = s.undoer();
-            undoer.feed_state(0.0, &(s.cursor.char_range().unwrap(), self.text.clone()));
+            let hist = crate::undo::history(&self.ctx, self.id);
+            hist.lock().unwrap().feed_state(0.0, &s.cursor.char_range().unwrap(), &self.text);
             self.text.insert(b, c);
             let after = CCursorRange::one(CCursor::new(ci + 1));
             s.cursor.set_char_range(Some(after));
-            undoer.feed_state(0.1, &(after, self.text.clone()));
-            s.set_undoer(undoer);
+            hist.lock().unwrap().feed_state(0.1, &after, &self.text);
             s.store(&self.ctx, self.id);
             run_in_editor(&self.ctx, self.id, &mut self.text, cfg, Lang::Sv, c)
         }
 
         fn undo(&mut self) {
             let mut s = TextEditState::load(&self.ctx, self.id).unwrap();
-            let cur = (s.cursor.char_range().unwrap(), self.text.clone());
-            let mut undoer = s.undoer();
-            // Som TextEdit: matas med aktuell bild först (korrigeringen), sedan ångra.
-            undoer.feed_state(0.3, &cur);
-            if let Some((range, text)) = undoer.undo(&cur).cloned() {
+            let cur = s.cursor.char_range().unwrap();
+            let hist = crate::undo::history(&self.ctx, self.id);
+            let mut h = hist.lock().unwrap();
+            // Som fältet: matas med aktuell bild först (korrigeringen), sedan ångra.
+            h.feed_state(0.3, &cur, &self.text);
+            if let Some((range, text)) = h.undo(&cur, &self.text) {
                 self.text = text;
                 s.cursor.set_char_range(Some(range));
             }
-            s.set_undoer(undoer);
             s.store(&self.ctx, self.id);
         }
     }

@@ -138,7 +138,6 @@ pub(super) fn layout_def(
         palette: p.palette,
         zoom: p.zoom,
         reveal: 0..0,
-        matches: &[],
         image_size: p.image_size,
         measure: p.measure,
         font_family: p.font_family,
@@ -152,8 +151,8 @@ pub(super) fn layout_def(
     q.page_break = false;
     q.col_break = false;
     let key = {
-        // Den statiska nyckeln gäller så länge markören inte står i raden (här visas aldrig markup) och inga sökträffar finns.
-        let skey = if p.matches.is_empty() && !intersects(&p.reveal, w) { skey } else { unit_key_static(text, a, &pv, w) };
+        // Den statiska nyckeln gäller så länge markören inte står i raden (här visas aldrig markup).
+        let skey = if !intersects(&p.reveal, w) { skey } else { unit_key_static(text, a, &pv, w) };
         let mut h = Fx(unit_key_with(env, skey, w, std::slice::from_ref(&q)));
         (wrap_width.to_bits(), 0xF007u32).hash(&mut h);
         h.finish()

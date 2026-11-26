@@ -276,6 +276,111 @@ impl CommonMarkViewerInternal {
         (re, std::mem::take(&mut self.checkbox_events))
     }
 
+    /// Kladd: ritar ett enda toppnivåblock (`text[a.range]`) som en egen visning, med källpositioner
+    /// (sökträffar, markeringar, kryssrutor, blockstil) räknade i hela texten. Används av läsläget för
+    /// att bara rita de block som syns (`src/mdwin.rs`). Blocket får samma avstånd till föregående
+    /// block som i en helritning: starten sätter in sin rad om det inte är första blocket och slutet
+    /// sin rad om det inte är sista.
+    pub(crate) fn show_slice(
+        &mut self,
+        ui: &mut egui::Ui,
+        cache: &mut CommonMarkCache,
+        options: &CommonMarkOptions,
+        text: &str,
+        a: &crate::SliceArgs,
+    ) -> (egui::InnerResponse<()>, Vec<CheckboxClickEvent>, bool, bool, f32) {
+        let max_width = options.max_width(ui);
+        self.any_image_loading = false;
+        self.want_scroll_to_active_match = a.want_match;
+        self.search_match_ys_scratch.clear();
+        self.last_end_para = a.prev_para;
+        if !a.first {
+            self.line.should_not_start_newline_forced = false;
+        }
+        let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+        let mut pitch = 0.0;
+        let re = ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let height = ui.text_style_height(&TextStyle::Body);
+            ui.set_row_height(height);
+            let top = ui.next_widget_position().y;
+            self.slice_render(cache, options, text, a, max_width, ui);
+            // Där nästa block börjar i en helritning (markören efter sista radbrytningen).
+            pitch = ui.next_widget_position().y - top;
+            // Länkklick i blocket: rubrikmålet lämnas till läsläget (flera block ritas per bildruta, så ett
+            // tomt värde får inte skriva över ett väntande mål).
+            if let Some(slug) = self.deferred_scroll_to_heading.take() {
+                *viewer_cache(cache, &options.source_id.unwrap_or(Id::NULL)).scroll_to_id_target_mut() = Some(slug);
+            }
+        });
+        let scrolled = a.want_match && !self.want_scroll_to_active_match;
+        (re, std::mem::take(&mut self.checkbox_events), scrolled, self.any_image_loading, pitch)
+    }
+
+    fn slice_render(
+        &mut self,
+        cache: &mut CommonMarkCache,
+        options: &CommonMarkOptions<'_>,
+        text: &str,
+        a: &crate::SliceArgs,
+        max_width: f32,
+        ui: &mut Ui,
+    ) {
+        // Blocket och (för att listor, tabeller och citat ska se samma efterföljande händelser som i en
+        // helritning) början av nästa block, som bara läses fram och inte ritas.
+        let end = a.range.end;
+        let slice = &text[a.range.start..a.ahead.max(end).min(text.len())];
+        // Länkdefinitioner (`[a]: url`) står ofta långt från blocket som använder dem: lägg dem efter blocket.
+        let with_refs;
+        let src: &str = if a.refs.is_empty() || !slice.contains('[') {
+            slice
+        } else {
+            with_refs = format!("{slice}\n\n{}", a.refs);
+            &with_refs
+        };
+        let base = a.range.start;
+        let mut events = pulldown_cmark::Parser::new_ext(
+            src,
+            parser_options_extras(options.math_fn.is_some(), options.enable_scroll_to_heading),
+        )
+        .into_offset_iter()
+        .map(|(e, r)| (e, r.start + base..r.end + base))
+        .enumerate()
+        .peekable();
+        let content_origin_y = ui.next_widget_position().y;
+        self.content_origin_y = content_origin_y;
+        let line_sid = options.source_id.unwrap_or(Id::NULL);
+        let vc = viewer_cache(cache, &line_sid);
+        vc.slice_points.clear();
+        while events.peek().is_some_and(|(_, (_, sp))| sp.start < end) {
+            let Some((index, (e, src_span))) = events.next() else { break };
+            let start_position = ui.next_widget_position();
+            if matches!(
+                e,
+                pulldown_cmark::Event::Rule
+                    | pulldown_cmark::Event::Start(
+                        pulldown_cmark::Tag::Paragraph
+                            | pulldown_cmark::Tag::Heading { .. }
+                            | pulldown_cmark::Tag::CodeBlock(_)
+                            | pulldown_cmark::Tag::Item
+                            | pulldown_cmark::Tag::HtmlBlock
+                            | pulldown_cmark::Tag::Table(_)
+                            | pulldown_cmark::Tag::DefinitionListTitle
+                    )
+            ) {
+                viewer_cache(cache, &line_sid).slice_points.push((src_span.start, start_position.y - content_origin_y));
+            }
+            // Sista händelsen i sista blocket (efter den kan bara tillagda länk- och fotnotsdefinitioner finnas).
+            if events.peek().is_none_or(|(_, (_, sp))| a.last && sp.start >= end) {
+                self.line.should_end_newline_forced = false;
+            }
+            self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
+            if index == 0 {
+                self.line.should_not_start_newline_forced = false;
+            }
+        }
+    }
+
     /// Perform a full render of the document.
     fn full_render(
         &mut self,

@@ -220,6 +220,12 @@ pub fn image_shape(ctx: &egui::Context, uri: &str, rect: Rect, uv: Rect) -> Opti
     }
 }
 
+/// Sant om bilden fortfarande läses in (en bild som misslyckats räknas inte: den blir aldrig klar, och en
+/// bildruta som väntar på den skulle begäras för evigt).
+pub fn image_pending(ctx: &egui::Context, uri: &str, size: egui::Vec2) -> bool {
+    matches!(egui::Image::new(uri.to_owned()).load_for_size(ctx, size), Ok(egui::load::TexturePoll::Pending { .. }))
+}
+
 /// Något användaren bett om; utförs av `word_page` via `word_edit` efter ritningen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Act {

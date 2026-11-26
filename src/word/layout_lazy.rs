@@ -94,6 +94,16 @@ pub(super) struct Stubs {
     /// Tomma rader mellan stycken: antal och sammanlagd höjd.
     empties: usize,
     empty_height: f32,
+    /// Kalibreringen som platshållarna görs med, fryst mellan bildrutorna (`freeze`): då blir platshållarna för stycken
+    /// som inte lagts ut än desamma i nästa bildruta och kan tas från förra (`resume`). `None` = den löpande (`cal`).
+    frozen: Option<Box<Frozen>>,
+}
+
+#[derive(Clone)]
+struct Frozen {
+    cal: [Calib; KINDS],
+    empties: usize,
+    empty_height: f32,
 }
 
 /// Antal synliga tecken i stycket (markup som dolda taggar och `**` ger inga tecken på raden).
@@ -113,6 +123,38 @@ fn avail_width(q: &Para, wrap_width: f32) -> f32 {
 }
 
 impl Stubs {
+    /// Kalibreringen som platshållarna görs med.
+    fn view(&self) -> (&[Calib; KINDS], usize, f32) {
+        match &self.frozen {
+            Some(f) => (&f.cal, f.empties, f.empty_height),
+            None => (&self.cal, self.empties, self.empty_height),
+        }
+    }
+
+    /// Fryser kalibreringen inför en ny bildruta (görs om när det utlagda har fördubblats sedan förra gången, så att
+    /// platshållarna bara behöver göras om några få gånger medan dokumentet fylls i).
+    pub fn freeze(&mut self) {
+        if !self.ready() {
+            return;
+        }
+        let body = Kind::Body.index();
+        if self.frozen.as_ref().is_none_or(|f| self.cal[body].paras >= 2 * f.cal[body].paras.max(1)) {
+            self.frozen = Some(Box::new(Frozen { cal: self.cal, empties: self.empties, empty_height: self.empty_height }));
+        }
+    }
+
+    /// Nyckel för kalibreringen som platshållarna görs med: samma nyckel ger samma platshållare.
+    pub fn key(&self) -> u64 {
+        let (cal, empties, eh) = self.view();
+        let mut h = Fx::default();
+        for c in cal {
+            (c.paras, c.chars.to_bits(), c.row_px.to_bits(), c.rows, c.height.to_bits()).hash(&mut h);
+        }
+        (empties, eh.to_bits()).hash(&mut h);
+        self.template.as_ref().map(|t| Arc::as_ptr(t) as usize).hash(&mut h);
+        h.finish()
+    }
+
     /// Kan platshållare göras (finns det en utlagd rad att utgå från)?
     pub fn ready(&self) -> bool {
         // Några brödtextstycken med flera rader behövs för att uppskatta radlängd och höjd.
@@ -175,12 +217,13 @@ impl Stubs {
     /// (tecken per px radbredd, radhöjd) för ett slag: egna siffror när det finns tillräckligt många stycken, annars
     /// brödtextens, omräknade med teckenstorlekarna (rubriker är större, kod mindre).
     fn per_kind(&self, kind: Kind, a: &Analysis) -> Option<(f32, f32)> {
-        let body = &self.cal[Kind::Body.index()];
+        let (cal, _, _) = self.view();
+        let body = &cal[Kind::Body.index()];
         if body.rows == 0 || body.row_px <= 0.0 {
             return None;
         }
         let (body_cpx, body_rh) = ((body.chars / body.row_px) as f32, (body.height / body.rows as f64) as f32);
-        let c = &self.cal[kind.index()];
+        let c = &cal[kind.index()];
         let own_rh = (c.paras >= 3 && c.rows > 0).then(|| (c.height / c.rows as f64) as f32);
         let own_cpx = (c.row_px > 0.0 && c.chars >= 400.0).then(|| (c.chars / c.row_px) as f32);
         if kind == Kind::Body {
@@ -200,6 +243,7 @@ impl Stubs {
     #[allow(clippy::too_many_arguments)]
     pub fn para(&mut self, q: &Para, text: &str, wrap_width: f32, a: &Analysis, p: &Params, ppp: f32, table: bool, idx: usize) -> Option<Arc<Galley>> {
         let nchars = visible_chars(q, text, a);
+        let (_, empties, empty_height) = self.view();
         let (n, row_h, first_extra) = if q.collapse {
             let h = if q.toc_h > 0.0 {
                 q.toc_h
@@ -213,8 +257,8 @@ impl Stubs {
             (1, h, q.space_before)
         } else if table && idx == 1 {
             (1, 1.0, 0.0)
-        } else if nchars == 0 && self.empties > 0 && !table {
-            (1, self.empty_height / self.empties as f32, 0.0)
+        } else if nchars == 0 && empties > 0 && !table {
+            (1, empty_height / empties as f32, 0.0)
         } else {
             let kind = Kind::of(q, a, table);
             let font = px(p.zoom, a.defaults.size());

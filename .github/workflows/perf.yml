@@ -1,0 +1,123 @@
+# Prestandaprov: räknar instruktioner (valgrind --tool=callgrind) för ett urval av Kladds tyngsta vägar
+# och jämför PR:ens kod med basgrenens i SAMMA jobb, så att resultatet inte beror på hur belastad
+# CI-maskinen är eller vilken kompilatorversion som råkar vara senaste. Se perf/README.md.
+#
+# Fel om något prov kräver mer än `fail` procent fler instruktioner än basen, varning över `warn`.
+# Tabellen hamnar i jobbets sammanfattning. Körs bara på Linux och rör inte de vanliga testjobben.
+name: Prestanda
+
+on:
+  pull_request:
+    paths-ignore: ["docs/**", "*.md", "packaging/**"]
+  # På main mäts bara PR-versionen (ingen jämförelse): det värmer cachen som PR-jobben bygger vidare på.
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "*.md", "packaging/**"]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Gren, tagg eller commit att jämföra mot (standard: PR:ens bas, annars main)"
+        type: string
+        default: ""
+      fail:
+        description: "Fel om instruktionerna ökar mer än så här många procent"
+        type: string
+        default: "10"
+      warn:
+        description: "Varning över så här många procent"
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  perf:
+    name: instruktionsräkning
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      FAIL: ${{ inputs.fail || '10' }}
+      WARN: ${{ inputs.warn || '3' }}
+      # En gemensam målkatalog för PR och bas så att beroendena bara byggs en gång.
+      PERF_TARGET_DIR: ${{ github.workspace }}/target-perf
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Optimerade provbyggen: egen cache, delas inte med testjobben.
+          shared-key: perf
+          workspaces: ". -> target-perf"
+
+      - name: Installera valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: Prov av jämförelseskriptet
+        run: python3 perf/test_compare.py
+
+      - name: Mät PR:en
+        run: perf/run.sh out/head .
+
+      - name: Bestäm basen
+        if: github.event_name != 'push'
+        id: base
+        run: |
+          ref="${{ inputs.base_ref }}"
+          if [ -z "$ref" ]; then
+            if [ "${{ github.event_name }}" = pull_request ]; then
+              ref="origin/${{ github.base_ref }}"
+            else
+              ref="origin/main"
+            fi
+          fi
+          sha=$(git rev-parse --verify "$ref^{commit}" 2>/dev/null || git rev-parse --verify "origin/$ref^{commit}")
+          # Vid pull_request är HEAD en sammanslagning med basen; mät mot basens spets.
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Jämför mot $ref ($sha)"
+
+      - name: Mät basen
+        if: github.event_name != 'push'
+        id: measure_base
+        # Basen får inte stoppa PR:en om den inte går att bygga med dagens prov (t.ex. ändrade inre gränssnitt).
+        continue-on-error: true
+        run: |
+          # Utanför arbetskatalogen (cache och sökvägar), men med samma målkatalog som PR:en.
+          git worktree add --detach "$RUNNER_TEMP/base" "${{ steps.base.outputs.sha }}"
+          # Samma prov som PR:en: provfilen och de små ändringarna för att den ska nå sina hjälpfunktioner läggs över basen.
+          perf/overlay.sh "$RUNNER_TEMP/base"
+          perf/run.sh out/base "$RUNNER_TEMP/base"
+
+      - name: Jämför
+        run: |
+          if [ -f out/base/ir.json ]; then
+            python3 perf/compare.py out/base/ir.json out/head/ir.json --fail "$FAIL" --warn "$WARN" --summary "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Prestandaprov (instruktioner, callgrind)"
+              echo
+              echo "Ingen jämförelse gjordes (på main mäts bara versionen själv; annars gick basen inte att bygga eller mäta med de nuvarande proven). Siffror:"
+              echo
+              python3 -c 'import json; [print(f"- `{k}`: {v:,}") for k, v in sorted(json.load(open("out/head/ir.json")).items())]'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "${{ github.event_name }}" = push ] || echo "::warning::Ingen baslinje: basen gick inte att mäta"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-ir
+          path: |
+            out/*/ir.json
+            out/*/*.log
+          if-no-files-found: ignore

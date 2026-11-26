@@ -32,6 +32,41 @@ pub fn mark_once(flag: &'static std::sync::atomic::AtomicBool, label: &str) {
     }
 }
 
+/// Räknar bildrutor: med mätningen på skrivs antalet bildrutor och tiden sedan förra raden var femte
+/// sekund (`[timing] bildrutor: N på T s`), följt av vad som begärde dem (fil:rad), så att man ser
+/// hur ofta appen ritar om i vila och varför.
+pub fn frame(ctx: &egui::Context) {
+    if !enabled() {
+        return;
+    }
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static STATE: RefCell<(u64, u64, HashMap<String, u64>)> = RefCell::new((0, 0, HashMap::new()));
+    }
+    STATE.with(|s| {
+        let (n, last, causes) = &mut *s.borrow_mut();
+        *n += 1;
+        for c in ctx.repaint_causes() {
+            *causes.entry(format!("{}:{} {}", c.file, c.line, c.reason)).or_default() += 1;
+        }
+        let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        if now >= *last + 5000 {
+            if *last > 0 {
+                eprintln!("[timing] bildrutor: {n} på {:.1} s", (now - *last) as f64 / 1000.0);
+                let mut v: Vec<_> = causes.iter().collect();
+                v.sort_by(|a, b| b.1.cmp(a.1));
+                for (k, c) in v.into_iter().take(6) {
+                    eprintln!("[timing]   {c:5} x {k}");
+                }
+            }
+            *last = now;
+            *n = 0;
+            causes.clear();
+        }
+    });
+}
+
 thread_local! {
     static LAP: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }

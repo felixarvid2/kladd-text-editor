@@ -40,7 +40,14 @@ const MARGIN: f32 = 12.0;
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 25.0;
 /// Tak för texturcachen (bytes).
-const CACHE_LIMIT: usize = 256 * 1024 * 1024;
+const CACHE_LIMIT: usize = 160 * 1024 * 1024;
+/// Rullar vyn snabbare än så här många gånger vyns höjd per sekund (motorn hinner inte med skarpa sidor) ritas nya sidor
+/// först i låg upplösning.
+const FAST_SCROLL: f32 = 10.0;
+/// Så länge efter den senaste snabba rullningen räknas rullningen som pågående (sedan renderas skarpa bilder).
+const FAST_HOLD: Duration = Duration::from_millis(140);
+/// Skalan (andel av den skarpa) som sidor renderas i under snabb rullning.
+const PREVIEW_SCALE: f32 = 0.35;
 const MAX_THUMBS: usize = 240;
 /// Tak för antalet sidors textlager i minnet (stora dokument: sökningen läser en sida i taget och
 /// släpper den). Sidor nära vyn och sidor med OCR-text rörs aldrig.
@@ -489,6 +496,14 @@ pub struct PdfView {
     /// Rullning efter ett hopp: sidan behåller sitt nummer tills användaren rullar.
     nav_lock: Option<f32>,
     history: History,
+    /// Rullhastighet (vyns höjder per sekund, jämnad), senaste rullriktning (+1 nedåt, -1 uppåt) och
+    /// när rullningen senast var snabb. Styr förrenderingen (se `after_frame`).
+    scroll_prev: (f32, Instant),
+    scroll_speed: f32,
+    scroll_dir: i8,
+    fast_until: Option<Instant>,
+    /// Sidor som just nu hålls kvar i texturcachen (synliga och förrenderade).
+    keep: HashSet<usize>,
 
     frame: u64,
     tex: HashMap<usize, Tex>,
@@ -548,6 +563,11 @@ impl PdfView {
             ppp_cache: 1.0,
             nav_lock: None,
             history: History::default(),
+            scroll_prev: (0.0, Instant::now()),
+            scroll_speed: 0.0,
+            scroll_dir: 0,
+            fast_until: None,
+            keep: HashSet::new(),
             frame: 0,
             tex: HashMap::new(),
             tex_bytes: 0,
@@ -1231,7 +1251,10 @@ impl PdfView {
             self.thumbs.insert(page, Thumb { handle, scale: req.scale, rotation: req.rotation });
             self.evict_thumbs();
         }
-        if is_page && req.recolor == self.recolor {
+        // En grov förhandsbild som kommer efter en skarp får inte ersätta den.
+        let stale_preview = req.scale < want * 0.9
+            && self.tex.get(&page).is_some_and(|t| t.rotation == req.rotation && t.recolor == req.recolor && t.scale > req.scale * 1.05);
+        if is_page && req.recolor == self.recolor && !stale_preview {
             let handle = ctx.load_texture(format!("pdf-page-{page}"), image, TextureOptions::LINEAR);
             if let Some(old) = self.tex.insert(
                 page,
@@ -1284,7 +1307,7 @@ impl PdfView {
             return;
         }
         let cur = self.cur_page as i64;
-        let mut keys: Vec<usize> = self.tex.keys().copied().filter(|p| !self.visible.contains(p)).collect();
+        let mut keys: Vec<usize> = self.tex.keys().copied().filter(|p| !self.visible.contains(p) && !self.keep.contains(p)).collect();
         keys.sort_by_key(|p| -(*p as i64 - cur).abs());
         for p in keys {
             if self.tex_bytes <= CACHE_LIMIT * 3 / 4 {
@@ -1452,6 +1475,7 @@ impl PdfView {
         });
         self.scroll = out.state.clamped_offset();
         self.vp = out.inner_rect.size();
+        self.track_scroll(want.is_some());
         if navigated {
             self.nav_lock = want.map(|o| o.y);
         }
@@ -1462,6 +1486,34 @@ impl PdfView {
                 self.cur_page = most_visible(&layout, Rect::from_min_size(self.scroll.to_pos2(), self.vp));
             }
         }
+    }
+
+    /// Mäter rullhastigheten och riktningen (hopp och zoom räknas inte som rullning).
+    fn track_scroll(&mut self, jumped: bool) {
+        let now = Instant::now();
+        let (prev_y, prev_t) = self.scroll_prev;
+        self.scroll_prev = (self.scroll.y, now);
+        let dt = now.duration_since(prev_t).as_secs_f32().max(0.001);
+        let dy = self.scroll.y - prev_y;
+        if jumped {
+            self.scroll_speed = 0.0;
+            self.fast_until = None;
+            return;
+        }
+        if dy.abs() > 0.5 {
+            self.scroll_dir = if dy > 0.0 { 1 } else { -1 };
+        }
+        let speed = dy.abs() / dt / self.vp.y.max(100.0);
+        self.scroll_speed = if dt > 0.25 { speed } else { 0.5 * self.scroll_speed + 0.5 * speed };
+        if self.scroll_speed > FAST_SCROLL {
+            self.fast_until = Some(now + FAST_HOLD);
+        } else if dy.abs() < 0.5 && self.fast_until.is_none_or(|t| now >= t) {
+            self.scroll_dir = 0;
+        }
+    }
+
+    fn scrolling_fast(&self) -> bool {
+        self.fast_until.is_some_and(|t| Instant::now() < t)
     }
 
     fn nav_offset(&self, layout: &Layout, nav: Nav, vp: Vec2) -> Vec2 {
@@ -1814,18 +1866,33 @@ impl PdfView {
         let cur = self.cur_page as i64;
         let mut vis = self.visible.clone();
         vis.sort_by_key(|p| (*p as i64 - cur).abs());
+        // Förrendera sidorna runt de synliga: fler i rullningsriktningen, färre bakom.
         let mut near = Vec::new();
         if let (Some(&lo), Some(&hi)) = (self.visible.iter().min(), self.visible.iter().max()) {
-            let reach = if self.presenting { 1 } else { 2 };
-            for d in 1..=reach {
-                if hi + d < n {
-                    near.push(hi + d);
+            let (ahead, behind) = if self.presenting {
+                (1, 1)
+            } else {
+                match self.scroll_dir {
+                    1 => (4, 1),
+                    -1 => (1, 4),
+                    _ => (2, 2),
                 }
-                if lo >= d {
-                    near.push(lo - d);
+            };
+            let (down, up) = if self.scroll_dir < 0 { (behind, ahead) } else { (ahead, behind) };
+            for d in 1..=down.max(up) {
+                // Framför först, sedan bakom.
+                let order = if self.scroll_dir < 0 { [false, true] } else { [true, false] };
+                for fwd in order {
+                    if fwd && d <= down && hi + d < n {
+                        near.push(hi + d);
+                    }
+                    if !fwd && d <= up && lo >= d {
+                        near.push(lo - d);
+                    }
                 }
             }
         }
+        let fast = self.scrolling_fast();
         let settling = self.last_zoom_change.elapsed() < ZOOM_SETTLE;
         let mut reqs = Vec::new();
         let mut waiting = false;
@@ -1834,8 +1901,13 @@ impl PdfView {
                 continue;
             }
             let want = self.wanted_scale(p);
-            let fresh = self.tex.get(&p).is_some_and(|t| t.rotation == self.rotation && t.recolor == self.recolor && close(t.scale, want));
+            let have = self.tex.get(&p).filter(|t| t.rotation == self.rotation && t.recolor == self.recolor);
+            let fresh = have.is_some_and(|t| close(t.scale, want));
             if fresh {
+                continue;
+            }
+            // Under snabb rullning duger en grov bild, och sidor utan bild får en i låg upplösning (snabb att rita).
+            if fast && have.is_some() {
                 continue;
             }
             if settling && self.tex.contains_key(&p) {
@@ -1843,8 +1915,14 @@ impl PdfView {
                 continue;
             }
             waiting |= self.visible.contains(&p);
-            reqs.push(RenderRequest { page: p, scale: self.k * self.ppp(), rotation: self.rotation, recolor: self.recolor });
+            let scale = if fast { self.k * self.ppp() * PREVIEW_SCALE } else { self.k * self.ppp() };
+            reqs.push(RenderRequest { page: p, scale, rotation: self.rotation, recolor: self.recolor });
         }
+        if fast {
+            // Efter rullningen byts de grova bilderna mot skarpa.
+            ctx.request_repaint_after(FAST_HOLD);
+        }
+        self.keep = vis.iter().chain(near.iter()).copied().collect();
         // Miniatyrer efter sidorna; de som inte efterfrågats på ett tag glöms.
         let frame = self.frame;
         self.thumb_wants.retain(|_, (_, f)| frame.saturating_sub(*f) <= 3);
@@ -2428,5 +2506,87 @@ mod tests {
         println!("PDF: minne +{:.0} MB (topp {hwm:.0})", r1 - r0);
         v.go_to_page(pages - 1);
         run_until(&ctx, &mut v, |v| v.current_page() == pages - 1);
+    }
+
+    /// Mäter rullning genom en stor PDF (körs för hand):
+    /// `KLADD_BENCH_PDF_PAGES=1200 cargo test pdf_scroll_bench -- --ignored --nocapture`
+    /// Tid per bildruta (visare utan egui:s uppritning), tomma sidor (ingen bild alls) och grova sidor
+    /// (bild i fel skala) under rullning, tid till skarp bild när rullningen stannat, texturminne.
+    #[test]
+    #[ignore]
+    fn pdf_scroll_bench() {
+        fn rss_mb() -> f64 {
+            let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0
+        }
+        let want: usize = std::env::var("KLADD_BENCH_PDF_PAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(1200);
+        let ctx = Context::default();
+        let t0 = Instant::now();
+        // PDF:en sparas mellan körningar (att skapa den tar en minut): `KLADD_BENCH_PDF_FILE=/sökväg/stor.pdf`.
+        let bytes = match std::env::var_os("KLADD_BENCH_PDF_FILE").map(std::path::PathBuf::from) {
+            Some(f) if f.exists() => Arc::new(std::fs::read(&f).expect("läsa PDF:en")),
+            Some(f) => {
+                let b = make_pdf(want);
+                std::fs::write(&f, b.as_slice()).expect("spara PDF:en");
+                b
+            }
+            None => make_pdf(want),
+        };
+        let engine = PdfEngine::open(bytes.clone(), None, ctx.clone()).expect("öppna");
+        let meta = super::super::meta::read_meta(&bytes, None);
+        let mut v = PdfView::new(engine, meta, bytes, None);
+        let pages = v.page_count();
+        eprintln!("pdf_scroll_bench: {pages} sidor, byggd och öppnad på {:.1} s", t0.elapsed().as_secs_f64());
+        run_until(&ctx, &mut v, |v| !v.tex.is_empty());
+        let sharp = |v: &PdfView| v.visible.iter().all(|p| v.tex.get(p).is_some_and(|t| close(t.scale, v.wanted_scale(*p))));
+        for (name, step, frames) in [("promenad (60 px per bildruta)", 60.0f32, 400usize), ("snabb (700 px per bildruta)", 700.0, 160)] {
+            // Börjar där förra rullningen slutade, efter att bilderna där blivit skarpa.
+            let settle = Instant::now();
+            while settle.elapsed() < Duration::from_secs(10) && !sharp(&v) {
+                frame(&ctx, &mut v);
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            let (mut times, mut blank, mut blurry, mut total_vis) = (Vec::new(), 0usize, 0usize, 0usize);
+            let start_page = v.current_page();
+            for _ in 0..frames {
+                v.scroll_by(vec2(0.0, step));
+                let t = Instant::now();
+                frame(&ctx, &mut v);
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                for p in &v.visible {
+                    total_vis += 1;
+                    match v.tex.get(p) {
+                        None => blank += 1,
+                        Some(t) if !close(t.scale, v.wanted_scale(*p)) => blurry += 1,
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            let end_page = v.current_page();
+            let stop = Instant::now();
+            let mut to_sharp = None;
+            while stop.elapsed() < Duration::from_secs(20) {
+                frame(&ctx, &mut v);
+                if sharp(&v) {
+                    to_sharp = Some(stop.elapsed());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            eprintln!(
+                "  {name}: sida {start_page}->{end_page}, bildruta medel {mean:.2} ms, median {:.2} ms, p95 {:.2} ms, max {:.2} ms; \
+                 sidor i bild {total_vis}: tomma {blank}, grova {blurry}; skarp efter stopp: {:?}; texturer {} st / {:.0} MB; toppminne {:.0} MB",
+                times[times.len() / 2],
+                times[times.len() * 95 / 100],
+                times[times.len() - 1],
+                to_sharp,
+                v.tex.len(),
+                v.tex_bytes as f64 / 1048576.0,
+                rss_mb()
+            );
+        }
     }
 }

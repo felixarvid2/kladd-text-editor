@@ -24,7 +24,6 @@ fn lay(text: &str, wrap: f32, img: Vec2, geom: Option<&pages::Geom>) -> (Arc<Gal
         palette: &pal,
         zoom: 1.0,
         reveal: 0..0,
-        matches: &[],
         image_size: &imgf,
         measure: &measure,
         font_family: &fam,

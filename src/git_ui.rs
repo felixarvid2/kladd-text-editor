@@ -740,9 +740,7 @@ fn set_text_undoable(ctx: &egui::Context, doc: &mut Document, text: String) {
     let mut state = TextEditState::load(ctx, id).unwrap_or_default();
     let end = doc.text.chars().count();
     let before = state.cursor.char_range().unwrap_or(CCursorRange::two(CCursor::new(end), CCursor::new(end)));
-    let mut undoer = state.undoer();
-    undoer.add_undo(&(before, doc.text.clone()));
-    state.set_undoer(undoer);
+    crate::undo::add_undo(ctx, id, &before, &doc.text);
     doc.text = text;
     doc.on_edited();
     let end = doc.text.chars().count();
@@ -842,7 +840,10 @@ impl KladdApp {
                 if g.refresh.is_none() && (g.want_refresh || (focused && now - g.last_refresh >= REFRESH_SECS)) {
                     g.start_refresh(ctx, ws, now);
                 }
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(REFRESH_SECS));
+                // Utan fokus uppdateras inget (se ovan): ingen bildruta behövs förrän fokus kommer tillbaka.
+                if focused {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(REFRESH_SECS));
+                }
             }
         }
         if let Some((job, r)) = done {

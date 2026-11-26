@@ -33,6 +33,7 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="2.10.0" date="2026-11-26"/>
     <release version="2.9.0" date="2026-11-26"/>
     <release version="2.8.0" date="2026-11-25"/>
     <release version="2.7.0" date="2026-11-25"/>

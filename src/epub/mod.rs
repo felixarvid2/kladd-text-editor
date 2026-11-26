@@ -20,9 +20,11 @@ use read::{Archive, RawToc};
 
 use crate::paste::{El, parse};
 
-/// Så stor (byte Markdown) en del högst är när ett kapitel delas. Hela delen ritas varje bildruta,
-/// så stora kapitel delas vid styckegränser för att rulla flytande.
-pub const SECTION_LIMIT: usize = 24_000;
+/// Så stor (byte Markdown) en del högst är när ett kapitel delas. Bara de synliga blocken ritas (`mdwin`),
+/// så delningen behövs bara för verkligt enorma kapitel.
+pub const SECTION_LIMIT: usize = 600_000;
+/// Gränsen före 2.10 (hela delen ritades varje bildruta); gamla sparade lägen gäller för den.
+pub const LEGACY_SECTION_LIMIT: usize = 24_000;
 /// Antal extra filer (utanför läsordningen) som tas med som länkmål, som mest.
 const MAX_EXTRA: usize = 64;
 /// Största stilmall (byte) som läses; större hoppas över.
@@ -506,6 +508,24 @@ impl Book {
     pub fn chapter_md(&self, ch: usize) -> String {
         let Some(c) = self.chapters.get(ch) else { return String::new() };
         self.sections[c.first_section..c.first_section + c.section_count].iter().map(|s| s.md.as_str()).collect()
+    }
+
+    /// Del och byte i den nuvarande delningen för ett läge som sparats när kapitlen delades vid `old_limit` byte:
+    /// `old_section` är delens nummer då och `frac` hur långt ner i den.
+    pub fn remap_position(&self, old_section: usize, frac: f32, old_limit: usize) -> Option<(usize, usize)> {
+        let mut base = 0;
+        for ci in 0..self.chapters.len() {
+            let md = self.chapter_md(ci);
+            let ranges = split_ranges(&md, old_limit);
+            if old_section < base + ranges.len() {
+                let r = &ranges[old_section - base];
+                let byte = (r.start + (r.len() as f32 * frac.clamp(0.0, 1.0)) as usize).min(md.len().saturating_sub(1));
+                let d = self.dest_in_chapter(ci, byte)?;
+                return Some((d.section, d.byte));
+            }
+            base += ranges.len();
+        }
+        None
     }
 
     /// Stället (del och byte i delen) för en byteposition i kapitel `ch`s Markdown.
