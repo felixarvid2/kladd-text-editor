@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.9.0] – 2026-11-26
+
 ### Nytt
 
 - **Bokmärken, understrykningar och anteckningar i EPUB-läsläget.** `Ctrl+D` eller bokmärkesknappen sätter (och tar bort) ett bokmärke på stället du läser. Markera text så visas en meny vid markeringen med fyra färger (gul, grön, blå, rosa), *Anteckning…* och *Kopiera*; understrykningen ritas som färgad bakgrund med ett litet märke när den har en anteckning, och ett klick på den öppnar menyn igen (byt färg, redigera, ta bort). Sidopanelen har flikarna *Innehåll*, *Bokmärken* och *Anteckningar* med kapitel, utdrag och anteckning, och *Exportera anteckningar…* (sidopanelen och Arkiv-menyn) ger Markdown med titel, författare, kapitelrubriker, citat och anteckningar som ett nytt osparat dokument. Posterna sparas per bok (bokens id ur OPF, sökvägen som reserv) i datamappen och aldrig i boken, förankras med kapitel, plats i kapitlets text och den markerade texten med omgivning så att de hittas igen efter omläggning, och har tak (2 000 per bok, 300 böcker).
