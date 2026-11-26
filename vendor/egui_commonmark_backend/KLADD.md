@@ -32,3 +32,18 @@ till vänster om kopieringsikonen. Kopieringsknappen fanns redan i originalet.
 `Style::to_richtext` läser ett radavstånd (`LINE_FACTOR_ID`, gånger brödtextens storlek) ur `egui::Context::data`
 och sätter det som radhöjd på löptext (inte rubriker eller kod). Läsläget för EPUB lägger dit värdet; utan värde
 är allt som förut.
+
+## Blockpositioner för HTML, tabeller och linjer (2.9.0)
+
+`line_points` får också en post för HTML-block, tabeller, definitionsrubriker och linjer. Ett dokument som börjar med
+`<p align="center">` hade tidigare ingen position före första stycket, så dubbelklicket i läsläget hittade ingen rad
+och bara markerade ett ord.
+
+## Galleri för stycken: justering, förlagets stil och markeringar (EPUB, 2.9.0)
+
+`misc::ViewExtras` (läggs i `egui::Context::data` med `set_extras`) ber visningen rita vissa stycken och rubriker som ett enda
+galleri. `egui_commonmark::parsers::pulldown` (`try_galley`, `galley_block`) samlar blockets händelser och bygger en `LayoutJob`:
+`justify`/`halign`, indrag som `leading_space`, vänstermarginal, små versaler (gemener som versaler i 80 % storlek med samma byte-längd),
+länkar (färg, träffprov med `Galley::cursor_from_pos`, samma länkhakar som förut), sökträffar och `Mark`-bakgrunder, ett
+anteckningsmärke efter markeringar med anteckning, och egui:s textmarkering. Klick på en markering lämnas i `MARK_HIT_ID` (`take_mark_hit`).
+Block med bild, formel, fotnotsreferens eller HTML ritas på det gamla sättet. Utan `ViewExtras` är allt som förut.

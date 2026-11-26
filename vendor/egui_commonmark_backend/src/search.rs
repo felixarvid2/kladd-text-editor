@@ -145,6 +145,69 @@ pub fn apply_search_highlights(
     job.sections = new_sections;
 }
 
+/// Kladd: markeringarna (färgade byteintervall i källtexten) som träffar en textbit, som lokala intervall.
+pub fn mark_intervals(
+    marks: &[crate::misc::Mark],
+    src_span: &Range<usize>,
+    text_len: usize,
+) -> Vec<(Range<usize>, Color32)> {
+    marks
+        .iter()
+        .filter(|m| m.range.start < src_span.end && m.range.end > src_span.start)
+        .filter_map(|m| {
+            let start = m.range.start.saturating_sub(src_span.start).min(text_len);
+            let end = m.range.end.saturating_sub(src_span.start).min(text_len);
+            (start < end).then_some((start..end, m.color))
+        })
+        .collect()
+}
+
+/// Kladd: ändrar formatet på de byteintervall i `job` som `intervals` anger (delar sektioner vid gränserna;
+/// egui slår ihop intilliggande sektioner med samma format, så gränserna måste delas här).
+pub fn format_ranges<T>(job: &mut LayoutJob, intervals: &[(Range<usize>, T)], apply: impl Fn(&mut egui::TextFormat, &T)) {
+    if intervals.is_empty() || job.sections.is_empty() {
+        return;
+    }
+    let text_len = job.text.len();
+    let mut new_sections = Vec::with_capacity(job.sections.len() + intervals.len() * 2);
+    for section in job.sections.drain(..) {
+        let sec_range = section.byte_range.as_usize();
+        let sec_start = sec_range.start.min(text_len);
+        let sec_end = sec_range.end.min(text_len);
+        if sec_start >= sec_end {
+            continue;
+        }
+        let mut points = vec![sec_start, sec_end];
+        for (range, _) in intervals {
+            if range.start > sec_start && range.start < sec_end {
+                points.push(range.start);
+            }
+            if range.end > sec_start && range.end < sec_end {
+                points.push(range.end);
+            }
+        }
+        points.sort_unstable();
+        points.dedup();
+        for pair in points.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            let mut format = section.format.clone();
+            for (r, v) in intervals {
+                if r.start <= start && r.end >= end {
+                    apply(&mut format, v);
+                }
+            }
+            let leading_space = if start == sec_start { section.leading_space } else { 0.0 };
+            new_sections.push(LayoutSection { leading_space, byte_range: ByteIndex(start)..ByteIndex(end), format });
+        }
+    }
+    job.sections = new_sections;
+}
+
+/// Kladd: sätter bakgrundsfärgen på de byteintervall i `job` som `intervals` anger.
+pub fn apply_mark_colors(job: &mut LayoutJob, intervals: &[(Range<usize>, Color32)]) {
+    format_ranges(job, intervals, |f, c| f.background = *c);
+}
+
 /// Like [`search_intervals`], but for content assembled from multiple
 /// markdown text events (`chunks`), each with its own local byte range
 /// within the final rendered text and source byte range in the original

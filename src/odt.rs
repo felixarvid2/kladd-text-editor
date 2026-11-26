@@ -997,6 +997,17 @@ fn is_code_char_style(st: &Styles, style: &str) -> bool {
     st.chain("text", style).iter().any(|d| norm(&d.name) == "source text" || norm(&d.display) == "source text")
 }
 
+/// Början på beskrivningen för ett Mermaid-diagram som bild: resten är diagramkoden.
+const MERMAID_ALT: &str = "kladd-mermaid\n";
+
+/// Markör (privat teckenområde) för ett diagram bland de lästa körningarna: resten är koden.
+const MERMAID_MARK: &str = "\u{E000}kladd-mermaid\u{E001}";
+
+/// Diagramkoden ur en beskrivning som Kladd skrivit för ett Mermaid-diagram.
+fn mermaid_code(alt: &str) -> Option<&str> {
+    alt.strip_prefix(MERMAID_ALT).map(|c| c.trim_matches('\n')).filter(|c| !c.trim().is_empty())
+}
+
 fn escape_alt(s: &str) -> String {
     s.replace(['\n', '\r'], " ").replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]")
 }
@@ -1279,6 +1290,12 @@ impl<'s, 'b> Rd<'s, 'b> {
             self.text_box(e, tb);
             return;
         }
+        // Ett diagram som Kladd skrivit: koden i beskrivningen blir ett ```mermaid-block igen (inte en bild).
+        let desc = e.child("svg:desc").map(|n| n.deep_text()).unwrap_or_default();
+        if let Some(code) = mermaid_code(&desc) {
+            push_run(runs, Run { text: format!("{MERMAID_MARK}{code}"), fmt: Fmt::default(), link: None, raw: true });
+            return;
+        }
         // LibreOffice skriver en SVG som två `draw:image`: SVG-filen och en PNG-reserv. Rastret är nyckeln;
         // SVG:n följer med som vektorkälla.
         let hrefs: Vec<String> = e
@@ -1515,6 +1532,23 @@ impl<'s, 'b> Rd<'s, 'b> {
         let lang_run = p.runs.iter().find(|r| lang_mark(r)).cloned();
         p.runs.retain(|r| !lang_mark(r));
         self.flush_boxes();
+        // Ett Mermaid-diagram (en ram med koden i beskrivningen) blir ett kodblock ```mermaid.
+        if p.kind == Kind::Normal && p.list.is_none() {
+            if let [r] = p.runs.as_slice() {
+                if let Some(code) = r.text.strip_prefix(MERMAID_MARK).filter(|_| r.raw) {
+                    let runs = vec![
+                        Run { text: code.to_owned(), fmt: Fmt::default(), link: None, raw: true },
+                        Run { text: crate::codehl::lang_marker("mermaid"), fmt: Fmt::default(), link: None, raw: true },
+                    ];
+                    self.blocks.push(Block::Para(Para { kind: Kind::Code, runs, align: Align::Left, list: None }));
+                    return;
+                }
+            }
+            // Diagrammet delar stycke med annan text: blocket sätts på egna rader.
+            for r in p.runs.iter_mut().filter(|r| r.raw && r.text.starts_with(MERMAID_MARK)) {
+                r.text = format!("\n```mermaid\n{}\n```\n", &r.text[MERMAID_MARK.len()..]);
+            }
+        }
         if p.kind == Kind::Rule {
             self.blocks.push(Block::Rule);
             return;
@@ -1616,8 +1650,21 @@ impl<'s, 'b> Rd<'s, 'b> {
                 self.section_row(&close);
             }
             // Innehållsförteckningen blir raden `<!-- kladd: toc -->`; innehållet byggs om av Kladd.
-            "text:table-of-content" => {
-                let run = Run { text: crate::word::nav::TOC_LINE.to_owned(), fmt: Fmt::default(), link: None, raw: true };
+            "text:table-of-content" | "text:illustration-index" | "text:table-index" => {
+                use crate::word::nav::{TocKind, TocSpec};
+                // Nivåerna (`text:outline-level` i förteckningens källa) och slaget följer med tillbaka.
+                let mut spec = TocSpec::default();
+                match n.name.as_str() {
+                    "text:illustration-index" => spec.kind = TocKind::Figures,
+                    "text:table-index" => spec.kind = TocKind::Tables,
+                    _ => {
+                        let lvl = n.child("text:table-of-content-source").and_then(|c| c.attr("text:outline-level")).and_then(|v| v.parse::<u8>().ok());
+                        if let Some(l) = lvl.filter(|l| (1..=6).contains(l)) {
+                            spec.max = l;
+                        }
+                    }
+                }
+                let run = Run { text: spec.line(), fmt: Fmt::default(), link: None, raw: true };
                 self.blocks.push(Block::Para(Para { kind: Kind::Normal, runs: vec![run], align: Align::Left, list: None }));
             }
             "text:list" => {
@@ -1626,8 +1673,8 @@ impl<'s, 'b> Rd<'s, 'b> {
                 self.list(n, 0, None, id);
             }
             "table:table" => self.table(n),
-            "text:section" | "text:alphabetical-index" | "text:illustration-index"
-            | "text:table-index" | "text:object-index" | "text:user-index" | "text:bibliography" | "text:index-body"
+            "text:section" | "text:alphabetical-index"
+            | "text:object-index" | "text:user-index" | "text:bibliography" | "text:index-body"
             | "text:index-title" => {
                 for c in n.els() {
                     self.walk(c);
@@ -1639,7 +1686,7 @@ impl<'s, 'b> Rd<'s, 'b> {
                 let mut pc = Pc { named: TProps::default(), span_ref: self.base.clone(), prev_space: true };
                 self.frame(n, &st, &mut pc, &mut runs);
                 if !runs.is_empty() {
-                    self.blocks.push(Block::Para(Para { kind: Kind::Normal, runs, align: Align::Left, list: None }));
+                    self.emit(Para { kind: Kind::Normal, runs, align: Align::Left, list: None });
                 }
             }
             n if n.starts_with("draw:") => self.dropped.shapes = true,
@@ -2520,7 +2567,10 @@ struct W<'a> {
     note_order: Vec<String>,
     in_note: bool,
     /// Rubrikerna H1–H3 (nivå, text, uppskattad sida) till innehållsförteckningen.
-    toc: Vec<(u8, String, usize)>,
+    /// Hela texten och sidor ur Kladds utläggning, för förteckningarna.
+    toc_md: String,
+    toc_laid: Option<Vec<(u8, String, usize)>>,
+    n_toc: usize,
     /// Avsnitt: dokumentets grundformat, första arkets mått, arket som gäller just nu, sidmallarna
     /// utöver "Standard" (M1, M2 …), ett öppet `text:section` och en brytning som väntar på nästa stycke
     /// (sidmallens namn, "column" eller "page").
@@ -2638,7 +2688,9 @@ impl<'a> W<'a> {
             notes: Vec::new(),
             note_order: Vec::new(),
             in_note: false,
-            toc: Vec::new(),
+            toc_md: String::new(),
+            toc_laid: None,
+            n_toc: 0,
             defaults: DocDefaults::default(),
             first: sections::Section::resolve(&sections::SectionProps::default(), &DocDefaults::default()),
             cur: sections::Section::resolve(&sections::SectionProps::default(), &DocDefaults::default()),
@@ -3330,25 +3382,48 @@ impl<'a> W<'a> {
         self.after_space = false;
     }
 
-    /// Skriver innehållsförteckningen: `text:table-of-content` med rubriknivåer 1–3 och en
-    /// färdig förteckning (LibreOffice uppdaterar den via Verktyg > Uppdatera).
-    fn toc(&mut self) {
+    /// Skriver en förteckning: `text:table-of-content` med rubriknivåerna i `spec` (eller en
+    /// `text:illustration-index`/`text:table-index` för bildtexter) och en färdig förteckning med
+    /// sidnummer ur Kladds utläggning (LibreOffice uppdaterar den via Verktyg > Uppdatera).
+    fn toc(&mut self, spec: &crate::word::nav::TocSpec) {
+        use crate::word::nav::{self, TocKind};
         self.flush_break();
-        let mut x = String::from("<text:table-of-content text:protected=\"true\" text:name=\"Innehåll1\"><text:table-of-content-source text:outline-level=\"3\"><text:index-title-template text:style-name=\"Contents_20_Heading\">Innehåll</text:index-title-template>");
-        for n in 1..=3 {
-            x.push_str(&format!(
-                "<text:table-of-content-entry-template text:outline-level=\"{n}\" text:style-name=\"Contents_20_{n}\"><text:index-entry-link-start text:style-name=\"Internet_20_link\"/><text:index-entry-chapter/><text:index-entry-text/><text:index-entry-tab-stop style:type=\"right\" style:leader-char=\".\"/><text:index-entry-page-number/><text:index-entry-link-end/></text:table-of-content-entry-template>"
-            ));
+        let heads = nav::headings_scan(&self.toc_md);
+        let items = nav::toc_items(&self.toc_md, &heads, spec);
+        let pages = self.toc_laid.as_ref().map(|l| crate::pdf_write::toc_pages_of(l, spec)).filter(|p| p.len() == items.len());
+        let title = spec.title();
+        let (open, source_open, close) = match spec.kind {
+            TocKind::Headings => ("table-of-content", format!("<text:table-of-content-source text:outline-level=\"{}\">", spec.max), "table-of-content"),
+            TocKind::Figures => ("illustration-index", "<text:illustration-index-source text:caption-sequence-name=\"Illustration\">".to_owned(), "illustration-index"),
+            TocKind::Tables => ("table-index", "<text:table-index-source text:caption-sequence-name=\"Table\">".to_owned(), "table-index"),
+        };
+        let mut x = format!("<text:{open} text:protected=\"true\" text:name=\"{title}{}\">{source_open}<text:index-title-template text:style-name=\"Contents_20_Heading\">{title}</text:index-title-template>", self.toc_n_name());
+        let tail = "<text:index-entry-tab-stop style:type=\"right\" style:leader-char=\".\"/><text:index-entry-page-number/>";
+        match spec.kind {
+            TocKind::Headings => {
+                for n in spec.min..=spec.max {
+                    x.push_str(&format!(
+                        "<text:table-of-content-entry-template text:outline-level=\"{n}\" text:style-name=\"Contents_20_{n}\"><text:index-entry-link-start text:style-name=\"Internet_20_link\"/><text:index-entry-chapter/><text:index-entry-text/>{tail}<text:index-entry-link-end/></text:table-of-content-entry-template>"
+                    ));
+                }
+                x.push_str("</text:table-of-content-source>");
+            }
+            TocKind::Figures => x.push_str(&format!("<text:illustration-index-entry-template text:style-name=\"Contents_20_1\"><text:index-entry-text/>{tail}</text:illustration-index-entry-template></text:illustration-index-source>")),
+            TocKind::Tables => x.push_str(&format!("<text:table-index-entry-template text:style-name=\"Contents_20_1\"><text:index-entry-text/>{tail}</text:table-index-entry-template></text:table-index-source>")),
         }
-        x.push_str("</text:table-of-content-source><text:index-body><text:index-title text:name=\"Innehåll1_Head\"><text:p text:style-name=\"Contents_20_Heading\">Innehåll</text:p></text:index-title>");
-        for (level, text, page) in &self.toc {
-            x.push_str(&format!(
-                "<text:p text:style-name=\"Contents_20_{level}\">{}<text:tab/>{page}</text:p>",
-                esc(text)
-            ));
+        x.push_str(&format!("<text:index-body><text:index-title text:name=\"{title}{}_Head\"><text:p text:style-name=\"Contents_20_Heading\">{title}</text:p></text:index-title>", self.toc_n_name()));
+        for (i, h) in items.iter().enumerate() {
+            let level = if spec.kind == TocKind::Headings { h.level.min(9) } else { 1 };
+            let page = pages.as_ref().map_or(1, |p| p[i]);
+            x.push_str(&format!("<text:p text:style-name=\"Contents_20_{level}\">{}<text:tab/>{page}</text:p>", esc(&h.text)));
         }
-        x.push_str("</text:index-body></text:table-of-content>");
+        x.push_str(&format!("</text:index-body></text:{close}>"));
         self.body.push_str(&x);
+    }
+
+    /// Ett löpnummer som gör förteckningarnas namn unika (1, 2 …).
+    fn toc_n_name(&self) -> usize {
+        self.n_toc
     }
 
     /// Stänger en textruta: stycknen sedan öppningen läggs i en `draw:text-box` i en ram som är förankrad
@@ -3455,9 +3530,10 @@ impl<'a> W<'a> {
             self.review.cur = Some(open).filter(|_| !self.in_note);
         } else if review::is_close_tag(t) {
             self.review.cur = None;
-        } else if t == crate::word::nav::TOC_LINE {
+        } else if let Some(spec) = crate::word::nav::parse_toc(t) {
             self.close_para();
-            self.toc();
+            self.n_toc += 1;
+            self.toc(&spec);
         } else if let Some(props) = sections::SectionProps::from_comment(t).filter(|_| self.table.is_none()) {
             self.section_marker(&props);
         } else if sections::is_column_break(t) && self.table.is_none() {
@@ -3605,13 +3681,9 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
     w.defaults = defaults.clone();
     w.first = sections::Section::resolve(&sections::SectionProps::default(), defaults);
     w.cur = w.first.clone();
-    if md.contains(crate::word::nav::TOC_LINE) {
-        let heads = crate::word::nav::headings_scan(md);
-        w.toc = crate::word::nav::toc_entries(&heads)
-            .into_iter()
-            // Grov uppskattning: ca 3 000 tecken per sida (LibreOffice räknar om vid uppdatering).
-            .map(|h| (h.level, h.text.clone(), 1 + md[..h.start].chars().count() / 3000))
-            .collect();
+    if md.contains("kladd: toc") {
+        w.toc_md = md.to_owned();
+        w.toc_laid = Some(crate::pdf_write::toc_laid_pages(md, resolve));
     }
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -3801,9 +3873,20 @@ fn build_body<'a>(md: &str, resolve: &'a dyn Fn(&str) -> Option<Image>, text_w: 
                     w.quote = w.quote.saturating_sub(1);
                 }
                 TagEnd::CodeBlock => {
-                    w.flush_code();
-                    w.code = false;
-                    w.code_lang.clear();
+                    // Ett Mermaid-block som går att rita skrivs som bild (SVG + PNG-reserv) med koden i beskrivningen.
+                    let key = (w.table.is_none() && crate::mermaid::is_lang(&w.code_lang)).then(|| crate::mermaid::image(&w.code_buf)).flatten();
+                    if let Some(key) = key {
+                        let alt = format!("{MERMAID_ALT}{}", w.code_buf.trim_end_matches('\n'));
+                        w.code_buf.clear();
+                        w.code = false;
+                        w.code_lang.clear();
+                        w.image(&key, &alt, None, None, None, None, None);
+                        w.close_para();
+                    } else {
+                        w.flush_code();
+                        w.code = false;
+                        w.code_lang.clear();
+                    }
                 }
                 TagEnd::List(_) => {
                     w.close_para();
@@ -4120,7 +4203,8 @@ fn styles_xml(d: &DocDefaults, fields: &style::Fields, first: &sections::Section
     // Innehållsförteckningen: rubrik och tre nivåer med högerställd flik med prickar.
     let text_w_pt = (pw - m[1] - m[3]).max(36.0);
     named.push_str("<style:style style:name=\"Contents_20_Heading\" style:display-name=\"Contents Heading\" style:family=\"paragraph\" style:parent-style-name=\"Heading\" style:class=\"index\"><style:paragraph-properties fo:margin-top=\"0.423cm\" fo:margin-bottom=\"0.212cm\"/><style:text-properties fo:font-size=\"18pt\" fo:color=\"#1F3864\"/></style:style>");
-    for (n, indent_pt) in [(1, 0.0f32), (2, 14.17), (3, 28.35)] {
+    for n in 1..=9u32 {
+        let indent_pt = (n - 1) as f32 * 14.17;
         let (indent, tab) = (cm(indent_pt), cm((text_w_pt - indent_pt).max(36.0)));
         named.push_str(&format!(
             "<style:style style:name=\"Contents_20_{n}\" style:display-name=\"Contents {n}\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\"><style:paragraph-properties fo:margin-left=\"{indent}\" fo:margin-top=\"0cm\" fo:margin-bottom=\"0.1cm\"><style:tab-stops><style:tab-stop style:position=\"{tw}\" style:type=\"right\" style:leader-style=\"dotted\" style:leader-text=\".\"/></style:tab-stops></style:paragraph-properties></style:style>",
@@ -4296,6 +4380,8 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<Image
     let (pw, _) = defaults.page();
     let m = defaults.margins();
     let text_w = (pw - m[1] - m[3]).max(36.0);
+    // Mermaid-diagram är bilder som ritats av Kladd själv (se `mermaid`).
+    let resolve = &|src: &str| crate::mermaid::resolve(src).or_else(|| resolve(src));
     let mut w = build_body(markdown, resolve, text_w, &defaults, revs, comments);
     w.fonts.insert(defaults.font().to_owned());
     w.fonts.extend(style::STYLE_IDS.iter().filter_map(|&id| defaults.styles.get(id).font_family.clone()));
@@ -4681,6 +4767,25 @@ Slut.
     }
 
     #[test]
+    fn toc_levels_pages_and_figure_lists_roundtrip() {
+        let pb = crate::word::sections::PAGE_BREAK_LINE;
+        let md = format!("# Ett\n\n<!-- kladd: toc; levels: 1-2 -->\n\n<!-- kladd: toc; kind: figures -->\n\nFigur 1: En bild\n\n{pb}\n\n## Två\n\n### Tre\n\nFigur 2: Till\n");
+        let w = write(&md, "T", &|_| None).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&w.bytes)).unwrap();
+        let mut content = String::new();
+        z.by_name("content.xml").unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("<text:table-of-content-source text:outline-level=\"2\">"), "{content}");
+        assert!(!content.contains("entry-template text:outline-level=\"3\""), "nivå 3 hör inte till förteckningen");
+        assert!(content.contains("<text:illustration-index "), "{content}");
+        // Sidnumren följer utläggningen: "Två" ligger efter sidbrytningen.
+        assert!(content.contains(">Två<text:tab/>2</text:p>") && content.contains(">Ett<text:tab/>1</text:p>"), "{content}");
+        assert!(content.contains(">Figur 2: Till<text:tab/>2</text:p>"), "{content}");
+        let back = read(&w.bytes).unwrap();
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
+    }
+
+    #[test]
     fn toc_line_roundtrips_as_table_of_content() {
         let md = "# Ett\n\n<!-- kladd: toc -->\n\n## Två\n\n#### Fyra\n\nSlut.\n";
         let w = write(md, "T", &|_| None).unwrap();
@@ -4694,6 +4799,37 @@ Slut.
         let back = read(&w.bytes).unwrap();
         assert!(back.dropped.is_empty(), "{:?}", back.dropped);
         assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
+    }
+
+    #[test]
+    fn mermaid_block_is_written_as_svg_frame_and_reads_back() {
+        let md = "# Rapport\n\nFöre.\n\n```mermaid\ngraph TD\n    A[Start] --> B{Klart?}\n    B -->|Ja| C[Slut]\n```\n\nEfter.\n\n```mermaid\nsom inte går att rita\n```\n";
+        let w = write(md, "T", &|_| None).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&w.bytes)).unwrap();
+        let names: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_owned()).collect();
+        let mut content = String::new();
+        z.by_name("content.xml").unwrap().read_to_string(&mut content).unwrap();
+        let mut manifest = String::new();
+        z.by_name("META-INF/manifest.xml").unwrap().read_to_string(&mut manifest).unwrap();
+        // Båda delarna är välformade XML.
+        for x in [&content, &manifest] {
+            let mut r = quick_xml::Reader::from_str(x);
+            loop {
+                match r.read_event() {
+                    Ok(quick_xml::events::Event::Eof) => break,
+                    Err(e) => panic!("inte välformad: {e}"),
+                    _ => {}
+                }
+            }
+        }
+        assert!(content.contains("image/svg+xml") && content.contains("<svg:desc>kladd-mermaid\ngraph TD"), "{content}");
+        assert!(names.iter().any(|n| n.starts_with("Pictures/") && n.ends_with(".svg")) && names.iter().any(|n| n.starts_with("Pictures/") && n.ends_with(".png")));
+        assert!(manifest.contains("image/svg+xml"));
+        assert!(!content.contains(">graph TD"), "koden ska inte stå som text");
+        assert!(content.contains("som inte går att rita"), "det som inte går att rita är kvar som kod");
+        let back = read(&w.bytes).unwrap();
+        assert_eq!(back.markdown, md, "\n--- fick ---\n{}", back.markdown);
+        assert!(back.images.is_empty());
     }
 
     #[test]

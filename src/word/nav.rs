@@ -12,6 +12,133 @@ pub const TOC_LINE: &str = "<!-- kladd: toc -->";
 /// Högsta rubriknivå som tas med i innehållsförteckningen (H1–H3).
 pub const TOC_MAX_LEVEL: u8 = 3;
 
+/// Vad en förteckning listar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TocKind {
+    /// Rubrikerna (Words `TOC \o "1-3"`).
+    #[default]
+    Headings,
+    /// Bildtexter som börjar med "Figur N" (Words `TOC \c "Figur"`).
+    Figures,
+    /// Bildtexter som börjar med "Tabell N" (Words `TOC \c "Tabell"`).
+    Tables,
+}
+
+/// Raden `<!-- kladd: toc; levels: 1-3; kind: figures -->` som värden. Utan tillägg: rubriknivå 1–3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TocSpec {
+    pub min: u8,
+    pub max: u8,
+    pub kind: TocKind,
+}
+
+impl Default for TocSpec {
+    fn default() -> Self {
+        Self { min: 1, max: TOC_MAX_LEVEL, kind: TocKind::Headings }
+    }
+}
+
+impl TocSpec {
+    /// Förteckningens rad: standardvalet skrivs som den korta `TOC_LINE`.
+    pub fn line(&self) -> String {
+        if *self == Self::default() {
+            return TOC_LINE.to_owned();
+        }
+        let mut parts = vec!["kladd: toc".to_owned()];
+        match self.kind {
+            TocKind::Headings => {
+                if (self.min, self.max) != (1, TOC_MAX_LEVEL) {
+                    parts.push(if self.min == self.max { format!("levels: {}", self.min) } else { format!("levels: {}-{}", self.min, self.max) });
+                }
+            }
+            TocKind::Figures => parts.push("kind: figures".to_owned()),
+            TocKind::Tables => parts.push("kind: tables".to_owned()),
+        }
+        format!("<!-- {} -->", parts.join("; "))
+    }
+
+    /// Words `TOC`-instruktion för förteckningen.
+    pub fn field_code(&self) -> String {
+        match self.kind {
+            TocKind::Headings => format!(" TOC \\o \"{}-{}\" \\h \\z \\u ", self.min, self.max),
+            TocKind::Figures => " TOC \\h \\z \\c \"Figur\" ".to_owned(),
+            TocKind::Tables => " TOC \\h \\z \\c \"Tabell\" ".to_owned(),
+        }
+    }
+
+    /// Rubrik ovanför förteckningen.
+    pub fn title(&self) -> &'static str {
+        match self.kind {
+            TocKind::Headings => "Innehåll",
+            TocKind::Figures => "Figurförteckning",
+            TocKind::Tables => "Tabellförteckning",
+        }
+    }
+
+    /// Ur Words `TOC`-instruktion (` TOC \o "2-4" \h \z \u `). Okända omkopplare ignoreras; utan `\o` och `\c`
+    /// gäller standardnivåerna (Words `\u` och `\t` ger fler rubriker än Kladd kan välja).
+    pub fn from_field_code(instr: &str) -> Self {
+        let mut spec = Self::default();
+        let quoted = |after: &str| -> Option<String> {
+            let a = after.trim_start();
+            let a = a.strip_prefix('"')?;
+            Some(a[..a.find('"')?].to_owned())
+        };
+        if let Some(i) = instr.find("\\c") {
+            if let Some(label) = quoted(&instr[i + 2..]) {
+                let l = label.to_lowercase();
+                spec.kind = if l.starts_with("tab") { TocKind::Tables } else { TocKind::Figures };
+                return spec;
+            }
+        }
+        if let Some(range) = instr.find("\\o").and_then(|i| quoted(&instr[i + 2..])) {
+            if let Some((a, b)) = parse_levels(&range) {
+                (spec.min, spec.max) = (a, b);
+            }
+        }
+        spec
+    }
+}
+
+/// `1-3`, `2` eller `2–4` som nivåintervall (1..=6, stigande).
+fn parse_levels(s: &str) -> Option<(u8, u8)> {
+    let s = s.trim();
+    let (a, b) = match s.split_once(['-', '–', ',']) {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (s, s),
+    };
+    let (a, b) = (a.parse::<u8>().ok()?, b.parse::<u8>().ok()?);
+    ((1..=6).contains(&a) && (1..=6).contains(&b) && a <= b).then_some((a, b))
+}
+
+/// Tolkar en förteckningsrad: `<!-- kladd: toc -->` med valfria `; levels: A-B` och `; kind: figures|tables`.
+pub fn parse_toc(line: &str) -> Option<TocSpec> {
+    let inner = line.trim().strip_prefix("<!--")?.strip_suffix("-->")?;
+    let mut parts = inner.split(';').map(str::trim);
+    if parts.next()? != "kladd: toc" {
+        return None;
+    }
+    let mut spec = TocSpec::default();
+    for part in parts {
+        match part.split_once(':').map(|(k, v)| (k.trim(), v.trim())) {
+            Some(("levels", v)) => {
+                if let Some((a, b)) = parse_levels(v) {
+                    (spec.min, spec.max) = (a, b);
+                }
+            }
+            Some(("kind", "figures")) => spec.kind = TocKind::Figures,
+            Some(("kind", "tables")) => spec.kind = TocKind::Tables,
+            _ => {}
+        }
+    }
+    Some(spec)
+}
+
+/// Är raden en innehållsförteckning (med eller utan nivåval)?
+pub fn is_toc_line(line: &str) -> bool {
+    line.contains("kladd: toc") && parse_toc(line).is_some()
+}
+
 /// En rubrik i dokumentet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heading {
@@ -141,7 +268,13 @@ pub fn has_children(h: &[Heading], i: usize) -> bool {
 // ------------------------------------------------------------------ innehållsförteckning
 
 /// Byteintervallen (utan radbrytning) för alla rader som är innehållsförteckningar.
+#[cfg(test)]
 pub fn toc_lines(text: &str) -> Vec<Range<usize>> {
+    toc_specs(text).into_iter().map(|(r, _)| r).collect()
+}
+
+/// Som `toc_lines`, med varje förteckningens val av nivåer och slag.
+pub fn toc_specs(text: &str) -> Vec<(Range<usize>, TocSpec)> {
     let mut out = Vec::new();
     if !text.contains("kladd: toc") {
         return out;
@@ -151,8 +284,8 @@ pub fn toc_lines(text: &str) -> Vec<Range<usize>> {
         let start = off;
         off += line.len();
         let t = line.trim_end_matches(['\n', '\r']);
-        if t.trim() == TOC_LINE {
-            out.push(start..start + t.len());
+        if let Some(spec) = parse_toc(t) {
+            out.push((start..start + t.len(), spec));
         }
     }
     out
@@ -160,7 +293,14 @@ pub fn toc_lines(text: &str) -> Vec<Range<usize>> {
 
 /// Sätter in en innehållsförteckning vid `at` som ett eget stycke (tomma rader runt om).
 /// Markören hamnar efter den, så att förteckningen syns direkt.
+#[cfg(test)]
 pub fn insert_toc(text: &str, at: usize) -> Edit {
+    insert_toc_spec(text, at, &TocSpec::default())
+}
+
+/// Som `insert_toc`, med val av nivåer eller slag.
+pub fn insert_toc_spec(text: &str, at: usize, spec: &TocSpec) -> Edit {
+    let line = spec.line();
     let mut at = at.min(text.len());
     while !text.is_char_boundary(at) {
         at -= 1;
@@ -176,10 +316,10 @@ pub fn insert_toc(text: &str, at: usize) -> Edit {
     };
     let newlines = after.bytes().take_while(|b| *b == b'\n').count().min(2);
     let trail = "\n".repeat(2 - newlines);
-    let mut t = String::with_capacity(text.len() + TOC_LINE.len() + 4);
+    let mut t = String::with_capacity(text.len() + line.len() + 4);
     t.push_str(before);
     t.push_str(lead);
-    t.push_str(TOC_LINE);
+    t.push_str(&line);
     t.push_str(&trail);
     let toc_end = t.len() - trail.len();
     t.push_str(after);
@@ -194,8 +334,117 @@ pub fn toc_metrics(z: f32, d: &DocDefaults) -> (f32, f32, f32) {
 }
 
 /// Rubrikerna som tas med i innehållsförteckningen.
+/// Det i bitarna `pieces` (ett fönster mellan stycken i `text`) som kan komma med i en innehållsförteckning: antalet
+/// rubriker per nivå (1–9) och antalet bildtexter för figurer och tabeller. Förteckningens höjd beror bara på antalet
+/// poster, och så länge detta är oförändrat i fönstret är antalet poster oförändrat för alla förteckningar (vilka nivåer
+/// och slag de än har).
+pub fn toc_sig_in(text: &str, pieces: &[super::markup::Piece]) -> [usize; 11] {
+    let mut sig = [0usize; 11];
+    let mut open = false;
+    for pc in pieces {
+        let Block::Heading(level) = pc.block else {
+            open = false;
+            continue;
+        };
+        if !open {
+            sig[(level as usize).clamp(1, 9) - 1] += 1;
+            open = true;
+        }
+        if text.get(pc.range.clone()).is_some_and(|b| b.ends_with('\n')) {
+            open = false;
+        }
+    }
+    if let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
+        if let Some(w) = text.get(first.range.start..last.range.end.min(text.len())) {
+            sig[9] = captions(w, TocKind::Figures).len();
+            sig[10] = captions(w, TocKind::Tables).len();
+        }
+    }
+    sig
+}
+
+/// Hur mycket det som kan komma med i en innehållsförteckning skiljer mellan två fönster (`toc_sig_in`); 0 = inget.
+pub fn toc_sig_diff(a: &[usize; 11], b: &[usize; 11]) -> isize {
+    a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).sum::<usize>() as isize
+}
+
+#[cfg(test)]
 pub fn toc_entries(h: &[Heading]) -> Vec<&Heading> {
     h.iter().filter(|x| x.level <= TOC_MAX_LEVEL).collect()
+}
+
+/// Posterna i en förteckning med val `spec`: rubriker i nivåintervallet, eller bildtexter ("Figur 1: …")
+/// ur `text` (nivå 1; `start` är styckets byteposition).
+pub fn toc_items(text: &str, h: &[Heading], spec: &TocSpec) -> Vec<Heading> {
+    match spec.kind {
+        TocKind::Headings => h.iter().filter(|x| (spec.min..=spec.max).contains(&x.level)).cloned().collect(),
+        kind => captions(text, kind),
+    }
+}
+
+/// Är texten (utan Markdown-tecken) en bildtext: etikett och tal ("Figur 3: …", "Tabell 2. …")?
+pub fn caption_kind(plain: &str) -> Option<TocKind> {
+    const FIGURE: [&str; 3] = ["figur", "figure", "bild"];
+    const TABLE: [&str; 2] = ["tabell", "table"];
+    let low = plain.trim_start().to_lowercase();
+    let numbered = |labels: &[&str]| {
+        labels.iter().any(|l| {
+            low.strip_prefix(l).and_then(|r| r.strip_prefix(' ')).is_some_and(|r| r.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        })
+    };
+    if numbered(&FIGURE) {
+        Some(TocKind::Figures)
+    } else if numbered(&TABLE) {
+        Some(TocKind::Tables)
+    } else {
+        None
+    }
+}
+
+/// Antalet poster i alla förteckningar i dokumentet (för att veta när layouten måste göras om).
+pub fn toc_total(text: &str, h: &[Heading]) -> usize {
+    toc_specs(text).iter().map(|(_, s)| toc_items(text, h, s).len()).sum()
+}
+
+/// Stycken som är bildtexter av slaget `kind` (se `caption_kind`). Kodblock hoppas över.
+pub fn captions(text: &str, kind: TocKind) -> Vec<Heading> {
+    let mut out = Vec::new();
+    let low = text.to_lowercase();
+    let possible = match kind {
+        TocKind::Headings => false,
+        TocKind::Figures => low.contains("figur") || low.contains("bild"),
+        TocKind::Tables => low.contains("tabell") || low.contains("table"),
+    };
+    if !possible {
+        return out;
+    }
+    let mut fence: Option<char> = None;
+    let mut off = 0usize;
+    for line in text.split_inclusive('\n') {
+        let start = off;
+        off += line.len();
+        let t = line.trim_end_matches(['\n', '\r']);
+        let lead = t.trim_start_matches(' ');
+        if let Some(c) = lead.chars().next().filter(|c| matches!(c, '`' | '~')) {
+            if lead.starts_with(&c.to_string().repeat(3)) {
+                match fence {
+                    None => fence = Some(c),
+                    Some(f) if f == c => fence = None,
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        if fence.is_some() || t.len() - lead.len() > 3 || lead.starts_with(['#', '|', '>', '<']) {
+            continue;
+        }
+        // Fetstil eller kursiv runt etiketten ("**Figur 1:** text") hör till bildtexten.
+        let plain = lead.replace(['*', '_'], "");
+        if caption_kind(&plain) == Some(kind) {
+            out.push(Heading { level: 1, text: plain.trim().to_owned(), start });
+        }
+    }
+    out
 }
 
 /// Antal rader (poster) som visas och förteckningens höjd i px. En förteckning är en enda
@@ -282,6 +531,60 @@ mod tests {
         let e = insert_toc("", 0);
         assert_eq!(e.text, format!("{TOC_LINE}\n\n"));
         assert_eq!(toc_lines(&format!("a\n\n{TOC_LINE}\n\nb")).len(), 1);
+    }
+
+    #[test]
+    fn toc_line_parses_levels_and_kind() {
+        assert_eq!(parse_toc(TOC_LINE), Some(TocSpec::default()));
+        let s = parse_toc("<!-- kladd: toc; levels: 2-4 -->").unwrap();
+        assert_eq!((s.min, s.max, s.kind), (2, 4, TocKind::Headings));
+        assert_eq!(parse_toc("<!-- kladd: toc; levels: 2 -->").map(|s| (s.min, s.max)), Some((2, 2)));
+        assert_eq!(parse_toc("<!-- kladd: toc; kind: tables -->").map(|s| s.kind), Some(TocKind::Tables));
+        // Ogiltigt nivåval ger standardnivåerna; andra rader är inga förteckningar.
+        assert_eq!(parse_toc("<!-- kladd: toc; levels: 5-2 -->"), Some(TocSpec::default()));
+        assert!(parse_toc("<!-- kladd: tocx -->").is_none() && parse_toc("<!-- kladd: font-size: 12pt -->").is_none() && parse_toc("text").is_none());
+        // Raden skrivs tillbaka som den lästes.
+        for l in [TOC_LINE, "<!-- kladd: toc; levels: 2-4 -->", "<!-- kladd: toc; levels: 2 -->", "<!-- kladd: toc; kind: figures -->"] {
+            assert_eq!(parse_toc(l).unwrap().line(), l);
+        }
+        assert_eq!(TocSpec { min: 1, max: 3, kind: TocKind::Headings }.line(), TOC_LINE);
+    }
+
+    #[test]
+    fn toc_field_codes_roundtrip_levels() {
+        for (min, max) in [(1, 3), (2, 4), (1, 6)] {
+            let s = TocSpec { min, max, kind: TocKind::Headings };
+            assert_eq!(TocSpec::from_field_code(&s.field_code()), s);
+        }
+        assert_eq!(TocSpec::from_field_code(r#" TOC \o "1-3" \h \z \u "#), TocSpec::default());
+        assert_eq!(TocSpec::from_field_code(r#" TOC \h \z \c "Figur" "#).kind, TocKind::Figures);
+        assert_eq!(TocSpec::from_field_code(r#" TOC \h \z \c "Tabell" "#).kind, TocKind::Tables);
+        assert_eq!(TocSpec::from_field_code(" TOC "), TocSpec::default());
+    }
+
+    #[test]
+    fn toc_items_by_level_and_captions() {
+        let t = "# Ett\n\n## Två\n\n### Tre\n\n#### Fyra\n\nFigur 1: Bild\n\n```\nFigur 9: i kod\n```\n\n**Tabell 2.** Siffror\n\nFigurer är bra.\n\n## Fig 3\n";
+        let h = headings_scan(t);
+        let lv = |min, max| toc_items(t, &h, &TocSpec { min, max, kind: TocKind::Headings }).iter().map(|x| x.text.clone()).collect::<Vec<_>>();
+        assert_eq!(lv(1, 3), ["Ett", "Två", "Tre", "Fig 3"]);
+        assert_eq!(lv(2, 4), ["Två", "Tre", "Fyra", "Fig 3"]);
+        assert_eq!(lv(2, 2), ["Två", "Fig 3"]);
+        let fig = toc_items(t, &h, &TocSpec { kind: TocKind::Figures, ..Default::default() });
+        assert_eq!(fig.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["Figur 1: Bild"]);
+        assert_eq!(&t[fig[0].start..fig[0].start + 5], "Figur");
+        let tab = toc_items(t, &h, &TocSpec { kind: TocKind::Tables, ..Default::default() });
+        assert_eq!(tab.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["Tabell 2. Siffror"]);
+        // Två förteckningar: antalet poster summeras (layoutminnet jämför det).
+        let two = format!("{t}\n<!-- kladd: toc -->\n\n<!-- kladd: toc; kind: figures -->\n");
+        assert_eq!(toc_total(&two, &headings_scan(&two)), 4 + 1);
+    }
+
+    #[test]
+    fn insert_toc_with_levels_writes_the_line() {
+        let e = insert_toc_spec("Hej", 3, &TocSpec { min: 1, max: 2, kind: TocKind::Headings });
+        assert_eq!(e.text, "Hej\n\n<!-- kladd: toc; levels: 1-2 -->\n\n");
+        assert_eq!(toc_specs(&e.text).len(), 1);
     }
 
     #[test]

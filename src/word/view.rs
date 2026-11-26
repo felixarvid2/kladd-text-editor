@@ -817,7 +817,7 @@ impl KladdApp {
                                 }
                             });
                         }
-                        if crate::app::menu_item(ui, p, t("Innehållsförteckning"), "", None, true) {
+                        if crate::app::menu_item(ui, p, t("Innehållsförteckning…"), "", None, true) {
                             acts.push(BarAct::Toc);
                         }
                         if crate::app::menu_item(ui, p, t("Textruta"), "", None, true) {
@@ -1807,13 +1807,14 @@ impl KladdApp {
                 if text.contains("kladd: toc") {
                     let from = text[..vis.start].rfind('\n').map_or(0, |i| i + 1);
                     let to = text[vis.end..].find('\n').map_or(text.len(), |i| vis.end + i);
-                    let entries = nav::toc_entries(&heads);
-                    let (shown, toc_h) = nav::toc_size_for(z, &analysis.defaults, entries.len());
-                    for (k, line) in nav::toc_lines(&text[from..to]).into_iter().enumerate() {
+                    for (k, (line, spec)) in nav::toc_specs(&text[from..to]).into_iter().enumerate() {
                         let line = line.start + from..line.end + from;
                         if overlaps(&line, &reveal) {
                             continue;
                         }
+                        let items = nav::toc_items(text, &heads, &spec);
+                        let entries: Vec<&nav::Heading> = items.iter().collect();
+                        let (shown, toc_h) = nav::toc_size_for(z, &analysis.defaults, entries.len());
                         let top = galley
                             .pos_from_cursor(CCursor::new(text[..line.start].chars().count()))
                             .translate(gpos.to_vec2())
@@ -1841,6 +1842,7 @@ impl KladdApp {
                             &entries,
                             &page_nums,
                             shown,
+                            spec.title(),
                         ) {
                             toc_click = Some(b);
                         }

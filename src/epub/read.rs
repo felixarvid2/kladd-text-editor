@@ -157,7 +157,7 @@ pub fn local(tag: &str) -> &str {
     tag.rsplit_once(':').map_or(tag, |(_, l)| l)
 }
 
-fn each<'a>(el: &'a El, f: &mut dyn FnMut(&'a El)) {
+pub fn each<'a>(el: &'a El, f: &mut dyn FnMut(&'a El)) {
     for k in &el.kids {
         if let Node::El(e) = k {
             f(e);
@@ -210,6 +210,8 @@ pub struct Meta {
     pub date: String,
     /// Beskrivningen som ren text (förlagen skriver ofta HTML i fältet).
     pub description: String,
+    /// Bokens unika id (`dc:identifier` som paketets `unique-identifier` pekar på, annars den första).
+    pub identifier: String,
 }
 
 #[derive(Clone, Debug)]
@@ -298,11 +300,14 @@ pub fn read_package(ar: &mut Archive) -> Result<Package, String> {
 
     // Metadata.
     let mut cover_id = None;
+    let unique = find(&root, "package").and_then(|p| p.attr("unique-identifier")).map(str::to_owned);
+    let mut identifiers: Vec<(Option<String>, String)> = Vec::new();
     if let Some(md) = find(&root, "metadata") {
         for k in &md.kids {
             let Node::El(e) = k else { continue };
             let text = plain_text(e);
             match local(&e.tag) {
+                "identifier" if !text.trim().is_empty() => identifiers.push((e.attr("id").map(str::to_owned), text.trim().to_owned())),
                 "title" if pkg.meta.title.is_empty() => pkg.meta.title = text,
                 "creator" if !text.is_empty() => pkg.meta.authors.push(text),
                 "publisher" if pkg.meta.publisher.is_empty() => pkg.meta.publisher = text,
@@ -318,6 +323,13 @@ pub fn read_package(ar: &mut Archive) -> Result<Package, String> {
             }
         }
     }
+
+    pkg.meta.identifier = identifiers
+        .iter()
+        .find(|(id, _)| id.is_some() && *id == unique)
+        .or_else(|| identifiers.first())
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default();
 
     // Manifest.
     let mut nav_path = None;

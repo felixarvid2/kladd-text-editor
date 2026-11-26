@@ -12,11 +12,16 @@ use egui::{
     Align, Align2, Color32, FontFamily, FontId, Frame, Id, Key, KeyboardShortcut, Layout, Margin, Modal, Modifiers, Order, Panel, Popup,
     PopupCloseBehavior, Rect, RectAlign, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, pos2, vec2,
 };
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer, SearchOptions};
+use egui_commonmark::{BlockAlign, BlockStyle, CommonMarkCache, CommonMarkViewer, SearchOptions, ViewExtras, set_extras, take_mark_hit};
 use serde::{Deserialize, Serialize};
 
+#[path = "annot.rs"]
+pub mod annot;
+
+use super::anchor::Note;
 use super::html::image_uri;
 use super::{Book, Dest};
+use annot::{AnnMenu, SideTab};
 use crate::app::quiet_button;
 use crate::i18n::t;
 use crate::icons::{self, Icon};
@@ -53,11 +58,15 @@ pub struct Prefs {
     pub width: u8,
     /// Sidfärg: 0 automatisk (följer temat), 1 ljus, 2 sepia, 3 mörk.
     pub page: u8,
+    /// Justerad text (rak högerkant).
+    pub justify: bool,
+    /// Förlagets formatering (centrerade rubriker, indrag, små versaler …).
+    pub publisher: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { size: 17.0, sans: false, spacing: 1, width: 1, page: 0 }
+        Prefs { size: 17.0, sans: false, spacing: 1, width: 1, page: 0, justify: false, publisher: true }
     }
 }
 
@@ -215,6 +224,23 @@ pub struct EpubTab {
     toc_scroll: bool,
     /// Rullar innehållsförteckningen så att aktuell post syns.
     last_toc_cur: Option<usize>,
+    /// Bokens nyckel i biblioteket och dess bokmärken och understrykningar.
+    pub key: String,
+    pub notes: Vec<Note>,
+    notes_gen: u64,
+    dirty: bool,
+    /// Var posterna står i kapitlens Markdown just nu (post-id och område), giltigt för `resolved_gen`.
+    resolved: Vec<(u64, Option<std::ops::Range<usize>>)>,
+    resolved_gen: Option<u64>,
+    /// Vilken post varje markering i den visade delen hör till.
+    mark_ids: Vec<u64>,
+    menu: Option<AnnMenu>,
+    pub side: SideTab,
+    /// Användaren bad om *Exportera anteckningar…* i sidopanelen (appen tar det).
+    pub export_requested: bool,
+    /// Var musknappen trycktes ned senast och när senaste dubbelklicket var (för att känna igen en markering).
+    press_at: Option<egui::Pos2>,
+    multi_click_at: Option<f64>,
 }
 
 impl EpubTab {
@@ -243,12 +269,36 @@ impl EpubTab {
             toc_cur: None,
             toc_scroll: true,
             last_toc_cur: None,
+            key: String::new(),
+            notes: Vec::new(),
+            notes_gen: 0,
+            dirty: false,
+            resolved: Vec::new(),
+            resolved_gen: None,
+            mark_ids: Vec::new(),
+            menu: None,
+            side: SideTab::default(),
+            export_requested: false,
+            press_at: None,
+            multi_click_at: None,
         }
     }
 
     /// Titeln som fliken visar.
     pub fn title(&self) -> String {
         self.book.title()
+    }
+
+    /// Visas menyn vid en markering eller understrykning?
+    #[cfg(test)]
+    pub fn has_menu(&self) -> bool {
+        self.menu.is_some()
+    }
+
+    /// Gäller menyn en befintlig understrykning (inte en ny markering)?
+    #[cfg(test)]
+    pub fn menu_is_existing(&self) -> bool {
+        matches!(&self.menu, Some(AnnMenu { target: annot::Target::Existing(_), .. }))
     }
 
     // ---------------------------------------------------------------- läge
@@ -460,7 +510,7 @@ impl EpubTab {
         let ctrl = Modifiers::COMMAND;
         let typing = ctx.egui_wants_keyboard_input();
         // Esc stänger det som hör till läsläget; en öppen meny (Aa) får tangenten själv.
-        if (self.note.is_some() || self.about || self.find.open) && hit(Modifiers::NONE, Key::Escape) {
+        if (self.note.is_some() || self.about || self.find.open) && self.menu.is_none() && hit(Modifiers::NONE, Key::Escape) {
             if self.note.is_some() {
                 self.note = None;
             } else if self.about {
@@ -480,6 +530,10 @@ impl EpubTab {
         }
         if hit(ctrl, Key::I) {
             self.about = !self.about;
+        }
+        // Bokmärke på stället man läser (Ctrl+D, som i Foliate): finns det ett tas det bort.
+        if !typing && hit(ctrl, Key::D) {
+            self.toggle_bookmark();
         }
         if self.find.open && hit(Modifiers::SHIFT, Key::F3) {
             self.step_hit(true);
@@ -676,7 +730,7 @@ impl EpubTab {
                             if let Some(cover) = &sec.cover {
                                 self.cover_page(ui, &book, cover, col, mid.height());
                             } else {
-                                let (top_y, link) = self.render_md(ui, p, section, col);
+                                let (top_y, link) = self.render_md(ui, p, section, col, &prefs_now, &c);
                                 md_rect_top = Some(top_y);
                                 clicked = link;
                             }
@@ -712,9 +766,38 @@ impl EpubTab {
             ctx.request_repaint();
         }
 
+        // En avslutad textmarkering eller ett klick på en understrykning: menyn för understrykning.
+        // egui rapporterar också ett vanligt klick som en markering; bara drag och dubbel- eller trippelklick räknas.
+        let (pressed, at, now, multi) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.interact_pos(),
+                i.time,
+                i.pointer.button_double_clicked(egui::PointerButton::Primary) || i.pointer.button_triple_clicked(egui::PointerButton::Primary),
+            )
+        });
+        if pressed {
+            self.press_at = at;
+        }
+        if multi {
+            self.multi_click_at = Some(now);
+        }
+        if let Some((text, pos, trusted)) = super::selection::take() {
+            if let Some(pos) = pos {
+                let moved = self.press_at.is_some_and(|p| p.distance(pos) > 4.0);
+                let multi = self.multi_click_at.is_some_and(|t| now - t < 2.0);
+                if trusted || moved || multi {
+                    self.on_selection(text, pos, mid);
+                }
+            }
+        }
+        if let Some((mi, pos)) = take_mark_hit(&ctx) {
+            self.on_mark_click(mi, pos);
+        }
+
         // Klick i marginalerna: en skärm bakåt eller framåt.
         let col_rect = Rect::from_min_max(pos2(mid.left() + side, mid.top()), pos2(mid.left() + side + col, mid.bottom()));
-        if ctx.input(|i| i.pointer.primary_clicked()) && !Popup::is_any_open(&ctx) && self.note.is_none() && !self.about {
+        if ctx.input(|i| i.pointer.primary_clicked()) && !Popup::is_any_open(&ctx) && self.note.is_none() && !self.about && self.menu.is_none() {
             if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()).filter(|p| mid.contains(*p)) {
                 let line = size * prefs_now.line_factor();
                 if pos.x < col_rect.left() - 4.0 {
@@ -773,9 +856,30 @@ impl EpubTab {
     }
 
     /// Ritar delens Markdown. Ger var texten börjar (skärmens y) och en eventuell klickad länk.
-    fn render_md(&mut self, ui: &mut Ui, p: &Palette, si: usize, col: f32) -> (f32, Option<String>) {
+    fn render_md(&mut self, ui: &mut Ui, p: &Palette, si: usize, col: f32, prefs: &Prefs, c: &Colors) -> (f32, Option<String>) {
         let book = self.book.clone();
         let sec = &book.sections[si];
+        // Justering, förlagets blockstil och understrykningar (se `egui_commonmark_backend::misc::ViewExtras`).
+        let (marks, ids) = self.marks_for_section(si, c.dark);
+        self.mark_ids = ids;
+        let blocks = if prefs.publisher {
+            sec.blocks
+                .iter()
+                .map(|(b, l)| {
+                    use crate::epub::css::Align as A;
+                    let align = l.align.map(|a| match a {
+                        A::Left => BlockAlign::Left,
+                        A::Center => BlockAlign::Center,
+                        A::Right => BlockAlign::Right,
+                        A::Justify => BlockAlign::Justify,
+                    });
+                    (*b, BlockStyle { align, indent: l.indent, margin_left: l.margin_left, small_caps: l.small_caps })
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
+        set_extras(ui.ctx(), Some(Arc::new(ViewExtras { justify: prefs.justify, blocks, marks, note_color: c.link })));
         for path in &sec.images {
             let uri = image_uri(book.uid, path);
             if self.registered.insert(uri.clone()) {
@@ -815,6 +919,7 @@ impl EpubTab {
             .search_match_color(p.match_bg)
             .search_active_match_color(p.match_current_bg);
         let resp = viewer.show_with_id(id, ui, &mut self.cache, &sec.md);
+        set_extras(ui.ctx(), None);
         let top = resp.response.rect.top();
         let link = sec.link_dests.iter().find(|d| self.cache.get_link_hook(d) == Some(true)).cloned();
         (top, link)
@@ -888,6 +993,14 @@ impl EpubTab {
                 .width(300.0)
                 .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| prefs_menu(ui, p, prefs));
+            // Bokmärke: fylld när stället har ett, ett klick till tar bort det.
+            let here = !self.bookmarks_here().is_empty();
+            let (br, bresp) = ui.allocate_exact_size(vec2(28.0, 26.0), Sense::click());
+            paint_bookmark(ui, br, here, if bresp.hovered() { c.text } else { c.muted }, c.link);
+            let tip = if here { t("Ta bort bokmärket (Ctrl+D)") } else { t("Bokmärke på det här stället (Ctrl+D)") };
+            if bresp.on_hover_text(tip).clicked() {
+                self.toggle_bookmark();
+            }
             // Titeln till vänster: ett klick visar Om boken.
             let w = ui.available_width().max(40.0);
             let (r, resp) = ui.allocate_exact_size(vec2(w, rect.height()), Sense::click());
@@ -988,6 +1101,7 @@ impl EpubTab {
         let c = colors(prefs, p);
         self.find_bar(ctx, p, anchor);
         self.note_popup(ctx, &c, prefs, anchor);
+        self.ann_menu(ctx, p, anchor);
         self.about_dialog(ctx, p);
     }
 
@@ -1281,6 +1395,23 @@ fn segmented(ui: &mut Ui, p: &Palette, options: &[&str], selected: usize) -> Opt
     out
 }
 
+/// Ett bokmärkesband (fyllt med färg när `on`).
+fn paint_bookmark(ui: &Ui, r: Rect, on: bool, color: Color32, fill: Color32) {
+    let c = r.center();
+    let (x0, x1, y0, y1) = (c.x - 5.5, c.x + 5.5, c.y - 8.0, c.y + 8.0);
+    let ym = y1 - 5.0;
+    let xm = c.x;
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(Rect::from_min_max(pos2(x0, y0), pos2(x1, ym)), 0.0, fill);
+        painter.add(egui::Shape::convex_polygon(vec![pos2(x0, ym), pos2(xm, ym), pos2(x0, y1)], fill, Stroke::NONE));
+        painter.add(egui::Shape::convex_polygon(vec![pos2(xm, ym), pos2(x1, ym), pos2(x1, y1)], fill, Stroke::NONE));
+    } else {
+        let st = Stroke::new(1.5, color);
+        painter.add(egui::Shape::line(vec![pos2(x0, y1), pos2(x0, y0), pos2(x1, y0), pos2(x1, y1), pos2(xm, ym), pos2(x0, y1)], st));
+    }
+}
+
 fn prefs_menu(ui: &mut Ui, p: &Palette, prefs: &mut Prefs) {
     ui.set_width(300.0);
     ui.spacing_mut().item_spacing.y = 6.0;
@@ -1311,6 +1442,14 @@ fn prefs_menu(ui: &mut Ui, p: &Palette, prefs: &mut Prefs) {
     if let Some(i) = segmented(ui, p, &[t("Smal"), t("Normal"), t("Bred")], usize::from(prefs.width)) {
         prefs.width = i as u8;
     }
+    head(ui, t("Justerad text"));
+    if let Some(i) = segmented(ui, p, &[t("Av"), t("På")], usize::from(prefs.justify)) {
+        prefs.justify = i == 1;
+    }
+    head(ui, t("Förlagets formatering"));
+    if let Some(i) = segmented(ui, p, &[t("Av"), t("På")], usize::from(prefs.publisher)) {
+        prefs.publisher = i == 1;
+    }
     head(ui, t("Sidfärg"));
     if let Some(i) = segmented(ui, p, &[t("Auto"), t("Ljus"), t("Sepia"), t("Mörk")], usize::from(prefs.page)) {
         prefs.page = i as u8;
@@ -1340,8 +1479,47 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut EpubTab) -> Option<Dest> {
         .frame(Frame::NONE.fill(p.editor).inner_margin(Margin { left: 10, right: 6, top: 12, bottom: 0 }))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(RichText::new(t("Innehåll")).font(FontId::new(12.0, theme::medium())).color(p.muted));
+            // Flikar: Innehåll | Bokmärken | Anteckningar.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for which in [SideTab::Toc, SideTab::Bookmarks, SideTab::Notes] {
+                    let label = annot::tab_label(which, &tab.notes);
+                    let on = tab.side == which;
+                    let galley = ui.painter().layout_no_wrap(label, FontId::new(12.0, theme::medium()), if on { p.accent } else { p.muted });
+                    let (r, resp) = ui.allocate_exact_size(vec2(galley.size().x + 14.0, 26.0), Sense::click());
+                    if on {
+                        ui.painter().rect_filled(Rect::from_min_size(pos2(r.left() + 7.0, r.bottom() - 2.0), vec2(galley.size().x, 2.0)), 1.0, p.accent);
+                    }
+                    let color = if on { p.accent } else if resp.hovered() { p.text } else { p.muted };
+                    ui.painter().galley(pos2(r.left() + 7.0, r.center().y - galley.size().y / 2.0 - 1.0), galley, color);
+                    if resp.clicked() {
+                        tab.side = which;
+                        if which == SideTab::Toc {
+                            tab.toc_scroll = true;
+                        }
+                    }
+                }
+            });
             ui.add_space(8.0);
+            if tab.side != SideTab::Toc {
+                let which = tab.side;
+                let salt = if which == SideTab::Bookmarks { "kladd-epub-bm-scroll" } else { "kladd-epub-hl-scroll" };
+                let mut picked = None;
+                annot::list_scroll(salt).show(ui, |ui| {
+                    picked = tab.note_list(ui, p, which == SideTab::Bookmarks);
+                    if which == SideTab::Notes && !tab.notes.is_empty() {
+                        ui.add_space(10.0);
+                        if ui.add(quiet_button(t("Exportera anteckningar…"), p).min_size(vec2(0.0, 28.0))).clicked() {
+                            tab.export_requested = true;
+                        }
+                        ui.add_space(16.0);
+                    }
+                });
+                if let Some(id) = picked {
+                    tab.goto_note(id);
+                }
+                return;
+            }
             ScrollArea::vertical().id_salt(("kladd-epub-toc-scroll", book.uid)).auto_shrink([false, false]).show(ui, |ui| {
                 if book.toc.is_empty() {
                     ui.label(RichText::new(t("Ingen innehållsförteckning")).size(12.5).color(p.muted));
@@ -1451,6 +1629,7 @@ mod tests {
     fn inställningar_från_en_gammal_fil_får_standardvärden() {
         let p: Prefs = serde_json::from_str("{\"size\":21.0,\"page\":2}").unwrap();
         assert_eq!((p.size, p.page, p.sans, p.spacing, p.width), (21.0, 2, false, 1, 1));
+        assert!(!p.justify && p.publisher, "justerad text av och förlagets formatering på som standard");
         let p: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(p, Prefs::default());
         // Hela appens inställningar utan EPUB-fälten.
@@ -1568,4 +1747,113 @@ mod tests {
         let s = snippet_of(&long.to_lowercase(), &long, long.find("träffen").unwrap(), "träffen".len());
         assert!(s.starts_with('…') && s.ends_with('…') && s.contains("träffen"), "{s}");
     }
+
+    // ------------------------------------------------------------ galleriet (justering, förlagets stil, markeringar)
+
+    /// Ritar `md` med tilläggen och ger alla textgalleri som målades.
+    fn galleys(md: &str, extras: ViewExtras) -> Vec<Arc<egui::Galley>> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<Arc<egui::Galley>>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.clone()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let mut cache = CommonMarkCache::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(700.0, 900.0))), ..Default::default() };
+        let mut out = Vec::new();
+        let extras = Arc::new(extras);
+        for _ in 0..2 {
+            out.clear();
+            let full = ctx.run_ui(input.clone(), |ui| {
+                set_extras(ui.ctx(), Some(extras.clone()));
+                CommonMarkViewer::new().show_with_id(Id::unique("t"), ui, &mut cache, md);
+                set_extras(ui.ctx(), None);
+            });
+            for cs in &full.shapes {
+                walk(&cs.shape, &mut out);
+            }
+            full.drop_without_applying_deltas();
+        }
+        out
+    }
+
+    const LONG: &str = "Det var en gång en lång berättelse om en räv och en hare som bodde i en stor skog långt borta från alla andra djur, \
+        och varje morgon gick de ut för att leta efter mat, medan solen steg över träden och dimman lättade över sjön där svanarna simmade.";
+
+    #[test]
+    fn justerad_text_ger_rak_högerkant_utom_på_sista_raden() {
+        let md = format!("{LONG}\n");
+        let plain = galleys(&md, ViewExtras::default());
+        let g = plain.iter().find(|g| g.text().starts_with("Det var")).expect("stycket ritas");
+        assert!(!g.job.justify);
+        let widths: Vec<f32> = g.rows.iter().map(|r| r.rect().width()).collect();
+        assert!(widths.len() >= 3, "stycket bryts över flera rader: {widths:?}");
+        let ragged = widths[..widths.len() - 1].windows(2).any(|w| (w[0] - w[1]).abs() > 1.0);
+        assert!(ragged, "utan justering är raderna ojämna: {widths:?}");
+
+        let just = galleys(&md, ViewExtras { justify: true, ..ViewExtras::default() });
+        let g = just.iter().find(|g| g.text().starts_with("Det var")).expect("stycket ritas justerat");
+        let widths: Vec<f32> = g.rows.iter().map(|r| r.rect().width()).collect();
+        let body = &widths[..widths.len() - 1];
+        assert!(body.windows(2).all(|w| (w[0] - w[1]).abs() < 1.5), "alla rader utom den sista är lika breda: {widths:?}");
+        assert!(widths[widths.len() - 1] < body[0] - 5.0, "sista raden är vänsterställd och kortare: {widths:?}");
+        assert_eq!(g.text(), plain.iter().find(|g| g.text().starts_with("Det var")).unwrap().text(), "justeringen ändrar inte texten");
+    }
+
+    #[test]
+    fn justerad_text_behåller_första_radens_indrag() {
+        let md = format!("{LONG}\n");
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(0, BlockStyle { indent: 2.0, ..BlockStyle::default() });
+        let gs = galleys(&md, ViewExtras { justify: true, blocks, ..ViewExtras::default() });
+        let g = gs.iter().find(|g| g.text().starts_with("Det var")).expect("stycket ritas");
+        let first_x = g.rows[0].row.glyphs[0].pos.x + g.rows[0].pos.x;
+        let second_x = g.rows[1].row.glyphs[0].pos.x + g.rows[1].pos.x;
+        assert!(first_x > second_x + 20.0, "första raden är indragen även när texten är justerad: {first_x} mot {second_x}");
+        let widths: Vec<f32> = g.rows.iter().map(|r| r.rect().right()).collect();
+        let n = widths.len();
+        assert!(widths[..n - 1].iter().all(|w| (w - widths[0]).abs() < 1.5), "alla rader utom den sista slutar vid samma kant: {widths:?}");
+    }
+
+    #[test]
+    fn förlagets_blockstil_centrerar_drar_in_och_ger_små_versaler() {
+        let md = "# Kapitel ett\n\nFörsta stycket här.\n\nAndra stycket.\n";
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(0, BlockStyle { align: Some(BlockAlign::Center), small_caps: true, ..BlockStyle::default() });
+        blocks.insert(md.find("Första").unwrap(), BlockStyle { indent: 2.0, ..BlockStyle::default() });
+        let gs = galleys(md, ViewExtras { blocks, ..ViewExtras::default() });
+        let head = gs.iter().find(|g| g.text().to_lowercase().starts_with("kapitel")).expect("rubriken ritas");
+        assert_eq!(head.job.halign, egui::Align::Center, "centrerad rubrik");
+        assert_eq!(head.text(), "KAPITEL ETT", "små versaler: gemener ritas som versaler");
+        let sizes: std::collections::BTreeSet<u32> = head.job.sections.iter().map(|s| (s.format.font_id.size * 10.0) as u32).collect();
+        assert!(sizes.len() == 2, "gemenerna är mindre än versalerna: {sizes:?}");
+        let p = gs.iter().find(|g| g.text().starts_with("Första")).expect("stycket ritas");
+        assert!(p.job.sections[0].leading_space > 20.0, "första raden är indragen: {}", p.job.sections[0].leading_space);
+        assert_eq!(p.job.halign, egui::Align::LEFT);
+        // Ett stycke utan blockstil ritas som vanligt (ingen galleri-väg: samma text men utan indrag).
+        let q = gs.iter().find(|g| g.text().starts_with("Andra")).expect("andra stycket ritas");
+        assert!(q.job.sections[0].leading_space < 5.0);
+    }
+
+    #[test]
+    fn markeringar_ritas_som_bakgrund_och_länkar_med_färg() {
+        let md = "Hej [en länk](kl:0:0) och mer text här.\n";
+        let color = Color32::from_rgba_unmultiplied(247, 200, 28, 110);
+        let start = md.find("mer").unwrap();
+        let marks = vec![egui_commonmark::Mark { range: start..start + 3, color, note: false }];
+        let gs = galleys(md, ViewExtras { justify: true, marks, ..ViewExtras::default() });
+        let g = gs.iter().find(|g| g.text().starts_with("Hej")).expect("stycket ritas");
+        let marked: String = g.job.sections.iter().filter(|s| s.format.background == color).map(|s| &g.job.text[s.byte_range.start.0..s.byte_range.end.0]).collect();
+        assert_eq!(marked, "mer", "bara den markerade texten får bakgrund");
+        let parts: Vec<&str> = g.job.sections.iter().map(|s| &g.job.text[s.byte_range.start.0..s.byte_range.end.0]).collect();
+        let link = g.job.sections.iter().find(|s| &g.job.text[s.byte_range.start.0..s.byte_range.end.0] == "en länk").unwrap_or_else(|| panic!("länken: {parts:?}"));
+        assert_ne!(link.format.color, g.job.sections[0].format.color, "länkar har länkfärg");
+        // Bild i stycket: ritas på vanligt sätt, utan att tappa texten omkring.
+        let with_img = galleys("Före ![x](bytes://finns-inte.png) efter\n", ViewExtras { justify: true, ..ViewExtras::default() });
+        assert!(with_img.iter().any(|g| g.text().contains("Före")), "stycket med bild finns kvar");
+    }
 }
+

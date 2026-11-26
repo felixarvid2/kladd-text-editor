@@ -363,6 +363,10 @@ impl DocDefaults {
         let t = line.trim();
         let inner = t.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
         let css = inner.strip_prefix("kladd:")?;
+        // Innehållsförteckningen (`<!-- kladd: toc; levels: 1-2 -->`) är inte grundformat, inte ens som första rad.
+        if crate::word::nav::is_toc_line(t) {
+            return None;
+        }
         // Avsnittsraderna (`crate::word::sections`) är inte grundformat.
         if crate::word::sections::is_section_keyword(css) {
             return None;

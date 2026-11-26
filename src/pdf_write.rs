@@ -31,9 +31,13 @@ use crate::word::markup::Float;
 use crate::word::sections::{self, Section, SectionProps};
 
 // --- mått i punkter (1/72 tum); sidstorlek och marginaler kommer från dokumentet ---
+#[cfg(test)]
 const BODY_SIZE: f32 = 10.5;
-const LINE: f32 = 1.5;
-const PARA_GAP: f32 = 7.5;
+const LINE: f32 = 1.4;
+/// Tom rad mellan stycken: 8 pt som dokumentläget lägger ut den, avrundad till hela bildpunkter (11 px).
+const PARA_GAP: f32 = 8.25;
+/// Rubrikernas radhöjd som faktor av teckenstorleken (som dokumentläget).
+const HEAD_LINE: f32 = 1.3;
 const INDENT: f32 = 16.0;
 /// Radhöjd för enkelt radavstånd i formatmallarnas `line-spacing`, gånger teckenstorleken.
 const LINE_SINGLE: f32 = 1.3;
@@ -44,7 +48,6 @@ const MUTED: (u8, u8, u8) = (0x66, 0x74, 0x8A);
 const RULE: (u8, u8, u8) = (0xD0, 0xD8, 0xE3);
 const LINK: (u8, u8, u8) = (0x1F, 0x63, 0xA8);
 const CODE_BG: (u8, u8, u8) = (0xF1, 0xF4, 0xF8);
-const ACCENT: (u8, u8, u8) = (0xB8, 0x65, 0x0F);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Face {
@@ -296,8 +299,8 @@ enum Block {
     Table { rows: Vec<Vec<Vec<Span>>>, spans: Vec<Vec<usize>>, weights: Option<Vec<usize>>, fmt: Option<crate::word::tablefmt::TableFmt> },
     Rule,
     Image { src: String, alt: String, indent: f32, size: ImgSize, align: Align, float: Option<Float>, place: ImgPlace },
-    /// Innehållsförteckning (`<!-- kladd: toc -->`).
-    Toc,
+    /// Innehållsförteckning (`<!-- kladd: toc -->`, med val av nivåer eller bildtexter).
+    Toc(crate::word::nav::TocSpec),
     /// Nytt avsnitt (`<!-- kladd: avsnitt; … -->`): egen sidstorlek, marginaler och spalter.
     SectionBreak(SectionProps),
     /// Spaltbrytning (`<!-- kladd: spaltbrytning -->`).
@@ -386,6 +389,9 @@ fn parse_img(tag: &str) -> Option<(String, String, ImgSize, Option<Float>, ImgPl
 /// Rubriknivåerna som Titel och Underrubrik lagras med (över Markdowns 1-6).
 const TITLE_LEVEL: u8 = 100;
 const SUBTITLE_LEVEL: u8 = 101;
+/// Bildtexter ("Figur 1: …", "Tabell 2: …") förs in bland rubrikerna för förteckningarna; de är inga rubriker.
+const FIGURE_LEVEL: u8 = 110;
+const TABLE_LEVEL: u8 = 111;
 
 fn heading_num(level: HeadingLevel) -> u8 {
     match level {
@@ -703,9 +709,9 @@ fn parse_blocks_notes(md: &str) -> (Vec<Block>, Vec<Vec<Span>>) {
                         // `<img>` med storlek blir ett eget bildblock, justerat av omgivande `<div align>`.
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::Image { src, alt, indent: indent_now(&lists, quote), size, align, float, place });
-                    } else if tag == crate::word::nav::TOC_LINE {
+                    } else if let Some(spec) = crate::word::nav::parse_toc(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
-                        blocks.push(Block::Toc);
+                        blocks.push(Block::Toc(spec));
                     } else if let Some(props) = SectionProps::from_comment(tag) {
                         flush(&mut spans, &mut blocks, None, &mut pending_marker, &lists, quote, align);
                         blocks.push(Block::SectionBreak(props));
@@ -845,10 +851,8 @@ struct Layout<'a> {
     images: Vec<Pic>,
     resolve: &'a dyn Fn(&str) -> Option<DocImage>,
     missing: Vec<String>,
-    /// Brödtextens storlek (dokumentets grundstorlek) och faktorn mot `BODY_SIZE`
-    /// som rubriker, tabeller och kod skalas med.
+    /// Brödtextens storlek (dokumentets grundstorlek).
     body: f32,
-    scale: f32,
     /// Dokumentets formatmallar (`h1: …`, `body: …`, `quote: …`).
     styles: style::StyleSet,
     /// Radhöjd som faktor av teckenstorleken (`LINE` om formatmallen inte anger något).
@@ -1053,7 +1057,7 @@ impl<'a> Layout<'a> {
 
     fn new(resolve: &'a dyn Fn(&str) -> Option<DocImage>, defaults: &DocDefaults) -> Self {
         let body = defaults.size();
-        let base = defaults.font_family.as_deref().map_or(Face::Sans, Face::for_family);
+        let base = defaults.font_family.as_deref().map_or(Face::Carlito, Face::for_family);
         let (pw, ph) = defaults.page();
         let [mt, mr, mb, ml] = defaults.layout_margins();
         // Orimliga marginaler (större än sidan) ger ändå en användbar textyta.
@@ -1067,7 +1071,6 @@ impl<'a> Layout<'a> {
             resolve,
             missing: Vec::new(),
             body,
-            scale: body / BODY_SIZE,
             styles: defaults.styles.clone(),
             line: LINE,
             first_indent: 0.0,
@@ -1112,28 +1115,39 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Ritar innehållsförteckningen: rubriken "Innehåll" och en rad per rubrik med prickad
-    /// ledlinje, sidnummer till höger och en intern länk till rubriken.
-    fn toc(&mut self) {
-        let size = 20.0 * self.scale;
-        self.ensure(size * LINE + self.body * LINE * 3.0);
+    /// Ritar innehållsförteckningen: rubriken "Innehåll" (eller "Figurförteckning") och en rad per post
+    /// med prickad ledlinje, sidnummer till höger och en intern länk till rubriken.
+    fn toc(&mut self, spec: &crate::word::nav::TocSpec) {
+        // Måtten och antalet rader som dokumentläget (`nav::toc_size`, en rad i flödet som aldrig är högre än en
+        // sida): titeln, en rad per post och luft under. Ett längre register kortas med "…".
         let (ml, cw, body) = (self.ml, self.cw, self.body);
-        let title = vec![Span { text: "Innehåll".to_owned(), style: Style::default() }];
-        self.text_block(&title, ml, cw, self.head_face().strong(), size, INK, false, None);
-        self.y += 6.0;
         let face = self.base;
-        let line_h = body * LINE;
-        let entries = self.toc_entries.clone();
+        // Indexen i den gemensamma listan (`toc_entries` och `toc_pos` hör ihop) som hör till förteckningen.
+        let entries: Vec<(usize, (u8, String))> = self.toc_entries.iter().cloned().enumerate().filter(|(_, (l, _))| toc_level_matches(*l, spec)).collect();
+        let text_h = self.ph - self.mt - self.mb;
+        // Mått i pt: `toc_metrics` räknar i bildpunkter vid zoom 1, så zoom 0,75 ger pt.
+        let (shown, total_h) = crate::word::nav::toc_size(0.75, &self.defaults, entries.len(), text_h);
+        let (title_h, row_h, _) = crate::word::nav::toc_metrics(0.75, &self.defaults);
+        // Dokumentläget lägger raderna på hela bildpunkter, också förteckningens.
+        let total_h = px_round(total_h);
+        self.ensure(total_h);
+        let top = self.y;
+        let title_size = 18.0;
+        let title_base = top + 2.0 * 0.75 + title_size * 1.08;
+        let hf = self.head_face().strong();
+        self.page().ops.push(Op::Text { x: ml, y: title_base, face: hf, size: title_size, text: spec.title().to_owned(), color: INK, italic: false });
+        let mut y = top + title_h;
         if entries.is_empty() {
-            let spans = vec![Span { text: "Inga rubriker i dokumentet".to_owned(), style: Style::default() }];
-            self.text_block(&spans, ml, cw, face, body, MUTED, true, None);
-            self.y += PARA_GAP;
+            let none = if spec.kind == crate::word::nav::TocKind::Headings { "Inga rubriker i dokumentet" } else { "Inga poster i förteckningen" };
+            self.page().ops.push(Op::Text { x: ml, y: y + body * 1.08, face, size: body, text: none.to_owned(), color: MUTED, italic: true });
+            self.y = top + total_h;
+            self.para_gap();
             return;
         }
-        for (i, (level, text)) in entries.iter().enumerate() {
-            self.ensure(line_h);
-            let indent = f32::from(level.saturating_sub(1)) * 14.0;
-            let baseline = self.y + body * 1.08;
+        let top_level = entries.iter().map(|(_, (l, _))| *l).min().unwrap_or(1);
+        for (i, (level, text)) in entries.iter().take(shown).map(|(i, e)| (*i, (e.0, &e.1))) {
+            let indent = f32::from(level.saturating_sub(top_level)) * 14.0;
+            let baseline = y + body * 1.08;
             let num = self.toc_pos.get(i).map(|(p, _)| (p + 1).to_string()).unwrap_or_default();
             let num_w = self.m.width(face, body, &num);
             let x = ml + indent;
@@ -1160,13 +1174,16 @@ impl<'a> Layout<'a> {
             if !num.is_empty() {
                 ops.push(Op::Text { x: ml + cw - num_w, y: baseline, face, size: body, text: num, color: INK, italic: false });
             }
-            if let Some((p, y)) = self.toc_pos.get(i).copied() {
-                let top = self.y;
-                self.pages[page].ops.push(Op::Goto { x, y: top, w: cw - indent, h: line_h, page: p, to_y: y });
+            if let Some((p, ty)) = self.toc_pos.get(i).copied() {
+                self.pages[page].ops.push(Op::Goto { x, y, w: cw - indent, h: row_h, page: p, to_y: ty });
             }
-            self.y += line_h + 2.0;
+            y += row_h;
         }
-        self.y += PARA_GAP;
+        if entries.len() > shown {
+            self.page().ops.push(Op::Text { x: ml, y: y + body * 1.08, face, size: body, text: "…".to_owned(), color: MUTED, italic: false });
+        }
+        self.y = top + total_h;
+        self.para_gap();
     }
 
     /// Sidhuvud och sidfot för sidan `f.page` (1-baserad) av `f.pages` i ett dokument utan avsnitt.
@@ -1327,10 +1344,23 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// Den tomma raden efter ett stycke. Ryms den inte på sidan läggs den överst på nästa, som i dokumentläget
+    /// (där den är en egen rad som följer sidindelningen), så att nästa stycke börjar en rad längre ned.
+    fn para_gap(&mut self) {
+        let fits = self.y + PARA_GAP <= self.room_end();
+        if fits || self.cols > 1 || self.y <= self.rt + 0.5 {
+            self.y += PARA_GAP;
+        } else {
+            self.new_page();
+            self.y = self.rt + PARA_GAP;
+        }
+    }
+
     /// Nedre gräns (y) för text i spalten: sidans botten minus fotnoterna, och vid utjämning av
     /// avsnittets sista sida spalternas överkant plus vald höjd.
     fn room_end(&self) -> f32 {
-        let end = self.ph - self.mb - self.reserved;
+        // En halv bildpunkt tolerans, som dokumentläget (`pages::paginate`: `eps`).
+        let end = self.ph - self.mb - self.reserved + 0.375;
         let page = self.pages.len().wrapping_sub(1);
         match self.balance.iter().find(|b| b.0 == self.cur_sec && b.1 == page) {
             Some(b) if self.cols > 1 => end.min(self.rt + b.2),
@@ -1685,7 +1715,7 @@ impl<'a> Layout<'a> {
                 }
             };
             let mut refs = refs_of(self, &line);
-            let line_h0 = line_size(&line, size) * self.line;
+            let line_h0 = px_round(line_size(&line, size) * self.line);
             let need0 = self.note_cost(&refs);
             if need0 > 0.0 && self.y + line_h0 + need0 > self.room_end() && self.y > self.rt + 0.5 {
                 self.new_page();
@@ -1705,7 +1735,7 @@ impl<'a> Layout<'a> {
             let (x, width) = (x + fx + ind0, width - fw.min(width - 24.0) - ind0);
             let last = after >= pieces.len() && !line.hard;
             let msz = line_size(&line, size);
-            let line_h = msz * self.line;
+            let line_h = px_round(msz * self.line);
             let baseline = self.y + msz * 1.08;
             if i == 0 {
                 if let Some((marker, mface)) = &first_line_extra {
@@ -2294,15 +2324,17 @@ impl<'a> Layout<'a> {
                 Block::Heading(level, spans, align) => {
                     self.align = *align;
                     let hb = self.head_face();
+                    // Samma mått som dokumentläget (`layout::block_size_pt`, radhöjd 1,3, en tom rad efter), så
+                    // att sidorna och förteckningens sidnummer blir desamma i vyn, i PDF, .docx och .odt.
                     let (size, face, before) = match *level {
-                        TITLE_LEVEL => (26.0, hb, 0.0),
+                        TITLE_LEVEL => (28.0, hb, 0.0),
                         SUBTITLE_LEVEL => (14.0, hb, 0.0),
-                        1 => (22.0, hb.strong(), 14.0),
-                        2 => (16.5, hb.strong(), 14.0),
-                        3 => (13.5, hb.strong(), 10.0),
-                        _ => (11.5, hb.strong(), 8.0),
+                        1 => (18.0, hb.strong(), 0.0),
+                        2 => (15.0, hb.strong(), 0.0),
+                        3 => (13.0, hb.strong(), 0.0),
+                        4 => (12.0, hb.strong(), 0.0),
+                        _ => (11.0, hb.strong(), 0.0),
                     };
-                    let size = size * self.scale;
                     // Formatmallens utseende (typsnittet är alltid det inbäddade).
                     let id = match *level {
                         TITLE_LEVEL => style::StyleId::Title,
@@ -2320,14 +2352,14 @@ impl<'a> Layout<'a> {
                     if *align == Align::Left {
                         self.align = st.align.unwrap_or(Align::Left);
                     }
-                    self.line = st.line_spacing.map_or(LINE, |m| m * LINE_SINGLE);
+                    self.line = st.line_spacing.map_or(HEAD_LINE, |m| m * LINE_SINGLE);
                     self.first_indent = st.first_indent.unwrap_or(0.0);
                     let before = before + st.space_before.unwrap_or(0.0);
                     if bi > 0 && self.y > self.rt + 0.5 {
                         self.y += before;
                     }
                     // Håll ihop rubriken med minst två rader text efter.
-                    self.ensure(size * LINE + self.body * LINE * 2.0);
+                    self.ensure(size * self.line);
                     let text: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
                     self.headings.push(Heading { level: *level, text: text.trim().to_owned(), page: self.pages.len() - 1, y: self.y });
                     let spans: Vec<Span> = spans.iter().map(|s| Span { text: s.text.replace('\n', " "), style: s.style.clone() }).collect();
@@ -2341,17 +2373,18 @@ impl<'a> Layout<'a> {
                         self.page().ops.push(Op::Rect { x: ml, y, w: cw, h: b.width, color: (b.color[0], b.color[1], b.color[2]) });
                         self.y += b.space * 0.5 + b.width + 4.0;
                     }
-                    if *level == 1 {
-                        let y = self.y + 2.0;
-                        let ml = self.ml;
-                        self.page().ops.push(Op::Rect { x: ml, y, w: 36.0, h: 2.2, color: ACCENT });
-                        self.y += 9.0;
-                    } else {
-                        self.y += 3.0;
-                    }
+                    self.para_gap();
                 }
                 Block::Para { spans, indent, quote, align, look } => {
                     self.align = *align;
+                    // Bildtexter ("Figur 1: …") hamnar i figur- och tabellförteckningarna.
+                    if self.pages.len() > 0 {
+                        let text: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
+                        if let Some(level) = caption_level(&text) {
+                            self.ensure(self.body * LINE);
+                            self.headings.push(Heading { level, text: text.trim().to_owned(), page: self.pages.len() - 1, y: self.y });
+                        }
+                    }
                     let page_before = self.breaks;
                     let (color, italic) = if *quote > 0 { (MUTED, true) } else { (INK, false) };
                     let st = self.styles.get(if *quote > 0 { style::StyleId::Quote } else { style::StyleId::Body }).clone();
@@ -2405,7 +2438,7 @@ impl<'a> Layout<'a> {
                         let end = self.y;
                         self.page().ops.push(Op::Rect { x, y: start + 2.0, w: 2.0, h: (end - start - 2.0).max(1.0), color: RULE });
                     }
-                    self.y += PARA_GAP;
+                    self.para_gap();
                 }
                 Block::Item { spans, indent, marker, quote, align } => {
                     self.align = *align;
@@ -2413,7 +2446,11 @@ impl<'a> Layout<'a> {
                     let color = if *quote > 0 { MUTED } else { INK };
                     self.text_block(spans, self.ml + indent + 4.0, self.cw - indent - 4.0, self.base, self.body, color, *quote > 0, Some((marker.clone(), mface)));
                     let next_is_item = matches!(blocks.get(bi + 1), Some(Block::Item { .. }));
-                    self.y += if next_is_item { 2.0 } else { PARA_GAP };
+                    if next_is_item {
+                        self.y += 2.0;
+                    } else {
+                        self.para_gap();
+                    }
                 }
                 Block::Code { text, indent, lang } => self.code(text, *indent, lang),
                 Block::Table { rows, spans, weights, fmt } => self.table(rows, spans, weights.as_deref(), fmt.as_ref()),
@@ -2426,7 +2463,7 @@ impl<'a> Layout<'a> {
                     self.y += 16.0;
                 }
                 Block::Image { src, alt, indent, size, align, float, place } => self.image(src, alt, *indent, *size, *align, *float, *place),
-                Block::Toc => self.toc(),
+                Block::Toc(spec) => self.toc(spec),
                 Block::SectionBreak(props) => self.section_break(props),
                 Block::ColumnBreak => {
                     self.manual_col = true;
@@ -2592,29 +2629,79 @@ fn hf_reserve(blocks: &[Block], defaults: &DocDefaults) -> Vec<[f32; 2]> {
     (0..secs.len().max(1)).map(|i| plan.reserve(defaults, i)).collect()
 }
 
-fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
-    // Rubrikerna H1–H3 till en eventuell innehållsförteckning (samma urval som bokmärkena).
-    let toc_entries: Vec<(u8, String)> = blocks
+/// Hör posten (rubriknivå, eller `FIGURE_LEVEL`/`TABLE_LEVEL` för bildtexter) till förteckningen?
+fn toc_level_matches(level: u8, spec: &crate::word::nav::TocSpec) -> bool {
+    use crate::word::nav::TocKind;
+    match spec.kind {
+        TocKind::Headings => (spec.min..=spec.max).contains(&level),
+        TocKind::Figures => level == FIGURE_LEVEL,
+        TocKind::Tables => level == TABLE_LEVEL,
+    }
+}
+
+/// Bildtextens slag som nivå, om stycket är en bildtext.
+fn caption_level(text: &str) -> Option<u8> {
+    use crate::word::nav::TocKind;
+    match crate::word::nav::caption_kind(text)? {
+        TocKind::Figures => Some(FIGURE_LEVEL),
+        TocKind::Tables => Some(TABLE_LEVEL),
+        TocKind::Headings => None,
+    }
+}
+
+/// Alla poster som en förteckning kan visa, i dokumentets ordning: rubrikerna och bildtexterna
+/// (nivå, text). Hör ihop med `toc_positions`, som ger deras sida och läge efter första passet.
+fn toc_candidates(blocks: &[Block]) -> Vec<(u8, String)> {
+    blocks
         .iter()
         .filter_map(|b| match b {
-            Block::Heading(l, spans, _) if *l <= 3 => {
+            Block::Heading(l, spans, _) if *l <= 6 => {
                 let t: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
                 (!t.trim().is_empty()).then(|| (*l, t.trim().to_owned()))
             }
+            Block::Para { spans, .. } => {
+                let t: String = spans.iter().map(|s| s.text.as_str()).collect::<String>().replace('\n', " ");
+                caption_level(&t).map(|l| (l, t.trim().to_owned()))
+            }
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// Rubrikerna och bildtexterna som layouten har lagt ut: (nivå, text, sida, läge).
+fn toc_laid(lay: &Layout) -> Vec<(u8, String, usize, f32)> {
+    lay.headings
+        .iter()
+        .filter(|h| !h.text.is_empty() && (h.level <= 6 || h.level >= FIGURE_LEVEL))
+        .map(|h| (h.level, h.text.clone(), h.page, h.y))
+        .collect()
+}
+
+/// Radhöjd i pt avrundad till hela bildpunkter (96 dpi): dokumentläget lägger ut raderna så, och sidindelningen
+/// ska bli densamma.
+fn px_round(pt: f32) -> f32 {
+    (pt * 4.0 / 3.0).round() * 0.75
+}
+
+fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, resolve: &'a dyn Fn(&str) -> Option<DocImage>) -> Layout<'a> {
+    // Rubrikerna och bildtexterna till eventuella förteckningar (som listan i första passet).
+    let toc_entries: Vec<(u8, String)> = toc_candidates(blocks);
     let reserve = Rc::new(hf_reserve(blocks, defaults));
     let toc_entries = Rc::new(toc_entries);
     let notes = Rc::new(notes.to_vec());
     // Mätcachen och de avkodade bilderna delas mellan passen.
     let (m, pics) = (Measurer::new(), Rc::<RefCell<HashMap<String, PicLoad>>>::default());
-    let pass = |toc_pos: Vec<(usize, f32)>, balance: &[(usize, usize, f32)], search: bool| -> Layout<'a> {
+    let pass = |toc: Option<Vec<(u8, String, usize, f32)>>, balance: &[(usize, usize, f32)], search: bool| -> Layout<'a> {
         let mut lay = Layout::new(resolve, defaults);
         lay.m = m.clone();
         lay.pics = pics.clone();
         lay.hf_reserve = reserve.clone();
-        lay.toc_entries = toc_entries.clone();
+        // Andra passet tar posterna ur det första passets utläggning, så att text och läge hör ihop.
+        let (toc_pos, entries) = match toc {
+            Some(t) => (t.iter().map(|e| (e.2, e.3)).collect(), Rc::new(t.into_iter().map(|e| (e.0, e.1)).collect())),
+            None => (Vec::new(), toc_entries.clone()),
+        };
+        lay.toc_entries = entries;
         lay.toc_pos = toc_pos;
         lay.notes = notes.clone();
         lay.balance = balance.to_vec();
@@ -2628,17 +2715,33 @@ fn lay_out<'a>(blocks: &[Block], notes: &[Vec<Span>], defaults: &DocDefaults, re
         lay.flush_notes();
         lay
     };
-    let mut lay = pass(Vec::new(), &[], true);
+    let mut lay = pass(None, &[], true);
     crate::timing::lap("pdf: utläggning (inkl. utjämning av spalter)");
-    if blocks.iter().any(|b| matches!(b, Block::Toc)) {
+    if blocks.iter().any(|b| matches!(b, Block::Toc(_))) {
         // Andra passet använder samma spalthöjder och söker inga nya.
         let balance = lay.balance.clone();
-        let pos: Vec<(usize, f32)> =
-            lay.headings.iter().filter(|h| h.level <= 3 && !h.text.is_empty()).map(|h| (h.page, h.y)).collect();
-        lay = pass(pos, &balance, false);
+        let laid = toc_laid(&lay);
+        lay = pass(Some(laid), &balance, false);
         crate::timing::lap("pdf: utläggning, pass för innehållsförteckning");
     }
     lay
+}
+
+/// Rubrikerna och bildtexterna med sida (från 1) ur samma utläggning som PDF-exporten: (nivå, text, sida).
+/// Docx och odt skriver sidnumren i sina förteckningar ur den (Word visar dem tills fältet uppdateras).
+pub fn toc_laid_pages(markdown: &str, resolve: &dyn Fn(&str) -> Option<DocImage>) -> Vec<(u8, String, usize)> {
+    let cleaned = crate::review::clean_for_export(markdown);
+    let markdown = cleaned.as_str();
+    let (blocks, notes) = parse_blocks_notes(markdown);
+    let defaults = doc_defaults(markdown);
+    let resolve = |src: &str| crate::mermaid::resolve(src).or_else(|| resolve(src));
+    let lay = lay_out(&blocks, &notes, &defaults, &resolve);
+    toc_laid(&lay).into_iter().map(|(l, t, p, _)| (l, t, p + 1)).collect()
+}
+
+/// Sidorna för posterna i en förteckning med val `spec`, ur `toc_laid_pages`.
+pub fn toc_pages_of(laid: &[(u8, String, usize)], spec: &crate::word::nav::TocSpec) -> Vec<usize> {
+    laid.iter().filter(|(l, ..)| toc_level_matches(*l, spec)).map(|(.., p)| *p).collect()
 }
 
 /// Layoutens tillstånd vid ett avsnitts början. `Layout::rollback` återställer det, så att avsnittet kan
@@ -2945,7 +3048,7 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     }
     doc.set_outline(outline);
 
-    let heading_title = lay.headings.first().map(|h| h.text.clone());
+    let heading_title = lay.headings.iter().find(|h| h.level <= SUBTITLE_LEVEL).map(|h| h.text.clone());
     doc.set_metadata(
         krilla::metadata::Metadata::new()
             .title(heading_title.unwrap_or_else(|| title.to_owned()))
@@ -3133,7 +3236,7 @@ mod tests {
         let w = write(&md, "T", &|_| None).unwrap();
         // Rubrikernas riktiga sidor, ur layouten.
         let blocks = parse_blocks(&md);
-        assert!(blocks.iter().any(|b| matches!(b, Block::Toc)));
+        assert!(blocks.iter().any(|b| matches!(b, Block::Toc(_))));
         let lay = lay_out(&blocks, &[], &doc_defaults(&md), &|_| None);
         let pages: Vec<usize> = lay.headings.iter().map(|h| h.page + 1).collect();
         assert_eq!(pages.len(), 8);
@@ -3148,6 +3251,31 @@ mod tests {
             assert_eq!(num, page.to_string(), "{name}:\n{}", back.markdown);
         }
         assert!(back.page_count >= 3);
+    }
+
+    #[test]
+    fn toc_honours_levels_dot_leaders_and_page_after_break() {
+        let pb = crate::word::sections::PAGE_BREAK_LINE;
+        let md = format!("# Ett\n\n<!-- kladd: toc; levels: 2-3 -->\n\n<!-- kladd: toc; kind: figures -->\n\n## Två\n\nFigur 1: Bilden\n\n{pb}\n\n### Tre\n\n#### Fyra\n\n{pb}\n\n## Fem\n\nFigur 2: Andra\n");
+        let w = write(&md, "T", &|_| None).unwrap();
+        let back = crate::pdf_read::read(&w.bytes, None).ok().expect("läsbar PDF");
+        let m = &back.markdown;
+        // Nivåerna 2–3: rubrik 1 och 4 är inte med; ledlinjer (punkter) och sidnummer följer med.
+        // Sidnumret efter ledlinjen (punkter) bakom posten, om den finns.
+        let flat = m.split_whitespace().collect::<Vec<_>>().join(" ");
+        let page = |name: &str| -> Option<String> {
+            let at = flat.find(&format!("{name} ."))?;
+            let rest = flat[at + name.len()..].trim_start_matches([' ', '.']);
+            Some(rest.chars().take_while(char::is_ascii_digit).collect())
+        };
+        assert_eq!(page("Två").as_deref(), Some("1"), "{m}");
+        assert_eq!(page("Tre").as_deref(), Some("2"));
+        assert_eq!(page("Fem").as_deref(), Some("3"));
+        assert!(page("Ett").is_none() && page("Fyra").is_none(), "{m}");
+        // Figurförteckningen: bildtexterna med sina sidor.
+        assert!(m.contains("Figurförteckning"), "{m}");
+        assert_eq!(page("Figur 1: Bilden").as_deref(), Some("1"), "{m}");
+        assert_eq!(page("Figur 2: Andra").as_deref(), Some("3"), "{m}");
     }
 
     #[test]
@@ -3500,8 +3628,9 @@ mod tests {
             let body = lay.body;
             let (mut beside, mut below) = (0, 0);
             for (x, y, t) in texts(&lay.pages[0].ops) {
-                let w = lay.m.width(Face::Sans, body, &t);
-                if y < iy + ih {
+                let w = lay.m.width(lay.base, body, &t);
+                // `y` är grundlinjen: raden hör till bilden om dess överkant ligger ovanför bildens underkant.
+                if y - body * 1.08 < iy + ih - 0.01 {
                     beside += 1;
                     let (lo, hi) = if side == Float::Left { (lay.ml + iw + FLOAT_GAP, lay.ml + lay.cw) } else { (lay.ml, lay.ml + lay.cw - iw - FLOAT_GAP) };
                     assert!(x >= lo - 0.01 && x + w <= hi + 0.5, "{side:?}: rad vid {x}..{} (y {y}) utanför {lo}..{hi}", x + w);

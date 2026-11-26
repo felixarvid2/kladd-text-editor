@@ -38,6 +38,8 @@ pub struct Delta {
     pub notes_changed: bool,
     /// Typsnitten som fönstrets nya bitar behöver.
     pub fonts: std::collections::BTreeSet<(String, bool, bool)>,
+    /// Hur mycket det som kan komma med i en innehållsförteckning ändrats i fönstret (`nav::toc_sig_diff`; 0 = inget).
+    pub toc_delta: isize,
 }
 
 /// Förekomster i hela texten av det som gör att en ändring var som helst kan ändra tolkningen av resten (tre tilda,
@@ -113,6 +115,10 @@ thread_local! {
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
+    // Stora block först (en jämförelse per block går fortare än många små i en lång text).
+    while i + 4096 <= n && a[i..i + 4096] == b[i..i + 4096] {
+        i += 4096;
+    }
     while i + 64 <= n && a[i..i + 64] == b[i..i + 64] {
         i += 64;
     }
@@ -125,6 +131,9 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
 fn common_suffix(a: &[u8], b: &[u8], limit: usize) -> usize {
     let n = a.len().min(b.len()).min(limit);
     let mut i = 0;
+    while i + 4096 <= n && a[a.len() - i - 4096..a.len() - i] == b[b.len() - i - 4096..b.len() - i] {
+        i += 4096;
+    }
     while i + 64 <= n && a[a.len() - i - 64..a.len() - i] == b[b.len() - i - 64..b.len() - i] {
         i += 64;
     }
@@ -181,6 +190,147 @@ fn para_end(t: &[u8], pos: usize) -> Option<usize> {
             return None;
         }
     }
+}
+
+/// Längst sträcka (byte) som söks efter gränserna mellan fotnotsdefinitioner.
+const MAX_DEF: usize = 16_000;
+
+/// Börjar en fotnotsdefinition (`[^etikett]:`) på raden som börjar vid `ls`, enligt analysen `a` av `t`? Etiketten är en
+/// egen bit (`footnote_def`) direkt efter `[^` (för slutnoter ett tecken senare).
+fn def_start(t: &[u8], a: &Analysis, ls: usize) -> bool {
+    if !t[ls.min(t.len())..].starts_with(b"[^") {
+        return false;
+    }
+    let i = a.pieces.partition_point(|p| p.range.start < ls + 2);
+    a.pieces.get(i).is_some_and(|p| p.footnote_def.is_some() && p.range.start <= ls + 3)
+}
+
+/// Början på raden före raden som börjar vid `ls` om den inte är tom (samma stycke).
+fn prev_line(t: &[u8], ls: usize) -> Option<usize> {
+    if ls == 0 {
+        return None;
+    }
+    let p = line_start(t, ls - 1);
+    (!blank(t, p, ls - 1)).then_some(p)
+}
+
+/// Början på raden efter raden som börjar vid `ls` om den finns och inte är tom (samma stycke).
+fn next_line(t: &[u8], ls: usize) -> Option<usize> {
+    let n = line_end(t, ls) + 1;
+    (n < t.len() && !blank(t, n, line_end(t, n))).then_some(n)
+}
+
+/// Början på den sista definitionen i stycket före `at` (början på ett stycke, eller en rad mitt i ett), om det slutar med
+/// en fotnotsdefinition: kanariefågeln före behöver då bara vara den definitionen.
+fn last_def_start(t: &[u8], a: &Analysis, at: usize) -> Option<usize> {
+    if at == 0 {
+        return None;
+    }
+    let mut l = line_start(t, at - 1);
+    while blank(t, l, line_end(t, l)) {
+        if l == 0 {
+            return None;
+        }
+        l = line_start(t, l - 1);
+    }
+    loop {
+        if def_start(t, a, l) {
+            return Some(l);
+        }
+        if at - l > MAX_DEF {
+            return None;
+        }
+        l = prev_line(t, l)?;
+    }
+}
+
+/// Slutet på den första definitionen i stycket efter `from` (efter blankraderna), om stycket är ett block av
+/// fotnotsdefinitioner med fler än en definition: början på nästa definitionsrad.
+fn first_def_end(t: &[u8], a: &Analysis, from: usize) -> Option<usize> {
+    let mut ls = line_start(t, from.min(t.len()));
+    while ls < t.len() && blank(t, ls, line_end(t, ls)) {
+        ls = line_end(t, ls) + 1;
+    }
+    if ls >= t.len() || !def_start(t, a, ls) {
+        return None;
+    }
+    let start = ls;
+    loop {
+        ls = next_line(t, ls)?;
+        if ls - start > MAX_DEF {
+            return None;
+        }
+        if def_start(t, a, ls) {
+            return Some(ls);
+        }
+    }
+}
+
+/// Fotnotsdefinitionen med en ändring och grannarna i ett block av definitioner (se `def_window`).
+struct DefWin {
+    /// Början på definitionen före (`None` om ändringen står i blockets första definition).
+    prev: Option<usize>,
+    /// Början på definitionen med ändringen.
+    start: usize,
+    /// Början på definitionen efter, och på den efter den (`None` vid blockets slut).
+    next: Option<usize>,
+    after: Option<usize>,
+    /// Blockets slut (början på blankraden efter det, eller textens slut).
+    block_end: usize,
+}
+
+/// Står ändringen `pre..end` (i `t`, analyserad som `a`) i ett block av fotnotsdefinitioner utan tomrader emellan? Varje
+/// definitionsrad börjar en ny definition, så det räcker att tolka om definitionen (eller definitionerna) med ändringen och
+/// en definition på var sida som kanariefåglar: texten utanför tolkas likadant. Ändringar som inte står i ett sådant block
+/// (eller där gränserna är för långt bort) ger `None`.
+fn def_window(t: &[u8], a: &Analysis, pre: usize, end: usize) -> Option<DefWin> {
+    let first = line_start(t, pre);
+    if first >= t.len() || blank(t, first, line_end(t, first)) {
+        return None;
+    }
+    let mut start = first;
+    while !def_start(t, a, start) {
+        start = prev_line(t, start)?;
+        if pre - start > MAX_DEF {
+            return None;
+        }
+    }
+    let mut prev = None;
+    let mut l = start;
+    while let Some(p) = prev_line(t, l) {
+        if start - p > MAX_DEF {
+            return None;
+        }
+        if def_start(t, a, p) {
+            prev = Some(p);
+            break;
+        }
+        l = p;
+    }
+    // Definitionen efter den sista raden som ändringen rör, och den efter den.
+    let last = line_start(t, end.max(pre).min(t.len()));
+    let mut block_end = t.len();
+    let mut found: Vec<usize> = Vec::new();
+    let mut ls = last;
+    while found.len() < 2 {
+        let n = line_end(t, ls) + 1;
+        if n >= t.len() {
+            block_end = t.len();
+            break;
+        }
+        if blank(t, n, line_end(t, n)) {
+            block_end = n;
+            break;
+        }
+        if n - last > 2 * MAX_DEF {
+            return None;
+        }
+        if def_start(t, a, n) {
+            found.push(n);
+        }
+        ls = n;
+    }
+    Some(DefWin { prev, start, next: found.first().copied(), after: found.get(1).copied(), block_end })
 }
 
 /// Finns det en oavslutad (eller överflödigt avslutad) HTML-kommentar? En sådan sväljer text över blankrader och ändrar
@@ -341,10 +491,6 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     }
     let delta = nb.len() as isize - ob.len() as isize;
 
-    // Fönstret: stycket med ändringen och ett stycke på var sida (kanariefåglar).
-    let edit_para = para_start(ob, pre)?;
-    let mut ws = if edit_para == 0 { 0 } else { para_start(ob, edit_para - 1)? };
-    let mid_end = para_end(ob, old_changed.end.min(ob.len().saturating_sub(1)).max(pre))?.max(old_changed.end);
     // Stycket efter: hoppa över blankraderna och ta nästa stycke.
     let next_end = |from: usize| -> Option<usize> {
         if from >= ob.len() {
@@ -356,7 +502,47 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
         }
         if ls >= ob.len() { Some(ob.len()) } else { para_end(ob, ls) }
     };
-    let mut we_old = next_end(mid_end)?;
+    // Kanariestycket efter `from` (slutet på ett stycke): nästa stycke, eller bara dess första definition om det är ett
+    // block av fotnotsdefinitioner (Word-läsaren skriver dem utan tomrader emellan, så blocket kan vara hela slutet av
+    // dokumentet).
+    let next_unit = |from: usize| -> Option<usize> {
+        match first_def_end(ob, old, from) {
+            Some(e) => Some(e),
+            None => next_end(from),
+        }
+    };
+    // Kanariestycket före stycket som börjar vid `at`: föregående stycke, eller dess sista definition.
+    let prev_unit = |at: usize| -> Option<usize> {
+        if at == 0 {
+            return Some(0);
+        }
+        match last_def_start(ob, old, at) {
+            Some(l) => Some(l),
+            None => para_start(ob, at - 1),
+        }
+    };
+    // Fönstret: stycket med ändringen och ett stycke på var sida (kanariefåglar); i ett block av fotnotsdefinitioner
+    // definitionen med ändringen och en definition på var sida.
+    let (mut ws, mut we_old) = match def_window(ob, old, pre, old_changed.end) {
+        Some(DefWin { prev, start, next, after, block_end }) => {
+            let ws = match prev {
+                Some(p) => p,
+                None => prev_unit(start)?,
+            };
+            let we = match (next, after) {
+                (Some(_), Some(a)) => a,
+                (Some(_), None) => block_end,
+                (None, _) => next_unit(block_end)?,
+            };
+            (ws, we)
+        }
+        None => {
+            let edit_para = para_start(ob, pre)?;
+            let ws = prev_unit(edit_para)?;
+            let mid_end = para_end(ob, old_changed.end.min(ob.len().saturating_sub(1)).max(pre))?.max(old_changed.end);
+            (ws, next_unit(mid_end)?)
+        }
+    };
     // `<div align>` runt stycken (justerad text i Word-dokument): fönstret ska innehålla hela `<div>`-block, annars
     // syns inte justeringen vid tolkning av fönstret för sig. Det vidgas till stycken tills blocken är hela.
     for _ in 0..8 {
@@ -522,6 +708,7 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
             labels(&ow) != labels(&mid)
         },
         fonts: super::layout::needed_fonts(&Analysis { pieces: mid.clone(), defaults: old.defaults.clone(), sections: Vec::new() }),
+        toc_delta: super::nav::toc_sig_diff(&super::nav::toc_sig_in(new_text, &mid), &super::nav::toc_sig_in(old_text, &ow)),
     };
     // Först nu ändras analysen: bitarna efter fönstret flyttas på plats, fönstrets byts ut.
     if delta != 0 {
@@ -641,9 +828,42 @@ mod tests {
         t.get(p[i].range.clone()).unwrap_or("").to_owned()
     }
 
+    /// Fotnotsdefinitionerna som Word-läsaren skriver dem: ett block utan tomrader, ibland med fortsättningsrader, en
+    /// referens i en definition och slutnoter efter.
+    fn word_notes(r: &mut Rng, n: usize) -> String {
+        let mut s = String::new();
+        for k in 1..=n {
+            s.push_str(&format!("[^{k}]: Fotnot {k} med *text* och <u>mer</u> text"));
+            match r.below(10) {
+                0 => s.push_str("\nfortsättning på noten"),
+                1 => s.push_str(" och en referens[^1]"),
+                2 => s.push_str(" **fet"),
+                _ => {}
+            }
+            s.push('\n');
+        }
+        if r.below(2) == 0 {
+            s.push_str("\n[^ei]: Slutnot.\n[^eii]: Slutnot två.\n");
+        }
+        s
+    }
+
+    /// Som `doc`, men med fotnotsdefinitionerna som ett block (Word-dialekten).
+    fn doc_word(r: &mut Rng, paras: usize, rich: bool) -> String {
+        let text = doc(r, paras, rich);
+        let cut = text.find("[^1]: ").unwrap_or(text.len());
+        let n = text[cut..].matches("]: ").count();
+        format!("{}{}", &text[..cut], word_notes(r, n))
+    }
+
     fn fuzz(rich: bool, seed: u64) -> (usize, usize) {
+        fuzz_with(rich, seed, false)
+    }
+
+    /// `word`: fotnotsdefinitionerna står i ett block och två tredjedelar av ändringarna görs i eller nära det.
+    fn fuzz_with(rich: bool, seed: u64, word: bool) -> (usize, usize) {
         let mut r = Rng(seed);
-        let mut text = doc(&mut r, 120, rich);
+        let mut text = if word { doc_word(&mut r, 120, rich) } else { doc(&mut r, 120, rich) };
         let mut a = markup::analyze(&text);
         let mut facts: Option<Facts> = None;
         let (mut used, mut declined) = (0, 0);
@@ -651,7 +871,11 @@ mod tests {
         for _ in 0..400 {
             let mut t = text.clone();
             let at = {
-                let mut p = r.below(t.len());
+                let focus = t.find("\n[^1]:").filter(|_| word && r.below(3) != 0);
+                let mut p = match focus {
+                    Some(f) => f.saturating_sub(300) + r.below(t.len() - f.saturating_sub(300)),
+                    None => r.below(t.len()),
+                };
                 while !t.is_char_boundary(p) {
                     p -= 1;
                 }
@@ -722,6 +946,64 @@ mod tests {
         for seed in [3, 5, 8, 13, 21, 34].into_iter().chain(100..100 + n) {
             fuzz(true, seed);
         }
+    }
+
+    /// Ändringar i och nära ett block av fotnotsdefinitioner utan tomrader (Word-dialekten): fönstret är då bara
+    /// definitionen med ändringen och grannarna (`def_window`), och resultatet ska vara detsamma som `analyze`.
+    #[test]
+    fn incremental_equals_full_in_footnote_definition_blocks() {
+        let n: u64 = std::env::var("KLADD_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let (mut used, mut declined) = (0, 0);
+        for seed in [2, 7, 19, 31].into_iter().chain(500..500 + n) {
+            let (u, d) = fuzz_with(seed % 2 == 1, seed, true);
+            used += u;
+            declined += d;
+        }
+        // Dokumenten har också indragen kod, kodstaket och ohela `<div>` (som alltid ger full analys).
+        assert!(used * 8 > used + declined, "den inkrementella vägen används ({used} av {})", used + declined);
+    }
+
+    /// Text i en fotnotsdefinition i ett stort block tolkar bara om definitionen och grannarna, och stycket före
+    /// blocket tar bara blockets första definition som kanariefågel.
+    #[test]
+    fn footnote_block_window_is_one_definition_on_each_side() {
+        let mut r = Rng(3);
+        let mut text = doc(&mut r, 3000, false);
+        let cut = text.find("[^1]: ").unwrap_or(text.len());
+        text.truncate(cut);
+        text.push_str("Sista stycket i brödtexten med en referens[^1] och mer.\n\n");
+        let refs = (1..=2000).map(|k| format!("ref[^{k}] ")).collect::<String>();
+        text.insert_str(text.len() / 2, &format!("{refs}\n\n"));
+        for k in 1..=2000 {
+            text.push_str(&format!("[^{k}]: Fotnot {k} med lite text i.\n"));
+        }
+        // Slutnoterna (synliga definitioner) i ett eget block efter.
+        text.push('\n');
+        for k in 1..=300 {
+            text.push_str(&format!("[^{}]: Slutnot {k} med text.\n", markup::endnote_label(k)));
+        }
+        let a = markup::analyze(&text);
+        let at = text.find(&format!("[^{}]: Slutnot", markup::endnote_label(299))).unwrap() + 20;
+        let mut t = text.clone();
+        t.insert(at, 'x');
+        let mut inc = a.clone();
+        let d = analyze_incremental(&text, &mut inc, &t).expect("inkrementell");
+        assert!(d.we_old - d.ws < 200, "fönstret i slutnoterna är tre definitioner ({})", d.we_old - d.ws);
+        assert_eq!(inc.pieces, markup::analyze(&t).pieces);
+        let at = text.find("[^1000]: Fotnot").unwrap() + 15;
+        let mut t = text.clone();
+        t.insert(at, 'x');
+        let mut inc = a.clone();
+        let d = analyze_incremental(&text, &mut inc, &t).expect("inkrementell");
+        assert!(d.we_old - d.ws < 200, "fönstret är tre definitioner, inte hela blocket ({})", d.we_old - d.ws);
+        assert_eq!(inc.pieces, markup::analyze(&t).pieces);
+        let at = text.find("Sista stycket").unwrap() + 3;
+        let mut t = text.clone();
+        t.insert(at, 'x');
+        let mut inc = a.clone();
+        let d = analyze_incremental(&text, &mut inc, &t).expect("inkrementell");
+        assert!(d.we_old - at < 200, "kanariefågeln efter är första definitionen ({})", d.we_old - at);
+        assert_eq!(inc.pieces, markup::analyze(&t).pieces);
     }
 
     #[test]

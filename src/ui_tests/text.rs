@@ -184,6 +184,50 @@ fn markdown_double_click_opens_editor_at_paragraph() {
     assert_eq!(caret, ui.text()[..at].chars().count(), "markören står i början av stycket");
 }
 
+/// Dubbelklickar en gång (musen vilar först, sedan ett klick per bild) mitt på texten `part`.
+fn dbl_click_on(ui: &mut Ui, part: &str) {
+    use egui_kittest::kittest::NodeT;
+    let node = ui.h.get_all_by_label_contains(part).next().unwrap_or_else(|| panic!("'{part}' syns"));
+    let r = node.accesskit_node().raw_bounds().expect("läge");
+    let pos = egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+    ui.h.input_mut().events.push(egui::Event::PointerMoved(pos));
+    ui.h.step();
+    for _ in 0..2 {
+        let inp = ui.h.input_mut();
+        for pressed in [true, false] {
+            inp.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+        }
+        ui.h.step();
+    }
+    ui.settle();
+}
+
+fn caret_of(ui: &Ui) -> usize {
+    let state = egui::text_edit::TextEditState::load(&ui.h.ctx, crate::app::editor_id(ui.app().docs[0].id)).unwrap();
+    state.cursor.char_range().unwrap().primary.index.0
+}
+
+#[test]
+fn markdown_double_click_opens_editor_on_first_try_even_after_html_block() {
+    // Rapporterat: första dubbelklicket markerade bara ett ord. Orsak: ett dokument som börjar med ett HTML-block
+    // (`<p align="center">`, som många README-filer) hade ingen blockposition före första stycket, så ingen rad hittades.
+    let mut ui = Ui::new();
+    let doc = "<p align=\"center\">\n  <strong>En lugn texteditor</strong>\n</p>\n\nFörsta stycket med ananas.\n\n---\n\nSista stycket med banan.\n";
+    let file = ui.dir.write("readme.md", doc);
+    ui.open(&file);
+    assert!(ui.app().md_read_mode());
+    dbl_click_on(&mut ui, "En lugn texteditor");
+    assert!(!ui.app().md_read_mode(), "ett dubbelklick på HTML-blocket öppnar redigeraren");
+    assert!(caret_of(&ui) <= doc.find("</p>").unwrap(), "markören står i HTML-blocket (rad 1-3)");
+
+    // Och på ett vanligt stycke efter blocket, utan att musen fått vila över det först.
+    ui.key(CTRL | Modifiers::SHIFT, Key::M);
+    assert!(ui.app().md_read_mode());
+    dbl_click_on(&mut ui, "Sista stycket");
+    assert!(!ui.app().md_read_mode(), "ett dubbelklick räcker");
+    assert_eq!(caret_of(&ui), doc[..doc.find("Sista").unwrap()].chars().count(), "markören står i början av stycket");
+}
+
 #[test]
 fn markdown_toggle_keeps_scroll_roughly() {
     let mut ui = Ui::new();

@@ -78,6 +78,8 @@ pub use egui_commonmark_backend::RenderHtmlFn;
 pub use egui_commonmark_backend::RenderMathFn;
 pub use egui_commonmark_backend::alerts::{Alert, AlertBundle};
 pub use egui_commonmark_backend::misc::CommonMarkCache;
+// Kladd: tilläggen för läsläget för EPUB (se `vendor/egui_commonmark_backend/KLADD.md`).
+pub use egui_commonmark_backend::misc::{BlockAlign, BlockStyle, Mark, ViewExtras, set_extras, take_mark_hit};
 #[cfg(feature = "regex")]
 pub use egui_commonmark_backend::misc::SearchOptions;
 

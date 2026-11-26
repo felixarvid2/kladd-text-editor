@@ -1135,7 +1135,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
             }
         }
     }
-    let (mut markdown, units) = to_markdown_units(&blocks, &numbering, text_w);
+    let (mut markdown, mut units) = to_markdown_units(&blocks, &numbering, text_w);
     let mut keys: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
     // Grundformatet (typsnitt, storlek och sida) står först när det avviker från standard.
     let mut base = styles.base();
@@ -1192,6 +1192,24 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         markdown = format!("{comment}\n\n{markdown}");
     }
     for f in found {
+        // Ett diagram som Kladd skrivit: koden i alt-texten blir ett ```mermaid-block igen (inte en bild).
+        if let Some(code) = mermaid_code(&f.alt) {
+            let alone = markdown.find(&f.placeholder).is_some_and(|at| {
+                let ls = markdown[..at].rfind('\n').map_or(0, |i| i + 1);
+                let le = markdown[at..].find('\n').map_or(markdown.len(), |i| at + i);
+                markdown[ls..le].trim() == f.placeholder
+            });
+            if alone {
+                let fence = if code.contains("```") { "~~~~" } else { "```" };
+                let repl = format!("{fence}mermaid\n{code}\n{fence}");
+                markdown = markdown.replace(&f.placeholder, &repl);
+                for (k, u) in keys.iter_mut().zip(units.iter_mut()).filter(|(k, _)| k.contains(&f.placeholder)) {
+                    *k = norm(&repl);
+                    u.desc = "c|left".to_owned();
+                }
+                continue;
+            }
+        }
         let name = if let Some(n) = by_target.get(&f.target) {
             Some(n.clone())
         } else {
@@ -1238,6 +1256,10 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         for k in keys.iter_mut().filter(|k| k.contains(&f.placeholder)) {
             *k = k.replace(&f.placeholder, &repl);
         }
+    }
+
+    for k in keys.iter_mut().filter(|k| crate::word::nav::is_toc_line(k)) {
+        *k = toc_unit_key(k, &markdown);
     }
 
     let source = collect_parts(&mut pkg).and_then(|parts| {
@@ -1940,6 +1962,23 @@ fn is_toc_xml(xml: &str) -> bool {
     xml.contains("w:instr=\" TOC") || xml.contains("w:instr=\"TOC")
 }
 
+/// Fältkoden (`TOC \o "1-3" \h \z \u`) för förteckningen i `xml`, om den har en.
+fn toc_instr(xml: &str) -> Option<String> {
+    let mut rest = xml;
+    while let Some(i) = rest.find("instrText") {
+        let after = &rest[i..];
+        let gt = after.find('>')?;
+        let body = &after[gt + 1..];
+        let end = body.find('<').unwrap_or(body.len());
+        let instr = body[..end].trim_start();
+        if instr.len() >= 3 && instr[..3].eq_ignore_ascii_case("TOC") && !instr[3..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            return Some(instr[3..].replace("&quot;", "\"").replace("&amp;", "&"));
+        }
+        rest = &body[end..];
+    }
+    None
+}
+
 /// Läser en textruta: innehållet som block (egna markörer räknas på samma lista som resten) och formen.
 /// `None` om innehållet inte går att visa som text (bilder, fotnoter) eller är tomt.
 fn read_box(
@@ -2141,7 +2180,8 @@ fn parse_body(
                         let slice = &xml[before..end];
                         if is_toc_xml(slice) && (name == b"sdt" || field_balance(slice) == 0) {
                             let mut p = Para::new();
-                            p.runs.push(Run { text: crate::word::nav::TOC_LINE.to_owned(), fmt: Fmt::default(), link: None, raw: true });
+                            let spec = toc_instr(slice).map(|i| crate::word::nav::TocSpec::from_field_code(&i)).unwrap_or_default();
+                            p.runs.push(Run { text: spec.line(), fmt: Fmt::default(), link: None, raw: true });
                             p.origin = info.elems.len().wrapping_sub(1);
                             blocks.push(Block::Para(p));
                             skip = 1;
@@ -3480,6 +3520,8 @@ struct Writer<'a> {
     /// Pågående kodblock: språket ur inhägnaden och koden hittills (färgas när blocket tar slut).
     code_lang: String,
     code_buf: String,
+    /// Var i brödtexten det pågående kodblocket börjar (ett ritat Mermaid-diagram ersätter det).
+    code_mark: usize,
     /// Antal skrivna språkbokmärken (för unika `w:id`).
     n_lang: u32,
     /// Bild som håller på att läsas: (källa, alt-text).
@@ -3500,6 +3542,8 @@ struct Writer<'a> {
     in_footnote: bool,
     /// Antal innehållsförteckningar skrivna hittills (för unika id).
     toc_n: u32,
+    /// Rubriker och bildtexter med sidor ur Kladds utläggning (för sidnumren i förteckningar).
+    toc_laid: Option<Vec<(u8, String, usize)>>,
     /// Öppen `<ins>`/`<del>`.
     rev: Option<(RevKind, u32)>,
     /// Öppen `<fmt>` (spårad teckenformatering).
@@ -3575,6 +3619,7 @@ impl<'a> Writer<'a> {
             in_code_block: false,
             code_lang: String::new(),
             code_buf: String::new(),
+            code_mark: 0,
             n_lang: 0,
             image: None,
             media: Vec::new(),
@@ -3585,6 +3630,7 @@ impl<'a> Writer<'a> {
             fn_order: Vec::new(),
             in_footnote: false,
             toc_n: 0,
+            toc_laid: None,
             rev: None,
             fchange: None,
             fchange_para: None,
@@ -3597,37 +3643,44 @@ impl<'a> Writer<'a> {
     }
 
     /// Skriver en innehållsförteckning: en innehållskontroll med ett `TOC`-fält vars sparade
-    /// resultat är rubrikerna H1–H3 (sidnummer grovt uppskattade). Word och LibreOffice uppdaterar
-    /// fältet vid öppning (`w:updateFields` i settings.xml).
-    fn toc(&mut self, md: &str) {
+    /// resultat är posterna (rubriker i `spec`s nivåer, eller bildtexter) med sidnumren ur Kladds egen
+    /// utläggning (samma som PDF-exporten). Word visar de sparade numren tills fältet uppdateras (F9);
+    /// `w:updateFields` begärs bara när utläggningen inte gick att para ihop med posterna.
+    fn toc(&mut self, md: &str, spec: &crate::word::nav::TocSpec) {
         use crate::word::nav;
         self.toc_n += 1;
         let heads = nav::headings_scan(md);
-        let entries = nav::toc_entries(&heads);
+        let entries = nav::toc_items(md, &heads, spec);
+        let pages = self.toc_laid.as_ref().map(|l| crate::pdf_write::toc_pages_of(l, spec)).filter(|p| p.len() == entries.len());
+        let stale = pages.is_none() && !entries.is_empty();
         // Textytans bredd i tjugondels punkter (EMU / 635).
         let width = if self.ctx.max_width > 0 { self.ctx.max_width / 635 } else { 9026 };
         let tab = format!("<w:tabs><w:tab w:val=\"right\" w:leader=\"dot\" w:pos=\"{width}\"/></w:tabs>");
         let id = 1_000_000 + self.toc_n;
+        let tag = if stale { TOC_STALE_TAG } else { TOC_TAG };
         let mut x = format!(
-            "<w:sdt><w:sdtPr><w:id w:val=\"{id}\"/><w:docPartObj><w:docPartGallery w:val=\"Table of Contents\"/><w:docPartUnique/></w:docPartObj><w:tag w:val=\"{TOC_TAG}\"/></w:sdtPr><w:sdtContent>"
+            "<w:sdt><w:sdtPr><w:id w:val=\"{id}\"/><w:docPartObj><w:docPartGallery w:val=\"Table of Contents\"/><w:docPartUnique/></w:docPartObj><w:tag w:val=\"{tag}\"/></w:sdtPr><w:sdtContent>"
         );
-        x.push_str("<w:p><w:pPr><w:pStyle w:val=\"TOCHeading\"/></w:pPr><w:r><w:t>Innehåll</w:t></w:r></w:p>");
-        let begin = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\"> TOC \\o \"1-3\" \\h \\z \\u </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>";
+        x.push_str(&format!("<w:p><w:pPr><w:pStyle w:val=\"TOCHeading\"/></w:pPr><w:r><w:t>{}</w:t></w:r></w:p>", spec.title()));
+        let begin = format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\">{}</w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>",
+            spec.field_code()
+        );
         for (i, h) in entries.iter().enumerate() {
-            let ind = (i32::from(h.level) - 1) * 220;
+            // Posterna följer Words TOC 1–9: indrag per nivå (bildtextlistor har ingen).
+            let ind = if spec.kind == nav::TocKind::Headings { (i32::from(h.level) - 1) * 220 } else { 0 };
             let mut t = String::new();
             xml_escape(&h.text, &mut t);
-            // Grov uppskattning: ca 3 000 tecken per sida.
-            let page = 1 + md[..h.start.min(md.len())].chars().count() / 3000;
+            let page = pages.as_ref().map_or(1, |p| p[i]);
+            let level = if spec.kind == nav::TocKind::Headings { h.level.min(9) } else { 1 };
             x.push_str(&format!(
-                "<w:p><w:pPr><w:pStyle w:val=\"TOC{}\"/>{tab}<w:spacing w:after=\"100\"/><w:ind w:left=\"{ind}\"/></w:pPr>{}<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>{page}</w:t></w:r></w:p>",
-                h.level,
-                if i == 0 { begin } else { "" },
+                "<w:p><w:pPr><w:pStyle w:val=\"TOC{level}\"/>{tab}<w:spacing w:after=\"100\"/><w:ind w:left=\"{ind}\"/></w:pPr>{}<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>{page}</w:t></w:r></w:p>",
+                if i == 0 { begin.as_str() } else { "" },
             ));
         }
         if entries.is_empty() {
             x.push_str(&format!(
-                "<w:p><w:pPr><w:pStyle w:val=\"TOC1\"/>{tab}</w:pPr>{begin}<w:r><w:t>Inga rubriker</w:t></w:r></w:p>"
+                "<w:p><w:pPr><w:pStyle w:val=\"TOC1\"/>{tab}</w:pPr>{begin}<w:r><w:t>Inga poster</w:t></w:r></w:p>"
             ));
         }
         x.push_str("<w:p><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p></w:sdtContent></w:sdt>");
@@ -3691,6 +3744,8 @@ impl<'a> Writer<'a> {
         self.doc_pr_next += 1;
         let mut alt_x = String::new();
         xml_escape(alt, &mut alt_x);
+        // Radbrytningar i ett attribut måste vara teckenreferenser, annars blir de blanksteg.
+        let alt_x = alt_x.replace('\r', "").replace('\n', "&#10;");
         self.open_para();
         const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
         let blip = if svg_ext.is_empty() { format!(r#"<a:blip r:embed="{id}"/>"#) } else { format!(r#"<a:blip r:embed="{id}">{svg_ext}</a:blip>"#) };
@@ -4270,6 +4325,19 @@ fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>), crop: Option<[f64
     }
 }
 
+/// Enhetsnyckeln för en förteckningsrad: raden och en kontrollsumma över posterna, så att en förteckning
+/// skrivs om när rubrikerna (eller bildtexterna) ändrats och annars behåller originalets XML.
+fn toc_unit_key(key: &str, md: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let Some(spec) = crate::word::nav::parse_toc(key) else { return key.to_owned() };
+    let heads = crate::word::nav::headings_scan(md);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for e in crate::word::nav::toc_items(md, &heads, &spec) {
+        (e.level, e.text.trim()).hash(&mut h);
+    }
+    format!("{key}\u{1}{:016x}", h.finish())
+}
+
 fn heading_num(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -4392,6 +4460,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         pulldown_cmark::CodeBlockKind::Indented => String::new(),
                     };
                     w.code_buf.clear();
+                    w.code_mark = w.body.len();
                     w.open_para();
                     // Språket sparas i ett dolt bokmärke först i stycket (se `lang_bookmark`).
                     if let Some(name) = crate::codehl::lang_bookmark(&w.code_lang).filter(|_| !w.code_lang.is_empty()) {
@@ -4543,15 +4612,34 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     w.quote = w.quote.saturating_sub(1);
                 }
                 TagEnd::CodeBlock => {
-                    w.flush_code();
-                    // Ta bort en avslutande radbrytning i kodblocket.
-                    if w.body.ends_with("<w:r><w:br/></w:r>") {
-                        let n = w.body.len() - "<w:r><w:br/></w:r>".len();
-                        w.body.truncate(n);
+                    // Ett Mermaid-block som går att rita skrivs som bild (SVG + PNG-reserv) med koden i alt-texten.
+                    let diagram = (w.table.is_none() && !w.in_footnote && crate::mermaid::is_lang(&w.code_lang))
+                        .then(|| crate::mermaid::image(&w.code_buf).and_then(|k| crate::mermaid::resolve(&k)))
+                        .flatten();
+                    if let Some(img) = diagram {
+                        w.body.truncate(w.code_mark);
+                        w.para_open = false;
+                        w.pending_pm.clear();
+                        w.pending_pp = None;
+                        w.fchange_para = None;
+                        let alt = format!("{MERMAID_ALT}{}", w.code_buf.trim_end_matches('\n'));
+                        w.code_buf.clear();
+                        w.in_code_block = false;
+                        w.code_lang.clear();
+                        let natural = img.natural_px();
+                        w.picture(img.bytes, img.svg.map(|s| s.data), natural, None, &alt, None, None);
+                        w.close_para();
+                    } else {
+                        w.flush_code();
+                        // Ta bort en avslutande radbrytning i kodblocket.
+                        if w.body.ends_with("<w:r><w:br/></w:r>") {
+                            let n = w.body.len() - "<w:r><w:br/></w:r>".len();
+                            w.body.truncate(n);
+                        }
+                        w.close_para();
+                        w.in_code_block = false;
+                        w.code_lang.clear();
                     }
-                    w.close_para();
-                    w.in_code_block = false;
-                    w.code_lang.clear();
                 }
                 TagEnd::List(_) => {
                     w.close_para();
@@ -4669,9 +4757,12 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                     }
                 } else if let Some(img) = parse_img(&s) {
                     w.image_ref(&img, resolve);
-                } else if s.trim() == crate::word::nav::TOC_LINE && w.table.is_none() && w.quote == 0 {
+                } else if let (Some(spec), true) = (crate::word::nav::parse_toc(s.trim()), w.table.is_none() && w.quote == 0) {
                     w.close_para();
-                    w.toc(md);
+                    if w.toc_laid.is_none() {
+                        w.toc_laid = Some(crate::pdf_write::toc_laid_pages(md, resolve));
+                    }
+                    w.toc(md, &spec);
                 } else if sections::SectionProps::from_comment(&s).is_some() && w.table.is_none() && w.quote == 0 {
                     // Avsnittsslut: ett tomt stycke med `w:sectPr` (egenskaperna sätts av `fix_sections`).
                     w.close_para();
@@ -4748,12 +4839,14 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                         // Ett HTML-block är bara en enhet när det är en ensam bild.
                         let ok = code != EvEnd::Html
                             || (key.to_ascii_lowercase().starts_with("<img") && !key.contains('\n'))
-                            || key == crate::word::nav::TOC_LINE
+                            || crate::word::nav::is_toc_line(&key)
                             || sections::SectionProps::from_comment(&key).is_some()
                             || sections::is_column_break(&key)
                             || sections::is_page_break(&key)
                             || crate::word::pbox::parse_empty(&key).is_some();
                         if ok && !key.is_empty() {
+                            // En förteckning är oförändrad bara om rubrikerna är det.
+                            let key = toc_unit_key(&key, md);
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
                         }
                     }
@@ -4784,6 +4877,14 @@ fn image_extent(natural: Option<(f32, f32)>, extent: Option<(i64, i64)>, max_wid
     (cx, cy.max(1))
 }
 
+/// Början på alt-texten för ett Mermaid-diagram som bild: resten är diagramkoden, som läses tillbaka som ```mermaid.
+const MERMAID_ALT: &str = "kladd-mermaid\n";
+
+/// Diagramkoden ur en alt-text som Kladd skrivit för ett Mermaid-diagram.
+fn mermaid_code(alt: &str) -> Option<&str> {
+    alt.strip_prefix(MERMAID_ALT).map(|c| c.trim_matches('\n')).filter(|c| !c.trim().is_empty())
+}
+
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="svg" ContentType="image/svg+xml"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#;
 
@@ -4792,6 +4893,9 @@ const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
 
 /// Märker en innehållsförteckning som Kladd skrivit (då begärs en uppdatering av fälten).
 const TOC_TAG: &str = "kladd-toc";
+
+/// Märker en innehållsförteckning vars sidnummer inte kunde läggas ut: då begärs en uppdatering av fälten.
+const TOC_STALE_TAG: &str = "kladd-toc-stale";
 
 /// Ber Word uppdatera fälten (innehållsförteckningen) när dokumentet öppnas.
 fn with_update_fields(settings: &str) -> String {
@@ -4848,7 +4952,8 @@ fn kladd_styles() -> String {
     // Word-lika Title och Subtitle (Calibri Light 28 pt respektive 14 pt).
     s.push_str(r#"<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="10"/><w:qFormat/><w:pPr><w:spacing w:after="120" w:line="240" w:lineRule="auto"/><w:contextualSpacing/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="1F3864"/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="11"/><w:qFormat/><w:pPr><w:spacing w:after="160"/></w:pPr><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/><w:color w:val="595959"/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr></w:style>"#);
     s.push_str(r#"<w:style w:type="paragraph" w:styleId="TOCHeading"><w:name w:val="TOC Heading"/><w:basedOn w:val="Heading1"/><w:next w:val="Normal"/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:qFormat/><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:style>"#);
-    for (n, ind) in [(1, 0), (2, 220), (3, 440)] {
+    for n in 1..=9 {
+        let ind = (n - 1) * 220;
         s.push_str(&format!(
             r#"<w:style w:type="paragraph" w:styleId="TOC{n}"><w:name w:val="toc {n}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:autoRedefine/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9016"/></w:tabs><w:spacing w:after="100"/><w:ind w:left="{ind}"/></w:pPr></w:style>"#
         ));
@@ -5772,7 +5877,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Fo
         ("word/numbering.xml".into(), numbering_xml(&w.ordered_nums).into_bytes()),
         (
             "word/settings.xml".into(),
-            if body.contains(TOC_TAG) { with_update_fields(SETTINGS) } else { SETTINGS.to_owned() }.into_bytes(),
+            if body.contains(TOC_STALE_TAG) { with_update_fields(SETTINGS) } else { SETTINGS.to_owned() }.into_bytes(),
         ),
     ];
     if let Some(xml) = footnotes_xml {
@@ -6688,8 +6793,8 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
             }
         }
     }
-    // En ny innehållsförteckning har gissade sidnummer: be Word uppdatera fälten vid öppning.
-    if body.contains(TOC_TAG) {
+    // En ny innehållsförteckning utan utlagda sidnummer: be Word uppdatera fälten vid öppning.
+    if body.contains(TOC_STALE_TAG) {
         if let Some(name) = find_rel("/settings") {
             let cur = replaced.get(&name.to_lowercase()).map(|b| decode_xml(b));
             if let Some(xml) = cur.or_else(|| src.part(&name).map(decode_xml)) {
@@ -7545,6 +7650,100 @@ Marginal
         assert_eq!(read(&out).unwrap().markdown, md2);
     }
 
+    const MERMAID_MD: &str = "# Rapport\n\nFöre.\n\n```mermaid\ngraph TD\n    A[Start] --> B{Klart?}\n    B -->|Ja| C[Slut]\n```\n\nEfter.\n\n```rust\nfn main() {}\n```\n\n```mermaid\nsom inte går att rita\n```\n";
+
+    /// Alla XML-delar i paketet är välformade och varje relation och innehållstyp har sin del.
+    fn assert_package_valid(bytes: &[u8]) {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let names: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_owned()).collect();
+        let mut rels = String::new();
+        for n in &names {
+            if n.ends_with(".xml") || n.ends_with(".rels") {
+                let mut x = String::new();
+                std::io::Read::read_to_string(&mut z.by_name(n).unwrap(), &mut x).unwrap();
+                let mut r = Reader::from_str(&x);
+                loop {
+                    match r.read_event() {
+                        Ok(Event::Eof) => break,
+                        Err(e) => panic!("{n} är inte välformad: {e}"),
+                        _ => {}
+                    }
+                }
+                if n == "word/_rels/document.xml.rels" {
+                    rels = x;
+                }
+            }
+        }
+        // Varje intern relation pekar på en del som finns.
+        for t in rels.split("Target=\"").skip(1) {
+            let t = &t[..t.find('"').unwrap()];
+            if !t.contains("://") {
+                assert!(names.iter().any(|n| n == &format!("word/{t}")), "relationen {t} saknar del");
+            }
+        }
+        let ct = {
+            let mut x = String::new();
+            std::io::Read::read_to_string(&mut z.by_name("[Content_Types].xml").unwrap(), &mut x).unwrap();
+            x
+        };
+        for n in names.iter().filter(|n| n.starts_with("word/media/")) {
+            let ext = n.rsplit('.').next().unwrap();
+            assert!(ct.contains(&format!("Extension=\"{ext}\"")), "innehållstyp för .{ext} saknas");
+        }
+    }
+
+    #[test]
+    fn mermaid_block_is_written_as_svg_picture_and_reads_back() {
+        let out = write(MERMAID_MD, "T", &|_| None, None).unwrap().bytes;
+        assert_package_valid(&out);
+        let doc = part_text(&out, "word/document.xml");
+        // Diagrammet är en bild med SVG-del och PNG-reserv; koden står i alt-texten (radbrytningar som teckenreferenser).
+        assert_eq!(doc.matches("asvg:svgBlip").count(), 1, "{doc}");
+        assert!(doc.contains("descr=\"kladd-mermaid&#10;graph TD&#10;"), "{doc}");
+        assert!(!doc.contains(">graph TD"), "koden ska inte stå som text");
+        // Det som inte går att rita är kvar som kod.
+        assert!(doc.contains("som inte går att rita") && doc.contains(">main<"));
+        let mut z = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let names: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_owned()).collect();
+        assert!(names.iter().any(|n| n.starts_with("word/media/") && n.ends_with(".svg")));
+        assert!(names.iter().any(|n| n.starts_with("word/media/") && n.ends_with(".png")));
+        // Tur och retur: blocket kommer tillbaka som ```mermaid, inte som bild.
+        let l = read(&out).unwrap();
+        assert_eq!(l.markdown, MERMAID_MD, "\n--- fick ---\n{}", l.markdown);
+        assert!(l.images.is_empty(), "diagrammet ska inte bli en bildfil i dokumentet");
+        // Orört dokument: samma XML vid ny sparning; ändrad text runt omkring behåller diagrammet.
+        let again = write(&l.markdown, "T", &|_| None, l.source.as_ref()).unwrap().bytes;
+        assert_eq!(part_text(&again, "word/document.xml"), doc);
+        let md2 = l.markdown.replace("Efter.", "Efteråt.");
+        let edited = write(&md2, "T", &|_| None, l.source.as_ref()).unwrap().bytes;
+        assert_package_valid(&edited);
+        assert_eq!(read(&edited).unwrap().markdown, md2);
+        assert_eq!(part_text(&edited, "word/document.xml").matches("asvg:svgBlip").count(), 1);
+    }
+
+    #[test]
+    fn mermaid_picture_is_limited_to_the_text_width() {
+        let wide = format!("```mermaid\ngraph LR\n{}\n```\n", (0..14).map(|i| format!("    N{i}[Ett ganska långt namn nummer {i}] --> N{}[Nästa steg {}]", i + 1, i + 1)).collect::<Vec<_>>().join("\n"));
+        let out = write(&wide, "T", &|_| None, None).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        let cx: i64 = doc.split("<wp:extent cx=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+        assert!(cx > 0 && cx <= MAX_IMAGE_WIDTH_EMU, "{cx}");
+    }
+
+    #[test]
+    #[ignore]
+    fn libreoffice_renders_mermaid() {
+        let dir = std::env::var_os("KLADD_TEST_OUT").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("kladd-test-docx-mermaid"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mermaid.docx"), write(MERMAID_MD, "T", &|_| None, None).unwrap().bytes).unwrap();
+        std::fs::write(dir.join("mermaid.odt"), crate::odt::write(MERMAID_MD, "T", &|_| None).unwrap().bytes).unwrap();
+        for f in ["mermaid.docx", "mermaid.odt"] {
+            let st = std::process::Command::new("soffice").args(["--headless", "--convert-to", "pdf", "--outdir"]).arg(&dir).arg(dir.join(f)).output().expect("soffice saknas");
+            assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+        }
+        assert!(dir.join("mermaid.pdf").exists());
+    }
+
     const TOC_MD: &str = "# Inledning\n\nText.\n\n<!-- kladd: toc -->\n\n## Bakgrund\n\nMer text.\n\n### Detalj\n\n#### För djup\n";
 
     #[test]
@@ -7557,8 +7756,10 @@ Marginal
         for h in ["Inledning", "Bakgrund", "Detalj"] {
             assert!(doc.contains(&format!(">{h}</w:t>")), "{h}");
         }
-        assert!(part_text(&out, "word/settings.xml").contains("<w:updateFields w:val=\"true\"/>"));
-        assert!(part_text(&out, "word/styles.xml").contains("w:styleId=\"TOC1\""));
+        // Sidnumren kommer ur Kladds utläggning, så Word behöver inte be om en uppdatering vid öppning.
+        assert!(!part_text(&out, "word/settings.xml").contains("updateFields"));
+        let styles = part_text(&out, "word/styles.xml");
+        assert!((1..=9).all(|n| styles.contains(&format!("w:styleId=\"TOC{n}\""))), "TOC1–TOC9");
         let l = read(&out).unwrap();
         assert_eq!(l.markdown, TOC_MD, "\n--- fick ---\n{}", l.markdown);
         // Orörd förteckning behåller originalets XML vid ny sparning.
@@ -7569,6 +7770,84 @@ Marginal
         let doc = part_text(&again, "word/document.xml");
         assert_eq!(doc.matches("<w:sdt ").count(), 1, "{doc}");
         assert_eq!(doc.matches("Table of Contents").count(), 1);
+    }
+
+    /// Sidnumren i fältresultatet, i ordning.
+    fn toc_page_numbers(doc: &str) -> Vec<String> {
+        let sdt = &doc[doc.find("<w:sdt>").unwrap()..doc.find("</w:sdt>").unwrap()];
+        sdt.split("<w:tab/></w:r><w:r><w:t>").skip(1).map(|r| r[..r.find('<').unwrap()].to_owned()).collect()
+    }
+
+    #[test]
+    fn toc_page_numbers_follow_the_layout_and_page_breaks() {
+        let pb = crate::word::sections::PAGE_BREAK_LINE;
+        let md = format!("# Ett\n\n<!-- kladd: toc -->\n\nText.\n\n{pb}\n\n# Två\n\n## Två b\n\n{pb}\n\nMellan.\n\n{pb}\n\n# Fyra\n");
+        let out = write(&md, "T", &|_| None, None).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert_eq!(toc_page_numbers(&doc), ["1", "2", "2", "4"], "{doc}");
+        assert!(!part_text(&out, "word/settings.xml").contains("updateFields"));
+        // Ett långt dokument: rubrikerna längre fram hamnar på senare sidor (inte alla på sida 1).
+        let mut long = String::from("<!-- kladd: toc -->\n\n");
+        for i in 1..=6 {
+            long.push_str(&format!("# Kapitel {i}\n\n"));
+            for _ in 0..16 {
+                long.push_str("Brödtext som fyller ut sidan så att kapitlen hamnar på olika sidor i dokumentet. Och lite till så att raden bryts.\n\n");
+            }
+        }
+        let doc = part_text(&write(&long, "T", &|_| None, None).unwrap().bytes, "word/document.xml");
+        let pages: Vec<usize> = toc_page_numbers(&doc).iter().map(|p| p.parse().unwrap()).collect();
+        assert_eq!(pages.len(), 6);
+        assert!(pages.windows(2).all(|w| w[0] <= w[1]) && pages[5] > pages[0] + 1, "{pages:?}");
+    }
+
+    #[test]
+    fn toc_levels_roundtrip_and_foreign_levels_are_read() {
+        let md = "# A\n\n<!-- kladd: toc; levels: 2-3 -->\n\n## B\n\n### C\n\n#### D\n";
+        let out = write(md, "T", &|_| None, None).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert!(doc.contains(r#"TOC \o "2-3" \h \z \u"#), "{doc}");
+        // H1 ligger utanför nivåerna, H4 också.
+        let sdt = &doc[doc.find("<w:sdt>").unwrap()..doc.find("</w:sdt>").unwrap()];
+        assert!(sdt.contains(">B</w:t>") && sdt.contains(">C</w:t>") && !sdt.contains(">A</w:t>") && !sdt.contains(">D</w:t>"));
+        assert!(sdt.contains("w:val=\"TOC2\"") && sdt.contains("w:val=\"TOC3\""));
+        assert_eq!(read(&out).unwrap().markdown, md);
+        // En främmande förteckning med `\o "1-5"` och `\o "2"`.
+        let foreign = |levels: &str| {
+            let patched = patch_part(&out, "word/document.xml", |x| x.replace(r#"\o "2-3""#, &format!(r#"\o "{levels}""#)));
+            read(&patched).unwrap().markdown
+        };
+        assert!(foreign("1-5").contains("<!-- kladd: toc; levels: 1-5 -->"));
+        assert!(foreign("2").contains("<!-- kladd: toc; levels: 2 -->"));
+        assert!(foreign("1-3").contains("<!-- kladd: toc -->"));
+    }
+
+    #[test]
+    fn changed_headings_rewrite_the_toc_and_untouched_keeps_it() {
+        let out = write(TOC_MD, "T", &|_| None, None).unwrap().bytes;
+        let marked = patch_part(&out, "word/document.xml", |x| x.replacen("<w:sdt>", "<w:sdt w:rsidR=\"00AB\">", 1));
+        let l = read(&marked).unwrap();
+        // Orörd: förteckningen behåller sitt XML.
+        let same = write(&l.markdown, "T", &|_| None, l.source.as_ref()).unwrap().bytes;
+        assert_eq!(part_text(&same, "word/document.xml").matches("w:rsidR=\"00AB\"").count(), 1);
+        // En rubrik ändras: förteckningen skrivs om med den nya texten.
+        let md2 = l.markdown.replace("Bakgrund", "Förutsättningar");
+        let edited = write(&md2, "T", &|_| None, l.source.as_ref()).unwrap().bytes;
+        let doc = part_text(&edited, "word/document.xml");
+        assert_eq!(doc.matches("w:rsidR=\"00AB\"").count(), 0, "den gamla förteckningen ska bort");
+        assert_eq!(doc.matches(">Förutsättningar</w:t>").count(), 2, "rubrik och förteckningspost");
+        assert_eq!(read(&edited).unwrap().markdown, md2);
+    }
+
+    #[test]
+    fn figure_list_is_written_from_captions_and_reads_back() {
+        let md = "# Rapport\n\n<!-- kladd: toc; kind: figures -->\n\n<!-- kladd: toc; kind: tables -->\n\nFigur 1: Första bilden\n\nTabell 1: Siffror\n\n**Figur 2:** Andra bilden\n";
+        let out = write(md, "T", &|_| None, None).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        assert!(doc.contains(r#"TOC \h \z \c "Figur""#) && doc.contains(r#"TOC \h \z \c "Tabell""#), "{doc}");
+        assert_eq!(doc.matches(">Figurförteckning</w:t>").count(), 1);
+        assert_eq!(doc.matches(">Figur 1: Första bilden</w:t>").count(), 2, "bildtext och förteckningspost");
+        assert_eq!(doc.matches(">Figur 2: Andra bilden</w:t>").count(), 1, "bara förteckningsposten: bildtexten är fet och delad i körningar");
+        assert_eq!(read(&out).unwrap().markdown, md);
     }
 
     /// Låter LibreOffice göra PDF av ett dokument med innehållsförteckning och kontrollerar att

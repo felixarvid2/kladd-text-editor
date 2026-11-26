@@ -105,7 +105,9 @@ välformade, ändringar på grundformatsraden och nya eller ändrade fotnotsetik
 
 Efter en inkrementell analys återanvänder `word::layout_memo` styckena, fotnotsplanen, grupperna och
 cachenycklarna från förra omläggningen (se nedan), så att ett tangenttryck inte längre kostar tid i proportion till
-dokumentets längd i de steg som var dominerande.
+dokumentets längd i de steg som var dominerande. I ett block av fotnotsdefinitioner är fönstret bara definitionen med
+ändringen och dess grannar, och `word::layout_resume` återupptar utläggningen, sammanfogningen och sidindelningen vid den
+ändrade gruppen och tar resten från förra omläggningen (se "Fotnoter och 2000 sidor, tredje omgången").
 
 ## Öppna stora Word-dokument (100–400 sidor)
 
@@ -253,16 +255,103 @@ Vad som gjordes, i den ordning mätningen pekade ut (callgrind på 30 tangenttry
   *Läggs ut…*, och framkanten av det utlagda räknas från raderna före första platshållaren (en rad i en textruta kan ligga
   högre upp). Test: `uppskattat_sidantal_ligger_nara_det_slutliga`.
 
+### Fotnoter och 2000 sidor, tredje omgången
+
+Mätning som förra omgången (`bench_docx_open` med `KLADD_BENCH_PLACES=1`, som nu också skriver tiden per steg och om
+utläggningen återupptogs), med `gen-skolrapport.docx` upprepad 100 och 500 gånger (404 och 2021 sidor, 650 kB och 3,3 MB
+Markdown, ca 13 000 och 65 000 grupper). Opt-level 2 för kladd och egui med närmaste krater (`epaint`, `emath`, `ecolor`,
+`harfrust`, `skrifa`, `read-fonts`), medianen av tre körningar; debug en till tre körningar.
+
+| Mått (ms) | 404 sidor före / efter | 2021 sidor före / efter |
+|---|---|---|
+| Tangenttryck, median av 10 ställen, opt-level 2 | 13,7 / 1,5 | 112,8 / 4,6 |
+| Tangenttryck, sämsta av 10, opt-level 2 | 38,8 / 13,7 | 604,5 / 17,3 |
+| Första fotnotsdefinitionen, opt-level 2 | 38,8 / 1,3 | 604,5 / 4,6 |
+| Sista definitionen (en slutnot), opt-level 2 | 33,7 / 0,8 | 581,0 / 3,1 |
+| Stycket närmast definitionerna, opt-level 2 | 20,0 / 0,9 | 185,6 / 4,4 |
+| Tangenttryck, median av 10 ställen, debug | 83,4 / 6,3 | 683,7 / 12,9 |
+| Tangenttryck, sämsta av 10, debug | 150,8 / 65,6 | 1676 / 54,5 |
+| Kall utläggning, allt i en bildruta, opt-level 2 | 422 / 353 | 1560 / 1344 |
+| Stegvis: första bildrutan / tills allt är utlagt, opt-level 2 | 148 / 423 och 143 / 410 | 730 / 2511 och 598 / 1674 |
+| Stegvis tills allt är utlagt, debug | 4343 / 3236 | 65 700 / 24 045 |
+| Oförändrad bildruta, opt-level 2 | 0,1 / 0,1 | 1,4 / 1,3 |
+
+Per ställe vid 404 sidor (opt-level 2, efter): början 13,7 (raden bryts om, se nedan), 25 % 4,2, mitten 1,5, 75 % 1,5,
+slutet av brödtexten 1,3, i tabell 2,1, vid fotnotsreferens 1,3, närmast definitionerna 0,9, första definitionen 1,3, sista
+0,8. Vid 2021 sidor: 17,3, 5,6, 4,5, 3,5, 3,3, 7,5, 6,8, 4,4, 4,6, 3,1. Små dokument är inte långsammare (Markdown 30 kB /
+55 kB, opt-level 2: tecken 6,0 / 10,7 ms före, 5,9 / 9,2 ms efter; debug 16,4 / 26,3 före, 13,2 / 21,9 efter; markören byter
+rad i debug 1,4 / 2,3 före, 1,0 / 1,4 efter; 600 kB opt-level 2: tecken 18,9 / 7,6 ms, markörbyte 6,8 / 3,0 ms).
+
+Målen: text i en fotnotsdefinition tar 1,3 ms vid 404 sidor (mål 15) och ungefär lika lång tid oavsett antalet fotnoter,
+stycket närmast definitionerna är som övrig brödtext. Tangenttrycket vid 2021 sidor är 4,6 / 1,5 = 3,1 gånger det vid 404
+sidor i opt-level 2 (målet var högst 2) och 12,9 / 6,3 = 2,0 gånger i debug; före var det 8 gånger. Det som återstår och växer
+med dokumentet står under *Kvar*.
+
+Vad som gjordes, i den ordning mätningen (callgrind på tangenttryck i 2021-sidorsdokumentet, `bench_docx_keys` som nu
+har tangenttrycken i en egen funktion, `--toggle-collect='*keys_loop*'`) pekade ut:
+
+- **Två kvadratiska sökningar.** Sidindelningen sökte bildhöjden för varje rad bland alla ankare (`floats.iter().find`), och
+  textrutornas omflöde (`apply_pulls`) sökte rutans intervall för varje rad bland alla rutor. Med tusentals bilder och rutor
+  var det över hälften av tangenttrycket vid 2000 sidor. Nu går båda i takt med raderna (`pages::FloatAt`).
+- **Fotnotsdefinitionerna som fönster** (`incr::def_window`). Word-läsaren skriver definitionerna som ett block utan
+  tomrader, så en ändring i en definition tolkade om hela blocket (53 kB vid 404 sidor, mer än gränsen för fönstret vid 2000
+  sidor). Varje definitionsrad börjar en ny definition, så fönstret är nu definitionen med ändringen och en definition på var
+  sida som kanariefåglar, och stycket före respektive efter ett block tar bara blockets sista respektive första definition.
+  Gränserna kontrolleras mot analysen (etikettens bit), och slutnoter (`[^ei]`) hanteras likadant.
+- **Fotnotsplanen i fönstret** (`layout_memo::plan_window`). Återanvändningen avstod när fönstret låg i eller nära
+  definitionerna. Nu räknas planen om i fönstret: definitionerna där ska ha samma etiketter i samma ordning som förut (annars
+  full omräkning), tomma stycken före en definition krymps, och luften över första slutnoten och de krympta styckena efter
+  sista definitionen räknas om när fönstret ligger efter den. `notes::plan` är omskriven kring samma regel per stycke
+  (`defs_of`) så att de inte kan glida isär.
+- **Återupptagen utläggning** (`word/layout_resume.rs`). Varvet över grupperna sparar tillståndet före varje grupp (läge,
+  flytande bilder, öppen textruta, sidsimulering) och vad den lade till (gallerier, ankare, tabeller, fotnoter …), i täta listor
+  med en post per grupp och glesa för det sällsynta. Nästa varv börjar vid den första ändrade gruppen; när tillståndet före en
+  oförändrad grupp är exakt detsamma som förra gången (jämfört bit för bit, också y) tas resten av sträckan från förra varvet,
+  flyttad i rader och byte. Listorna lappas på plats (`patch_dense`, `patch_sparse`) i stället för att kopieras. Ändras höjden
+  (raden bryts om) blir tillståndet aldrig detsamma igen; efter 64 oförändrade grupper i följd ges varvet upp och resten görs
+  som vanligt (`Fast::abandon`).
+- **Sammanfogning och sidindelning från den ändrade sidan.** Sammanfogningen räknar som `Galley::concat` (samma avrundning)
+  men grupp för grupp från den sparade rektangeln, och oförändrade sträckor ska börja med samma rektangel och samma drag från
+  textrutorna. Sidindelningen (ett avsnitt) sparar tillståndet före första raden på varje sida och återupptas därifrån före varje
+  ändring (ändrade rader och referenser till noter som fått annan höjd), tills en ny sida börjar med samma tillstånd som förut;
+  raderna efter behåller sina lägen i förra galleriet, vars radlista och textbuffert återanvänds. Fotnoternas referenser flyttas
+  med sträckorna och söks bara i de ändrade grupperna; summorna (hörn, ritytor) hålls per block om 256 grupper. Galleriet byggs
+  i båda vägarna av färdiga rader (`galley_from`), så egui:s `intrinsic_size` är noll (den används bara för `Response`).
+- **Mindre per tangent:** tabellerna och kodblocken efter fönstret flyttas i stället för att byggas om, antalet rubriker i
+  innehållsförteckningen kommer från analysen (`Delta::toc_delta`) i stället för en genomgång av alla rubriker, grupperna görs om
+  bara kring fönstren (`regroup`), textrutornas markörer ligger i en lista (`Prep::marks`), bildernas storleksnycklar sparas,
+  minnets text byter buffert i stället för att kopieras, och början och slutet av en ändring hittas med större block.
+
+Prov: `layout::resume::tests` (slumpade ändringar i dokument med flytande bilder, textrutor, fotnoter som block, tabeller,
+sidbrytningar, ibland spalter; galleriet, rektangeln, ritytan, arken med fotnoterna, noterna och tabellerna jämförs med en
+cache som alltid gör hela varvet och ibland med en ny cache), `layout_memo` (planen i fönstret och galleriet med fotnoterna
+mot full omräkning och ny cache) och `incr` (fönster i definitionsblock och slutnoter mot `analyze`). Alla körda med
+`KLADD_FUZZ_SEEDS=300`. I appen (`KLADD_TIMING=1`, 404 sidor, debug) skriver *omläggning* nu också om den återupptogs (och
+varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3,6–6 ms per omläggning med återupptagning,
+ångra återställde texten, och markering med Skift+pil återupptogs också. Med sökträffar räknas allt om som förut.
+
 ### Kvar
 
-- Tangenttryck kostar fortfarande en genomgång av alla grupper (styckeloopen), `Galley::concat` och sidindelningen (~3 ms
-  var vid 404 sidor, opt-level 2): linjärt med liten konstant (uppskattat ca 50 ms vid 2000 sidor). Nästa steg är det som
-  står i tidigare avsnitt: återuppta utläggningen vid den ändrade gruppen med sparat tillstånd (sidposition, flytande bilder,
-  textrutor) och sluta när tillståndet stämmer med det gamla, och sidindela från den ändrade sidan.
-- Fotnotsdefinitioner står som ett enda stycke (en rad per definition, utan tomrad emellan): text i en definition är då ett
-  fönster på hela definitionsblocket (53 kB vid 404 sidor), så det blir inkrementell analys men full omräkning av
-  förberedelsen (34–37 ms opt-level 2). Ett stycke i brödtextens sista del intill definitionerna avvisas av
-  återanvändningen (20 ms): fotnotsplanen ändrar styckena kring definitionerna och kan inte räknas om i ett fönster.
+- Tangenttrycket växer fortfarande med dokumentet (3,1 gånger från 404 till 2021 sidor i opt-level 2), med små konstanter:
+  varje anrop till `Cache` jämför hela texten med sin kopia (memcmp; bänken och vyn gör det fyra–fem gånger per bildruta,
+  ca 0,15 ms vardera vid 3,3 MB), den inkrementella analysen flyttar alla bitar efter fönstret (`Piece` är stor, ca 0,7 ms),
+  förberedelsen flyttar styckena och grupperna efter ändringen (ca 0,5 ms), och texten kopieras två gånger (cachens kopia och
+  galleriets). Att jämföra texten bara när den kan ha ändrats kräver en ändringsräknare från vyn; att slippa flytta bitar och
+  stycken kräver relativa lägen.
+- En ändring som ändrar en grupps höjd flyttar allt efter: då görs hela varvet, sammanfogningen och sidindelningen (13,7 ms
+  vid 404 sidor och 17 ms vid 2021 i opt-level 2, mot 20 och över 100 ms före). Sidindelningen kunde återupptas vid
+  tvingade sidbrytningar om lägena räknades i hela bildpunkter.
+- Dokument med flera avsnitt (`paginate_sections`, spalter) återupptar varvet över grupperna men gör sammanfogning och
+  sidindelning helt; olika breda spalter (spaltutjämning) gör allt.
+- Den inkrementella analysen avstår fortfarande vid ändrade fotnotsetiketter och -definitioner (en ny eller borttagen
+  definition), referenslänkar med hakparenteser i fönstret, kodstaket i dokument med udda antal staket eller staket mitt på
+  en rad, tre tilda och ändringar på grundformatsraden. Sökträffar ger full omräkning av förberedelsen.
+- Stegvis utläggning, första sidan och bilder som i förra omgången (nedan).
+
+### Kvar efter andra omgången
+
+- (Åtgärdat i tredje omgången ovan: genomgången av alla grupper, sammanfogningen och sidindelningen vid varje tangent, och
+  fotnotsdefinitionerna som ett enda fönster.)
 - Den inkrementella analysen avstår fortfarande vid ändrade fotnotsetiketter och -definitioner, referenslänkar med
   hakparenteser i fönstret, kodstaket i dokument med udda antal staket eller staket mitt på en rad, tre tilda, ändringar
   på grundformatsraden och när kontrollerna i fönstrets kant inte stämmer.

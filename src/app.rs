@@ -307,6 +307,8 @@ pub struct KladdApp {
     pub(crate) panes: crate::panes::Panes,
     /// Extra markörer och kolumnmarkering i textläget.
     mc: crate::multicursor::State,
+    /// EPUB-biblioteket och bokmärkena (se `epub/store.rs`).
+    pub(crate) library: crate::epub::store::Store,
     /// Vim-läget (`vim.rs`, `vim_ui.rs`): tillstånd, rulning och synliga rader från förra bilden.
     vimui: crate::vim_ui::State,
     vim_scroll: Option<usize>,
@@ -401,6 +403,7 @@ impl KladdApp {
         crate::timing::mark("install_fonts");
         theme::install_styles(ctx);
         egui_extras::install_image_loaders(ctx);
+        crate::epub::selection::install(ctx);
         crate::timing::mark("install_styles, bildinläsare");
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
@@ -446,6 +449,7 @@ impl KladdApp {
             focus_editor: false,
             editor_rect: Rect::NOTHING,
             mc: Default::default(),
+            library: crate::epub::store::Store::load(),
             vimui: Default::default(),
             vim_scroll: None,
             vim_scroll_lines: 0,
@@ -2564,10 +2568,11 @@ impl KladdApp {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         let col_w = 400.0f32.min(rect.width() - 48.0);
-        let top = rect.top() + (rect.height() * 0.24).max(36.0);
+        let shelf = self.library.shelf().len().min(crate::epub::store::SHELF_MAX);
+        let top = rect.top() + (rect.height() * if shelf > 0 { 0.08 } else { 0.24 }).max(36.0);
         let col = Rect::from_min_size(pos2(rect.center().x - col_w / 2.0, top), vec2(col_w, rect.bottom() - top));
 
-        ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::top_down(Align::Min)), |ui| {
+        let head = ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::top_down(Align::Min)), |ui| {
             // Ordbild med blinkande markör – appens enda rörelse.
             let font = FontId::new(52.0, theme::semibold());
             let galley = ui.painter().layout_no_wrap("Kladd".into(), font, p.text);
@@ -2601,13 +2606,29 @@ impl KladdApp {
             if welcome_row(ui, p, t("Öppna fil…"), "Ctrl+O", None) {
                 self.request_open(&ctx);
             }
+        });
 
-            if !self.settings.recent.is_empty() {
-                ui.add_space(28.0);
+        // Böckerna (EPUB) som omslag, i en egen rad som får vara bredare än kolumnen.
+        let mut y = head.response.rect.bottom();
+        if shelf > 0 {
+            let wide = (shelf as f32 * crate::epub::store::CARD_W).min(rect.width() - 48.0).max(col_w);
+            let shelf_rect = Rect::from_min_size(pos2(rect.center().x - wide / 2.0, y + 26.0), vec2(wide, rect.bottom() - y - 26.0));
+            let r = ui.scope_builder(UiBuilder::new().max_rect(shelf_rect).layout(Layout::top_down(Align::Min)), |ui| self.epub_shelf(ui, p));
+            y = r.response.rect.bottom();
+        }
+
+        // Senast öppnade filer (böcker som syns som omslag ovan tas inte med igen).
+        let books: std::collections::HashSet<PathBuf> =
+            self.library.shelf().iter().take(crate::epub::store::SHELF_MAX).map(|b| PathBuf::from(&b.path)).collect();
+        let recent: Vec<PathBuf> = self.settings.recent.iter().filter(|p| !books.contains(*p)).take(if shelf > 0 { 3 } else { 6 }).cloned().collect();
+        if !recent.is_empty() {
+            let col2 = Rect::from_min_size(pos2(col.left(), y + 24.0), vec2(col_w, (rect.bottom() - y - 24.0).max(0.0)));
+            ui.scope_builder(UiBuilder::new().max_rect(col2).layout(Layout::top_down(Align::Min)), |ui| {
                 ui.label(RichText::new(t("Senast öppnade")).font(FontId::new(12.5, theme::medium())).color(p.muted));
                 ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 let mut open = None;
-                for path in self.settings.recent.iter().take(6) {
+                for path in &recent {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     if welcome_row(ui, p, &name, "", Some(&pretty_dir(path))) {
                         open = Some(path.clone());
@@ -2616,8 +2637,8 @@ impl KladdApp {
                 if let Some(path) = open {
                     self.open_path(&ctx, &path);
                 }
-            }
-        });
+            });
+        }
     }
 
     fn find_bar(&mut self, ctx: &egui::Context, p: &Palette) {
@@ -3975,6 +3996,7 @@ impl eframe::App for KladdApp {
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);
         self.header_dialog(&ctx, &p);
+        self.toc_dialog(&ctx, &p);
         self.styles_dialog(&ctx, &p);
         self.drop_hint(&ctx, &p);
         self.window_edges(&ctx, &p);
