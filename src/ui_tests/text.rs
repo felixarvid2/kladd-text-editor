@@ -409,3 +409,119 @@ fn history_restore() {
     ui.click("Återställ");
     assert_eq!(ui.text(), "två", "den sparade versionen är tillbaka i fliken");
 }
+
+/// En lång Markdown-fil (flera hundra kilobyte) med ett unikt ord i början och ett i slutet.
+fn huge_markdown(paragraphs: usize) -> String {
+    let mut s = String::from("# Överst\n\nBörjan med nyckelordet ananas här.\n\n");
+    for i in 0..paragraphs {
+        if i % 10 == 0 {
+            s.push_str(&format!("## Avsnitt {}\n\n", i / 10));
+        }
+        s.push_str(&format!("Stycke {i}. {}\n\n", "Fyllnadstext som tar plats på sidan och fortsätter. ".repeat(4)));
+    }
+    s.push_str("## Slutet\n\nSist finns också ananas.\n");
+    s
+}
+
+#[test]
+fn markdown_large_file_reads_with_jumps_and_search() {
+    let mut ui = Ui::new();
+    let text = huge_markdown(3000);
+    assert!(text.len() > 600_000, "{}", text.len());
+    let file = ui.dir.write("stor.md", &text);
+    ui.open(&file);
+    ui.settle();
+    assert!(ui.app().md_read_mode(), "en stor .md öppnas i läsläget");
+    assert!(ui.h.query_all_by_label_contains("Början med nyckelordet").count() >= 1);
+    // Navigeringsfönstret hoppar långt ner: rubriken hamnar överst.
+    ui.key(CTRL | Modifiers::SHIFT, Key::O);
+    let want = text.find("## Avsnitt 250\n").unwrap();
+    let ctx = ui.h.ctx.clone();
+    ui.app_mut().goto_byte(&ctx, want);
+    ui.settle();
+    ui.settle();
+    let top = ui.app().md.top_byte;
+    assert!(ui.app().md_read_mode());
+    assert!(top + 2000 >= want && top <= want + 2000, "rubriken ligger överst ({top} mot {want})");
+    assert!(ui.h.query_all_by_label_contains("Avsnitt 250").count() >= 1, "rubriken syns");
+    // Sök från mitten av texten: första träffen efter det som syns är den längst ned, och den rullas fram.
+    ui.key(CTRL | Modifiers::SHIFT, Key::O);
+    ui.key(CTRL, Key::F);
+    ui.focus_nth_input(0);
+    ui.type_text("ananas");
+    ui.wait_until("två träffar", |a| a.md.count == 2);
+    assert_eq!(ui.app().md.current, Some(1));
+    ui.wait_until("rullat till slutet", |a| a.md.top_byte + 20_000 >= text.len() - 2000);
+    assert!(ui.h.query_all_by_label_contains("Sist finns också").count() >= 1, "träffen syns");
+    // F3 går runt till första träffen (överst), Skift+F3 tillbaka till den längst ned.
+    ui.key(Modifiers::NONE, Key::F3);
+    ui.wait_until("första träffen", |a| a.md.current == Some(0));
+    ui.wait_until("rullat till början", |a| a.md.top_byte < 2000);
+    assert!(ui.h.query_all_by_label_contains("Början med nyckelordet").count() >= 1);
+    ui.key(Modifiers::SHIFT, Key::F3);
+    ui.wait_until("sista träffen igen", |a| a.md.current == Some(1));
+    ui.wait_until("rullat till slutet igen", |a| a.md.top_byte + 20_000 >= text.len() - 2000);
+}
+
+/// Markdown på ungefär `kb` kilobyte: rubriker, stycken med formatering, listor, kodblock, tabeller och uppgiftslistor.
+fn bench_markdown(kb: usize) -> String {
+    let mut s = String::from("# Stor fil\n\n");
+    let mut i = 0;
+    while s.len() < kb * 1024 {
+        if i % 12 == 0 {
+            s.push_str(&format!("## Avsnitt {}\n\n", i / 12));
+        }
+        match i % 6 {
+            0 => s.push_str(&format!(
+                "Stycke {i}. Det var en gång en mycket lång berättelse som aldrig tycktes ta slut, med *kursiv* och **fet** text samt en [länk](https://exempel.se/{i}) och `kod`. \
+                 Vi fortsätter att skriva för att fylla ut raderna ordentligt så att varje stycke blir flera rader långt.\n\n"
+            )),
+            1 => s.push_str(&format!("- punkt {i} med lite text\n- punkt två\n  - under {i}\n- punkt tre\n\n")),
+            2 => s.push_str(&format!("```rust\nfn rad_{i}() {{\n    println!(\"hej {i}\");\n}}\n```\n\n")),
+            3 => s.push_str(&format!("| Namn | Värde |\n|---|---|\n| a{i} | 1 |\n| b | 2 |\n\n")),
+            4 => s.push_str(&format!("- [ ] att göra {i}\n- [x] gjort\n\n")),
+            _ => s.push_str(&format!("> Ett citat nummer {i} som löper över\n> två rader.\n\n")),
+        }
+        i += 1;
+    }
+    s
+}
+
+/// Mäter hur lång en bildruta i Markdown-läsläget tar för stora filer (körs för hand:
+/// `KLADD_BENCH_MD_KB=24,400,4900 cargo test markdown_large_frame_time -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn markdown_large_frame_time() {
+    let sizes: Vec<usize> = std::env::var("KLADD_BENCH_MD_KB").unwrap_or_else(|_| "24,100,400".into()).split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    for kb in sizes {
+        let mut ui = Ui::new();
+        let text = bench_markdown(kb);
+        let file = ui.dir.write("stor.md", &text);
+        ui.open(&file);
+        ui.settle();
+        let reading = ui.app().md_read_mode();
+        let frames = if kb > 1000 { 3 } else if kb > 200 { 8 } else { 30 };
+        let time = |ui: &mut Ui, n: usize| {
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                ui.h.step();
+            }
+            start.elapsed() / n as u32
+        };
+        // Stillastående vid början.
+        let still = time(&mut ui, frames);
+        // Rullning: ett hjulsteg per bildruta.
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            ui.h.input_mut().events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -90.0), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: Modifiers::NONE });
+            ui.h.step();
+        }
+        let scroll = start.elapsed() / frames as u32;
+        // Stillastående mitt i filen.
+        ui.app_mut().md.frac_in = Some(0.5);
+        ui.h.step();
+        ui.h.step();
+        let mid = time(&mut ui, frames);
+        println!("md {kb} kB ({} byte): läsläge={reading}, stilla överst {still:?}, rullning {scroll:?}, stilla mitt {mid:?}", text.len());
+    }
+}

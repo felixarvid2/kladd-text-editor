@@ -20,6 +20,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer, SearchOptions};
 use crate::app::{KladdApp, byte_to_char, editor_id};
 use crate::doc::Document;
 use crate::i18n::t;
+use crate::mdwin::{Cfg, Win};
 use crate::theme::{self, Palette};
 use crate::word::nav;
 
@@ -30,7 +31,7 @@ const BOLD_FAMILY_ID: &str = "egui_commonmark_bold_family";
 const COLUMN_W: f32 = 760.0;
 
 /// Ska fliken öppnas i läsläget? Vanliga Markdown-filer från disk; inte Word, ODT eller PDF
-/// (de har dokumentläget och PDF-visaren), inte namnlösa flikar och inte stora filer.
+/// (de har dokumentläget och PDF-visaren) och inte namnlösa flikar. Stora filer går också bra: bara de synliga blocken ritas.
 pub fn opens_in_reading(doc: &Document) -> bool {
     doc.path.is_some()
         && !doc.docx
@@ -38,7 +39,6 @@ pub fn opens_in_reading(doc: &Document) -> bool {
         && doc.pdfv.is_none()
         && !doc.word_view
         && matches!(doc.extension().as_str(), "md" | "markdown" | "mdown" | "mkd")
-        && !crate::bigtext::is_big(&doc.text)
 }
 
 /// Förenklade tecken för rubrikernas id i den ritade texten (`# Rubrik {#kladd-h3}`).
@@ -77,13 +77,24 @@ pub struct MdState {
     /// Dokumentbyte som läsvyn ska rulla till (en rubrik i navigeringsfönstret).
     pub scroll_to: Option<usize>,
     /// Väntande rullningsandel (0..1) från redigeraren.
-    frac_in: Option<f32>,
+    pub(crate) frac_in: Option<f32>,
     /// Dokumentbyte högst upp i läsvyn, och rullningsandelen och största rullningen.
     pub top_byte: usize,
     read_frac: f32,
     read_max: f32,
     /// Redigerarens rullningsandel i senaste bildrutan.
     pub editor_frac: f32,
+    /// Den förberedda texten och dess blockindelning för läsvyn (görs om när texten eller utseendet ändras).
+    prep: Option<Prepared>,
+    /// Översättningen av översta källpositionen till dokumentets text (görs bara när positionen ändras).
+    top_memo: Option<(u64, usize, usize)>,
+}
+
+/// Läsvyns text efter omgörning av formler, HTML och rubrik-id, och blocken den ritas i.
+struct Prepared {
+    key: u64,
+    text: String,
+    win: Win,
 }
 
 impl MdState {
@@ -114,29 +125,8 @@ pub struct Out {
     pub dbl: Option<usize>,
 }
 
-/// Ritar dokumentets Markdown som i förhandsvisningen: bilder, formler och Kladds HTML-format.
-pub fn render(
-    ui: &mut Ui,
-    p: &Palette,
-    doc: &Document,
-    images: &mut HashSet<String>,
-    cache: &mut CommonMarkCache,
-    st: &mut MdState,
-    o: &Opts,
-) -> Out {
-    let st_ui = ui.style_mut();
-    st_ui.text_styles.insert(egui::TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
-    st_ui.text_styles.insert(egui::TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace));
-    st_ui.text_styles.insert(egui::TextStyle::Heading, FontId::new(26.0, theme::semibold()));
-    st_ui.spacing.item_spacing.y = 8.0;
-    // Brödtexten får textfärgen via det vanliga ytans färg (inte `override_text_color`, som också
-    // skulle färga länkarna i textfärgen). Fet text (`RichText::strong`) får samma färg; fetstilen
-    // kommer från typsnittet nedan.
-    st_ui.visuals.widgets.noninteractive.fg_stroke.color = p.text;
-    st_ui.visuals.widgets.active.fg_stroke.color = p.text;
-    st_ui.visuals.hyperlink_color = link_color(p);
-    // Den lappade egui_commonmark_backend (vendor/) ritar fet text med den här familjen.
-    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(BOLD_FAMILY_ID), theme::semibold()));
+/// Texten som ritas: formler, diagram, HTML och bilder görs om till vanlig Markdown.
+fn prepare_text(ui: &Ui, p: &Palette, doc: &Document, images: &mut HashSet<String>, reading: bool) -> String {
     // Bilder: inbäddade (bild:) registreras som minnesdata, övriga läses från disk.
     // HTML-formatet (<u>, <span>, <div>, <img> …) görs först om till vanlig Markdown.
     let with_math = crate::math::preview::replace(&doc.text, ui.ctx(), 15.0, p.text, ui.available_width());
@@ -154,16 +144,51 @@ pub fn render(
             text = text.replace(&from, &format!("]({uri})"));
         }
     }
-    let home = crate::platform::home_dir();
-    if let Some(home) = &home {
+    if let Some(home) = crate::platform::home_dir() {
         if text.contains("](~/") {
             text = text.replace("](~/", &format!("](file://{}/", home.display()));
         }
     }
     // Rubrikerna får id (för rullning från navigeringsfönstret).
-    if o.reading {
+    if reading {
         text = with_heading_ids(&text);
     }
+    text
+}
+
+/// Stilen för läsytan: typsnitt, storlekar och färger.
+fn apply_style(ui: &mut Ui, p: &Palette) {
+    let st_ui = ui.style_mut();
+    st_ui.text_styles.insert(egui::TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+    st_ui.text_styles.insert(egui::TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace));
+    st_ui.text_styles.insert(egui::TextStyle::Heading, FontId::new(26.0, theme::semibold()));
+    st_ui.spacing.item_spacing.y = 8.0;
+    // Brödtexten får textfärgen via det vanliga ytans färg (inte `override_text_color`, som också
+    // skulle färga länkarna i textfärgen). Fet text (`RichText::strong`) får samma färg; fetstilen
+    // kommer från typsnittet nedan.
+    st_ui.visuals.widgets.noninteractive.fg_stroke.color = p.text;
+    st_ui.visuals.widgets.active.fg_stroke.color = p.text;
+    st_ui.visuals.hyperlink_color = link_color(p);
+    // Den lappade egui_commonmark_backend (vendor/) ritar fet text med den här familjen.
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(BOLD_FAMILY_ID), theme::semibold()));
+}
+
+/// Ritar dokumentets Markdown som i förhandsvisningen: bilder, formler och Kladds HTML-format.
+pub fn render(
+    ui: &mut Ui,
+    p: &Palette,
+    doc: &Document,
+    images: &mut HashSet<String>,
+    cache: &mut CommonMarkCache,
+    st: &mut MdState,
+    o: &Opts,
+) -> Out {
+    apply_style(ui, p);
+    if o.reading {
+        return render_reading(ui, p, doc, images, cache, st, o);
+    }
+    let mut text = prepare_text(ui, p, doc, images, false);
+    let home = crate::platform::home_dir();
 
     // Sökningen: görs om när något ändrats, och F3 hoppar mellan träffarna.
     let want = o.search.clone().unwrap_or_default();
@@ -176,13 +201,6 @@ pub fn render(
     }
     if st.step != 0 && o.search.is_some() {
         cache.go_to_match(&o.id, std::mem::take(&mut st.step));
-    }
-    if o.reading {
-        if let Some(byte) = st.scroll_to.take() {
-            if let Some(slug) = heading_slug(&doc.text, byte) {
-                cache.scroll_to_heading(&o.id, Some(slug));
-            }
-        }
     }
 
     let base = doc.base_dir().or(home).unwrap_or_default();
@@ -199,7 +217,6 @@ pub fn render(
     } else {
         viewer.show_with_id(o.id, ui, cache, &text)
     };
-    let rect = resp.response.rect;
     let mut out = Out::default();
     if let Some(before) = before {
         if resp.response.changed() {
@@ -211,20 +228,102 @@ pub fn render(
         st.current = cache.active_match(&o.id);
         st.error = cache.search_regex_error(&o.id);
     }
-    if o.reading {
-        let points = cache.line_points(&o.id);
-        let top = ui.clip_rect().top() - rect.top();
-        st.top_byte = to_doc_offset(&text, &doc.text, line_at(points, top).unwrap_or(0));
-        // Dubbelklick på ett stycke (inte på en länk eller kryssruta).
-        let hand = ui.ctx().output(|o| o.cursor_icon) == egui::CursorIcon::PointingHand;
-        if !hand && out.toggled.is_none() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()).filter(|p| ui.clip_rect().contains(*p)) {
-                // Över första blocket (eller innan något block har ritats) öppnas redigeraren i början.
-                let at = line_at(points, pos.y - rect.top()).unwrap_or(0);
-                out.dbl = Some(to_doc_offset(&text, &doc.text, at));
-            }
+    out
+}
+
+/// Läsvyn: bara de synliga blocken ritas (se `mdwin`), så stora filer går lika snabbt som små.
+fn render_reading(
+    ui: &mut Ui,
+    p: &Palette,
+    doc: &Document,
+    images: &mut HashSet<String>,
+    cache: &mut CommonMarkCache,
+    st: &mut MdState,
+    o: &Opts,
+) -> Out {
+    use std::hash::{Hash, Hasher};
+    // Texten görs om en gång per version. Formlernas bredd beror på spaltbredden, så bredden räknas bara med när det finns formler.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (doc.id, doc.rev, doc.images.len(), p.dark, p.text, o.id).hash(&mut h);
+    if doc.text.contains('$') {
+        ui.available_width().to_bits().hash(&mut h);
+    }
+    let key = h.finish();
+    if st.prep.as_ref().is_none_or(|pr| pr.key != key) {
+        let text = prepare_text(ui, p, doc, images, true);
+        let win = Win::new(&text, true);
+        st.prep = Some(Prepared { key, text, win });
+        st.applied = None;
+        st.top_memo = None;
+    }
+    let mut prep = st.prep.take().expect("förberedd text");
+
+    // Sökningen: görs om när något ändrats, och F3 hoppar mellan träffarna.
+    let want = o.search.clone().unwrap_or_default();
+    let skey = (o.id, want.clone(), doc.rev, prep.text.len());
+    if st.applied.as_ref() != Some(&skey) {
+        *cache.search_query_mut(&o.id) = want.query.clone();
+        *cache.search_options_mut(&o.id) = want.flags();
+        prep.win.sync_search_layout(cache, o.id);
+        cache.update_search_matches(&o.id, &prep.text);
+        st.applied = Some(skey);
+    }
+    if st.step != 0 && o.search.is_some() {
+        cache.go_to_match(&o.id, std::mem::take(&mut st.step));
+    }
+    if let Some(byte) = st.scroll_to.take() {
+        if let Some(slug) = heading_slug(&doc.text, byte) {
+            cache.scroll_to_heading(&o.id, Some(slug));
         }
     }
+
+    let base = doc.base_dir().or_else(crate::platform::home_dir).unwrap_or_default();
+    let scheme = format!("file://{}/", base.display());
+    let (match_bg, match_cur) = (p.match_bg, p.match_current_bg);
+    let width = ui.available_width();
+    let max_w = width as usize;
+    let make = move || {
+        CommonMarkViewer::new()
+            .default_implicit_uri_scheme(scheme.clone())
+            .max_image_width(Some(max_w))
+            .enable_scroll_to_heading(true)
+            .search_match_color(match_bg)
+            .search_active_match_color(match_cur)
+    };
+    let mut sh = std::collections::hash_map::DefaultHasher::new();
+    (p.dark, p.text).hash(&mut sh);
+    let cfg = Cfg { id: o.id, width, key: sh.finish(), mutable: o.boxes, make: &make };
+    let wo = prep.win.show(ui, cache, &prep.text, &cfg);
+    let rect = wo.rect;
+    let mut out = Out { toggled: wo.toggled.first().copied(), dbl: None };
+    if o.search.is_some() {
+        st.count = cache.search_ranges(&o.id).len();
+        st.current = cache.active_match(&o.id);
+        st.error = cache.search_regex_error(&o.id);
+    }
+    let text = &prep.text;
+    let points = cache.line_points(&o.id);
+    let top = ui.clip_rect().top() - rect.top();
+    let at = line_at(points, top).unwrap_or(0);
+    // Översättningen till dokumentets text går igenom hela texten: gör den bara när positionen ändras.
+    st.top_byte = match st.top_memo {
+        Some((k, from, to)) if k == key && from == at => to,
+        _ => {
+            let to = to_doc_offset(text, &doc.text, at);
+            st.top_memo = Some((key, at, to));
+            to
+        }
+    };
+    // Dubbelklick på ett stycke (inte på en länk eller kryssruta).
+    let hand = ui.ctx().output(|o| o.cursor_icon) == egui::CursorIcon::PointingHand;
+    if !hand && out.toggled.is_none() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()).filter(|p| ui.clip_rect().contains(*p)) {
+            // Över första blocket (eller innan något block har ritats) öppnas redigeraren i början.
+            let at = line_at(points, pos.y - rect.top()).unwrap_or(0);
+            out.dbl = Some(to_doc_offset(text, &doc.text, at));
+        }
+    }
+    st.prep = Some(prep);
     out
 }
 
@@ -274,13 +373,9 @@ fn heading_slug(doc_text: &str, byte: usize) -> Option<String> {
 
 /// Källbyten i den ritade texten för den ruta som ligger vid eller strax före höjden `y`.
 pub fn line_at(points: &[(usize, f32)], y: f32) -> Option<usize> {
-    let mut best: Option<(usize, f32)> = None;
-    for &(b, py) in points {
-        if py <= y + 0.5 && best.is_none_or(|(_, by)| py >= by) {
-            best = Some((b, py));
-        }
-    }
-    best.map(|b| b.0)
+    // Punkterna ligger i ritordning, alltså med växande y: sista punkten som inte ligger under `y`.
+    let n = points.partition_point(|&(_, py)| py <= y + 0.5);
+    n.checked_sub(1).map(|i| points[i].0)
 }
 
 /// Översätter en byteposition i den ritade texten till dokumentets text. Den ritade texten är
@@ -373,7 +468,6 @@ impl KladdApp {
                 && d.is_markdown()
                 && !d.word_view
                 && d.pdfv.is_none()
-                && !self.big.has_view(d.id)
                 && !self.panes.is_split()
         })
     }

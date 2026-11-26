@@ -12,6 +12,7 @@ use egui::{
     Align, Align2, Color32, FontFamily, FontId, Frame, Id, Key, KeyboardShortcut, Layout, Margin, Modal, Modifiers, Order, Panel, Popup,
     PopupCloseBehavior, Rect, RectAlign, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, pos2, vec2,
 };
+use crate::mdwin::{Cfg, Win};
 use egui_commonmark::{BlockAlign, BlockStyle, CommonMarkCache, CommonMarkViewer, SearchOptions, ViewExtras, set_extras, take_mark_hit};
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +98,13 @@ pub struct Memory {
     pub section: usize,
     /// Andel (0..1) av delens rullning.
     pub frac: f32,
+    /// Delningsgränsen (`SECTION_LIMIT`) som delnumret gäller för; 0 i gamla filer (då 24 000). Ändras gränsen
+    /// räknas stället om till rätt del.
+    #[serde(default)]
+    pub limit: usize,
+    /// Källpositionen överst i delen, om den är känd (säkrare än andelen i stora delar).
+    #[serde(default)]
+    pub byte: Option<usize>,
 }
 
 /// Lägger läget först i listan (och tar bort äldre poster för samma fil).
@@ -213,6 +221,8 @@ pub struct EpubTab {
     back: Vec<Pos>,
     fwd: Vec<Pos>,
     cache: CommonMarkCache,
+    /// Blockindelningen och höjderna för delen som visas (delens nummer hör till).
+    win: Option<(usize, Win)>,
     registered: HashSet<String>,
     hooks_for: Option<usize>,
     applied: Option<(usize, String, bool)>,
@@ -259,6 +269,7 @@ impl EpubTab {
             back: Vec::new(),
             fwd: Vec::new(),
             cache: CommonMarkCache::default(),
+            win: None,
             registered: HashSet::new(),
             hooks_for: None,
             applied: None,
@@ -305,13 +316,28 @@ impl EpubTab {
 
     pub fn memory(&self) -> Memory {
         let frac = if self.max_scroll > 1.0 { (self.scroll / self.max_scroll).clamp(0.0, 1.0) } else { 0.0 };
-        Memory { section: self.section, frac }
+        let byte = (self.book.sections.get(self.section).is_some_and(|s| s.cover.is_none())).then(|| self.top_byte());
+        Memory { section: self.section, frac, limit: super::SECTION_LIMIT, byte }
     }
 
     pub fn restore(&mut self, m: &Memory) {
+        let limit = if m.limit == 0 { super::LEGACY_SECTION_LIMIT } else { m.limit };
+        if limit != super::SECTION_LIMIT {
+            // Boken delades annorlunda när läget sparades: räkna om stället till rätt del.
+            if let Some((s, byte)) = self.book.remap_position(m.section, m.frac, limit) {
+                self.section = s;
+                self.pending = Some(Jump::Byte(byte));
+                self.laid_out = false;
+                self.layout_tries = 0;
+            }
+            return;
+        }
         if m.section < self.book.sections.len() {
             self.section = m.section;
-            self.pending = Some(Jump::Frac(m.frac.clamp(0.0, 1.0)));
+            self.pending = Some(match m.byte {
+                Some(b) if b > 0 => Jump::Byte(b),
+                _ => Jump::Frac(m.frac.clamp(0.0, 1.0)),
+            });
             self.laid_out = false;
             self.layout_tries = 0;
         }
@@ -660,19 +686,10 @@ impl EpubTab {
             Jump::End => max,
             Jump::Frac(f) => (f * max).clamp(0.0, max),
             Jump::Offset(o) => o.clamp(0.0, max),
-            Jump::Byte(b) => {
-                let pts = self.cache.line_points(&self.view_id(self.section));
-                let mut best: Option<(usize, f32)> = None;
-                for &(pb, y) in pts {
-                    if pb <= b && best.is_none_or(|(bb, _)| pb >= bb) {
-                        best = Some((pb, y));
-                    }
-                }
-                match best {
-                    Some((_, y)) => (self.md_top + y - 28.0).clamp(0.0, max),
-                    None => 0.0,
-                }
-            }
+            Jump::Byte(b) => match self.win.as_ref().filter(|(s, _)| *s == self.section) {
+                Some((_, w)) => (self.md_top + w.y_of_byte(b) - 28.0).clamp(0.0, max),
+                None => 0.0,
+            },
         }
     }
 
@@ -896,6 +913,9 @@ impl EpubTab {
             }
             self.hooks_for = Some(si);
         }
+        if self.win.as_ref().is_none_or(|(s, _)| *s != si) {
+            self.win = Some((si, Win::new(&sec.md, false)));
+        }
         // Sökningen (markeringar i delen).
         let want = if self.find.open { self.find.query.trim().to_owned() } else { String::new() };
         let key = (si, want.clone(), self.find.case);
@@ -904,6 +924,9 @@ impl EpubTab {
             let mut f = SearchOptions::empty();
             f.set(SearchOptions::CASE_SENSITIVE, self.find.case);
             *self.cache.search_options_mut(&id) = f;
+            if let Some((_, w)) = self.win.as_mut() {
+                w.sync_search_layout(&mut self.cache, id);
+            }
             self.cache.update_search_matches(&id, &sec.md);
             self.applied = Some(key);
             if let Some(n) = self.want_nth.take() {
@@ -914,13 +937,16 @@ impl EpubTab {
                 }
             }
         }
-        let viewer = CommonMarkViewer::new()
-            .max_image_width(Some(col as usize))
-            .search_match_color(p.match_bg)
-            .search_active_match_color(p.match_current_bg);
-        let resp = viewer.show_with_id(id, ui, &mut self.cache, &sec.md);
+        let (match_bg, match_cur, max_w) = (p.match_bg, p.match_current_bg, col as usize);
+        let make = move || CommonMarkViewer::new().max_image_width(Some(max_w)).search_match_color(match_bg).search_active_match_color(match_cur);
+        // Allt som påverkar blockens höjd; ändras något mäts blocken om.
+        let mut kh = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(prefs.size.to_bits(), prefs.line_factor().to_bits(), prefs.sans, prefs.justify, prefs.publisher, c.dark), &mut kh);
+        let cfg = Cfg { id, width: ui.available_width(), key: std::hash::Hasher::finish(&kh), mutable: false, make: &make };
+        let win = &mut self.win.as_mut().expect("win").1;
+        let wo = win.show(ui, &mut self.cache, &sec.md, &cfg);
         set_extras(ui.ctx(), None);
-        let top = resp.response.rect.top();
+        let top = wo.rect.top();
         let link = sec.link_dests.iter().find(|d| self.cache.get_link_hook(d) == Some(true)).cloned();
         (top, link)
     }
@@ -1615,12 +1641,12 @@ mod tests {
     fn läget_per_bok_minns_högst_hundra_och_flyttar_fram_senast_använda() {
         let mut list: Vec<(String, Memory)> = Vec::new();
         for i in 0..105 {
-            remember(&mut list, format!("/bok{i}.epub"), Memory { section: i, frac: 0.5 }, MAX_MEMORY);
+            remember(&mut list, format!("/bok{i}.epub"), Memory { section: i, frac: 0.5, ..Default::default() }, MAX_MEMORY);
         }
         assert_eq!(list.len(), MAX_MEMORY);
         assert_eq!(list[0].0, "/bok104.epub");
-        remember(&mut list, "/bok50.epub".into(), Memory { section: 7, frac: 0.1 }, MAX_MEMORY);
-        assert_eq!(list[0], ("/bok50.epub".into(), Memory { section: 7, frac: 0.1 }));
+        remember(&mut list, "/bok50.epub".into(), Memory { section: 7, frac: 0.1, ..Default::default() }, MAX_MEMORY);
+        assert_eq!(list[0], ("/bok50.epub".into(), Memory { section: 7, frac: 0.1, ..Default::default() }));
         assert_eq!(list.iter().filter(|(k, _)| k == "/bok50.epub").count(), 1);
         assert_eq!(list.len(), MAX_MEMORY);
     }
@@ -1689,15 +1715,17 @@ mod tests {
     #[test]
     fn minnet_återställer_del_och_rullning() {
         let mut t = tab();
-        t.restore(&Memory { section: 2, frac: 0.25 });
+        t.restore(&Memory { section: 2, frac: 0.25, limit: super::super::SECTION_LIMIT, byte: None });
         assert_eq!(t.section, 2);
         assert_eq!(t.pending, Some(Jump::Frac(0.25)));
         // En del som inte finns (boken har ändrats) ignoreras.
-        t.restore(&Memory { section: 999, frac: 0.9 });
+        t.restore(&Memory { section: 999, frac: 0.9, limit: super::super::SECTION_LIMIT, byte: None });
         assert_eq!(t.section, 2);
         t.scroll = 30.0;
         t.max_scroll = 120.0;
-        assert_eq!(t.memory(), Memory { section: 2, frac: 0.25 });
+        let m = t.memory();
+        assert_eq!((m.section, m.limit), (2, super::super::SECTION_LIMIT));
+        assert!((m.frac - 0.25).abs() < 1e-6);
     }
 
     #[test]

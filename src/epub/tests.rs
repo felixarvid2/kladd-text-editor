@@ -232,7 +232,7 @@ fn trasig_xhtml_och_saknade_filer_tolereras() {
 #[test]
 fn stora_kapitel_delas_vid_styckegränser_och_länkmålen_följer_med() {
     let mut body = String::new();
-    for i in 0..400 {
+    for i in 0..6000 {
         body.push_str(&format!("<p id=\"p{i}\">Stycke nummer {i} med lite text som fyller ut raden så att kapitlet blir stort nog att delas i flera delar. {}</p>", "ord ".repeat(30)));
     }
     body.push_str("<pre>kod\n\nmed tom rad\n</pre>");
@@ -248,9 +248,9 @@ fn stora_kapitel_delas_vid_styckegränser_och_länkmålen_följer_med() {
     assert_eq!(b.chapters.len(), 1);
     assert_eq!(b.chapters[0].section_count, b.sections.len());
     // Ett mål långt in hamnar i rätt del, med byteposition i den delen.
-    let d = b.anchors["a.xhtml#p399"];
+    let d = b.anchors["a.xhtml#p5999"];
     assert!(d.section > 0);
-    assert!(b.sections[d.section].md[d.byte..].starts_with("Stycke nummer 399"), "{:?}", &b.sections[d.section].md[d.byte..d.byte + 30]);
+    assert!(b.sections[d.section].md[d.byte..].starts_with("Stycke nummer 5999"), "{:?}", &b.sections[d.section].md[d.byte..d.byte + 30]);
     // Kodblocket med tom rad delades inte mitt i.
     let all: String = b.sections.iter().map(|s| s.md.as_str()).collect::<Vec<_>>().join("");
     assert!(all.contains("```\nkod\n\nmed tom rad\n```"), "{}", &all[all.len() - 80..]);
@@ -426,7 +426,8 @@ fn bokens_id_följer_paketets_unique_identifier_och_stilen_når_delarna() {
 fn bokmärkenas_plats_hittas_igen_oavsett_hur_kapitlet_delas_i_delar() {
     use super::anchor::{bookmark_at, locate, make, resolve};
     let mut body = String::from("<h1>Långt</h1>");
-    for i in 0..400 {
+    // Så långt att kapitlet delas vid `SECTION_LIMIT`.
+    for i in 0..9000 {
         body.push_str(&format!("<p>Stycke nummer {i} med en del text som fyller ut raden och gör kapitlet långt nog att delas.</p>"));
     }
     let b = Book::load(2, styled_book(&body)).unwrap();
@@ -450,4 +451,29 @@ fn bokmärkenas_plats_hittas_igen_oavsett_hur_kapitlet_delas_i_delar() {
         assert!(md[rg.start..][r.start - rg.start..].starts_with("Stycke nummer 333"), "gräns {limit}, del {si}");
         assert_eq!(rg.start + (r.start - rg.start), r.start);
     }
+}
+
+#[test]
+fn sparat_läge_från_gamla_delningen_räknas_om_till_rätt_ställe() {
+    let mut body = String::new();
+    for i in 0..400 {
+        body.push_str(&format!("<p>Stycke nummer {i} med lite text som fyller ut raden. {}</p>", "ord ".repeat(30)));
+    }
+    let opf = r#"<package><metadata><title>Stor</title></metadata><manifest><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/></spine></package>"#;
+    let epub = zip_of(&[
+        ("META-INF/container.xml", CONTAINER.replace("OEBPS/content.opf", "o.opf").into_bytes()),
+        ("o.opf", opf.as_bytes().to_vec()),
+        ("a.xhtml", xhtml(&body)),
+    ]);
+    let b = Book::load(1, epub).unwrap();
+    assert_eq!(b.sections.len(), 1, "ett kapitel på ungefär 80 kB delas inte längre");
+    let md = b.chapter_md(0);
+    // Gamla delningen vid 24 000 byte: del 2 (nr 2), hälften in.
+    let old = split_ranges(&md, 24_000);
+    assert!(old.len() >= 3);
+    let (s, byte) = b.remap_position(2, 0.5, 24_000).expect("läget finns");
+    assert_eq!(s, 0);
+    let want = old[2].start + old[2].len() / 2;
+    assert_eq!(byte, want);
+    assert!(b.remap_position(99, 0.0, 24_000).is_none());
 }

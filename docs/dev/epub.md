@@ -43,10 +43,12 @@ Gränssnittstester: `src/ui_tests/epub.rs`.
   (`http`, `mailto`) är vanliga länkar.
 - **Noter**: fotnotsreferenser (`epub:type="noteref"`, `role="doc-noteref"` eller en liten siffra i `<sup>` som länkar vidare) hittas i ett
   första varv över alla kapitel; målets text (utan bakåtlänkar) sparas som not. Ett klick visar noten i en ruta med läsytans färger.
-- **Delning**: ett kapitel över `SECTION_LIMIT` (24 000 byte Markdown) delas vid styckegränser (tomma rader utanför kodstaket) i delar,
-  eftersom `egui_commonmark` ritar hela delen varje bildruta. Mätt i ett debugbygge: cirka 28 ms per bildruta för 24 kB (46 ms för
-  40 kB), ett kapitel på 400 kB blir 18 delar. Delarna är osynliga för läsaren utom att *Fortsätt ›* står längst ner och att
-  framstegen och Tillbaka räknar dem.
+- **Delning**: ett kapitel över `SECTION_LIMIT` (600 000 byte Markdown) delas vid styckegränser (tomma rader utanför kodstaket) i delar.
+  Före 2.10 var gränsen 24 000 byte eftersom hela delen ritades varje bildruta (28 ms för 24 kB i debug). Nu ritas bara de synliga
+  blocken (`src/mdwin.rs`), så delningen behövs bara för verkligt enorma kapitel (ett kapitel på 400 kB är en del och tar ca 4 ms per
+  bildruta). Sparade lägen (`Memory`) har `limit` (0 = gamla 24 000) och `byte`; `Book::remap_position` räknar om ett läge från den
+  gamla delningen till rätt del och byte. Delarna är osynliga för läsaren utom att *Fortsätt ›* står längst ner och att framstegen och
+  Tillbaka räknar dem.
 - **Bilder** ligger kvar i zip-filen och läses första gången en del visas (`Book::image`), registreras som `bytes://kladd-epub/{id}/{sökväg}`
   och skalas till spaltbredden men aldrig upp. SVG ritas om till PNG (`imgfmt::svg_to_png`) och får `.png` på adressen.
 - **DRM**: `META-INF/rights.xml`, `sinf.xml` eller en `encryption.xml` med annan metod än IDPF/Adobe-typsnittsobfuskering ger felet

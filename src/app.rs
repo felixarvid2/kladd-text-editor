@@ -289,6 +289,8 @@ pub struct KladdApp {
     pub(crate) md_reading: std::collections::HashSet<u64>,
     /// Läsläget: sökning, rullning och kryssrutor (se `mdread`).
     pub(crate) md: crate::mdread::MdState,
+    /// Ordantalet i statusraden (dokument, version, antal) så att en stor text inte räknas om varje bildruta.
+    words_memo: std::cell::Cell<(u64, u64, usize)>,
     owns_socket: bool,
     pub(crate) word: crate::word::layout::Cache,
     /// Typsnitt som Word-dokumenten använder, hämtade från systemet.
@@ -459,6 +461,7 @@ impl KladdApp {
             incoming: None,
             preview_images: std::collections::HashSet::new(),
             md_reading: std::collections::HashSet::new(),
+            words_memo: std::cell::Cell::new((u64::MAX, 0, 0)),
             md: Default::default(),
             owns_socket: false,
             word: Default::default(),
@@ -2102,7 +2105,15 @@ impl KladdApp {
                             ui.label(RichText::new(s).font(font.clone()).color(p.muted));
                             return;
                         }
-                        let words = self.big.words(doc.id).unwrap_or_else(|| doc.text.split_whitespace().count());
+                        let words = self.big.words(doc.id).unwrap_or_else(|| {
+                            let (id, rev, n) = self.words_memo.get();
+                            if id == doc.id && rev == doc.rev {
+                                return n;
+                            }
+                            let n = doc.text.split_whitespace().count();
+                            self.words_memo.set((doc.id, doc.rev, n));
+                            n
+                        });
                         let words = if words == 1 { t("1 ord").to_owned() } else { tf!("{words} ord", words = words) };
                         ui.label(RichText::new(words).font(font.clone()).color(p.muted));
                         ui.add_space(10.0);

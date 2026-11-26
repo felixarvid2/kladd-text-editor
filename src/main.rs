@@ -45,6 +45,7 @@ mod icons;
 mod keys;
 mod lsp;
 mod mdread;
+mod mdwin;
 mod macopen;
 mod menubar;
 mod mermaid;

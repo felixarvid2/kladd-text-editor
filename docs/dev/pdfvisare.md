@@ -47,7 +47,7 @@ Visning
 4. Kontinuerlig lodrät rullning med ~10 px mellanrum mellan sidorna, sidorna centrerade.
 5. Platshållare i rätt storlek medan en sida renderas (och en snurra efter 400 ms).
 6. Vid zoom sträcks den gamla bilden direkt och en skarp bild renderas efteråt.
-7. Bara synliga sidor (och grannar) renderas; synliga först (prioritetskö), övriga släpps (cache med tak i MB).
+7. Bara synliga sidor (och grannar, fler i rullningsriktningen) renderas; synliga först (prioritetskö), övriga släpps (cache med tak i MB). Under snabb rullning renderas nya sidor i låg upplösning och byts mot skarpa när rullningen stannat (se `docs/dev/prestanda.md`).
 8. Rendering i bakgrundstrådar, flera sidor parallellt; UI:t fryser aldrig.
 9. Stora sidor begränsas (max ~32 MP per bild, kantlängd inom texturgränsen).
 10. Uppslag: en sida / två sidor (udda/jämna, med eller utan omslag).

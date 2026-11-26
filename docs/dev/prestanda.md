@@ -364,12 +364,82 @@ varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3
 - Bilder avkodas av egui:s bildinläsare och påverkar inte layouten förrän storleken är känd (`word_image` rensar då
   layoutcachen, en gång per bild), så ett dokument med hundratals bilder lägger ut om en gång i början.
 
+## Läsläget (Markdown och EPUB), 2.10
+
+Mätt med `markdown_large_frame_time` (`KLADD_BENCH_MD_KB=24,100,400,4900`, `src/ui_tests/text.rs`) och
+`epub_large_chapter_frame_time` (`src/ui_tests/epub.rs`): CPU-tid per `ui.h.step()` i kittest, debugbygge, delad 4-kärnig
+maskin (±30 %). Markdown-filen har rubriker, stycken med formatering, listor, kodblock, tabeller, uppgiftslistor och citat.
+
+| Fall (debug) | Före | Efter |
+|---|---|---|
+| Markdown 24 kB, stilla / rullning | 158 / 159 ms | 7 / 9 ms |
+| Markdown 100 kB | 665 / 670 ms | 9 / 9 ms |
+| Markdown 400 kB | ca 2,7 s (linjärt, ej körd hela vägen) | 18 / 19 ms |
+| Markdown 5 MB (öppnades inte i läsläget) | ca 33 s (uppskattat, 6,5 ms/kB) | 6,3 / 6,3 ms (de ritade blocken ca 4,5 ms) |
+| EPUB-kapitel 400 kB (18 delar) | 23 ms | 4,1 ms (en del) |
+
+Före 2.10 ritade `egui_commonmark` hela texten varje bildruta (och förbehandlingen med formler, diagram, HTML och rubrik-id
+gjordes om varje bildruta), så kostnaden växte linjärt med storleken: 6,5 ms/kB. Därför delades EPUB-kapitel vid 24 kB och `.md`-filer
+från 5 MB öppnades inte i läsläget.
+
+**Vad som gjordes** (`src/mdwin.rs`, `vendor/egui_commonmark`):
+- Texten delas i toppnivåblock (`split`, samma `pulldown-cmark`-flaggor som visningen). `CommonMarkViewer::show_slice` ritar ett
+  block med källpositioner räknade i hela texten, så sökträffar, markeringar, kryssrutor och blockstil fungerar oförändrat. Länk- och
+  fotnotsdefinitioner långt från blocket läggs efter det, och nästa block läses fram (ritas inte) så att listor och tabeller ser
+  samma efterföljande händelser som i en helritning.
+- `Win::show` ritar bara blocken i `ui.clip_rect()`; varje blocks höjd mäts när det ritas och blocken sätts på sin uträknade plats.
+  Ej ritade block har en uppskattad höjd ur textlängden, som räknas om efter 4, 32 och 256 kB uppmätt text. Dokument under 64 kB
+  ritas helt första bildrutan så att alla höjder är exakta (ingen uppskattning, samma rullningslist som förut).
+- När ett block ovanför det man tittar på får sin riktiga höjd (eller uppskattningen räknas om) flyttas rullningen lika mycket och
+  bildrutan ritas om (`request_discard`), så texten står still. Hopp till en rubrik (länk, navigeringsfönstret) och till sökträffen
+  rullar först till blockets uppskattade plats och sedan exakt när blocket ritats.
+- Texten förbehandlas en gång per version (`MdState::prep`) i stället för varje bildruta; ordantalet i statusraden räknas om bara
+  när texten ändrats; översättningen av översta positionen till dokumentets text görs bara när positionen ändras.
+- `CommonMarkCache::line_points` fylls med punkter för blocken nära det synliga (dubbelklick, rullningssynk, EPUB-understrykningar);
+  `Win::y_of_byte` ger blockets överkant för hopp (`Jump::Byte`). Sökträffarnas läge ges av `sync_search_layout`.
+- `.md`-filer över 5 MB öppnas nu i läsläget (Redigera ger den stora textvyn som förut).
+
+**Kontroller**: `blocken_hamnar_som_i_en_helritning` och `ritade_block_ser_ut_som_i_helritningen` (`mdwin::tests`) jämför blockens
+överkanter, texter och galleriformer med en helritning (listor, kod, tabeller, citat, HTML, fotnoter, regler);
+`stor_text_ritar_bara_det_synliga_och_hamnar_som_i_en_helritning` rullar genom en text på 190 kB (som mest 60 block ritas per
+bildruta) och jämför alla överkanter med en helritning efteråt.
+
+**Kvar**: ritningen av de synliga blocken kostar ca 0,5 ms per block i debug (egui:s textutläggning); mer än så kräver att
+galleriet cachas mellan bildrutor. Höjden på ej ritade block är en uppskattning, så rullningslisten kan hoppa lite i stora texter;
+sparade lägen i EPUB använder källpositionen (`Memory::byte`) i stället för andelen av uppskattad höjd.
+
 ## PDF-visaren
 
 Layouten (`build_layout`) är O(sidor) med binärsökning, miniatyrpanelen är virtualiserad och texturcachen har
-tak (256 MB, 240 miniatyrer). Nytt: textlagren (`PageText`, ~0,2 MB per sida) har tak (`MAX_TEXT_PAGES` = 160)
+tak (160 MB, 240 miniatyrer). Nytt: textlagren (`PageText`, ~0,2 MB per sida) har tak (`MAX_TEXT_PAGES` = 160)
 och släpps långt från vyn; sidor som redan sökts hämtas inte om, den aktuella träffens sida hämtas vid behov
 och "markera allt" behåller allt. `find_status` bygger inte längre träfflistan varje bildruta.
+
+### Rullning i en stor PDF, 2.10
+
+Mätt med `pdf_scroll_bench` (`KLADD_BENCH_PDF_PAGES=1200`, `pdfview/view.rs`; 1863 sidor, fönster 900x700, 16 ms mellan bildrutor, tre
+körningar, debug): "promenad" 60 px per bildruta och "snabb" 700 px per bildruta (som att dra i rullningslisten). Tomma = en sida i
+bild utan någon bild alls; grova = bild i fel skala.
+
+| Fall | Före | Efter |
+|---|---|---|
+| Promenad: bildruta medel / p95 | 0,7–0,9 / 1,5–3,4 ms | 0,9–1,0 / 1,9–4,0 ms (brus; visaren är inte flaskhalsen) |
+| Promenad: tomma / grova sidor i bild (av 617) | 0 / 0 | 0 / 0 |
+| Snabb: bildruta medel | 0,6–0,9 ms | 0,6–1,1 ms |
+| Snabb: tomma sidor i bild (av 248) | 153–196 | 0–83 (resten visas grovt), grova 108–191 |
+| Snabb: skarp efter stopp | 0,6–0,9 s | 0,6–1,0 s (oförändrat: hayro-renderingen) |
+| Snabb: texturer i minnet | 33–34 st, 137–141 MB | 34–36 st, 97–109 MB |
+| Toppminne (process) | 105–108 MB | 107–111 MB |
+
+**Vad som gjordes** (`pdfview/view.rs`): rullhastigheten och riktningen mäts (`track_scroll`); förrenderingen tar fler sidor i
+rullningsriktningen (4 framåt, 1 bakåt, annars 2/2); rullar vyn snabbare än tio vyhöjder per sekund (`FAST_SCROLL`, motorn hinner
+inte med skarpa sidor) renderas sidor som saknar bild i 35 % av skalan (snabbt att rita) och byts mot skarpa 140 ms efter att
+rullningen stannat; en grov bild som kommer efter en skarp ersätter den inte; texturcachen har tak 160 MB (förut 256 MB) och släpper
+aldrig synliga eller förrenderade sidor. Promenad (under tröskeln) är oförändrad.
+
+**Kvar**: tiden till skarp bild efter en snabb rullning ändrades inte mätbart: den bestäms av hur snabbt hayro renderar de synliga
+sidorna (en tråd per sida), och renderingar som redan pågått kan inte avbrytas. Ett snabbare spår kräver avbrytbar rendering eller
+bandvis rendering av en sida.
 
 ## PDF-export (`pdf_write.rs`)
 
