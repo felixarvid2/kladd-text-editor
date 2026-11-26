@@ -98,10 +98,12 @@ men mättes inte (disken räckte inte till ett `--release`-bygge).
 `word::incr` (`analyze_incremental_with`) tolkar efter en liten ändring (högst 4 kB, i dokument över 200 kB)
 bara stycket med ändringen plus ett stycke på var sida. De yttre styckena är kanariefåglar: ger de inte
 exakt samma bitar som i den gamla analysen (något sträcker sig över styckegränsen) görs full analys.
-Tre tilda, oavslutade kommentarer, referenslänkar (när fönstret har hakparenteser), kodstaket som inte är
-välformade, ändringar på grundformatsraden och nya eller ändrade fotnotsetiketter och avsnittsrader ger full analys; se
-"Tangenttryck och öppning, andra omgången" nedan för vad som går inkrementellt. Slumpade ändringar mot
-`markup::analyze` ingår som test. Tabeller, bilder och typsnitt återanvänds när fönstret inte rört dem.
+Oavslutade kommentarer, kodstaket i fönstret eller där det inte går att avgöra om de är staket (i en lista eller ett
+citat), referenslänkar som inte är enkla (när fönstret har hakparenteser), ändringar på grundformatsraden, ändrade
+avsnittsrader och nya eller borttagna fotnotsdefinitioner med referenser utanför fönstret ger full analys; se
+"Tangenttryck och öppning, andra omgången" och "fjärde omgången" nedan för vad som går inkrementellt. Slumpade ändringar mot
+`markup::analyze` ingår som test. Tabeller, bilder, typsnitt och styckenas utseende (`<!--k:pp`) återanvänds när fönstret
+inte rört dem.
 
 Efter en inkrementell analys återanvänder `word::layout_memo` styckena, fotnotsplanen, grupperna och
 cachenycklarna från förra omläggningen (se nedan), så att ett tangenttryck inte längre kostar tid i proportion till
@@ -332,6 +334,8 @@ varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3
 
 ### Kvar
 
+(Delvis åtgärdat i fjärde omgången nedan: ändringsräknaren, höjdändringar, färre fall av full analys och stegvis utläggning.)
+
 - Tangenttrycket växer fortfarande med dokumentet (3,1 gånger från 404 till 2021 sidor i opt-level 2), med små konstanter:
   varje anrop till `Cache` jämför hela texten med sin kopia (memcmp; bänken och vyn gör det fyra–fem gånger per bildruta,
   ca 0,15 ms vardera vid 3,3 MB), den inkrementella analysen flyttar alla bitar efter fönstret (`Piece` är stor, ca 0,7 ms),
@@ -347,6 +351,150 @@ varför inte): skrivning i brödtext och i en fotnot (redigerad på sidan) gav 3
   definition), referenslänkar med hakparenteser i fönstret, kodstaket i dokument med udda antal staket eller staket mitt på
   en rad, tre tilda och ändringar på grundformatsraden. Sökträffar ger full omräkning av förberedelsen.
 - Stegvis utläggning, första sidan och bilder som i förra omgången (nedan).
+
+### Höjdändringar, färre jämförelser och stegvis utläggning, fjärde omgången
+
+Mätning: `bench_docx_place` (ny, ignorerat test i `src/word/bench.rs`) skriver ett tecken in och ut om vartannat på ett av de
+tio ställena (`KLADD_BENCH_PLACE=1..10`, `KLADD_BENCH_KEYS=20`) och ger medianen av 20 bildrutor: en varm slinga, inte ett enda
+tangenttryck per ställe som i tabellerna ovan, så siffrorna är inte direkt jämförbara med förra omgångens. `KLADD_BENCH_TEXT`
+skriver något annat än ett tecken, `KLADD_BENCH_PRE` lägger ett stycke först i dokumentet (för fallen där analysen avstod) och
+`KLADD_BENCH_VIEW=1` hämtar också det vyn hämtar ur cachen varje bildruta (rubriker, styckerutor). Profilering med
+`valgrind --tool=callgrind --toggle-collect='*place_loop*'`. Dokumenten är som förra omgången `gen-skolrapport.docx` upprepad
+100 och 500 gånger (404 och 2021 sidor). Opt-level 2 för kladd, egui, epaint, emath, ecolor, harfrust, skrifa och read-fonts,
+övrigt debug; dev-profilen har kvar `debug_assertions`, men bänken slår av de nya kontrollerna över hela dokumentet som bara
+görs i debugbyggen (`layout::CHECKS`: att texten med en `Seen` är cachens och att texten utanför det ändrade området är
+densamma i `layout_memo`), så siffrorna efter motsvarar ett optimerat bygge. Delad 4-kärnig maskin med belastning 2–10:
+skillnader under ca 15 % är brus.
+
+| Tangenttryck, opt-level 2, median av 20 (ms) | 404 sidor före / efter | 2021 sidor före / efter |
+|---|---|---|
+| 1 början (raden bryts om: höjden ändras) | 11,8 / 5,1 | 4,5 / 2,6 |
+| 2 25 % | 8,5 / 2,4 | 3,9 / 2,1 |
+| 3 mitten | 0,80 / 0,57 | 3,5 / 1,7 |
+| 4 75 % | 1,13 / 0,87 | 2,6 / 1,4 |
+| 5 slutet av brödtexten | 0,55 / 0,42 | 2,9 / 1,2 |
+| 6 i tabell | 1,22 / 1,37 | 6,1 / 3,8 |
+| 7 vid fotnotsreferens | 0,83 / 0,69 | 107,5 / 2,3 |
+| 8 närmast fotnotsdefinitionerna | 0,92 / 0,52 | 3,4 / 1,9 |
+| 9 första fotnotsdefinitionen | 0,62 / 0,49 | 3,7 / 1,8 |
+| 10 sista fotnotsdefinitionen | 0,41 / 0,29 | 2,5 / 1,2 |
+| **Median av de tio** | **0,88 / 0,63** | **3,58 / 1,89** |
+| **Sämsta** | **11,8 / 5,1** | **107,5 / 3,8** |
+| Med vyns hämtningar (`KLADD_BENCH_VIEW`, mätt innan rubrikerna lästes om bara i fönstret), ställe 1 / 3 | – | – / 4,1 och 2,6 |
+| Oförändrad bildruta (`bench_docx_open`) | 0,1 / 0,0 | 1,4–1,5 / 0,2–0,3 |
+| Kall utläggning, allt i en bildruta | 427–434 / 402–431 | 1975–2042 / 1616–1735 |
+| Stegvis: första bildrutan | 172–185 / 140–141 | 934–966 / 704–821 |
+| Stegvis tills allt är utlagt | 490–522 / 408–417 | 2643–2741 / 1901–1997 |
+
+Rubrikerna i fönstret (`headings_patch`) och rättelsen i vyn kom efter den sista mätningen i opt-level 2 och syns inte i
+tabellen. Debug (404 sidor, `bench_docx_open`, ett tangenttryck per ställe): median 6,1–7,0 / 6,0–6,2 ms, sämsta 76–77 / 53–70 ms;
+kall utläggning 2,79–2,96 / 2,79–2,91 s, stegvis tills allt är utlagt 3,82–4,25 / 3,29–3,31 s (22 bildrutor).
+
+Fall där den inkrementella analysen avstod förut (debug, 404 sidor, hela tangenttrycket, median av 6): ett tecken i ett
+dokument med ett kodstaket mitt i en rad någonstans 317 / 2,3 ms, med ett `~~~`-staket 280 / 3,6 ms, `[namn]` i ett dokument
+med en referenslänk 317 / 4,0 ms; en ny fotnotsdefinition (`\n[^ny]: Ny fotnot.` i sista definitionen) 375 / 292 ms
+(analysen är nu inkrementell, men fotnotsplanen har ändrats, så förberedelsen och varvet görs hela).
+
+Små dokument är inte långsammare (`bench_document_mode`, ett tecken i mitten, opt-level 2, tre körningar): 30 kB 5,4–5,8 /
+5,7–6,3 ms (brus), 55 kB 10,2–10,8 / 8,9–9,3 ms, 600 kB 6,5–7,1 / 3,2–4,1 ms; markören byter rad i 600 kB 2,4–2,6 / 0,2–0,3 ms.
+Debug: 30 kB 22,5 / 15,7 ms, 55 kB 30,8 / 25,4 ms.
+
+Målen: sämsta tangenttrycket vid 404 sidor är 5,1 ms (mål 5, inte riktigt nått; bästa av 20 4,8 ms), tangenttrycket vid 2021
+sidor är 1,89 / 0,63 = 3,0 gånger det vid 404 sidor (mål 2; förut 4,1), och stegvis utläggning av 404 sidor är i opt-level 2 lika
+snabb som den kalla (408–417 mot 402–431 ms) men i debug fortfarande ca 15 % långsammare (förut ca 40 %); se *Kvar*.
+
+Vad som gjordes, i den ordning mätningen pekade ut:
+
+- **Innehållsförteckningar i fönstret.** Det sämsta tangenttrycket vid 2021 sidor (ställe 7, 108 ms) och en stor del av de
+  sämsta vid 404 sidor var `toc_count`: varje upprepning av skolrapporten har en förteckning, och när ett fönster rörde en
+  räknades alla förteckningars poster om med en kopia av alla rubriker per förteckning (kvadratiskt). Nu räknas posterna utan
+  kopior (`nav::toc_total`), och är rubrikerna som kan komma med oförändrade (`Delta::toc_delta == 0`) och förteckningens rad
+  densamma återanvänds både antalet och radens höjd (`paragraphs_toc` med kända höjder).
+- **Höjdändring utan att lägga ut resten** (förslag 1, `layout_resume.rs`). Ändras höjden blir tillståndet före de följande
+  grupperna aldrig detsamma som förut, och efter 64 grupper gavs det återupptagna varvet upp. Nu sparar varvet för varje grupp
+  om den beror på sitt läge (`Rec::plain`: inga flytande bilder eller textrutor före, i eller efter den, ingen bild i stycket);
+  en sträcka sådana grupper tas från förra varvet förskjuten (`Fast::splice_shifted`): gruppernas gallerier, ankare, tabeller och
+  fotnoter är desamma, och bara läget (`y`) och sidsimuleringen förs fram grupp för grupp och rad för rad med exakt samma
+  räkneordning som i varvet, så att resultatet blir detsamma bit för bit. Att bara flytta lägena med skillnaden går inte i
+  flyttal (avrundningen beror på storleken, särskilt med skalning 125 % och 150 %), så sammanfogningen och sidindelningen räknas
+  om från den ändrade raden till slutet, men utan att lägga ut, hasha eller slå upp något: raderna sammanfogas en gång
+  (`FlatRows::pre`) och flyttas till det nya galleriet, fotnotsreferenserna i förskjutna sträckor flyttas bara, och
+  ritytornas summor görs om per block. Sidindelningen återupptas fortfarande bara där tillståndet åter blir detsamma.
+  Sammanfogningen jämför bara rektangelns y (galleriets bredd följs per grupp, `PageTrace::xr`), så att en rad som blir bredare
+  inte längre ger full sammanfogning (det var ställe 2). Dokument utan fotnoter återupptogs aldrig sidindelningen för (luften och
+  taket för fotnoterna var noll i den fullständiga vägen); nu sätts de alltid.
+- **Ändringsräknare i stället för textjämförelse** (förslag 2). `Cache::seen(id, text)` jämför texten en gång och ger en
+  `Seen` med en stämpel (unik i hela programmet, ny vid varje ändring); `Cache`:s metoder tar `&str` eller `&Seen` (`DocText`)
+  och litar på stämpeln så länge texten lånas (lånekontrollen garanterar att den inte ändras). Vyn använder den för alla
+  hämtningar efter TextEdit (åtta jämförelser av hela texten per bildruta blir en), mätverktyget för hela bildrutan. Före
+  TextEdit lånar vyn `self` på andra sätt mellan anropen, där är det kvar som förut. Kontrollen av att texten utanför det
+  ändrade området är densamma (`layout_memo::reuse`) görs bara i debugbyggen när området kommer från en enda inkrementell
+  analys (som själv jämför texterna); ett område som satts samman av flera ändringar före en omläggning kontrolleras alltid. Kontrollstyckena jämförs fält för fält (`same_para`) i stället för som `format!("{:?}")`,
+  och första ändrade gruppen räknas fram när grupperna görs om (`Prep::first_new`) i stället för att sökas.
+- **Färre fall av full analys** (förslag 6, `incr.rs`). En ny, borttagen eller omdöpt fotnotsdefinition i fönstret går när
+  ingen referens till etiketten finns utanför det; kodstaket räknas per rad (först på raden, osäkert i en lista eller ett citat,
+  eller mitt i en rad, som inte är något staket), `~~~` följs som ``` och fönstret avgörs ligga utanför ett kodblock genom att
+  följa staketen som CommonMark (`in_fenced_block`), så att ett dokument med ett staket mitt i en rad eller ett `~~~`-block inte
+  längre ger full analys vid varje tangent; och fönster med hakparenteser i dokument med referenslänkar tolkas med dokumentets
+  definitioner efter sig när alla är enkla (`link_defs_of`). Grundformatsraden ger fortfarande full analys: en ändring där
+  ändrar cachenycklarna för alla stycken, så omläggningen efteråt är full ändå. Fuzzningen med de nya ändringarna hittade två
+  gamla avvikelser mot full analys: en referens vars definitionsrad inte är någon definition (mitt i ett stycke) togs för giltig
+  (nu krävs en riktig definition i den gamla analysen, `has_def_outside`), och en HTML-tagg med ett citattecken utan sin like
+  kan fortsätta långt efter fönstret (`open_tag` ger full analys).
+- **Stegvis utläggning** (förslag 9). Förut var varje bildruta under den stegvisa utläggningen ett helt varv (en nyckel och en
+  uppslagning per grupp och en platshållare per grupp som inte lagts ut). Nu sparas varvet också när det är ofullständigt
+  (`Trace::stub_from`, `Rec::stub`), platshållarnas kalibrering följer med mellan bildrutorna och fryses (`Stubs::freeze`, görs om
+  när det utlagda har fördubblats) och nästa bildruta återupptar varvet: grupperna före gränsen tas från förra varvet, nya
+  grupper läggs ut inom budgeten och platshållarna för resten tas förskjutna från förra varvet när kalibreringen är densamma.
+  Sammanfogningen och sidindelningen återupptas också under den stegvisa utläggningen (det ofullständiga galleriet sparas,
+  `partial_galley`). Medan fotnotsdefinitionerna läggs ut ändras antalet noter och de bildrutorna gör sammanfogningen hela.
+- **Mindre per tangent i vyn:** styckenas utseende (`pbox::scan` över hela texten vid varje ändring, ca 6,5 ms i debug vid 404
+  sidor) och rubrikerna läses om bara i fönstret och flyttas efter det (`pspecs_patch`, `headings_patch`), och notregistret i
+  sammanfogningen byggs bara när många referenser söks.
+
+Prov: `layout::resume::tests` med förskjutna sträckor, sidbrytningar, flytande bilder och textrutor, med skalning 125 % och 150 %
+i vart annat frö, `Fast::abandon` efter förskjutna sträckor i vartannat frö och, i provet med avsnitt, olika breda spalter;
+`lazy_tests::stegvis_utlaggning_aterupptar_forra_varvet` (återupptagna bildrutor och samma galleri, sidor och fotnoter som när
+allt läggs ut direkt); `layout_memo` med `toc_delta` (förteckningens höjd) och `paragraph_looks_follow_incremental_edits`
+(styckenas utseende och rubrikerna mot en hel omläsning); `incr` med nya definitioner, staket mitt i rader, `~~~` och
+referenslänkar. Alla med `KLADD_FUZZ_SEEDS=300`.
+
+I appen (`KLADD_TIMING=1`, 404 sidor, debug, samtidigt som annat byggdes på maskinen): den stegvisa utläggningen återupptog
+varje bildruta utom de sista fem (fotnotsdefinitionerna); ett tecken gav en omläggning på 5–7 ms (hela bildrutan 80–110 ms,
+se *Kvar*), Enter 30 ms, Backspace över en styckegräns 29 ms, ångra 29–33 ms, alla återupptagna och med förskjutna sträckor;
+en inklistring på 5 kB (över gränsen för den inkrementella analysen) gav full analys (169 ms) och en omläggning på 148 ms, och
+tecknet efter 17 ms. Att ångra inklistringen kraschade vyn (också före den här omgången): rubrikerna hämtas före TextEdit och
+användes efter den med den ändrade texten, så att ett gammalt byteläge hamnade mitt i ett tecken. Rubrikerna hämtas nu om
+efter en ändring, och omvandlingen från byte till tecken tål ett läge mitt i ett tecken.
+
+#### Kvar
+
+- Tangenttrycket vid 2021 sidor är 3,0 gånger det vid 404 sidor. Det som återstår och växer med dokumentet (callgrind, 2021
+  sidor, mitten, per tangent): grupperna flyttas när de görs om (`regroup`, ca 1 M instruktioner), den inkrementella analysen
+  flyttar alla bitar efter fönstret (ca 1 M), det återupptagna varvet flyttar förra varvets listor två gånger (`Fast::start` och
+  `splice`: fotnoternas `NoteLayout`, tabellernas `TableGeom` och gallerierna, ca 1,1 M), de täta listorna per grupp lappas och
+  justeras (`finish_rec`, `finish_fast`), och texten kopieras två gånger (cachens kopia och galleriets). Relativa lägen
+  (förslag 3: en förskjutning som tillämpas lat för bitar, stycken, grupper och listorna) skulle ta bort det mesta, men kräver
+  att alla som läser `Analysis::pieces`, `Prep` och `Out` gör det genom en förskjutning; det har inte gjorts i den här omgången.
+- En höjdändring vid 404 sidor tar ca 5 ms, nästan allt i sammanfogningen och sidindelningen av raderna efter ändringen. De
+  räknas om exakt; att i stället flytta dem med skillnaden kräver att lägena räknas i hela bildpunkter (eller med heltal) i både
+  den fullständiga och den återupptagna vägen, vilket ändrar avrundningen mot i dag.
+- Dokument med flera avsnitt (förslag 5) återupptar bara varvet över grupperna och gör sammanfogningen och sidindelningen
+  (`paginate_sections`) hela, och med olika breda spalter görs allt hela och flera gånger (spaltutjämningen). Mätt med
+  `gen-nyhetsbrev.docx` upprepad 150 gånger (tre spalter med olika bredd): 84 / 86 ms per tecken i debug, oförändrat. Att
+  återuppta `paginate_sections` kräver ett sparat tillstånd per ark (spalt, avsnitt, enheterna på arket för utjämningen,
+  fotnoterna) och att utjämningens varv också återupptas.
+- I appen kostar resten av bildrutan mer än omläggningen: i debug ca 75–80 ms per tecken vid 404 sidor mot 4–6 ms för
+  omläggningen (`KLADD_TIMING` skriver nu också hela bildrutan med ändring). Före TextEdit jämförs texten fortfarande sju gånger
+  per bildruta (vyn lånar `self` mellan anropen), och debugbyggen jämför den med flit också för varje `Seen`.
+- En ny fotnotsdefinition eller ändrade fotnotsreferenser ger full förberedelse och ett helt varv (fotnotsplanen), och en ändring i
+  en tabell bygger om alla tabeller (ställe 6).
+- Ett fönster mitt i ett `<div align="justify">`-block som går över flera stycken (Word-läsarens justerade text) ger full
+  analys (`incr`, skäl 19: bitarna har justering men fönstret ser inte `<div>`-taggarna), och därmed full förberedelse. I appen
+  gäller det mycket av brödtexten i `gen-skolrapport` (ca 140 ms analys och 130 ms omläggning per tecken i debug vid 404 sidor);
+  de tio mätställena ligger utanför sådana block. Fönstret kunde tolkas inslaget i blockets `<div>`.
+- Stegvis utläggning i debug är ca 15 % långsammare än den kalla: varje bildruta för fram lägena över resten av dokumentet
+  (förskjutna platshållare, sammanfogning och sidindelning), och medan fotnotsdefinitionerna läggs ut görs sammanfogningen hela.
 
 ### Kvar efter andra omgången
 

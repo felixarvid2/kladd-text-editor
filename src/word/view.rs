@@ -996,6 +996,8 @@ impl KladdApp {
 
     /// Sidvyn: grått skrivbord, vita ark (en per sida) med text, sidhuvud/sidfot och stavningsmarkering.
     pub(crate) fn word_page(&mut self, ui: &mut Ui, p: &Palette) {
+        // `KLADD_TIMING=1`: hela dokumentlägets bildruta (texten ändrad) skrivs ut, inte bara omläggningen.
+        let t_frame = std::time::Instant::now();
         self.word_initial_caret(ui.ctx());
         let paper = if self.settings.white_paper { p.paper() } else { *p };
         let p = &paper;
@@ -1369,11 +1371,15 @@ impl KladdApp {
                     let clip = ui.clip_rect();
                     lazy_next = (clip.bottom() >= front, clip.top() >= front);
                 }
-                let text = doc.text.as_str();
-                let analysis = word.analysis(doc_id, text);
+                // Texten jämförs med layoutcachens kopia en gång; anropen nedan slipper jämförelsen (`layout::Seen`).
+                let seen = word.seen(doc_id, doc.text.as_str());
+                let text = seen.text();
+                // Rubrikerna hämtades före TextEdit: har texten ändrats sedan dess gäller de inte längre.
+                let heads = if edited { word.headings(doc_id, &seen) } else { heads };
+                let analysis = word.analysis(doc_id, &seen);
                 // Arken (med avsnitt olika stora, med spalter) från omläggningen som TextEdit just gjorde.
                 let origin_y = page_top + geom.top;
-                let mut boxes = word.page_boxes(doc_id, text);
+                let mut boxes = word.page_boxes(doc_id, &seen);
                 if boxes.is_empty() {
                     boxes = Arc::new(geom.uniform_boxes(pages::page_count(&galley, &geom)));
                 }
@@ -1383,7 +1389,7 @@ impl KladdApp {
                     if geom.multi() { secpages::column_at(&boxes, geom.origin_x(), x, y) } else { (0.0, text_w) }
                 };
                 // Tabeller: kolumnkanter att dra i, pekarens träffyta och markören i cellens innehåll.
-                let tview = if edited { None } else { word.table_view(doc_id, text) };
+                let tview = if edited { None } else { word.table_view(doc_id, &seen) };
                 let mut vtabs: Vec<VisTable> = Vec::new();
                 let mut drag_preview: Option<(f32, f32, f32)> = None;
                 let mut on_edge = false;
@@ -1451,7 +1457,7 @@ impl KladdApp {
                 // Fotnoter: skiljelinje över definitionerna som står sist (de som inte ritas längst ned på sin
                 // sida); numret är en länk mellan referens och definition.
                 if text.contains("[^") {
-                    let notes = word.notes(doc_id, text);
+                    let notes = word.notes(doc_id, &seen);
                     let collapsed = |b: usize| notes.iter().any(|n| n.line.start <= b && b < n.line.end.max(n.line.start + 1));
                     let area = markup::footnote_area_start(text, &analysis).and_then(|s| {
                         if !collapsed(s) {
@@ -1533,7 +1539,7 @@ impl KladdApp {
                 ui.painter().set(shadow_slot, shadows);
                 ui.painter().set(page_slot, sheets);
                 if !edited {
-                    let pb = word.para_boxes(doc_id, text);
+                    let pb = word.para_boxes(doc_id, &seen);
                     if !pb.1.is_empty() {
                         let vis = {
                             let lo = galley.cursor_from_pos(vec2(0.0, clip.top() - gpos.y - 300.0)).index.0;
@@ -1606,7 +1612,7 @@ impl KladdApp {
                     }
                 }
                 // Fotnoterna längst ned på sina sidor.
-                let page_notes = word.notes(doc_id, text);
+                let page_notes = word.notes(doc_id, &seen);
                 if !page_notes.is_empty() {
                     let env = super::notesui::Env {
                         palette: p,
@@ -1750,7 +1756,7 @@ impl KladdApp {
                             let ci = conv.at(pc.range.start);
                             let r = galley.pos_from_cursor(CCursor::new(ci)).translate(gpos.to_vec2());
                             // Flytande bild: vid textkanten, på radens höjd (raden själv har ingen höjd).
-                            let side = word.float_side(doc_id, text, pc.range.start);
+                            let side = word.float_side(doc_id, &seen, pc.range.start);
                             {
                                 let uri = image_uri(&img.src, doc_id);
                                 let top = side.and_then(|(_, row)| galley.rows.get(row)).map_or(r.min.y, |row| row.pos.y + gpos.y);
@@ -1906,7 +1912,7 @@ impl KladdApp {
                 }
 
                 // Kodblockens rutor (bakom texten), språknamn och kopieringsknapp.
-                let code_blocks = word.code_blocks(doc_id, text);
+                let code_blocks = word.code_blocks(doc_id, &seen);
                 let diagram = |b: &super::codeblock::Block| -> Option<(String, Vec2)> {
                     let size = b.diagram_key(text).and_then(|k| sizes.get(&k).copied())?;
                     let overlaps = reveal.start < b.whole().end && b.whole().start < reveal.end;
@@ -2124,6 +2130,9 @@ impl KladdApp {
                 self.notify(&ctx, t("Koden kopierades"), false);
             }
             self.wv.pages = page_pos;
+            if edited && crate::timing::enabled() {
+                crate::timing::mark(&format!("dokumentläge, bildruta med ändring: {:.1} ms", t_frame.elapsed().as_secs_f64() * 1000.0));
+            }
             if self.word.partial(doc_id) {
                 self.wv.lazy_frames = self.wv.lazy_frames.saturating_add(1);
                 (self.wv.lazy_boost, self.wv.lazy_hurry) = lazy_next;
@@ -2401,8 +2410,9 @@ impl<'a> ByteToChar<'a> {
     }
 
     fn at(&mut self, b: usize) -> usize {
+        // Ett läge från före en ändring i samma bildruta (stavnings- och grammatikträffar, eller rubriker när TextEdit
+        // ångrar själv) kan hamna mitt i ett tecken: aldrig mitt i ett tecken.
         let mut b = b.min(self.text.len());
-        // Stavnings- och grammatikträffar kan höra till texten före tangenttrycket i samma bildruta: aldrig mitt i ett tecken.
         while !self.text.is_char_boundary(b) {
             b -= 1;
         }

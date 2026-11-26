@@ -106,15 +106,34 @@ fn frame_lazy(
     reveal: std::ops::Range<usize>,
     budget: Option<std::time::Duration>,
 ) -> usize {
+    // Som i ett optimerat bygge: inga extra kontroller över hela dokumentet (görs bara i debugbyggen).
+    #[cfg(debug_assertions)]
+    layout::CHECKS.store(false, std::sync::atomic::Ordering::Relaxed);
     let pal = theme::palette(false);
     let t = Instant::now();
-    let a = c.analysis(1, text);
+    // Som i appen: texten jämförs med cachens kopia en gång per bildruta (`Cache::seen`).
+    let seen = c.seen(1, text);
+    let a = c.analysis(1, &seen);
     let t_an = ms(t);
     // Som i appen: sidgeometri per avsnitt (arken kan ha olika storlek och spalter).
     let geom = pages::Geom::for_sections(1.0, &a.defaults, &a.sections);
     let t = Instant::now();
-    let _tabs = c.tables(1, text);
-    let _fonts = c.fonts(1, text);
+    let _tabs = c.tables(1, &seen);
+    let _fonts = c.fonts(1, &seen);
+    // `KLADD_BENCH_VIEW=1`: också det vyn hämtar ur cachen varje bildruta (rubriker, styckerutor, bilder, kodblock).
+    if std::env::var_os("KLADD_BENCH_VIEW").is_some() {
+        let t = Instant::now();
+        let _ = c.headings(1, &seen);
+        let t_h = ms(t);
+        let t = Instant::now();
+        let _ = c.para_boxes(1, &seen);
+        let t_p = ms(t);
+        let t = Instant::now();
+        let _ = (c.images(1, &seen), c.code_blocks(1, &seen));
+        if std::env::var_os("KLADD_BENCH_VERBOSE").is_some() {
+            eprintln!("    vyn: rubriker {t_h:.1} ms, styckerutor {t_p:.1} ms, bilder och kodblock {:.1} ms", ms(t));
+        }
+    }
     if std::env::var_os("KLADD_BENCH_VERBOSE").is_some() {
         eprintln!(
             "    frame: analys/tillstånd {t_an:.1} ms, tabeller+typsnitt {:.1} ms (inkrementell analys avstod: {:?})",
@@ -133,9 +152,9 @@ fn frame_lazy(
         font_family: &fam,
         fonts_gen: 0,
     };
-    let g = c.galley_paged_lazy(ctx, 1, text, &p, geom.edit_w(), Some(&geom), budget);
+    let g = c.galley_paged_lazy(ctx, 1, &seen, &p, geom.edit_w(), Some(&geom), budget);
     // Som statusraden: under stegvis utläggning den uppräknade uppskattningen (0 = ingen än), annars det riktiga antalet.
-    let boxes = c.page_boxes(1, text);
+    let boxes = c.page_boxes(1, &seen);
     if c.partial(1) {
         c.estimated_pages(1, text.len(), &g, &boxes).unwrap_or(0)
     } else if boxes.is_empty() {
@@ -420,33 +439,7 @@ fn bench_docx_open() {
         // Ett tecken på tio ställen i dokumentet (varje gång från den oförändrade texten): början, 25 %, mitten, 75 %,
         // slutet av brödtexten, i en tabell, i ett stycke med fotnotsreferens, i stycket närmast fotnotsdefinitionerna
         // och i första respektive sista fotnotsdefinitionen.
-        let word_at = |from: usize| -> usize {
-            // Första tecknet i ett ord i löpande text (inte i markup eller en etikett).
-            let mut at = from.min(text.len());
-            while !text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic()) {
-                at += 1;
-            }
-            at
-        };
-        let first_def = text.find("\n[^1]:").unwrap_or(text.len());
-        let mut places: Vec<(&str, usize)> = vec![
-            ("början", word_at(text.len() / 50)),
-            ("25 %", word_at(text.len() / 4)),
-            ("mitten", word_at(text.len() / 2)),
-            ("75 %", word_at(text.len() * 3 / 4)),
-            ("slutet av brödtexten", word_at(first_def.saturating_sub(3000))),
-        ];
-        if let Some(t) = text[text.len() / 2..].find("\n| ") {
-            places.push(("i tabell", text.len() / 2 + t + 3));
-        }
-        if let Some(r) = text[text.len() * 2 / 5..].find("[^") {
-            places.push(("vid fotnotsreferens", text.len() * 2 / 5 + r));
-        }
-        places.push(("närmast fotnotsdefinitionerna", word_at(first_def.saturating_sub(300))));
-        if first_def < text.len() {
-            places.push(("första fotnotsdefinitionen", word_at(first_def + 10)));
-            places.push(("sista fotnotsdefinitionen", word_at(text.rfind("\n[^").unwrap_or(0) + 10)));
-        }
+        let places = places(&text);
         let mut times = Vec::new();
         for (k, (name, at)) in places.iter().enumerate() {
             let mut e = text.clone();
@@ -459,12 +452,13 @@ fn bench_docx_open() {
             if std::env::var_os("KLADD_BENCH_VERBOSE").is_some() || std::env::var_os("KLADD_BENCH_PLACES").is_some() {
                 let st = c.stats(1);
                 eprintln!(
-                    "    ställe {} ({name}): {:.1} ms, återanvänd {}, skäl {}, återupptagen {} | plan {:.1} loop {:.1} concat {:.1} sidor {:.1} ms",
+                    "    ställe {} ({name}): {:.1} ms, återanvänd {}, skäl {}, återupptagen {} ({}) | plan {:.1} loop {:.1} concat {:.1} sidor {:.1} ms",
                     k + 1,
                     times.last().unwrap(),
                     st.reused,
                     st.memo_why,
                     st.resumed,
+                    st.resume_why,
                     st.plan_ms,
                     st.loop_ms,
                     st.concat_ms,
@@ -526,6 +520,99 @@ fn bench_docx_open() {
         println!("    återanvänd förberedelse: {}", s.reused);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ställena för tangenttrycken i `bench_docx_open` (se där).
+fn places(text: &str) -> Vec<(&'static str, usize)> {
+    // Första tecknet i ett ord i löpande text (inte i markup eller en etikett).
+    let word_at = |from: usize| -> usize {
+        let mut at = from.min(text.len());
+        while !text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic()) {
+            at += 1;
+        }
+        at
+    };
+    let first_def = text.find("\n[^1]:").unwrap_or(text.len());
+    let mut places: Vec<(&str, usize)> = vec![
+        ("början", word_at(text.len() / 50)),
+        ("25 %", word_at(text.len() / 4)),
+        ("mitten", word_at(text.len() / 2)),
+        ("75 %", word_at(text.len() * 3 / 4)),
+        ("slutet av brödtexten", word_at(first_def.saturating_sub(3000))),
+    ];
+    if let Some(t) = text[text.len() / 2..].find("\n| ") {
+        places.push(("i tabell", text.len() / 2 + t + 3));
+    }
+    if let Some(r) = text[text.len() * 2 / 5..].find("[^") {
+        places.push(("vid fotnotsreferens", text.len() * 2 / 5 + r));
+    }
+    places.push(("närmast fotnotsdefinitionerna", word_at(first_def.saturating_sub(300))));
+    if first_def < text.len() {
+        places.push(("första fotnotsdefinitionen", word_at(first_def + 10)));
+        places.push(("sista fotnotsdefinitionen", word_at(text.rfind("\n[^").unwrap_or(0) + 10)));
+    }
+    places
+}
+
+/// Ett tecken in och ut om vartannat på ett av ställena i `bench_docx_open` (`KLADD_BENCH_PLACE=1..10`), många gånger
+/// (för profilering: `--toggle-collect='*place_loop*'`). `KLADD_BENCH_TEXT=sträng` skriver den i stället för ett tecken.
+#[test]
+#[ignore]
+fn bench_docx_place() {
+    let Ok(path) = std::env::var("KLADD_BENCH_DOCX") else { return };
+    let n: usize = std::env::var("KLADD_BENCH_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let k: usize = std::env::var("KLADD_BENCH_PLACE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ins = std::env::var("KLADD_BENCH_TEXT").unwrap_or_else(|_| "x".into());
+    let bytes = std::fs::read(&path).unwrap();
+    let mut text = crate::docx::read(&bytes).unwrap().markdown;
+    // `KLADD_BENCH_PRE=text`: ett stycke med den texten först i dokumentet (efter grundformatsraden), t.ex. ett kodstaket
+    // mitt i en rad eller en referenslänk, som påverkar om analysen kan göras inkrementellt.
+    if let Ok(pre) = std::env::var("KLADD_BENCH_PRE") {
+        let at = text.find("\n\n").map_or(0, |i| i + 2);
+        text.insert_str(at, &format!("{pre}\n\n"));
+    }
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    in_ui(&ctx, || {});
+    let mut c = layout::Cache::default();
+    in_ui(&ctx, || {
+        frame(&mut c, &ctx, &text, 0..0);
+        // `KLADD_BENCH_FIND=text`: skriv efter första förekomsten av texten i stället för på ett av ställena.
+        let (name, at) = match std::env::var("KLADD_BENCH_FIND").ok().and_then(|f| text.find(&f).map(|i| i + f.len())) {
+            Some(at) => ("KLADD_BENCH_FIND", at),
+            None => places(&text)[k - 1],
+        };
+        let mut e = text.clone();
+        e.insert_str(at, &ins);
+        // En ändring och tillbaka först: förekomsterna för den inkrementella analysen (`incr::Facts`) räknas en gång för
+        // hela texten efter en full analys, det hör inte till tangenttrycken.
+        frame(&mut c, &ctx, &e, 0..0);
+        frame(&mut c, &ctx, &text, 0..0);
+        let mut times = Vec::new();
+        place_loop(&mut c, &ctx, &text, &e, n, &mut times);
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let st = c.stats(1);
+        eprintln!(
+            "ställe {k} ({name}), {n} gånger: median {:.2} ms, bästa {:.2} ms | återupptagen {} ({}) | plan {:.1} loop {:.1} concat {:.1} sidor {:.1} ms",
+            times[times.len() / 2],
+            times[0],
+            st.resumed,
+            st.resume_why,
+            st.plan_ms,
+            st.loop_ms,
+            st.concat_ms,
+            st.pages_ms
+        );
+    });
+}
+
+#[inline(never)]
+fn place_loop(c: &mut layout::Cache, ctx: &egui::Context, text: &str, edited: &str, n: usize, times: &mut Vec<f64>) {
+    for k in 0..n {
+        let t = Instant::now();
+        frame(c, ctx, if k % 2 == 0 { edited } else { text }, 0..0);
+        times.push(ms(t));
+    }
 }
 
 /// Bara tangenttryck i mitten av ett stort Word-dokument, många gånger (för profilering med `valgrind --tool=callgrind`):

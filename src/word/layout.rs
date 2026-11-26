@@ -165,6 +165,10 @@ pub struct LayoutStats {
     pub resumed: bool,
     /// Varför det inte gick att återuppta (0 = ingen anledning; `resume::Fast::start` och `finish_fast`); för mätning.
     pub resume_why: usize,
+    /// Grupper som togs från förra varvet förskjutna i y (`resume::Fast::splice_shifted`).
+    pub shifted: usize,
+    /// Platshållare som gjordes i det här varvet (`stubs` räknar också dem som togs från förra varvet).
+    pub stubs_made: usize,
 }
 
 /// Markup-analysen av en text, gjord utanför gränssnittstråden (inläsningen av ett stort Word-dokument), så att den
@@ -186,6 +190,63 @@ impl Prepared {
     }
 }
 
+/// Stämplar för texten i ett `DocState`: unika i hela programmet och nya vid varje ändring (se `Seen`).
+static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_stamp() -> u64 {
+    STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Extra kontroller i debugbyggen som kostar en genomgång av hela dokumentet (t.ex. att texten med en `Seen` verkligen är
+/// cachens). Mätningarna (`bench`) slår av dem för att mäta som i ett optimerat bygge.
+#[cfg(debug_assertions)]
+pub static CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// En text som cachen redan har jämfört med sin kopia (`Cache::seen`). Så länge den lånas kan texten inte ändras, så anrop
+/// med den i stället för `&str` behöver inte jämföra hela texten igen (en `memcmp` av hela dokumentet per anrop, flera
+/// gånger per bildruta): stämpeln räcker. I debugbyggen jämförs ändå.
+#[derive(Clone, Copy)]
+pub struct Seen<'t> {
+    text: &'t str,
+    stamp: u64,
+}
+
+impl<'t> Seen<'t> {
+    pub fn text(&self) -> &'t str {
+        self.text
+    }
+}
+
+/// Texten som `Cache`:s metoder tar: en vanlig sträng (jämförs med cachens kopia) eller en `Seen`.
+pub trait DocText {
+    fn as_text(&self) -> &str;
+    /// Stämpeln från `Cache::seen` (0 = ingen).
+    fn stamp(&self) -> u64 {
+        0
+    }
+}
+
+impl DocText for str {
+    fn as_text(&self) -> &str {
+        self
+    }
+}
+
+impl DocText for String {
+    fn as_text(&self) -> &str {
+        self
+    }
+}
+
+impl DocText for Seen<'_> {
+    fn as_text(&self) -> &str {
+        self.text
+    }
+    fn stamp(&self) -> u64 {
+        self.stamp
+    }
+}
+
 /// Allt som cachas för ett dokument.
 struct DocState {
     stats: LayoutStats,
@@ -195,6 +256,8 @@ struct DocState {
     text: String,
     /// Räknas upp varje gång texten ändrats.
     rev: u64,
+    /// Ny (unik) varje gång texten ändrats, för `Seen`.
+    stamp: u64,
     analysis: Arc<Analysis>,
     tables: Option<Arc<Vec<Table>>>,
     images: Option<Arc<Vec<markup::ImageRef>>>,
@@ -215,6 +278,8 @@ struct DocState {
     /// Minnet gäller `text` (som då inte kopieras till `memo_text`): sant efter en omläggning tills texten ändras.
     memo_same: bool,
     hull: Option<(usize, usize)>,
+    /// Antal inkrementella ändringar som `hull` är sammansatt av sedan förra omläggningen.
+    hull_n: usize,
     /// Förekomster i texten som gör att en ändring kan påverka hela analysen (`incr::Facts`), om kända.
     facts: Option<super::incr::Facts>,
     /// Fotnotsreferenser eller -definitioner har ändrats sedan `memo` byggdes.
@@ -234,6 +299,9 @@ struct DocState {
     code: Option<Arc<Vec<codeblock::Block>>>,
     /// Förra utläggningsvarvet, för att kunna återuppta nästa (`resume`).
     trace: Option<resume::Trace>,
+    /// Stegvis utläggning pågår: platshållarnas kalibrering och det ofullständiga galleriet (för att återuppta nästa varv).
+    stubs: Option<lazy::Stubs>,
+    partial_galley: Option<Arc<Galley>>,
 }
 
 #[derive(Default)]
@@ -247,6 +315,7 @@ impl DocState {
         DocState {
             text: text.to_owned(),
             rev: 0,
+            stamp: next_stamp(),
             stats: LayoutStats::default(),
             partial: false,
             analysis: Arc::new(analysis),
@@ -262,6 +331,7 @@ impl DocState {
             memo_text: String::new(),
             memo_same: false,
             hull: None,
+            hull_n: 0,
             facts: None,
             notes_changed: false,
             toc_delta: 0,
@@ -272,6 +342,8 @@ impl DocState {
             notes: Arc::default(),
             code: None,
             trace: None,
+            stubs: None,
+            partial_galley: None,
         }
     }
 
@@ -309,11 +381,28 @@ impl Cache {
         }
     }
 
+    /// Jämför texten med cachens kopia en gång (och uppdaterar analysen om den ändrats); anropen med den `Seen` som ges
+    /// slipper sedan jämförelsen så länge texten lånas.
+    pub fn seen<'t>(&mut self, doc_id: u64, text: &'t str) -> Seen<'t> {
+        let stamp = self.state(doc_id, text).stamp;
+        Seen { text, stamp }
+    }
+
     /// Håller dokumentets tillstånd i takt med texten. En ändring kostar en jämförelse av
     /// texten och en ny analys; är texten oförändrad görs ingenting.
-    fn state(&mut self, doc_id: u64, text: &str) -> &mut DocState {
+    fn state<T: DocText + ?Sized>(&mut self, doc_id: u64, src: &T) -> &mut DocState {
+        let text = src.as_text();
         let st = self.docs.entry(doc_id).or_insert_with(|| DocState::new(text, markup::analyze(text)));
+        let stamp = src.stamp();
+        if stamp != 0 && stamp == st.stamp {
+            #[cfg(debug_assertions)]
+            if CHECKS.load(std::sync::atomic::Ordering::Relaxed) {
+                assert!(st.text == text, "Seen med en annan text än cachens");
+            }
+            return st;
+        }
         if st.text != text {
+            st.stamp = next_stamp();
             // Stora dokument: tolka bara om stycket med ändringen (samma resultat som `analyze`) och
             // behåll tabeller, bilder och typsnitt som ändringen inte rört.
             let t_an = std::time::Instant::now();
@@ -322,6 +411,9 @@ impl Cache {
                 None => None,
             };
             let incr = delta.is_some();
+            // Styckenas utseende (`<!--k:pp …-->`) kan läsas om bara i fönstret om markörerna där slutar på sin rad (se
+            // `pspecs_patch`); det avgörs på den gamla texten innan den byts.
+            let pp_old_ok = delta.as_ref().is_some_and(|d| pspecs_local(&st.text[d.ws..d.we_old]));
             // Den gamla texten behövs för minnet (`memo`): byt buffert i stället för att kopiera den efter varje omläggning.
             if std::mem::take(&mut st.memo_same) {
                 std::mem::swap(&mut st.memo_text, &mut st.text);
@@ -332,6 +424,7 @@ impl Cache {
             match delta {
                 Some(d) => {
                     st.hull = Some(memo::compose_hull(st.hull, d.ws, d.we_old, d.we_new));
+                    st.hull_n += 1;
                     st.notes_changed |= d.notes_changed;
                     st.toc_delta += d.toc_delta;
                     // Tabellerna efter fönstret flyttas med texten (de före är oförändrade); rör fönstret en tabell, eller
@@ -368,10 +461,13 @@ impl Cache {
                     if st.fonts.as_ref().is_some_and(|f| !d.fonts.is_subset(f)) {
                         st.fonts = None;
                     }
+                    st.pspecs = st.pspecs.take().and_then(|ps| if pp_old_ok { pspecs_patch(ps, text, &d) } else { None });
+                    st.headings = st.headings.take().and_then(|h| headings_patch(h, text, &st.analysis, &d));
                 }
                 None => {
                     st.memo = None;
                     st.hull = None;
+                    st.hull_n = 0;
                     st.facts = None;
                     st.analysis = Arc::new(markup::analyze(text));
                     st.tables = None;
@@ -379,10 +475,10 @@ impl Cache {
                     st.image_keys = None;
                     st.code = None;
                     st.fonts = None;
+                    st.pspecs = None;
+                    st.headings = None;
                 }
             }
-            st.headings = None;
-            st.pspecs = None;
             if crate::timing::enabled() {
                 crate::timing::mark(&format!("analys efter ändring: {:.1} ms ({})", t_an.elapsed().as_secs_f64() * 1000.0, if incr { "inkrementell" } else { "full" }));
             }
@@ -437,39 +533,39 @@ impl Cache {
     }
 
     /// Revisionsnummer: ändras exakt när texten ändrats sedan förra anropet.
-    pub fn rev(&mut self, doc_id: u64, text: &str) -> u64 {
+    pub fn rev<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> u64 {
         self.state(doc_id, text).rev
     }
 
     /// Arken från senaste omläggningen av `text` (tom om den inte gjorts med sidbrytning).
-    pub fn page_boxes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::secpages::PageBox>> {
+    pub fn page_boxes<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Vec<super::secpages::PageBox>> {
         self.state(doc_id, text).page_boxes.clone()
     }
 
     /// Fotnoterna från senaste omläggningen av `text`: `PageBox::notes` pekar in i listan.
-    pub fn notes(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::fnotes::NoteLayout>> {
+    pub fn notes<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Vec<super::fnotes::NoteLayout>> {
         self.state(doc_id, text).notes.clone()
     }
 
     /// Dokumentets inhägnade kodblock (färgningen läggs till när syntaxerna är inlästa).
-    pub fn code_blocks(&mut self, doc_id: u64, text: &str) -> Arc<Vec<codeblock::Block>> {
+    pub fn code_blocks<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Vec<codeblock::Block>> {
         self.state(doc_id, text).code_blocks()
     }
 
-    pub fn analysis(&mut self, doc_id: u64, text: &str) -> Arc<Analysis> {
+    pub fn analysis<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Analysis> {
         self.state(doc_id, text).analysis.clone()
     }
 
     /// Dokumentets tabeller (räknas om bara när texten ändrats).
-    pub fn tables(&mut self, doc_id: u64, text: &str) -> Arc<Vec<Table>> {
+    pub fn tables<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Vec<Table>> {
         self.state(doc_id, text).tables()
     }
 
     /// Tabellernas rutnät från senaste utläggningen av `text` och galleriet som visas, om
     /// utläggningen gjordes för just den här texten (annars `None`).
-    pub fn table_view(&mut self, doc_id: u64, text: &str) -> Option<(Arc<Galley>, Arc<Vec<TableGeom>>)> {
+    pub fn table_view<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Option<(Arc<Galley>, Arc<Vec<TableGeom>>)> {
         let st = self.docs.get(&doc_id)?;
-        if st.text != text {
+        if (text.stamp() == 0 || text.stamp() != st.stamp) && st.text != text.as_text() {
             return None;
         }
         let (_, g) = st.frame.as_ref()?;
@@ -477,20 +573,20 @@ impl Cache {
     }
 
     /// Bilderna i ordning (räknas om bara när texten ändrats).
-    pub fn images(&mut self, doc_id: u64, text: &str) -> Arc<Vec<markup::ImageRef>> {
+    pub fn images<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Vec<markup::ImageRef>> {
         self.state(doc_id, text).images()
     }
 
     /// Sidan (och radnumret i galleriet som bilden är förankrad vid) om bilden som börjar vid
     /// `byte` flyter i den senaste utläggningen. Bilder som inte får plats bredvid texten är
     /// vanliga bilder (`None`).
-    pub fn float_side(&mut self, doc_id: u64, text: &str, byte: usize) -> Option<(Float, usize)> {
+    pub fn float_side<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T, byte: usize) -> Option<(Float, usize)> {
         let st = self.state(doc_id, text);
         st.float_starts.iter().find(|f| f.0 == byte).map(|f| (f.1, f.2))
     }
 
     /// Stycken med styckeutseende och deras rutor (räknas om bara när texten ändrats).
-    pub fn para_boxes(&mut self, doc_id: u64, text: &str) -> Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)> {
+    pub fn para_boxes<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)> {
         let st = self.state(doc_id, text);
         let t = &st.text;
         st.pspecs
@@ -503,14 +599,14 @@ impl Cache {
     }
 
     /// Rubrikerna i ordning (räknas om bara när texten ändrats).
-    pub fn headings(&mut self, doc_id: u64, text: &str) -> Arc<Vec<super::nav::Heading>> {
+    pub fn headings<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<Vec<super::nav::Heading>> {
         let st = self.state(doc_id, text);
         let (t, a) = (&st.text, &st.analysis);
         st.headings.get_or_insert_with(|| Arc::new(super::nav::headings(t, a))).clone()
     }
 
     /// Typsnitten dokumentet använder (räknas om bara när texten ändrats).
-    pub fn fonts(&mut self, doc_id: u64, text: &str) -> Arc<BTreeSet<(String, bool, bool)>> {
+    pub fn fonts<T: DocText + ?Sized>(&mut self, doc_id: u64, text: &T) -> Arc<BTreeSet<(String, bool, bool)>> {
         let st = self.state(doc_id, text);
         let a = &st.analysis;
         st.fonts.get_or_insert_with(|| Arc::new(needed_fonts(a))).clone()
@@ -529,7 +625,7 @@ impl Cache {
     }
 
     /// Hela dokumentets galleri, utlagt stycke för stycke (justering, hängande indrag).
-    pub fn galley(&mut self, ctx: &egui::Context, doc_id: u64, text: &str, p: &Params, wrap_width: f32) -> Arc<Galley> {
+    pub fn galley<T: DocText + ?Sized>(&mut self, ctx: &egui::Context, doc_id: u64, text: &T, p: &Params, wrap_width: f32) -> Arc<Galley> {
         self.galley_paged(ctx, doc_id, text, p, wrap_width, None)
     }
 
@@ -538,11 +634,11 @@ impl Cache {
     /// Oförändrad bildruta: en jämförelse av texten och en hash av parametrarna. Efter en
     /// ändring läggs bara de stycken ut som ändrats (eller vars parametrar ändrats); övriga
     /// hämtas ur styckecachen. Sedan fogas styckena ihop och sidbryts.
-    pub fn galley_paged(
+    pub fn galley_paged<T: DocText + ?Sized>(
         &mut self,
         ctx: &egui::Context,
         doc_id: u64,
-        text: &str,
+        text: &T,
         p: &Params,
         wrap_width: f32,
         pages: Option<&super::pages::Geom>,
@@ -555,20 +651,21 @@ impl Cache {
     /// dokumentet av platshållare och `partial` blir sant. Anropa igen nästa bildruta tills det är
     /// klart; då är galleriet detsamma som utan budget. Med `None` läggs allt ut direkt.
     #[allow(clippy::too_many_arguments)]
-    pub fn galley_paged_lazy(
+    pub fn galley_paged_lazy<T: DocText + ?Sized>(
         &mut self,
         ctx: &egui::Context,
         doc_id: u64,
-        text: &str,
+        src: &T,
         p: &Params,
         wrap_width: f32,
         pages: Option<&super::pages::Geom>,
         budget: Option<std::time::Duration>,
     ) -> Arc<Galley> {
+        let text = src.as_text();
         let ppp = ctx.pixels_per_point();
         // En nyregistrerad familj bygger om typsnittsatlasen: gamla galleri kan bli ogiltiga.
         let families = ctx.fonts(|f| f.families().len());
-        let st = self.state(doc_id, text);
+        let st = self.state(doc_id, src);
 
         // Parametrar som gäller alla stycken.
         let mut e = Fx::default();
@@ -600,8 +697,9 @@ impl Cache {
         }
 
         let g = Arc::new(relayout(st, ctx, text, p, wrap_width, ppp, env, pages, budget));
-        // Ett ofullständigt galleri cachas inte: nästa bildruta lägger ut mer.
+        // Ett ofullständigt galleri cachas inte: nästa bildruta lägger ut mer (och återupptar varvet från det).
         st.frame = if st.partial { None } else { Some((key, g.clone())) };
+        st.partial_galley = st.partial.then(|| g.clone());
         g
     }
 
@@ -633,6 +731,61 @@ impl Cache {
             self.forget(doc_id);
         }
     }
+}
+
+/// Slutar varje styckemarkör (`<!--k:pp …-->`) i fönstret på sin egen rad? Då läser `pbox::scan` fönstret likadant för
+/// sig som i hela texten (annars kan en markör sträcka sig över flera rader och fönstrets kant).
+fn pspecs_local(w: &str) -> bool {
+    w.match_indices(pbox::MARK).all(|(i, _)| w[i..].split('\n').next().is_some_and(|l| l.contains("-->")))
+}
+
+/// Styckenas utseende efter en inkrementell ändring (`incr::Delta`): markörerna i fönstret läses om, de före behålls
+/// och de efter flyttas; rutorna (`box_runs`) görs om. Fönstret ska ha tomma rader runt sig (så att inget stycke går över
+/// kanten) och markörerna i det sluta på sin rad, annars `None` (allt läses om när det behövs).
+fn pspecs_patch(ps: Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)>, text: &str, d: &super::incr::Delta) -> Option<Arc<(Vec<pbox::ParaSpec>, Vec<pbox::BoxRun>)>> {
+    let (ws, we_old, we_new) = (d.ws, d.we_old, d.we_new);
+    let blank_before = ws == 0 || text[..ws].ends_with("\n\n");
+    let blank_after = we_new >= text.len() || text[we_new..].starts_with('\n');
+    let win = text.get(ws..we_new)?;
+    if !blank_before || !blank_after || !pspecs_local(win) {
+        return None;
+    }
+    let (specs, _) = Arc::try_unwrap(ps).unwrap_or_else(|a| (*a).clone());
+    let dd = we_new as isize - we_old as isize;
+    let i0 = specs.partition_point(|s| s.range.start < ws);
+    let i1 = specs.partition_point(|s| s.range.start < we_old);
+    let mut out = specs;
+    let tail: Vec<pbox::ParaSpec> = out.split_off(i1);
+    out.truncate(i0);
+    out.extend(pbox::scan(win).into_iter().map(|s| pbox::ParaSpec { range: s.range.start + ws..s.range.end + ws, ..s }));
+    out.extend(tail.into_iter().map(|s| pbox::ParaSpec { range: (s.range.start as isize + dd) as usize..(s.range.end as isize + dd) as usize, ..s }));
+    let runs = pbox::box_runs(text, &out);
+    Some(Arc::new((out, runs)))
+}
+
+/// Rubrikerna efter en inkrementell ändring: de i fönstret hämtas ur de nya bitarna, de före behålls och de efter flyttas.
+/// Fönstret ska ha tomma rader runt sig (ingen rubrik går över kanten), annars `None` (alla räknas om när de behövs).
+fn headings_patch(old: Arc<Vec<super::nav::Heading>>, text: &str, a: &Analysis, d: &super::incr::Delta) -> Option<Arc<Vec<super::nav::Heading>>> {
+    let (ws, we_old, we_new) = (d.ws, d.we_old, d.we_new);
+    let blank_before = ws == 0 || text[..ws].ends_with("\n\n");
+    let blank_after = we_new >= text.len() || text[we_new..].starts_with('\n');
+    if !blank_before || !blank_after {
+        return None;
+    }
+    let mut v = Arc::try_unwrap(old).unwrap_or_else(|a| (*a).clone());
+    let dd = we_new as isize - we_old as isize;
+    let i0 = v.partition_point(|h| h.start < ws);
+    let i1 = v.partition_point(|h| h.start < we_old);
+    let mut tail = v.split_off(i1);
+    v.truncate(i0);
+    let p0 = a.pieces.partition_point(|pc| pc.range.end <= ws);
+    let p1 = a.pieces.partition_point(|pc| pc.range.start < we_new);
+    v.extend(super::nav::headings_in(text, &a.pieces[p0..p1.max(p0)]));
+    for h in &mut tail {
+        h.start = (h.start as isize + dd) as usize;
+    }
+    v.extend(tail);
+    Some(Arc::new(v))
 }
 
 /// Hashar det som påverkar hur ett fönster av texten ser ut efter layout: texten, styckenas
@@ -800,7 +953,7 @@ fn relayout(
     let prep = match st.memo.take() {
         Some(m) if !st.notes_changed => {
             let old_text = if st.memo_same { text } else { st.memo_text.as_str() };
-            memo::reuse(m, old_text, st.hull, st.rev, text, &a, p, sig, &grid, &cb, Some(st.toc_delta))
+            memo::reuse(m, old_text, st.hull, st.rev, text, &a, p, sig, &grid, &cb, Some(st.toc_delta), st.hull_n > 1)
         }
         Some(_) => None,
         None => None,
@@ -817,6 +970,7 @@ fn relayout(
     let g = relayout_inner(st, ctx, text, p, wrap_width, ppp, env, pages, budget, &prep, sig);
     st.memo_same = true;
     st.hull = None;
+    st.hull_n = 0;
     st.notes_changed = false;
     st.toc_delta = 0;
     if crate::timing::enabled() {
@@ -939,17 +1093,26 @@ fn relayout_pass(
     // Stegvis utläggning: när tiden för utlagda (inte cachade) stycken överstiger budgeten, och all övrig
     // tid i varvet, ersätts stycken som saknas i cachen av platshållare.
     let mut lazy = false;
-    let mut stubs = lazy::Stubs::default();
+    // Platshållarnas kalibrering följer med mellan bildrutorna under stegvis utläggning (fryst, se `Stubs::freeze`), så att
+    // ett varv bara behöver lägga ut de nya grupperna och tar platshållarna för resten från förra varvet.
+    let mut stubs = if budget.is_some() { st.stubs.take().unwrap_or_default() } else { lazy::Stubs::default() };
+    stubs.freeze();
+    let mut stub_from = groups.len();
+    let mut stub_key = 0u64;
     let mut def_i = 0;
     // Återupptaget varv (`resume`): förra varvets tillstånd och listor fram till den första ändrade gruppen, och sträckor
     // av oförändrade grupper som tas från förra varvet när tillståndet före dem är detsamma som då.
     let resumable = balance.is_empty() && !unequal;
     let psig = resume::pass_sig(sig, wrap_width, ppp, multi);
     let mut rec = resume::Rec::with_capacity(groups.len(), sim.is_some());
-    let mut fast = if resumable { resume::Fast::start(st, prep, psig, &mut out, &mut rec) } else { None };
+    let mut fast = if resumable { resume::Fast::start(st, prep, psig, &mut out, &mut rec, stubs.key()) } else { None };
     st.trace = None;
-    // Utan budget i ett återupptaget varv: bara de ändrade grupperna läggs ut.
-    let budget = if fast.is_some() { None } else { budget };
+    // Utan budget i ett återupptaget varv efter ett komplett: bara de ändrade grupperna läggs ut. Fanns platshållare
+    // fortsätter den stegvisa utläggningen där förra varvet slutade.
+    let budget = match &fast {
+        Some(f) if f.stub_from >= f.n_old => None,
+        _ => budget,
+    };
     let mut gi = 0;
     let mut replaced_done = 0usize;
     let mut fresh_keys: Vec<u64> = Vec::new();
@@ -968,10 +1131,11 @@ fn relayout_pass(
     while gi < groups.len() {
         let mut give_up = false;
         if let Some(f) = fast.as_mut() {
-            if let Some(gj) = f.old_of(prep, gi).filter(|&gj| gj >= replaced_done) {
+            if let Some(gj) = f.old_of(prep, gi, lazy).filter(|&gj| gj >= replaced_done) {
                 if f.matches(gj, y, sim.as_ref(), &active, boxst.as_ref(), row_no) {
                     misses_in_row = 0;
-                    let len = f.run_len(prep, gi, gj);
+                    let len = f.run_len(prep, gi, gj, lazy);
+                    st.stats.stubs += f.stubs_in(gj, len);
                     f.replaced_upto(gj, &mut replaced_done);
                     let db = groups[gi].1.start as isize - f.old.rec.wstart[gj] as isize;
                     row_no = f.splice(&mut out, &mut rec, gi, gj, len, row_no, db, multi);
@@ -981,8 +1145,24 @@ fn relayout_pass(
                     gi += len;
                     continue;
                 }
+                // Samma grupper men ett annat läge (en grupp före har fått annan höjd): grupper som inte beror på sitt
+                // läge tas från förra varvet, och bara lägena räknas om (`splice_shifted`).
+                let plain_state = active.is_empty() && boxst.is_none();
+                let len = if plain_state { f.plain_len(prep, gi, gj, lazy) } else { 0 };
+                if len > 0 {
+                    misses_in_row = 0;
+                    st.stats.stubs += f.stubs_in(gj, len);
+                    f.replaced_upto(gj, &mut replaced_done);
+                    let db = groups[gi].1.start as isize - f.old.rec.wstart[gj] as isize;
+                    row_no = f.splice_shifted(&mut out, &mut rec, gi, gj, len, row_no, db, multi, &mut y, &mut sim);
+                    replaced_done = gj + len;
+                    st.stats.hits += len;
+                    st.stats.shifted += len;
+                    gi += len;
+                    continue;
+                }
                 misses_in_row += 1;
-                give_up = misses_in_row > 64;
+                give_up = misses_in_row > resume::give_up_after();
             }
         }
         if give_up {
@@ -993,9 +1173,11 @@ fn relayout_pass(
             }
         }
         let (pr, w, tbl) = &groups[gi];
+        let plain_before = active.is_empty() && boxst.is_none();
         rec.state(gi, y, sim.as_ref(), &active, boxst.as_ref(), row_no, out.counts());
         rec.begin(w.start);
         let mut used_key: u64;
+        let mut made_stub = false;
         if let (false, Some(b)) = (lazy, budget) {
             let spent = st.stats.miss_ms;
             let other = t0.elapsed().as_secs_f64() * 1000.0 - spent;
@@ -1003,6 +1185,8 @@ fn relayout_pass(
                 lazy = true;
                 st.stats.lazy_row = Some(row_no);
                 st.stats.lazy_byte = w.start;
+                stub_from = gi;
+                stub_key = stubs.key();
             }
         }
         // Stycken i ett avsnitt läggs ut med avsnittets spaltbredd.
@@ -1108,6 +1292,8 @@ fn relayout_pass(
         } else if let Some(gs) = lazy.then(|| gp.iter().enumerate().map(|(k, q)| stubs.para(q, text, wrap_width, &a, p, ppp, table, k)).collect::<Option<Vec<_>>>()).flatten() {
             // Platshållare (ingen cachepost): rätt antal rader med uppskattad höjd.
             st.stats.stubs += 1;
+            st.stats.stubs_made += 1;
+            made_stub = true;
             (Arc::new(gs), None)
         } else {
             st.stats.misses += 1;
@@ -1206,6 +1392,7 @@ fn relayout_pass(
                 r += lg.rows.len();
             }
         }
+        let anchor_none = anchor.is_none();
         if let Some((f, pl)) = anchor {
             // Sidbrytningen räknar bilden som en rad av dess höjd (om den ligger vid stycket).
             if pl.side.is_some() && (f.anchor.is_none() || (pl.para_rel && pl.top > -0.5)) {
@@ -1286,6 +1473,14 @@ fn relayout_pass(
         if let Some(k) = rec.key.last_mut() {
             *k = used_key;
         }
+        if let Some(sb) = rec.stub.last_mut() {
+            *sb = made_stub;
+        }
+        if let Some(pl) = rec.plain.last_mut() {
+            // En bild i stycket kan bero på var på sidan det står, även om den inte blir flytande.
+            let no_float = table || paras[pr.start].float.is_none();
+            *pl = plain_before && no_float && anchor_none && !opened && !closing && !in_box && active.is_empty() && boxst.is_none();
+        }
         if fast.is_some() {
             fresh_keys.push(used_key);
         }
@@ -1296,8 +1491,9 @@ fn relayout_pass(
         // Bara de ersatta gruppernas poster släpps (resten av styckecachen har inte gåtts igenom).
         let n_old = f.old.rec.key.len();
         f.replaced_upto(n_old, &mut replaced_done);
+        let fresh: std::collections::HashSet<u64, IdBuild> = fresh_keys.iter().copied().collect();
         for k in &f.replaced {
-            if !fresh_keys.contains(k) {
+            if !fresh.contains(k) {
                 st.units.remove(k);
             }
         }
@@ -1318,6 +1514,7 @@ fn relayout_pass(
     }
     st.stats.loop_ms += t1.elapsed().as_secs_f64() * 1000.0;
     st.partial = lazy;
+    st.stubs = lazy.then_some(stubs);
     let t2 = std::time::Instant::now();
 
     // Texten fylls i när galleriet byggs (ett återupptaget varv återanvänder det gamla galleriets buffert).
@@ -1328,9 +1525,10 @@ fn relayout_pass(
         byte_range: ByteIndex(0)..ByteIndex(text.len()),
         format: TextFormat::default(),
     });
-    let single = !multi && !lazy;
-    // Återupptagen sammanfogning och sidindelning (ett avsnitt med sidor): bara de ändrade sidorna.
-    let old_frame = st.frame.take();
+    let single = !multi;
+    // Återupptagen sammanfogning och sidindelning (ett avsnitt med sidor): bara de ändrade sidorna. Under stegvis
+    // utläggning cachas inte galleriet som bildrutans (`frame`), men det sparas för att kunna återuppta nästa varv.
+    let old_frame = st.frame.take().or_else(|| st.partial_galley.take().map(|g| (0, g)));
     if let (Some(f), Some(geom), true) = (fast.as_mut(), pages, single) {
         match resume::finish_fast(f, &out, &rec, groups, text, &a, p.zoom, geom, ppp, wrap_width, job, old_frame) {
             Ok((g, pt, touched)) => {
@@ -1361,7 +1559,7 @@ fn relayout_pass(
                 st.geoms = Arc::new(std::mem::take(&mut out.geoms));
                 st.notes = Arc::new(std::mem::take(&mut out.notes));
                 st.float_starts = std::mem::take(&mut out.starts);
-                st.trace = Some(resume::Trace { sig: psig, rev: st.rev, rec, out, page: Some(pt) });
+                st.trace = Some(resume::Trace { sig: psig, rev: st.rev, rec, out, page: Some(pt), stub_from, stub_key });
                 return (g, csim.runs);
             }
             Err((j, why)) => {
@@ -1376,6 +1574,7 @@ fn relayout_pass(
     let mut g_rect: Vec<Rect> = Vec::with_capacity(n + 1);
     let mut g_chars: Vec<usize> = Vec::with_capacity(n + 1);
     let (mut g_nv, mut g_ni, mut g_el): (Vec<u32>, Vec<u32>, Vec<bool>) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut g_x: Vec<[f32; 2]> = Vec::with_capacity(n);
     let mut rect = Rect::ZERO;
     let mut mesh = Rect::NOTHING;
     let (mut nv, mut ni, mut elided, mut chars) = (0usize, 0usize, false, 0usize);
@@ -1383,8 +1582,9 @@ fn relayout_pass(
         let r0 = rows.len();
         g_rect.push(rect);
         g_chars.push(chars);
-        let (r, v, i, e) = resume::concat_group(&out.all[rec.gall[gi]..rec.gall[gi + 1]], rect, ppp, gi + 1 == n, &mut rows);
+        let (r, v, i, e, x) = resume::concat_group(&out.all[rec.gall[gi]..rec.gall[gi + 1]], rect, ppp, gi + 1 == n, &mut rows);
         rect = r;
+        g_x.push(x);
         g_nv.push(v as u32);
         g_ni.push(i as u32);
         g_el.push(e);
@@ -1422,7 +1622,9 @@ fn relayout_pass(
                 g.rows.len(),
             )
         }
-        _ => super::fnotes::NoteSpec::default(),
+        // Utan fotnoter: samma luft och tak som med (de används inte då), så att ett återupptaget varv känner igen dem.
+        Some(geom) => super::fnotes::NoteSpec { sep: px(p.zoom, 9.0), cap: geom.text_h() * 0.5, ..Default::default() },
+        None => super::fnotes::NoteSpec::default(),
     };
     let mut page_trace = None;
     match pages {
@@ -1457,7 +1659,7 @@ fn relayout_pass(
                 b.reserved = n.reserved;
             }
             st.page_boxes = Arc::new(boxes);
-            if !lazy {
+            {
                 page_trace = Some(resume::PageTrace {
                     rect: g_rect,
                     chars: g_chars,
@@ -1466,6 +1668,7 @@ fn relayout_pass(
                     nv: g_nv,
                     ni: g_ni,
                     elided: g_el,
+                    xr: g_x,
                     snaps,
                     pout: pn,
                     end: (pb, fb),
@@ -1474,7 +1677,7 @@ fn relayout_pass(
                     sums: Vec::new(),
                 });
                 if let Some(pt) = page_trace.as_mut() {
-                    pt.sums = resume::sums_of(&pt.nv, &pt.ni, &pt.elided, &pt.fmesh, &pt.urect);
+                    pt.sums = resume::sums_of(&pt.nv, &pt.ni, &pt.elided, &pt.fmesh, &pt.urect, &pt.xr);
                 }
             }
         }
@@ -1484,8 +1687,8 @@ fn relayout_pass(
     st.notes = Arc::new(std::mem::take(&mut out.notes));
     st.float_starts = std::mem::take(&mut out.starts);
     st.stats.pages_ms += t3.elapsed().as_secs_f64() * 1000.0;
-    if resumable && !lazy {
-        st.trace = Some(resume::Trace { sig: psig, rev: st.rev, rec, out, page: page_trace });
+    if resumable {
+        st.trace = Some(resume::Trace { sig: psig, rev: st.rev, rec, out, page: page_trace, stub_from, stub_key });
     }
     (g, csim.runs)
 }
@@ -2427,6 +2630,13 @@ fn paragraphs(text: &str, a: &Analysis, p: &Params) -> Vec<Para> {
 /// fönstret saknas; anroparen (`layout_memo`) lägger kontrollstycken utanför det som används. `cb` är hela textens
 /// kodblock.
 fn paragraphs_in(text: &str, a: &Analysis, p: &Params, win: Option<Range<usize>>, cb: &[codeblock::Block]) -> Vec<Para> {
+    paragraphs_toc(text, a, p, win, cb, &[])
+}
+
+/// Som `paragraphs_in`, med kända höjder för innehållsförteckningar (radens text, höjd) från förra omläggningen
+/// (`layout_memo`, när rubrikerna som kan komma med är desamma): annars kostar en förteckning i fönstret en genomgång
+/// av alla rubriker i dokumentet.
+fn paragraphs_toc(text: &str, a: &Analysis, p: &Params, win: Option<Range<usize>>, cb: &[codeblock::Block], toc_known: &[(String, f32)]) -> Vec<Para> {
     let (mut s, win_end, doc_start) = match &win {
         Some(w) => (w.start, w.end, w.start == 0),
         None => (0, usize::MAX, true),
@@ -2536,6 +2746,7 @@ fn paragraphs_in(text: &str, a: &Analysis, p: &Params, win: Option<Range<usize>>
         }
         let collapse = tag.last() != Some(&0) || float.is_some_and(|f| f.alone);
         let toc = match super::nav::parse_toc(t).filter(|_| tag.last() != Some(&0)) {
+            Some(_) if toc_known.iter().any(|k| k.0 == t) => toc_known.iter().find(|k| k.0 == t).map(|k| k.1),
             Some(spec) => {
                 let heads = toc_heads.get_or_insert_with(|| super::nav::headings(text, a));
                 let n = super::nav::toc_items(text, heads, &spec).len();

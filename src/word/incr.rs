@@ -42,39 +42,75 @@ pub struct Delta {
     pub toc_delta: isize,
 }
 
-/// Förekomster i hela texten av det som gör att en ändring var som helst kan ändra tolkningen av resten (tre tilda,
+/// Förekomster i hela texten av det som gör att en ändring var som helst kan ändra tolkningen av resten (kodstaket,
 /// referenslänkar och oavslutade HTML-kommentarer). De räknas per rad, så att en ändring bara behöver räkna om fönstret
-/// (`Facts::minus`/`plus`) i stället för att söka igenom hela texten vid varje tangent.
+/// (`Facts::swap`) i stället för att söka igenom hela texten vid varje tangent.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Facts {
-    tildes: usize,
     link_defs: usize,
     open_comments: usize,
-    /// Kodstaket (```) och hur många av dem som står först på en rad.
+    /// Kodstaket (``` eller ~~~) först på en rad, och sådana som kan stå i en lista, ett citat eller ett indrag (där det
+    /// inte går att avgöra lokalt om de är staket). Tre tecken mitt i en rad är inget staket.
     fences: usize,
-    fence_lines: usize,
+    fence_ambig: usize,
+}
+
+/// Vad tre backticks eller tilda vid `i` (i `t`) kan vara.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FenceMark {
+    /// Först på raden (högst tre blanksteg före): ett kodstaket (om det inte är kod i ett annat block).
+    Line,
+    /// Efter bara blanksteg, listtecken eller `>` (eller mer än tre blanksteg): kan vara ett staket i en lista eller ett
+    /// citat, eller kod i ett indrag.
+    Ambiguous,
+    /// Efter annan text på raden: inget staket (en kodbit på raden, eller bara tecken).
+    Inline,
+}
+
+fn fence_mark(t: &str, i: usize) -> FenceMark {
+    let pre = &t[line_start(t.as_bytes(), i)..i];
+    if pre.len() <= 3 && pre.bytes().all(|c| c == b' ') {
+        FenceMark::Line
+    } else if pre.bytes().all(|c| matches!(c, b' ' | b'\t' | b'>' | b'-' | b'*' | b'+' | b'.' | b')' | b'0'..=b'9')) {
+        FenceMark::Ambiguous
+    } else {
+        FenceMark::Inline
+    }
+}
+
+/// Alla ``` och ~~~ i `t` (början), i ordning.
+fn fence_marks(t: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut v: Vec<usize> = t.match_indices("```").map(|(i, _)| i).chain(t.match_indices("~~~").map(|(i, _)| i)).collect();
+    v.sort_unstable();
+    v.into_iter()
 }
 
 impl Facts {
     /// Förekomsterna i `t`, som ska börja och sluta vid en radgräns (hela texten eller ett fönster mellan stycken).
     pub fn of(t: &str) -> Facts {
         let b = t.as_bytes();
+        let (mut fences, mut fence_ambig) = (0, 0);
+        for i in fence_marks(t) {
+            match fence_mark(t, i) {
+                FenceMark::Line => fences += 1,
+                FenceMark::Ambiguous => fence_ambig += 1,
+                FenceMark::Inline => {}
+            }
+        }
         Facts {
-            tildes: t.matches("~~~").count(),
             link_defs: t.match_indices("]:").filter(|(i, _)| !b[line_start(b, *i)..].starts_with(b"[^")).count(),
             open_comments: t.match_indices("<!--").filter(|(i, _)| !t[*i..line_end(b, *i)].contains("-->")).count(),
-            fences: t.matches("```").count(),
-            fence_lines: t.match_indices("```").filter(|(i, _)| t[line_start(b, *i)..*i].len() <= 3 && t[line_start(b, *i)..*i].bytes().all(|c| c == b' ')).count(),
+            fences,
+            fence_ambig,
         }
     }
 
     fn swap(&self, old_win: &Facts, new_win: &Facts) -> Facts {
         Facts {
-            tildes: (self.tildes + new_win.tildes).saturating_sub(old_win.tildes),
             link_defs: (self.link_defs + new_win.link_defs).saturating_sub(old_win.link_defs),
             open_comments: (self.open_comments + new_win.open_comments).saturating_sub(old_win.open_comments),
             fences: (self.fences + new_win.fences).saturating_sub(old_win.fences),
-            fence_lines: (self.fence_lines + new_win.fence_lines).saturating_sub(old_win.fence_lines),
+            fence_ambig: (self.fence_ambig + new_win.fence_ambig).saturating_sub(old_win.fence_ambig),
         }
     }
 }
@@ -351,7 +387,30 @@ fn html_ctx(w: &str) -> bool {
         return false;
     }
     let l = w.to_ascii_lowercase();
-    ["<pre", "<script", "<style", "<textarea", "<?", "<![cdata["].iter().any(|m| l.contains(m))
+    ["<pre", "<script", "<style", "<textarea", "<?", "<![cdata["].iter().any(|m| l.contains(m)) || open_tag(w)
+}
+
+/// Finns en HTML-tagg som inte slutar på sin rad (ett `>` utanför citattecken)? Taggen kan då fortsätta långt efter
+/// fönstret (t.ex. ett citattecken som saknar sin like), vilket fönstret inte ser.
+fn open_tag(w: &str) -> bool {
+    let b = w.as_bytes();
+    w.match_indices('<').any(|(i, _)| {
+        if !b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'/') {
+            return false;
+        }
+        let mut q: Option<u8> = None;
+        for &c in &b[i + 1..] {
+            match (q, c) {
+                (_, b'\n') => return true,
+                (Some(x), c) if c == x => q = None,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => q = Some(c),
+                (None, b'>') => return false,
+                _ => {}
+            }
+        }
+        true
+    })
 }
 
 /// Etiketterna i fotnotsdefinitionerna (`[^etikett]:` först på en rad) i `w`, i ordning.
@@ -380,17 +439,72 @@ fn clip(pieces: &[Piece], from: usize, to: usize) -> Vec<Piece> {
     out
 }
 
-/// Står alla kodstaket (```) i `t[..end]` först på en rad och är de ett jämnt antal (så att `end` ligger utanför ett kodblock)?
-fn fences_before_are_balanced(t: &str, end: usize) -> bool {
-    let mut n = 0;
-    for (i, _) in t[..end].match_indices("```") {
-        let ls = line_start(t.as_bytes(), i);
-        if t[ls..i].len() > 3 || !t[ls..i].bytes().all(|c| c == b' ') {
-            return false;
+/// Ligger `end` (början på en rad) i ett inhägnat kodblock? Staketen före `end` följs som CommonMark gör: ett block
+/// öppnas av ``` eller ~~~ först på en rad (backticks utan backtick i resten av raden) och stängs av en rad med samma tecken,
+/// minst lika många, och inget efter. Förutsätter att inga staket kan stå i en lista eller ett citat (`Facts::fence_ambig`).
+fn in_fenced_block(t: &str, end: usize) -> bool {
+    let b = t.as_bytes();
+    let mut open: Option<(u8, usize)> = None;
+    let mut last_line = usize::MAX;
+    for i in fence_marks(&t[..end]) {
+        let ls = line_start(b, i);
+        if ls == last_line || fence_mark(t, i) != FenceMark::Line {
+            continue;
         }
-        n += 1;
+        last_line = ls;
+        let c = b[i];
+        let n = b[i..].iter().take_while(|&&x| x == c).count();
+        let rest = &t[i + n..line_end(b, i)];
+        match open {
+            None => {
+                if c == b'`' && rest.contains('`') {
+                    continue;
+                }
+                open = Some((c, n));
+            }
+            Some((oc, on)) => {
+                if c == oc && n >= on && rest.trim().is_empty() {
+                    open = None;
+                }
+            }
+        }
     }
-    n % 2 == 0
+    open.is_some()
+}
+
+/// Referenslänkarnas definitioner i `t` utanför fönstret `win` (som inte har några), i ordning, om alla är enkla: en egen
+/// rad som börjar med `[namn]:` och en adress, utan indrag, med en tom rad (eller en annan sådan definition) före och efter.
+/// Då gäller de likadant om de står efter fönstret för sig. En rad med `]:` som inte är en sådan ger `None`.
+fn link_defs_of(t: &str, win: Range<usize>) -> Option<Vec<&str>> {
+    let b = t.as_bytes();
+    let simple = |ls: usize| -> bool {
+        let le = line_end(b, ls);
+        let line = &t[ls..le];
+        let Some(rest) = line.strip_prefix('[') else { return false };
+        let Some((label, after)) = rest.split_once("]:") else { return false };
+        !label.is_empty() && !label.starts_with('^') && !label.contains(['[', ']']) && !after.trim().is_empty() && !after.trim().contains(char::is_whitespace)
+    };
+    let blank_or_def = |ls: usize| ls >= b.len() || blank(b, ls, line_end(b, ls)) || simple(ls);
+    let mut out: Vec<&str> = Vec::new();
+    let mut last = usize::MAX;
+    for (i, _) in t.match_indices("]:") {
+        let ls = line_start(b, i);
+        if ls == last || b[ls..].starts_with(b"[^") {
+            continue;
+        }
+        last = ls;
+        if win.contains(&ls) || !simple(ls) {
+            return None;
+        }
+        let le = line_end(b, ls);
+        let before = ls == 0 || blank_or_def(line_start(b, ls - 1));
+        let after = le >= b.len() || blank_or_def(le + 1);
+        if !before || !after {
+            return None;
+        }
+        out.push(&t[ls..le]);
+    }
+    Some(out)
 }
 
 /// Finns det referenslänkar (`[namn]: adress`)? De ändrar tolkningen av `[text][namn]` var som helst i dokumentet.
@@ -411,6 +525,8 @@ fn has_content_before(prefix: &str) -> bool {
 
 /// Konstruktioner vars tolkning beror på resten av dokumentet: då görs full analys.
 fn risky(s: &str) -> bool {
+    // Kodstaket (också tre tecken mitt i en rad: fönstret tolkas då hellre om helt) och referenslänkar. Staket mitt i en
+    // rad någon annanstans i dokumentet påverkar inte fönstret (`Facts`).
     if s.contains("```") || s.contains("~~~") || has_link_defs(s) {
         return true;
     }
@@ -433,10 +549,21 @@ fn note_labels(w: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Finns definitionen `[^etikett]:` först på en rad i texten? (Definitioner står oftast sist: sök bakifrån.)
-fn has_def(t: &str, label: &str) -> bool {
+/// Finns en definition av `[^etikett]` utanför fönstret `win` i `t`, som analysen `a` (av `t`) också tolkar som en
+/// definition? En rad som börjar med `[^etikett]:` är inte alltid en definition (t.ex. mitt i ett stycke). Definitioner
+/// står oftast sist: sök bakifrån.
+fn has_def_outside(t: &str, a: &Analysis, label: &str, win: &Range<usize>) -> bool {
     let pat = format!("\n[^{label}]:");
-    t.starts_with(&pat[1..]) || t.rfind(&pat).is_some()
+    let b = t.as_bytes();
+    let real = |ls: usize| !(win.start..win.end).contains(&ls) && def_start(b, a, ls);
+    let mut end = t.len();
+    while let Some(i) = t[..end].rfind(&pat) {
+        if real(i + 1) {
+            return true;
+        }
+        end = i;
+    }
+    t.starts_with(&pat[1..]) && real(0)
 }
 
 fn shifted(p: &Piece, delta: isize, base: usize) -> Piece {
@@ -577,18 +704,43 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     let f_old = facts.take().unwrap_or_else(|| Facts::of(old_text));
     let f_new = f_old.swap(&Facts::of(old_win), &Facts::of(new_win));
     let brackets = |w: &str| w.contains(['[', ']']);
-    if f_new.tildes > 0 || f_new.open_comments > 0 || (f_new.link_defs > 0 && (brackets(old_win) || brackets(new_win))) {
+    if f_new.open_comments > 0 {
         return decline(13);
     }
-    // Finns kodstaket i dokumentet: alla ska stå först på en rad och vara ett jämnt antal (annars vet vi inte vad som är kod),
-    // ett jämnt antal ska ligga före fönstret (fönstret är då inte i ett kodblock) och fönstret får inte ha något.
-    if f_new.fences > 0 && (f_new.fences != f_new.fence_lines || f_new.fences % 2 != 0 || !fences_before_are_balanced(old_text, ws)) {
+    // Referenslänkar (`[namn]: adress`) och hakparenteser i fönstret: fönstret tolkas med dokumentets definitioner efter
+    // sig, om alla är enkla (se `link_defs_of`); annars full analys.
+    let mut link_defs: Vec<&str> = Vec::new();
+    if f_new.link_defs > 0 && (brackets(old_win) || brackets(new_win)) {
+        match (f_new.fences == 0 && f_new.fence_ambig == 0).then(|| link_defs_of(new_text, ws..(we_old as isize + delta) as usize)).flatten() {
+            Some(v) if !v.is_empty() => link_defs = v,
+            _ => return decline(13),
+        }
+    }
+    // Finns kodstaket i dokumentet: inga får stå där det inte går att avgöra om de är staket (i en lista, ett citat), och
+    // fönstret får inte ligga i ett kodblock (det har själv inga staket, se `risky`).
+    if f_new.fence_ambig > 0 || (f_new.fences > 0 && in_fenced_block(old_text, ws)) {
         return decline(13);
     }
     // Giltigheten av en fotnotsreferens beror på vilka definitioner som finns: får fönstret andra definitionsetiketter
-    // (en definition har lagts till, tagits bort eller bytt etikett) ger det full analys, men text i en definition går bra.
-    if def_labels(old_win) != def_labels(new_win) {
-        return decline(17);
+    // (en definition har lagts till, tagits bort eller bytt etikett) ändras tolkningen av referenserna till dem. Det går
+    // bra så länge ingen sådan referens (eller annan definition av etiketten) finns utanför fönstret.
+    let (dl_old, dl_new) = (def_labels(old_win), def_labels(new_win));
+    if dl_old != dl_new {
+        let mut changed: Vec<&str> = dl_old.iter().filter(|l| !dl_new.contains(l)).chain(dl_new.iter().filter(|l| !dl_old.contains(l))).copied().collect();
+        // Samma etiketter i annan ordning eller två gånger: full analys.
+        if changed.is_empty() {
+            return decline(17);
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        let we_new = (we_old as isize + delta) as usize;
+        let outside = |l: &str| {
+            let pat = format!("[^{l}]");
+            new_text[..ws].contains(&pat) || new_text.get(we_new.min(new_text.len())..).is_some_and(|t| t.contains(&pat))
+        };
+        if changed.iter().any(|l| l.is_empty() || outside(l)) {
+            return decline(17);
+        }
     }
     // Avsnittsrader i fönstret: de får inte ändras eller beröras av ändringen (då räknas avsnitten om med full analys);
     // annars flyttas de med texten.
@@ -653,15 +805,21 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     labels.extend(l_new);
     labels.sort_unstable();
     labels.dedup();
-    if labels.iter().any(|l| !has_def(new_text, l)) {
+    // Etiketter som fönstret självt definierar tolkas i fönstret; övriga ska ha en riktig definition utanför det.
+    let own_defs = def_labels(new_win);
+    if labels.iter().any(|l| !own_defs.contains(&l.as_str()) && !has_def_outside(old_text, old, l, &(ws..we_old))) {
         return decline(20);
     }
-    let mut mid: Vec<Piece> = if labels.is_empty() {
+    let mut mid: Vec<Piece> = if labels.is_empty() && link_defs.is_empty() {
         markup::pieces_of(new_win)
     } else {
         // Etiketter som fönstret självt definierar behöver ingen tillfällig definition.
         let own = def_labels(new_win);
-        let src = format!("{new_win}{}", labels.iter().filter(|l| !own.contains(&l.as_str())).map(|l| format!("\n\n[^{l}]: x")).collect::<String>());
+        let mut src = format!("{new_win}{}", labels.iter().filter(|l| !own.contains(&l.as_str())).map(|l| format!("\n\n[^{l}]: x")).collect::<String>());
+        for d in &link_defs {
+            src.push_str("\n\n");
+            src.push_str(d);
+        }
         let mut v = markup::pieces_of(&src);
         v.retain(|p| p.range.start < new_win.len());
         if let Some(l) = v.last_mut() {
@@ -867,7 +1025,7 @@ mod tests {
         let mut a = markup::analyze(&text);
         let mut facts: Option<Facts> = None;
         let (mut used, mut declined) = (0, 0);
-        let edits = ["x", " ", "\n", "\n\n", "**", "*", "<u>", "</u>", "`", "```", "<", ">", "[", "]", "(", ")", "#", "- ", "| ", "ä", "<span>", "</span>", "<div>", "</div>", "\n    ", "[^", "]:"];
+        let edits = ["x", " ", "\n", "\n\n", "**", "*", "<u>", "</u>", "`", "```", "<", ">", "[", "]", "(", ")", "#", "- ", "| ", "ä", "<span>", "</span>", "<div>", "</div>", "\n    ", "[^", "]:", "\n[^ny]: Ny fotnot.", "\n\n[^ny]: Ny fotnot.\n\n", "[^ny]", "[^1]", "[namn]", "[namn][namn] ", "text ```kod``` ", "~~~", "\n~~~\n"];
         for _ in 0..400 {
             let mut t = text.clone();
             let at = {
@@ -903,7 +1061,8 @@ mod tests {
                     if inc.pieces != full.pieces {
                         let i = inc.pieces.iter().zip(&full.pieces).position(|(a, b)| a != b).unwrap_or(0);
                         let lo = text_around(&t, &full.pieces, i);
-                        panic!("första skillnad vid bit {i} ({} vs {} bitar): inc {:?} full {:?}; text {lo:?}; ändring {:?} i {:?}", inc.pieces.len(), full.pieces.len(), inc.pieces.get(i), full.pieces.get(i), changed_range(&text, &t), &t[at.saturating_sub(120)..(at + 120).min(t.len())]);
+                        let oc = changed_range(&t, &text);
+                        panic!("första skillnad vid bit {i} ({} vs {} bitar): inc {:?} full {:?}; text {lo:?}; ändring {:?} i {:?}; förut {:?}", inc.pieces.len(), full.pieces.len(), inc.pieces.get(i), full.pieces.get(i), changed_range(&text, &t), &t[at.saturating_sub(120)..(at + 120).min(t.len())], &text[oc.start.saturating_sub(200).min(text.len())..(oc.end + 120).min(text.len())]);
                     }
                     assert_eq!(inc.pieces, full.pieces, "avvikelse efter ändring vid {at} ({:?})", changed_range(&text, &t));
                     assert_eq!(inc.defaults, full.defaults);
@@ -1097,10 +1256,20 @@ mod tests {
         let mut inc = a.clone();
         assert!(analyze_incremental(&text, &mut inc, &t).is_some(), "{:?}", WHY.with(|w| w.borrow().last().copied()));
         assert_eq!(inc.pieces, markup::analyze(&t).pieces);
-        // Med hakparenteser i fönstret kan en referens ha tillkommit eller försvunnit.
+        // Med hakparenteser i fönstret kan en referens ha tillkommit eller försvunnit: fönstret tolkas med dokumentets
+        // definitioner efter sig (de är enkla, se `link_defs_of`).
         let mut t = text.clone();
         t.insert_str(p, "[namn]");
-        assert!(analyze_incremental(&text, &mut a.clone(), &t).is_none());
+        let mut inc = a.clone();
+        assert!(analyze_incremental(&text, &mut inc, &t).is_some(), "{:?}", WHY.with(|w| w.borrow().last().copied()));
+        assert_eq!(inc.pieces, markup::analyze(&t).pieces);
+        assert!(inc.pieces.iter().any(|pc| pc.link), "[namn] ska vara en länk");
+        // En definition som inte är enkel (mitt i ett stycke) ger full analys.
+        let mut u = text.replace("[namn]: http://x.se/y\n\n", "Text\n[namn]: http://x.se/y\n\n");
+        let mut v = u.clone();
+        u.insert_str(p, "[namn]");
+        v.insert_str(p, "[namn]x");
+        assert!(analyze_incremental(&u, &mut markup::analyze(&u), &v).is_none());
     }
 
     #[test]
@@ -1177,11 +1346,21 @@ mod tests {
         let mut t = text.clone();
         t.insert(text.rfind("[^1]:").unwrap() + 2, '2');
         assert!(analyze_incremental(&text, &mut a.clone(), &t).is_none(), "ny etikett");
-        // Referenslänkar gäller hela dokumentet.
+        // Referenslänkar gäller hela dokumentet: fönstret tolkas med definitionerna efter sig.
         let mut t = text.clone();
         t.push_str("[namn]: http://x.se\n\n");
         let mut u = t.clone();
         u.insert(at - 3, 'x');
-        assert!(analyze_incremental(&t, &mut markup::analyze(&t), &u).is_none());
+        let mut inc = markup::analyze(&t);
+        if analyze_incremental(&t, &mut inc, &u).is_some() {
+            assert_eq!(inc.pieces, markup::analyze(&u).pieces);
+        }
+        // En ny definition i definitionsblocket går bra när ingen referens till den finns utanför fönstret.
+        let mut t = text.clone();
+        let end = t.rfind("Fotnotstext.").unwrap() + "Fotnotstext.".len();
+        t.insert_str(end, "\n[^ny]: Ny fotnot.");
+        let mut inc = a.clone();
+        assert!(analyze_incremental(&text, &mut inc, &t).is_some(), "ny definition: {:?}", WHY.with(|w| w.borrow().last().copied()));
+        assert_eq!(inc.pieces, markup::analyze(&t).pieces);
     }
 }
