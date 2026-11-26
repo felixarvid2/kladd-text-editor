@@ -334,6 +334,10 @@ pub struct KladdApp {
 #[cfg(test)]
 #[path = "ui_tests/mod.rs"]
 mod ui_tests;
+/// Prestandaprov för CI (instruktionsräkning, se `perf/README.md`).
+#[cfg(test)]
+#[path = "perfci.rs"]
+mod perfci;
 
 pub(crate) fn editor_id(doc_id: u64) -> Id {
     Id::unique(("kladd-editor", doc_id, crate::panes::salt()))

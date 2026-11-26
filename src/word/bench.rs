@@ -95,7 +95,7 @@ fn ms(t: Instant) -> f64 {
 }
 
 /// En bildruta i dokumentläget utan UI: det som `word_page` gör före TextEdit.
-fn frame(c: &mut layout::Cache, ctx: &egui::Context, text: &str, reveal: std::ops::Range<usize>) -> usize {
+pub(crate) fn frame(c: &mut layout::Cache, ctx: &egui::Context, text: &str, reveal: std::ops::Range<usize>) -> usize {
     frame_lazy(c, ctx, text, reveal, None)
 }
 
@@ -164,7 +164,7 @@ fn frame_lazy(
     }
 }
 
-fn in_ui(ctx: &egui::Context, f: impl FnOnce()) {
+pub(crate) fn in_ui(ctx: &egui::Context, f: impl FnOnce()) {
     let mut f = Some(f);
     let out = ctx.run_ui(Default::default(), |_| {
         if let Some(f) = f.take() {

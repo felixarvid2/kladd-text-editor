@@ -887,3 +887,98 @@ Fler källor som gjordes villkorade (hittade genom att gå igenom varje `request
 
 Utanför mätningen: uppdateringskontrollen, språkservern (en bildruta per 100 ms bara medan anrop väntar) och inläsningar (100 ms bara
 medan de pågår) är redan villkorade.
+
+## Prestandaprov i CI och snabbare release-bygge (2.10)
+
+### Prestandaprov i CI (instruktionsräkning)
+
+Mål: en ändring som gör Kladd märkbart långsammare ska synas i pull requesten, utan falsklarm från brusiga delade CI-maskiner.
+Tid duger inte (±30 % mellan körningar på samma maskin, se ovan), så proven räknar **instruktioner** med
+`valgrind --tool=callgrind`. Arbetsflödet `.github/workflows/perf.yml` bygger och mäter PR:ens kod och basgrenens i samma
+jobb och jämför (`perf/compare.py`): fel om något prov ökar mer än 10 %, varning över 3 %, tabell i jobbets sammanfattning.
+Allt om proven, hur man kör dem lokalt och hur man lägger till ett prov står i `perf/README.md`.
+
+Basen byggs i samma jobb i stället för att jämföras mot en incheckad baslinje (`perf/baseline.json`): instruktionsantalet
+beror på kompilatorversion, libc och valgrind, och `dtolnay/rust-toolchain@stable` flyttar sig, så en baslinje skulle ge
+falsklarm vid varje verktygsuppdatering och kräva underhåll vid varje avsiktlig ändring. Kostnaden är ett bygge till
+(beroendena delas, så bara Kladd själv byggs om). På `main` mäts bara versionen själv, vilket värmer cachen som PR-jobben bygger på.
+Samma prov läggs över basen (`perf/overlay.sh`) så att båda mäts med exakt samma prov; går basen inte att bygga med dem
+(som `main` före den här ändringen) visas bara PR:ens siffror och en varning, jobbet stoppas inte.
+
+Proven (`src/perfci.rs`, `#[ignore]`, indata genereras av Kladds egna skrivare med fasta frön, inget nätverk):
+
+| Prov | Instruktioner (opt-level 2) | Vad |
+|---|--:|---|
+| `perfci_docx_read_mt` | 270 M | läsa ett .docx på ~100 sidor (trådar: hela processen) |
+| `perfci_odt_read_mt` | 164 M | läsa ett .odt |
+| `perfci_docx_open` | 1 613 M | analys och kall utläggning med sidindelning |
+| `perfci_docx_keys` | 30 M | ett tecken på fem ställen (inkrementellt) |
+| `perfci_docx_search` | 285 M | åtta tangenttryck med sökningen öppen ("och") |
+| `perfci_md_read` | 221 M | läsläget, 400 kB Markdown: stilla, rullning, mitt i filen |
+| `perfci_pdf_export_mt` | 579 M | PDF-export av ett medelstort dokument (trådar) |
+
+Provet slår på räkningen bara kring själva mätningen (callgrind-förfrågan, `CALLGRIND_TOGGLE_COLLECT`), så att uppvärmning och
+kall utläggning före tangenttrycken inte späder ut dem. `--toggle-collect='*funktion*'` provades först men missade
+funktioner med stor stackram (noll instruktioner räknades i vissa byggen), därför förfrågan. Callgrinds räkning gäller bara den
+tråd som slår på den: prov som använder arbetstrådar (läsning av docx/odt, PDF-export) räknas för hela processen (`_mt`).
+
+Mätt spridning: två körningar av samma kod (och samma kod i två olika trädkopior) skiljer sig 0,00–0,15 % för alla prov, också de
+med trådar; gränsen 10 % har alltså mycket god marginal och 3 % gör varningen användbar. Hela
+mätningen tar 20–25 s per version (4 samtidiga valgrind-körningar); byggena är det som tar tid. En avsiktlig försämring
+(extra uppackning i `docx::read`) gav +4,25 % på `perfci_docx_read_mt` och 0,0 % på de andra proven. Basen jämförd mot sig själv (PR-trädet
+mot en annan kopia av samma commit) gav -0,14 … 0,00 %.
+
+### Allokerare och PGO: vad som mättes
+
+Mätt med `cargo test --release` (profilen `[profile.release]`: opt-level 3, thin LTO, codegen-units 1) i en egen målkatalog,
+Linux x86_64, delad 4-kärnig maskin. Proven är de ignorerade bänkarna mot ett .docx på 100 × skolrapporten (~400 sidor, 3 MB):
+`bench_docx_open`, `bench_docx_keys` (200 tangenter), `bench_docx_search`, `bench_docx_read`, `pdf_bench` (40 upprepningar),
+`bench_document_mode`, `markdown_large_frame_time` (400 kB) och `epub_large_chapter_frame_time`. Varje siffra är medianen av 7
+körningar där versionerna körts omväxlande; tid är hela processens klocktid (inkl. start och att bygga indata), minne
+högsta resident-minne. Systemversionens tid driver 5–8 % mellan olika omgångar, så skillnader under ~5 % är brus.
+
+**mimalloc** (`#[global_allocator]`, MIT, C-beroende via `cc`) mot systemets allokerare (glibc):
+
+| Bänk | system: tid / minne | mimalloc: tid / minne | tid | minne |
+|---|---|---|--:|--:|
+| `bench_docx_open` | 0,77 s / 200 MB | 0,57 s / 298 MB | -26 % | +49 % |
+| `bench_docx_keys` | 0,38 s / 102 MB | 0,32 s / 160 MB | -16 % | +57 % |
+| `bench_docx_search` | 1,34 s / 104 MB | 1,11 s / 164 MB | -17 % | +58 % |
+| `pdf_bench` | 0,39 s / 61 MB | 0,35 s / 86 MB | -10 % | +41 % |
+| `bench_docx_read` | 0,50 s / 47 MB | 0,38 s / 88 MB | -24 % | +87 % |
+| `bench_document_mode` | 0,56 s / 178 MB | 0,46 s / 222 MB | -18 % | +25 % |
+| `markdown_large_frame_time` | 0,08 s / 37 MB | 0,07 s / 67 MB | (brus) | +81 % |
+| `epub_large_chapter_frame_time` | 0,05 s / 33 MB | 0,04 s / 54 MB | (brus) | +64 % |
+
+Vinsten är tydlig (10–26 % på alla bänkar som tar mer än en kvarts sekund), men resident-minnet växer med 25–90 MB (25–90 %) och
+mimalloc behåller frigjort minne i stället för att lämna tillbaka det. Inställningarna som får tillbaka minnet
+(`MIMALLOC_PURGE_DELAY=0`, `MIMALLOC_PURGE_DECOMMITS=1`, `MIMALLOC_ARENA_EAGER_COMMIT=0`) tar också bort vinsten
+(`bench_docx_open` 0,74 s och 204 MB mot 0,72 s och 200 MB för systemet). **Avstår**: kravet var tydlig vinst *och* att minnet inte växer märkbart, och
+det sista uppfylls inte (Kladd är ett program som ofta står öppet med stora dokument). Om minnet börjar spela mindre roll är
+`#[global_allocator]` med `mimalloc` en rad plus ett beroende, och siffrorna ovan är utgångspunkten.
+
+**PGO** (`-Cprofile-generate`, träning med `perfci_*`-proven, `llvm-profdata merge`, `-Cprofile-use`; träningen kördes på
+de små CI-dokumenten, mätningen på de stora):
+
+| Bänk | utan PGO | med PGO | tid |
+|---|--:|--:|--:|
+| `bench_docx_open` | 0,72 s | 0,68 s | -6 % |
+| `bench_docx_keys` | 0,41 s | 0,40 s | -2 % (brus) |
+| `bench_docx_search` | 1,34 s | 1,36 s | +1 % (brus) |
+| `pdf_bench` | 0,35 s | 0,32 s | -9 % |
+| `bench_docx_read` | 0,53 s | 0,45 s | -15 % |
+| `bench_document_mode` | 0,61 s | 0,61 s | 0 % |
+
+Minnet oförändrat eller 2–4 MB lägre. Vinsten är tydlig bara för inläsning och PDF-export (de vägar som mest är rak kod i
+tolkarna); tangenttryck, sökning och utläggning, där tiden går åt i egui/epaint och i dokumentlayouten, ändras inte. Byggkostnaden är
+stor: PGO kräver ett instrumenterat bygge, en träningskörning och ett bygge till per mål (provbygget tog 11 minuter i stället
+för 7), i alla fyra release-jobben, plus `llvm-tools-preview` och en reserv för varje mål; profilen från testbinären måste
+dessutom stämma med programbinären (inte provat). **Avstår**: vinsten är under tröskeln på de vägar användaren känner av mest och
+priset i CI-tid och underhåll är högt.
+
+**`[profile.release]`**: `lto = "fat"` mot `thin` gav 0–7 % (`bench_docx_keys` 0,47 → 0,39 s, övriga inom ±4 %; systemversionen
+drev 0,72 → 0,75 s mellan omgångarna), alltså inom bruset, och ett längre bygge: ingen ändring. `panic = "abort"` går inte:
+`catch_unwind` används i `src/pdfview/forms.rs` (formulärvärden i trasiga PDF-filer ska ge ett felmeddelande, inte krascha).
+
+Det som skulle löna sig härnäst är inte byggflaggor utan att minska allokeringarna i läsning och utläggning (mimalloc visar att
+10–25 % av tiden går åt i allokeraren).
