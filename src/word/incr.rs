@@ -413,6 +413,109 @@ fn open_tag(w: &str) -> bool {
     })
 }
 
+/// `<div>`-taggarna i `w` (som `markup` känner igen dem: en egen rad, högst tre blanksteg in): öppning eller stängning,
+/// läge och raden.
+fn div_tags(w: &str) -> Vec<(bool, Range<usize>, &str)> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    for line in w.split_inclusive('\n') {
+        let ls = off;
+        off += line.len();
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let t = line.trim();
+        if indent > 3 || t.is_empty() {
+            continue;
+        }
+        let ts = ls + (line.len() - line.trim_start().len());
+        if t.matches('>').count() == 1 && crate::style::parse_div_open(t).is_some() {
+            out.push((true, ts..ts + t.len(), t));
+        } else if crate::style::is_div_close(t) {
+            out.push((false, ts..ts + t.len(), t));
+        }
+    }
+    out
+}
+
+/// De `<div>`-block som ett fönster ligger i (se `div_context`): justeringen före fönstret (`outer[0]`, den innersta) och
+/// efter var och en av fönstrets stängningar utan par (`outer[1..]`), och antalet öppningar utan par i fönstret.
+struct DivCtx {
+    inner: markup::Align,
+    outer: Vec<markup::Align>,
+    opens: usize,
+}
+
+impl DivCtx {
+    /// Behövs inget omslag (inga block runt fönstret och inga taggar utan par)?
+    fn is_plain(&self) -> bool {
+        self.inner == markup::Align::Left && self.outer.len() == 1 && self.opens == 0
+    }
+
+    /// Text före och efter fönstret: blocken öppnas yttersta först och stängs efter fönstret (dess egna öppningar utan par
+    /// först). Fönstrets stängningar utan par stänger de inre blocken, som i hela texten.
+    fn wrap(&self) -> (String, String) {
+        if self.is_plain() {
+            return (String::new(), String::new());
+        }
+        let mut pre = String::new();
+        for a in self.outer.iter().rev() {
+            pre.push_str(&crate::style::div_open(*a));
+            pre.push_str("\n\n");
+        }
+        let post = "\n\n</div>".repeat(self.opens + 1);
+        (pre, post)
+    }
+}
+
+/// Blocken runt fönstret `ws..` (gamla texten `t`, analyserad som `a`; `old_win`/`new_win` = fönstret före och efter
+/// ändringen). Taggarna utan par i fönstret ska vara desamma före och efter ändringen och vara parade i den gamla analysen
+/// (deras bitar är dolda taggar), annars `None`. Justeringen efter en stängning utan par läses ur den gamla analysen.
+fn div_context(t: &str, a: &Analysis, ws: usize, old_win: &str, new_win: &str) -> Option<DivCtx> {
+    let piece_at = |b: usize| a.pieces.get(a.pieces.partition_point(|p| p.range.end <= b));
+    // Justeringen just före fönstret (den tomma raden före det): börjar fönstret med en stängning hör den till blocket som
+    // stängs, inte till det yttre.
+    let inner = if ws == 0 { markup::Align::Left } else { piece_at(ws - 1).map_or(markup::Align::Left, |p| p.align) };
+    let unpaired = |w: &str| -> (Vec<(bool, Range<usize>)>, Vec<String>) {
+        let tags = div_tags(w);
+        let mut stack: Vec<usize> = Vec::new();
+        let mut closes: Vec<usize> = Vec::new();
+        for (k, (open, _, _)) in tags.iter().enumerate() {
+            if *open {
+                stack.push(k);
+            } else if stack.pop().is_none() {
+                closes.push(k);
+            }
+        }
+        let mut idx: Vec<usize> = closes.into_iter().chain(stack).collect();
+        idx.sort_unstable();
+        (idx.iter().map(|&k| (tags[k].0, tags[k].1.clone())).collect(), idx.iter().map(|&k| tags[k].2.to_owned()).collect())
+    };
+    let (old_u, old_s) = unpaired(old_win);
+    let (new_u, new_s) = unpaired(new_win);
+    if old_s != new_s || old_u.iter().map(|x| x.0).ne(new_u.iter().map(|x| x.0)) {
+        return None;
+    }
+    let mut outer = vec![inner];
+    let mut opens = 0;
+    for (open, r) in &old_u {
+        let r = ws + r.start..ws + r.end;
+        // I hela texten parades taggen (den är en dold tagg); annars tolkas den som text och fönstret räcker inte.
+        if !piece_at(r.start).is_some_and(|p| p.markup) {
+            return None;
+        }
+        if *open {
+            opens += 1;
+        } else {
+            if opens > 0 {
+                // En stängning utan par efter en öppning utan par kan inte hända (de hade parats); för säkerhets skull.
+                return None;
+            }
+            outer.push(if r.end < t.len() { piece_at(r.end).map_or(markup::Align::Left, |p| p.align) } else { markup::Align::Left });
+        }
+    }
+    // `outer[0]` gäller före fönstrets första stängning utan par: den innersta. Omslaget öppnar `outer` yttersta först.
+    Some(DivCtx { inner, outer, opens })
+}
+
 /// Etiketterna i fotnotsdefinitionerna (`[^etikett]:` först på en rad) i `w`, i ordning.
 fn def_labels(w: &str) -> Vec<&str> {
     w.lines()
@@ -670,23 +773,28 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
             (ws, next_unit(mid_end)?)
         }
     };
-    // `<div align>` runt stycken (justerad text i Word-dokument): fönstret ska innehålla hela `<div>`-block, annars
-    // syns inte justeringen vid tolkning av fönstret för sig. Det vidgas till stycken tills blocken är hela.
+    // `<div align>` runt stycken (justerad text i Word-dokument): små block tas med hela i fönstret (det vidgas till
+    // stycken tills blocken är hela). Går det inte (blocket är stort) behålls fönstret, och taggarna utan par i det får sin
+    // motsvarighet i tolkningen av fönstret (se `div_context`).
+    let (ws0, we0) = (ws, we_old);
     for _ in 0..8 {
         let w = &old_text[ws..we_old];
         let (open, close) = (w.matches("<div").count(), w.matches("</div").count());
         if open == close {
             break;
         }
-        if open > close {
-            if we_old >= ob.len() {
-                return decline(16);
-            }
+        if open > close && we_old < ob.len() {
             we_old = next_end(we_old)?;
-        } else if ws == 0 {
-            return decline(16);
-        } else {
+        } else if open < close && ws > 0 {
             ws = para_start(ob, ws - 1)?;
+        } else {
+            break;
+        }
+    }
+    {
+        let w = &old_text[ws..we_old];
+        if w.matches("<div").count() != w.matches("</div").count() {
+            (ws, we_old) = (ws0, we0);
         }
     }
     if we_old - ws > MAX_WINDOW {
@@ -787,15 +895,14 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     if let Some(l) = ow.last_mut() {
         l.range.end = l.range.end.min(we_old);
     }
-    // Fortfarande ohela `<div>`-block (i den nya texten eller efter fönstrets vidgning): full analys.
-    let unbalanced = |w: &str| w.matches("<div").count() != w.matches("</div").count();
-    if unbalanced(old_win) || unbalanced(new_win) {
-        return decline(16);
-    }
     if html_ctx(old_win) || html_ctx(new_win) {
         return decline(18);
     }
-    if ow.iter().any(|p| p.align != markup::Align::Left) && !old_win.contains("align") {
+    // Fönstret kan ligga i `<div>`-block som börjar före och slutar efter det (Word-läsarens justerade eller centrerade
+    // text, ofta hundratals stycken). Fönstret tolkas då inslaget i lika många block med samma justering som där (`ctx`),
+    // så att det får samma justering och samma parning av taggarna som i hela texten.
+    let Some(ctx) = div_context(old_text, old, ws, old_win, new_win) else { return decline(16) };
+    if div_tags(old_win).is_empty() && ow.iter().any(|p| p.align != ctx.inner) {
         return decline(19);
     }
     // Fotnotsreferenser (`[^n]`) tolkas bara om definitionen finns i dokumentet: fönstret tolkas med en definition per
@@ -810,20 +917,22 @@ fn incremental(old_text: &str, old: &mut Analysis, new_text: &str, min_bytes: us
     if labels.iter().any(|l| !own_defs.contains(&l.as_str()) && !has_def_outside(old_text, old, l, &(ws..we_old))) {
         return decline(20);
     }
-    let mut mid: Vec<Piece> = if labels.is_empty() && link_defs.is_empty() {
+    let mut mid: Vec<Piece> = if labels.is_empty() && link_defs.is_empty() && ctx.is_plain() {
         markup::pieces_of(new_win)
     } else {
+        let (pre, post) = ctx.wrap();
         // Etiketter som fönstret självt definierar behöver ingen tillfällig definition.
         let own = def_labels(new_win);
-        let mut src = format!("{new_win}{}", labels.iter().filter(|l| !own.contains(&l.as_str())).map(|l| format!("\n\n[^{l}]: x")).collect::<String>());
+        let mut src = format!("{pre}{new_win}{post}{}", labels.iter().filter(|l| !own.contains(&l.as_str())).map(|l| format!("\n\n[^{l}]: x")).collect::<String>());
         for d in &link_defs {
             src.push_str("\n\n");
             src.push_str(d);
         }
+        let (a, b) = (pre.len(), pre.len() + new_win.len());
         let mut v = markup::pieces_of(&src);
-        v.retain(|p| p.range.start < new_win.len());
-        if let Some(l) = v.last_mut() {
-            l.range.end = l.range.end.min(new_win.len());
+        v.retain(|p| p.range.end > a && p.range.start < b);
+        for p in &mut v {
+            p.range = p.range.start.max(a) - a..p.range.end.min(b) - a;
         }
         v
     };
@@ -938,7 +1047,18 @@ mod tests {
         let mut s = if r.below(4) == 0 { String::from("Första raden med text\n\n") } else { String::from("<!-- kladd: sida=a4 -->\n\n") };
         let words = ["alfa", "beta", "gamma", "delta", "åäö", "text", "rad", "stycke"];
         let mut notes = 0;
+        // Rika dokument: `<div>`-block över flera stycken, ibland nästlade (som Word-läsarens justerade text).
+        let mut depth = 0;
         for i in 0..paras {
+            if rich && depth < 2 && r.below(9) == 0 {
+                let open = ["<div align=\"justify\">", "<div align=\"center\">", "<div style=\"text-align: right\">", "<div>"][r.below(4)];
+                s.push_str(open);
+                s.push_str("\n\n");
+                depth += 1;
+            } else if depth > 0 && r.below(7) == 0 {
+                s.push_str("</div>\n\n");
+                depth -= 1;
+            }
             let kind = if rich { r.below(18) } else { r.below(4) };
             match kind {
                 0 | 1 | 2 => {
@@ -973,6 +1093,9 @@ mod tests {
                 _ => s.push_str("![bild](a.png)"),
             }
             s.push_str("\n\n");
+        }
+        for _ in 0..depth {
+            s.push_str("</div>\n\n");
         }
         for n in 1..=notes {
             s.push_str(&format!("[^{n}]: Fotnot {n} med text.\n\n"));
@@ -1097,6 +1220,99 @@ mod tests {
     fn incremental_equals_full_on_plain_documents() {
         let (used, _) = fuzz(false, 11);
         assert!(used > 100, "den inkrementella vägen används ({used})");
+    }
+
+    /// Hur ofta ett tecken analyseras inkrementellt i ett riktigt dokument (`KLADD_BENCH_MD=fil.md`, t.ex. dumpat med
+    /// `KLADD_BENCH_DUMP` i `bench_docx_open`): ett tecken på 400 jämnt fördelade ställen i löpande text (orden), och varför
+    /// analysen avstod. Skriver också hur många av ställena som ligger i ett `<div>`-block.
+    #[test]
+    #[ignore]
+    fn bench_incr_coverage() {
+        let Ok(path) = std::env::var("KLADD_BENCH_MD") else { return };
+        let text = std::fs::read_to_string(path).unwrap();
+        let a = markup::analyze(&text);
+        let (mut inc, mut in_div, mut inc_div) = (0, 0, 0);
+        let mut why = std::collections::BTreeMap::new();
+        let n = 400;
+        for k in 0..n {
+            let mut at = text.len() * k / n;
+            while at < text.len() && (!text.is_char_boundary(at) || at == 0 || text.as_bytes()[at - 1] != b' ' || !text[at..].starts_with(|c: char| c.is_alphabetic())) {
+                at += 1;
+            }
+            if at >= text.len() {
+                continue;
+            }
+            let div = a.pieces[a.pieces.partition_point(|p| p.range.end <= at)].align != markup::Align::Left;
+            in_div += usize::from(div);
+            let mut t = text.clone();
+            t.insert(at, 'x');
+            let mut b = a.clone();
+            match analyze_incremental(&text, &mut b, &t) {
+                Some(_) => {
+                    inc += 1;
+                    inc_div += usize::from(div);
+                }
+                None => *why.entry(WHY.with(|w| w.borrow().last().copied()).unwrap_or(0)).or_insert(0) += 1,
+            }
+        }
+        println!("inkrementellt {inc} av {n}; i justerade block {inc_div} av {in_div}; avstod: {why:?}");
+    }
+
+    /// Brödtext i `<div>`-block över många stycken (justerad, centrerad, nästlad, med listor och citat): ett tecken mitt i
+    /// ett block tolkas inkrementellt och ger samma bitar som `analyze`; ändringar i taggarna får avstå men aldrig ge fel.
+    #[test]
+    fn text_inside_div_blocks_keeps_the_incremental_path() {
+        let para = |i: usize| format!("Stycke {i} med **fet** och *kursiv* text som fyller raden ordentligt och lite till.\n\n");
+        let mut text = String::from("<!-- kladd: sida=a4 -->\n\nInledning utan block.\n\n<div align=\"justify\">\n\n");
+        for i in 0..1500 {
+            text.push_str(&para(i));
+        }
+        text.push_str("- punkt ett\n- punkt två\n\n> citat i blocket\n\n<div style=\"text-align: center\">\n\n");
+        for i in 1500..2500 {
+            text.push_str(&para(i));
+        }
+        text.push_str("</div>\n\n");
+        for i in 2500..3500 {
+            text.push_str(&para(i));
+        }
+        text.push_str("</div>\n\nSlut utan block.\n");
+        assert!(text.len() > MIN_BYTES);
+        let a = markup::analyze(&text);
+        for needle in ["Stycke 700 ", "Stycke 2000 ", "Stycke 3000 ", "citat i", "punkt två", "Stycke 1499 ", "Stycke 2500 "] {
+            let at = text.find(needle).unwrap() + needle.len();
+            let mut t = text.clone();
+            t.insert(at, 'x');
+            let mut inc = a.clone();
+            assert!(analyze_incremental(&text, &mut inc, &t).is_some(), "{needle}: {:?}", WHY.with(|w| w.borrow().last().copied()));
+            assert_eq!(inc.pieces, markup::analyze(&t).pieces, "{needle}");
+        }
+        // Ändringar i och runt taggarna: inkrementellt eller inte, men alltid samma bitar som `analyze`.
+        let mut r = Rng(77);
+        for _ in 0..60 {
+            let tags: Vec<usize> = text.match_indices("<div").map(|(i, _)| i).chain(text.match_indices("</div>").map(|(i, _)| i)).collect();
+            let at = (tags[r.below(tags.len())] + r.below(30)).min(text.len() - 1);
+            let mut at = at.saturating_sub(r.below(8));
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            let mut t = text.clone();
+            match r.below(4) {
+                0 => t.insert(at, 'x'),
+                1 => t.insert_str(at, "\n\n"),
+                2 => {
+                    let mut e = (at + 1 + r.below(5)).min(t.len());
+                    while !t.is_char_boundary(e) {
+                        e += 1;
+                    }
+                    t.replace_range(at..e, "");
+                }
+                _ => t.insert_str(at, "<div align=\"right\">\n\n"),
+            }
+            let mut inc = a.clone();
+            if analyze_incremental(&text, &mut inc, &t).is_some() {
+                assert_eq!(inc.pieces, markup::analyze(&t).pieces, "ändring vid {at}");
+            }
+        }
     }
 
     #[test]

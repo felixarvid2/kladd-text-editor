@@ -593,9 +593,11 @@ fn bench_docx_place() {
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let st = c.stats(1);
         eprintln!(
-            "ställe {k} ({name}), {n} gånger: median {:.2} ms, bästa {:.2} ms | återupptagen {} ({}) | plan {:.1} loop {:.1} concat {:.1} sidor {:.1} ms",
+            "ställe {k} ({name}), {n} gånger: median {:.2} ms, bästa {:.2} ms | förberedelsen återanvänd {} ({}) | återupptagen {} ({}) | plan {:.1} loop {:.1} concat {:.1} sidor {:.1} ms",
             times[times.len() / 2],
             times[0],
+            st.reused,
+            st.memo_why,
             st.resumed,
             st.resume_why,
             st.plan_ms,

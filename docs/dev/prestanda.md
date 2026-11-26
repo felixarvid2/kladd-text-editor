@@ -467,6 +467,36 @@ tecknet efter 17 ms. Att ångra inklistringen kraschade vyn (också före den h�
 användes efter den med den ändrade texten, så att ett gammalt byteläge hamnade mitt i ett tecken. Rubrikerna hämtas nu om
 efter en ändring, och omvandlingen från byte till tecken tål ett läge mitt i ett tecken.
 
+#### Brödtext i `<div>`-block (efter integrationen)
+
+Word-läsaren skriver justerad, centrerad och högerställd text som `<div align="…">`-block, ofta över många stycken. Ett
+fönster mitt i ett sådant block, där taggarna ligger utanför fönstret, gav full analys (`incr`, skäl 19: bitarna har blockets
+justering men fönstret ser inte taggarna; skäl 16: fönstret har en tagg utan sin like och blocket är för stort för att vidgas
+till) och därmed full förberedelse och ett helt varv. Nu tolkas fönstret inslaget i likadana block som de det ligger i
+(`DivCtx`: justeringen före fönstret och efter varje stängning utan par läses ur den gamla analysen, taggarna utan par i
+fönstret ska vara desamma efter ändringen och ha varit parade i hela texten), så att det får samma justering och samma parning
+som i hela texten. Små block tas fortfarande med hela i fönstret.
+
+| Mått | Före / efter |
+|---|---|
+| Ett tecken i justerad brödtext ("februari och mars.", 404 sidor), opt-level 2 | 97 / 0,8–1,0 ms |
+| Samma, debug | 254 / 3,3 ms |
+| Ställen med inkrementell analys, 400 ord jämnt fördelade, `gen-skolrapport` ×100 (i justerade block) | 367 / 375 (164 / 172 av 172) |
+| Samma, `gen-nyhetsbrev` ×150 | 299 / 384 (223 / 297 av 302) |
+
+Mätt med det ignorerade provet `incr::tests::bench_incr_coverage` (`KLADD_BENCH_MD=fil.md`, Markdown dumpad med
+`KLADD_BENCH_DUMP`) och `bench_docx_place` med `KLADD_BENCH_FIND`. Nästlade block, block med `style="text-align: …"`, `<div>`
+utan justering och listor och citat i ett block går nu inkrementellt. Det som fortfarande avstår: en ändring i själva en
+tagg utan sin like i fönstret (taggarna ska vara desamma), kanterna (skäl 10, 24 av 400 i `gen-skolrapport`: raden efter
+ändringen tolkas annorlunda, t.ex. vid en ändring alldeles före en textruta) och avsnittsrader (skäl 3). I appen (`KLADD_TIMING=1`,
+404 sidor, debug) gav skrivning i justerad brödtext inkrementell analys (1,5–7 ms) och återupptagen omläggning.
+
+Prov: `incr::tests::text_inside_div_blocks_keeps_the_incremental_path` (stycken mitt i stora och nästlade block, listor och
+citat i ett block, ändringar i och runt taggarna mot `analyze`), rika dokument i `incr`-fuzzen, `layout_memo` och
+`layout::resume` med block över flera stycken, ibland nästlade; alla med `KLADD_FUZZ_SEEDS=300`. Fuzzen av förberedelsen
+(`reuse` direkt med ett område) hoppar nu över ändringar där bitarna utanför området har ändrats, som den inkrementella
+analysen aldrig ger ett område för (en ändring i en tagg som parar ihop taggarna annorlunda långt bort).
+
 #### Kvar
 
 - Tangenttrycket vid 2021 sidor är 3,0 gånger det vid 404 sidor. Det som återstår och växer med dokumentet (callgrind, 2021
@@ -489,10 +519,6 @@ efter en ändring, och omvandlingen från byte till tecken tål ett läge mitt i
   per bildruta (vyn lånar `self` mellan anropen), och debugbyggen jämför den med flit också för varje `Seen`.
 - En ny fotnotsdefinition eller ändrade fotnotsreferenser ger full förberedelse och ett helt varv (fotnotsplanen), och en ändring i
   en tabell bygger om alla tabeller (ställe 6).
-- Ett fönster mitt i ett `<div align="justify">`-block som går över flera stycken (Word-läsarens justerade text) ger full
-  analys (`incr`, skäl 19: bitarna har justering men fönstret ser inte `<div>`-taggarna), och därmed full förberedelse. I appen
-  gäller det mycket av brödtexten i `gen-skolrapport` (ca 140 ms analys och 130 ms omläggning per tecken i debug vid 404 sidor);
-  de tio mätställena ligger utanför sådana block. Fönstret kunde tolkas inslaget i blockets `<div>`.
 - Stegvis utläggning i debug är ca 15 % långsammare än den kalla: varje bildruta för fram lägena över resten av dokumentet
   (förskjutna platshållare, sammanfogning och sidindelning), och medan fotnotsdefinitionerna läggs ut görs sammanfogningen hela.
 

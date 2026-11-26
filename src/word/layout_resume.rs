@@ -1911,7 +1911,16 @@ mod tests {
         let words = ["alfa", "beta", "gamma", "delta", "åäö", "text", "rad", "stycke", "dokument", "sida", "ord"];
         let mut s = String::from("<!-- kladd: sida=a5 -->\n\n");
         let mut notes = 0;
+        // Brödtext i `<div>`-block över flera stycken, ibland nästlade.
+        let mut depth = 0;
         for i in 0..paras {
+            if depth < 2 && r.below(12) == 0 {
+                s.push_str(["<div align=\"justify\">\n\n", "<div align=\"center\">\n\n"][r.below(2)]);
+                depth += 1;
+            } else if depth > 0 && r.below(8) == 0 {
+                s.push_str("</div>\n\n");
+                depth -= 1;
+            }
             let mut line = String::new();
             for _ in 0..(3 + r.below(60)) {
                 let w = words[r.below(words.len())];
@@ -1940,6 +1949,9 @@ mod tests {
                 _ => s.push_str(&line),
             }
             s.push_str("\n\n");
+        }
+        for _ in 0..depth {
+            s.push_str("</div>\n\n");
         }
         for n in 1..=notes {
             s.push_str(&format!("[^{n}]: Fotnot {n} med *text* och mer text"));

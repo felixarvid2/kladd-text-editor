@@ -813,7 +813,16 @@ mod tests {
         let words = ["alfa", "beta", "gamma", "delta", "åäö", "text", "rad", "stycke", "dokument", "sida"];
         let mut s = String::from("<!-- kladd: sida=a4; h1: \"Calibri\" 20pt -->\n\n");
         let mut notes = 0;
+        // `<div>`-block över flera stycken, ibland nästlade (Word-läsarens justerade och centrerade text).
+        let mut depth = 0;
         for i in 0..paras {
+            if depth < 2 && r.below(12) == 0 {
+                s.push_str(["<div align=\"justify\">\n\n", "<div align=\"center\">\n\n", "<div>\n\n"][r.below(3)]);
+                depth += 1;
+            } else if depth > 0 && r.below(8) == 0 {
+                s.push_str("</div>\n\n");
+                depth -= 1;
+            }
             let kind = r.below(24);
             let mut line = String::new();
             for _ in 0..(3 + r.below(40)) {
@@ -846,6 +855,9 @@ mod tests {
             if i == paras / 5 {
                 s.push_str("<!-- kladd: toc -->\n\n");
             }
+        }
+        for _ in 0..depth {
+            s.push_str("</div>\n\n");
         }
         if word {
             for n in 1..=notes {
@@ -1000,6 +1012,24 @@ mod tests {
                 fell_back += 1;
                 continue;
             }
+            // Den inkrementella analysen ger bara ett område om bitarna utanför det är desamma (t.ex. inte när en ändring i
+            // en `<div>`-tagg parar ihop taggarna på ett annat sätt långt bort); samma förutsättning här.
+            let outside = |a: &Analysis, len: usize, he: usize| -> Vec<(bool, crate::style::Align, Block)> {
+                let mut v = Vec::with_capacity(len);
+                for p in &a.pieces {
+                    for b in p.range.clone() {
+                        if b < hull.0 || b >= he {
+                            v.push((p.markup, p.align, p.block));
+                        }
+                    }
+                }
+                v
+            };
+            let d = text.len() as isize - old.len() as isize;
+            if outside(&ao, old.len(), (hull.1 as isize - d) as usize) != outside(&an, text.len(), hull.1) {
+                WHY.with(|w| w.borrow_mut().push(98));
+                continue;
+            }
             // Ändringen i det som kan komma med i en innehållsförteckning (som den inkrementella analysen ger), i hälften av
             // stegen: med 0 återanvänds förteckningens höjd och antal (`toc_known`).
             let toc_delta = (step % 2 == 0).then(|| {
@@ -1027,7 +1057,14 @@ mod tests {
             back += b;
         }
         // De flesta ändringar ligger långt från fotnotsdefinitioner och rutor och ska gå att återanvända.
-        assert!(reused > 2 * back, "återanvändes {reused}, full omräkning {back}");
+        let why = WHY.with(|w| {
+            let mut c = std::collections::BTreeMap::new();
+            for x in w.borrow_mut().drain(..) {
+                *c.entry(x).or_insert(0) += 1;
+            }
+            c
+        });
+        assert!(reused > 2 * back, "återanvändes {reused}, full omräkning {back} (skäl {why:?})");
     }
 
     /// Ändringar i och nära fotnotsdefinitionerna (Word-dialekten, ett block utan tomrader): planen räknas om i
