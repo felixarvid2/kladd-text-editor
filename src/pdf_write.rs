@@ -236,30 +236,120 @@ fn shape_glyphs(shaper: &Shaper, face: Face, text: &str) -> Vec<krilla::text::Kr
 /// Antal sidor vars texter formas åt gången.
 const SHAPE_BATCH: usize = 32;
 
-/// Formar texterna i sidorna `jobs` (en lista per sida: typsnitt och text) på flera trådar. Formningen är
-/// det mesta av tiden för att rita sidorna och beror inte på något annat. Svaret har samma form som `jobs`.
-fn shape_pages(jobs: &[Vec<(Face, &str)>], shaper: &Shaper) -> Vec<Vec<Vec<krilla::text::KrillaGlyph>>> {
-    let flat: Vec<(Face, &str)> = jobs.iter().flatten().copied().collect();
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(flat.len() / 200 + 1);
-    let shaped: Vec<Vec<krilla::text::KrillaGlyph>> = if workers <= 1 {
-        flat.iter().map(|(f, t)| shape_glyphs(shaper, *f, t)).collect()
-    } else {
-        let per = flat.len().div_ceil(workers);
-        std::thread::scope(|sc| {
-            let handles: Vec<_> = flat
-                .chunks(per)
-                .map(|chunk| {
-                    sc.spawn(move || {
-                        let shaper = Shaper::new();
-                        chunk.iter().map(|(f, t)| shape_glyphs(&shaper, *f, t)).collect::<Vec<_>>()
-                    })
+/// Test: forma allt på huvudtråden (för att jämföra med den flertrådade vägen).
+#[cfg(test)]
+static SINGLE_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Texterna (typsnitt och text) på sidorna `from..to`, en lista per sida: kroppens operationer följda av sidhuvudets och sidfotens.
+fn page_jobs<'a>(pages: &'a [PageOps], extras: &'a [Vec<Op>], from: usize, to: usize) -> Vec<Vec<(Face, &'a str)>> {
+    (from..to)
+        .map(|k| {
+            pages[k]
+                .ops
+                .iter()
+                .chain(extras[k].iter())
+                .filter_map(|o| match o {
+                    Op::Text { face, text, .. } => Some((*face, text.as_str())),
+                    _ => None,
                 })
-                .collect();
-            handles.into_iter().flat_map(|h| h.join().expect("formningstråd")).collect()
+                .collect()
         })
-    };
-    let mut it = shaped.into_iter();
-    jobs.iter().map(|j| it.by_ref().take(j.len()).collect()).collect()
+        .collect()
+}
+
+/// Formade texter för en grupp sidor: en lista per sida med en glyflista per text.
+type ShapedPages = Vec<Vec<Vec<krilla::text::KrillaGlyph>>>;
+
+fn shape_jobs(jobs: &[Vec<(Face, &str)>], shaper: &Shaper) -> ShapedPages {
+    jobs.iter().map(|page| page.iter().map(|(f, t)| shape_glyphs(shaper, *f, t)).collect()).collect()
+}
+
+/// Formningen av sidorna (grupper om `SHAPE_BATCH` sidor) på arbetstrådar medan huvudtråden ritar de formade
+/// sidorna i krilla (som är enkeltrådat). Formningen beror bara på typsnitt och text och ger samma glyfer i vilken
+/// ordning grupperna formas; huvudtråden tar dem alltid i sidornas ordning, så PDF:en blir densamma.
+/// Arbetstrådarna ligger högst `ahead` grupper före ritningen (minnet), var och en med egna typsnittsytor och
+/// formningsplaner som återanvänds för alla grupper den formar.
+struct ShapeQueue {
+    state: std::sync::Mutex<QueueState>,
+    cond: std::sync::Condvar,
+    batches: usize,
+    ahead: usize,
+}
+
+struct QueueState {
+    /// Nästa grupp som ska delas ut.
+    next: usize,
+    /// Grupper som huvudtråden är klar med.
+    consumed: usize,
+    done: HashMap<usize, ShapedPages>,
+    /// En arbetstråd har avbrutits (panik): huvudtråden väntar inte längre.
+    dead: bool,
+}
+
+impl ShapeQueue {
+    fn new(batches: usize, ahead: usize) -> Self {
+        Self { state: std::sync::Mutex::new(QueueState { next: 0, consumed: 0, done: HashMap::new(), dead: false }), cond: std::sync::Condvar::new(), batches, ahead }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Arbetstråd: forma grupper tills alla är utdelade.
+    fn work(&self, pages: &[PageOps], extras: &[Vec<Op>]) {
+        struct Guard<'q>(&'q ShapeQueue);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.lock().dead = true;
+                    self.0.cond.notify_all();
+                }
+            }
+        }
+        let _guard = Guard(self);
+        let shaper = Shaper::new();
+        loop {
+            let batch = {
+                let mut st = self.lock();
+                while st.next < self.batches && st.next >= st.consumed + self.ahead && !st.dead {
+                    st = self.cond.wait(st).unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if st.next >= self.batches || st.dead {
+                    return;
+                }
+                st.next += 1;
+                st.next - 1
+            };
+            let from = batch * SHAPE_BATCH;
+            let jobs = page_jobs(pages, extras, from, (from + SHAPE_BATCH).min(pages.len()));
+            let shaped = shape_jobs(&jobs, &shaper);
+            self.lock().done.insert(batch, shaped);
+            self.cond.notify_all();
+        }
+    }
+
+    /// Huvudtråden: de formade sidorna i grupp `batch` (väntar tills den är klar).
+    fn take(&self, batch: usize) -> Option<ShapedPages> {
+        let mut st = self.lock();
+        loop {
+            if let Some(b) = st.done.remove(&batch) {
+                st.consumed = batch + 1;
+                drop(st);
+                self.cond.notify_all();
+                return Some(b);
+            }
+            if st.dead {
+                return None;
+            }
+            st = self.cond.wait(st).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Ritningen är klar eller avbruten: arbetstrådarna slutar.
+    fn stop(&self) {
+        self.lock().dead = true;
+        self.cond.notify_all();
+    }
 }
 
 // ============================================================== blockmodell
@@ -2905,125 +2995,152 @@ pub fn write(markdown: &str, title: &str, resolve: &dyn Fn(&str) -> Option<DocIm
     let extras: Vec<Vec<Op>> = (0..total).map(|pi| lay.header_footer_page(&defaults, &hf_plan, &hf_pages, &fields, pi)).collect();
     let images = std::mem::take(&mut lay.images);
     crate::timing::lap("pdf: sidhuvud/sidfot");
-    // Texterna formas på flera trådar, några sidor i taget (formen är densamma som `Surface::draw_text`).
+    // Texterna formas på arbetstrådar, grupper om några sidor, medan huvudtråden ritar sidorna (formen är densamma som
+    // `Surface::draw_text`). Små dokument formas direkt på huvudtråden.
+    let mut shape_time = std::time::Duration::ZERO;
     let mut shaped: std::collections::VecDeque<std::vec::IntoIter<Vec<krilla::text::KrillaGlyph>>> = std::collections::VecDeque::new();
-    for (pi, page_ops) in lay.pages.iter().enumerate() {
-        if shaped.is_empty() {
-            let end = (pi + SHAPE_BATCH).min(total);
-            let jobs: Vec<Vec<(Face, &str)>> = (pi..end)
-                .map(|k| {
-                    lay.pages[k]
-                        .ops
-                        .iter()
-                        .chain(extras[k].iter())
-                        .filter_map(|o| match o {
-                            Op::Text { face, text, .. } => Some((*face, text.as_str())),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .collect();
-            shaped = shape_pages(&jobs, &shapers).into_iter().map(Vec::into_iter).collect();
+    let texts: usize = lay.pages.iter().map(|p| p.ops.iter().filter(|o| matches!(o, Op::Text { .. })).count()).sum();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(1).clamp(1, 8);
+    #[cfg(test)]
+    let threaded = !SINGLE_THREAD.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let threaded = true;
+    let queue = (threaded && total > SHAPE_BATCH && texts >= 400 && std::thread::available_parallelism().map_or(1, |n| n.get()) > 1)
+        .then(|| ShapeQueue::new(total.div_ceil(SHAPE_BATCH), workers * 2 + 2));
+    let (page_list, extra_list): (&[PageOps], &[Vec<Op>]) = (&lay.pages, &extras);
+    let drawn: Result<(), String> = std::thread::scope(|sc| {
+        if let Some(q) = &queue {
+            for _ in 0..workers {
+                sc.spawn(move || q.work(page_list, extra_list));
+            }
         }
-        let mut page_glyphs = shaped.pop_front().expect("formade sidor");
-        let mut page = doc.start_page_with(PageSettings::from_wh(page_ops.geom.pw, page_ops.geom.ph).ok_or("ogiltig sidstorlek")?);
-        let mut links = Vec::new();
-        let mut gotos = Vec::new();
-        {
-            let mut s = page.surface();
-            for op in page_ops.ops.iter().chain(extras[pi].iter()) {
-                match op {
-                    Op::Rect { x, y, w, h, color } => {
-                        if let Some(r) = Rect::from_xywh(*x, *y, *w, *h) {
-                            let mut pb = PathBuilder::new();
-                            pb.push_rect(r);
-                            if let Some(path) = pb.finish() {
-                                s.set_fill(Some(fill(*color)));
-                                s.set_stroke(None);
-                                s.draw_path(&path);
+        let r = (|| -> Result<(), String> {
+            for (pi, page_ops) in lay.pages.iter().enumerate() {
+                if shaped.is_empty() {
+                    let t_shape = std::time::Instant::now();
+                    shaped = match &queue {
+                        Some(q) => q.take(pi / SHAPE_BATCH).ok_or("formningen avbröts")?,
+                        None => {
+                            let end = (pi + SHAPE_BATCH).min(total);
+                            shape_jobs(&page_jobs(&lay.pages, &extras, pi, end), &shapers)
+                        }
+                    }
+                    .into_iter()
+                    .map(Vec::into_iter)
+                    .collect();
+                    shape_time += t_shape.elapsed();
+                }
+                let mut page_glyphs = shaped.pop_front().expect("formade sidor");
+                let mut page = doc.start_page_with(PageSettings::from_wh(page_ops.geom.pw, page_ops.geom.ph).ok_or("ogiltig sidstorlek")?);
+                let mut links = Vec::new();
+                let mut gotos = Vec::new();
+                {
+                    let mut s = page.surface();
+                    for op in page_ops.ops.iter().chain(extras[pi].iter()) {
+                        match op {
+                            Op::Rect { x, y, w, h, color } => {
+                                if let Some(r) = Rect::from_xywh(*x, *y, *w, *h) {
+                                    let mut pb = PathBuilder::new();
+                                    pb.push_rect(r);
+                                    if let Some(path) = pb.finish() {
+                                        s.set_fill(Some(fill(*color)));
+                                        s.set_stroke(None);
+                                        s.draw_path(&path);
+                                    }
+                                }
                             }
-                        }
-                    }
-                    Op::Math { x, y, src, display, em, color } => draw_math(&mut s, src, *display, *x, *y, *em, *color),
-                    Op::Line { x1, y1, x2, y2, width, color } => {
-                        let mut pb = PathBuilder::new();
-                        pb.move_to(*x1, *y1);
-                        pb.line_to(*x2, *y2);
-                        if let Some(path) = pb.finish() {
-                            s.set_fill(None);
-                            s.set_stroke(Some(Stroke {
-                                paint: rgb::Color::new(color.0, color.1, color.2).into(),
-                                width: *width,
-                                miter_limit: 4.0,
-                                line_cap: LineCap::Butt,
-                                line_join: LineJoin::Miter,
-                                opacity: NormalizedF32::ONE,
-                                dash: None,
-                            }));
-                            s.draw_path(&path);
-                        }
-                    }
-                    Op::Text { x, y, face, size, text, color, italic } => {
-                        s.set_stroke(None);
-                        s.set_fill(Some(fill(*color)));
-                        if *italic {
-                            // Plex finns inte i kursiv här: luta texten 12° (falsk kursiv).
-                            s.push_transform(&Transform::from_row(1.0, 0.0, -0.21, 1.0, 0.21 * y, 0.0));
-                        }
-                        let glyphs = page_glyphs.next().expect("formad text");
-                        s.draw_glyphs(Point::from_xy(*x, *y), &glyphs, fonts[face].clone(), text, *size, false);
-                        if *italic {
-                            s.pop();
-                        }
-                    }
-                    Op::Image { x, y, w, h, index, crop } => {
-                        if let Some(size) = Size::from_wh(*w, *h) {
-                            match crop {
-                                // Beskärning: hela bilden ritas större och klipps till rutan.
-                                Some(c) => {
-                                    let (fw, fh) = (*w / (1.0 - (c[0] + c[2]) / 100.0), *h / (1.0 - (c[1] + c[3]) / 100.0));
-                                    if let (Some(full), Some(r)) = (Size::from_wh(fw, fh), Rect::from_xywh(*x, *y, *w, *h)) {
-                                        let mut pb = PathBuilder::new();
-                                        pb.push_rect(r);
-                                        if let Some(path) = pb.finish() {
-                                            s.push_clip_path(&path, &FillRule::NonZero);
-                                            s.push_transform(&Transform::from_translate(*x - fw * c[0] / 100.0, *y - fh * c[1] / 100.0));
-                                            images[*index].draw(&mut s, full);
-                                            s.pop();
+                            Op::Math { x, y, src, display, em, color } => draw_math(&mut s, src, *display, *x, *y, *em, *color),
+                            Op::Line { x1, y1, x2, y2, width, color } => {
+                                let mut pb = PathBuilder::new();
+                                pb.move_to(*x1, *y1);
+                                pb.line_to(*x2, *y2);
+                                if let Some(path) = pb.finish() {
+                                    s.set_fill(None);
+                                    s.set_stroke(Some(Stroke {
+                                        paint: rgb::Color::new(color.0, color.1, color.2).into(),
+                                        width: *width,
+                                        miter_limit: 4.0,
+                                        line_cap: LineCap::Butt,
+                                        line_join: LineJoin::Miter,
+                                        opacity: NormalizedF32::ONE,
+                                        dash: None,
+                                    }));
+                                    s.draw_path(&path);
+                                }
+                            }
+                            Op::Text { x, y, face, size, text, color, italic } => {
+                                s.set_stroke(None);
+                                s.set_fill(Some(fill(*color)));
+                                if *italic {
+                                    // Plex finns inte i kursiv här: luta texten 12° (falsk kursiv).
+                                    s.push_transform(&Transform::from_row(1.0, 0.0, -0.21, 1.0, 0.21 * y, 0.0));
+                                }
+                                let glyphs = page_glyphs.next().expect("formad text");
+                                s.draw_glyphs(Point::from_xy(*x, *y), &glyphs, fonts[face].clone(), text, *size, false);
+                                if *italic {
+                                    s.pop();
+                                }
+                            }
+                            Op::Image { x, y, w, h, index, crop } => {
+                                if let Some(size) = Size::from_wh(*w, *h) {
+                                    match crop {
+                                        // Beskärning: hela bilden ritas större och klipps till rutan.
+                                        Some(c) => {
+                                            let (fw, fh) = (*w / (1.0 - (c[0] + c[2]) / 100.0), *h / (1.0 - (c[1] + c[3]) / 100.0));
+                                            if let (Some(full), Some(r)) = (Size::from_wh(fw, fh), Rect::from_xywh(*x, *y, *w, *h)) {
+                                                let mut pb = PathBuilder::new();
+                                                pb.push_rect(r);
+                                                if let Some(path) = pb.finish() {
+                                                    s.push_clip_path(&path, &FillRule::NonZero);
+                                                    s.push_transform(&Transform::from_translate(*x - fw * c[0] / 100.0, *y - fh * c[1] / 100.0));
+                                                    images[*index].draw(&mut s, full);
+                                                    s.pop();
+                                                    s.pop();
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            s.push_transform(&Transform::from_translate(*x, *y));
+                                            images[*index].draw(&mut s, size);
                                             s.pop();
                                         }
                                     }
                                 }
-                                None => {
-                                    s.push_transform(&Transform::from_translate(*x, *y));
-                                    images[*index].draw(&mut s, size);
-                                    s.pop();
-                                }
                             }
+                            Op::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
+                            Op::Goto { x, y, w, h, page, to_y } => gotos.push((*x, *y, *w, *h, *page, *to_y)),
                         }
                     }
-                    Op::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
-                    Op::Goto { x, y, w, h, page, to_y } => gotos.push((*x, *y, *w, *h, *page, *to_y)),
+                    s.finish();
                 }
+                for (x, y, w, h, url) in links {
+                    if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
+                        let target = krilla::annotation::Target::Action(krilla::action::Action::Link(krilla::action::LinkAction::new(url)));
+                        page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
+                    }
+                }
+                for (x, y, w, h, to_page, to_y) in gotos {
+                    if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
+                        let dest = krilla::destination::XyzDestination::new(to_page, Point::from_xy(lay.ml, to_y));
+                        let target = krilla::annotation::Target::Destination(krilla::destination::Destination::Xyz(dest));
+                        page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
+                    }
+                }
+                page.finish();
             }
-            s.finish();
-        }
-        for (x, y, w, h, url) in links {
-            if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
-                let target = krilla::annotation::Target::Action(krilla::action::Action::Link(krilla::action::LinkAction::new(url)));
-                page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
-            }
-        }
-        for (x, y, w, h, to_page, to_y) in gotos {
-            if let Some(rect) = Rect::from_xywh(x, y, w.max(1.0), h) {
-                let dest = krilla::destination::XyzDestination::new(to_page, Point::from_xy(lay.ml, to_y));
-                let target = krilla::annotation::Target::Destination(krilla::destination::Destination::Xyz(dest));
-                page.add_annotation(krilla::annotation::Annotation::new_link(krilla::annotation::LinkAnnotation::new(rect, target), None));
-            }
-        }
-        page.finish();
-    }
 
+            Ok(())
+        })();
+        if let Some(q) = &queue {
+            q.stop();
+        }
+        r
+    });
+    drawn?;
+
+    if crate::timing::enabled() {
+        eprintln!("[timing] pdf: varav formning (väntetid på huvudtråden): {:.1} ms", shape_time.as_secs_f64() * 1000.0);
+    }
     crate::timing::lap("pdf: ritning av sidor");
     // Bokmärken från rubrikerna (nivå 1–3), nästlade efter nivå.
     let mut outline = krilla::outline::Outline::new();
@@ -3462,6 +3579,25 @@ mod tests {
         assert!(w.bytes.starts_with(b"%PDF"));
         let w = write("<div align=\"justify\">\n\nEn <span style=\"background-color: #FF0\">gul</span> rad.\n\n</div>\n", "x", &|_| None).unwrap();
         assert!(w.bytes.starts_with(b"%PDF"));
+    }
+
+    /// Formningen på arbetstrådar ger exakt samma PDF som formning på huvudtråden.
+    #[test]
+    fn threaded_shaping_gives_the_same_bytes() {
+        let mut md = String::new();
+        for i in 0..1200 {
+            md.push_str(&format!("# Avsnitt {i}\n\nStycke {i} med **fet**, *kursiv* och `kod` samt åäö och en [länk](https://exempel.se/{i}).[^1]\n\n"));
+        }
+        md.push_str("[^1]: En fotnot.\n");
+        let none = |_: &str| None;
+        let threaded = write(&md, "T", &none).unwrap().bytes;
+        SINGLE_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
+        let single = write(&md, "T", &none).unwrap().bytes;
+        SINGLE_THREAD.store(false, std::sync::atomic::Ordering::Relaxed);
+        let text = String::from_utf8_lossy(&single);
+        let pages = text.matches("/Type /Page").count().max(text.matches("/Type/Page").count());
+        assert!(pages > 2 * SHAPE_BATCH, "{pages} sidor");
+        assert!(threaded == single, "PDF:en skiljer sig mellan flertrådad och enkeltrådad formning");
     }
 
     #[test]

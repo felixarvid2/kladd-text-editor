@@ -225,6 +225,17 @@ fn decode_xml(buf: &[u8]) -> String {
     }
 }
 
+/// Som `decode_xml`, men giltig UTF-8 (det vanliga) blir en `String` utan kopia.
+fn decode_xml_owned(mut buf: Vec<u8>) -> String {
+    if buf.starts_with(&[0xFF, 0xFE]) || buf.starts_with(&[0xFE, 0xFF]) {
+        return decode_xml(&buf);
+    }
+    if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        buf.drain(..3);
+    }
+    String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 struct Package<'a> {
     zip: zip::ZipArchive<Cursor<&'a [u8]>>,
     total: u64,
@@ -233,7 +244,7 @@ struct Package<'a> {
 impl Package<'_> {
     fn part(&mut self, name: &str) -> Result<Option<String>, String> {
         let Some(buf) = self.part_bytes(name)? else { return Ok(None) };
-        Ok(Some(decode_xml(&buf)))
+        Ok(Some(decode_xml_owned(buf)))
     }
 
     fn part_bytes(&mut self, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -985,10 +996,20 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(crate::i18n::t("Word-dokumentet är för stort för att öppnas.").into());
     }
+    crate::timing::lap_start();
     check_entry_count(bytes)?;
     let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| crate::tf!("Word-dokumentet är skadat: {e}", e = e))?;
-    let mut pkg = Package { zip, total: 0 };
+    let pkg = Package { zip, total: 0 };
+    crate::timing::lap("docx: zip-katalog");
+    // Källans delar (alla filer i paketet, för den källbevarande sparningen) packas upp i en egen tråd medan
+    // dokumentet tolkas: de behövs först allra sist och beror inte på tolkningen.
+    std::thread::scope(|sc| {
+        let parts = sc.spawn(|| collect_parts(bytes));
+        read_package(pkg, || parts.join().ok().flatten())
+    })
+}
 
+fn read_package(mut pkg: Package<'_>, take_parts: impl FnOnce() -> Option<Vec<(String, Vec<u8>)>>) -> Result<Loaded, String> {
     // Huvuddokumentet pekas ut av paketets relationer.
     let main = pkg
         .part("_rels/.rels")?
@@ -1004,6 +1025,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         return Err(crate::i18n::t("Word-dokumentet saknar sitt huvudinnehåll.").into());
     };
 
+    crate::timing::lap("docx: document.xml uppackad");
     let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
     let rels = pkg.part(&rels_name)?.map(|x| parse_rels(&x)).unwrap_or_default();
     let find_part = |suffix: &str| {
@@ -1035,11 +1057,27 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         Some(p) => pkg.part(&p)?.map(|x| parse_numbering(&x)).unwrap_or_default(),
         None => Numbering::default(),
     };
+    crate::timing::lap("docx: tema, formatmallar, numrering");
     let mut dropped = Dropped::default();
 
     let mut found: Vec<FoundImage> = Vec::new();
     let mut info = BodyInfo { track: true, ..Default::default() };
-    let mut blocks = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info)?;
+    // Fot- och slutnoternas delar packas upp här och tolkas i egna trådar medan brödtexten tolkas (de beror bara
+    // på formatmallar, tema och numrering). Fel från uppackningen visas efter brödtextens, som förut.
+    let fn_raw = find_part("/footnotes").map(|name| raw_footnotes(&mut pkg, &name));
+    let en_raw = find_part("/endnotes").map(|name| raw_footnotes(&mut pkg, &name));
+    let (body, footnotes, endnotes) = std::thread::scope(|sc| {
+        let fnh = fn_raw.as_ref().and_then(|r| r.as_ref().ok()).map(|raw| sc.spawn(|| read_footnotes(raw, &styles, &theme, &numbering, "footnote")));
+        let enh = en_raw.as_ref().and_then(|r| r.as_ref().ok()).map(|raw| sc.spawn(|| read_footnotes(raw, &styles, &theme, &numbering, "endnote")));
+        let body = parse_body(&doc_xml, &styles, &theme, &numbering, &rels, &mut dropped, &mut found, dir, &mut info);
+        let join = |h: Option<std::thread::ScopedJoinHandle<'_, Option<FnPart>>>| h.and_then(|h| h.join().ok()).flatten();
+        (body, join(fnh), join(enh))
+    });
+    let mut blocks = body?;
+    for r in [fn_raw, en_raw].into_iter().flatten() {
+        r?;
+    }
+    crate::timing::lap("docx: parse_body");
     // Kommentarerna: posterna läggs sist i texten, och bara de som har ett område.
     let comments = match find_part("/comments") {
         Some(name) => {
@@ -1049,18 +1087,10 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         None => None,
     };
 
-    // Fotnoterna: texten läses ur footnotes.xml och läggs som definitioner sist i dokumentet.
-    let footnotes = match find_part("/footnotes") {
-        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering, "footnote")?,
-        None => None,
-    };
+    // Fotnoterna (texten ur footnotes.xml läggs som definitioner sist i dokumentet) och slutnoterna (endnotes.xml,
+    // `ei`, `eii` …) är lästa ovan.
 
-    // Slutnoterna: endnotes.xml, som fotnoterna men med etiketterna `ei`, `eii` …
-    let endnotes = match find_part("/endnotes") {
-        Some(name) => read_footnotes(&mut pkg, &name, &styles, &theme, &numbering, "endnote")?,
-        None => None,
-    };
-
+    crate::timing::lap("docx: kommentarer, fotnoter, slutnoter");
     // Sida, sidhuvud och sidfot ur första avsnittet (de övriga avsnitten blir avsnittsrader).
     let page = match info.sects.first().or(info.sect_pr.as_ref()) {
         Some(sect) => read_page(sect)?,
@@ -1100,6 +1130,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         page.page_start = h.own.page_start;
         page.page_format = h.own.page_fmt;
     }
+    crate::timing::lap("docx: sidhuvud/sidfot");
     fill_section_rows(&mut blocks, &all_sects, &page, &sect_hf);
 
     // Packa upp bilderna som dokumentet faktiskt använder.
@@ -1135,7 +1166,9 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
             }
         }
     }
+    crate::timing::lap("docx: fill_*, rutor");
     let (mut markdown, mut units) = to_markdown_units(&blocks, &numbering, text_w);
+    crate::timing::lap("docx: to_markdown_units");
     let mut keys: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
     // Grundformatet (typsnitt, storlek och sida) står först när det avviker från standard.
     let mut base = styles.base();
@@ -1191,6 +1224,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if !comment.is_empty() {
         markdown = format!("{comment}\n\n{markdown}");
     }
+    crate::timing::lap("docx: noter, kommentarer, review");
     for f in found {
         // Ett diagram som Kladd skrivit: koden i alt-texten blir ett ```mermaid-block igen (inte en bild).
         if let Some(code) = mermaid_code(&f.alt) {
@@ -1258,11 +1292,15 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         }
     }
 
+    crate::timing::lap("docx: bilder");
+    let mut toc_heads = None;
     for k in keys.iter_mut().filter(|k| crate::word::nav::is_toc_line(k)) {
-        *k = toc_unit_key(k, &markdown);
+        *k = toc_unit_key(k, &markdown, &mut toc_heads);
     }
+    drop(toc_heads);
 
-    let source = collect_parts(&mut pkg).and_then(|parts| {
+    crate::timing::lap("docx: förteckningsnycklar");
+    let source = take_parts().and_then(|parts| {
         // Delen får det namn den har i paketet (skiftläge kan skilja).
         let real = parts.iter().find(|(n, _)| n.trim_start_matches('/').eq_ignore_ascii_case(&main)).map(|(n, _)| n.clone())?;
         if !info.head.contains("<w:document") {
@@ -1281,6 +1319,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         }
         Some(Source { parts, main: real, head: info.head, tail: info.tail, sect_pr: info.sect_pr, elems, tokens: info.tokens, footnotes, endnotes, page, styles: read_styles, comments, hf_secs: sect_hf.iter().map(|h| h.own.clone()).collect(), sect_prs, tboxes })
     });
+    crate::timing::lap("docx: källa (collect_parts)");
     Ok(Loaded { source, markdown, images, dropped: dropped.list() })
 }
 
@@ -1377,21 +1416,33 @@ fn footnote_md(
     escape_line_start(&joined)
 }
 
-fn read_footnotes(pkg: &mut Package<'_>, name: &str, styles: &Styles, theme: &Theme, numbering: &Numbering, tag: &str) -> Result<Option<FnPart>, String> {
+/// Det som läses ur paketet för fot- eller slutnoter: delens namn, XML och relationer.
+struct RawNotes {
+    name: String,
+    xml: String,
+    /// Hyperlänkar i noterna pekar på delens egna relationer.
+    rels: HashMap<String, (String, String, bool)>,
+}
+
+fn raw_footnotes(pkg: &mut Package<'_>, name: &str) -> Result<Option<RawNotes>, String> {
     let Some(xml) = pkg.part(name)? else { return Ok(None) };
-    let Some((head, raw, tail)) = split_footnotes(&xml, tag) else { return Ok(None) };
-    // Hyperlänkar i fotnoterna pekar på footnotes.xml:s egna relationer.
     let (dir, file) = name.rsplit_once('/').unwrap_or(("", name));
     let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
     let rels = pkg.part(&rels_name)?.map(|x| parse_rels(&x)).unwrap_or_default();
+    Ok(Some(RawNotes { name: name.to_owned(), xml, rels }))
+}
+
+fn read_footnotes(raw: &Option<RawNotes>, styles: &Styles, theme: &Theme, numbering: &Numbering, tag: &str) -> Option<FnPart> {
+    let RawNotes { name, xml, rels } = raw.as_ref()?;
+    let (head, raw, tail) = split_footnotes(xml, tag)?;
     let items = raw
         .into_iter()
         .map(|(id, ty, xml_el, inner)| {
-            let md = if ty.is_none() { footnote_md(&xml[inner], styles, theme, numbering, &rels) } else { String::new() };
+            let md = if ty.is_none() { footnote_md(&xml[inner], styles, theme, numbering, rels) } else { String::new() };
             FnOrig { id, ty, md, xml: xml_el }
         })
         .collect();
-    Ok(Some(FnPart { name: name.to_owned(), head, tail, items }))
+    Some(FnPart { name: name.to_owned(), head, tail, items })
 }
 
 /// Hur en bild skrivs i texten: `![alt](bild:namn)`, eller `<img … width>` när storleken avviker
@@ -1459,11 +1510,12 @@ fn image_md(name: &str, alt: &str, extent: Option<(i64, i64)>, img: Option<&Imag
 }
 
 /// Alla poster i paketet i ordning, eller `None` om de blir för stora.
-fn collect_parts(pkg: &mut Package<'_>) -> Option<Vec<(String, Vec<u8>)>> {
+fn collect_parts(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
     let mut out = Vec::new();
     let mut total = 0u64;
-    for i in 0..pkg.zip.len() {
-        let mut f = pkg.zip.by_index(i).ok()?;
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).ok()?;
         if f.is_dir() {
             continue;
         }
@@ -4327,12 +4379,15 @@ fn sized_extent(img: &Image, size: (Option<f64>, Option<f64>), crop: Option<[f64
 
 /// Enhetsnyckeln för en förteckningsrad: raden och en kontrollsumma över posterna, så att en förteckning
 /// skrivs om när rubrikerna (eller bildtexterna) ändrats och annars behåller originalets XML.
-fn toc_unit_key(key: &str, md: &str) -> String {
+///
+/// `heads` är rubrikerna i `md`; de söks fram första gången en förteckning behöver dem och delas av alla
+/// förteckningar i texten (annars skannas hela dokumentet en gång per förteckning).
+fn toc_unit_key(key: &str, md: &str, heads: &mut Option<Vec<crate::word::nav::Heading>>) -> String {
     use std::hash::{Hash, Hasher};
     let Some(spec) = crate::word::nav::parse_toc(key) else { return key.to_owned() };
-    let heads = crate::word::nav::headings_scan(md);
+    let heads = heads.get_or_insert_with(|| crate::word::nav::headings_scan(md));
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for e in crate::word::nav::toc_items(md, &heads, &spec) {
+    for e in crate::word::nav::toc_items(md, heads, &spec) {
         (e.level, e.text.trim()).hash(&mut h);
     }
     format!("{key}\u{1}{:016x}", h.finish())
@@ -4360,6 +4415,8 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
     opts.insert(Options::ENABLE_MATH);
     opts.insert(titles::OPTS);
     let mut next_num: u32 = base + 1; // base = punktlistor
+    // Rubrikerna i `md` för förteckningarnas kontrollsummor (söks fram första gången de behövs).
+    let mut toc_heads: Option<Vec<crate::word::nav::Heading>> = None;
     // Enheter (stycke, listpunkt, tabell …) i brödtexten, för att kunna bytas mot originalet.
     let mut cur: Option<OpenUnit> = None;
     let mut items: Vec<OpenItem> = Vec::new();
@@ -4846,7 +4903,7 @@ fn body_from_markdown<'a>(md: &str, resolve: &dyn Fn(&str) -> Option<Image>, ctx
                             || crate::word::pbox::parse_empty(&key).is_some();
                         if ok && !key.is_empty() {
                             // En förteckning är oförändrad bara om rubrikerna är det.
-                            let key = toc_unit_key(&key, md);
+                            let key = toc_unit_key(&key, md, &mut toc_heads);
                             w.units.push(GenUnit { desc: c.desc, key, range: c.start..w.body.len() });
                         }
                     }

@@ -74,6 +74,17 @@ fn is_container(path: &Path) -> bool {
 /// och tolka XML tar sekunder för ett dokument på hundratals sidor.
 pub const WORD_BACKGROUND_BYTES: u64 = 100_000;
 
+/// ... eller om delarna är så här stora uppackade: text-XML packas till en bråkdel, så ett dokument på hundratals
+/// sidor kan vara under 100 kB packat och ändå ta över 100 ms att tolka (och hålla första bildrutan).
+pub const WORD_BACKGROUND_UNPACKED_BYTES: u64 = 1_000_000;
+
+/// Delarnas sammanlagda storlek uppackade, ur zip-katalogen (ingen del packas upp). 0 om filen inte är ett zip-arkiv.
+fn unpacked_len(path: &Path) -> u64 {
+    let Ok(f) = std::fs::File::open(path) else { return 0 };
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(f)) else { return 0 };
+    (0..zip.len()).filter_map(|i| zip.by_index_raw(i).ok().map(|e| e.size())).sum()
+}
+
 /// Är det ett dokument som `Document::load` gör om till Markdown (`.docx`, `.dotx`, `.odt`) eller en bok (`.epub`)?
 fn is_word_file(path: &Path) -> bool {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -84,7 +95,7 @@ fn is_word_file(path: &Path) -> bool {
 pub fn wants_background(path: &Path) -> bool {
     let len = std::fs::metadata(path).map_or(0, |m| m.len());
     if is_word_file(path) {
-        return len > WORD_BACKGROUND_BYTES;
+        return len > WORD_BACKGROUND_BYTES || unpacked_len(path) > WORD_BACKGROUND_UNPACKED_BYTES;
     }
     !is_container(path) && len > bigtext::BACKGROUND_LOAD_BYTES
 }
@@ -420,6 +431,15 @@ mod tests {
             std::fs::write(&f, vec![b'a'; WORD_BACKGROUND_BYTES as usize]).unwrap();
             assert!(!wants_background(&f), "{name}");
         }
+        // Ett litet (packat) dokument med mycket XML går också i bakgrunden: texten packas till en bråkdel.
+        let md = crate::word::bench::big_markdown(300_000, 5);
+        let packed = dir.join("packad.docx");
+        std::fs::write(&packed, crate::docx::write(&md, "P", &|_| None, None).unwrap().bytes).unwrap();
+        assert!(unpacked_len(&packed) > WORD_BACKGROUND_UNPACKED_BYTES, "{} byte uppackat", unpacked_len(&packed));
+        let tiny = dir.join("liten.docx");
+        std::fs::write(&tiny, crate::docx::write("Hej\n", "P", &|_| None, None).unwrap().bytes).unwrap();
+        assert!(unpacked_len(&tiny) < WORD_BACKGROUND_UNPACKED_BYTES);
+        assert!(!wants_background(&tiny));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

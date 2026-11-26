@@ -257,3 +257,20 @@ fn same_layout(a: &Galley, b: &Galley) -> bool {
                 && x.row.glyphs.iter().zip(&y.row.glyphs).all(|(g, h)| g.pos == h.pos && g.chr == h.chr && g.advance_width == h.advance_width)
         })
 }
+
+/// Första bildrutan efter öppning: när bilderna blir kända behålls analysen (den tolkas inte om); efter en
+/// utläggning kasseras allt som förr.
+#[test]
+fn image_sizes_keep_the_analysis_until_something_is_laid_out() {
+    let text = document(30);
+    let mut rig = Rig::new();
+    let before = rig.cache.analysis(1, &text);
+    rig.cache.images_sized(1);
+    assert!(Arc::ptr_eq(&before, &rig.cache.analysis(1, &text)), "analysen tolkades om före första utläggningen");
+    rig.frame(&text, None);
+    let laid = rig.cache.analysis(1, &text);
+    rig.cache.images_sized(1);
+    assert!(!Arc::ptr_eq(&laid, &rig.cache.analysis(1, &text)), "utläggningen kasserades inte");
+    // Okänt dokument: inget att göra.
+    rig.cache.images_sized(99);
+}

@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Ändrat
+
+- **Snabbare öppning av Word- och ODT-filer, inget gap efter inläsningen och flertrådad PDF-export.** Ett `.docx` på 404 sidor läses på 77 ms i stället för 160 ms (9 MB XML, 1 212 sidor: 270 ms i stället för 760 ms): källans delar (alla filer i paketet för den källbevarande sparningen) packas upp i en egen tråd medan dokumentet tolkas, fot- och slutnoterna tolkas på egna trådar under tiden brödtexten tolkas, förteckningarnas kontrollsummor delar en rubriksökning i stället för att skanna hela texten per förteckning, och XML-delarna blir `String` utan kopia. Ett `.odt` tolkar `office:text` i `content.xml` på flera trådar (bitar som börjar vid ett barns starttagg, samma träd som förut; testas mot den sekventiella tolkningen) och river träden i bakgrunden: 184 ms i stället för 243 ms för 10 MB XML. Gapet mellan färdig inläsning och första utläggning (0,35 s i debug) berodde på att första bildrutan kastade den färdiga analysen när bilderna blev kända (analysen tolkades om) och på att ordantalet i statusraden räknades om i varje bildruta; analysen behålls nu och ordantalet räknas bara när texten ändrats (82 ms i stället för 222 ms från färdig inläsning till första sidan, opt-level 2). Word- och ODT-filer som är små packade men har över 1 MB XML läses nu också i bakgrunden, så fönstret ritas direkt. PDF-exporten formar texten på arbetstrådar medan huvudtråden ritar sidorna (krilla är enkeltrådat), med egna typsnittsytor per tråd som återanvänds; PDF:en är byte för byte densamma. Uppstarten (fönster, GL, typsnitt, stavning, syntaxfärgning, inställningar) har inget kvar att vinna: Kladds egen del före första bilden är under 10 ms. Mätningar i `docs/dev/prestanda.md`.
+
 ## [2.9.0] – 2026-11-26
 
 ### Nytt

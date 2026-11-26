@@ -418,6 +418,114 @@ Vad som tog tid och vad som gjordes:
 - Återstår: formningen och krillas `draw_glyphs` är nu det mesta av tiden (~3 s för 125 000 textkörningar);
   PDF-exporten körs fortfarande på gränssnittstråden (Arkiv → Spara som PDF och utskrift).
 
+## Öppning, gapet efter inläsningen, uppstart och PDF-trådar (2.10)
+
+Mätt i optimerat läge (opt-level 2 för hela beroendeträdet i en egen målkatalog), median av 9 körningar, omväxlande
+före- och efterbygget, på en delad 4-kärnig maskin med andra byggen igång (lastsnitt 4–10, så siffrorna varierar
+±25 %; ordningen mellan före och efter är stabil). Testdokument: `gen-skolrapport.docx` upprepad 100 respektive 300
+gånger (`wave-view/gen-stor-docx.py`; 404 sidor/3 MB XML och 1 212 sidor/9 MB XML, lagrade eller packade), och
+samma dokument som `.odt` (skrivet av Kladd, 10 MB `content.xml`). `bench_docx_read` (ny, ignorerad) läser en fil
+`KLADD_BENCH_READS` gånger och skriver median och minimum; `KLADD_TIMING=1` skriver delsteg (`docx: …`, `odt: …`).
+
+### 7. Läsning av Word och ODT
+
+| Fall | Före (median / minst) | Efter (median / minst) |
+|---|---|---|
+| `.docx` 404 sidor, 3 MB XML, lagrad | 141 / 133 ms | 74 / 71 ms |
+| `.docx` 404 sidor, packad (66 kB) | 156 / 136 ms | 84 / 79 ms |
+| `.docx` 1 212 sidor, 9 MB XML, packad (149 kB) | 829 / 769 ms | 294 / 267 ms |
+| `.odt` 10 MB `content.xml` | 229 / 211 ms | 162 / 145 ms |
+
+Delsteg för 404 sidor (före → efter): `collect_parts` (källans delar för den källbevarande sparningen) 57–92 ms →
+0 på huvudtråden, tolkningen av brödtexten (`parse_body`, 64 ms) är nu den dominerande och enda stora delen; 1 212 sidor:
+förteckningsnycklarna 500 ms → 49 ms.
+
+- **Källans delar i egen tråd.** `collect_parts` packar upp alla filer i paketet (bilder, XML) och behövs först allra
+  sist (`Source::parts`); den körs nu i en egen tråd (`std::thread::scope`, egen `ZipArchive` över samma byte, samma
+  gränser och samma resultat) medan resten läses. I ett dokument med stora foton är det den största enskilda kostnaden.
+  Bilderna som dokumentet visar packas fortfarande upp bara om de används (`pkg.part_bytes`).
+- **Förteckningsnycklarna** (`toc_unit_key`) sökte fram rubrikerna i hela texten en gång per förteckning; nu delas
+  sökningen av alla förteckningar (ett dokument har oftast en, mätdokumentet 300).
+- **Fot- och slutnoter** tolkas i egna trådar (`read_footnotes` delades i `raw_footnotes`, som läser ur paketet, och
+  tolkningen) medan brödtexten tolkas; fel vid uppackningen visas efter brödtextens, som förut.
+- **XML-delarna** (`Package::part`, `Pkg::text`) blir `String` utan kopia när de är giltig UTF-8.
+- **ODT:** `office:text` i `content.xml` tolkas på upp till 8 trådar (`parse_xml_par`): en lätt skanning
+  (`text_children`, hanterar citattecken i attribut, kommentarer, CDATA och processinstruktioner) hittar barnens
+  starttaggar, skelettet (allt utom barnen) tolkas för sig och bitarna sätts in i `office:text`. Ger skanningen eller
+  någon bit upp, eller har dokumentet en annan form, tolkas det i ett stycke med samma fel som förut. Testat mot den
+  sekventiella tolkningen (`odt_par_tests.rs`: träden jämförs för olika innehåll, trådantal och felfall). XML-träden
+  rivs i en bakgrundstråd (10 % av tiden).
+- **Bilder, formatmallar och sidhuvud** mättes: under 2 ms vardera i testdokumenten (som har en bild; inte mätt med många foton). Resten av `docx::read` är en
+  platt profil (`callgrind`: ingen funktion över 6 % utom `quick_xml` själv och minnesallokering); `parse_body` bär
+  global ordning (fotnotsnummer, markörnummer, ändringsnummer, bildplatshållare) och delades inte.
+
+### 8. Gapet efter inläsningen
+
+Orsaken var två saker i första bildrutan efter att dokumentet installerats, inte teckensnitt, stavning, rubrikträd
+eller historik (alla under 1 ms):
+
+1. `word_image` anropade `Cache::forget` så fort en bilds storlek blev känd ("layoutcachen nycklar inte på
+   bildstorlekar"), och det händer i första bildrutan. Det kastade den färdiga analysen som inläsningstråden gjort
+   (`Prepared`) och tvingade fram en ny `markup::analyze` (ca 60 ms i opt, 0,3 s i debug) mitt i bildrutan. Nu
+   behåller `Cache::images_sized` allt när inget lagts ut än; efter en utläggning kasseras det som förut.
+2. Statusraden räknade orden i hela dokumentet i varje bildruta (`markup::count` bygger en kopia av hela texten):
+   ca 5 ms per bildruta vid 650 kB. Ordantalet cachas nu på (flik, textlängd, texthash).
+
+| Mått | Före | Efter |
+|---|---|---|
+| Färdig inläsning → första sidan klar, 404 sidor (3 MB lagrad) | 186 ms (173–195) | 69 ms (64–106) |
+| Samma, `.docx` packat till 66 kB | 572 ms | 102 ms |
+| Ordräkning i statusraden, per bildruta (404 sidor) | ca 5 ms | cachas; kvar är hashen av texten (ca 0,1 ms, uppskattad, inte mätt i appen) |
+
+(Siffrorna inkluderar själva utläggningen, 50–60 ms.) En ändring av ett Word-dokument med redan utlagda sidor
+kasserar cachen som förut (`images_sized` gör `forget` när något lagts ut).
+
+### 10. Uppstart
+
+`KLADD_TIMING=1`, tom miljö, `--new-window`, Xvfb med programvaru-GL, median av 5:
+
+| Steg (tom start, ms sedan processstart) | Före | Efter |
+|---|---|---|
+| `main` till `run_native` (argument, enkelinstans, ikon) | 0,5 | 0,5 |
+| winit, X11, GL-kontext (Mesa/llvmpipe), eframe | 64–79 | 64–79 (utanför Kladd; `strace` visar bara bibliotek, X11 och Mesa) |
+| `KladdApp::new` (typsnitt, stilar, inställningar, återställning, syntaxer, bibliotek, enkelinstans-socket) | 1,0 | 1,0 |
+| första `logic()` och `ui()` till första bilden | 2–6 | 2–6 |
+| **Första bilden: tom start** | 80 | 79 |
+| Första bilden: textfil / Markdown-fil | 79–126 / 76–85 | 79–86 / 71–95 (brus) |
+| **Första bilden: `.docx` 66 kB packat (3 MB XML)** | **386 (minst 321)** | **96 (minst 77)** |
+| Första bilden: `.docx` 3 MB lagrad (läses redan i bakgrunden) | 128 | 143 (brus) |
+
+Allt som kan skjutas upp var redan uppskjutet förra omgången (typsnitt, stavning, syntaxer, uppdateringskontroll).
+Det som återstår av Kladds del före första bilden är under 10 ms, resten är ramverk och drivrutiner. Enda ändringen:
+Word- och ODT-filer som är små packade men har över 1 MB XML (`WORD_BACKGROUND_UNPACKED_BYTES`, ur zip-katalogen utan
+att packa upp något) läses nu i bakgrunden i stället för att hålla första bilden (tid till första sidan är oförändrad
+inom bruset). Mätningar utan ändring: typsnittsskanning (`fontdb`/`fc-match`) sker först när ett dokument kräver ett
+typsnitt som inte är inbyggt; `install_fonts` tar under 0,1 ms.
+
+### 13. PDF-export på flera trådar
+
+| Fall (opt-level 2) | Före | Efter |
+|---|---|---|
+| 321 sidor (`pdf_bench`, 40 upprepningar), median / minst | 0,60 / 0,56 s | 0,51 / 0,46 s |
+| 641 sidor (80 upprepningar) | 1,12 s | 0,93 s |
+| 81 sidor (10 upprepningar) | 0,16 s | 0,13 s |
+
+PDF:erna är byte för byte lika före och efter (`cmp` på 81, 321 och 641 sidor, och testet
+`threaded_shaping_gives_the_same_bytes` jämför flertrådad och enkeltrådad formning).
+
+Profilen (`callgrind`, huvudtråden + arbetstrådar): formningen (rustybuzz) var 40 % av instruktionerna och låg redan
+på trådar men i grupper som huvudtråden väntade på; krillas ritning (`draw_glyphs`) 17 %, komprimeringen av varje
+sidas innehållsström i `Page::drop` 17 %, utläggningen 16 %. Nu formas grupperna om 32 sidor av upp till sju
+arbetstrådar (var och en med egna typsnittsytor och formningsplaner som återanvänds för alla grupper) medan
+huvudtråden ritar de redan formade sidorna i ordning (`ShapeQueue`; arbetstrådarna ligger högst `2·trådar + 2` grupper
+före). Formningens väntetid på huvudtråden gick från hela formningstiden till 75–130 ms av 0,5 s.
+
+Det som återstår är enkeltrådat och kan inte delas utan att ändra krilla: `Document` och `Surface` är `&mut`,
+glyfregistreringen och sidornas objektnummer beror på ordningen (byte för byte-kravet), och `Page::finish`
+komprimerar på huvudtråden. krillas `rayon`-funktion lades inte till (rayon finns inte i beroendeträdet). Utläggningen
+(16 %) är sekventiell av samma skäl: varje avsnitt börjar där förra slutade. Små dokument (under 32 sidor eller 400
+texter) formas som förut på huvudtråden.
+
 ## Stavning och grammatik
 
 Körs bara i dokumentläget, som redan bara kontrollerar ändrade stycken (`misspelled_cached`); grammatiken

@@ -628,6 +628,16 @@ impl Cache {
         self.docs.remove(&doc_id);
         self.jobs.remove(&doc_id);
     }
+
+    /// Bildernas storlekar blev kända: det som lagts ut förut gäller inte längre. Har inget lagts ut ännu (första
+    /// bildrutan efter öppning, då alla bilder blir kända) finns inget att kassera; analysen beror inte på bildernas
+    /// storlek och behålls i stället för att tolkas om (det var det mesta av gapet efter inläsningen).
+    pub fn images_sized(&mut self, doc_id: u64) {
+        let untouched = self.docs.get(&doc_id).is_some_and(|st| st.frame.is_none() && st.memo.is_none() && st.units.is_empty());
+        if !(untouched && !self.jobs.contains_key(&doc_id)) {
+            self.forget(doc_id);
+        }
+    }
 }
 
 /// Hashar det som påverkar hur ett fönster av texten ser ut efter layout: texten, styckenas

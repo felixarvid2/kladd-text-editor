@@ -110,6 +110,8 @@ enum SpellAct {
 pub struct State {
     pub(crate) images: HashMap<(u64, String), Option<ImgInfo>>,
     spell: Option<SpellCache>,
+    /// Ordantalet i statusraden för (flik, textlängd, texthash): räknas om bara när texten ändrats.
+    words: Option<((u64, usize, u64), usize)>,
     /// Vald bild, pågående storleksändring.
     pub(crate) img: images::State,
     /// Vald textruta, pågående flytt eller storleksändring.
@@ -967,7 +969,7 @@ impl KladdApp {
         self.wv.images.insert(key, info);
         if known {
             // Layoutcachen nycklar inte på bildstorlekar.
-            self.word.forget(self.docs[self.active].id);
+            self.word.images_sized(self.docs[self.active].id);
         }
     }
 
@@ -2223,8 +2225,17 @@ impl KladdApp {
     /// Statusradens högra del i dokumentläget (läggs ut från höger till vänster).
     pub(crate) fn word_status(&mut self, ui: &mut Ui, p: &Palette, font: &FontId) {
         let Some(doc) = self.docs.get(self.active) else { return };
-        let analysis = self.word.analysis(doc.id, &doc.text);
-        let (words, _) = markup::count(&doc.text, &analysis);
+        // Ordräkningen går igenom hela texten: görs bara när texten ändrats, inte i varje bildruta.
+        let key = (doc.id, doc.text.len(), layout::fast_hash(&doc.text));
+        let words = match self.wv.words {
+            Some((k, w)) if k == key => w,
+            _ => {
+                let analysis = self.word.analysis(doc.id, &doc.text);
+                let w = markup::count(&doc.text, &analysis).0;
+                self.wv.words = Some((key, w));
+                w
+            }
+        };
         let (cur, total) = self.wv.pages;
         let zoom_pct = (self.settings.word_zoom * 100.0).round() as i32;
         let label = |ui: &mut Ui, s: String| {

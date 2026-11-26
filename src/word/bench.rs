@@ -312,6 +312,34 @@ fn bench_write_big_markdown() {
     }
 }
 
+/// Bara läsningen (zip/XML till Markdown) av `KLADD_BENCH_DOCX` (.docx eller .odt), `KLADD_BENCH_READS` gånger
+/// (standard 9): median och minimum i ms. Samma som första raden i `bench_docx_open`, men utan resten.
+#[test]
+#[ignore]
+fn bench_docx_read() {
+    let Ok(path) = std::env::var("KLADD_BENCH_DOCX") else { return };
+    let n: usize = std::env::var("KLADD_BENCH_READS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+    let bytes = std::fs::read(&path).unwrap();
+    // KLADD_BENCH_MAKE_ODT=fil: skriv dokumentet som .odt (ett stort .odt att mäta på) och avsluta.
+    if let Ok(out) = std::env::var("KLADD_BENCH_MAKE_ODT") {
+        let l = crate::docx::read(&bytes).unwrap();
+        let w = crate::odt::write(&l.markdown, "Bänk", &|src| crate::doc::resolve_image(src, std::path::Path::new(""), &l.images)).unwrap();
+        std::fs::write(out, &w.bytes).unwrap();
+        return;
+    }
+    let mut t: Vec<f64> = (0..n)
+        .map(|_| {
+            let t = Instant::now();
+            let l = if path.ends_with(".odt") { crate::odt::read(&bytes) } else { crate::docx::read(&bytes) }.unwrap();
+            let d = ms(t);
+            drop(l);
+            d
+        })
+        .collect();
+    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    eprintln!("läsning: median {:.1} ms, minst {:.1} ms ({n} körningar, {} kB)", t[t.len() / 2], t[0], bytes.len() / 1024);
+}
+
 /// Öppning av ett stort Word-dokument (`KLADD_BENCH_DOCX=sökväg`, se docs/dev/prestanda.md):
 /// läsning, analys, stavning, utläggning (med delsteg), en redigering och en oförändrad bildruta.
 #[test]

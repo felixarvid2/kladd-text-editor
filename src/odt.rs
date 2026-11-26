@@ -129,13 +129,38 @@ fn node_of(e: &BytesStart<'_>) -> Node {
     n
 }
 
+/// Dokument över den här storleken tolkas på flera trådar (se `parse_xml_par`).
+const PAR_MIN_BYTES: usize = 256 * 1024;
+
 fn parse_xml(xml: &str) -> Result<Node, String> {
+    if xml.len() >= PAR_MIN_BYTES {
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+        if workers > 1 {
+            if let Some(n) = parse_xml_par(xml, workers) {
+                return Ok(n);
+            }
+        }
+    }
+    parse_xml_seq(xml)
+}
+
+fn parse_xml_seq(xml: &str) -> Result<Node, String> {
+    let root = parse_xml_from(xml, 0)?;
+    root.kids
+        .into_iter()
+        .find_map(|k| if let Kid::El(n) = k { Some(n) } else { None })
+        .ok_or_else(|| "OpenDocument-filen saknar innehåll.".to_owned())
+}
+
+/// Tolkar `xml` till en nod `#rot` med innehållet som barn. `base` är antalet öppna element runt `xml`
+/// (för djupgränsen när bara en del av ett dokument tolkas).
+fn parse_xml_from(xml: &str, base: usize) -> Result<Node, String> {
     let mut r = Reader::from_str(xml);
     let mut stack: Vec<Node> = vec![Node::new("#rot".into())];
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => {
-                if stack.len() > MAX_DEPTH {
+                if stack.len() + base > MAX_DEPTH {
                     return Err(crate::i18n::t("OpenDocument-filen är för djupt nästlad för att öppnas.").into());
                 }
                 stack.push(node_of(&e));
@@ -170,11 +195,104 @@ fn parse_xml(xml: &str) -> Result<Node, String> {
         let n = stack.pop().unwrap();
         stack.last_mut().unwrap().kids.push(Kid::El(n));
     }
-    let root = stack.pop().unwrap();
-    root.kids
-        .into_iter()
-        .find_map(|k| if let Kid::El(n) = k { Some(n) } else { None })
-        .ok_or_else(|| "OpenDocument-filen saknar innehåll.".to_owned())
+    Ok(stack.pop().unwrap())
+}
+
+/// Var `office:text` i ett `content.xml` har sina barn: startpositionerna för barnen (element direkt under
+/// `office:body/office:text`) och positionen för sluttaggen `</office:text>`. `None` om dokumentet inte ser ut
+/// som väntat (då tolkas det i ett stycke).
+fn text_children(xml: &str) -> Option<(Vec<usize>, usize)> {
+    let b = xml.as_bytes();
+    let find = |from: usize, pat: &str| xml.get(from..)?.find(pat).map(|i| from + i);
+    let mut stack: Vec<&str> = Vec::new();
+    let (mut starts, mut end) = (Vec::new(), None);
+    let mut i = 0;
+    while let Some(p) = b[i..].iter().position(|&c| c == b'<') {
+        let at = i + p;
+        match *b.get(at + 1)? {
+            b'?' => i = find(at + 2, "?>")? + 2,
+            b'!' => {
+                if xml[at..].starts_with("<!--") {
+                    i = find(at + 4, "-->")? + 3;
+                } else if xml[at..].starts_with("<![CDATA[") {
+                    i = find(at + 9, "]]>")? + 3;
+                } else {
+                    return None;
+                }
+            }
+            b'/' => {
+                let close = find(at + 2, ">")?;
+                let name = xml[at + 2..close].trim_end();
+                if stack.pop()? != name {
+                    return None;
+                }
+                if stack.len() == 2 && name == "office:text" && end.is_none() {
+                    end = Some(at);
+                }
+                i = close + 1;
+            }
+            _ => {
+                // Starttagg: slutet är första `>` utanför citattecken.
+                let mut j = at + 1;
+                let mut quote = 0u8;
+                let close = loop {
+                    let c = *b.get(j)?;
+                    match (quote, c) {
+                        (0, b'>') => break j,
+                        (0, b'"' | b'\'') => quote = c,
+                        (q, c) if q != 0 && q == c => quote = 0,
+                        _ => {}
+                    }
+                    j += 1;
+                };
+                let empty = b[close - 1] == b'/';
+                let name_end = (at + 1..close).find(|&k| b[k].is_ascii_whitespace() || b[k] == b'/').unwrap_or(close);
+                let name = &xml[at + 1..name_end];
+                if stack.len() == 3 && stack[1] == "office:body" && stack[2] == "office:text" && end.is_none() {
+                    starts.push(at);
+                }
+                if !empty {
+                    stack.push(name);
+                }
+                i = close + 1;
+            }
+        }
+    }
+    (stack.is_empty() && !starts.is_empty()).then_some(())?;
+    Some((starts, end?))
+}
+
+/// Samma träd som `parse_xml_seq`, men barnen till `office:text` (där nästan hela innehållet i ett
+/// `content.xml` ligger) tolkas på `workers` trådar, i bitar som börjar vid ett barns starttagg. Ger `None`
+/// (och anroparen tolkar i ett stycke, med samma fel som förut) om dokumentet inte har den formen eller
+/// någon bit inte går att tolka.
+fn parse_xml_par(xml: &str, workers: usize) -> Option<Node> {
+    let (starts, end) = text_children(xml)?;
+    let n = workers.min(starts.len() / 4);
+    if n < 2 {
+        return None;
+    }
+    // Bitarnas gränser: lika många barn per bit.
+    let mut cuts: Vec<usize> = (0..n).map(|k| starts[k * starts.len() / n]).collect();
+    cuts.push(end);
+    // Skelettet: allt utom barnen till `office:text`.
+    let skeleton = format!("{}{}", &xml[..cuts[0]], &xml[end..]);
+    let mut root = parse_xml_seq(&skeleton).ok()?;
+    let kids: Vec<Option<Vec<Kid>>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = cuts.windows(2).map(|w| sc.spawn(move || parse_xml_from(&xml[w[0]..w[1]], 3).ok().map(|r| r.kids))).collect();
+        hs.into_iter().map(|h| h.join().ok().flatten()).collect()
+    });
+    let text = root.kids.iter_mut().find_map(|k| match k {
+        Kid::El(b) if b.name == "office:body" => b.kids.iter_mut().find_map(|k| match k {
+            Kid::El(t) if t.name == "office:text" => Some(t),
+            _ => None,
+        }),
+        _ => None,
+    })?;
+    for k in kids {
+        text.kids.extend(k?);
+    }
+    Some(root)
 }
 
 // ============================================================== zip
@@ -211,9 +329,12 @@ impl Pkg<'_> {
     }
 
     fn text(&mut self, name: &str) -> Result<Option<String>, String> {
-        Ok(self.bytes(name)?.map(|b| {
-            let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&b);
-            String::from_utf8_lossy(b).into_owned()
+        Ok(self.bytes(name)?.map(|mut b| {
+            if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                b.drain(..3);
+            }
+            // Giltig UTF-8 (det vanliga) blir en `String` utan kopia.
+            String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
         }))
     }
 }
@@ -2231,6 +2352,7 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(crate::i18n::t("Dokumentet är för stort för att öppnas.").into());
     }
+    crate::timing::lap_start();
     let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| crate::tf!("OpenDocument-filen är skadad: {e}", e = e))?;
     if zip.len() > MAX_ENTRIES {
         return Err(crate::i18n::t("Dokumentet innehåller orimligt många delar och öppnas inte.").into());
@@ -2247,13 +2369,16 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     let content = pkg
         .text("content.xml")?
         .ok_or_else(|| "OpenDocument-filen saknar sitt innehåll (content.xml).".to_owned())?;
+    crate::timing::lap("odt: content.xml uppackad");
     let croot = parse_xml(&content)?;
     drop(content);
+    crate::timing::lap("odt: content.xml tolkad");
     let sroot = match pkg.text("styles.xml")? {
         Some(x) => Some(parse_xml(&x)?),
         None => None,
     };
 
+    crate::timing::lap("odt: styles.xml tolkad");
     let mut st = Styles::default();
     if let Some(s) = &sroot {
         st.read_fonts(s);
@@ -2302,17 +2427,20 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
         masters,
         review: ReviewRd::default(),
     };
+    crate::timing::lap("odt: formatmallar, sidor");
     read_regions(body, &mut rd.review, &mut rd.dropped);
     for c in body.els() {
         rd.walk(c);
     }
     rd.flush_boxes();
+    crate::timing::lap("odt: walk");
     let text_w = {
         let (w, _) = defaults.page();
         let m = defaults.margins();
         f64::from(w - m[1] - m[3])
     };
     let mut markdown = render(&rd.blocks, Some(text_w));
+    crate::timing::lap("odt: render");
     if !rd.notes.is_empty() {
         markdown.push('\n');
         // Fotnoterna först (1..n), sedan slutnoterna (`ei`, `eii` …).
@@ -2331,7 +2459,11 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     if !comment.is_empty() {
         markdown = format!("{comment}\n\n{markdown}");
     }
-    Ok(Loaded { source: None, markdown, images: rd.images, dropped: rd.dropped.list() })
+    crate::timing::lap("odt: noter, ändringar");
+    let loaded = Loaded { source: None, markdown, images: rd.images, dropped: rd.dropped.list() };
+    // XML-träden är stora i stora dokument och tar tid att riva: det görs i bakgrunden.
+    std::thread::spawn(move || drop((croot, sroot)));
+    Ok(loaded)
 }
 
 // ============================================================== skrivning
@@ -5149,6 +5281,10 @@ mod review_tests;
 #[cfg(test)]
 #[path = "odt_section_tests.rs"]
 mod section_tests;
+
+#[cfg(test)]
+#[path = "odt_par_tests.rs"]
+mod par_tests;
 
 #[path = "odt_hf.rs"]
 mod hf;
