@@ -19,7 +19,6 @@ use super::codeblock;
 use super::grid::{self, TableGeom};
 use super::markup::{self, Align, Analysis, Block, DocDefaults, Float, Piece};
 use super::pbox::{self, LineRule, PPr};
-use crate::highlight;
 use crate::theme::{self, Palette};
 
 #[path = "layout_notes.rs"]
@@ -45,8 +44,6 @@ pub struct Params<'a> {
     pub zoom: f32,
     /// Byteintervall där markup visas (markörens rader); tomt = dölj all markup.
     pub reveal: Range<usize>,
-    /// Sökträffar som `(start, slut, är_aktuell)` i källtexten (se `search::highlights`).
-    pub matches: &'a [(usize, usize, bool)],
     /// Bildkälla -> visningsstorlek i px (redan zoomad).
     pub image_size: &'a dyn Fn(&str) -> Option<Vec2>,
     /// Textbredd i px för en sträng i ett typsnitt (för tabellkolumner och listindrag).
@@ -519,7 +516,7 @@ impl Cache {
         st.fonts.get_or_insert_with(|| Arc::new(needed_fonts(a))).clone()
     }
 
-    /// Nyckeln: revision, reveal, zoom, dark, sökträffar, typsnittsgeneration.
+    /// Nyckeln: revision, reveal, zoom, dark, typsnittsgeneration.
     fn job_key(rev: u64, p: &Params) -> u64 {
         let mut h = Fx::default();
         rev.hash(&mut h);
@@ -527,7 +524,6 @@ impl Cache {
         p.reveal.end.hash(&mut h);
         p.zoom.to_bits().hash(&mut h);
         p.palette.dark.hash(&mut h);
-        p.matches.hash(&mut h);
         p.fonts_gen.hash(&mut h);
         h.finish()
     }
@@ -589,7 +585,6 @@ impl Cache {
         st.rev.hash(&mut h);
         p.reveal.start.hash(&mut h);
         p.reveal.end.hash(&mut h);
-        p.matches.hash(&mut h);
         if let Some(g) = pages {
             g.hash_into(&mut h);
         }
@@ -701,9 +696,6 @@ fn unit_key_static(text: &str, a: &Analysis, p: &Params, w: &Range<usize>) -> u6
     if intersects(&p.reveal, w) {
         (p.reveal.start.max(w.start) - w.start).hash(&mut h);
         (p.reveal.end.min(w.end) - w.start).hash(&mut h);
-    }
-    for m in matches_in(p.matches, w) {
-        (m.0.max(w.start) - w.start, m.1.min(w.end) - w.start, m.2).hash(&mut h);
     }
     for pc in pieces_in(a, w) {
         (pc.range.start.max(w.start) - w.start).hash(&mut h);
@@ -2115,13 +2107,6 @@ pub fn layout_job(text: &str, a: &Analysis, p: &Params) -> LayoutJob {
     LayoutJob { text: text.to_owned(), sections: secs, ..Default::default() }
 }
 
-/// Sökträffarna (sorterade på start) som överlappar `w`.
-fn matches_in<'a>(m: &'a [(usize, usize, bool)], w: &Range<usize>) -> &'a [(usize, usize, bool)] {
-    let i = m.partition_point(|x| x.1 <= w.start);
-    let n = m[i..].partition_point(|x| x.0 < w.end);
-    &m[i..i + n]
-}
-
 /// Bitarna som överlappar `w`.
 fn pieces_in<'a>(a: &'a Analysis, w: &Range<usize>) -> &'a [Piece] {
     let i = a.pieces.partition_point(|pc| pc.range.end <= w.start);
@@ -2336,12 +2321,6 @@ fn build_sections(text: &str, a: &Analysis, p: &Params, grid: &[Table], win: Ran
         });
     }
 
-    {
-        let matches = matches_in(p.matches, &win);
-        if !matches.is_empty() {
-            highlight::apply_backgrounds(&mut job, matches, p.palette);
-        }
-    }
     job.sections
 }
 
@@ -3368,16 +3347,13 @@ mod tests {
         s.chars().count() as f32 * 7.0
     }
 
-    fn build(text: &str, reveal: Range<usize>, query: &str) -> LayoutJob {
+    fn build(text: &str, reveal: Range<usize>, _query: &str) -> LayoutJob {
         let pal = theme::palette(false);
         let img = |_: &str| Some(Vec2::new(100.0, 50.0));
-        let matches: Vec<(usize, usize, bool)> =
-            highlight::find_all(text, query, false).into_iter().map(|(a, b)| (a, b, false)).collect();
         let p = Params {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            matches: &matches,
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -3463,7 +3439,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &no_img,
             measure: &measure,
             font_family: &fam,
@@ -3509,14 +3484,6 @@ mod tests {
             let w = gs[0].col_x[2] - gs[0].col_x[1];
             assert!(w >= 3.0 * px(1.0, 11.0), "{w}");
         });
-    }
-
-    #[test]
-    fn find_background() {
-        let pal = theme::palette(false);
-        let job = build("hej och hopp", 0..0, "och");
-        assert_eq!(sec_at(&job, 5).format.background, pal.match_bg);
-        assert_eq!(job.text, "hej och hopp");
     }
 
     #[test]
@@ -3587,7 +3554,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &no_img,
             measure: &measure,
             font_family: &fam,
@@ -3640,7 +3606,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family,
@@ -3847,8 +3812,7 @@ mod tests {
                 palette: &pg,
                 zoom: 1.0,
                 reveal,
-                matches: &[],
-                image_size: &img,
+                    image_size: &img,
                 measure: &measure,
                 font_family: &fam,
                 fonts_gen: 0,
@@ -3898,7 +3862,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &ff,
@@ -3931,7 +3894,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -3985,7 +3947,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &ff,
@@ -4008,13 +3969,6 @@ mod tests {
         let b = sec_at(&job, t.find("blå").unwrap());
         assert_eq!(b.format.color, Color32::from_rgb(0, 0, 255));
         assert_eq!(b.format.font_id.size, px(1.0, 18.0));
-        // Sökträffar går före markeringsfärgen.
-        let found: Vec<(usize, usize, bool)> =
-            highlight::find_all(t, "röd", false).into_iter().map(|(a, b)| (a, b, false)).collect();
-        let mut q = Params { matches: &found, ..p };
-        q.palette = &pal;
-        let job = Cache::default().job(1, t, &q);
-        assert_eq!(sec_at(&job, t.find("röd").unwrap()).format.background, pal.match_bg);
         // De efterfrågade typsnitten: grundtypsnittet och spanens, i rätt variant.
         let need = needed_fonts(&markup::analyze(t));
         assert!(need.contains(&("Times New Roman".to_owned(), false, false)));
@@ -4060,7 +4014,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -4134,7 +4087,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &no_img,
             measure: &meas,
             font_family: &fam,
@@ -4440,7 +4392,6 @@ mod tests {
             palette: &pal,
             zoom: 1.0,
             reveal,
-            matches: &[],
             image_size: &img,
             measure: &measure,
             font_family: &fam,
@@ -4514,15 +4465,11 @@ mod tests {
                 rv += 1;
             }
             let reveal = if step % 3 == 0 { 0..0 } else { super::super::tables::reveal_range(&text, rv..rv) };
-            let mut ms = highlight::find_all(&text, "dokument", false);
-            ms.truncate(50);
-            let matches: Vec<(usize, usize, bool)> = ms.iter().enumerate().map(|(i, m)| (m.0, m.1, i == 3)).collect();
             let measure_fn = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
             let p = Params {
                 palette: &pal,
                 zoom: 1.0,
                 reveal,
-                matches: &matches,
                 image_size: &img,
                 measure: &measure_fn,
                 font_family: &fam,
@@ -4565,8 +4512,7 @@ mod tests {
                 palette: &pal,
                 zoom: 1.0,
                 reveal,
-                matches: &[],
-                image_size: &img,
+                    image_size: &img,
                 measure: &measure_fn,
                 font_family: &fam,
                 fonts_gen: 0,
@@ -4643,7 +4589,6 @@ mod tests {
             palette: &theme::palette(false),
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &no_img,
             measure: &|s: &str, _| s.len() as f32 * 7.0,
             font_family: &fam,
@@ -4658,7 +4603,6 @@ mod tests {
             palette: &theme::palette(false),
             zoom: 1.0,
             reveal: 0..0,
-            matches: &[],
             image_size: &no_img,
             measure: &|s: &str, _| s.len() as f32 * 7.0,
             font_family: &fam,
@@ -4732,8 +4676,7 @@ mod tests {
                 palette: &pal,
                 zoom: 1.0,
                 reveal: 0..0,
-                matches: &[],
-                image_size: &no_img,
+                    image_size: &no_img,
                 measure: &|s: &str, _| s.len() as f32,
                 font_family: &fam,
                 fonts_gen: 0,
@@ -4753,7 +4696,6 @@ mod tests {
             palette: pal,
             zoom: 1.0,
             reveal,
-            matches: &[],
             image_size: &no_img,
             measure: &|s: &str, _| s.len() as f32 * 7.0,
             font_family: &fam,
@@ -4871,8 +4813,7 @@ mod tests {
                 palette: &pal,
                 zoom: 1.0,
                 reveal,
-                matches: &[],
-                image_size: if with_size { &size } else { &no_img },
+                    image_size: if with_size { &size } else { &no_img },
                 measure: &|s: &str, _| s.len() as f32 * 7.0,
                 font_family: &fam,
                 fonts_gen: 0,

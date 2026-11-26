@@ -43,7 +43,6 @@ impl Rig {
                 palette: &pal,
                 zoom: 1.0,
                 reveal: 0..0,
-                matches: &[],
                 image_size: &img,
                 measure: &measure,
                 font_family: &fam,

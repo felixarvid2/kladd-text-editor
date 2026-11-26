@@ -82,7 +82,11 @@ pub fn paint(
                 let img = Rect::from_min_size(pos2(x, gpos.y + top + pad), size);
                 match crate::word::images::image_shape(ui.ctx(), &uri, img, crate::word::images::crop_uv(None)) {
                     Some(sh) => out.fills.push(sh),
-                    None => ui.ctx().request_repaint_after(std::time::Duration::from_millis(50)),
+                    None => {
+                        if crate::word::images::image_pending(ui.ctx(), &uri, img.size()) {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                        }
+                    }
                 }
                 rect = img.expand(px(zoom, 4.0));
             } else {

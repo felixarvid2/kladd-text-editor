@@ -160,8 +160,6 @@ impl State {
     }
 }
 
-type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
-
 enum BarAct {
     Inline(Inline),
     Block(Block),
@@ -307,9 +305,7 @@ impl KladdApp {
         let edit = f(&doc.text, sel);
         if edit.text != doc.text {
             // Spara läget före ändringen som ett eget ångra-steg.
-            let mut undoer = state.undoer();
-            undoer.add_undo(&(before, doc.text.clone()));
-            state.set_undoer(undoer);
+            crate::undo::add_undo(ctx, id, &before, &doc.text);
             doc.text = edit.text;
             doc.on_edited();
         }
@@ -348,15 +344,7 @@ impl KladdApp {
         let id = editor_id(doc.id);
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
         let cur_range = state.cursor.char_range().unwrap_or(CCursorRange::one(CCursor::new(0)));
-        let mut undoer = state.undoer();
-        let cur = (cur_range, doc.text.clone());
-        let step = |u: &mut Undoer, c: &_| if redo { u.redo(c) } else { u.undo(c) }.cloned();
-        let mut res = step(&mut undoer, &cur);
-        // Samma text men annan markör räknas som ett eget steg; hoppa över det.
-        if res.as_ref().is_some_and(|(_, t)| *t == cur.1) {
-            res = step(&mut undoer, &cur);
-        }
-        state.set_undoer(undoer);
+        let res = crate::undo::step(ctx, id, redo, &cur_range, &doc.text);
         if let Some((range, text)) = res {
             doc.text = text;
             doc.on_edited();
@@ -1148,7 +1136,8 @@ impl KladdApp {
                                 Some(SpellCache { doc_id, rev, generation: gen_, ranges: Arc::new(found), per_range });
                         }
                         misspelled = self.wv.spell.as_ref().map(|c| c.ranges.clone()).unwrap_or_default();
-                    } else {
+                    } else if sp.loading() {
+                        // Ordlistan läses in: rita om när den är klar (utan ordlista för språket väntar vi inte).
                         ctx.request_repaint_after(std::time::Duration::from_millis(120));
                     }
                 }
@@ -1307,6 +1296,8 @@ impl KladdApp {
                 let mut behind_shapes: Vec<Shape> = Vec::new();
                 // Cellskuggning ligger ovanpå arket men bakom texten.
                 let cell_fill_slot = ui.painter().add(Shape::Noop);
+                // Sökträffarna ligger över cellskuggningen och under texten (se `matchlayer`).
+                let match_slot = ui.painter().add(Shape::Noop);
 
                 let text_rect = Rect::from_min_size(
                     pos2(page_left + geom.origin_x(), page_top + geom.top),
@@ -1316,7 +1307,6 @@ impl KladdApp {
                     palette: p,
                     zoom: z,
                     reveal: reveal.clone(),
-                    matches: &matches,
                     image_size: &image_size,
                     measure: &measure,
                     font_family: &font_family,
@@ -1326,6 +1316,17 @@ impl KladdApp {
                     word.galley_paged_lazy(ui.ctx(), doc_id, buf.as_str(), &params, wrap_width, Some(&geom), lazy_budget)
                 };
                 let min_h = geom.text_h();
+                // Ångra och gör om med ändringshistoriken (egui:s egen sparar en hel kopia av texten per steg).
+                let range_before = TextEditState::load(&ctx, id).and_then(|s| s.cursor.char_range()).unwrap_or_default();
+                let mut undone: Option<egui::text::CCursorRange> = None;
+                if let Some((r, t)) = crate::undo::before_show(&ctx, id, ui.memory(|m| m.has_focus(id)), &range_before, &doc.text) {
+                    doc.text = t;
+                    if let Some(mut s) = TextEditState::load(&ctx, id) {
+                        s.cursor.set_char_range(Some(r));
+                        s.store(&ctx, id);
+                    }
+                    undone = Some(r);
+                }
                 let out = ui
                     .scope_builder(UiBuilder::new().max_rect(text_rect), |ui| {
                         TextEdit::multiline(&mut doc.text)
@@ -1341,7 +1342,13 @@ impl KladdApp {
                     })
                     .inner;
 
-                if out.response.changed() {
+                crate::undo::after_show(&ctx, id, &out.cursor_range.unwrap_or(range_before), &doc.text);
+                // Som egui:s eget ångra: markören som ångra eller gör om lämnade ska synas.
+                if let Some(r) = undone {
+                    let c = out.galley.pos_from_cursor(r.primary).translate(out.galley_pos.to_vec2()).expand(1.5);
+                    ui.scroll_to_rect(c, None);
+                }
+                if out.response.changed() || undone.is_some() {
                     doc.on_edited();
                     edited = true;
                     // Spåra ändringar: skrivet blir infogat och raderat blir struket.
@@ -1913,6 +1920,20 @@ impl KladdApp {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
                 }
                 ui.painter().set(cell_fill_slot, cell_fills);
+                // Sökträffar som lager ovanpå galleriet: de ingår inte i utläggningen, så att den kan återanvändas.
+                if !matches.is_empty() {
+                    let layer = super::matchlayer::build(
+                        &galley,
+                        text,
+                        &matches,
+                        gpos.to_vec2(),
+                        clip.top() - gpos.y - 300.0,
+                        clip.bottom() - gpos.y + 300.0,
+                        p,
+                    );
+                    ui.painter().set(match_slot, Shape::Vec(layer.behind));
+                    painter.extend(layer.over);
+                }
                 let caret_ci = out.state.cursor.char_range().map_or(0, |r| r.primary.index.0);
                 let caret_y = galley.pos_from_cursor(CCursor::new(caret_ci)).min.y;
                 page_pos = ((secpages::page_index(&boxes, caret_y) + 1).min(total), total);
@@ -2380,7 +2401,11 @@ impl<'a> ByteToChar<'a> {
     }
 
     fn at(&mut self, b: usize) -> usize {
-        let b = b.min(self.text.len());
+        let mut b = b.min(self.text.len());
+        // Stavnings- och grammatikträffar kan höra till texten före tangenttrycket i samma bildruta: aldrig mitt i ett tecken.
+        while !self.text.is_char_boundary(b) {
+            b -= 1;
+        }
         if b < self.b {
             self.b = 0;
             self.c = 0;

@@ -262,9 +262,7 @@ pub fn restore_into(ctx: &egui::Context, doc: &mut Document, version: Document) 
     let mut state = TextEditState::load(ctx, id).unwrap_or_default();
     let end = doc.text.chars().count();
     let before = state.cursor.char_range().unwrap_or(CCursorRange::two(CCursor::new(end), CCursor::new(end)));
-    let mut undoer = state.undoer();
-    undoer.add_undo(&(before, doc.text.clone()));
-    state.set_undoer(undoer);
+    crate::undo::add_undo(ctx, id, &before, &doc.text);
     doc.text = version.text;
     doc.encoding = version.encoding;
     doc.line_ending = version.line_ending;

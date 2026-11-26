@@ -376,7 +376,7 @@ pub(super) fn reuse(
     cb: &[codeblock::Block],
     toc_delta: Option<isize>,
 ) -> Option<Prep> {
-    if m.sig != sig || !p.matches.is_empty() {
+    if m.sig != sig {
         return no(1);
     }
     let mut prep = m.prep;
@@ -894,7 +894,6 @@ mod tests {
                 palette: &pal,
                 zoom: 1.0,
                 reveal,
-                matches: &[],
                 image_size: &img,
                 measure: &measure,
                 font_family: &fam,
@@ -1036,7 +1035,7 @@ mod tests {
             let geom = pages::Geom::for_sections(1.0, &a0.defaults, &a0.sections);
             let mut cache = Cache::default();
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, egui::Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal: 0..0, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal: 0..0, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             for step in 0..3 {
                 if step > 0 {
                     // Ersätt ett stycke mitt i dokumentet med en ny post (styckegränserna är kvar).
@@ -1082,7 +1081,7 @@ mod tests {
             }
             let reveal = if step % 4 == 1 { crate::word::tables::reveal_range(&text, text.len() / 2..text.len() / 2) } else { 0..0 };
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, egui::Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             let out = ctx.run_ui(Default::default(), |_| {
                 let g = cache.galley_paged(&ctx, 1, &text, &p, geom.edit_w(), Some(&geom));
                 reused += usize::from(cache.stats(1).reused);

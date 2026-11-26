@@ -85,7 +85,11 @@ pub fn header_footer(
                         Some(sh) => {
                             painter.add(sh);
                         }
-                        None => ui.ctx().request_repaint(),
+                        None => {
+                            if super::images::image_pending(ui.ctx(), uri, rect.size()) {
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     }
                 }
             }

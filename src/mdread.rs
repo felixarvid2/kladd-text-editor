@@ -517,13 +517,11 @@ impl KladdApp {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let Some(new) = flip_task(&doc.text, n) else { return };
         let id = editor_id(doc.id);
-        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        let state = TextEditState::load(ctx, id).unwrap_or_default();
         let end = doc.text.chars().count();
         let before = state.cursor.char_range().unwrap_or(CCursorRange::one(CCursor::new(end)));
         // Läget före ändringen som ångra-steg (editorn har kanske aldrig visats för fliken).
-        let mut undoer = state.undoer();
-        undoer.add_undo(&(before, doc.text.clone()));
-        state.set_undoer(undoer);
+        crate::undo::add_undo(ctx, id, &before, &doc.text);
         state.store(ctx, id);
         doc.text = new;
         doc.on_edited();

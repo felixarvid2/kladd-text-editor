@@ -19,7 +19,7 @@ fn lay(text: &str, wrap: f32, geom: Option<&pages::Geom>) -> Arc<Galley> {
     theme::install_fonts(&ctx);
     let imgf = |_: &str| None;
     let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, Color32::WHITE).size().x);
-    let p = layout::Params { palette: &pal, zoom: 1.0, reveal: 0..0, matches: &[], image_size: &imgf, measure: &measure, font_family: &fam, fonts_gen: 0 };
+    let p = layout::Params { palette: &pal, zoom: 1.0, reveal: 0..0, image_size: &imgf, measure: &measure, font_family: &fam, fonts_gen: 0 };
     let mut cache = layout::Cache::default();
     let mut res = None;
     for _ in 0..2 {

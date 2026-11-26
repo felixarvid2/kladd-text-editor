@@ -129,7 +129,6 @@ fn notnummer_har_minsta_storlek_och_etikettens_bredd_är_textens() {
         palette: &pal,
         zoom: 1.0,
         reveal: 0..0,
-        matches: &[],
         image_size: &|_| None,
         measure: &measure,
         font_family: &fam,

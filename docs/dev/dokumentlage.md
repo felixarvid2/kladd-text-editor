@@ -520,17 +520,21 @@ Hur det fungerar:
   analys och nya listor över tabeller, bilder och typsnitt; annars görs ingenting.
 - **Styckecache.** `galley_paged` lägger ut dokumentet stycke för stycke (en tabell är ett
   stycke). Nyckeln är styckets text, dess bitar (relativt styckets början), geometri
-  (justering, listindrag), markörens träff och sökträffar, plus parametrar som zoom, tema,
+  (justering, listindrag) och markörens träff, plus parametrar som zoom, tema,
   bredd och typsnittsgeneration. Efter en ändring läggs bara berörda stycken om; markören som
   byter rad berör två. Sedan fogas styckena ihop (som `Galley::concat`) och sidbryts. Cachen
   rensas på stycken som inte användes i senaste bildrutan (efter ett återupptaget varv bara på de ersatta styckena).
+- **Sökträffar** är inte en del av utläggningen (`Params` har ingen `matches`): `word/matchlayer.rs` ritar dem som
+  rektanglar ur galleriets glyfer för raderna i fönstret, i en plats i målarlistan mellan cellskuggningen och texten
+  (där texten har egen bakgrund ovanpå den). Byte av sökning eller aktuell träff kostar därför ingen omläggning.
+- **Ångra** (`src/undo.rs`): fältet tar Ctrl+Z/Y/Skift+Z själv och sparar ändringar i stället för en text per steg.
 - **Återanvänd förberedelse** (`word/layout_memo.rs`, stora dokument). Styckena (`Para`), fotnotsplanen,
   grupperna och nyckelns statiska del sparas från förra omläggningen. Efter en inkrementell analys
   (`incr::Delta` anger det ändrade området) räknas bara ett fönster kring ändringen och markörens rader om med
   `paragraphs_in`, med kontrollstycken som jämförs mot de gamla. Fotnotsplanen räknas om i fönstret (`plan_window`:
   definitionerna i fönstret ska ha samma etiketter som förut), grupperna görs om bara kring fönstren (`regroup`) och
   antalet rubriker i innehållsförteckningen kommer från analysen (`Delta::toc_delta`). Kan fönstret inte räknas om säkert
-  (ändrade definitioner, flera fönster nära fotnoterna, trasiga `<!--k:`-markörer, sökträffar) räknas allt om. Testas mot
+  (ändrade definitioner, flera fönster nära fotnoterna, trasiga `<!--k:`-markörer) räknas allt om. Testas mot
   full omräkning.
 - **Återupptagen utläggning** (`word/layout_resume.rs`, stora dokument). Varvet över grupperna sparar tillståndet före
   varje grupp (läge, flytande bilder, öppen textruta, sidsimulering) och vad den lade till. Nästa varv börjar vid den första

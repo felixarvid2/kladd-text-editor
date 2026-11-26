@@ -600,3 +600,116 @@ texter) formas som förut på huvudtråden.
 
 Körs bara i dokumentläget, som redan bara kontrollerar ändrade stycken (`misspelled_cached`); grammatiken
 skickar bara ändrade stycken. Oförändrat.
+
+## Sökträffar som lager, ångra-minne och ingen omritning i vila
+
+Tre saker som hör ihop: sökningen får inte lägga om dokumentet, ångra-historiken får inte vara en kopia av texten
+per steg, och appen ska inte rita om när ingenting händer. Mätt på samma maskin (delad, 4 kärnor, ±30 %),
+opt-level 2 för kladd och egui, medianer. Dokumenten är `gen-skolrapport.docx` upprepad 100 och 500 gånger
+(404 och 2021 sidor, `scratchpad/wave-view/gen-stor-docx.py`).
+
+### 4. Sökträffar som lager
+
+Mått: ett tecken in eller ut med sökningen öppen (analys, `search::search_doc`, `search::highlights`, galleri, och efter
+ändringen också lagret för fönstret), och "nästa träff" (bara aktuell träff byts). `bench_docx_search`
+(`KLADD_BENCH_DOCX=sökväg [KLADD_BENCH_FIND=ord] cargo test -- --ignored bench_docx_search --nocapture`), sökning på "och".
+
+| Mått (ms) | 404 sidor (3 000 träffar) före / efter | 2021 sidor (15 000 träffar) före / efter |
+|---|---|---|
+| Tangent utan sökning | 0,9 / 0,9 | 3,2 / 3,5 |
+| Tangent med sökningen öppen | 41,5 / 8,6 | 511 / 51,6 |
+| varav analys + `search_doc` | 7,0 / 7,2 | 43 / 43 |
+| Nästa träff (bara aktuell träff byts) | 34,6 / 0,08 | 497 / 0,47 |
+
+`Params::matches` var en del av utläggningen (`layout.rs`): nyckeln för bildrutan, för varje stycke och för minnet i
+`layout_memo::reuse` innehöll träffarna, så med sökningen öppen lades allt om för varje tangent och för varje byte av
+aktuell träff. Träffarna är nu borta ur `Params` och ritas av `word/matchlayer.rs` som ett lager mellan
+cellskuggningen och texten: rektanglarna byggs ur galleriets glyfer för raderna i fönstret (±300 px) på samma sätt som epaints
+`add_row_backgrounds` (en rektangel per följd glyfer med samma över- och underkant, en pixel vidgad, avrundad till hela
+pixlar), så att utseendet är detsamma. Skärmbilder före och efter (404-sidors rapport, ljust och mörkt, sökning på "och" med
+aktuell träff, i brödtext, listor, tabeller, fotnoter och textrutor, och med markering över träffarna) är pixel för pixel lika
+utom markörens blink (högst 46 bildpunkter).
+
+Kvar: det som återstår av tangenten är sökningen själv (`search_doc` går igenom hela texten för varje ändring, 7 ms vid 404 och 43 ms
+vid 2021 sidor) och `fast_hash` av hela texten för sökcachen i `search_results`. En inkrementell sökning är nästa steg.
+
+Ändrat utseende: text som har en egen bakgrund (markerad text, inline-kod, kommentarsområden) har förut fått träffens färg i stället för sin
+egen. Ett lager bakom texten kan inte ersätta den, så där ritas träffen ovanpå (med sin genomskinliga färg): träffen syns, men över den egna
+färgen. Alla andra träffar är oförändrade.
+
+Textläget (`highlight.rs`) fick inget lager: `bench_text_search` (300 kB Markdown, 818 träffar) ger 12,4 ms för en tangent med träffar
+mot 10,2 ms utan, och 8,9 ms för nästa träff (en tangent utan träffar tar lika lång tid, egui lägger ut stycke för stycke och
+återanvänder oförändrade). Vinsten vore högst 2 ms, så ingen ändring. Läsläget (Markdown och EPUB) målar träffarna med
+`egui_commonmark`s egna sökfärger och har ingen utläggning med träffar i.
+
+### 14. Minne i stora dokument
+
+Mått: `VmRSS`/`VmHWM` ur `/proc/<pid>/status` för det riktiga programmet i Xvfb (`.docx` öppnat, markören i slutet, 20 skurar om 5
+tecken med 1,3 s mellan (egui sparar en ångra-punkt först när texten stått stilla en sekund, så 100 tangenter i ett svep ger bara
+en eller två punkter), därefter 20 gånger Ctrl+Z).
+
+| RSS (MB) | 404 sidor före / efter | 2021 sidor före / efter |
+|---|---|---|
+| Efter öppning | 266,8 / 269,5 | 549,2 / 548,6 |
+| Efter 100 tangenttryck | 294,2 / 278,4 | 648,5 / 592,1 |
+| Efter 20 ångra | 294,2 / 278,8 | 648,5 / 592,1 |
+| Tillväxt av 100 tangenttryck | 27,4 / 8,9 | 99,3 / 43,5 |
+
+Kopior av texten: själva `String` (1), `DocState::text` i `word::layout::Cache` (1), galleriets `LayoutJob::text` (1–2 medan nästa lagts
+ut), `memo_text` (1, bara mellan en ändring och nästa omläggning), egui:s ångra-historik (**en hel kopia per ångra-punkt, upp till 100,
+plus en för texten som håller på att ändras och en per gör om-steg**), och `Document::docx_source` (originalpaketet, delas som `Arc`).
+Autosparning, återställning och historiken sparar bara hashar eller skriver direkt till disk; sökningen sparar träffar, inte text.
+Ångra-historiken var alltså det enda som växte med antalet steg (3,3 MB per punkt vid 2021 sidor, 330 MB vid 100 punkter) och
+`TextEditState::undoer()` klonade dessutom hela historiken vid varje Ctrl+Z i menyn.
+
+`src/undo.rs` ersätter den: fälten i dokumentläget och textläget tar Ctrl+Z, Ctrl+Y och Ctrl+Skift+Z ur indata innan `TextEdit`
+ser dem och använder en egen historik med egui:s regler (100 punkter, en punkt efter en sekunds stillhet eller var 30:e sekund i
+ständig ändring, samma ångra/gör om-logik) men som sparar ändringar: bara den senaste punkten är en hel text, varje äldre är ändringen
+(gemensamt början och slut, det som skilde i mitten) som tar tillbaka den. Texten som håller på att ändras jämförs med längd och hash
+i stället för en kopia. egui:s egen historik töms efter varje bildruta. `tests::som_egui` kör slumpade anrop (läge, tid, ångra, gör om,
+tillägg) mot egui:s `Undoer` och jämför varje resultat (`KLADD_FUZZ_SEEDS`); ångra, gör om och Ctrl+Skift+Z ger pixel för pixel samma
+skärmbilder som förut i både dokumentläget och textläget.
+
+Kvar: efter 100 tangenttryck har RSS fortfarande växt 9 respektive 44 MB, och toppen (`VmHWM` 873 MB vid 2021 sidor) är densamma. Det
+är inte ångra-historiken (hela historiken är nu cirka en kopia av texten). Troligen är det utläggningen (galleriet byggs om medan det
+förra finns kvar, utlagda stycken i `Cache::units`), men det är inte undersökt: det ligger i `word::layout::Cache`, som hör till
+den som arbetar med utläggningen.
+
+### 15. Ingen omritning i vila
+
+Mått: bildrutor per sekund (`KLADD_TIMING=1` skriver `bildrutor: N på T s` och vad som begärde dem, fil:rad, var femte sekund) och CPU-tid
+(`utime + stime` ur `/proc/<pid>/stat`) under 30 s i vila, fönstret med och utan fokus (ett annat fönster har fokus), för den tomma
+fliken, en textfil, ett Word-dokument i dokumentläget (`gen-skolrapport.docx`, 4 sidor), Markdown i läsläget, EPUB, PDF och CSV. Skripten ligger inte i
+repot; mätningen är `idle.sh` (starta, vänta, läs `/proc`).
+
+| Vy | Före: bildrutor/s, CPU ms/s (fokus / inget fokus) | Efter: bildrutor/s, CPU ms/s (fokus / inget fokus) |
+|---|---|---|
+| Tom flik | 98 / 134 fps, 761 / 1190 | 1,9 / 0,05 fps, 19 / 0 |
+| Textfil | 163 / 174 fps, 1432 / 1449 | 2,1 / 0,05 fps, 22 / 0 |
+| Dokumentläge | 101 / 80 fps, 1819 / 1255 | 2,1 / 0,05 fps, 44 / 0 |
+| Läsläge | 129 / 96 fps, 1421 / 982 | 0,15 / 0,05 fps, 0 / 0 |
+| EPUB | 142 / 91 fps, 1369 / 946 | 0,15 / 0,05 fps, 0 / 0 |
+| PDF | 32 / 42 fps, 978 / 1144 | 1,06 / 0,05 fps, 39 / 1 |
+| CSV | 170 / 109 fps, 1577 / 1194 | 0,15 / 0,05 fps, 0 / 0 |
+
+(Före ritades appen om 80–170 gånger i sekunden med en kärna på 100 % i alla vyer; maskinen var delad, så
+CPU-talen före är osäkra uppåt.) Orsaken var en rad: `Lsp::poll_ops` (`lsp/mod.rs`) anropade `ctx.request_repaint()` varje
+bildruta, också utan väntande anrop, och kördes från `logic()` i varje vy. Nu begärs en bildruta bara när ett svar kommit. Det som
+är kvar i vila är det som behövs: markörens blink (2 bildrutor/s, bara med fokus; egui:s eget), återställningsfilen var 30:e sekund
+och i PDF-fliken filkontrollen en gång i sekunden (39 ms CPU per bildruta, bara med fokus).
+
+Fler källor som gjordes villkorade (hittade genom att gå igenom varje `request_repaint`):
+
+- Välkomstsidans blinkande markör ritade om 2 gånger/s också utan fokus; den står nu still utan fokus.
+- PDF-flikens filkontroll (`pdf_frame`), arbetsmappens uppdatering (`workspace_refresh`, var 3:e sekund) och git-statusen (`git_ui`,
+  var 15:e sekund) begärde en bildruta utan fokus fast de inte gör något då; de väntar nu tills fokus kommer tillbaka (då är
+  kontrollen förfallen och görs direkt).
+- Stavningskontrollen (`word/view.rs`) begärde en bildruta var 120:e ms för alltid när språket saknar ordlista (`ready()` blir
+  aldrig sann); nu bara medan ordlistan läses in (`Speller::loading`).
+- En bild som inte gick att läsa in (saknad eller trasig bild i sidhuvud, ett Mermaid-diagram som inte kan ritas) gjorde att
+  `request_repaint()` begärdes varje bildruta (sidhuvudet) respektive var 50:e ms (kodblock) för alltid; nu bara medan bilden
+  verkligen läses in (`images::image_pending`).
+- Ingen av de övriga (`request_repaint` efter dialoger, kanaler och drag) körs utan en händelse.
+
+Utanför mätningen: uppdateringskontrollen, språkservern (en bildruta per 100 ms bara medan anrop väntar) och inläsningar (100 ms bara
+medan de pågår) är redan villkorade.

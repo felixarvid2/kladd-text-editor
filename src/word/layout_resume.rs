@@ -1794,7 +1794,7 @@ mod tests {
             let a0 = markup::analyze(&text);
             let geom = pages::Geom::for_sections(1.0, &a0.defaults, &a0.sections);
             let measure = |s: &str, f: FontId| ctx.fonts_mut(|fo| fo.layout_no_wrap(s.to_owned(), f, egui::Color32::WHITE).size().x);
-            let p = Params { palette: &pal, zoom: 1.0, reveal, matches: &[], image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
+            let p = Params { palette: &pal, zoom: 1.0, reveal, image_size: &img, measure: &measure, font_family: &fam, fonts_gen: 0 };
             let out = ctx.run_ui(Default::default(), |_| {
                 let g = c.galley_paged(&ctx, 1, &text, &p, geom.edit_w(), Some(&geom));
                 resumed += usize::from(c.stats(1).resumed);

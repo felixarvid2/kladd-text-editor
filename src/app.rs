@@ -2279,6 +2279,17 @@ impl KladdApp {
                             if vim_on && vimui.hides_caret() {
                                 ui.visuals_mut().text_cursor.stroke.width = 0.0;
                             }
+                            // Ångra och gör om med ändringshistoriken (egui:s egen sparar en hel kopia av texten per steg).
+                            let range_before = TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range()).unwrap_or_default();
+                            let mut undone: Option<egui::text::CCursorRange> = None;
+                            if let Some((r, t)) = crate::undo::before_show(ui.ctx(), id, ui.memory(|m| m.has_focus(id)), &range_before, &doc.text) {
+                                doc.text = t;
+                                if let Some(mut s) = TextEditState::load(ui.ctx(), id) {
+                                    s.cursor.set_char_range(Some(r));
+                                    s.store(ui.ctx(), id);
+                                }
+                                undone = Some(r);
+                            }
                             let out = TextEdit::multiline(&mut doc.text)
                                 .id(id)
                                 .frame(Frame::NONE)
@@ -2290,7 +2301,13 @@ impl KladdApp {
                                 .layouter(&mut layouter)
                                 .show(ui);
 
-                            if out.response.changed() {
+                            crate::undo::after_show(ui.ctx(), id, &out.cursor_range.unwrap_or(range_before), &doc.text);
+                            // Som egui:s eget ångra: markören som ångra eller gör om lämnade ska synas.
+                            if let Some(r) = undone {
+                                let c = out.galley.pos_from_cursor(r.primary).translate(out.galley_pos.to_vec2()).expand(1.5);
+                                ui.scroll_to_rect(c, None);
+                            }
+                            if out.response.changed() || undone.is_some() {
                                 // Autokorrigering efter ett skrivet tecken (Markdown och vanlig text).
                                 if let Some(c) = ac_typed
                                     && crate::autocorrect_ui::run_in_editor(ui.ctx(), id, &mut doc.text, ac_cfg, ac_lang, c)
@@ -2591,7 +2608,9 @@ impl KladdApp {
             let gsize = galley.size();
             ui.painter().galley(r.left_top(), galley, p.text);
             let time = ctx.input(|i| i.time);
-            let on = (time % 1.1) < 0.65;
+            // Utan fokus står markören still (och ingen bild begärs): ingen rörelse i en bakgrundsflik.
+            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+            let on = !focused || (time % 1.1) < 0.65;
             if on {
                 ui.painter().rect_filled(
                     Rect::from_min_size(pos2(r.left() + gsize.x + 6.0, r.top() + 10.0), vec2(5.0, gsize.y - 16.0)),
@@ -2599,8 +2618,10 @@ impl KladdApp {
                     p.accent,
                 );
             }
-            let wait = if on { 0.65 - time % 1.1 } else { 1.1 - time % 1.1 };
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.01)));
+            if focused {
+                let wait = if on { 0.65 - time % 1.1 } else { 1.1 - time % 1.1 };
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.01)));
+            }
 
             ui.add_space(6.0);
             ui.label(
@@ -3317,7 +3338,10 @@ impl KladdApp {
             doc.dirty = t.unsaved();
         }
         let Some(tab) = doc.pdfv.as_deref_mut() else { return };
-        ctx.request_repaint_after(std::time::Duration::from_secs_f64(pdfui::CHECK_EVERY));
+        // Filkontrollen kräver en bildruta: utan fokus väntar den tills fönstret får fokus igen (då är den förfallen).
+        if ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(pdfui::CHECK_EVERY));
+        }
         let mut reload = false;
         if now >= tab.next_check {
             tab.next_check = now + pdfui::CHECK_EVERY;
@@ -3955,6 +3979,7 @@ impl eframe::App for KladdApp {
         static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         crate::timing::mark_once(&FIRST, "första ui() börjar");
         let ctx = ui.ctx().clone();
+        crate::timing::frame(&ctx);
         let p = self.palette();
 
         self.sync_panes();

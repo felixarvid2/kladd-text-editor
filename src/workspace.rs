@@ -565,7 +565,10 @@ impl KladdApp {
             self.ws.last_refresh = now;
             self.ws.reload_all(self.settings.workspace_hidden);
         }
-        ctx.request_repaint_after(std::time::Duration::from_secs_f64(REFRESH_SECS));
+        // Utan fokus läses inget om, så ingen bildruta behövs; när fokus kommer tillbaka läses mapparna om direkt.
+        if focused {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(REFRESH_SECS));
+        }
     }
 
     /// Filträdet i en sidopanel till vänster.

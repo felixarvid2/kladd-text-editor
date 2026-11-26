@@ -128,7 +128,6 @@ fn frame_lazy(
         palette: &pal,
         zoom: 1.0,
         reveal,
-        matches: &[],
         image_size: &img,
         measure: &measure,
         font_family: &fam,

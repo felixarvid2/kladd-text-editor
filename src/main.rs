@@ -64,6 +64,7 @@ mod templates;
 mod templates_ui;
 mod theme;
 mod timing;
+mod undo;
 mod update;
 mod word;
 mod workspace;

@@ -544,6 +544,12 @@ impl Speller {
         false
     }
 
+    /// Sant medan ordlistan läses in i bakgrunden (då kommer den snart). Utan ordlista för språket är den falsk:
+    /// ingen bildruta ska då begäras för att vänta på den.
+    pub fn loading(&self) -> bool {
+        self.rx.is_some()
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
