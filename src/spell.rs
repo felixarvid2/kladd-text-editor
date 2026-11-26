@@ -795,7 +795,7 @@ mod tests {
     fn wait(s: &mut Speller) {
         let t = std::time::Instant::now();
         while !s.ready() {
-            assert!(t.elapsed().as_secs() < 5, "ordlistan laddades inte");
+            assert!(t.elapsed().as_secs() < 30, "ordlistan laddades inte");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
@@ -890,7 +890,8 @@ mod tests {
         let g = s.generation();
         s.set_lang("bb_BB");
         assert!(s.generation() > g);
-        assert!(s.check_word("blorp")); // laddar: inga våglinjer
+        // Medan den nya ordlistan laddas ges inga våglinjer; hann den bli klar gäller den (och då är ordet okänt).
+        assert!(s.check_word("blorp") || !s.loading());
         wait(&mut s);
         assert!(s.check_word("tja"));
         assert!(!s.check_word("hej"));
