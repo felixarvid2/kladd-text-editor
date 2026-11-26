@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.10.0] – 2026-11-26
+
 ### Ändrat
 
 - **Prestandaprov i CI.** Arbetsflödet `perf.yml` mäter instruktioner (valgrind/callgrind, alltså deterministiskt och utan brus från delade maskiner) för sju tunga vägar (läsa stor docx/odt, öppna och skriva i ett stort Word-dokument, skriva med sökningen öppen, läsläget för stor Markdown, PDF-export) för pull requestens kod och basgrenens i samma jobb, och ger fel vid mer än 10 % fler instruktioner. Mätningar av mimalloc (10–26 % snabbare men 25–90 % mer minne), PGO (bara inläsning och PDF-export blir märkbart snabbare) och fat LTO (inom bruset) finns i `docs/dev/prestanda.md`; ingen av dem infördes. Se `perf/README.md`.
