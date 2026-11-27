@@ -351,3 +351,173 @@ fn linjediagram_i_3d_ritar_varje_serie() {
         assert!(f.iter().any(|(_, c)| c.b > accent1.b + 0.02 && c.r > accent1.r), "ljus ovansida");
     }
 }
+
+// ---- Sekundäraxlar, trendlinjer, felstaplar och radar (w-pchart2) ----
+
+const C_NS: &str = r#"xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+
+fn num_lit(vals: &[f64]) -> String {
+    let pts: String = vals.iter().enumerate().map(|(i, v)| format!(r#"<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>"#)).collect();
+    format!(r#"<c:numLit><c:ptCount val="{}"/>{pts}</c:numLit>"#, vals.len())
+}
+
+fn str_lit(vals: &[&str]) -> String {
+    let pts: String = vals.iter().enumerate().map(|(i, v)| format!(r#"<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>"#)).collect();
+    format!(r#"<c:strLit><c:ptCount val="{}"/>{pts}</c:strLit>"#, vals.len())
+}
+
+fn ser(idx: usize, name: &str, cats: &[&str], vals: &[f64], extra: &str) -> String {
+    format!(r#"<c:ser><c:idx val="{idx}"/><c:order val="{idx}"/><c:tx><c:v>{name}</c:v></c:tx>{extra}<c:cat>{}</c:cat><c:val>{}</c:val></c:ser>"#, str_lit(cats), num_lit(vals))
+}
+
+fn axes(cat: &str, val: &str, val_pos: &str, crosses: &str, deleted_cat: bool) -> String {
+    format!(
+        r#"<c:catAx><c:axId val="{cat}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="{}"/><c:axPos val="b"/><c:crossAx val="{val}"/></c:catAx><c:valAx><c:axId val="{val}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="{val_pos}"/>{}<c:numFmt formatCode="General" sourceLinked="0"/><c:crossAx val="{cat}"/><c:crosses val="{crosses}"/></c:valAx>"#,
+        u8::from(deleted_cat),
+        if val_pos == "l" { "<c:majorGridlines/>" } else { "" }
+    )
+}
+
+fn chart_xml(plot: &str) -> String {
+    format!(r#"<c:chartSpace {C_NS}><c:chart><c:autoTitleDeleted val="1"/><c:plotArea><c:layout/>{plot}</c:plotArea><c:legend><c:legendPos val="b"/></c:legend></c:chart></c:chartSpace>"#)
+}
+
+/// Ritar ett diagram och sparar bilden i `KLADD_CHART_PNG` (för att titta på den).
+fn render_chart(xml: &str, name: &str) -> super::scene::Scene {
+    let bytes = deck(&chart_frame(), &[("charts/chart1.xml", "chart", xml.as_bytes())]);
+    let d = Deck::open(&bytes).unwrap();
+    let scene = render::slide_scene(&d, 0);
+    if let Some(dir) = std::env::var_os("KLADD_CHART_PNG") {
+        let pm = super::raster::render(&scene, 720, 540).unwrap();
+        let (w, h, rgba) = super::raster::to_rgba(pm);
+        image::RgbaImage::from_raw(w, h, rgba).unwrap().save(std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
+    }
+    assert!(super::pdf::write(&d, &[0]).is_ok());
+    scene
+}
+
+const CATS: [&str; 4] = ["Q1", "Q2", "Q3", "Q4"];
+
+#[test]
+fn sekundar_axel_har_egen_skala_till_hoger() {
+    // Staplar 10–40 på den primära axeln, linje 0,1–0,4 på den sekundära (till höger, `crosses max`).
+    let plot = format!(
+        r#"<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>{}<c:gapWidth val="150"/><c:axId val="1"/><c:axId val="2"/></c:barChart><c:lineChart><c:grouping val="standard"/>{}<c:marker val="1"/><c:axId val="3"/><c:axId val="4"/></c:lineChart>{}{}"#,
+        ser(0, "Intäkt", &CATS, &[10.0, 20.0, 30.0, 40.0], ""),
+        ser(1, "Andel", &CATS, &[0.1, 0.4, 0.2, 0.3], ""),
+        axes("1", "2", "l", "autoZero", false),
+        axes("3", "4", "r", "max", true),
+    );
+    let scene = render_chart(&chart_xml(&plot), "sekundaraxel");
+    let t = texts(&scene.items);
+    // Båda skalorna: 0–45 till vänster, 0–0,45 till höger.
+    for want in ["45", "0.45", "0.1", "Q1"] {
+        assert!(t.iter().any(|x| x == want), "saknar {want:?} i {t:?}");
+    }
+    // Den sekundära axelns etiketter står till höger om de primära.
+    let x_of = |s: &str| scene.items.iter().find_map(|i| if let Item::Glyphs(g) = i { (g.text.trim() == s).then(|| g.t.apply(0.0, 0.0).0) } else { None }).unwrap();
+    assert!(x_of("0.45") > x_of("45") + 200.0);
+    // Linjens högsta punkt (0,4) ligger nära ritytans överkant, inte nere vid staplarnas 0,4.
+    let line_top = scene.items.iter().filter_map(|i| if let Item::Stroke { path, stroke } = i { (stroke.width > 2.0).then(|| path.bounds()).flatten() } else { None }).map(|b| b.1).fold(f32::INFINITY, f32::min);
+    let bar_top = fills(&scene.items).iter().filter(|(_, c)| *c == Rgba::rgb8(0x44, 0x72, 0xC4)).map(|(b, _)| b.1).fold(f32::INFINITY, f32::min);
+    assert!(line_top < bar_top + 40.0, "linjen {line_top} staplarna {bar_top}");
+}
+
+#[test]
+fn trendlinjer_med_ekvation_och_r2() {
+    let trend = |t: &str, extra: &str| format!(r#"<c:trendline><c:spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill><a:prstDash val="sysDash"/></a:ln></c:spPr><c:trendlineType val="{t}"/>{extra}<c:dispRSqr val="1"/><c:dispEq val="1"/></c:trendline>"#);
+    let plot = format!(
+        r#"<c:scatterChart><c:scatterStyle val="lineMarker"/>{}<c:axId val="1"/><c:axId val="2"/></c:scatterChart><c:valAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="2"/></c:valAx><c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:crossAx val="1"/></c:valAx>"#,
+        format!(
+            r#"<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>Mätning</c:v></c:tx><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>{}<c:xVal>{}</c:xVal><c:yVal>{}</c:yVal></c:ser>"#,
+            trend("linear", r#"<c:forward val="1"/>"#),
+            num_lit(&[1.0, 2.0, 3.0, 4.0, 5.0]),
+            num_lit(&[1.0, 3.0, 2.0, 5.0, 4.0])
+        )
+    );
+    let scene = render_chart(&chart_xml(&plot), "trendlinje");
+    let t: String = texts(&scene.items).join(" ");
+    // y = 0,8x + 0,6 och R² = 0,64 (som Excel).
+    assert!(t.contains("y = 0.8x + 0.6"), "{t}");
+    assert!(t.contains("R² = 0.64"), "{t}");
+    // Den röda streckade linjen ritas, klippt till ritytan.
+    assert!(scene.items.iter().any(|i| matches!(i, Item::Stroke { stroke, .. } if matches!(stroke.paint, Paint::Solid(c) if c == Rgba::rgb8(255, 0, 0)) && !stroke.dash.is_empty())));
+    assert!(scene.items.iter().any(|i| matches!(i, Item::PushClip { .. })));
+    // Polynom och glidande medel i ett linjediagram.
+    let plot = format!(
+        r#"<c:lineChart><c:grouping val="standard"/>{}<c:marker val="1"/><c:axId val="1"/><c:axId val="2"/></c:lineChart>{}"#,
+        ser(0, "A", &CATS, &[3.0, 1.0, 2.0, 6.0], &format!("{}{}", trend("poly", r#"<c:order val="2"/>"#).replace("<c:dispRSqr val=\"1\"/><c:dispEq val=\"1\"/>", ""), trend("movingAvg", r#"<c:period val="2"/>"#).replace("<c:dispRSqr val=\"1\"/><c:dispEq val=\"1\"/>", ""))),
+        axes("1", "2", "l", "autoZero", false)
+    );
+    let scene = render_chart(&chart_xml(&plot), "trendlinje-polynom");
+    let reds = scene.items.iter().filter(|i| matches!(i, Item::Stroke { stroke, .. } if matches!(stroke.paint, Paint::Solid(c) if c == Rgba::rgb8(255, 0, 0)))).count();
+    assert_eq!(reds, 2, "polynom och glidande medel");
+}
+
+#[test]
+fn felstaplar_pa_staplar_och_punkter() {
+    let err = |extra: &str| format!(r#"<c:errBars>{extra}<c:spPr><a:ln w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></c:spPr></c:errBars>"#);
+    let plot = format!(
+        r#"<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>{}{}<c:gapWidth val="150"/><c:axId val="1"/><c:axId val="2"/></c:barChart>{}"#,
+        ser(0, "A", &CATS, &[10.0, 20.0, 30.0, 25.0], &err(r#"<c:errBarType val="both"/><c:errValType val="fixedVal"/><c:noEndCap val="0"/><c:val val="5"/>"#)),
+        ser(1, "B", &CATS, &[15.0, 10.0, 20.0, 30.0], &err(&format!(r#"<c:errBarType val="plus"/><c:errValType val="cust"/><c:noEndCap val="1"/><c:plus>{}</c:plus>"#, num_lit(&[2.0, 4.0, 6.0, 8.0])))),
+        axes("1", "2", "l", "autoZero", false)
+    );
+    let scene = render_chart(&chart_xml(&plot), "felstaplar");
+    let black: Vec<&Item> = scene.items.iter().filter(|i| matches!(i, Item::Stroke { stroke, .. } if matches!(stroke.paint, Paint::Solid(c) if c == Rgba::BLACK) && (stroke.width - 1.0).abs() < 1e-3)).collect();
+    assert_eq!(black.len(), 2, "en bana per serie");
+    // Serie A: ±5 kring 30 vid Q3 → från 25 till 35; serie B: bara plus.
+    let Item::Stroke { path, .. } = black[0] else { unreachable!() };
+    let (_, y0, _, y1) = path.bounds().unwrap();
+    // Höjden motsvarar 10 + 5 + 5 enheter i skalan 0–35 (5 ovanför 30): större än noll och mindre än ritytan.
+    assert!(y1 - y0 > 20.0 && y1 - y0 < 300.0, "{y0} {y1}");
+}
+
+#[test]
+fn radardiagram_med_rutnat_och_serier() {
+    let plot = format!(
+        r#"<c:radarChart><c:radarStyle val="marker"/><c:varyColors val="0"/>{}{}<c:axId val="1"/><c:axId val="2"/></c:radarChart>{}"#,
+        ser(0, "Lag 1", &["Fart", "Kraft", "Teknik", "Taktik", "Ork"], &[4.0, 3.0, 5.0, 2.0, 4.0], ""),
+        ser(1, "Lag 2", &["Fart", "Kraft", "Teknik", "Taktik", "Ork"], &[2.0, 5.0, 3.0, 4.0, 3.0], ""),
+        axes("1", "2", "l", "autoZero", false).replace(r#"<c:axPos val="b"/>"#, r#"<c:axPos val="b"/><c:majorGridlines/>"#)
+    );
+    let scene = render_chart(&chart_xml(&plot), "radar");
+    let t = texts(&scene.items);
+    for want in ["Fart", "Kraft", "Teknik", "Taktik", "Ork", "Lag 1", "Lag 2", "6"] {
+        assert!(t.iter().any(|x| x == want), "saknar {want:?} i {t:?}");
+    }
+    assert!(!t.iter().any(|x| x == "Diagram"), "ingen platshållare");
+    // "Fart" står överst (första ekern klockan tolv), "Teknik" nedanför mitten till höger.
+    let at = |s: &str| scene.items.iter().find_map(|i| if let Item::Glyphs(g) = i { (g.text.trim() == s).then(|| g.t.apply(0.0, 0.0)) } else { None }).unwrap();
+    let (fart, kraft, teknik) = (at("Fart"), at("Kraft"), at("Teknik"));
+    assert!(fart.1 < kraft.1 && kraft.1 < teknik.1 && kraft.0 > fart.0);
+    // Fyllt radardiagram.
+    let filled = chart_xml(&plot.replace(r#"<c:radarStyle val="marker"/>"#, r#"<c:radarStyle val="filled"/>"#));
+    let scene = render_chart(&filled, "radar-fylld");
+    let f = fills(&scene.items);
+    assert!(f.iter().filter(|(b, c)| *c == Rgba::rgb8(0x44, 0x72, 0xC4) && b.2 - b.0 > 50.0).count() >= 1);
+}
+
+#[test]
+fn datatabell_under_ritytan() {
+    let plot = format!(
+        r#"<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>{}{}<c:gapWidth val="150"/><c:axId val="1"/><c:axId val="2"/></c:barChart>{}<c:dTable><c:showHorzBorder val="1"/><c:showVertBorder val="1"/><c:showOutline val="1"/><c:showKeys val="1"/></c:dTable>"#,
+        ser(0, "Norr", &CATS, &[12.0, 20.0, 31.0, 25.0], ""),
+        ser(1, "Söder", &CATS, &[15.0, 11.5, 20.0, 30.0], ""),
+        axes("1", "2", "l", "autoZero", false)
+    );
+    let scene = render_chart(&chart_xml(&plot), "datatabell");
+    let t = texts(&scene.items);
+    for want in ["Q1", "Q4", "Norr", "Söder", "31", "11.5"] {
+        assert!(t.iter().any(|x| x == want), "saknar {want:?} i {t:?}");
+    }
+    // Värdena står i rader under kategorierna: "31" (Norr, Q3) ovanför "20" (Söder, Q3) och under "Q3".
+    let at = |s: &str| scene.items.iter().filter_map(|i| if let Item::Glyphs(g) = i { (g.text.trim() == s).then(|| g.t.apply(0.0, 0.0)) } else { None }).collect::<Vec<_>>();
+    let q3 = at("Q3")[0];
+    let v31 = at("31")[0];
+    assert!(v31.1 > q3.1 && (v31.0 - q3.0).abs() < 15.0, "{q3:?} {v31:?}");
+    assert!(at("Söder").last().unwrap().1 > at("Norr").last().unwrap().1);
+    // Förklaringsnycklarna i tabellen (två extra rutor i seriefärgerna).
+    let keys = fills(&scene.items).iter().filter(|(b, c)| *c == Rgba::rgb8(0x44, 0x72, 0xC4) && (b.2 - b.0) < 8.0).count();
+    assert!(keys >= 2, "{keys}");
+}

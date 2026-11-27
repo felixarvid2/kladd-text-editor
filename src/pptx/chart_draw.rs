@@ -22,6 +22,12 @@ use super::xml::Node;
 
 #[path = "chart_3d_draw.rs"]
 mod three_d;
+#[path = "chart_analysis.rs"]
+mod analysis;
+#[path = "chart_radar.rs"]
+mod radar;
+#[path = "chart_table.rs"]
+mod table;
 
 /// Yttre marginal (punkter).
 const PAD: f32 = 7.0;
@@ -410,6 +416,12 @@ impl<'b, 'a> Draw<'b, 'a> {
             }
             return;
         }
+        if c.plots.iter().any(|p| matches!(p.kind, Kind::Radar { .. })) {
+            let inner = inner_fixed.unwrap_or(outer);
+            self.shape(Path::rect(inner.x, inner.y, inner.w, inner.h), inner, c.plot_sppr, None, None);
+            self.radar(c, inner);
+            return;
+        }
         if c.plots.iter().any(|p| p.three_d) {
             self.axes_plot_3d(c, outer, inner_fixed);
         } else {
@@ -442,7 +454,7 @@ impl<'b, 'a> Draw<'b, 'a> {
                     }
                 } else {
                     // 3D-linjer är band: nyckeln är en ruta i bandets färg.
-                    let line = matches!(p.kind, Kind::Line | Kind::Scatter) && !p.three_d;
+                    let line = (matches!(p.kind, Kind::Line | Kind::Scatter) && !p.three_d) || p.kind == (Kind::Radar { filled: false });
                     entries.push(Entry { text: ser.name.clone(), sppr: ser.sppr, color: self.auto_color(c.style, ser.idx, total), line });
                 }
             }
@@ -657,10 +669,20 @@ impl<'b, 'a> Draw<'b, 'a> {
         let ncat = c.plots.iter().flat_map(|p| p.series.iter()).map(|s| s.vals.len().max(s.cats.len())).max().unwrap_or(0).max(1);
         let cats: Vec<String> = c.plots.iter().flat_map(|p| p.series.iter()).map(|s| s.cats.clone()).find(|v| !v.is_empty()).unwrap_or_else(|| (1..=ncat).map(|i| i.to_string()).collect());
 
+        // Sekundär värdeaxel: en senare plotts värdeaxel som inte är den första plottens (punktdiagram har
+        // två värdeaxlar och ingen sekundär här).
+        let sec_ax: Option<&Axis<'_>> = if scatter {
+            None
+        } else {
+            c.plots.iter().skip(1).flat_map(|p| p.ax_ids.iter().filter_map(|id| find(id))).find(|a| a.kind == "valAx" && val_ax.is_none_or(|v| v.id != a.id) && cat_ax.is_none_or(|cx| cx.id != a.id))
+        };
+        let on_sec = |p: &Plot<'_>| sec_ax.is_some_and(|s| p.ax_ids.iter().any(|id| *id == s.id));
+        let (lo2, hi2, percent2) = value_range(c.plots.iter().filter(|p| on_sec(p)), ncat);
+
         // Värdeområdet.
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
         let mut percent = false;
-        for p in &c.plots {
+        for p in c.plots.iter().filter(|p| !on_sec(p)) {
             let stacked = p.grouping != Grouping::Clustered && !matches!(p.kind, Kind::Scatter);
             if p.grouping == Grouping::Percent {
                 percent = true;
@@ -688,6 +710,9 @@ impl<'b, 'a> Draw<'b, 'a> {
         if lo > hi {
             (lo, hi) = (0.0, 1.0);
         }
+        // Felstaplarna ska få plats (Excel räknar in dem i skalan).
+        let (lo, hi) = error_extent(c.plots.iter().filter(|p| !on_sec(p)), (lo, hi));
+        let (lo2, hi2) = error_extent(c.plots.iter().filter(|p| on_sec(p)), (lo2, hi2));
         let x_range = scatter.then(|| {
             let xs: Vec<f64> = first.series.iter().flat_map(|s| s.xvals.iter().flatten().copied()).collect();
             if xs.is_empty() { (1.0, ncat as f64) } else { (xs.iter().cloned().fold(f64::INFINITY, f64::min), xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) }
@@ -735,6 +760,24 @@ impl<'b, 'a> Draw<'b, 'a> {
             }
         };
         let mut scale = scale_for(self, guess);
+        // Den sekundära axelns skala och etiketter (till höger, eller överst för liggande staplar).
+        let sec_style = self.style(&[sec_ax.and_then(|a| a.txpr), c.space_txpr], 1000);
+        let sec_fmt = |v: f64| -> String {
+            let code = match sec_ax {
+                Some(a) if !a.source_linked => a.num_fmt.clone().unwrap_or_else(|| "General".into()),
+                _ if percent2 => "0%".into(),
+                _ => c.plots.iter().filter(|p| on_sec(p)).flat_map(|p| p.series.first()).map(|s| s.format.clone()).next().unwrap_or_else(|| "General".into()),
+            };
+            chart_fmt::format(v, &code)
+        };
+        let show_sec_lbl = sec_ax.is_some_and(|a| !a.deleted && a.tick_lbl_pos != "none");
+        let sec_scale_for = |inner: R| -> Scale {
+            let a = sec_ax;
+            let (fmin, fmax, fstep) = a.map_or((None, None, None), |a| (a.min, a.max, a.major));
+            let (fmin, fmax) = if percent2 { (fmin.or(Some(0.0)), fmax.or(Some(1.0))) } else { (fmin, fmax) };
+            auto_scale(lo2, hi2, fmin, fmax, fstep, &fits_vertical(if horizontal { inner.w } else { inner.h }))
+        };
+        let mut scale2 = sec_scale_for(guess);
         let x_scale = x_range.map(|(a, b2)| {
             let fits = |mn: f64, mx: f64, step: f64| -> bool {
                 let n = ((mx - mn) / step).round().max(1.0);
@@ -746,17 +789,33 @@ impl<'b, 'a> Draw<'b, 'a> {
         });
 
         let between = val_ax.and_then(|a| a.cross_between.as_deref()).map_or(!matches!(first.kind, Kind::Area), |b| b == "between");
+        // Datatabell (stående kategoridiagram med kategorierna i band).
+        let dtable = c.dtable.filter(|_| !horizontal && !scatter && between).map(|t| table::Table { t, cats: cats.clone(), style: self.style(&[t.txpr, c.space_txpr], 1000) });
+        let show_cat_lbl = show_cat_lbl && dtable.is_none();
         // Ritytans inre rektangel.
         let inner = inner_fixed.unwrap_or_else(|| {
             let val_w = if show_val_lbl { scale.ticks().iter().map(|v| measure(self, &val_fmt(*v), &val_style).0).fold(0.0, f32::max) } else { 0.0 };
-            let (left_w, bottom_h) = if horizontal {
+            let (mut left_w, mut bottom_h) = if horizontal {
                 (if show_cat_lbl { cat_w + 0.92 * cs } else { 0.0 }, if show_val_lbl { 1.81 * vs } else { 0.0 })
             } else {
                 (if show_val_lbl { val_w + 0.92 * vs } else { 0.0 }, if show_cat_lbl || scatter { 1.81 * cs } else { 0.0 })
             };
+            // Datatabellen tar kategorietiketternas plats under ritytan och har seriernas namn till vänster.
+            if let Some((name_w, table_h)) = dtable.as_ref().map(|t| t.size(self, c)) {
+                bottom_h = table_h + 0.3 * cs;
+                left_w = left_w.max(name_w);
+            }
             let mut x = outer.x + left_w;
-            let y = outer.y + 0.45 * left_s;
+            let mut y = outer.y + 0.45 * left_s;
             let mut right = outer.right() - 0.33 * bottom_s;
+            if show_sec_lbl {
+                if horizontal {
+                    y = outer.y + 1.81 * sec_style.size;
+                } else {
+                    let w2 = scale2.ticks().iter().map(|v| measure(self, &sec_fmt(*v), &sec_style).0).fold(0.0, f32::max);
+                    right = outer.right() - w2 - 0.92 * sec_style.size;
+                }
+            }
             // Kategorier på strecken (`midCat`): första och sista etiketten ska få plats i diagrammet.
             if !between && !horizontal && show_cat_lbl && !scatter {
                 if let (Some(f0), Some(fl)) = (cats.first(), cats.last()) {
@@ -769,6 +828,13 @@ impl<'b, 'a> Draw<'b, 'a> {
         if inner_fixed.is_none() {
             scale = scale_for(self, inner);
         }
+        scale2 = if sec_ax.is_some() { sec_scale_for(inner) } else { scale2 };
+        let sec_rev = sec_ax.is_some_and(|a| a.reversed);
+        let vpos2 = move |v: f64| -> f32 {
+            let t = ((v - scale2.min) / (scale2.max - scale2.min)) as f32;
+            let t = if sec_rev { 1.0 - t } else { t };
+            if horizontal { inner.x + t * inner.w } else { inner.bottom() - t * inner.h }
+        };
         // Ritytans bakgrund.
         self.shape(Path::rect(inner.x, inner.y, inner.w, inner.h), inner, c.plot_sppr, None, None);
 
@@ -856,11 +922,24 @@ impl<'b, 'a> Draw<'b, 'a> {
         let total_series: usize = c.plots.iter().map(|p| p.series.len()).sum();
         let mut labels: Vec<(Label, (f32, f32, f32, f32), Labels<'n>)> = Vec::new();
         for p in &c.plots {
+            let vp: &dyn Fn(f64) -> f32 = if on_sec(p) { &vpos2 } else { &vpos };
             match p.kind {
-                Kind::Bar { .. } => self.bars(c, p, ncat, total_series, &vpos, &cpos, band, horizontal, inner, &mut labels),
-                Kind::Line | Kind::Area => self.lines(c, p, ncat, total_series, &vpos, &cpos, inner, &mut labels),
-                Kind::Scatter => self.scatter(c, p, total_series, &vpos, &xpos, inner, &mut labels),
-                Kind::Pie { .. } => {}
+                Kind::Bar { .. } => self.bars(c, p, ncat, total_series, vp, &cpos, band, horizontal, inner, &mut labels),
+                Kind::Line | Kind::Area => self.lines(c, p, ncat, total_series, vp, &cpos, inner, &mut labels),
+                Kind::Scatter => self.scatter(c, p, total_series, vp, &xpos, inner, &mut labels),
+                Kind::Pie { .. } | Kind::Radar { .. } => {}
+            }
+            // Trendlinjer och felstaplar.
+            if p.series.iter().any(|s| !s.trendlines.is_empty() || !s.err_bars.is_empty()) {
+                for (k, ser) in p.series.iter().enumerate() {
+                    if ser.trendlines.is_empty() && ser.err_bars.is_empty() {
+                        continue;
+                    }
+                    let sp = series_points(p, ser, k, ncat, band, horizontal, &cpos, &xpos, scatter);
+                    let col = self.series_paint(c, p, ser, None, total_series, ncat);
+                    let xp: Option<&dyn Fn(f64) -> f32> = if scatter { Some(&xpos) } else { None };
+                    self.analysis(ser, &sp, vp, horizontal, inner, col, xp);
+                }
             }
         }
 
@@ -935,6 +1014,51 @@ impl<'b, 'a> Draw<'b, 'a> {
                         // Etiketten centreras på strecket (baslinjen 0,28 em under det, som i PowerPoint).
                         self.place(l, inner.x - 0.92 * vs, p - 0.1 * vs, 1.0, 0.5, 0.0);
                     }
+                }
+            }
+        }
+        if let Some(t) = &dtable {
+            self.data_table(c, t, inner, band, &cpos);
+        }
+        // Den sekundära värdeaxeln.
+        if let Some(ax) = sec_ax.filter(|a| !a.deleted) {
+            if let Some(st) = self.line_of(ax.sppr, inner).unwrap_or(Some(axis_def.clone())) {
+                let mut path = Path::default();
+                if horizontal {
+                    path.move_to(inner.x, inner.y);
+                    path.line_to(inner.right(), inner.y);
+                } else {
+                    path.move_to(inner.right(), inner.y);
+                    path.line_to(inner.right(), inner.bottom());
+                }
+                self.stroke(path, st);
+            }
+            if show_sec_lbl {
+                let ss = sec_style.size;
+                for v in scale2.ticks() {
+                    let t = sec_fmt(v);
+                    let p = vpos2(v);
+                    if horizontal {
+                        let l = self.lay(Self::plain_paras(&t, &sec_style, Align::Center), f32::INFINITY);
+                        self.place(l, p, inner.y - 0.61 * ss, 0.5, 1.0, 0.0);
+                    } else {
+                        let l = self.lay(Self::plain_paras(&t, &sec_style, Align::Left), f32::INFINITY);
+                        self.place(l, inner.right() + 0.92 * ss, p - 0.1 * ss, 0.0, 0.5, 0.0);
+                    }
+                }
+            }
+            if let Some(t) = &ax.title {
+                let chain = [t.txpr, c.space_txpr];
+                let paras = match (t.rich, &t.text) {
+                    (Some(rich), _) => Some(self.rich_paras(rich, &chain, 1000, Align::Center, &|_| None)),
+                    (None, Some(txt)) => Some(Self::plain_paras(txt, &self.style(&chain, 1000), Align::Center)),
+                    _ => None,
+                };
+                if let Some(paras) = paras {
+                    let l = self.lay(paras, f32::INFINITY);
+                    let w2 = scale2.ticks().iter().map(|v| measure(self, &sec_fmt(*v), &sec_style).0).fold(0.0, f32::max);
+                    let x = (inner.right() + 0.92 * sec_style.size + w2 + 0.3 * sec_style.size).min(self.f.w - l.h);
+                    self.place(l, x, inner.y + inner.h / 2.0, 0.5, 0.0, -90.0);
                 }
             }
         }
@@ -1251,6 +1375,100 @@ impl<'b, 'a> Draw<'b, 'a> {
 }
 
 /// Linje med fyllning ur en `a:ln`-nod (bredd i punkter).
+/// Värdeområdet (minsta, största, 100 %) för plottarna, staplade summerade.
+fn value_range<'a, 'n: 'a>(plots: impl Iterator<Item = &'a Plot<'n>>, ncat: usize) -> (f64, f64, bool) {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut percent = false;
+    for p in plots {
+        let stacked = p.grouping != Grouping::Clustered && !matches!(p.kind, Kind::Scatter);
+        if p.grouping == Grouping::Percent {
+            percent = true;
+            lo = lo.min(0.0);
+            hi = hi.max(1.0);
+        } else if stacked {
+            for i in 0..ncat {
+                let (mut pos, mut neg) = (0.0, 0.0);
+                for s in &p.series {
+                    let v = s.vals.get(i).copied().flatten().unwrap_or(0.0);
+                    if v >= 0.0 { pos += v } else { neg += v }
+                }
+                lo = lo.min(neg);
+                hi = hi.max(pos);
+            }
+        } else {
+            for v in p.series.iter().flat_map(|s| s.vals.iter().flatten()) {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+        }
+    }
+    if lo > hi {
+        (lo, hi) = (0.0, 1.0);
+    }
+    (lo, hi, percent)
+}
+
+/// Värdeområdet utvidgat med felstaplarna i värdeled (ogrupperade serier).
+fn error_extent<'a, 'n: 'a>(plots: impl Iterator<Item = &'a Plot<'n>>, (mut lo, mut hi): (f64, f64)) -> (f64, f64) {
+    for p in plots.filter(|p| p.grouping == Grouping::Clustered) {
+        for ser in &p.series {
+            let all: Vec<f64> = ser.vals.iter().flatten().copied().collect();
+            for e in ser.err_bars.iter().filter(|e| !e.dir_x) {
+                for (i, v) in ser.vals.iter().enumerate() {
+                    let Some(v) = *v else { continue };
+                    let (a, b, center) = analysis::error_amounts(e, i, v, &all);
+                    let c = center.unwrap_or(v);
+                    lo = lo.min(c - a);
+                    hi = hi.max(c + b);
+                }
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// En series punkter för trendlinjer och felstaplar (samma lägen som när serien ritas: stapelns mitt,
+/// staplade värden ovanpå varandra).
+#[allow(clippy::too_many_arguments)]
+fn series_points(p: &Plot<'_>, ser: &Series<'_>, k: usize, ncat: usize, band: f32, horizontal: bool, cpos: &dyn Fn(f32) -> f32, xpos: &dyn Fn(f64) -> f32, scatter: bool) -> analysis::SeriesPoints {
+    if scatter {
+        let pts = ser.vals.iter().enumerate().filter_map(|(i, v)| {
+            let x = ser.xvals.get(i).copied().flatten().unwrap_or(i as f64 + 1.0);
+            Some((x, (*v)?, xpos(x)))
+        });
+        let x0 = xpos(0.0);
+        return analysis::SeriesPoints { pts: pts.collect(), x0, dx: xpos(1.0) - x0 };
+    }
+    // Stapelns förskjutning från kategorins mitt.
+    let slot = match p.kind {
+        Kind::Bar { .. } if p.grouping == Grouping::Clustered => {
+            let m = p.series.len().max(1) as f32;
+            let (gap, ov) = (p.gap / 100.0, p.overlap / 100.0);
+            let w = band / (m - (m - 1.0) * ov + gap);
+            let group_w = m * w - (m - 1.0) * ov * w;
+            let off = k as f32 * w * (1.0 - ov) + w / 2.0 - group_w / 2.0;
+            if horizontal { -off } else { off }
+        }
+        _ => 0.0,
+    };
+    let sums: Vec<f64> = (0..ncat).map(|i| p.series.iter().map(|s| s.vals.get(i).copied().flatten().unwrap_or(0.0)).sum()).collect();
+    let pts = (0..ncat).filter_map(|i| {
+        let v = ser.vals.get(i).copied().flatten()?;
+        let v = match p.grouping {
+            Grouping::Clustered => v,
+            // Staplat: värdet ovanpå de föregående seriernas.
+            g => {
+                let below: f64 = p.series[..k].iter().map(|s| s.vals.get(i).copied().flatten().unwrap_or(0.0)).sum();
+                let t = below + v;
+                if g == Grouping::Percent && sums[i] != 0.0 { t / sums[i] } else { t }
+            }
+        };
+        Some(((i + 1) as f64, v, cpos(i as f32) + slot))
+    });
+    let x0 = cpos(-1.0) + slot;
+    analysis::SeriesPoints { pts: pts.collect(), x0, dx: cpos(0.0) - cpos(-1.0) }
+}
+
 fn stroke(paint: Paint, width: f32, ln: &Node) -> Stroke {
     let dash: Vec<f32> = match ln.child("a:prstDash").and_then(|d| d.attr("val")).unwrap_or("solid") {
         "dot" | "sysDot" => vec![1.0, 1.0],

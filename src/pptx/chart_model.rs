@@ -16,6 +16,65 @@ pub enum Kind {
     /// Cirkel/ring: `hole` är hålets storlek som andel av radien (0 = cirkel).
     Pie { hole: f32, three_d: bool },
     Scatter,
+    /// Radar (`c:radarChart`): `filled` = fyllda ytor (`radarStyle filled`).
+    Radar { filled: bool },
+}
+
+/// Datatabellen (`c:dTable`): kantlinjer och förklaringsnycklar.
+#[derive(Clone, Copy, Debug)]
+pub struct DataTable<'n> {
+    pub horz: bool,
+    pub vert: bool,
+    pub outline: bool,
+    pub keys: bool,
+    pub sppr: Option<&'n Node>,
+    pub txpr: Option<&'n Node>,
+}
+
+/// Trendlinjens typ (`c:trendlineType`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrendKind {
+    Linear,
+    Exp,
+    Log,
+    /// Polynom av graden 2–6.
+    Poly(usize),
+    Power,
+    /// Glidande medel över så här många punkter.
+    MovingAvg(usize),
+}
+
+/// En trendlinje (`c:trendline`).
+#[derive(Clone, Debug)]
+pub struct Trendline<'n> {
+    pub kind: TrendKind,
+    pub sppr: Option<&'n Node>,
+    /// Förlängning framåt/bakåt i x-axelns enheter.
+    pub forward: f64,
+    pub backward: f64,
+    /// Fast skärningspunkt med y-axeln (`c:intercept`; linjär, polynom, exponentiell).
+    pub intercept: Option<f64>,
+    pub disp_eq: bool,
+    pub disp_r2: bool,
+    /// Etikettens `c:trendlineLbl` (formatering och talformat).
+    pub label: Option<&'n Node>,
+}
+
+/// Felstaplar (`c:errBars`).
+#[derive(Clone, Debug)]
+pub struct ErrBars<'n> {
+    /// `x` eller `y` (`c:errDir`; staplar och linjer har bara värdeled).
+    pub dir_x: bool,
+    /// `both`, `plus` eller `minus`.
+    pub kind: String,
+    /// `fixedVal`, `percentage`, `stdDev`, `stdErr` eller `cust`.
+    pub val_type: String,
+    pub val: f64,
+    pub no_end_cap: bool,
+    /// Egna värden (`c:plus`/`c:minus`).
+    pub plus: Vec<Option<f64>>,
+    pub minus: Vec<Option<f64>>,
+    pub sppr: Option<&'n Node>,
 }
 
 /// Gruppering för stapel/linje/yta.
@@ -84,6 +143,8 @@ pub struct Series<'n> {
     pub labels: Labels<'n>,
     /// Etiketter för enskilda punkter (`c:dLbl`).
     pub point_labels: Vec<(usize, Labels<'n>)>,
+    pub trendlines: Vec<Trendline<'n>>,
+    pub err_bars: Vec<ErrBars<'n>>,
 }
 
 impl<'n> Series<'n> {
@@ -220,6 +281,8 @@ pub struct Chart<'n> {
     pub space_sppr: Option<&'n Node>,
     pub space_txpr: Option<&'n Node>,
     pub plot_sppr: Option<&'n Node>,
+    /// Datatabellen under ritytan (`c:dTable`).
+    pub dtable: Option<DataTable<'n>>,
     pub view3d: Option<View3D>,
     /// Golvets och väggarnas `c:spPr`.
     pub walls: Walls<'n>,
@@ -383,6 +446,44 @@ fn series<'n>(s: &'n Node, plot_labels: &Labels<'n>) -> Series<'n> {
         smooth: flag(s, "c:smooth", false),
         labels: base,
         point_labels,
+        trendlines: s.children_named("c:trendline").map(trendline).collect(),
+        err_bars: s.children_named("c:errBars").map(err_bars).collect(),
+    }
+}
+
+fn trendline(t: &Node) -> Trendline<'_> {
+    let order = num(t, "c:order").unwrap_or(2.0).clamp(2.0, 6.0) as usize;
+    let period = num(t, "c:period").unwrap_or(2.0).clamp(2.0, 255.0) as usize;
+    Trendline {
+        kind: match val(t, "c:trendlineType").unwrap_or("linear") {
+            "exp" => TrendKind::Exp,
+            "log" => TrendKind::Log,
+            "poly" => TrendKind::Poly(order),
+            "power" => TrendKind::Power,
+            "movingAvg" => TrendKind::MovingAvg(period),
+            _ => TrendKind::Linear,
+        },
+        sppr: t.child("c:spPr"),
+        forward: num(t, "c:forward").unwrap_or(0.0).max(0.0),
+        backward: num(t, "c:backward").unwrap_or(0.0).max(0.0),
+        intercept: num(t, "c:intercept"),
+        disp_eq: flag(t, "c:dispEq", false),
+        disp_r2: flag(t, "c:dispRSqr", false),
+        label: t.child("c:trendlineLbl"),
+    }
+}
+
+fn err_bars(e: &Node) -> ErrBars<'_> {
+    let nums = |name: &str| e.child(name).map(|n| cache_strings(n).0.iter().map(|v| parse_num(v)).collect()).unwrap_or_default();
+    ErrBars {
+        dir_x: val(e, "c:errDir") == Some("x"),
+        kind: val(e, "c:errBarType").unwrap_or("both").to_owned(),
+        val_type: val(e, "c:errValType").unwrap_or("fixedVal").to_owned(),
+        val: num(e, "c:val").unwrap_or(1.0),
+        no_end_cap: flag(e, "c:noEndCap", false),
+        plus: nums("c:plus"),
+        minus: nums("c:minus"),
+        sppr: e.child("c:spPr"),
     }
 }
 
@@ -420,6 +521,7 @@ fn plot(n: &Node) -> Option<Plot<'_>> {
         "pie3DChart" => Kind::Pie { hole: 0.0, three_d: true },
         "doughnutChart" => Kind::Pie { hole: num(n, "c:holeSize").unwrap_or(50.0).clamp(10.0, 90.0) as f32 / 100.0, three_d: false },
         "scatterChart" | "bubbleChart" => Kind::Scatter,
+        "radarChart" => Kind::Radar { filled: val(n, "c:radarStyle") == Some("filled") },
         _ => return None,
     };
     let grouping = match val(n, "c:grouping") {
@@ -439,7 +541,8 @@ fn plot(n: &Node) -> Option<Plot<'_>> {
         gap: num(n, "c:gapWidth").unwrap_or(150.0).clamp(0.0, 500.0) as f32,
         overlap: num(n, "c:overlap").unwrap_or(if grouping == Grouping::Clustered { 0.0 } else { 100.0 }).clamp(-100.0, 100.0) as f32,
         first_angle: num(n, "c:firstSliceAng").unwrap_or(0.0) as f32,
-        markers: flag(n, "c:marker", true),
+        // Radar: markörer bara för `radarStyle marker`.
+        markers: if n.local() == "radarChart" { val(n, "c:radarStyle") == Some("marker") } else { flag(n, "c:marker", true) },
         ax_ids: n.children_named("c:axId").filter_map(|a| a.attr("val")).map(str::to_owned).collect(),
         three_d: matches!(n.local(), "bar3DChart" | "line3DChart" | "area3DChart"),
         shape: val(n, "c:shape").unwrap_or("box").to_owned(),
@@ -479,6 +582,14 @@ pub fn parse(root: &Node) -> Option<Chart<'_>> {
         space_sppr: root.child("c:spPr"),
         space_txpr: root.child("c:txPr"),
         plot_sppr: pa.child("c:spPr"),
+        dtable: pa.child("c:dTable").map(|d| DataTable {
+            horz: flag(d, "c:showHorzBorder", false),
+            vert: flag(d, "c:showVertBorder", false),
+            outline: flag(d, "c:showOutline", false),
+            keys: flag(d, "c:showKeys", false),
+            sppr: d.child("c:spPr"),
+            txpr: d.child("c:txPr"),
+        }),
         view3d: chart.child("c:view3D").map(|v| View3D {
             rot_x: num(v, "c:rotX").map(|x| x as f32),
             rot_y: num(v, "c:rotY").map(|x| x as f32),
@@ -535,7 +646,7 @@ pub(crate) mod tests {
 
     #[test]
     fn okand_typ_ger_inget() {
-        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:radarChart/></c:plotArea></c:chart></c:chartSpace>"#;
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:surfaceChart/></c:plotArea></c:chart></c:chartSpace>"#;
         let root = crate::pptx::xml::parse(xml.as_bytes()).unwrap();
         assert!(parse(&root).is_none());
     }

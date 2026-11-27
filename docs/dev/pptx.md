@@ -182,7 +182,10 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
-- **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
+- **Diagram:** yt-3D (`surface3DChart`), chartex (`cx:`), sekundär x-axel i punktdiagram, datumaxlar med tidsskala
+  (`baseTimeUnit`: i `cand/uzis-souhrn` bild 28 hamnar dagarna för tätt); sekundäraxlar, trendlinjer, felstaplar,
+  radar och datatabeller finns men saknar referensbilder från PowerPoint (se *Sekundäraxlar, trendlinjer,
+  felstaplar, radar och datatabeller*);
   3D-diagrammen utan referensbilder (stapel/linje/yta) är inte kalibrerade (se *3D i diagram och former*).
 - **EMF/WMF:** `ExcludeClipRect`, fler regionoperationer, streckade/mönstrade penslar, `ETO_GLYPH_INDEX`, EMF+.
 - **Tabeller:** lodrät text i celler låter inte raden växa; några val är inte prövade mot referensbilder (se
@@ -1104,3 +1107,43 @@ Moduler: `edit_format.rs` (modellens formatfunktioner), `edit_fit.rs` (autoanpas
   teckensnitt, radavstånd, nivåspecifika punkttecken och numrerade listor i formatraden; format på
   markeringen som visas blandat (raden visar värdet i körningen vid markören); autoanpassning efter att en form
   ändrar storlek med handtagen (PowerPoint räknar då om); markering och redigering av flera tabellceller.
+
+## Sekundäraxlar, trendlinjer, felstaplar, radar och datatabeller (omgång 5)
+
+`chart_draw.rs` (sekundäraxeln) och tre nya undermoduler som delar `Draw`: `chart_analysis.rs` (trendlinjer och
+felstaplar, matematiken som rena funktioner), `chart_radar.rs` och `chart_table.rs`. Modellen (`chart_model.rs`) har fått
+`Series::trendlines`/`err_bars` (`Trendline`, `TrendKind`, `ErrBars`) och `Kind::Radar { filled }`.
+
+- **Sekundär värdeaxel:** en senare plotts värdeaxel som inte är den första plottens (som Excel skriver en
+  kombination: andra plotten har en egen `catAx` (ofta `delete`) och en `valAx` med `crosses max`, `axPos r`).
+  Plottarna på den får en egen skala (samma regler, värdeområdet ur bara de plottarna), axeln ritas vid ritytans
+  högerkant (överst för liggande staplar) med etiketterna utanför och rubriken vriden; ritytan krymper med
+  etiketternas bredd. Inte för punktdiagram (de har två värdeaxlar redan).
+- **Trendlinjer** (`c:trendline`): x är kategorins nummer (1, 2 …; vid grupperade staplar genom stapelns mitt)
+  eller punktens x-värde. Linjär och polynom (grad 2–6, minsta kvadrat med Gauss), exponentiell (ln y linjärt),
+  logaritmisk, potens (ln–ln), glidande medel (`period`). `forward`/`backward`, `intercept`, linjen klipps till
+  ritytan. `dispEq`/`dispRSqr` ger ekvationen (koefficienter med fyra decimaler, exponenter upphöjda) och R²
+  (i den linjäriserade formen, som Excel) vid linjens slut. Standardlinje: seriens färg, 2,25 pt, punktstreckad.
+  Jämfört mot PowerPoints PDF för ett glidande medel över 7 punkter (`cand/uzis-souhrn` bild 28, inte i
+  jämförelseprovets urval): kurvan följer PowerPoints.
+- **Felstaplar** (`c:errBars`): fast värde, procent, standardavvikelse (kring seriens medelvärde, som Excel),
+  standardfel, egna värden (`c:plus`/`c:minus`), `both`/`plus`/`minus`, `noEndCap`, i värdeled för stapel/linje/
+  yta (även liggande staplar och staplade värden) och i båda leden för punktdiagram. Felstaplarna räknas in i
+  axelns skala (grupperade serier). Standardlinje: textfärgen med 65 %, 0,75 pt.
+- **Radar** (`c:radarChart`): ekrar medurs från klockan tolv, värdeaxeln längs den första ekern med etiketterna
+  till vänster, månghörningar för värdeaxelns `majorGridlines` och ekrar för kategoriaxelns, kategorietiketter
+  utanför ekrarna; `radarStyle` `standard` (linjer), `marker` (linjer med markörer), `filled` (ytor).
+- **Datatabell** (`c:dTable`, `Chart::dtable`) i stående kategoridiagram: rubrikraden med kategorierna i
+  kategoriernas band (ersätter kategorietiketterna), en rad per serie med namnet och förklaringsnyckeln
+  (`showKeys`) i en kolumn till vänster om ritytan och värdena i seriens talformat; kantlinjer efter
+  `showHorzBorder`/`showVertBorder`/`showOutline` (temats rutnätsfärg, eller tabellens `spPr`). Ritytan krymper
+  med tabellen. Inte för liggande staplar eller punktdiagram.
+- **Inte gjort:** trendlinjeetikettens `manualLayout` och talformat, felstaplar för
+  staplade linjer/ytor i skalan, sekundär x-axel. Inget av de 33 referensdeckens diagram använder funktionerna,
+  så jämförelseprovet ändras inte; proven i `chart_tests.rs` ritar egna fixturer (`KLADD_CHART_PNG=mapp` sparar
+  bilderna).
+
+**Prov:** `chart_analysis.rs` (linjär, låst skärning, polynom, exponentiell, logaritmisk, potens, R², glidande
+medel, ekvationerna, felstaplarnas belopp), `chart_radar.rs` (ekrarnas lägen), `chart_tests.rs` (sekundäraxel
+med egen skala till höger, trendlinje med ekvation och R² som Excel, polynom och glidande medel, felstaplar på
+staplar, radar med markörer och fylld radar, datatabell med kantlinjer och nycklar, alla även till PDF).
