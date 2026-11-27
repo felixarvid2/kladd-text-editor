@@ -7,6 +7,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Nytt
 
 - **PowerPoint: länkar och åtgärdsknappar i bildspelet, bildnummer med siffror och bättre video.** Ett klick på en länk (`hlinkClick` på text, form eller bild) utför åtgärden: webbadresser och `mailto:` öppnas utanför Kladd, länkar till en bild hoppar dit med bildens övergång, och åtgärdsknapparna nästa, föregående, första, sista, senast visade och avsluta fungerar; `hlinkHover` körs när pekaren kommer in, handen visas över länkar och utlösare går före. Siffror + `Enter` hoppar till ett bildnummer. Videon ritas i formens eget lager (följer animering, övergångar, morph, vridning och beskärning som rundad rektangel eller ellips), `showWhenStopped="0"` döljer den när den inte spelas, och länkade mediefiler med relativ sökväg läses från presentationens mapp. Se `docs/dev/pptx.md`.
+- **PowerPoint: organisationsscheman och hierarkier i SmartArt ritas som diagram.** SmartArt-hierarkier utan sparad ritning (organisationsscheman, vågräta hierarkier, släktträd) läggs ut av layoutmotorn med rutorna i rätt ordning och linjerna mellan dem – roten centrerad över sina underordnade, assistenter vid sidan av linjen och den lägsta nivån hängande i en spalt – i stället för att visas som en punktlista. Böjda kopplingar (pilarna runt kugghjulen m.fl.) ritas som cirkelbågspilar. Se `docs/dev/pptx.md`.
 
 ## [2.13.0] – 2026-11-27
 

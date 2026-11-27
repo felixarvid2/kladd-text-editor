@@ -184,13 +184,13 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **EMF/WMF:** `ExcludeClipRect`, fler regionoperationer, streckade/mönstrade penslar, `ETO_GLYPH_INDEX`, EMF+.
 - **Tabeller:** lodrät text i celler låter inte raden växa; några val är inte prövade mot referensbilder (se
   avsnittet).
-- **SmartArt:** layouter som PowerPoint lägger om (kugghjulen i `msrc-win32k` bild 4/22) kräver en layoutmotor.
 - **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
-- **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)*) används bara när ritdelen saknas eller är tom;
-  hierarkier (`hierRoot`/`hierChild`, organisationsscheman) ger ännu reserven, och böjda kopplingar
-  (kugghjulens pilar), linjer i hierarkier, text som får rutan att växa (`rule type="h" val="INF"`), ikoner
-  (`blipPhldr`) och egna förskjutningar i `composite` saknas.
+- **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)* och *SmartArt: hierarkier och böjda kopplingar
+  (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: text som får rutan att växa
+  (`rule type="h" val="INF"`, `vList2`), ikoner i platshållare (`blipPhldr` ritas som en tom form), egna
+  förskjutningar i `composite` (kugghjul med ett och två hjul), hierarkins `hang` i två spalter (`secLinDir`),
+  nivåetiketterna i `hierarchy5` och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
 - **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
@@ -748,8 +748,8 @@ färg- och stildefinitionerna tillämpas också rätt (ingen skillnad hittad).
 former. Saknas den eller är `dsp:spTree` tom (PowerPoint sparar ibland en tom ritdel; `owasp-top10-2017-he`
 bild 20–21, där PowerPoint lägger ut diagrammet ur datamodellen) lägger layoutmotorn ut diagrammet när
 presentationen läses in (`smartart::lay_out_missing`, efter typsnitten) i ramens visade storlek, och resultatet
-ritas som en ritdel (nyckel `<datadel>#kladd` i `Deck::drawings`). Saknas layoutdefinitionen, används
-hierarkialgoritmerna, eller går resultatet inte att läsa (text under 5 punkter, text som inte får plats ens i
+ritas som en ritdel (nyckel `<datadel>#kladd` i `Deck::drawings`). Saknas layoutdefinitionen eller går
+resultatet inte att läsa (text under 5 punkter, text som inte får plats ens i
 regelns minsta storlek, eller mer än hälften av datamodellens text utan form) blir det som förut datamodellens
 text som punktlista. Ett panik i motorn ger också reserven (`catch_unwind`).
 
@@ -765,8 +765,9 @@ tvärs över bara storlekar räknade ur flödesriktningen; ihop centrerade läng
 justerade tvärs över efter rutan; uppmätt mot `vList5`, `vList2`, `hProcess9`), `composite` (`l`/`t`/`r`/`b`/
 `ctrX`/`ctrY`/`w`/`h` och förskjutningar, `ar`), `snake` (det antal per rad som ger störst noder, sista raden
 centrerad), `cycle` (lika vinkelsteg från `stAng`, radien så att noderna inte överlappar), `pyra` (nivåer som
-trapetser med pyramidens sidor; `fromT` = omvänd pyramid), `hierRoot`/`hierChild` (roten centrerad över barnens
-rad), `tx`, `sp`, `conn` (pil i sin ruta; böjda kopplingar ritas inte). Bara noder med `tx` visar text. En
+trapetser med pyramidens sidor; `fromT` = omvänd pyramid), `hierRoot`/`hierChild` (se omgång 5), `tx`, `sp`,
+`conn` (pil i sin ruta; linjer och böjda kopplingar: se omgång 5). Bara noder med `tx` visar text (utan
+`presOf` sin egen punkts). En
 nods egna villkor är standardvärden: förälderns villkor för den går före. Får helheten inte plats krymps och
 centreras den.
 
@@ -983,3 +984,48 @@ gjorda med ffmpeg `sine`/`testsrc`).
 - **Kvar:** föredragsvyns val av skärm (winit ger ingen skärmlista via egui här: inte gjort); länkar på gruppbarn och i
   SmartArt; `hlinkfile`/`hlinkpres`; markering av länkar vid tangentbordsnavigering (Tab); `p:quickTimeFile` som video utan
   `rect_pt` i grupper; videoformer med andra geometrier än rektangel, rundad rektangel och ellips beskärs som rektangel.
+- **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
+  videon bara när ingen övergång pågår och ovanpå lagren); rotation och formens geometri (rundade hörn) för videon;
+  `showWhenStopped`; länkar relativa mot presentationen; ffmpeg i flatpak; spolning av video med ljud utan ffmpeg.
+
+## SmartArt: hierarkier och böjda kopplingar (omgång 5)
+
+Organisationsscheman och andra hierarkier (`orgChart1`, `hierarchy2`, `hierarchy5`, `hierarchy6` i provsamlingarna,
+alla utan ritdel) läggs nu ut av layoutmotorn i stället för att visas som punktlista, med linjer mellan rutorna.
+Det finns inga PowerPoint-referenser för dem i materialet; reglerna nedan följer layoutdefinitionerna och
+PowerPoints kända utseende (standardschemat, hängande lägsta nivå, assistenter).
+
+- **`hierChild`** (`tree.rs`): barnen efter varandra längs `linDir` (`fromL` standard, `fromR`, `fromT`, `fromB`) med
+  `sibSp` emellan (`secSibSp` lodrätt), justerade tvärs över efter `chAlign`.
+- **`hierRoot`**: roten först, under den assistentraden (assistenterna två och två på var sin sida om den lodräta
+  linjen, `sibSp` från linjen) och sedan barnens rad, `sp` emellan. `hierAlign`: `tCtrCh` (standard) centrerar
+  roten över raden; `tL`/`tR` låter raden hänga under roten förskjuten `alignOff` av rotens bredd (`alignOff` är en
+  bråkdel, inte millimeter); `lCtrCh`, `lT`, `lB`, `r…` lägger raden bredvid roten (vågräta hierarkier).
+  `orgChart1` väljer själv: rotens barn som standardrad, föräldrar till löv (`maxDepth` ≤ 1, `hierBranch="init"`)
+  med en hängande spalt.
+- **Linjer** (`connect`): kopplingar med `dim="1D"` blir brutna linjer (`a:custGeom` utan fyllning, under
+  formerna, med stilen ur färg- och stildefinitionen) från formen för övergångens förälder till barnets
+  (`srcNode`/`dstNode` väljer en namngiven nod för samma punkt, t.ex. `rootConnector`). Av `begPts`/`endPts`
+  används de två punkter som ligger närmast varandra; `bCtr` → `tCtr` ger knäet `bendDist` före målet
+  (`bendPt="end"`), `midL`/`midR` ett lodrätt ben längs linjen och sedan in i sidan, vågrätt ut och in ett knä
+  på mitten.
+- **Text utan `presOf`:** äldre layouter (`orgChart1#2` i `O12Typical`) har textnoder utan `presOf`; de visar sin
+  egen punkts text (förut föll diagrammet tillbaka till punktlistan eftersom ingen text syntes).
+- **Rättelser i datamodellen:** `ptType="nonAsst"` är bara vanliga noder (övergångarna räknades förut, så varje
+  barn fick tre rutor), och `precedSib` är i dokumentordning så att `st="-1"` ger närmaste föregående syskon
+  (kopplingarna hamnade förut alla på första barnets övergång).
+- **Böjda kopplingar** (`connRout="curve"` i `composite`, kugghjulens pilar): en cirkelbågspil
+  (`circularArrow`, `leftCircularArrow` när `diam` är negativ) runt formen som källnoden hör till
+  (`gear1srcNode` → `gear1`) med diametern `diam`, från källnodens till målnodens vinkel; tjockleken är
+  kopplingens `h`. Bågarna räknas inte när helheten krymps för att få plats (de får sticka ut, som i PowerPoint).
+  Andra böjda kopplingar (t.ex. `cycle8`:s pilar mellan hjälpnoder) ritas inte än. Alla kugghjul i
+  referensmaterialet har en ritdel, så bågarna ändrar ingen bild där; bara jämförelsen mot ritdelarna.
+
+Av de 15 hierarkierna utan ritdel i provsamlingarna ritas nu alla som diagram (ingen faller tillbaka till
+punktlistan). Det finns ingen PowerPoint-referens för dem, så utseendet är inte uppmätt.
+
+**Jämförelse mot ritdelarna** (`oracle`, 57 diagram): `gear1` med tre kugghjul 0,44 → 0,82, med ett och två
+0,03–0,25 → 0,09–0,49 (PowerPoints egna förskjutningar saknas), medel 0,638 → 0,662. Övriga layouter oförändrade.
+
+**Prov:** `hierarki_med_roten_over_barnen_och_linjer` (rutor, avstånd, centrering och linjernas ändpunkter),
+`bojd_koppling_blir_en_cirkelbagspil` (läge, storlek och vinklar).

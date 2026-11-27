@@ -123,6 +123,12 @@ impl<'a> Model<'a> {
         d
     }
 
+    /// Kopplingens ändar för en övergång (`parTrans`/`sibTrans`): (förälder, barn).
+    pub fn trans_ends(&self, t: usize) -> Option<(usize, usize)> {
+        let child = self.owner_of_trans(t)?;
+        Some((*self.parent.get(&child)?, child))
+    }
+
     /// Övergångens nod (för `parTrans`/`sibTrans`): den vars koppling nämner den.
     fn owner_of_trans(&self, t: usize) -> Option<usize> {
         self.kids.values().flatten().find(|k| k.par_trans == Some(t) || k.sib_trans == Some(t)).map(|k| k.pt)
@@ -188,7 +194,8 @@ impl<'a> Model<'a> {
                 let Some(par) = self.parent_of(pt) else { return Vec::new() };
                 let seq = self.child_seq(par, hide_last);
                 let Some(i) = seq.iter().position(|x| *x == pt) else { return Vec::new() };
-                if axis == "followSib" { seq[i + 1..].to_vec() } else { seq[..i].iter().rev().copied().collect() }
+                // Båda i dokumentordning (`st="-1"` ger då det närmaste föregående syskonet).
+                if axis == "followSib" { seq[i + 1..].to_vec() } else { seq[..i].to_vec() }
             }
             _ => Vec::new(),
         }
@@ -211,7 +218,8 @@ impl<'a> Model<'a> {
             "norm" => k == Kind::Node,
             "nonNorm" => k != Kind::Node,
             "asst" => k == Kind::Asst,
-            "nonAsst" => k != Kind::Asst,
+            // Noder som inte är assistenter (övergångarna räknas inte som noder).
+            "nonAsst" => k == Kind::Node,
             "parTrans" => k == Kind::ParTrans,
             "sibTrans" => k == Kind::SibTrans,
             "pres" => k == Kind::Pres,
