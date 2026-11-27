@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use egui::emath::GuiRounding;
 use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect, RichText, Sense, Ui, pos2, vec2};
 
-use super::anim::{MediaCmd, MediaShape, State, Timeline};
+use super::anim::{MediaCmd, MediaShape, State, Target, Timeline};
 use super::anim_layers::{self, LayerKind};
+use super::media_play::MediaHub;
 use super::scene::Affine;
 use super::edit_ops::{self, ShapeInfo};
 use super::morph;
@@ -114,6 +115,8 @@ pub struct ShowView {
     /// övergång eller självstartande animering inte hinner gå medan bilden är svart.
     stalled: f64,
     last_real: f64,
+    /// Ljud och video (`media_play.rs`).
+    hub: MediaHub,
 }
 
 impl ShowView {
@@ -141,6 +144,7 @@ impl ShowView {
         let (morph_tx, morph_rx) = channel();
         let morph_in = deck.slides.iter().map(|s| animate && matches!(Transition::of_slide(&s.root).kind, Kind::Morph(_))).collect();
         ShowView {
+            hub: MediaHub::new(deck.clone(), animate),
             play: Playback::new(show, timing, 0.0),
             deck,
             timelines,
@@ -192,7 +196,6 @@ impl ShowView {
 
     /// Mediakommandona (`p:cmd`) som kommit sedan sist, i ordning, för aktuell bild; se
     /// `Playback::take_media`. Läses av ljud- och videouppspelningen.
-    #[allow(dead_code)]
     pub fn take_media(&mut self) -> Vec<MediaCmd> {
         self.play.take_media()
     }
@@ -228,11 +231,21 @@ impl ShowView {
     }
 
     /// Klick på bilden i `rect` vid `pos`: en utlösare spelas, annars nästa steg. Falskt = avsluta.
+    #[cfg(test)]
     pub(super) fn click_slide(&mut self, rect: Rect, pos: Option<Pos2>, now: f64) -> bool {
+        self.click_slide_in(None, rect, pos, now)
+    }
+
+    /// Som `click_slide`; med `ctx` får också mediaformer utan utlösare klicket.
+    fn click_slide_in(&mut self, ctx: Option<&egui::Context>, rect: Rect, pos: Option<Pos2>, now: f64) -> bool {
         if let Some(id) = pos.and_then(|p| self.trigger_at(rect, p)) {
             if self.play.click_shape(id, now) {
                 return true;
             }
+        }
+        // En mediaform utan utlösare spelas/pausas av klicket (en med utlösare har redan fått sitt kommando).
+        if ctx.is_some_and(|c| self.media_click(c, rect, pos)) {
+            return true;
         }
         self.play.next(now, true)
     }
@@ -241,6 +254,9 @@ impl ShowView {
     fn hover_trigger(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) {
         if pos.and_then(|p| self.trigger_at(rect, p)).is_some() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if let Some(s) = self.media_slide(&self.play.frame(self.now())) {
+            self.hub.hover(ctx, s, rect, self.deck.size_pt().0, pos);
         }
     }
 
@@ -303,6 +319,16 @@ impl ShowView {
         if !self.play.tick(now) {
             return false;
         }
+        let at = match self.play.show.screen() {
+            Screen::Slide(i) => Some((i, self.play.show.step())),
+            _ => None,
+        };
+        self.hub.on_position(at);
+        let slide = self.play.show.slide();
+        for c in self.take_media() {
+            self.hub.apply(&ctx, slide, c);
+        }
+        self.hub.update(&ctx);
         let rect = ui.max_rect();
         let mut keep = true;
         let embedded = ctx.embed_viewports();
@@ -351,12 +377,12 @@ impl ShowView {
         self.want_width((slide_rect.width() * ctx.pixels_per_point()).round() as u32);
         let frame = self.play.frame(self.now());
         self.paint_frame(&painter, slide_rect, rect, &frame);
-        // Mus: klick framåt, högerklick bakåt, hjulet bläddrar.
+        // Mus: klick framåt (på en mediaform utan utlösare: spela/paus), högerklick bakåt, hjulet bläddrar.
         let now = self.now();
         let mut keep = true;
         self.hover_trigger(&ctx, slide_rect, resp.hover_pos());
         if resp.clicked_by(PointerButton::Primary) {
-            keep = self.click_slide(slide_rect, resp.interact_pointer_pos(), now);
+            keep = self.click_slide_in(Some(&ctx), slide_rect, resp.interact_pointer_pos(), now);
         } else if resp.clicked_by(PointerButton::Secondary) {
             self.play.prev(now);
         }
@@ -420,7 +446,11 @@ impl ShowView {
                             }
                         }
                     }
-                    None => self.paint_slide(painter, slide_rect, cur, None, &transition::IDENTITY, 1.0),
+                    None => {
+                        self.paint_slide(painter, slide_rect, cur, None, &transition::IDENTITY, 1.0);
+                        let opacity = |id: u32| Self::media_opacity(&self.timelines, cur, id);
+                        self.hub.paint(painter, cur.slide, slide_rect, self.deck.size_pt().0, painter.ctx().pointer_hover_pos(), &opacity);
+                    }
                 }
             }
             Screen::Blank(Blank::Black) => {}
@@ -673,9 +703,39 @@ impl ShowView {
         let resp = ui.interact(cur_rect, ui.scope_id().with("kladd-pptx-presenter-cur"), Sense::click());
         self.hover_trigger(&ctx, cur_rect, resp.hover_pos());
         if resp.clicked() {
-            keep &= self.click_slide(cur_rect, resp.interact_pointer_pos(), now);
+            keep &= self.click_slide_in(Some(&ctx), cur_rect, resp.interact_pointer_pos(), now);
         }
         keep
+    }
+
+    /// Bilden vars media får ritas och klickas på: aktuell bild när ingen övergång pågår.
+    fn media_slide(&self, frame: &Frame) -> Option<usize> {
+        match (&frame.screen, &frame.transition) {
+            (Screen::Slide(i), None) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Formens genomskinlighet ur animeringarna (0 = dold före sin in-effekt eller efter sin ut-effekt).
+    fn media_opacity(timelines: &[Arc<Timeline>], st: &SlideState, shape: u32) -> f32 {
+        let Some(tl) = timelines.get(st.slide) else { return 1.0 };
+        let tg = Target { shape, para: None };
+        if !tl.targets().contains(&tg) {
+            return 1.0;
+        }
+        let s = tl.layer_state(tg, None, super::anim::Geom { cx: 0.5, cy: 0.5, w: 1.0, h: 1.0 }, st.chain.clone(), st.t, &st.trig);
+        if s.drawn() { s.opacity } else { 0.0 }
+    }
+
+    /// Klick på en mediaform (spela/paus, tidslinje). Sant = klicket är förbrukat.
+    fn media_click(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) -> bool {
+        let frame = self.play.frame(self.now());
+        let (Some(s), Some(p), Some(cur)) = (self.media_slide(&frame), pos, frame.cur.as_ref()) else { return false };
+        let sw = self.deck.size_pt().0;
+        let tls = &self.timelines;
+        let opacity = |id: u32| Self::media_opacity(tls, cur, id);
+        let hub = &mut self.hub;
+        hub.click(ctx, s, rect, sw, p, &opacity)
     }
 
     /// Antal klara animeringsgrupper efter `step` klick på bild `slide`.

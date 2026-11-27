@@ -175,8 +175,8 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
   understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** länkar och åtgärdsknappar i bildspelet, video/ljud (kommandona finns: *Utlösare …, omgång 4*),
-  föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
+- **Visning:** länkar och åtgärdsknappar i bildspelet, föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
+  markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
 - **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
@@ -244,7 +244,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
   enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
   `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
-- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3) länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
+- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3, ljud och video i omgång 4) länkar och åtgärdsknappar i bildspelet, hoppa till bildnummer med siffror + Enter i
   bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
 - **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
   anteckningar, `.ppt` via LibreOffice, handboken.
@@ -644,8 +644,7 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   614 klick-steg; alla 1 081 mål hittas i visningslistan (`anim_layers::tests::referensmaterialets_animeringar`,
   ignorerat, `KLADD_PPTX_REFS`).
 - **Kvar:** `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i betoningar (kräver
-  omrendering), ljud och video (själva uppspelningen; kommandona ges ut, se omgång 4), val av skärm. (Morph,
-  `iterate` och utlösare gjordes i omgång 4.)
+  omrendering), val av skärm. (Morph, `iterate`, utlösare och ljud/video gjordes i omgång 4.)
 
 ## 3D i diagram och former (omgång 3)
 
@@ -866,7 +865,7 @@ in-effekt, att allt utan ut-effekt syns till slut (en uppdelad text ritas då so
 
 **Kvar:** utlösare på former i grupper, på layouten och på text inom stycken (delar av text som utlösare); `p:bldP`
 `animBg`; `iterate type="el"` (element, ritas som en effekt för hela texten); fler än en klickgrupp i en utlösare
-(alla spelas vid ett klick); färgbyten i delar; uppspelningen av ljud och video (en annan omgång).
+(alla spelas vid ett klick); färgbyten i delar.
 
 ## Morph (omgång 4)
 
@@ -907,3 +906,50 @@ bilderna, 95 par.
 **Kvar:** fyllnadsfärg och linje interpoleras inte (renderingarna tonas i varandra), text som ändras tonas som helhet
 (ingen morph per ord eller tecken), grupper, tabeller och diagram flyttas som en enhet, spegling (`flipH`/`flipV`)
 interpoleras inte, och den nya bildens in-animeringar syns inte under övergången (som övriga övergångar).
+
+## Ljud och video i bildspelet (omgång 4)
+
+Nya filer: `media_model.rs` (rent: `of_slide(deck, i) -> SlideMedia` med `MediaShape` per `p:pic` med `a:videoFile`/
+`a:audioFile`/`a:wavAudioFile`/`p14:media`, och `TransitionSound` ur `p:sndAc/p:stSnd`; samt en TILLFÄLLIG kopia av
+w-ptrigs `MediaCmd` och `step_commands` som tolkar `p:cmd` i huvudsekvensen), `media_audio.rs` (avkodning, mixer,
+cpal-utmatning), `media_video.rs` (ffmpeg), `media_play.rs` (`MediaHub`, ägd av `ShowView`), `media_tests.rs`
+(provpresentation byggd i provet) och fixturerna `media_fixtures/ton.mp3` och `film.mp4` (egna, 2 respektive 16 kB,
+gjorda med ffmpeg `sine`/`testsrc`).
+
+- **Källa:** `p14:media/@r:embed` före `r:link` (länken är ofta en död extern `Target="NULL"`). Länkade filer spelas om de
+  finns som sökväg eller `file:`-adress (relativa sökvägar mot presentationen är inte kopplade: `Deck` känner inte
+  filens plats). `p14:trim/@st` och `@end` är millisekunder som klipps i början respektive slutet (`end` mot
+  materialet: `end="113.45"` på en ca 0,3 s lång WAV). `p:cMediaNode`: `vol` (100000 = full), `mute`, `numSld`
+  (antal bildbyten mediet överlever, standard 1), `showWhenStopped` (tolkas, men stillbilden döljs inte efter slutet).
+- **Ljud:** `media_audio::spawn` avkodar i en egen tråd med symphonia (`mp3`, `wav`, `pcm`, `isomp4`, `aac`) och skickar
+  stereoblock i en begränsad kö (32 block). Sökning till startpunkten med `SeekMode::Accurate`, annars avkodning och
+  kassering. `Mixer` omsamplar linjärt till enhetens takt och kanaler och räknar utmatade bildrutor per röst: det är
+  ljudklockan. Strömmen byggs och hålls i en egen tråd (`AudioOut::open`, aldrig på gränssnittstråden); tillståndet
+  är `Opening`/`Ready`/`Failed`. Utan enhet (behållaren, CI) loggas en rad och inga röster skapas.
+- **Video:** `ffmpeg -nostdin -loglevel error -ss <från> -i <fil> -an -vf fps=25,scale=B:H:…,pad=… -pix_fmt rgba -f rawvideo -`
+  (stdin och stderr på null, så inget rör fastnar). Inbäddade filer skrivs till en temporär fil
+  (`kladd-media-<pid>-<n>.<ext>`). En läsartråd skickar bildrutor i en kö på sex; gränssnittet visar den senaste vars tid
+  (`index/25`) har kommit. `Drop` dödar och avvaktar processen, släpper läsaren och raderar filen. ffmpeg söks i `PATH`
+  samt `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`; på Windows `ffmpeg.exe` utan konsolfönster
+  (`CREATE_NO_WINDOW`). Windows- och macOS-grenarna är inte kompilerade här. Bildrutans storlek är formens storlek i
+  bildpunkter vid senaste klicket (annars 2 px per punkt), högst 1920.
+- **Klocka och synk:** med en ljudröst som börjat är rösten klockan (videon väntar högst 1,5 s på att ljudet ska börja),
+  annars väggklockan, som ankras i ljudklockan varje bildruta. Paus fryser klockan och pausar rösten; videoprocessen
+  står då stilla av sig själv när röret fylls. `playFrom` startar om.
+- **Gränssnitt i `presenter.rs`:** `ShowView::media` matas med `on_position(slide, step)` och `update()` varje bildruta,
+  ritar via `paint` (videobild, kontroller, notis) i `paint_frame` när ingen övergång pågår, och klick går först till
+  `click` (spela/paus eller tidslinjen) innan de går till nästa steg. Mediet stoppas vid bildbyte enligt `numSld`
+  och när bildspelet slutar.
+- **Reserv:** utan ffmpeg ritas bara stillbilden (`p:blipFill`) och en notis visas en gång per bildspel; videons
+  ljud spelas ändå. Utan ljudenhet går videon på väggklockan.
+- **Paket:** Linux bygger med `libasound2-dev` (ci.yml, perf.yml, release.yml för deb och AppImage), deb får
+  `Suggests: ffmpeg` och `$auto` ger `libasound2`; AppImage lämnar libasound till värden (`--exclude-library`, oprövat
+  här); flatpak får `--socket=pulseaudio`. Att ffmpeg går att nå i flatpak (t.ex. tillägget
+  `org.freedesktop.Platform.ffmpeg-full`, som innehåller bibliotek men inte säkert programmet `ffmpeg`) är INTE
+  undersökt; i flatpak visas därför stillbilden tills det är löst.
+- **Vid sammanslagning med w-ptrig:** byt `media_model::MediaCmd`/`CmdKind`/`step_commands` mot uppspelningens
+  `take_media()` (mata `MediaHub::apply(ctx, slide, cmd)` och ta bort `step_commands`-delen i `on_position`), och låt
+  en utlösare som förbrukat ett klick gå före `MediaHub::click`.
+- **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
+  videon bara när ingen övergång pågår och ovanpå lagren); rotation och formens geometri (rundade hörn) för videon;
+  `showWhenStopped`; länkar relativa mot presentationen; ffmpeg i flatpak; spolning av video med ljud utan ffmpeg.

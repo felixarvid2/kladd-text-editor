@@ -28,6 +28,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Installera ALSA (ljudet i bildspelet)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev
+
       - name: Bygg
         run: cargo build --locked
 
@@ -45,10 +51,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Installera LibreOffice
+      - name: Installera LibreOffice och ALSA
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libreoffice-writer
+          sudo apt-get install -y --no-install-recommends libreoffice-writer libasound2-dev
 
       - name: Korpustester med LibreOffice
         env:

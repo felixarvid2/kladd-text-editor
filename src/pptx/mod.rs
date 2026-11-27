@@ -12,6 +12,10 @@ pub mod fonts;
 pub mod geom;
 pub mod inherit;
 pub mod media;
+pub mod media_audio;
+pub mod media_model;
+pub mod media_play;
+pub mod media_video;
 pub mod model;
 pub mod package;
 pub mod pdf;
@@ -61,6 +65,8 @@ pub mod dgm;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod media_tests;
 #[cfg(test)]
 mod view_tests;
 #[cfg(test)]

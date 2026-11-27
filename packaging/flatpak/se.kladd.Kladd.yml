@@ -23,6 +23,8 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
+  # Ljud i bildspelet (cpal/ALSA når PulseAudio/PipeWire via runtimens ALSA-plugin).
+  - --socket=pulseaudio
   # Kladd öppnar och sparar filer var som helst i hemkatalogen.
   - --filesystem=home
   - --share=ipc

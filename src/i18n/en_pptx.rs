@@ -118,4 +118,6 @@ pub const EN: &[(&str, &str)] = &[
     ("Aktuell bild", "Current slide"),
     ("Nästa", "Next"),
     ("Inga anteckningar", "No notes"),
+    ("Video spelas med ffmpeg, som inte är installerat. Videons stillbild visas.", "Video is played with ffmpeg, which is not installed. The video's still image is shown."),
+    ("Videon kunde inte spelas (ffmpeg startade inte). Videons stillbild visas.", "The video could not be played (ffmpeg did not start). The video's still image is shown."),
 ];
