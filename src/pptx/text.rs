@@ -598,9 +598,9 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
                 if p.mar_l >= after - 0.01 && p.indent < 0.0 {
                     p.mar_l
                 } else {
-                    // Punkten är bredare än det hängande indraget: nästa tabbstopp.
-                    let tab = p.def_tab.max(1.0);
-                    if p.indent < 0.0 { (after / tab).ceil() * tab } else { after }
+                    // Punkten är bredare än det hängande indraget: texten börjar direkt efter punkten
+                    // (som i PowerPoints PDF-export, t.ex. cncf-overview-ja bild 38 och owasp-2010-es).
+                    after
                 }
             }
             None => first_x,

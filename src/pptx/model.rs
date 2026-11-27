@@ -116,6 +116,7 @@ pub struct Deck {
 
 /// Grovt innehåll på en bild (för jämförelseprovet och statusraden).
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // används av jämförelseprovet
 pub struct SlideFeatures {
     pub chart: bool,
     pub emf: bool,
@@ -370,6 +371,7 @@ impl Deck {
     }
 
     /// Vad en bild innehåller (diagram, EMF/WMF, SmartArt, tabeller).
+    #[allow(dead_code)] // används av jämförelseprovet
     pub fn features(&self, i: usize) -> SlideFeatures {
         let mut f = SlideFeatures::default();
         let Some(s) = self.slides.get(i) else { return f };
