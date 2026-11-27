@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **PowerPoint-presentationer (`.pptx`) kan öppnas och visas.** Bilderna ritas med en egen ritmotor (`src/pptx/`): platshållararv bild → layout → mall, temafärger med alla modifierare, alla 187 förinställda former och egna former, grupper, rotation och spegling, bakgrunder, övertoningar, bilder med beskärning och SVG, linjer med streckning och pilspetsar, text med PowerPoints radavstånd, punkter och numrering och lagrad autoanpassning, enkla tabeller och SmartArt från den sparade ritningen. Samma visningslista ritas på skärmen och till PDF. Jämfört med PowerPoints egen PDF-export av 15 presentationer (632 bilder) ligger Kladd närmare än LibreOffice i alla 15 och på 539 av bilderna (se `docs/dev/pptx.md`). Diagram och EMF/WMF-bilder visas som platshållare, och presentationen kan inte ändras eller sparas än. Arkiv → Öppna har filtret *PowerPoint (.pptx)*.
+
 ## [2.10.0] – 2026-11-26
 
 ### Ändrat

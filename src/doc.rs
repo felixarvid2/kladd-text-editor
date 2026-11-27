@@ -56,6 +56,8 @@ pub struct Document {
     pub pdfv: Option<Box<crate::pdfview::chrome::PdfTab>>,
     /// Sant om filen är en EPUB-bok som visas i läsläget (ingen text, aldrig ändrad eller sparad).
     pub epub: Option<Box<crate::epub::view::EpubTab>>,
+    /// En PowerPoint-presentation som visas i presentationsvyn (ingen text, aldrig ändrad).
+    pub pptx: Option<Box<crate::pptx::view::PptxTab>>,
     /// Meddelande att visa när filen har öppnats (t.ex. vad som inte kommer med).
     pub open_note: Option<String>,
     /// Innehåll i ett öppnat Word-dokument som Kladd inte kan spara tillbaka.
@@ -73,7 +75,7 @@ pub struct Document {
 
 /// Filtyper som visas i öppna/spara-dialogerna.
 pub const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "docx", "odt", "pdf", "epub", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
+    "txt", "md", "markdown", "docx", "odt", "pdf", "epub", "pptx", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
     "yml", "html", "htm", "css", "scss", "xml", "svg", "sh", "bash", "zsh", "c", "h", "cpp",
     "hpp", "cc", "java", "kt", "go", "rb", "php", "lua", "sql", "ini", "conf", "cfg", "env",
     "csv", "tsv", "log", "tex", "rst", "org", "srt", "desktop", "service",
@@ -235,6 +237,7 @@ impl Document {
             pdf: false,
             pdfv: None,
             epub: None,
+            pptx: None,
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
@@ -330,6 +333,7 @@ impl Document {
             pdf: true,
             pdfv: None,
             epub: None,
+            pptx: None,
             open_note,
             docx_dropped: loaded.dropped,
             images: loaded.images,
@@ -380,8 +384,23 @@ impl Document {
         d
     }
 
+    /// En flik i presentationsvyn: ingen text, aldrig ändrad.
+    pub fn pptx_tab(id: u64, path: &Path, tab: crate::pptx::view::PptxTab) -> Self {
+        let mut d = Self::new_untitled(id, 0);
+        d.path = Some(path.to_path_buf());
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        d.open_note = tab.open_note(&name);
+        d.pptx = Some(Box::new(tab));
+        d
+    }
+
     fn load_bytes(id: u64, path: &Path, bytes: Vec<u8>, ext: &str) -> Result<Self, String> {
         let ext = ext.to_owned();
+        // En PowerPoint-presentation öppnas i presentationsvyn.
+        if ext == "pptx" {
+            let deck = crate::pptx::Deck::open(&bytes)?;
+            return Ok(Self::pptx_tab(id, path, crate::pptx::view::PptxTab::new(deck)));
+        }
         // En EPUB-bok öppnas i läsläget.
         if ext == "epub" {
             let book = crate::epub::Book::load(id, bytes)?;
@@ -404,6 +423,7 @@ impl Document {
                 pdf: false,
                 pdfv: None,
                 epub: None,
+            pptx: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     crate::tf!("{name} innehåller {lost} som inte visas i Kladd", name = name, lost = join_sv(&loaded.dropped))
@@ -432,6 +452,7 @@ impl Document {
                 pdf: false,
                 pdfv: None,
                 epub: None,
+            pptx: None,
                 open_note: (!loaded.dropped.is_empty()).then(|| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     crate::tf!("{name} innehåller {lost} som inte visas i Kladd", name = name, lost = join_sv(&loaded.dropped))
@@ -470,6 +491,7 @@ impl Document {
             pdf: false,
             pdfv: None,
             epub: None,
+            pptx: None,
             open_note: None,
             docx_dropped: Vec::new(),
             images: Vec::new(),
@@ -481,6 +503,10 @@ impl Document {
 
     /// Sparar dokumentet. Returnerar varningar (t.ex. bilder som inte hittades).
     pub fn save_to(&mut self, path: &Path) -> Result<Vec<String>, String> {
+        // En presentation har ingen text att spara: skriv aldrig över .pptx-filen.
+        if self.pptx.is_some() {
+            return Err(crate::i18n::t("Presentationen visas bara; den kan inte sparas från Kladd än.").to_owned());
+        }
         if self.is_export_target(path) {
             // Export (webbsida, e-bok): filen skrivs men fliken behåller sin sökväg, sitt format
             // och sitt ändrat-läge, till skillnad från PDF som blir flikens nya format.
@@ -593,6 +619,12 @@ impl Document {
 
     /// Ska anropas när texten har ändrats i editorn.
     pub fn on_edited(&mut self) {
+        // Presentationsfliken har ingen text; inget kommando får göra den ändrad.
+        if self.pptx.is_some() {
+            self.text.clear();
+            self.dirty = false;
+            return;
+        }
         self.rev = self.rev.wrapping_add(1);
         // Stora texter hashas inte vid varje tangenttryck: de räknas som ändrade efter första ändringen.
         if self.text.len() >= crate::bigtext::BIG_BYTES {
@@ -644,6 +676,9 @@ impl Document {
         }
         if self.epub.is_some() {
             return "EPUB".to_owned();
+        }
+        if self.pptx.is_some() {
+            return "PowerPoint".to_owned();
         }
         let ext = self.extension();
         let name = match ext.as_str() {

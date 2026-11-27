@@ -263,6 +263,10 @@ impl KladdApp {
             self.notify(ctx, crate::i18n::t("Boken kan inte skrivas ut. Använd Redigera en kopia."), false);
             return;
         }
+        if self.pptx_mode() {
+            self.notify(ctx, crate::i18n::t("Presentationer kan inte skrivas ut än."), false);
+            return;
+        }
         self.print.dialog = Some(PrintDialog::new(ctx));
     }
 

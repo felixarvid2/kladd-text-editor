@@ -67,7 +67,7 @@ pub struct State {
 /// Filändelser som aldrig läses i den virtualiserade textvyn.
 fn is_container(path: &Path) -> bool {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "docx" | "dotx" | "doc" | "odt" | "pdf" | "epub")
+    matches!(ext.as_str(), "docx" | "dotx" | "doc" | "odt" | "pdf" | "epub" | "pptx")
 }
 
 /// Word- och OpenDocument-filer över så här många byte (packade) läses i en bakgrundstråd: att packa upp
@@ -88,7 +88,7 @@ fn unpacked_len(path: &Path) -> u64 {
 /// Är det ett dokument som `Document::load` gör om till Markdown (`.docx`, `.dotx`, `.odt`) eller en bok (`.epub`)?
 fn is_word_file(path: &Path) -> bool {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "docx" | "dotx" | "odt" | "epub")
+    matches!(ext.as_str(), "docx" | "dotx" | "odt" | "epub" | "pptx")
 }
 
 /// Ska filen läsas in i en bakgrundstråd?

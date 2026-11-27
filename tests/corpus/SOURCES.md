@@ -13,6 +13,7 @@ originalen, utom `gen-*` som skapats här (se `generate/`). Namnprefixet visar k
 | `lo-import-`, `lo-export-` | LibreOffice core, `sw/qa/extras/odfimport` och `odfexport` (https://github.com/LibreOffice/core) | MPL-2.0 |
 | inget prefix (PDF) | pypdf 7.0.1, `resources/` (https://github.com/py-pdf/pypdf) | BSD-3-Clause |
 | `gen-` | skapade här med LibreOffice (se nedan) | MIT, som Kladd |
+| `pptx/pythonpptx-` | python-pptx (https://github.com/scanny/python-pptx), se `pptx/SOURCES.md` | MIT |
 
 PDF-filerna är valda bland pypdf:s testresurser: sådana som skapats med verktyg som LibreOffice,
 pdfLaTeX, ImageMagick, Inkscape och ReportLab, eller små handgjorda testfiler. pypdf distribueras som helhet

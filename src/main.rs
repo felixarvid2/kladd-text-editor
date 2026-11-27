@@ -31,6 +31,7 @@ mod odt;
 mod pdf_read;
 mod pdf_write;
 mod pdfview;
+mod pptx;
 mod search;
 mod settings_ui;
 mod preview;

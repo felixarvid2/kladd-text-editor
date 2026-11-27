@@ -38,11 +38,14 @@ svenska och engelska. Allt beskrivs i [handboken](docs/handbok.md).
 | Kod och konfiguration | `.rs`, `.py`, `.js`, `.ts`, `.go`, `.c`, `.cpp`, `.java`, `.html`, `.css`, `.json`, `.toml`, `.yaml`, `.xml`, `.sh`, `.sql` m.fl. | ✓ | ✓ | Textredigerare med färgning |
 | Webbsida | `.html` | | export | Från Markdown och dokument |
 | E-bok | `.epub` | ✓ läsläge | export | Läsläge (bara läsning), *Redigera en kopia* ger ett nytt dokument; export från Markdown och dokument |
+| PowerPoint | `.pptx` | ✓ visning | | Bilderna under varandra (bara visning, första versionen) |
 
 - **Word och OpenDocument** sparas förlustfritt: det Kladd inte ändrat skrivs tillbaka som det var. Formatmallar,
   tabeller, bilder, spalter, textrutor, sidhuvud och sidfot, fotnoter, slutnoter, kommentarer och spårade
   ändringar följer med.
 - **EPUB**: e-böcker öppnas bara för läsning, med innehållsförteckning, sök i hela boken, fotnoter i en ruta, framstegslinje och typografi (storlek, typsnitt, radavstånd, spaltbredd, ljus, sepia eller mörk sida). Kopieringsskyddade (DRM) böcker öppnas inte.
+- **PowerPoint**: presentationer visas bild för bild med Kladds egen ritmotor (former, bilder, text med PowerPoints
+  radavstånd och autoanpassning, tabeller och SmartArt). Diagram och EMF-bilder visas än så länge som platshållare.
 - **PDF**: sidor kan ordnas, roteras och slås ihop, formulär fyllas i och anteckningar läggas till. Sparningen ändrar
   inte resten av filen.
 - **`.doc`, `.rtf`, `.wpd` och `.wps`** konverteras till `.docx` med LibreOffice när du öppnar dem (LibreOffice måste vara installerat). Originalet skrivs aldrig över: *Spara* frågar efter ett nytt `.docx`-namn. Utan LibreOffice öppnas `.rtf` med en enkel inbyggd läsare (text, fet, kursiv, stycken); övriga ger ett felmeddelande.

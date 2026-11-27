@@ -1,0 +1,34 @@
+# Likhet med PowerPoints miniatyr av bild 1 (se SOURCES.md). Skrivs om med KLADD_CORPUS_BLESS=1.
+
+["pythonpptx-shp-shapes.pptx"]
+thumbnail_ssim = 0.899
+
+["pythonpptx-txt-text-frame.pptx"]
+thumbnail_ssim = 0.946
+
+["pythonpptx-shp-autoshape-props.pptx"]
+thumbnail_ssim = 0.961
+
+["pythonpptx-txt-paragraph-spacing.pptx"]
+thumbnail_ssim = 0.970
+
+["pythonpptx-tbl-cell.pptx"]
+thumbnail_ssim = 0.978
+
+["pythonpptx-dml-line.pptx"]
+thumbnail_ssim = 0.984
+
+["pythonpptx-ph-inherit-props.pptx"]
+thumbnail_ssim = 0.985
+
+["pythonpptx-font-color.pptx"]
+thumbnail_ssim = 0.989
+
+["pythonpptx-shp-groupshape.pptx"]
+thumbnail_ssim = 0.995
+
+["pythonpptx-shp-picture.pptx"]
+thumbnail_ssim = 0.999
+
+["pythonpptx-txt-fit-text.pptx"]
+thumbnail_ssim = 0.995
