@@ -46,10 +46,11 @@ svenska och engelska. Allt beskrivs i [handboken](docs/handbok.md).
 - **EPUB**: e-böcker öppnas bara för läsning, med innehållsförteckning, sök i hela boken, fotnoter i en ruta, framstegslinje och typografi (storlek, typsnitt, radavstånd, spaltbredd, ljus, sepia eller mörk sida). Kopieringsskyddade (DRM) böcker öppnas inte.
 - **PowerPoint**: presentationer visas bild för bild med Kladds egen ritmotor (former, bilder, text med PowerPoints
   radavstånd och autoanpassning, tabeller och SmartArt), med miniatyrlist, rullande lista, zoom, talaranteckningar,
-  sök i bildtext och anteckningar (träffarna markeras på bilden), bildspel i helskärm (`F5`/`Skift+F5`), export till
-  PDF och utskrift. I redigeringsläget (`Ctrl+E`) flyttas, ändras och vrids former, text skrivs direkt i formerna,
-  bilder läggs till, dupliceras, döljs och flyttas, och anteckningar redigeras; sparningen skriver bara om det som
-  ändrats. *Redigera en kopia* gör presentationens text till ett nytt dokument. Läget sparas per fil.
+  sök i bildtext och anteckningar (träffarna markeras på bilden), bildspel i helskärm (`F5`/`Skift+F5`) med
+  övergångar, animeringar och föredragsvy (`Alt+F5`), export till PDF och utskrift. I redigeringsläget (`Ctrl+E`)
+  flyttas, ändras och vrids former, text skrivs direkt i formerna, bilder läggs till, dupliceras, döljs och flyttas,
+  och anteckningar redigeras; sparningen skriver bara om det som ändrats. *Redigera en kopia* gör presentationens
+  text till ett nytt dokument. Läget sparas per fil.
 - **PDF**: sidor kan ordnas, roteras och slås ihop, formulär fyllas i och anteckningar läggas till. Sparningen ändrar
   inte resten av filen.
 - **`.doc`, `.rtf`, `.wpd` och `.wps`** konverteras till `.docx` med LibreOffice när du öppnar dem (LibreOffice måste vara installerat). Originalet skrivs aldrig över: *Spara* frågar efter ett nytt `.docx`-namn. Utan LibreOffice öppnas `.rtf` med en enkel inbyggd läsare (text, fet, kursiv, stycken); övriga ger ett felmeddelande.

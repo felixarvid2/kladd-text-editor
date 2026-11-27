@@ -195,7 +195,7 @@ pub(super) fn draw_items(pm: &mut sk::Pixmap, items: &[Item], page: &Affine) {
                 super::effects::draw(pm, &items[i..end.min(items.len())], effects, page, mask);
                 i = end + 1;
             }
-            Item::EndEffect => {}
+            Item::EndEffect | Item::BeginShape { .. } | Item::EndShape | Item::Para(_) => {}
             Item::Fill { path, paint, even_odd } => {
                 let Some(p) = sk_path(path) else { continue };
                 let Some(sh) = shader(paint) else { continue };

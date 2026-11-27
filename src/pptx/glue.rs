@@ -189,8 +189,9 @@ impl KladdApp {
     }
 
     pub(crate) fn pptx_start_show(&mut self, ctx: &egui::Context, from_current: bool) {
+        let animate = self.settings.pptx.animate;
         let Some(tab) = self.pptx_tab_mut() else { return };
-        if !tab.start_show(from_current) {
+        if !tab.start_show(from_current, animate) {
             self.notify(ctx, t("Presentationen har inga bilder att visa (alla är dolda)."), false);
         }
     }

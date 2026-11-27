@@ -825,7 +825,13 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
 
     // 3. Utritning.
     let mut items = Vec::new();
+    let mut cur_para = None;
     for pl_ref in &placed {
+        // Styckemärke (för animeringar stycke för stycke).
+        if cur_para != Some(pl_ref.para) {
+            cur_para = Some(pl_ref.para);
+            items.push(Item::Para(pl_ref.para as u32));
+        }
         let pl = &plaid[pl_ref.para];
         let p = &frame.paras[pl_ref.para];
         let line = &pl.lines[pl_ref.line];
@@ -1109,6 +1115,9 @@ pub fn transform_items(items: Vec<Item>, t: &Affine) -> Vec<Item> {
                 Item::BeginEffect(e)
             }
             Item::EndEffect => Item::EndEffect,
+            Item::BeginShape { id } => Item::BeginShape { id },
+            Item::EndShape => Item::EndShape,
+            Item::Para(n) => Item::Para(n),
         })
         .collect()
 }

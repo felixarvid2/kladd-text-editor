@@ -8,18 +8,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 
 use egui::emath::GuiRounding;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align, Align2, Color32, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, Panel, PointerButton,
+    Align, Align2, Color32, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, Panel,
     Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
 };
 use serde::{Deserialize, Serialize};
 
 use super::find::{self, Hit, Place, SlideText};
-use super::slideshow::{Blank, Screen, Show};
+use super::slideshow::Show;
 use super::Deck;
 use crate::i18n::t;
 use crate::icons::{self, Icon};
@@ -37,8 +37,6 @@ pub const MAX_MEMORY: usize = 100;
 const PT_TO_PX: f32 = 96.0 / 72.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 4.0;
-/// Pekaren göms i bildspelet när musen stått still så här länge.
-const HIDE_POINTER: Duration = Duration::from_secs(2);
 
 /// Zoomläge.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -62,11 +60,13 @@ pub struct Prefs {
     /// Alla bilder i en rullande lista i stället för en bild i taget.
     pub scroll: bool,
     pub zoom: Zoom,
+    /// Bildspelet spelar upp övergångar och animeringar.
+    pub animate: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { thumbs: true, notes: true, scroll: false, zoom: Zoom::Window }
+        Prefs { thumbs: true, notes: true, scroll: false, zoom: Zoom::Window, animate: true }
     }
 }
 
@@ -133,8 +133,6 @@ pub enum Action {
 /// Vilken sorts textur.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 enum Kind {
-    /// Bildspelet (högst prioritet).
-    Show,
     /// Bilden i vyn.
     Page,
     /// Miniatyr i sidopanelen.
@@ -210,7 +208,7 @@ impl Pool {
         }
     }
 
-    /// Startar de viktigaste önskningarna (bildspel före vyn före miniatyrer).
+    /// Startar de viktigaste önskningarna (vyn före miniatyrer).
     fn dispatch(&mut self, ctx: &egui::Context, deck: &Arc<Deck>) {
         let mut wants = std::mem::take(&mut self.wants);
         wants.sort_by_key(|w| w.0);
@@ -319,10 +317,11 @@ pub struct PptxTab {
     notes: HashMap<usize, String>,
     has_notes: bool,
     pub find: FindState,
-    show: Option<Show>,
+    show: Option<super::presenter::ShowView>,
     /// Helskärm har begärts för bildspelet (appen återställer när det slutar).
     pub fullscreen_sent: bool,
-    pointer_moved: Instant,
+    /// Nästa bildspel startar med föredragsvyn (Alt+F5).
+    presenter_on_start: bool,
     wheel: f32,
     /// Skalan i senaste bilden (för zoomstegen).
     last_k: f32,
@@ -354,7 +353,7 @@ impl PptxTab {
             find: FindState::default(),
             show: None,
             fullscreen_sent: false,
-            pointer_moved: Instant::now(),
+            presenter_on_start: false,
             wheel: 0.0,
             last_k: 1.0,
             page_text: String::new(),
@@ -440,11 +439,12 @@ impl PptxTab {
         self.show.is_some()
     }
 
-    /// Startar bildspelet. Falskt om ingen bild kan visas.
-    pub fn start_show(&mut self, from_current: bool) -> bool {
+    /// Startar bildspelet (`animate`: övergångar och animeringar). Falskt om ingen bild kan visas.
+    pub fn start_show(&mut self, from_current: bool, animate: bool) -> bool {
         let hidden: Vec<bool> = self.deck.slides.iter().map(|s| s.hidden).collect();
-        self.show = if from_current { Show::new(&hidden, self.current) } else { Show::from_beginning(&hidden) };
-        self.pointer_moved = Instant::now();
+        let show = if from_current { Show::new(&hidden, self.current) } else { Show::from_beginning(&hidden) };
+        let presenter = std::mem::take(&mut self.presenter_on_start);
+        self.show = show.map(|s| super::presenter::ShowView::new(self.deck.clone(), s, animate).with_presenter(presenter));
         self.show.is_some()
     }
 
@@ -453,126 +453,18 @@ impl PptxTab {
         if let Some(s) = self.show.take() {
             self.go_to(s.slide());
         }
-        self.pool.retain(Kind::Show, |_| false);
     }
 
     /// Tangenterna i bildspelet (appen skickar alla tangenter hit medan det pågår).
     pub fn show_keys(&mut self, ctx: &egui::Context) {
-        let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-        let Some(show) = self.show.as_mut() else { return };
-        if key(Modifiers::NONE, Key::Escape) {
+        if self.show.as_mut().is_some_and(|s| !s.keys(ctx)) {
             self.stop_show();
-            return;
-        }
-        // Skift-varianterna först: `consume_key` bryr sig inte om extra Skift.
-        let prev = key(Modifiers::SHIFT, Key::Space)
-            | key(Modifiers::NONE, Key::ArrowLeft)
-            | key(Modifiers::NONE, Key::ArrowUp)
-            | key(Modifiers::NONE, Key::PageUp)
-            | key(Modifiers::NONE, Key::Backspace)
-            | key(Modifiers::NONE, Key::P);
-        let next = key(Modifiers::NONE, Key::ArrowRight)
-            | key(Modifiers::NONE, Key::ArrowDown)
-            | key(Modifiers::NONE, Key::PageDown)
-            | key(Modifiers::NONE, Key::Space)
-            | key(Modifiers::NONE, Key::Enter)
-            | key(Modifiers::NONE, Key::N);
-        if prev {
-            show.prev();
-        }
-        if next && !show.next() {
-            self.stop_show();
-            return;
-        }
-        if key(Modifiers::NONE, Key::Home) {
-            show.first();
-        }
-        if key(Modifiers::NONE, Key::End) {
-            show.last();
-        }
-        if key(Modifiers::NONE, Key::B) || key(Modifiers::NONE, Key::Period) {
-            show.toggle_blank(Blank::Black);
-        }
-        if key(Modifiers::NONE, Key::W) || key(Modifiers::NONE, Key::Comma) {
-            show.toggle_blank(Blank::White);
         }
     }
 
-    /// Bildspelet: hela fönstret svart med bilden anpassad till skärmen.
+    /// Bildspelet (och föredragsvyn), se `presenter.rs`.
     pub fn show_page(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        self.pool.receive(&ctx);
-        let rect = ui.max_rect();
-        let resp = ui.allocate_rect(rect, Sense::click());
-        let Some(show) = self.show.as_mut() else { return };
-        let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
-        let (sw, sh) = self.deck.size_pt();
-        let k = scale_for(Zoom::Window, rect.width(), rect.height(), sw, sh);
-        let slide_rect = Rect::from_center_size(rect.center(), vec2(sw * k, sh * k)).round_to_pixels(ctx.pixels_per_point());
-        let px = (slide_rect.width() * ctx.pixels_per_point()).round().max(1.0) as u32;
-        match show.screen() {
-            Screen::Slide(i) => {
-                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                // Medan bilden renderas i skärmens storlek visas vyns textur (suddigare) i stället.
-                match self.pool.get(Kind::Show, i).or_else(|| self.pool.get(Kind::Page, i)) {
-                    Some(tex) => {
-                        painter.image(tex.id(), slide_rect, uv, Color32::WHITE);
-                    }
-                    None => {
-                        painter.rect_filled(slide_rect, 0.0, Color32::WHITE);
-                    }
-                }
-                self.pool.want(Kind::Show, i, px);
-            }
-            Screen::Blank(Blank::Black) => {}
-            Screen::Blank(Blank::White) => {
-                painter.rect_filled(rect, 0.0, Color32::WHITE);
-            }
-            Screen::End => {
-                painter.text(
-                    pos2(rect.center().x, rect.top() + 40.0),
-                    Align2::CENTER_TOP,
-                    t("Slut på bildspelet. Klicka för att avsluta."),
-                    FontId::new(16.0, FontFamily::Proportional),
-                    Color32::from_gray(170),
-                );
-            }
-        }
-        // Förrendera nästa bild.
-        if let Some(n) = show.upcoming() {
-            self.pool.want(Kind::Show, n, px);
-        }
-        let keep: Vec<usize> = [Some(show.slide()), show.upcoming()].into_iter().flatten().collect();
-        // Mus: klick framåt, högerklick bakåt, hjulet bläddrar.
-        let mut exit = false;
-        if resp.clicked_by(PointerButton::Primary) {
-            exit = !show.next();
-        } else if resp.clicked_by(PointerButton::Secondary) {
-            show.prev();
-        }
-        let dy = ui.input(|i| i.smooth_scroll_delta.y);
-        self.wheel += dy;
-        if self.wheel <= -60.0 {
-            self.wheel = 0.0;
-            exit |= !show.next();
-        } else if self.wheel >= 60.0 {
-            self.wheel = 0.0;
-            show.prev();
-        }
-        // Pekaren göms när musen står still.
-        let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed());
-        if moved {
-            self.pointer_moved = Instant::now();
-        }
-        if self.pointer_moved.elapsed() >= HIDE_POINTER {
-            ctx.set_cursor_icon(CursorIcon::None);
-        } else {
-            ctx.request_repaint_after(HIDE_POINTER);
-        }
-        self.pool.retain(Kind::Show, |s| keep.contains(&s));
-        self.pool.dispatch(&ctx, &self.deck);
-        if exit {
+        if self.show.as_mut().is_some_and(|s| !s.ui(ui)) {
             self.stop_show();
         }
     }
@@ -1136,6 +1028,9 @@ impl PptxTab {
                         if crate::app::menu_item(ui, p, t("Bildspel från aktuell bild"), "Shift+F5", None, true) {
                             act = Some(Action::Show(true));
                         }
+                        if crate::app::menu_item(ui, p, t("Spela upp övergångar och animeringar"), "", Some(prefs.animate), true) {
+                            prefs.animate = !prefs.animate;
+                        }
                         crate::app::menu_divider(ui, p);
                         if crate::app::menu_item(ui, p, t("Exportera som PDF…"), "", None, true) {
                             act = Some(Action::ExportPdf);
@@ -1219,8 +1114,11 @@ impl PptxTab {
         self.edit_keys(ctx);
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let mut act = None;
-        // Skift+F5 före F5: `consume_key` bryr sig inte om extra Skift.
-        if key(Modifiers::SHIFT, Key::F5) {
+        // Alt+F5 (bildspel med föredragsvyn) och Skift+F5 före F5: `consume_key` bryr sig inte om extra Alt/Skift.
+        if key(Modifiers::ALT, Key::F5) {
+            self.presenter_on_start = true;
+            act = Some(Action::Show(false));
+        } else if key(Modifiers::SHIFT, Key::F5) {
             act = Some(Action::Show(true));
         } else if key(Modifiers::NONE, Key::F5) {
             act = Some(Action::Show(false));

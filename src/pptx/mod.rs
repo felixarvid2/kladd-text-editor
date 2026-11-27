@@ -45,6 +45,12 @@ pub mod edit_text;
 pub mod edit_view;
 pub mod edit_xml;
 pub mod save;
+// Omgång 3, bildspelet (w-panim): övergångar, animeringar och föredragsvy.
+pub mod anim;
+pub mod anim_expr;
+pub mod anim_layers;
+pub mod presenter;
+pub mod transition;
 
 #[cfg(test)]
 mod tests;

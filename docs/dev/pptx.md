@@ -169,12 +169,13 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 2 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
   understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** bildövergångar, animeringar, föredragsvy, länkar i bildspelet, markering av text på bilden;
+- **Visning:** länkar och åtgärdsknappar i bildspelet, utlösare (`interactiveSeq`), video/ljud, morph som riktig
+  forminterpolering, föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
 - **Diagram:** riktig 3D, sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, chartex (`cx:`).
@@ -597,3 +598,46 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   PowerPoint är oförändrat för alla 1 124 bilder (medel 0,8842, samma värde per bild som `integ2`).
 - **Inte kontrollerat mot PowerPoint** (finns inte i behållaren), så att PowerPoint öppnar filerna utan
   reparationsdialog är inte bevisat; ordningen i schemat och relationerna är gjorda för det.
+
+## Bildspel: övergångar, animeringar och föredragsvy (omgång 3)
+
+| `scene.rs` | `Item::BeginShape { id }`/`EndShape` runt varje toppnivåform på bilden (`p:cNvPr/@id`; bara bildens eget formträd, inte mall/layout eller former inuti grupper och SmartArt), `Item::Para(n)` före varje stycke i en textram (från `text.rs`), `Scene::shape_ranges() -> Vec<(u32, Range<usize>)>`. Markörerna ritas inte (raster, PDF och sökningen hoppar över dem). |
+| `transition.rs` | `Transition::of_slide(root)` (`kind`, `dur`, `adv_click`, `adv_after`); `pieces(kind, p, aspect) -> Vec<Piece>` (konvexa polygoner i texturens koordinater med avbildning till målet och alfa, lager gammal/ny/svart); `reveal(Reveal, p, aspect)` för avslöjningsformerna (används också av animeringarna). |
+| `anim.rs` + `anim_expr.rs` | `Timeline::of_slide(root)`: klickgrupper (`Group { auto, effects, dur }`), `clicks()`, `groups_at_step(k)`, `chain(k)` (grupperna som spelas när man kommer till steg k), `targets()`, `initially_hidden(t)`, `state(target, geom, chain, t) -> State` (synlig, opacitet, förskjutning, skala, vridning, avslöjning). Formlerna i `p:tav`/`by`/`from`/`to` räknas av `anim_expr::eval`. |
+| `anim_layers.rs` | `split(&Scene, &[Target]) -> Vec<LayerItems>` (fasta lager och mål i ritordning), `filter` (styckeval med balanserade effekt-/klippmarkörer), `render(..) -> Vec<Rendered>` (förmultiplicerad RGBA beskuren till innehållet + marginal för skugga/glöd/spegling, i samma bildpunktsrutnät som hela bilden). |
+| `slideshow.rs` | `Show` har klick-steg per bild (`with_steps`, `step`, `peek_next`, `position`); `Playback` (`next(now, click)`, `prev`, `jump`, `tick`, `frame(now) -> Frame`, `animating`, `auto_due`); `Timer` och `clock_text` för föredragsvyn. Rent, provat utan GUI. |
+| `presenter.rs` | `ShowView` (ägs av `PptxTab` under bildspelet): bakgrundsrendering av lagren (högst två trådar), bildrutan som egui-nät (`paint_slide`, `clip_convex`), föredragsvyn; `timings(deck, timelines, animate)`. |
+
+- **Tidsträdet:** huvudsekvensens `p:par` är klickgrupper. En grupp med `evt="onBegin"` (eller en fördröjning utan
+  `indefinite`) startar själv: först på bilden när övergången är klar, annars när gruppen före är klar. Inom gruppen
+  börjar en tidsförskjuten del med *efter föregående* vid max(skriven fördröjning, förra delens slut) – PowerPoint
+  skriver den summerade fördröjningen (t.ex. 1000, 3560), men 0 förekommer efter effekter på 1 ms.
+  Beteendena tolkas generellt (inte per `presetID`): `p:set style.visibility`, `p:animEffect` (`fade`, `wipe(dir)`,
+  `barn`, `circle`, `diamond`, `plus`, `box`, `blinds`, `checkerboard`, `randombar`, `dissolve`, `wheel`, `wedge`,
+  `strips`; annat = toning), `p:anim` (`ppt_x`/`ppt_y`/`ppt_w`/`ppt_h`/`style.rotation`/`r`/`style.opacity` med nyckelbilder
+  och formler), `p:animScale`, `p:animRot`, `p:animMotion` (banan som polylinje, kurvor i 8 steg, längs båglängden),
+  färgbyten (`p:animClr`, `p:set` av färger i betoningar) som en blinkning. `accel`/`decel`, `autoRev` och
+  `repeatCount` gäller; `fill="remove"` tar bort effekten när den är klar. `p:txEl/p:pRg` ger ett mål per stycke;
+  `charRg`, `graphicEl` (SmartArt/diagram i delar) och `bg` gäller hela formen. Utlösare (`interactiveSeq`) räknas inte:
+  de formerna syns som vanligt. Ett mål som inte finns i visningslistan (t.ex. på layouten) ritas som vanligt –
+  aldrig "dolt för alltid".
+- **Lagren:** en bild utan mål är ett enda lager (samma bild som förut). Med mål delas listan vid varje animerad form
+  så att ritordningen behålls (en animerad form under en fast hamnar under den). Stycken i samma form blir egna lager;
+  formens geometri och övriga stycken stannar i det fasta lagret. Provet `lagren_ger_samma_bild_som_hela_renderingen`
+  visar att lagren ihoplagda ger samma bildpunkter (±2) som hela renderingen.
+- **Uppspelning:** övergången ritar den gamla bilden i sitt slutläge och den nya i läget före sina animeringar; nästa
+  bild förrenderas. Bakåt hoppar utan animering. `advTm` räknas från stegets början (efter övergången) men väntar
+  tills stegets animeringar är klara; finns klick-steg kvar tar den automatiska övergången nästa steg. `advClick="0"`
+  gör att musklick inte byter bild (tangenter gör det). Medan lagren renderas visas inget av bilden (svart), så att en
+  form med in-effekt aldrig syns för tidigt, och uppspelningens klocka står still så att övergången och de
+  självstartande animeringarna inte hinner gå under väntan (föredragsvyns förflutna tid går som vanligt).
+- **Föredragsvyn** öppnas med `Alt+F5` i vyn (bildspel från början med föredragsvyn, `PptxTab::handle_keys`) eller
+  under bildspelet. Den är en egui-viewport (`show_viewport_immediate`); utan stöd för flera fönster
+  (`ctx.embed_viewports()`) växlar `Alt+F5` vyn i samma fönster. Kladd avgör inte själv om det finns två skärmar och
+  öppnar inte föredragsvyn automatiskt: talarens fönster öppnas som ett vanligt fönster och publikens är helskärm.
+- **Referensmaterialet:** 257 bilder har övergångar (toning 147, genom svart/`p14:reveal` 81, torka 18, push 11) och
+  614 klick-steg; alla 1 081 mål hittas i visningslistan (`anim_layers::tests::referensmaterialets_animeringar`,
+  ignorerat, `KLADD_PPTX_REFS`).
+- **Kvar:** morph som forminterpolering, `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i
+  betoningar (kräver omrendering), `iterate` (bokstav för bokstav), ljud och video, utlösare, val av skärm.
+

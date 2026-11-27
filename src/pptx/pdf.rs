@@ -144,7 +144,7 @@ fn draw_scene(s: &mut krilla::surface::Surface<'_>, scene: &Scene) {
                     }
                 }
             }
-            Item::EndEffect => {}
+            Item::EndEffect | Item::BeginShape { .. } | Item::EndShape | Item::Para(_) => {}
             Item::Fill { path, paint, even_odd } => {
                 if let Paint::Image { image, alpha, tile: true, .. } = paint {
                     // Upprepad bild (mönster, `a:tile`): bildens medelfärg.

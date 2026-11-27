@@ -340,6 +340,11 @@ En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öp
 | `Home` / `End` | Första / sista bilden |
 | `B` eller `.` / `W` eller `,` | Svart / vit skärm (samma tangent igen, eller nästa, tar tillbaka bilden) |
 | `Esc` | Avsluta bildspelet |
+| `Alt+F5` | Föredragsvy på/av |
+
+**Övergångar, animeringar och föredragsvy.** Bildspelet spelar upp presentationens bildövergångar (tona, även genom svart, push, torka, dela, täck, dra undan, slumpstaplar, cirkel, romb, plus, zoom, upplösning, schack, jalusi, kam, hjul och kil; PowerPoints nyare effekter som virvel och glitter blir en toning, och morph tonar mellan bilderna) och animeringarna i den ordning de är gjorda: in-effekter (visas, tona, flyg in, torka, dela, zooma och liknande), ut-effekter, betoning (snurra, växa/krympa, färgbyte som en blinkning) och rörelsebanor, även stycke för stycke. Former med en in-effekt är dolda tills effekten körs, och effekter som Kladd inte kan rita visas eller göms direkt i rätt ordning. Nästa-tangenterna och klick tar nästa klick-steg innan de går till nästa bild, och bakåt går ett klick-steg tillbaka (från bildens början till föregående bild som den ser ut när alla steg är klara). Bilder med *Gå vidare efter* byter själva. *Spela upp övergångar och animeringar* i *Visa*-menyn stänger av alltihop; då visas varje bild som i vyn.
+
+`Alt+F5` startar bildspelet med föredragsvyn, och under bildspelet växlar `Alt+F5` föredragsvyn av och på. Den öppnas i ett eget fönster (flytta det till skärmen du själv ser): aktuell bild, nästa klick-steg eller bild, anteckningarna (`A−`/`A+` ändrar textstorleken), klockan och förfluten tid (*Pausa*/*Nollställ*), bildnummer och knappar för föregående, nästa, svart skärm och avsluta. Tangenterna fungerar i båda fönstren, och att stänga föredragsvyns fönster stänger bara föredragsvyn. Kan Kladd inte öppna fler fönster växlar `Alt+F5` mellan publikens vy och föredragsvyn i samma fönster.
 
 **Sök.** `Ctrl+F` söker i bildernas text och i anteckningarna. Träffarna markeras på bilden (gult, den aktuella orange) och i anteckningspanelen, fältet visar *träff av antal*, och `Enter`/`Skift+Enter` (eller `F3`/`Skift+F3`) går mellan träffarna; en träff i anteckningarna öppnar panelen. Texten tas ur samma ritning som visas, så det som syns på bilden är det som hittas.
 

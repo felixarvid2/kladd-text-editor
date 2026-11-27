@@ -27,6 +27,8 @@ struct Builder {
     layout_tree: String,
     slides: Vec<(String, String)>,
     pres_attrs: String,
+    /// XML efter `p:cSld` per bild (övergång, tidsträd).
+    tails: Vec<(usize, String)>,
 }
 
 fn sp_ph(id: u32, name: &str, ph: &str, xfrm: Option<(i64, i64, i64, i64)>, body: &str) -> String {
@@ -53,11 +55,17 @@ impl Builder {
         let layout_tree = sp_ph(2, "Rubrik", r#"<p:ph type="title"/>"#, None, r#"<p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr><a:defRPr sz="3600"/></a:lvl1pPr></a:lstStyle><a:p><a:endParaRPr/></a:p></p:txBody>"#)
             + &sp_ph(3, "Innehåll", r#"<p:ph idx="1"/>"#, Some((914400, 1828800, 7315200, 3657600)), r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr/></a:p></p:txBody>"#)
             + &sp_ph(4, "Nummer", r#"<p:ph type="sldNum" sz="quarter" idx="12"/>"#, None, r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:fld id="{1}" type="slidenum"><a:t>‹#›</a:t></a:fld></a:p></p:txBody>"#);
-        Builder { master_tree, master_extra, layout_tree, slides: Vec::new(), pres_attrs: String::new() }
+        Builder { master_tree, master_extra, layout_tree, slides: Vec::new(), pres_attrs: String::new(), tails: Vec::new() }
     }
 
     fn slide(mut self, attrs: &str, inner: &str) -> Builder {
         self.slides.push((attrs.to_owned(), inner.to_owned()));
+        self
+    }
+
+    /// XML efter `p:cSld` på senaste bilden (`p:transition`, `p:timing`).
+    fn tail(mut self, xml: &str) -> Builder {
+        self.tails.push((self.slides.len().saturating_sub(1), xml.to_owned()));
         self
     }
 
@@ -78,7 +86,8 @@ impl Builder {
             let n = i + 1;
             ids.push_str(&format!(r#"<p:sldId id="{}" r:id="rIdS{n}"/>"#, 255 + n));
             rels.push_str(&format!(r#"<Relationship Id="rIdS{n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide{n}.xml"/>"#));
-            put(&format!("ppt/slides/slide{n}.xml"), &format!(r#"<p:sld {NS} {attrs}>{}</p:sld>"#, tree(inner)));
+            let tail: String = self.tails.iter().filter(|(k, _)| *k == i).map(|(_, x)| x.as_str()).collect();
+            put(&format!("ppt/slides/slide{n}.xml"), &format!(r#"<p:sld {NS} {attrs}>{}{tail}</p:sld>"#, tree(inner)));
             put(
                 &format!("ppt/slides/_rels/slide{n}.xml.rels"),
                 r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#,
@@ -373,6 +382,9 @@ fn dump_scene() {
             Item::PopClip => println!("pop"),
             Item::BeginEffect(e) => println!("effect {e:?}"),
             Item::EndEffect => println!("end effect"),
+            Item::BeginShape { id } => println!("shape {id}"),
+            Item::EndShape => println!("end shape"),
+            Item::Para(n) => println!("para {n}"),
         }
     }
 }
@@ -544,4 +556,113 @@ fn minne_per_bild() {
         let _ = raster::render(&s, 320, 180);
         println!("bild {} raster: {}", i + 1, rss());
     }
+}
+
+// ------------------------------------------------------------ bildspel: övergångar och animeringar (w-panim)
+
+/// En bild med en röd ruta (id 5) som tonas in på första klicket och en punktlista (id 3) vars andra
+/// stycke visas på andra klicket; övergången är push uppåt. Bild 2 går vidare automatiskt efter 2 s.
+fn anim_deck() -> Vec<u8> {
+    use super::anim::tests::{appear, click, fade_in};
+    let rect = r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Ruta"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></p:spPr></p:sp>"#;
+    let body = text_body(r#"<a:p><a:r><a:t>Ett</a:t></a:r></a:p><a:p><a:r><a:t>Två</a:t></a:r></a:p><a:p><a:r><a:t>Tre</a:t></a:r></a:p>"#);
+    let timing = click(false, &[(0, fade_in(5, None, "clickEffect", 500))]) + &click(false, &[(0, appear(3, Some(1), "clickEffect"))]);
+    let timing = format!(r#"<p:timing><p:tnLst><p:par><p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot"><p:childTnLst><p:seq concurrent="1" nextAc="seek"><p:cTn id="2" dur="indefinite" nodeType="mainSeq"><p:childTnLst>{timing}</p:childTnLst></p:cTn></p:seq></p:childTnLst></p:cTn></p:par></p:tnLst><p:bldLst><p:bldP spid="3" grpId="0" build="p"/></p:bldLst></p:timing>"#);
+    Builder::new()
+        .slide("", &(sp_ph(3, "I", r#"<p:ph idx="1"/>"#, None, &body) + rect))
+        .tail(&(r#"<p:transition spd="med"><p:push dir="u"/></p:transition>"#.to_owned() + &timing))
+        .slide("", &sp_ph(3, "I", r#"<p:ph idx="1"/>"#, None, &text_body("<a:p><a:r><a:t>Sist</a:t></a:r></a:p>")))
+        .tail(r#"<p:transition advTm="2000"><p:fade/></p:transition>"#)
+        .build()
+}
+
+/// Lagren ihoplagda med tillståndet i läget `st` (bara synligheten), RGBA i `w`×`h`.
+fn composite(deck: &Deck, tl: &super::anim::Timeline, st: &super::slideshow::SlideState, w: u32, h: u32) -> Vec<u8> {
+    use resvg::tiny_skia as sk;
+    use super::anim_layers::{self, LayerKind};
+    let scene = render::slide_scene(deck, st.slide);
+    let layers = anim_layers::split(&scene, &tl.targets());
+    let mut acc = sk::Pixmap::new(w, h).unwrap();
+    for r in anim_layers::render(&scene, &layers, w, h) {
+        if let LayerKind::Target(t) = r.kind {
+            if !tl.state(t, r.geom, st.chain.clone(), st.t).drawn() {
+                continue;
+            }
+        }
+        let pm = sk::Pixmap::from_vec(r.rgba, sk::IntSize::from_wh(r.px.2, r.px.3).unwrap()).unwrap();
+        acc.draw_pixmap(r.px.0 as i32, r.px.1 as i32, pm.as_ref(), &sk::PixmapPaint::default(), sk::Transform::identity(), None);
+    }
+    acc.take()
+}
+
+#[test]
+fn bildspel_former_och_stycken_visas_per_klick() {
+    use super::anim::{Target, Timeline};
+    use super::anim_layers::{self, LayerKind};
+    use super::slideshow::SlideState;
+    let deck = Deck::open(&anim_deck()).unwrap();
+    let tl = Timeline::of_slide(&deck.slides[0].root);
+    assert_eq!(tl.clicks(), 2);
+    let ruta = Target { shape: 5, para: None };
+    let två = Target { shape: 3, para: Some(1) };
+    assert_eq!(tl.targets(), vec![två, ruta]);
+    // Formidentiteten finns i visningslistan.
+    let scene = render::slide_scene(&deck, 0);
+    let ids: Vec<u32> = scene.shape_ranges().iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![3, 5]);
+    let layers = anim_layers::split(&scene, &tl.targets());
+    let kinds: Vec<LayerKind> = layers.iter().map(|l| l.kind).collect();
+    assert_eq!(kinds, vec![LayerKind::Static, LayerKind::Target(två), LayerKind::Target(ruta)]);
+    let text: String = layers[1].items.iter().filter_map(|i| if let Item::Glyphs(g) = i { Some(g.text.clone()) } else { None }).collect();
+    assert_eq!(text, "•Två", "punkten hör till stycket");
+    let fixed: String = layers[0].items.iter().filter_map(|i| if let Item::Glyphs(g) = i { Some(g.text.clone()) } else { None }).collect::<Vec<_>>().join(" ");
+    assert!(fixed.contains("Ett") && fixed.contains("Tre") && !fixed.contains("Två"), "{fixed}");
+    // Rutans mitt (36, 36 pt) per steg: dold, röd efter första klicket.
+    let (w, h) = (360u32, 270u32);
+    let px = |rgba: &[u8], x: u32, y: u32| { let o = ((y * w + x) * 4) as usize; [rgba[o], rgba[o + 1], rgba[o + 2]] };
+    let rest = |step| { let e = tl.groups_at_step(step); SlideState { slide: 0, step, chain: e..e, t: f32::INFINITY } };
+    assert_eq!(px(&composite(&deck, &tl, &rest(0), w, h), 18, 18), [255, 255, 255]);
+    assert_eq!(px(&composite(&deck, &tl, &rest(1), w, h), 18, 18), [255, 0, 0]);
+    // Steg 2 är samma bild som den vanliga renderingen (allt synligt).
+    let full = raster::to_rgba(raster::render(&scene, w, h).unwrap()).2;
+    let all = composite(&deck, &tl, &rest(2), w, h);
+    let diff = full.iter().zip(&all).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    assert!(diff <= 2, "största skillnad {diff}");
+    // Före steg 2 fattas stycke 2: bilden skiljer sig från den fullständiga.
+    let one = composite(&deck, &tl, &rest(1), w, h);
+    assert!(full.iter().zip(&one).any(|(a, b)| (*a as i32 - *b as i32).abs() > 60));
+}
+
+#[test]
+fn bildspel_tider_övergång_och_automatisk_övergång() {
+    use std::sync::Arc;
+    use super::anim::Timeline;
+    use super::slideshow::{Playback, Screen, Show};
+    use super::transition::{Dir, Kind};
+    let deck = Deck::open(&anim_deck()).unwrap();
+    let tls: Vec<Arc<Timeline>> = deck.slides.iter().map(|s| Arc::new(Timeline::of_slide(&s.root))).collect();
+    let t = super::presenter::timings(&deck, &tls, true);
+    assert_eq!(t[0].transition.kind, Kind::Push(Dir::Up));
+    assert_eq!(t[0].transition.dur, 0.75);
+    assert_eq!(t[0].clicks(), 2);
+    assert_eq!(t[1].transition.adv_after, Some(2.0));
+    // Utan animeringar: direkt byte och inga klick-steg, men automatisk övergång finns kvar.
+    let off: Vec<Arc<Timeline>> = deck.slides.iter().map(|_| Arc::new(Timeline::default())).collect();
+    let t_off = super::presenter::timings(&deck, &off, false);
+    assert!(!t_off[0].transition.animated() && t_off[0].clicks() == 0);
+    assert_eq!(t_off[1].transition.adv_after, Some(2.0));
+    // Uppspelning: första bilden kommer med push från svart; två klick; sedan bild 2 som går vidare själv.
+    let mut p = Playback::new(Show::from_beginning(&[false, false]).unwrap(), t, 0.0);
+    let f = p.frame(0.3);
+    assert!(matches!(f.transition, Some((None, Kind::Push(Dir::Up), _))));
+    assert!(p.tick(1.0));
+    assert!(p.next(1.0, true) && p.next(2.0, true));
+    assert_eq!((p.show.slide(), p.show.step()), (0, 2));
+    assert!(p.next(3.0, true));
+    assert_eq!(p.show.slide(), 1);
+    assert!(p.tick(3.6));
+    assert!(p.tick(5.4));
+    assert_eq!(p.show.screen(), Screen::Slide(1));
+    assert!(p.tick(5.6));
+    assert_eq!(p.show.screen(), Screen::End, "advTm räknas från när övergången är klar");
 }
