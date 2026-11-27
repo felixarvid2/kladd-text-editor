@@ -672,8 +672,11 @@ funktioner), `chart_3d_draw.rs` (undermodul till `chart_draw.rs`, delar `Draw`) 
   standard), värdeaxelns rutnät på väggarna, serierna som föremål ritade bakifrån och fram (varje föremåls
   ytor med baksidesgallring och ljushet relativt framsidan). Staplar: lådor, cylindrar (36 sidor), koner och
   pyramider (`coneToMax`/`pyramidToMax` som stympade mot axelns största värde), grupperade, staplade, 100 %
-  och `standard` (serierna på djupet när diagrammet har en `serAx`). Linjer som band och ytor som skivor på
-  var sin rad på djupet (`gapDepth`), första serien närmast. Axeletiketterna längs lådans främre kanter,
+  och `standard` (serierna på djupet när diagrammet har en `serAx`). Linjer som band (ovansida, framsida så tjock
+  som 1,6 × linjebredden, minst 2,25 pt, undersida och ändar) och ytor som skivor, på var sin rad på djupet,
+  lika djupa som staplarna (`gapDepth`), första serien närmast. Tomma punkter följer `c:dispBlanksAs` (`zero`
+  när elementet saknas, som standardvärdet i ECMA-376; `gap`, `span`); ytor har alltid noll. 2D-linjerna
+  är oförändrade (luckor). I förklaringen har 3D-linjer en ruta i bandets färg. Axeletiketterna längs lådans främre kanter,
   seriernas namn till höger om djupet.
 - **Inte gjort:** `surface3DChart`, perspektiv i 3D-cirkeln, datatabeller i 3D, att räkna in etikettbredden i
   lådans placering vid stor vridning. Stapel/linje/yta i 3D finns inte i referensmaterialet och är bara

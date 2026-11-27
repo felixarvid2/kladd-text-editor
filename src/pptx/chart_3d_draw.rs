@@ -359,7 +359,7 @@ impl Draw<'_, '_> {
                 // Första serien närmast betraktaren.
                 let zc = (row as f32 + 0.5) * slot;
                 let zw = slot / (1.0 + gap_d);
-                let (z0, z1) = if matches!(p.kind, Kind::Bar { .. }) { (zc - zw / 2.0, zc + zw / 2.0) } else { (zc - slot * 0.35, zc + slot * 0.35) };
+                let (z0, z1) = (zc - zw / 2.0, zc + zw / 2.0);
                 let col = self.series_paint(c, p, ser, None, total_series, ncat);
                 match p.kind {
                     Kind::Bar { .. } => {
@@ -408,13 +408,15 @@ impl Draw<'_, '_> {
                         let area = p.kind == Kind::Area;
                         let mid = |i: usize| cw(i as f32) + cband / 2.0;
                         let base_v = vw(scale.min.max(0.0).min(scale.max));
+                        // Tomma punkter (`dispBlanksAs`): noll, lucka eller överbryggad. Ytor har alltid noll.
+                        let blanks = if area { "zero" } else { c.blanks.as_str() };
+                        let npts = ser.vals.len().max(ser.cats.len()).min(ncat);
                         // Staplade ytor: värdena läggs ovanpå varandra.
                         let vals: Vec<Option<f32>> = (0..ncat)
                             .map(|i| {
-                                // Tomma punkter: luckor i linjen, noll i ytan (som Excel).
                                 let v = match ser.vals.get(i).copied().flatten() {
                                     Some(v) => v,
-                                    None if area && i < ser.vals.len().max(ser.cats.len()) => 0.0,
+                                    None if blanks == "zero" && i < npts => 0.0,
                                     None => return None,
                                 };
                                 let v = if p.grouping == Grouping::Percent { if sums[i] > 0.0 { v / sums[i] } else { 0.0 } } else { v };
@@ -426,18 +428,32 @@ impl Draw<'_, '_> {
                                 }
                             })
                             .collect();
+                        // Sträckorna: mellan grannar, eller över luckor vid `span`.
+                        let present: Vec<usize> = (0..ncat).filter(|&i| vals[i].is_some()).collect();
+                        let segs: Vec<(usize, usize)> = present.windows(2).map(|w| (w[0], w[1])).filter(|(a, b)| blanks == "span" || b - a == 1).collect();
+                        // Linjens tjocklek (bandets framsida): seriens linjebredd, minst 2,25 pt, ×1,6, i världens enheter.
+                        let lw = ser.sppr.and_then(|sp| sp.child("a:ln")).and_then(|l| l.attr_i64("w")).map_or(2.25, super::super::render::emu).max(2.25);
+                        let t = (lw * 1.6 / s).max(1e-4);
                         let mut polys: Vec<Poly> = Vec::new();
-                        for i in 0..ncat.saturating_sub(1) {
-                            let (Some(y0), Some(y1)) = (vals[i], vals[i + 1]) else { continue };
-                            let (x0, x1) = (mid(i), mid(i + 1));
+                        for &(i, j) in &segs {
+                            let (Some(y0), Some(y1)) = (vals[i], vals[j]) else { continue };
+                            let (x0, x1) = (mid(i), mid(j));
                             // Bandets ovansida.
                             polys.push(Poly { kind: FaceKind::Top, pts: vec![to_w(x0, y0, z0), to_w(x1, y1, z0), to_w(x1, y1, z1), to_w(x0, y0, z1)] });
                             if area {
                                 polys.push(Poly { kind: FaceKind::Front, pts: vec![to_w(x0, base_v, z0), to_w(x1, base_v, z0), to_w(x1, y1, z0), to_w(x0, y0, z0)] });
                             } else {
-                                // Linjen: bandets framkant som en smal list.
-                                let t = (hy * 0.012).max(0.002);
+                                // Linjen: bandets framsida (linjens tjocklek) och undersida.
                                 polys.push(Poly { kind: FaceKind::Front, pts: vec![to_w(x0, y0 - t, z0), to_w(x1, y1 - t, z0), to_w(x1, y1, z0), to_w(x0, y0, z0)] });
+                                polys.push(Poly { kind: FaceKind::Bottom, pts: vec![to_w(x0, y0 - t, z0), to_w(x1, y1 - t, z0), to_w(x1, y1 - t, z1), to_w(x0, y0 - t, z1)] });
+                            }
+                        }
+                        if !area {
+                            // Bandets ändar.
+                            let ends: Vec<usize> = segs.iter().flat_map(|&(i, j)| [i, j]).collect();
+                            for i in ends.iter().copied().filter(|i| ends.iter().filter(|e| *e == i).count() == 1) {
+                                let (Some(y), x) = (vals[i], mid(i)) else { continue };
+                                polys.push(Poly { kind: FaceKind::Side, pts: vec![to_w(x, y - t, z0), to_w(x, y, z0), to_w(x, y, z1), to_w(x, y - t, z1)] });
                             }
                         }
                         if area {
@@ -482,10 +498,12 @@ impl Draw<'_, '_> {
             let base = self.fill_of(*sppr, *r).flatten().map(|p| p.average()).unwrap_or(*col);
             let line = self.line_of(*sppr, *r).flatten();
             // Rundade former (cylinder, kon) har många smala sidor: en tunn kant i samma färg döljer skarvarna.
+            // Likaså ytornas och bandens framsidor, som består av en bit per sträcka.
             let many = faces.iter().filter(|f| f.kind == FaceKind::Side).count() > 4;
+            let fronts = faces.iter().filter(|f| f.kind == FaceKind::Front).count() > 1;
             for f in faces {
                 self.face(f, base);
-                if many && f.kind == FaceKind::Side && line.is_none() {
+                if ((many && f.kind == FaceKind::Side) || (fronts && f.kind == FaceKind::Front)) && line.is_none() {
                     self.stroke(poly_path(&f.pts), Stroke { paint: Paint::Solid(shaded(base, f.shade)), width: 0.5, dash: Vec::new(), cap: Cap::Butt, join: Join::Round });
                 }
                 if let Some(st) = &line {

@@ -441,7 +441,8 @@ impl<'b, 'a> Draw<'b, 'a> {
                         entries.push(Entry { text: ser.cats.get(i).cloned().unwrap_or_else(|| (i + 1).to_string()), sppr: sp, color: self.auto_color(c.style, i, n), line: false });
                     }
                 } else {
-                    let line = matches!(p.kind, Kind::Line | Kind::Scatter);
+                    // 3D-linjer är band: nyckeln är en ruta i bandets färg.
+                    let line = matches!(p.kind, Kind::Line | Kind::Scatter) && !p.three_d;
                     entries.push(Entry { text: ser.name.clone(), sppr: ser.sppr, color: self.auto_color(c.style, ser.idx, total), line });
                 }
             }

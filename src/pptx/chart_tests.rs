@@ -304,3 +304,50 @@ fn pdf_med_3d_effekter() {
         assert!(pdf.len() > plain.len() + 200, "3D-effekten som rasterbild i PDF:en: {} mot {}", pdf.len(), plain.len());
     }
 }
+
+/// Fyllningar i en serie färgs kulör (färgen skalad mot svart eller blandad mot vitt).
+fn of_hue(f: &[((f32, f32, f32, f32), Rgba)], base: Rgba) -> usize {
+    let n = |c: Rgba| {
+        let m = c.r.max(c.g).max(c.b).max(1e-3);
+        (c.r / m, c.g / m, c.b / m)
+    };
+    let (br, bg, bb) = n(base);
+    f.iter()
+        .filter(|(b, c)| b.2 - b.0 < 700.0 && c.r.max(c.g).max(c.b) > 0.05)
+        .filter(|(_, c)| {
+            // Mörkare: samma förhållanden. Ljusare: avståndet till vitt i samma förhållanden.
+            let (r, g, b) = n(*c);
+            let dark = (r - br).abs() < 0.08 && (g - bg).abs() < 0.08 && (b - bb).abs() < 0.08;
+            let w = |x: f32| 1.0 - x;
+            let wm = w(c.r).max(w(c.g)).max(w(c.b)).max(1e-3);
+            let bw = w(base.r).max(w(base.g)).max(w(base.b)).max(1e-3);
+            let light = (w(c.r) / wm - w(base.r) / bw).abs() < 0.08 && (w(c.g) / wm - w(base.g) / bw).abs() < 0.08 && (w(c.b) / wm - w(base.b) / bw).abs() < 0.08;
+            dark || light
+        })
+        .count()
+}
+
+#[test]
+fn linjediagram_i_3d_ritar_varje_serie() {
+    // Serie 2 (grön i spPr) saknar mittvärdet. Utan `dispBlanksAs` (standard `zero`) och med `span`
+    // ritas båda serierna som band; med `gap` har serie 2 inga två grannar men serie 1 ritas.
+    let accent1 = Rgba::rgb8(0x44, 0x72, 0xC4);
+    let green = Rgba::rgb8(0, 0xFF, 0);
+    let view = r#"<c:view3D><c:rotX val="15"/><c:rotY val="20"/><c:rAngAx val="0"/></c:view3D>"#;
+    for (blanks, both) in [("", true), (r#"<c:dispBlanksAs val="span"/>"#, true), (r#"<c:dispBlanksAs val="gap"/>"#, false)] {
+        let xml = bar_3d("line3DChart", "", view).replace("<c:barDir val=\"col\"/>", "").replace("</c:plotArea>", &format!("</c:plotArea>{blanks}"));
+        let bytes = deck(&chart_frame(), &[("charts/chart1.xml", "chart", xml.as_bytes())]);
+        let scene = render::slide_scene(&Deck::open(&bytes).unwrap(), 0);
+        let f = fills(&scene.items);
+        // Bandet: ovansida, framsida, undersida och ändar per sträcka (förklaringens nyckel är en till).
+        assert!(of_hue(&f, accent1) >= 4, "serie 1 ({blanks}): {f:?}");
+        let g = of_hue(&f, green);
+        if both {
+            assert!(g >= 4, "serie 2 ({blanks}): {g}");
+        } else {
+            assert_eq!(g, 1, "bara förklaringens nyckel ({blanks})");
+        }
+        // Bandets ovansida är ljusare än framsidan: tydligt djup.
+        assert!(f.iter().any(|(_, c)| c.b > accent1.b + 0.02 && c.r > accent1.r), "ljus ovansida");
+    }
+}

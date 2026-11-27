@@ -223,6 +223,9 @@ pub struct Chart<'n> {
     pub view3d: Option<View3D>,
     /// Golvets och väggarnas `c:spPr`.
     pub walls: Walls<'n>,
+    /// Tomma celler (`c:dispBlanksAs`): `gap`, `zero` eller `span`. Saknas elementet gäller
+    /// standardvärdet i ECMA-376, `zero` (Office skriver alltid ut det). Används bara i 3D-linjer och -ytor.
+    pub blanks: String,
 }
 
 fn val<'a>(n: &'a Node, child: &str) -> Option<&'a str> {
@@ -484,6 +487,7 @@ pub fn parse(root: &Node) -> Option<Chart<'_>> {
             right_angle: v.child("c:rAngAx").map(|_| flag(v, "c:rAngAx", true)),
             perspective: num(v, "c:perspective").map(|x| x.clamp(0.0, 240.0) as f32),
         }),
+        blanks: chart.child("c:dispBlanksAs").map_or("zero", |d| d.attr("val").unwrap_or("zero")).to_owned(),
         walls: Walls { floor: chart.path(&["c:floor", "c:spPr"]), side: chart.path(&["c:sideWall", "c:spPr"]), back: chart.path(&["c:backWall", "c:spPr"]) },
     })
 }
