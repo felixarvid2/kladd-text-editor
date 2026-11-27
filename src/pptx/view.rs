@@ -325,20 +325,8 @@ impl PptxTab {
     /// Meddelande om sådant som inte visas än (diagram, EMF, inbäddade typsnitt som inte kan läsas).
     pub fn open_note(&self, name: &str) -> Option<String> {
         let mut lost: Vec<&str> = Vec::new();
-        let (mut charts, mut emf) = (false, false);
-        for i in 0..self.deck.slides.len() {
-            let f = self.deck.features(i);
-            charts |= f.chart;
-            emf |= f.emf;
-        }
-        if charts {
-            lost.push(t("diagram"));
-        }
-        if emf {
-            lost.push(t("EMF/WMF-bilder"));
-        }
         if !self.deck.fonts.unreadable_embedded.is_empty() {
-            lost.push(t("komprimerade inbäddade typsnitt"));
+            lost.push(t("inbäddade typsnitt som inte kan läsas"));
         }
         (!lost.is_empty()).then(|| tf!("{name} innehåller {lost} som ännu inte visas som i PowerPoint", name = name, lost = crate::doc::join_sv(&lost)))
     }

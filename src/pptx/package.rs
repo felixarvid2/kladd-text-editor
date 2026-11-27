@@ -36,7 +36,7 @@ impl Package {
     pub fn open(bytes: &[u8]) -> Result<Package, String> {
         // OLE-behållare: krypterad .pptx eller det äldre .ppt-formatet.
         if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
-            return Err(crate::i18n::t("Presentationen är lösenordsskyddad eller i det äldre .ppt-formatet, som Kladd inte kan öppna än.").to_owned());
+            return Err(crate::i18n::t("Presentationen är lösenordsskyddad, eller så är det en .ppt-fil i det äldre formatet med fel filändelse (byt till .ppt så konverteras den med LibreOffice).").to_owned());
         }
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
             .map_err(|_| crate::i18n::t("Filen är inte en giltig PowerPoint-fil (inget zip-arkiv).").to_owned())?;

@@ -2,7 +2,7 @@
 
 pub const EN: &[(&str, &str)] = &[
     ("Filen är inte en giltig PowerPoint-fil (inget zip-arkiv).", "The file is not a valid PowerPoint file (not a zip archive)."),
-    ("Presentationen är lösenordsskyddad eller i det äldre .ppt-formatet, som Kladd inte kan öppna än.", "The presentation is password-protected or in the older .ppt format, which Kladd cannot open yet."),
+    ("Presentationen är lösenordsskyddad, eller så är det en .ppt-fil i det äldre formatet med fel filändelse (byt till .ppt så konverteras den med LibreOffice).", "The presentation is password-protected, or it is an older-format .ppt file with the wrong extension (rename it to .ppt to convert it with LibreOffice)."),
     ("PowerPoint-filen är för stor uppackad.", "The PowerPoint file is too large when unpacked."),
     ("Filen saknar en PowerPoint-presentation (presentation.xml).", "The file has no PowerPoint presentation (presentation.xml)."),
     ("SmartArt", "SmartArt"),
@@ -10,9 +10,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Bild (EMF)", "Picture (EMF)"),
     ("Bild (WMF)", "Picture (WMF)"),
     ("Ogiltig bildstorlek.", "Invalid slide size."),
-    ("diagram", "charts"),
-    ("EMF/WMF-bilder", "EMF/WMF pictures"),
-    ("komprimerade inbäddade typsnitt", "compressed embedded fonts"),
+    ("inbäddade typsnitt som inte kan läsas", "embedded fonts that cannot be read"),
     ("{name} innehåller {lost} som ännu inte visas som i PowerPoint", "{name} contains {lost} that are not yet shown as in PowerPoint"),
     ("Presentationen har inga bilder.", "The presentation has no slides."),
     ("Bild {n} (dold)", "Slide {n} (hidden)"),

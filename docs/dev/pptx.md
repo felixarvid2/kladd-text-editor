@@ -62,14 +62,15 @@ En ritväg för allt:
   `indent`/`marR`, tabbar, `spcBef`/`spcAft`/`lnSpc` (procent och punkter), lagrad `normAutofit`
   (`fontScale` på storlekarna, `lnSpcReduction` på radavståndet; räknas inte om), punkter och numrering
   (`buChar`, alla `buAutoNum`-scheman med räknare per nivå, `buFont`/`buClr`/`buSzPct`/`buSzPts`), höger-till-
-  vänster (förenklad bidi), östasiatiska och komplexa skrifter (`ea`/`cs` och skriftens typsnitt ur temat),
+  vänster (full bidi, se omgång 2), östasiatiska och komplexa skrifter (`ea`/`cs` och skriftens typsnitt ur temat),
   fält (`slidenum`), hyperlänkar (temats länkfärg och understrykning), versaler, upphöjt, teckenavstånd,
   understrykning, genomstrykning, markering.
-- **Tabeller (grund):** rutnät, sammanslagna celler, cellmarginaler och förankring, cellernas fyllningar och
+- **Tabeller:** (se *Tabeller och SmartArt* nedan för inbyggda format m.m.) rutnät, sammanslagna celler, cellmarginaler och förankring, cellernas fyllningar och
   kanter, tabellformat ur `tableStyles.xml` (`wholeTbl`, band, första/sista rad och kolumn), tabeller från
   höger till vänster.
 - **SmartArt:** den sparade ritdelen (`dsp:`) ritas som en grupp, med `txXfrm` för texten.
-- **Diagram, EMF/WMF med vektorinnehåll:** grå ram med etikett (hookar för nästa omgång).
+- **Diagram, EMF/WMF:** ritas, se *Diagram och EMF/WMF* nedan. Okända diagramtyper och chartex (`cx:`) blir en grå
+  ram med etikett.
 
 ## Radhöjd (kalibrerat)
 
@@ -166,29 +167,26 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 - Korpusfilerna: python-pptx, MIT (`tests/corpus/pptx/SOURCES.md`). Referenspresentationerna (CppCon, MSRC,
   OWASP …) ligger **inte** i git; de flesta saknar licens.
 
-## Kvar till nästa omgång
+## Kvar
 
-- **Diagram** (`charts.rs`): stapel/linje/cirkel ur `c:numCache`/`c:strCache`; prova mot docx4j:s `p4-*`
-  (Apache-2.0, med text ur PowerPoints PDF).
-- **EMF/WMF** (`media.rs`): en delmängd (polygoner, linjer, text, bitmappar) efter POI:s `hemf`/`hwmf`.
-- **Tabeller** (`tables.rs`): inbyggda tabellformat när GUID:en saknas i filen, alla formatdelar, diagonaler,
-  lodrät text i celler.
-- **SmartArt** (`smartart.rs`): reserv utan ritdel (datamodellens text); PowerPoint verkar lägga om vissa
-  layouter (kugghjulen i `msrc-win32k` bild 4/22 hamnar annorlunda, som i LibreOffice).
-- **Effekter:** yttre skugga, glöd, mjuka kanter, 3D-fasning (`sp3d`) ritas inte; `effectRef` och
-  `effectStyleLst` läses men används inte.
-- **Temats `objectDefaults`** läses in i `Theme` men används inte i arvet (PowerPoint verkar använda dem bara
-  för nya former; inte verifierat).
-- **Bildfyllning `a:tile`** ritas utsträckt, inte upprepad; bildeffekterna `lum`, `duotone` m.fl. görs inte.
-- **Minne:** avkodade bilder hålls i en cache på högst 256 MB per presentation (`ImageCache`) och skalas ner
-  till högst 2560 bildpunkter. `cncf-overview-ja` (30 MB, 158 beskurna bilder) ger 495 MB som mest när alla
-  bilder renderas i följd (1,3 GB utan taket).
-- **MicroType Express** för inbäddade typsnitt: alla `.fntdata` i referensmaterialet (cppcon19-macrofree,
-  psconf19-pscore, cncf-overview-ja) är MTX-komprimerade, så inbäddade typsnitt fungerar i praktiken inte än.
-  Tunna vikter (Calibri Light, Segoe UI Light).
-- **Text:** full bidi (UAX #9), `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), vertikal östasiatisk text
-  (`eaVert` roteras bara), bindestreck.
-- **Visning:** se *Visningen* nedan (kvar där).
+Sammanställt efter omgång 2 (detaljer i respektive avsnitt nedan):
+
+- **Redigering:** presentationen kan inte ändras eller sparas (de råa delarna behålls i `Package` för senare
+  källbevarande redigering).
+- **Visning:** bildövergångar, animeringar, föredragsvy, länkar i bildspelet, markering av text på bilden;
+  sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
+  i `GlyphRun`).
+- **Diagram:** riktig 3D, sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, chartex (`cx:`).
+- **EMF/WMF:** `ExcludeClipRect`, fler regionoperationer, streckade/mönstrade penslar, `ETO_GLYPH_INDEX`, EMF+.
+- **Tabeller:** lodrät text i celler låter inte raden växa; några val är inte prövade mot referensbilder (se
+  avsnittet).
+- **SmartArt:** layouter som PowerPoint lägger om (kugghjulen i `msrc-win32k` bild 4/22) kräver en layoutmotor.
+- **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
+- **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
+  (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
+- **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
+- **Minne:** avkodade bilder hålls i en cache på högst 256 MB per presentation och skalas ner till högst
+  2560 bildpunkter.
 
 ## Visningen
 
