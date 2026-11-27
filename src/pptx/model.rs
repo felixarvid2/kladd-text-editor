@@ -222,7 +222,8 @@ impl Deck {
             if deck.drawings.contains_key(&part) {
                 continue;
             }
-            if let Some(root) = deck.pkg.xml(&part) {
+            if let Some(mut root) = deck.pkg.xml(&part) {
+                super::smartart::prepare_drawing(&deck.pkg, &part, &mut root);
                 let rels = deck.pkg.rels(&part);
                 deck.drawings.insert(part, Drawing { root, rels });
             }

@@ -319,3 +319,91 @@ Kvar: diagramytans radiella övertoning i `msrc-eko19` (banövertoningen ritas f
 3D (sidornas skuggning, väggar och golv), sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar- och
 yt-3D-diagram, `cx:` (chartex). Tid i debug för den tyngsta EMF-bilden (`cppcon15` bild 83, 22 000 element):
 visningslistan 60 ms, rastret 1,8 s (en bild utan EMF i samma presentation: 1,2 s), PDF 0,56 s.
+
+## Tabeller och SmartArt (omgång 2)
+
+Ersätter punkterna *Tabeller* och *SmartArt* under "Kvar till nästa omgång" ovan.
+
+**Tabeller** (`tables.rs`):
+
+- **Formatet** slås upp i filens `ppt/tableStyles.xml` och annars bland PowerPoints 74 inbyggda format
+  (`table_builtin.rs`, data i `table_builtin.xml`). Saknas `a:tableStyleId` används inget format (inte
+  listans `def`).
+- **Formatdelar** i stigande prioritet: `wholeTbl`, `band1H`/`band2H`, `band1V`/`band2V`, `lastCol`,
+  `firstCol`, `lastRow`, `firstRow`, `seCell`, `swCell`, `neCell`, `nwCell`. Banden räknas efter
+  rubrikraden/-kolumnen och gäller inte första/sista raden eller kolumnen när de är påslagna.
+  Hörncellerna gäller när både raden och kolumnen är påslagna.
+- **Kanter:** varje del gäller ett område (hela tabellen, en rad eller en kolumn). En cellkant på
+  områdets yttersida tar delens `left`/`right`/`top`/`bottom`, en kant inuti området `insideH`/`insideV`.
+  Varje linje i rutnätet ritas en gång: cellernas egna `a:lnL`/`lnR`/`lnT`/`lnB` (även `a:noFill`) går
+  före formatet, annars vinner delen med högst prioritet av de två cellerna. `a:lnRef` ger temats
+  linjestil, `cmpd="dbl"` två linjer à en tredjedel, `prstDash` streckning (mönster under 1 pt ritas
+  heldraget, som PowerPoints PDF i 72 dpi visar dem). Diagonaler: `a:lnTlToBr`/`lnBlToTr` och formatets
+  `tl2br`/`tr2bl`. Sammanslagna celler tar kanterna från ursprungscellen. Har båda cellerna en egen tunn
+  kant (under 1 pt) ritas linjen två gånger, som när PowerPoint ritar varje cells kanter (en delad
+  hårfin linje blir mörkare; i PowerPoints PDF i 72 dpi är den en hel svart bildpunkt).
+- **Fyllning:** cellens egen (även `a:noFill`) före formatets `a:fill`/`a:fillRef` (temats fyllningar);
+  tabellens bakgrund ur `a:tblPr` eller formatets `a:tblBg`.
+- **Text:** formatets `a:tcTxStyle` (`b`, `i`, `a:fontRef` major/minor, färg) läggs som en nivålista
+  mellan cellens `a:lstStyle` och mallens stilar, så att den går före `otherStyle`/`defaultTextStyle` men
+  efter körningens egna egenskaper.
+- **Radhöjd:** `h` är minsta höjd; raden växer med texten. En cell över flera rader (`rowSpan`) får
+  plats genom att den sista raden växer. Lodrät text (`vert`) får inte raden att växa.
+
+**Inbyggda tabellformat.** `table_builtin_gen.py` läser `ppt/tableStyles.xml` i PowerPoint-sparade filer i
+de licensierade provsamlingarna (Apache POI `test-data`, Apache-2.0; Open-XML-SDK, ShapeCrawler,
+python-pptx, MIT) och skriver `table_builtin.xml` och `table_builtin_sources.md` (källa per GUID).
+47 av 74 format finns i samlingarna. Övriga härleds ur ett syskon i samma familj genom att byta
+accentfärgen; regeln provas av skriptet på alla familjer med flera observerade medlemmar (avviker ett
+format stannar skriptet), och 7 av de 27 härledda stämmer exakt med PowerPoint-filer i referensmaterialet
+som inte är licensierade (de används bara som kontroll). Ej verifierade: Dark Style 1 med accent (regeln i
+oxml-drawing, MIT OR Apache-2.0) och Dark Style 2 – Accent 3/4 och 5/6. GUID-listan är Microsofts.
+
+**SmartArt** (`smartart.rs`):
+
+- Ritdelen ritas som förut. Textfärgen (`richtext.rs`, några rader; gäller alla former med `p:style`):
+  körningens färg, sedan formens och platshållarnas egna nivåstilar (`a:lstStyle` på bild, layout och
+  mall), sedan formens `p:style/a:fontRef`, sedan mallens `p:txStyles` och `defaultTextStyle`. Förut
+  gick mallens textstilar före `fontRef`, så SmartArt-former och infogade former fick svart text där
+  PowerPoint visar vit (`msrc-identity` bild 22 och 31, pratbubblan i `cppcon19-macrofree` bild 22). Ritdelen slår ihop en nod och dess text; visar layouten texten i
+  en egen punkt (`presOf` till en `revTx`-punkt, t.ex. pyramiden i `cppcon17-refactor-or-die` bild 4)
+  skriver `prepare_drawing` färgdefinitionens textfärg (`dgm:txFillClrLst`) in i formens `a:fontRef` när
+  presentationen läses in (`model.rs`, en rad).
+- Utan ritdel: datamodellens noder (`dgm:pt` utan typ, `node`, `asst`) i `parOf`-ordning som punktlista
+  i en ruta med accent 1, storleken nedskalad tills texten får plats. Utan text: platshållaren som förut.
+- Kvar: PowerPoint lägger om vissa layouter (kugghjulen i `msrc-win32k` bild 4) i stället för att
+  använda ritdelen; layoutmotorn för SmartArt (`layoutN.xml`) finns inte.
+
+**Resultat** (jämförelseprovet, SSIM-medel, alla 30 presentationer med PowerPoint-PDF, 1121 bilder; före =
+omgång 1). Ingen presentation blev sämre; fyra enskilda bilder sjönk 0,003–0,013 (förklaring nedan).
+
+| Presentation | Bilder | Före | Efter | Bilder med tabell/SmartArt: före → efter |
+|---|---:|---:|---:|---|
+| cppcon14-decomposing | 48 | 0.8943 | 0.8967 | 4: 0.912 → 0.917 |
+| cppcon14-parallel-overview | 37 | 0.8266 | 0.8268 | 2: 0.845 → 0.848 |
+| cppcon15-functional | 51 | 0.8518 | 0.8537 | 1: 0.853 → 0.949 |
+| cppcon17-refactor-or-die | 13 | 0.9812 | 0.9820 | 6: 0.988 → 0.990 |
+| cppcon19-charconv | 64 | 0.8475 | 0.8481 | 10: 0.914 → 0.918 |
+| cppcon19-macrofree | 70 | 0.9217 | 0.9221 | (inga; pratbubblor med `fontRef`) |
+| ms-copilot-workshop | 58 | 0.9266 | 0.9266 | 2: 0.936 → 0.937 |
+| msrc-identity | 34 | 0.9283 | 0.9384 | 9: 0.933 → 0.971 |
+| msrc-win32k | 35 | 0.8785 | 0.8793 | 5: 0.802 → 0.806 |
+| owasp-top10-2010-es | 22 | 0.8724 | 0.8903 | 20: 0.863 → 0.883 |
+| owasp-top10-2017-en/he/ja/ko/ru | 126 | | | +0.0005 – +0.0009 var |
+| psconf19-pscore | 21 | 0.9301 | 0.9331 | 2: 0.923 → 0.955 |
+| psconf22-chasing-seconds | 21 | 0.9033 | 0.9052 | 1: 0.841 → 0.882 |
+| **alla** | 1121 | 0.8717 | 0.8728 | 181: 0.798 → 0.804 |
+
+Sämre bilder: `cppcon19-macrofree` 22 och 51 (pratbubblans text är nu vit som i PowerPoint, men radbrytningen
+skiljer eftersom de inbäddade typsnitten inte kan läsas), `msrc-win32k` 4 (kugghjulens text är vit som i
+PowerPoint, men PowerPoint lägger om kugghjulen), `owasp-top10-2017-ja` 23 (kanterna ritas en gång per linje
+med fyrkantiga ändar i stället för en gång per cellsida; skillnaden är under en bildpunkt).
+
+Obs till textmotorn: SmartArt-texten i `owasp-top10-2010-es` bild 17–20 har `a:buChar char="••"` och ett
+indrag som är smalare än punkten; PowerPoint visar ett tecken och texten direkt efter punkten, Kladd två
+tecken och texten vid nästa tabbstopp (`richtext.rs`/`text.rs`).
+
+**Prov:** `table_tests.rs` (sammanslagna celler, inbyggt format med band och rubrikrad, filens format
+före det inbyggda, diagonaler och egna kanter, dubbel linje och temats linjestil, rader som växer även
+över `rowSpan`, formatdelarnas ordning och text, SmartArt med `fontRef`-färg, `revTx`-färg och reserven
+utan ritdel) och `table_builtin.rs` (alla 74 format finns och har `wholeTbl`).

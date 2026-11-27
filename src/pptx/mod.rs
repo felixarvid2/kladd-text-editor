@@ -33,6 +33,7 @@ pub mod emf;
 pub mod chart_draw;
 pub mod chart_fmt;
 pub mod chart_model;
+pub mod table_builtin;
 
 #[cfg(test)]
 mod tests;

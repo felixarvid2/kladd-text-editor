@@ -139,9 +139,19 @@ impl TextEnv<'_, '_> {
         let sym = face("a:sym").filter(|s| !s.is_empty());
         let size = a("sz").and_then(super::xml::parse_i64).map_or(18.0, |v| v as f32 / 100.0) * self.font_scale;
         let on = |v: Option<&str>| v.is_some_and(|v| v == "1" || v == "true");
-        let mut color = inherit::first_child_of(&chain, inherit::FILLS)
-            .and_then(|f| text_fill(self.sheets, f))
+        // Färgen: körningens och formens egna nivåstilar (även platshållarnas på layout och mall), sedan
+        // formens `p:style/a:fontRef`, sedan mallens textstilar och `defaultTextStyle`. Som i PowerPoint:
+        // vit text i SmartArt och infogade former trots att mallens stilar säger `tx1`.
+        let base: Vec<&Node> = self.sheets.master.and_then(|m| m.root.child("p:txStyles")).into_iter().flat_map(|t| t.children.iter()).chain(self.sheets.deck.default_text_style.as_ref()).collect();
+        let in_base = |lvl: &Node| base.iter().any(|b| b.children.iter().any(|c| std::ptr::eq(c, lvl)));
+        let fill_of = |n: &Node| n.children.iter().find(|c| inherit::FILLS.contains(&c.name.as_str())).and_then(|f| text_fill(self.sheets, f));
+        let mut own_levels = levels.iter().filter(|l| !in_base(l)).filter_map(|l| l.child("a:defRPr"));
+        let mut base_levels = levels.iter().filter(|l| in_base(l)).filter_map(|l| l.child("a:defRPr"));
+        let mut color = rpr
+            .and_then(fill_of)
+            .or_else(|| own_levels.find_map(fill_of))
             .or(self.font_color)
+            .or_else(|| base_levels.find_map(fill_of))
             .or_else(|| self.sheets.colors.scheme_color("tx1"))
             .unwrap_or(Rgba::BLACK);
         let mut underline = a("u").is_some_and(|u| u != "none");
