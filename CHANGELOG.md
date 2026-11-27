@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.12.0] – 2026-11-27
+
 ### Nytt
 
 - **PowerPoint-presentationer kan ändras och sparas.** *Redigera* i presentationsvyn (`Ctrl+E`, eller dubbelklick på en form) slår på redigeringsläget: markera former (klick, `Tab`), flytta (dra, pilarna, `Skift` = större steg), ändra storlek med handtagen (`Skift` behåller proportionerna), vrid med rotationshandtaget, ta bort (`Delete`), duplicera (`Ctrl+D`) och ordna fram/bak (högerklick). Dubbelklick eller `Enter` skriver i formen, även i tomma platshållare (*Klicka för att lägga till text*): markör och markering ur samma textmotor som ritar bilden, `Enter` nytt stycke, `Skift+Enter` radbrytning, `Tab`/`Skift+Tab` nivå i punktlistor, `Ctrl+B`/`I`/`U`; körningarnas formatering behålls och nya stycken ärver styckeformatet. I sidopanelen: ny bild med mallens layouter (`Ctrl+M`), duplicera, ta bort, dölj och dra för att ändra ordning. Anteckningarna redigeras i panelen under bilden (anteckningssidan skapas vid behov), och *Infoga* lägger till textruta och bild (PNG/JPEG/GIF). Ångra/gör om (`Ctrl+Z`/`Ctrl+Y`) gäller alla ändringar. `Ctrl+S` sparar `.pptx`/`.ppsx`/`.potx` källbevarande: bara de delar som ändrats skrivs om (XML:en med alla okända element, namnrymder, `mc:AlternateContent` och `extLst` kvar), övriga zip-poster kopieras oförändrade, och en fil som sparas utan ändringar har samma delar som originalet. Digitala signaturer tas bort när filen ändras (med en notis). En konverterad `.ppt` sparas med *Spara som* `.pptx`. Fliken märks som ändrad och Kladd frågar vid stängning; automatisk sparning fungerar som för andra dokument.
