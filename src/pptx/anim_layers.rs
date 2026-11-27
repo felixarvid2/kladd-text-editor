@@ -214,7 +214,10 @@ fn extent(items: &[Item], scene: &Scene) -> Option<((f32, f32, f32, f32), (f32, 
                             let skew = if *t != Affine::IDENTITY { 40.0 } else { 0.0 };
                             pad = pad.max(dx.abs().max(dy.abs()) + blur * 2.0 + 2.0 + skew);
                         }
-                        Effect::InnerShadow { .. } | Effect::SoftEdge { .. } | Effect::Thin { .. } => {}
+                        Effect::InnerShadow { .. } | Effect::SoftEdge { .. } | Effect::Thin { .. } | Effect::Bevel { .. } => {}
+                        Effect::Contour { width, .. } => pad = pad.max(width + 2.0),
+                        // Förvrängningen kan flytta formen var som helst på bilden: lagret täcker hela bilden.
+                        Effect::Camera { .. } => pad = pad.max(scene.width.max(scene.height)),
                         Effect::Glow { radius, .. } => pad = pad.max(radius * 2.0 + 2.0),
                         Effect::Reflection { blur, dist, .. } => reflect = reflect.max(dist + blur * 2.0 + 2.0),
                     }

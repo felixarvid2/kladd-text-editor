@@ -1,7 +1,8 @@
 # PowerPoint (.pptx) i Kladd
 
 Första omgången: läsning, arv, ritmotor, jämförelse mot PowerPoint och en enkel visning. Allt ligger i
-`src/pptx/`. Presentationen kan inte ändras eller sparas än.
+`src/pptx/`. Omgång 3 lade till redigering och källbevarande sparning, övergångar, animeringar och föredragsvy,
+3D och SmartArt-layout (se avsnitten längre ned).
 
 ## Arkitektur
 
@@ -207,7 +208,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 |---|---|
 | `view.rs` | `PptxTab { deck, current, find, … }`: `toolbar`, `sidebar` (miniatyrer), `show` (bild för bild eller rullande lista, anteckningspanel), `find_bar`, `handle_keys`; bildspel `start_show`/`show_page`/`show_keys`/`stop_show`; `pdf_bytes`, `begin_export`/`poll_export`; `memory`/`restore`. `Prefs` (miniatyrer, anteckningar, läge, `Zoom`) och `Memory` ligger i inställningarna (`settings.pptx`, `settings.pptx_memory`). Rena hjälpare: `scale_for`, `zoom_step`, `parse_slide_input`, `pdf_of`. |
 | `glue.rs` | `KladdApp::pptx_*`: verktygsrad, sidopanel, sökfält, tangenter, helskärm (`pptx_sync_fullscreen`), PDF-export, lägesminne, *Redigera en kopia*. |
-| `slideshow.rs` | `Show::new(hidden, start)`, `screen()` (bild, svart/vit skärm, slutskärm), `next`/`prev`/`first`/`last`, `toggle_blank`, `upcoming` (förrendering). |
+| `slideshow.rs` | `Show::new(hidden, start)`, `screen()` (bild, svart/vit skärm, slutskärm), `next`/`prev`/`first`/`last`, `toggle_blank`, `upcoming` (förrendering); klick-steg och uppspelning, se *Bildspel: övergångar, animeringar och föredragsvy*. |
 | `find.rs` | `slide_text(&Scene) -> SlideText` (bildens text ur glyfkörningarna med tecknens lägen), `find_all`, `hits_for`, `hit_rects` (rektanglar i punkter). |
 | `notes.rs` | `notes(deck, i)`/`notes_text` (anteckningssidans brödtextplatshållare), `paragraphs(txBody)` (nivå, fet, kursiv), `shapes(tree)`. |
 | `copy_md.rs` | `deck_to_markdown(deck) -> (String, bilder)` för *Redigera en kopia*. |
@@ -243,8 +244,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
   enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
   `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
-- **Kvar:** bildövergångar och animeringar (bildspelet visar slutläget direkt), föredragsvy med nästa bild och
-  timer, länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
+- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3) länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
   bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
 - **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
   anteckningar, `.ppt` via LibreOffice, handboken.
@@ -260,8 +260,8 @@ ritning till `Scene`) med `chart_fmt.rs` (Excels talformat inklusive datum). For
 i formerna.
 
 - **Typer:** stapel och liggande stapel (grupperad/staplad/100 %, `gapWidth`, `overlap`), linje (markörer,
-  `smooth`), yta, cirkel/ring (`firstSliceAng`, `explosion`, `holeSize`), 3D-cirkel (lutning ur `rotX`, en kant
-  i mörkare färg; ingen riktig 3D), punktdiagram. Okända typer (radar, yta 3D, aktie …) och `cx:` (chartex) →
+  `smooth`), yta, cirkel/ring (`firstSliceAng`, `explosion`, `holeSize`), 3D-cirkel, 3D-stapel/linje/yta
+  (se *3D i diagram och former*), punktdiagram. Okända typer (radar, yta 3D, aktie …) och `cx:` (chartex) →
   platshållaren. Flera plottar i samma rityta ritas på samma axlar (ingen sekundäraxel).
 - **Färger:** seriens/punktens `spPr`, annars diagramformatet `c:style` (1 = gråskala, 2 = accent 1–6 med
   ljusare/mörkare varianter efter sex serier, 3–8 = en accentfärg i nyanser).
@@ -322,8 +322,7 @@ presentation fick lägre medel, ingen bild blev sämre och alla bilder med diagr
 | msrc-eko19 6 | 100 % staplad yta med etiketter | 0,645 | 0,768 |
 | msrc-win32k 8 | 3D-cirkel, utskjuten sektor | 0,784 | 0,865 |
 
-Kvar: diagramytans radiella övertoning i `msrc-eko19` (banövertoningen ritas för ljus, `render.rs`), riktig
-3D (sidornas skuggning, väggar och golv), sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar- och
+Kvar: diagramytans radiella övertoning i `msrc-eko19` (banövertoningen ritas för ljus, `render.rs`), sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar- och
 yt-3D-diagram, `cx:` (chartex). Tid i debug för den tyngsta EMF-bilden (`cppcon15` bild 83, 22 000 element):
 visningslistan 60 ms, rastret 1,8 s (en bild utan EMF i samma presentation: 1,2 s), PDF 0,56 s.
 
@@ -378,8 +377,7 @@ oxml-drawing, MIT OR Apache-2.0) och Dark Style 2 – Accent 3/4 och 5/6. GUID-l
   presentationen läses in (`model.rs`, en rad).
 - Utan ritdel: datamodellens noder (`dgm:pt` utan typ, `node`, `asst`) i `parOf`-ordning som punktlista
   i en ruta med accent 1, storleken nedskalad tills texten får plats. Utan text: platshållaren som förut.
-- Kvar: PowerPoint lägger om vissa layouter (kugghjulen i `msrc-win32k` bild 4) i stället för att
-  använda ritdelen; layoutmotorn för SmartArt (`layoutN.xml`) finns inte.
+- Kugghjulen i `msrc-win32k` och layoutmotorn för SmartArt: se *SmartArt-layout (omgång 3)*.
 
 **Resultat** (jämförelseprovet, SSIM-medel, alla 30 presentationer med PowerPoint-PDF, 1121 bilder; före =
 omgång 1). Ingen presentation blev sämre; fyra enskilda bilder sjönk 0,003–0,013 (förklaring nedan).

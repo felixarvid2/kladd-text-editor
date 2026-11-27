@@ -327,7 +327,7 @@ Klick i marginalen utanför spalten går en skärm bakåt (vänster) eller fram�
 
 ## PowerPoint
 
-En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öppnas i en presentationsvy för bara läsning. Bilderna ritas med Kladds egen ritmotor (former, bilder, text med PowerPoints radavstånd och autoanpassning, tabeller och SmartArt) i bakgrundstrådar, så att gränssnittet inte fryser. Makron i `.pptm` körs aldrig. Gamla `.ppt`-filer konverteras till `.pptx` med LibreOffice när de öppnas (som `.doc`), och utan LibreOffice säger Kladd det. Presentationen kan ändras i redigeringsläget (se *Redigera* nedan) och sparas som `.pptx`, `.ppsx` eller `.potx`.
+En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öppnas i en presentationsvy. Bilderna ritas med Kladds egen ritmotor (former, bilder, text med PowerPoints radavstånd och autoanpassning, tabeller och SmartArt) i bakgrundstrådar, så att gränssnittet inte fryser. Makron i `.pptm` körs aldrig. Gamla `.ppt`-filer konverteras till `.pptx` med LibreOffice när de öppnas (som `.doc`), och utan LibreOffice säger Kladd det. Presentationen kan ändras i redigeringsläget (se *Redigera* nedan) och sparas som `.pptx`, `.ppsx` eller `.potx`.
 
 **Vyn.** Till vänster ligger miniatyrlisten (`F4`) med bildnummer; aktuell bild är markerad, ett klick hoppar dit, och dolda bilder är tonade med överstruket nummer. *Visa* i verktygsraden växlar mellan *Bild för bild* (en bild i taget, som PowerPoints normalvy) och *Rullande lista* (alla bilder under varandra). Zoomen har lägena *Hel bild* (hela bilden syns), *Bildbredd* och fasta procent. I läget bild för bild bläddrar mushjulet mellan bilderna när hela bilden syns. Talaranteckningarna visas i en panel under bilden när presentationen har anteckningar (av och på under *Visa*; dra i kanten för att ändra höjden). Statusraden visar *Bild 4 av 12*. Bilden du var på sparas per fil för de 100 senaste presentationerna.
 
@@ -335,8 +335,8 @@ En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öp
 
 | Kommando | Funktion |
 |---|---|
-| `Höger` / `Ner` / `Mellanslag` / `Page Down` / `Enter` / `N` / klick / hjulet nedåt | Nästa bild |
-| `Vänster` / `Upp` / `Backsteg` / `Page Up` / `P` / högerklick / hjulet uppåt | Föregående bild |
+| `Höger` / `Ner` / `Mellanslag` / `Page Down` / `Enter` / `N` / klick / hjulet nedåt | Nästa steg (animering eller bild) |
+| `Vänster` / `Upp` / `Backsteg` / `Page Up` / `P` / högerklick / hjulet uppåt | Föregående steg (bakåt från bildens början: föregående bild i slutläget) |
 | `Home` / `End` | Första / sista bilden |
 | `B` eller `.` / `W` eller `,` | Svart / vit skärm (samma tangent igen, eller nästa, tar tillbaka bilden) |
 | `Esc` | Avsluta bildspelet |
