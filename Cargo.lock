@@ -2449,6 +2449,7 @@ dependencies = [
  "sys-locale",
  "trash",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-normalization",
  "ureq",
  "windows-sys 0.61.2",

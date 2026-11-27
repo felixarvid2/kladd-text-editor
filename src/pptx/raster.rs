@@ -8,6 +8,10 @@ fn ts(a: &Affine) -> sk::Transform {
     sk::Transform::from_row(a.a, a.b, a.c, a.d, a.e, a.f)
 }
 
+pub(super) fn to_sk_path(p: &Path) -> Option<sk::Path> {
+    sk_path(p)
+}
+
 fn sk_path(p: &Path) -> Option<sk::Path> {
     let mut b = sk::PathBuilder::new();
     let mut open = false;
@@ -156,11 +160,42 @@ pub fn render(scene: &Scene, w: u32, h: u32) -> Option<sk::Pixmap> {
 
 /// Ritar visningslistan med transformen `page` (punkter → bildpunkter).
 pub fn draw(pm: &mut sk::Pixmap, scene: &Scene, page: &Affine) {
+    draw_items(pm, &scene.items, page);
+}
+
+/// Index för `EndEffect` som hör till `BeginEffect` på plats `i` (eller listans slut).
+pub(super) fn matching_end(items: &[Item], i: usize) -> usize {
+    let mut depth = 0usize;
+    for (k, it) in items.iter().enumerate().skip(i) {
+        match it {
+            Item::BeginEffect(_) => depth += 1,
+            Item::EndEffect => {
+                depth -= 1;
+                if depth == 0 {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+    }
+    items.len()
+}
+
+pub(super) fn draw_items(pm: &mut sk::Pixmap, items: &[Item], page: &Affine) {
     let pt = ts(page);
     let mut clips: Vec<sk::Mask> = Vec::new();
-    for it in &scene.items {
+    let mut i = 0;
+    while i < items.len() {
+        let it = &items[i];
+        i += 1;
         let mask = clips.last();
         match it {
+            Item::BeginEffect(effects) => {
+                let end = matching_end(items, i - 1);
+                super::effects::draw(pm, &items[i..end.min(items.len())], effects, page, mask);
+                i = end + 1;
+            }
+            Item::EndEffect => {}
             Item::Fill { path, paint, even_odd } => {
                 let Some(p) = sk_path(path) else { continue };
                 let Some(sh) = shader(paint) else { continue };

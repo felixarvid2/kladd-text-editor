@@ -45,6 +45,8 @@ pub struct FontFace {
     pub italic: bool,
     /// Har en symbolteckentabell (3,0): tecknen ligger i U+F000–U+F0FF.
     pub symbol_cmap: bool,
+    /// Vikten (OS/2 `usWeightClass`, 400 = normal).
+    pub weight: u16,
     outlines: Mutex<HashMap<u16, Option<Arc<Path>>>>,
     #[allow(dead_code)]
     pdf_font: OnceLock<Option<krilla::text::Font>>,
@@ -93,6 +95,7 @@ impl FontFace {
             bold: face.is_bold() || face.weight().to_number() >= 600,
             italic: face.is_italic() || face.is_oblique(),
             symbol_cmap,
+            weight: face.weight().to_number(),
             outlines: Mutex::default(),
             pdf_font: OnceLock::new(),
             data: data.clone(),
@@ -184,7 +187,7 @@ pub struct FontBook {
     embedded: HashMap<(String, bool, bool), Arc<FontFace>>,
     cache: Mutex<HashMap<(String, bool, bool), Resolved>>,
     fallback: Mutex<HashMap<(char, u64), Option<Arc<FontFace>>>>,
-    /// Inbäddade typsnitt som inte kunde läsas (MicroType Express-komprimerade).
+    /// Inbäddade typsnitt som inte kunde läsas.
     pub unreadable_embedded: Vec<String>,
 }
 
@@ -330,6 +333,26 @@ fn substitutes(name: &str) -> &'static [(&'static str, f32, f32)] {
         | "mspmincho" | "hiraginokakugothicpro" | "gungsuh" | "malgungothic" | "batang" | "gulim" | "dengxian" | "simsun" | "microsoftyahei"
         | "mingliu" | "pmingliu" | "microsoftjhenghei" => &[("IPAPGothic", 1.0, 1.0), ("Noto Sans CJK JP", 1.0, 1.0), ("WenQuanYi Zen Hei", 1.0, 1.0)],
         _ => &[],
+    }
+}
+
+/// Hur mycket tunnare än normalvikt en familj med `Light`/`Thin` i namnet ska ritas när ersättaren har
+/// normal vikt: andel av storleken som skrapas bort från varje kant (0 = ingen). Uppskattat ur
+/// stamtjockleken: Calibri 0,074 em mot Calibri Light 0,050 em, Segoe UI 0,083 em mot Light 0,047 em
+/// och Semilight 0,065 em.
+pub fn thin_amount(requested: &str, face: &FontFace) -> f32 {
+    if face.weight < 350 {
+        return 0.0;
+    }
+    let n = normalize(requested);
+    if n.contains("semilight") || n.contains("demilight") {
+        0.009
+    } else if n.contains("extralight") || n.contains("ultralight") || n.contains("thin") || n.contains("hairline") {
+        0.02
+    } else if n.contains("light") {
+        0.012
+    } else {
+        0.0
     }
 }
 
@@ -718,8 +741,8 @@ pub fn symbol_to_unicode(font: SymbolFont, c: char) -> char {
     char::from_u32(mapped).unwrap_or(c)
 }
 
-/// Avkodar ett inbäddat typsnitt: rå TrueType/OpenType, okomprimerad EOT (ev. XOR-krypterad)
-/// eller Word-stilens GUID-obfuskering. MicroType Express-komprimerad EOT stöds inte (`None`).
+/// Avkodar ett inbäddat typsnitt: rå TrueType/OpenType, EOT (okomprimerad eller MicroType
+/// Express-komprimerad, ev. XOR-krypterad) eller Word-stilens GUID-obfuskering.
 pub fn decode_embedded(bytes: &[u8], part: &str) -> Option<Vec<u8>> {
     let is_sfnt = |b: &[u8]| b.len() > 12 && (b.starts_with(&[0, 1, 0, 0]) || b.starts_with(b"OTTO") || b.starts_with(b"true") || b.starts_with(b"ttcf"));
     if is_sfnt(bytes) {
@@ -734,15 +757,15 @@ pub fn decode_embedded(bytes: &[u8], part: &str) -> Option<Vec<u8>> {
         if data_size == 0 || data_size > eot_size {
             return None;
         }
-        // TTEMBED_TTCOMPRESSED: MicroType Express.
-        if flags & 0x4 != 0 {
-            return None;
-        }
         let mut data = bytes[eot_size - data_size..eot_size].to_vec();
         if flags & 0x1000_0000 != 0 {
             for b in &mut data {
                 *b ^= 0x50;
             }
+        }
+        // TTEMBED_TTCOMPRESSED: MicroType Express (`mtx.rs`).
+        if flags & 0x4 != 0 {
+            return super::mtx::decode(&data).filter(|d| is_sfnt(d) && ttf_parser::Face::parse(d, 0).is_ok());
         }
         return is_sfnt(&data).then_some(data);
     }
@@ -808,7 +831,7 @@ mod tests {
         eot[35] = b'P';
         eot.extend(ttf.iter().map(|b| b ^ 0x50));
         assert_eq!(decode_embedded(&eot, "x.fntdata").as_deref(), Some(ttf));
-        // MTX-komprimerad: stöds inte.
+        // MTX-flaggan med data som inte är MTX: ingen panik, inget typsnitt.
         eot[12..16].copy_from_slice(&0x4u32.to_le_bytes());
         assert!(decode_embedded(&eot, "x.fntdata").is_none());
     }

@@ -21,6 +21,75 @@ pub enum Caps {
     Small,
 }
 
+/// Understrykningens utseende (`u`). `Single` gäller också när bara `underline` är satt.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Underline {
+    #[default]
+    Single,
+    Double,
+    Heavy,
+    Dotted,
+    DottedHeavy,
+    Dash,
+    DashHeavy,
+    DashLong,
+    DashLongHeavy,
+    DotDash,
+    DotDashHeavy,
+    DotDotDash,
+    DotDotDashHeavy,
+    Wavy,
+    WavyHeavy,
+    WavyDouble,
+    /// Bara orden (inte blankstegen).
+    Words,
+}
+
+impl Underline {
+    /// `ST_TextUnderlineType` (`none` ger `None`).
+    pub fn from_attr(v: &str) -> Option<Underline> {
+        use Underline::*;
+        Some(match v {
+            "none" => return None,
+            "dbl" => Double,
+            "heavy" => Heavy,
+            "dotted" => Dotted,
+            "dottedHeavy" => DottedHeavy,
+            "dash" => Dash,
+            "dashHeavy" => DashHeavy,
+            "dashLong" => DashLong,
+            "dashLongHeavy" => DashLongHeavy,
+            "dotDash" => DotDash,
+            "dotDashHeavy" => DotDashHeavy,
+            "dotDotDash" => DotDotDash,
+            "dotDotDashHeavy" => DotDotDashHeavy,
+            "wavy" => Wavy,
+            "wavyHeavy" => WavyHeavy,
+            "wavyDbl" => WavyDouble,
+            "words" => Words,
+            _ => Single,
+        })
+    }
+
+    fn heavy(self) -> bool {
+        use Underline::*;
+        matches!(self, Heavy | DottedHeavy | DashHeavy | DashLongHeavy | DotDashHeavy | DotDotDashHeavy | WavyHeavy)
+    }
+
+    /// Streckmönster i linjebredder.
+    fn dash(self) -> &'static [f32] {
+        use Underline::*;
+        match self {
+            Dotted | DottedHeavy => &[1.0, 1.0],
+            Dash | DashHeavy => &[4.0, 2.0],
+            DashLong | DashLongHeavy => &[8.0, 3.0],
+            DotDash | DotDashHeavy => &[4.0, 2.0, 1.0, 2.0],
+            DotDotDash | DotDotDashHeavy => &[4.0, 2.0, 1.0, 2.0, 1.0, 2.0],
+            _ => &[],
+        }
+    }
+}
+
 /// En körnings färdiga stil.
 #[derive(Clone, Debug)]
 pub struct RunStyle {
@@ -44,6 +113,13 @@ pub struct RunStyle {
     pub spacing: f32,
     pub caps: Caps,
     pub highlight: Option<Rgba>,
+    /// Texteffekter (`a:rPr/a:effectLst`: skugga, glöd …).
+    pub effects: Vec<super::scene::Effect>,
+    /// Understrykningens utseende och färg (`uFill`; annars textens färg).
+    pub underline_kind: Underline,
+    pub underline_color: Option<Rgba>,
+    /// Dubbel genomstrykning (`dblStrike`).
+    pub strike_double: bool,
 }
 
 impl Default for RunStyle {
@@ -64,6 +140,10 @@ impl Default for RunStyle {
             spacing: 0.0,
             caps: Caps::None,
             highlight: None,
+            effects: Vec::new(),
+            underline_kind: Underline::Single,
+            underline_color: None,
+            strike_double: false,
         }
     }
 }
@@ -199,7 +279,8 @@ struct Cl {
     kind: Kind,
     /// Får raden brytas efter klustret?
     break_after: bool,
-    rtl: bool,
+    /// Bidinivå (UAX #9): udda = höger till vänster.
+    level: u8,
 }
 
 struct Line {
@@ -226,15 +307,25 @@ fn break_after_char(c: char, next: Option<char>) -> bool {
     fonts::is_cjk(c) || next.is_some_and(fonts::is_cjk)
 }
 
-/// Riktningsklass: 2 = höger-till-vänster-bokstav, 1 = bokstav eller siffra (vänster-till-höger), 0 = neutral.
-fn char_dir(c: char) -> u8 {
-    if matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF) {
-        2
-    } else if c.is_alphanumeric() {
-        1
-    } else {
-        0
+/// Bidinivåer (UAX #9) per tecken för styckets körningar, i samma teckenföljd som `shape_run` formar
+/// (efter versalinställningen). Radbrytningar räknas som radavgränsare (inte nytt stycke).
+fn para_levels(runs: &[Run], rtl: bool) -> Vec<Vec<u8>> {
+    let texts: Vec<String> = runs.iter().map(|r| if r.line_break { "\u{2028}".to_owned() } else { apply_caps(&r.text, r.style.caps) }).collect();
+    let all: String = texts.concat();
+    let base = if rtl { 1 } else { 0 };
+    if !rtl && !all.chars().any(|c| matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x202B | 0x202E | 0x2067)) {
+        // Bara vänster-till-höger: nivå 0 överallt (snabbt fall).
+        return texts.iter().map(|t| vec![0; t.chars().count()]).collect();
     }
+    let level = if rtl { unicode_bidi::Level::rtl() } else { unicode_bidi::Level::ltr() };
+    let info = unicode_bidi::BidiInfo::new(&all, Some(level));
+    let mut out = Vec::with_capacity(texts.len());
+    let mut off = 0usize;
+    for t in &texts {
+        out.push(t.char_indices().map(|(i, _)| info.levels.get(off + i).map_or(base, |l| l.number())).collect());
+        off += t.len();
+    }
+    out
 }
 
 /// Gör om texten efter versalinställningen.
@@ -256,14 +347,47 @@ fn script_class(c: char) -> u8 {
     }
 }
 
-/// Delar en körning i segment efter skrift och teckentäckning och formar dem.
-fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>, tab_stops_on: bool) {
+/// Storleken för upphöjd/nedsänkt text.
+const SCRIPT_SIZE: f32 = 2.0 / 3.0;
+
+/// Kapitälernas storlek (gemener ritas som versaler i den här andelen av storleken).
+const SMALL_CAPS: f32 = 0.8;
+
+/// Delar en körning i segment efter skrift, teckentäckning och bidinivå och formar dem. `levels` är
+/// bidinivån per tecken (efter versalinställningen); saknas den gäller nivå 0.
+fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>, levels: &[u8]) {
     let style = &run.style;
-    let size = if style.caps == Caps::Small { style.size * 0.8 } else { style.size };
+    // Upphöjt/nedsänkt ritas i två tredjedelar av storleken (uppmätt i PowerPoints PDF: cppcon14-
+    // parallel-overview bild 7, cppcon19-charconv bild 50).
+    let size = if style.baseline != 0.0 { style.size * SCRIPT_SIZE } else { style.size };
     if run.line_break {
         let res = book.resolve(&style.latin, style.bold, style.italic);
         segs.push(Seg { face: res.face.clone(), res, style: style.clone(), text: String::new() });
-        cls.push(Cl { seg: segs.len() - 1, range: (0, 0), glyphs: Vec::new(), width: 0.0, kind: Kind::Break, break_after: true, rtl: false });
+        cls.push(Cl { seg: segs.len() - 1, range: (0, 0), glyphs: Vec::new(), width: 0.0, kind: Kind::Break, break_after: true, level: levels.first().copied().unwrap_or(0) });
+        return;
+    }
+    if style.caps == Caps::Small {
+        // Kapitäler: gemener blir mindre versaler, övriga tecken behåller storleken.
+        let mut groups: Vec<(String, bool)> = Vec::new();
+        for c in run.text.chars() {
+            let small = c.is_lowercase();
+            match groups.last_mut() {
+                Some((g, sm)) if *sm == small => g.extend(c.to_uppercase()),
+                _ => groups.push((c.to_uppercase().collect(), small)),
+            }
+        }
+        let mut k = 0usize;
+        for (g, small) in groups {
+            let n = g.chars().count();
+            let mut st = style.clone();
+            st.caps = Caps::None;
+            if small {
+                st.size *= SMALL_CAPS;
+            }
+            let lv = levels.get(k..(k + n).min(levels.len())).unwrap_or(&[]);
+            shape_run(&Run { text: g, style: st, line_break: false }, book, segs, cls, lv);
+            k += n;
+        }
         return;
     }
     let text = apply_caps(&run.text, style.caps);
@@ -278,11 +402,11 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
             _ => &style.latin,
         }
     };
-    let mut pieces: Vec<(Resolved, Arc<FontFace>, String)> = Vec::new();
-    let mut cur: Option<(Resolved, Arc<FontFace>, String)> = None;
+    let mut pieces: Vec<(Resolved, Arc<FontFace>, String, u8)> = Vec::new();
+    let mut cur: Option<(Resolved, Arc<FontFace>, String, u8)> = None;
     let chars: Vec<char> = text.chars().collect();
     for (i, &c0) in chars.iter().enumerate() {
-        let _ = i;
+        let level = levels.get(i).copied().unwrap_or(0);
         let class = script_class(c0);
         let res = book.resolve(fam(class), style.bold, style.italic);
         let c = match res.symbol_map {
@@ -303,29 +427,23 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
                 }
             }
         }
-        // Byt bit när skriftriktningen byter (höger-till-vänster-bokstäver mot latinska bokstäver och
-        // siffror); neutrala tecken (blanksteg, skiljetecken) följer med biten de står i.
-        let dir = char_dir(c_out);
-        let same_dir = |s: &str| match dir {
-            0 => true,
-            d => s.chars().rev().map(char_dir).find(|&x| x != 0).is_none_or(|x| x == d),
-        };
+        // Byt bit när bidinivån byter (UAX #9).
         match &mut cur {
-            Some((r, f, s)) if Arc::ptr_eq(f, &face) && r.x_scale == res.x_scale && r.fake_bold == res.fake_bold && r.fake_italic == res.fake_italic && same_dir(s) => {
+            Some((r, f, s, lv)) if Arc::ptr_eq(f, &face) && r.x_scale == res.x_scale && r.fake_bold == res.fake_bold && r.fake_italic == res.fake_italic && *lv == level => {
                 s.push(c_out);
             }
             _ => {
                 if let Some(p) = cur.take() {
                     pieces.push(p);
                 }
-                cur = Some((res, face, c_out.to_string()));
+                cur = Some((res, face, c_out.to_string(), level));
             }
         }
     }
     if let Some(p) = cur.take() {
         pieces.push(p);
     }
-    for (res, face, piece) in pieces {
+    for (res, face, piece, level) in pieces {
         let seg_idx = segs.len();
         let mut st = style.clone();
         st.size = size;
@@ -335,9 +453,11 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(&piece);
         buf.guess_segment_properties();
-        // Riktningen bestäms av bitens starka tecken (siffror i hebreisk text formas vänster-till-höger).
-        let rtl = piece.chars().any(|c| char_dir(c) == 2);
+        // Riktningen ur bidinivån (siffror i hebreisk text har jämn nivå och formas vänster till höger).
+        let rtl = level % 2 == 1;
         buf.set_direction(if rtl { rustybuzz::Direction::RightToLeft } else { rustybuzz::Direction::LeftToRight });
+        // Kerning alltid (som förut). `kern` (minsta storlek för kerning) prövades: bara rutor med
+        // 9–11 pt brödtext ändrades, och måttet blev bättre i två och sämre i två presentationer.
         let out = rustybuzz::shape(&rb, &[], buf);
         let scale = size / face.upm * res.x_scale;
         let infos = out.glyph_infos();
@@ -383,7 +503,6 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
             } else {
                 width += spacing;
             }
-            let _ = tab_stops_on;
             cls.push(Cl {
                 seg: seg_idx,
                 range: (start, end),
@@ -391,7 +510,7 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
                 width,
                 kind,
                 break_after: break_after_char(last, next) || kind == Kind::Tab,
-                rtl,
+                level,
             });
         }
     }
@@ -446,15 +565,16 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
     for (pi, p) in frame.paras.iter().enumerate() {
         let mut segs = Vec::new();
         let mut cls = Vec::new();
-        for r in &p.runs {
-            shape_run(r, book, &mut segs, &mut cls, true);
+        let levels = para_levels(&p.runs, p.rtl);
+        for (r, lv) in p.runs.iter().zip(&levels) {
+            shape_run(r, book, &mut segs, &mut cls, lv);
         }
         // Punkten (bara om stycket har text).
         let has_text = p.runs.iter().any(|r| !r.line_break && !r.text.is_empty());
         let bullet = p.bullet.as_ref().filter(|_| has_text).and_then(|b| {
             let mut bs = Vec::new();
             let mut bc = Vec::new();
-            shape_run(&Run { text: b.text.clone(), style: b.style.clone(), line_break: false }, book, &mut bs, &mut bc, false);
+            shape_run(&Run { text: b.text.clone(), style: b.style.clone(), line_break: false }, book, &mut bs, &mut bc, &[]);
             let seg = bs.into_iter().next()?;
             // (id, x, y, framflyttning) som `emit_glyphs` vill ha.
             let mut gx = 0.0;
@@ -673,20 +793,24 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
         let line_avail = if frame.wrap { line.avail } else { (inner_w - line.start_x - p.mar_r).max(line.width) };
         let slack = (line_avail - line.width).max(0.0);
         let last_line = pl_ref.line + 1 == pl.lines.len() || line.hard_end;
+        // Höger till vänster (`rtl="1"`): indrag och punkt räknas från högerkanten; `algn` är absolut
+        // (l = vänster), men ett justerat styckes sista rad ställs till höger.
+        let left = if p.rtl { p.mar_r } else { line.start_x };
         let (mut x, extra_per_space) = match p.align {
-            Align::Center => (line.start_x + slack / 2.0, 0.0),
-            Align::Right => (line.start_x + slack, 0.0),
+            Align::Center => (left + slack / 2.0, 0.0),
+            Align::Right => (left + slack, 0.0),
             Align::Justify | Align::Distributed if !last_line || p.align == Align::Distributed => {
                 let spaces = pl.cls[line.from..line.to].iter().filter(|c| c.kind == Kind::Space).count();
-                if spaces > 0 { (line.start_x, slack / spaces as f32) } else { (line.start_x, 0.0) }
+                if spaces > 0 { (left, slack / spaces as f32) } else { (left, 0.0) }
             }
-            _ => (line.start_x, 0.0),
+            Align::Justify if p.rtl => (left + slack, 0.0),
+            _ => (left, 0.0),
         };
         x += col_x;
         // Punkten.
         if line.first {
-            if let Some((bseg, bglyphs, _)) = &pl.bullet {
-                let bx = col_x + (p.mar_l + p.indent).max(0.0);
+            if let Some((bseg, bglyphs, bw)) = &pl.bullet {
+                let bx = if p.rtl { col_x + col_w - (p.mar_l + p.indent).max(0.0) - bw } else { col_x + (p.mar_l + p.indent).max(0.0) };
                 emit_glyphs(&mut items, bseg, bglyphs.iter().copied(), bx, base_y, &bseg.text);
             }
         }
@@ -696,18 +820,11 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
         while order.last().is_some_and(|&k| pl.cls[k].kind == Kind::Space) {
             order.pop();
         }
-        // Förenklad bidi (UAX #9, regel L2): nivå 1 för höger-till-vänster-kluster, 0 eller 2 för
-        // vänster-till-höger beroende på styckets riktning; sedan vänds varje följd med nivå ≥ n.
-        let levels: Vec<u8> = order
-            .iter()
-            .map(|&k| match (pl.cls[k].rtl, p.rtl) {
-                (true, _) => 1,
-                (false, false) => 0,
-                (false, true) => 2,
-            })
-            .collect();
+        // UAX #9, regel L2: från högsta nivån ner till lägsta udda nivån vänds varje följd med nivå ≥ n.
+        let mut levels: Vec<u8> = order.iter().map(|&k| pl.cls[k].level).collect();
         let max = levels.iter().copied().max().unwrap_or(0);
-        for lvl in (1..=max).rev() {
+        let min_odd = levels.iter().copied().min().unwrap_or(0) | 1;
+        for lvl in (min_odd..=max).rev() {
             let mut i = 0;
             while i < order.len() {
                 if levels[i] >= lvl {
@@ -716,6 +833,7 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
                         e += 1;
                     }
                     order[i..e].reverse();
+                    levels[i..e].reverse();
                     i = e;
                 } else {
                     i += 1;
@@ -766,10 +884,17 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
                 }
                 let (a, b) = (c.range.0 as usize, c.range.1 as usize);
                 if let Some(t) = seg.text.get(a..b) {
-                    text.push_str(t);
+                    // Texten i logisk ordning (för sökning och PDF:ens textlager): höger-till-vänster-kluster
+                    // kommer i visuell ordning och läggs därför först.
+                    if c.level % 2 == 1 {
+                        text.insert_str(0, t);
+                    } else {
+                        text.push_str(t);
+                    }
                 }
             }
-            if seg.style.underline || seg.style.strike || seg.style.highlight.is_some() {
+            let words_gap = c.kind == Kind::Space && seg.style.underline_kind == Underline::Words && !seg.style.strike && seg.style.highlight.is_none();
+            if (seg.style.underline || seg.style.strike || seg.style.highlight.is_some()) && !words_gap {
                 deco.push((c.seg, xx, cw));
             }
             xx += cw;
@@ -792,10 +917,16 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
                 items.insert(0, Item::Fill { path: Path::rect(x0, base_y - a, x1 - x0, a + dsc), paint: Paint::Solid(hl), even_odd: false });
             }
             if st.underline {
-                items.push(Item::Fill { path: Path::rect(x0, base_y + st.size * 0.1, x1 - x0, thick), paint: Paint::Solid(st.color), even_odd: false });
+                underline(&mut items, st, x0, x1, base_y + st.size * 0.1, thick);
             }
             if st.strike {
-                items.push(Item::Fill { path: Path::rect(x0, base_y - st.size * 0.3, x1 - x0, thick), paint: Paint::Solid(st.color), even_odd: false });
+                let y = base_y - st.size * 0.3;
+                if st.strike_double {
+                    items.push(Item::Fill { path: Path::rect(x0, y - thick, x1 - x0, thick * 0.7), paint: Paint::Solid(st.color), even_odd: false });
+                    items.push(Item::Fill { path: Path::rect(x0, y + thick * 0.6, x1 - x0, thick * 0.7), paint: Paint::Solid(st.color), even_odd: false });
+                } else {
+                    items.push(Item::Fill { path: Path::rect(x0, y, x1 - x0, thick), paint: Paint::Solid(st.color), even_odd: false });
+                }
             }
             d = e;
         }
@@ -803,12 +934,67 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
     Laid { items, height: total }
 }
 
+/// Ritar en understrykning från `x0` till `x1` med överkanten på `y`.
+fn underline(items: &mut Vec<Item>, st: &RunStyle, x0: f32, x1: f32, y: f32, thick: f32) {
+    let k = st.underline_kind;
+    let color = st.underline_color.unwrap_or(st.color);
+    let w = if k.heavy() { thick * 2.0 } else { thick };
+    let fill = |items: &mut Vec<Item>, y: f32, h: f32| items.push(Item::Fill { path: Path::rect(x0, y, x1 - x0, h), paint: Paint::Solid(color), even_odd: false });
+    let stroke = |items: &mut Vec<Item>, path: Path, dash: Vec<f32>| {
+        items.push(Item::Stroke { path, stroke: Stroke { paint: Paint::Solid(color), width: w, dash, cap: super::scene::Cap::Butt, join: super::scene::Join::Round } })
+    };
+    match k {
+        Underline::Double => {
+            fill(items, y, thick * 0.7);
+            fill(items, y + thick * 1.4, thick * 0.7);
+        }
+        Underline::Wavy | Underline::WavyHeavy | Underline::WavyDouble => {
+            let amp = (w * 1.2).max(0.6);
+            let period = (w * 6.0).max(2.0);
+            let rows: &[f32] = if k == Underline::WavyDouble { &[0.0, 2.5] } else { &[0.0] };
+            for &dy in rows {
+                let yy = y + w / 2.0 + dy * w;
+                let mut p = Path::default();
+                p.move_to(x0, yy);
+                let mut x = x0;
+                let mut up = true;
+                while x < x1 - 0.01 {
+                    let nx = (x + period / 2.0).min(x1);
+                    p.quad_to((x + nx) / 2.0, yy + if up { -amp } else { amp }, nx, yy);
+                    x = nx;
+                    up = !up;
+                }
+                stroke(items, p, Vec::new());
+            }
+        }
+        _ if !k.dash().is_empty() => {
+            let mut p = Path::default();
+            p.move_to(x0, y + w / 2.0);
+            p.line_to(x1, y + w / 2.0);
+            stroke(items, p, k.dash().iter().map(|d| d * w).collect());
+        }
+        _ => fill(items, y, w),
+    }
+}
+
 /// Skriver en glyfkörning. `glyphs` är (id, x relativt start, y, framflyttning).
 fn emit_glyphs(items: &mut Vec<Item>, seg: &Seg, glyphs: impl Iterator<Item = (u16, f32, f32, f32)>, x: f32, y: f32, text: &str) {
-    let base_shift = -seg.style.baseline * seg.style.size;
+    // Förskjutningen räknas på körningens fulla storlek (inte den förminskade).
+    let full = if seg.style.baseline != 0.0 { seg.style.size / SCRIPT_SIZE } else { seg.style.size };
+    let base_shift = -seg.style.baseline * full;
     let placed: Vec<PlacedGlyph> = glyphs.map(|(id, gx, gy, adv)| PlacedGlyph { id, x: gx, y: gy, advance: adv }).collect();
     if placed.is_empty() {
         return;
+    }
+    // Tunna vikter (Calibri Light …) som ritas med ett typsnitt i normal vikt görs tunnare.
+    let thin = if seg.style.bold || seg.text.chars().any(fonts::is_cjk) { 0.0 } else { fonts::thin_amount(&seg.style.latin, &seg.face) * seg.style.size };
+    let fx = !seg.style.effects.is_empty() || thin > 0.0;
+    if fx {
+        let mut e = seg.style.effects.clone();
+        if thin > 0.0 {
+            e.push(super::scene::Effect::Thin { width: thin });
+        }
+        items.push(Item::BeginEffect(e));
     }
     items.push(Item::Glyphs(GlyphRun {
         font: seg.face.clone(),
@@ -822,6 +1008,9 @@ fn emit_glyphs(items: &mut Vec<Item>, seg: &Seg, glyphs: impl Iterator<Item = (u
         fake_italic: seg.res.fake_italic,
         x_scale: seg.res.x_scale,
     }));
+    if fx {
+        items.push(Item::EndEffect);
+    }
 }
 
 /// Flyttar utlagd text till bildkoordinater.
@@ -839,6 +1028,92 @@ pub fn transform_items(items: Vec<Item>, t: &Affine) -> Vec<Item> {
             Item::Svg { tree, t: it, crop, alpha } => Item::Svg { tree, t: it.then(t), crop, alpha },
             Item::PushClip { path } => Item::PushClip { path: path.transformed(t) },
             Item::PopClip => Item::PopClip,
+            Item::BeginEffect(mut e) => {
+                for x in &mut e {
+                    if let super::scene::Effect::OuterShadow { t: st, .. } = x {
+                        if *st != Affine::IDENTITY {
+                            if let Some(inv) = t.invert() {
+                                *st = inv.then(st).then(t);
+                            }
+                        }
+                    }
+                }
+                Item::BeginEffect(e)
+            }
+            Item::EndEffect => Item::EndEffect,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(paras: Vec<Para>) -> Frame {
+        Frame { paras, insets: (0.0, 0.0, 0.0, 0.0), wrap: true, ..Default::default() }
+    }
+
+    fn para(text: &str, rtl: bool) -> Para {
+        let style = RunStyle { latin: "Liberation Sans".into(), cs: "Liberation Sans".into(), size: 12.0, ..Default::default() };
+        Para { runs: vec![Run { text: text.into(), style, line_break: false }], rtl, align: if rtl { Align::Right } else { Align::Left }, ..Default::default() }
+    }
+
+    /// (text, vänsterkant) för glyfkörningarna.
+    fn runs(laid: &Laid) -> Vec<(String, f32)> {
+        laid.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Glyphs(g) => Some((g.text.clone(), g.t.apply(g.glyphs[0].x, 0.0).0)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn x_of(r: &[(String, f32)], needle: &str) -> f32 {
+        r.iter().find(|(t, _)| t.contains(needle)).unwrap_or_else(|| panic!("{needle} saknas i {r:?}")).1
+    }
+
+    #[test]
+    fn bidi_hoger_till_vanster_med_latin_och_parentes() {
+        let book = FontBook::default();
+        // Höger-till-vänster-stycke: den latinska delen (med parenteser) hamnar till vänster om hebreiskan.
+        let laid = layout(&frame(vec![para("שלום (Injection)", true)]), 400.0, 100.0, &book);
+        let r = runs(&laid);
+        assert!(x_of(&r, "Injection") < x_of(&r, "שלום"), "{r:?}");
+        // Högerjusterat: texten slutar vid högerkanten.
+        assert!(x_of(&r, "שלום") > 300.0, "{r:?}");
+        // Vänster-till-höger-stycke med hebreiska i mitten: latinska ordens ordning behålls.
+        let laid = layout(&frame(vec![para("abc שלום עולם def", false)]), 400.0, 100.0, &book);
+        let r = runs(&laid);
+        assert!(x_of(&r, "abc") < x_of(&r, "def"), "{r:?}");
+        // Hebreiska ord i följd vänds: det första ordet (logiskt) står till höger om det andra.
+        let levels = para_levels(&[Run { text: "abc שלום עולם def".into(), style: RunStyle::default(), line_break: false }], false);
+        assert_eq!(levels[0][0], 0);
+        assert_eq!(levels[0][4], 1);
+        assert_eq!(levels[0][14], 0);
+    }
+
+    #[test]
+    fn punkt_till_hoger_i_hoger_till_vanster_stycke() {
+        let book = FontBook::default();
+        let mut p = para("שלום עולם", true);
+        p.mar_l = 20.0;
+        p.indent = -20.0;
+        p.bullet = Some(Bullet { text: "•".into(), style: p.runs[0].style.clone() });
+        let laid = layout(&frame(vec![p]), 300.0, 100.0, &book);
+        let r = runs(&laid);
+        let bullet = x_of(&r, "•");
+        assert!(bullet > 280.0, "punkten vid högerkanten: {r:?}");
+        assert!(x_of(&r, "שלום") < bullet - 5.0, "{r:?}");
+    }
+
+    #[test]
+    fn kapitaler_gemener_mindre() {
+        let book = FontBook::default();
+        let mut p = para("Ab", false);
+        p.runs[0].style.caps = Caps::Small;
+        let laid = layout(&frame(vec![p]), 300.0, 100.0, &book);
+        let sizes: Vec<(String, f32)> = laid.items.iter().filter_map(|it| if let Item::Glyphs(g) = it { Some((g.text.clone(), g.size)) } else { None }).collect();
+        assert_eq!(sizes, vec![("A".to_owned(), 12.0), ("B".to_owned(), 12.0 * SMALL_CAPS)]);
+    }
 }

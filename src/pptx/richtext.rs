@@ -200,6 +200,14 @@ impl TextEnv<'_, '_> {
                 _ => Caps::None,
             },
             highlight: chain.iter().find_map(|n| n.child("a:highlight")).and_then(color::first_color).and_then(|c| self.sheets.color(c, None)),
+            underline_kind: a("u").and_then(text::Underline::from_attr).unwrap_or_default(),
+            underline_color: chain.iter().find_map(|n| n.child("a:uFill")).and_then(|f| f.child("a:solidFill")).and_then(color::first_color).and_then(|c| self.sheets.color(c, None)),
+            strike_double: a("strike") == Some("dblStrike"),
+            effects: chain
+                .iter()
+                .find_map(|n| n.child("a:effectLst"))
+                .map(|l| super::effects::effect_list(self.sheets, l, None, (&super::scene::Affine::IDENTITY, 0.0, 0.0)))
+                .unwrap_or_default(),
         };
         (style, lang)
     }

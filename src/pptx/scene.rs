@@ -305,6 +305,28 @@ pub struct GlyphRun {
     pub x_scale: f32,
 }
 
+/// En effekt på elementen mellan `Item::BeginEffect` och `Item::EndEffect` (DrawingML:s `a:effectLst`).
+/// Mått i punkter, vinklar redan upplösta till förskjutningar.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Effect {
+    /// Yttre skugga (`outerShdw`, även förinställda `prstShdw`): innehållets täckning, oskarp (`blur` =
+    /// oskärperadien), färgad och förskjuten `dx`/`dy`. `t` skalar/snedvrider skuggan (`sx`/`sy`/`kx`/`ky`)
+    /// runt justeringspunkten, i bildkoordinater, före förskjutningen.
+    OuterShadow { dx: f32, dy: f32, blur: f32, color: Rgba, t: Affine },
+    /// Inre skugga (`innerShdw`): skuggan av formens kant innanför formen.
+    InnerShadow { dx: f32, dy: f32, blur: f32, color: Rgba },
+    /// Glöd (`glow`): en oskarp gloria med radien `radius` utanför formen.
+    Glow { radius: f32, color: Rgba },
+    /// Mjuka kanter (`softEdge`): täckningen tonar ut inåt över `radius`.
+    SoftEdge { radius: f32 },
+    /// Spegling (`reflection`): innehållet speglat runt sin nederkant, `dist` nedanför, med genomskinlighet
+    /// som går från `start_alpha` (vid `start_pos`) till `end_alpha` (vid `end_pos`, andelar av höjden).
+    Reflection { blur: f32, dist: f32, start_alpha: f32, end_alpha: f32, start_pos: f32, end_pos: f32 },
+    /// Tunnare text (syntetiskt tunt typsnitt, t.ex. Calibri Light): glyferna skrapas `width` punkter
+    /// in från kanten.
+    Thin { width: f32 },
+}
+
 /// Ett element i visningslistan.
 #[derive(Clone, Debug)]
 pub enum Item {
@@ -319,6 +341,10 @@ pub enum Item {
     /// Klipp till banan (bildkoordinater) tills motsvarande `PopClip`.
     PushClip { path: Path },
     PopClip,
+    /// Elementen fram till motsvarande `EndEffect` ritas med effekterna (skugga, glöd …). Listan förblir
+    /// platt: den som bara läser glyfkörningar (sökning) kan hoppa över markörerna.
+    BeginEffect(Vec<Effect>),
+    EndEffect,
 }
 
 /// En bild som visningslista.

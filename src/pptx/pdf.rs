@@ -131,9 +131,32 @@ fn draw_image(s: &mut krilla::surface::Surface<'_>, image: krilla::image::Image,
 
 fn draw_scene(s: &mut krilla::surface::Surface<'_>, scene: &Scene) {
     let mut depth = 0usize;
-    for it in &scene.items {
+    for (idx, it) in scene.items.iter().enumerate() {
         match it {
+            Item::BeginEffect(effects) => {
+                // Skugga, glöd och spegling som rasterbild under innehållet (144 dpi); innehållet ritas som vanligt.
+                let end = super::raster::matching_end(&scene.items, idx).min(scene.items.len());
+                if let Some((pm, t)) = super::effects::underlay(&scene.items[idx + 1..end], effects, scene.width, scene.height, 2.0) {
+                    let (w, h, rgba) = super::raster::to_rgba(pm);
+                    let img = super::scene::ImageData::new(w, h, rgba, None);
+                    if let Some(k) = kimage(&img) {
+                        draw_image(s, k, &Affine::scale(w as f32, h as f32).then(&t), [0.0; 4], 1.0);
+                    }
+                }
+            }
+            Item::EndEffect => {}
             Item::Fill { path, paint, even_odd } => {
+                if let Paint::Image { image, alpha, tile: true, .. } = paint {
+                    // Upprepad bild (mönster, `a:tile`): bildens medelfärg.
+                    let n = (image.rgba.len() / 4).max(1) as f32;
+                    let sum = image.rgba.chunks_exact(4).fold([0.0f32; 4], |a, p| [a[0] + p[0] as f32, a[1] + p[1] as f32, a[2] + p[2] as f32, a[3] + p[3] as f32]);
+                    let c = Rgba { r: sum[0] / n / 255.0, g: sum[1] / n / 255.0, b: sum[2] / n / 255.0, a: sum[3] / n / 255.0 * alpha };
+                    let (Some(p), Some((paint, opacity))) = (kpath(path), kpaint(&Paint::Solid(c))) else { continue };
+                    s.set_stroke(None);
+                    s.set_fill(Some(Fill { paint, opacity: norm(opacity), rule: if *even_odd { FillRule::EvenOdd } else { FillRule::NonZero } }));
+                    s.draw_path(&p);
+                    continue;
+                }
                 if let Paint::Image { image, t, alpha, .. } = paint {
                     let Some(clip) = kpath(path) else { continue };
                     s.push_clip_path(&clip, &FillRule::NonZero);

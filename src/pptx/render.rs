@@ -143,7 +143,7 @@ impl<'a> Builder<'a> {
 
     /// Fyller en bana; bildfyllningar klipps till banan.
     fn fill_paint(&mut self, path: Path, paint: Paint) {
-        if let Paint::Image { image, t, alpha, .. } = &paint {
+        if let Paint::Image { image, t, alpha, tile: false } = &paint {
             self.scene.items.push(Item::PushClip { path: path.clone() });
             self.scene.items.push(Item::Image { image: image.clone(), t: *t, crop: [0.0; 4], alpha: *alpha });
             self.scene.items.push(Item::PopClip);
@@ -195,8 +195,13 @@ impl<'a> Builder<'a> {
         };
         let fill = gpr.children.iter().find(|c| inherit::FILLS.contains(&c.name.as_str()));
         self.group_fill.push(GroupFill { node: fill, owner });
+        let start = self.scene.items.len();
         self.tree(g, owner, &child_t);
         self.group_fill.pop();
+        if let (Some(lst), Some(f)) = (gpr.child("a:effectLst"), gpr.child("a:xfrm").and_then(|x| frame_of(x, parent))) {
+            let effects = super::effects::effect_list(&self.sheets, lst, None, (&f.t, f.w, f.h));
+            self.wrap_effects(start, effects);
+        }
     }
 
     /// Kedjans första `spPr`-barn med ett av namnen.
@@ -217,7 +222,15 @@ impl<'a> Builder<'a> {
         let Some(f) = frame_of(xfrm, parent) else { return };
         let style = chain.iter().find_map(|s| s.child("p:style"));
         let geom = self.geometry(&chain, f.w, f.h);
+        let effects = super::effects::shape_effects(&self.sheets, &chain, style, (&f.t, f.w, f.h));
+        let start = self.scene.items.len();
         self.draw_geometry(&chain, style, &f, &geom, owner);
+        // Effekterna gäller formen; utan fyllning och linje gäller de texten.
+        let geom_drawn = self.scene.items.len() > start;
+        if geom_drawn {
+            self.wrap_effects(start, effects.clone());
+        }
+        let text_start = self.scene.items.len();
         if let Some(body) = body.filter(|_| has_text) {
             let mut tr = geom.as_ref().map(|g| g.text_rect).unwrap_or((0.0, 0.0, f.w, f.h));
             // SmartArt-ritningar har en egen textram (`dsp:txXfrm`).
@@ -229,6 +242,18 @@ impl<'a> Builder<'a> {
             }
             self.text_body(sp, &chain, body, style, &tf, tr, owner);
         }
+        if !geom_drawn {
+            self.wrap_effects(text_start, effects);
+        }
+    }
+
+    /// Lägger elementen från `start` och framåt mellan `BeginEffect` och `EndEffect`.
+    pub fn wrap_effects(&mut self, start: usize, effects: Vec<super::scene::Effect>) {
+        if effects.is_empty() || start >= self.scene.items.len() {
+            return;
+        }
+        self.scene.items.insert(start, Item::BeginEffect(effects));
+        self.scene.items.push(Item::EndEffect);
     }
 
     /// Formens geometri (förinställd eller egen), eller en rektangel.
@@ -397,15 +422,17 @@ impl<'a> Builder<'a> {
                 let r = package::rel(rels, id)?;
                 let img = self.sheets.deck.image(&r.target)?;
                 let alpha = n.path(&["a:blip", "a:alphaModFix"]).and_then(|a| a.attr("amt").and_then(super::xml::parse_i64)).map_or(1.0, |v| v as f32 / 100000.0);
+                if let Some(tile) = n.child("a:tile") {
+                    return Some(super::fills::tile_paint(tile, img, f.w, f.h, &f.t, alpha));
+                }
                 let t = Affine::scale(f.w, f.h).then(&f.t);
-                Some(Paint::Image { image: img, t, tile: n.child("a:tile").is_some(), alpha })
+                Some(Paint::Image { image: img, t, tile: false, alpha })
             }
             "a:pattFill" => {
                 let fg = n.child("a:fgClr").and_then(color::first_color).and_then(|c| self.sheets.color(c, ph)).unwrap_or(Rgba::BLACK);
                 let bg = n.child("a:bgClr").and_then(color::first_color).and_then(|c| self.sheets.color(c, ph)).unwrap_or(Rgba::WHITE);
                 let prst = n.attr("prst").unwrap_or("pct50");
-                let k = prst.strip_prefix("pct").and_then(|p| p.parse::<f32>().ok()).map_or(0.3, |p| p / 100.0);
-                Some(Paint::Solid(mix(bg, fg, k)))
+                Some(super::fills::pattern_paint(prst, fg, bg, &Affine::IDENTITY))
             }
             "a:grpFill" => {
                 // Närmaste grupp med en riktig fyllning (en grupp kan själv ha grpFill).
@@ -445,6 +472,11 @@ impl<'a> Builder<'a> {
             let cy = (t + (1.0 - b)) / 2.0 * h;
             let rx = cx.max(w - cx);
             let ry = cy.max(h - cy);
+            if path.attr("path") != Some("circle") {
+                // Rektangel och form: rektangulära nivåkurvor från fokusrektangeln ut till kanten (stopp 0 ytterst).
+                let inner: Vec<Stop> = stops.iter().rev().map(|s| Stop { pos: 1.0 - s.pos, color: s.color }).collect();
+                return super::fills::rect_gradient(&inner, (l, t, r, b), w, h, &f.t);
+            }
             let (rad, t) = if path.attr("path") == Some("circle") {
                 let rr = (rx * rx + ry * ry).sqrt();
                 (rr, Affine::IDENTITY)
@@ -497,7 +529,10 @@ impl<'a> Builder<'a> {
             extra += v;
             std::mem::swap(&mut tw, &mut th);
         }
-        let laid = text::layout(fr, tw, th, &self.sheets.deck.fonts);
+        let mut laid = text::layout(fr, tw, th, &self.sheets.deck.fonts);
+        if matches!(bp.vert.as_str(), "eaVert" | "wordArtVertRtl") {
+            laid.items = upright_cjk(laid.items);
+        }
         // Rutans mitt i formens lokala koordinater; texten läggs ut runt sin egen mitt och roteras.
         let (cx, cy) = (l + (r - l) / 2.0, t + (b - t) / 2.0);
         let local = Affine::translate(-tw / 2.0, -th / 2.0).then(&Affine::rotate(extra)).then(&Affine::translate(cx, cy));
@@ -510,6 +545,9 @@ impl<'a> Builder<'a> {
         let Some(xfrm) = Self::sppr_child(&chain, &["a:xfrm"]) else { return };
         let Some(f) = frame_of(xfrm, parent) else { return };
         let Some(bf) = pic.child("p:blipFill") else { return };
+        let style = chain.iter().find_map(|s| s.child("p:style"));
+        let effects = super::effects::shape_effects(&self.sheets, &chain, style, (&f.t, f.w, f.h));
+        let start = self.scene.items.len();
         // Bildformens egen fyllning ligger bakom bilden (syns genom genomskinliga bilder och metafiler).
         if let Some(paint) = Self::sppr_child(&chain[..chain.len().min(1)], inherit::FILLS).and_then(|n| self.paint(n, None, &f, owner)) {
             for sp in self.geometry(&chain, f.w, f.h).iter().flat_map(|g| g.paths.iter()).filter(|p| p.fill != FillMode::None) {
@@ -518,7 +556,6 @@ impl<'a> Builder<'a> {
         }
         self.draw_blip(bf, &chain, &f, owner);
         // Ram runt bilden.
-        let style = chain.iter().find_map(|s| s.child("p:style"));
         if let Some(stroke) = self.line(&chain, style, &f, owner) {
             if let Some(g) = self.geometry(&chain, f.w, f.h) {
                 for sp in g.paths.iter().filter(|p| p.stroke) {
@@ -526,6 +563,12 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        // Yttre skugga ritas inte för bilder med genomskinliga partier: PowerPoints PDF-export saknar
+        // skuggan för en sådan bild (bara ett fall i referensmaterialet: psconf22-chasing-seconds bild
+        // 11 och 17; osäkert om det gäller generellt).
+        let transparent = effects.iter().any(|e| matches!(e, super::scene::Effect::OuterShadow { .. })) && self.scene.items[start..].iter().any(|it| matches!(it, Item::Image { image, .. } if image.rgba.chunks_exact(4).any(|p| p[3] < 250)));
+        let effects: Vec<_> = effects.into_iter().filter(|e| !(transparent && matches!(e, super::scene::Effect::OuterShadow { .. }))).collect();
+        self.wrap_effects(start, effects);
     }
 
     /// Ritar `p:blipFill` (bild, SVG eller platshållare för EMF/WMF) i formen `f`.
@@ -645,6 +688,38 @@ fn lighten(c: Rgba, k: f32) -> Rgba {
     mix(c, Rgba { a: c.a, ..Rgba::WHITE }, k)
 }
 
+/// Lodrät östasiatisk text (`eaVert`): rutan vrids 90°, men östasiatiska tecken ska stå upprätt. Varje
+/// sådan glyf blir en egen körning som vrids tillbaka runt fyrkantens mitt.
+fn upright_cjk(items: Vec<Item>) -> Vec<Item> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let Item::Glyphs(g) = it else {
+            out.push(it);
+            continue;
+        };
+        if !g.text.chars().any(super::fonts::is_cjk) {
+            out.push(Item::Glyphs(g));
+            continue;
+        }
+        let chars: Vec<char> = g.text.chars().collect();
+        let same = chars.len() == g.glyphs.len();
+        for (i, pg) in g.glyphs.iter().enumerate() {
+            let c = if same { Some(chars[i]) } else { None };
+            let upright = c.is_none_or(super::fonts::is_cjk);
+            let mut run = g.clone();
+            run.glyphs = vec![*pg];
+            run.text = c.map(String::from).unwrap_or_else(|| if i == 0 { g.text.clone() } else { String::new() });
+            if upright {
+                // Fyrkantens mitt: halva framflyttningen, 0,38 em ovanför baslinjen.
+                let (cx, cy) = (pg.x + pg.advance / 2.0, pg.y - g.size * 0.38);
+                run.t = Affine::rotate_at(-90.0, cx, cy).then(&g.t);
+            }
+            out.push(Item::Glyphs(run));
+        }
+    }
+    out
+}
+
 /// En ellips som bana.
 pub fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Path {
     let mut p = Path::default();
@@ -652,4 +727,25 @@ pub fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Path {
     geom::arc_to(&mut p, ((cx + rx) as f64, cy as f64), rx as f64, ry as f64, 0.0, 21_600_000.0);
     p.close();
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lodrat_ostasiatisk_text_star_upprätt() {
+        let book = super::super::fonts::FontBook::default();
+        let style = text::RunStyle { size: 20.0, ..Default::default() };
+        let fr = text::Frame { paras: vec![text::Para { runs: vec![text::Run { text: "日本a".into(), style, line_break: false }], ..Default::default() }], wrap: true, ..Default::default() };
+        let laid = text::layout(&fr, 200.0, 100.0, &book);
+        let items = upright_cjk(laid.items);
+        let runs: Vec<&super::super::scene::GlyphRun> = items.iter().filter_map(|i| if let Item::Glyphs(g) = i { Some(g) } else { None }).collect();
+        let cjk: Vec<_> = runs.iter().filter(|g| g.text.chars().any(super::super::fonts::is_cjk)).collect();
+        assert_eq!(cjk.len(), 2, "en körning per östasiatiskt tecken");
+        for g in cjk {
+            // Vridna −90° (motsols): x-axeln pekar uppåt.
+            assert!(g.t.a.abs() < 1e-4 && (g.t.b + 1.0).abs() < 1e-4, "{:?}", g.t);
+        }
+    }
 }

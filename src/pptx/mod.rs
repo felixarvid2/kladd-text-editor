@@ -34,6 +34,10 @@ pub mod chart_draw;
 pub mod chart_fmt;
 pub mod chart_model;
 pub mod table_builtin;
+// Omgång 2, ritmotorn (w-prend).
+pub mod effects;
+pub mod fills;
+pub mod mtx;
 
 #[cfg(test)]
 mod tests;

@@ -54,7 +54,7 @@ En ritväg för allt:
   inte (som i bildspel).
 - **Former:** alla 187 förinställda former och `custGeom` med guider, `arcTo` (synliga vinklar som POI),
   `fill`-lägen (`darken`/`lighten`…), grupper (`chOff`/`chExt`), rotation och spegling, pilspetsar.
-- **Fyllningar:** enfärg, linjär och radiell övertoning, bildfyllning, mönster (som blandfärg), bakgrunder
+- **Fyllningar:** enfärg, linjär och radiell övertoning, bildfyllning, mönster (riktiga mönster, se omgång 2), bakgrunder
   (`bg`/`bgRef`).
 - **Bilder:** `srcRect`, alfa (`alphaModFix`), gråskala, klippning till formen, SVG via `asvg:svgBlip`, EMF som
   bara bär en bitmapp.
@@ -100,10 +100,10 @@ Obs: kvoterna och radhöjden är kalibrerade mot samma PowerPoint-PDF:er som jä
 - **Aptos** har ingen fri, metriskt lik ersättare; Liberation Sans med skalning används.
 - **Segoe UI** ersätts av Selawik (Microsoft, OFL) om det är installerat, annars Liberation Sans. Selawik
   följer inte med Kladd.
-- **Calibri Light** och **Segoe UI Light** ritas i normal vikt (för kraftigt men med rätt bredd).
-- **Inbäddade typsnitt:** okomprimerad EOT (även XOR-krypterad), rå TrueType och GUID-obfuskering läses.
-  PowerPoints `.fntdata` är nästan alltid **MicroType Express-komprimerade** (flagga 0x4); de kan inte läsas än
-  och ersättningstabellen används (notis vid öppning).
+- **Calibri Light**, **Segoe UI Light/Semilight** och andra tunna vikter som saknas ritas med ersättaren i
+  normal vikt men görs syntetiskt tunnare i rastret (se omgång 2 nedan).
+- **Inbäddade typsnitt:** okomprimerad och MicroType Express-komprimerad EOT (även XOR-krypterad), rå TrueType
+  och GUID-obfuskering läses (se omgång 2 nedan).
 - Tecken som typsnittet saknar tas ur en reservlista (CJK: IPAPGothic/Noto CJK/WenQuanYi; annars DejaVu Sans …).
 
 ## Prov
@@ -407,3 +407,114 @@ tecken och texten vid nästa tabbstopp (`richtext.rs`/`text.rs`).
 före det inbyggda, diagonaler och egna kanter, dubbel linje och temats linjestil, rader som växer även
 över `rowSpan`, formatdelarnas ordning och text, SmartArt med `fontRef`-färg, `revTx`-färg och reserven
 utan ritdel) och `table_builtin.rs` (alla 74 format finns och har `wholeTbl`).
+
+## Omgång 2: ritmotor, text och typsnitt
+
+Nya moduler: `effects.rs` (effektlistor → `scene::Effect`, ritningen i rastret), `fills.rs` (mönster,
+`a:tile`, rektangulära övertoningar) och `mtx.rs` (MicroType Express). `Scene` har fått markörerna
+`Item::BeginEffect(Vec<Effect>)`/`Item::EndEffect`; listan är fortfarande platt, så den som bara läser
+glyfkörningar (sökning) kan hoppa över dem. `RunStyle` har nya fält (`effects`, `underline_kind`,
+`underline_color`, `strike_double`) med standardvärden, och `FontFace` har `weight`.
+
+- **Effekter:** yttre skugga (`outerShdw`, `prstShdw` som yttre skugga) med oskärpa, avstånd, riktning,
+  `sx`/`sy`/`kx`/`ky` runt `algn`; inre skugga; glöd; mjuka kanter; spegling nedåt (`stA`/`endA`/`stPos`/
+  `endPos`/`dist`, oskärpan görs inte). Effekterna ärvs som PowerPoint gör: första `a:effectLst` i
+  platshållarkedjans `spPr` (en tom lista stänger av), annars `p:style/a:effectRef idx` mot temats
+  `a:effectStyleLst` (med stilmatrisens platshållarfärg). Gäller former (formen; utan fyllning och linje
+  texten), bilder, grupper (`grpSpPr`) och textkörningar (`a:rPr/a:effectLst`). Rastret ritar innehållet i
+  ett eget lager stort som innehållet plus effektens räckvidd och bygger effekterna ur lagrets täckning
+  (gaussisk oskärpa som tre lådfilter, σ = halva `blurRad`). PDF:en får skugga, glöd och spegling som en
+  rasterbild i 144 dpi under innehållet; mjuka kanter, inre skugga och tunn text görs bara i rastret.
+  Bilder med genomskinliga partier får ingen yttre skugga: PowerPoints PDF saknar den i det enda fallet i
+  materialet (`psconf22-chasing-seconds` bild 11 och 17), osäkert om det gäller generellt.
+- **`objectDefaults`:** gäller bara nya former i PowerPoint och används inte vid ritningen (ingen ändring).
+- **Fyllningar:** `a:pattFill` ritas som riktiga mönster (alla 48 förinställda; Kladds egna 8×8-rutor efter
+  utseendet i PowerPoint, `pctNN` med en Bayer-matris, en ruta = 6 pt som vid 100 % i PowerPoint); PDF:en
+  får mönstrets medelfärg. `a:tile` upprepar bilden (storlek ur bildpunkterna vid 96 dpi × `sx`/`sy`,
+  `algn`, `tx`/`ty`, spegling `x`/`y`/`xy`). Banövertoningar med `path="rect"`/`"shape"` får rektangulära
+  nivåkurvor från `fillToRect` (en förberäknad bild); `circle` som förut. Stoppens riktning i
+  banövertoningar (läge 0 ytterst) är oförändrad från omgång 1 och inte kontrollerad mot materialet.
+- **3D** (`sp3d`/`scene3d`, fasning): görs inte. Fasningarna i materialet (owasp-presentationerna,
+  cppcon14) sitter på små former där skillnaden inte syns i måttet.
+- **Text:** bidi enligt UAX #9 med `unicode-bidi` (nivåer per stycke över alla körningar, formning per nivå,
+  omordning per rad enligt L2; körningens text i logisk ordning för sökning och PDF:ens textlager). Stycken
+  med `rtl="1"` har indrag och punkt från högerkanten; `algn` är absolut (l = vänster), men ett justerat
+  styckes sista rad ställs till höger. Kapitäler (`cap="small"`): gemener som versaler i 80 %, övriga tecken
+  i full storlek. Upphöjt/nedsänkt i två tredjedelar av storleken (uppmätt i PowerPoints PDF:
+  `cppcon14-parallel-overview` bild 7 och `cppcon19-charconv` bild 50 ger 0,665), förskjutningen räknas på
+  full storlek. Alla understrykningar (`dbl`, `heavy`, prickade/streckade varianter, vågiga, `words`) och
+  `uFill`; dubbel genomstrykning. `eaVert`: östasiatiska tecken står upprätt (en körning per tecken som
+  vrids tillbaka). `kern` (minsta storlek för kerning) prövades men infördes inte: bara 9–11 pt brödtext
+  i owasp-presentationerna ändrades, med bättre mått i två och sämre i två presentationer; kerning görs
+  alltid som förut.
+- **Typsnitt:** MicroType Express avkodas (`mtx.rs`, efter W3C:s MTX-specifikation: LZCOMP med tre
+  adaptiva Huffmanträd, sedan CTF → TrueType: `glyf`/`loca` återskapas, hintningen och tabellerna
+  `cvt `/`fpgm`/`prep`/`hdmx`/`VDMX`/`LTSH` tas bort; CFF-typsnitt behåller sina tabeller). Alla 49
+  `.fntdata` i materialet avkodas; inbäddad Calibri har samma teckenbredder som Carlito. Tunna vikter som
+  saknas (`Light`, `Semilight`, `Thin` i namnet) ritas med ersättaren i normal vikt och skrapas
+  0,012 em (Light), 0,009 em (Semilight) eller 0,02 em (Thin, ExtraLight) per kant med en tjock linje i
+  läget `DestinationOut` (uppskattat ur stamtjockleken: Calibri 0,074 em mot Calibri Light 0,050 em, Segoe
+  UI 0,083 em mot Light 0,047 em).
+- **Prov:** `effects.rs` (skugga, glöd, mjuka kanter, inre skugga, spegling i rastret; tolkningen av en
+  effektlista; `effectRef` mot korpusfilens tema och PDF med effekter), `fills.rs` (mönstertäthet,
+  upprepning i rastret, rektangulär övertoning), `text.rs` (bidi med parenteser, punkt till höger,
+  kapitäler), `render.rs` (`eaVert`), `mtx.rs` (LZCOMP med bokstavliga symboler, DUP2 och kopior på båda
+  sidor om 512, körlängd, CTF-glyfer → TrueType som ttf-parser läser). Ignorerade prov:
+  `pptx::mtx::mtx_referenspresentationer` (avkodar alla `.fntdata` under `KLADD_PPTX_REFS`, jämför Calibri
+  med Carlito och skriver PDF:er till `KLADD_MTX_PDF`) och `pptx::compare::tid_per_bild`.
+
+### Tid per bild (debug)
+
+`pptx::compare::tid_per_bild` (visningslista + raster i 960 × 540, debug, delad maskin med andra byggen):
+median 415 ms per bild över 1 121 bilder, 95:e percentilen 2,3 s. Visningslistan (formning och utläggning
+av text) tar 11–600 ms i median per presentation (owasp-presentationerna med mycket 9-punktstext är
+tyngst). De riktigt långsamma bilderna (3–35 s) är första avkodningen av stora bilder (PNG/JPEG i
+`image` utan optimering i debug), som sedan cachas. Formade textkörningar cachas inte: i debug är
+formningen inte det som dominerar, och i en optimerad byggnad är den en bråkdel. Att öppna en presentation
+med inbäddade MTX-typsnitt tar längre tid (alla typsnitt avkodas vid öppningen: `cppcon19-macrofree` 0,8 s,
+`psconf19-pscore` 1,8 s, `cncf-overview-ja` 1,7 s i debug).
+
+### Resultat mot PowerPoint, omgång 2 (SSIM-medel, alla presentationer med PowerPoint-PDF)
+
+"Före" är omgång 1 (09f28e5), mätt på samma maskin, för alla 33 presentationer med PowerPoint-PDF
+(provet tar nu också mappar med `ref-1.png`, som de tre `covid-infographic-*`). Ingen
+presentation blev sämre utom `cppcon14-cheap-logging` (−0,00001, bild 1: textskuggan ritas på
+ersättaren för det saknade typsnittet Harlow Solid Italic). Bland de 15 presentationerna med
+LibreOffice-rendering är Kladd nu närmare PowerPoint på 573 av 632 bilder (539 före).
+
+| Presentation | Bilder | Före | Efter | LibreOffice |
+|---|---:|---:|---:|---:|
+| cncf-overview-ja | 52 | 0.829 | 0.924 | 0.797 |
+| cppcon14-cheap-logging | 18 | 0.876 | 0.876 | – |
+| cppcon14-decomposing | 48 | 0.894 | 0.899 | – |
+| cppcon14-new-old-thing | 13 | 0.981 | 0.981 | – |
+| cppcon14-parallel-overview | 37 | 0.827 | 0.832 | 0.806 |
+| cppcon15-functional | 51 | 0.852 | 0.852 | – |
+| cppcon15-stl-algorithms-mac | 99 | 0.802 | 0.803 | 0.728 |
+| cppcon16-iterator-haiku | 46 | 0.796 | 0.796 | – |
+| cppcon17-inherited-codebase-mac | 71 | 0.971 | 0.971 | – |
+| cppcon17-refactor-or-die | 13 | 0.981 | 0.985 | 0.965 |
+| cppcon18-say-nothing | 35 | 0.956 | 0.957 | 0.912 |
+| cppcon18-simplicity | 43 | 0.952 | 0.952 | – |
+| cppcon19-charconv | 64 | 0.847 | 0.848 | 0.734 |
+| cppcon19-macrofree | 70 | 0.922 | 0.951 | 0.861 |
+| cppcon20-stl-features | 45 | 0.857 | 0.857 | – |
+| ms-copilot-workshop | 58 | 0.927 | 0.930 | 0.902 |
+| ms-workshop-dlcv | 41 | 0.943 | 0.944 | 0.923 |
+| msrc-eko19 | 23 | 0.878 | 0.881 | 0.834 |
+| msrc-identity | 34 | 0.928 | 0.929 | 0.912 |
+| msrc-win32k | 35 | 0.879 | 0.881 | 0.833 |
+| owasp-top10-2010-es | 22 | 0.872 | 0.883 | – |
+| owasp-top10-2017-en | 25 | 0.876 | 0.882 | 0.768 |
+| owasp-top10-2017-he | 25 | 0.680 | 0.698 | 0.632 |
+| owasp-top10-2017-ja | 25 | 0.718 | 0.724 | – |
+| owasp-top10-2017-ko | 26 | 0.661 | 0.667 | – |
+| owasp-top10-2017-ru | 25 | 0.816 | 0.822 | – |
+| psconf18-jea | 15 | 0.907 | 0.907 | – |
+| psconf19-pscore | 21 | 0.930 | 0.971 | 0.914 |
+| psconf22-chasing-seconds | 21 | 0.903 | 0.904 | – |
+| psconf22-video-processing | 20 | 0.924 | 0.925 | – |
+| covid-infographic-exposed-fr | 1 | 0.726 | 0.726 | – |
+| covid-infographic-hospitalized-fr | 1 | 0.640 | 0.640 | – |
+| covid-infographic-waiting-fr | 1 | 0.787 | 0.787 | – |
+| **alla 33** | 1124 | 0.871 | 0.880 | |

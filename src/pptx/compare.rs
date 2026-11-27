@@ -286,7 +286,7 @@ fn powerpoint_reference() {
         .expect("KLADD_PPTX_REFS")
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.join("deck.pptx").exists() && p.join("ref-01.png").exists())
+        .filter(|p| p.join("deck.pptx").exists() && !numbered(p, "ref-").is_empty())
         .filter(|p| decks_filter.is_empty() || decks_filter.iter().any(|d| p.file_name().is_some_and(|n| n.to_string_lossy() == *d)))
         .collect();
     dirs.sort();
@@ -362,4 +362,51 @@ mod tests {
         let c = Gray { w, h, px: (0..w * h).map(|i| if ((i / w) + 1) % 10 < 5 { 0.0 } else { 1.0 }).collect() };
         assert!(similarity(&a, &c) > similarity(&a, &b));
     }
+}
+
+/// Tid per bild (visningslista + raster i 960 × 540) för presentationerna under `KLADD_PPTX_REFS`:
+/// median och sämsta per presentation. Körs för hand:
+/// `KLADD_PPTX_REFS=… cargo test pptx::compare::tid_per_bild -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn tid_per_bild() {
+    let Some(refs) = std::env::var_os("KLADD_PPTX_REFS").map(PathBuf::from) else { return };
+    let decks_filter: Vec<String> = std::env::var("KLADD_PPTX_DECKS").ok().map(|s| s.split(',').map(|x| x.trim().to_owned()).collect()).unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&refs).unwrap().flatten().map(|e| e.path()).filter(|p| p.join("deck.pptx").exists() && !numbered(p, "ref-").is_empty()).collect();
+    dirs.retain(|p| decks_filter.is_empty() || decks_filter.iter().any(|d| p.file_name().is_some_and(|n| n.to_string_lossy() == *d)));
+    dirs.sort();
+    println!("| presentation | öppna (ms) | bild median (ms) | bild sämsta (ms) | varav visningslista, median (ms) |\n|---|---:|---:|---:|---:|");
+    let mut all = Vec::new();
+    for dir in dirs {
+        let bytes = std::fs::read(dir.join("deck.pptx")).unwrap();
+        let t0 = std::time::Instant::now();
+        let Ok(deck) = super::Deck::open(&bytes) else { continue };
+        let open_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut total = Vec::new();
+        let mut scene_t = Vec::new();
+        for i in 0..deck.slides.len() {
+            let t = std::time::Instant::now();
+            let scene = super::render::slide_scene(&deck, i);
+            let s = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = super::raster::render(&scene, 960, 540);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if ms > 3000.0 {
+                let effects = scene.items.iter().filter(|i| matches!(i, super::scene::Item::BeginEffect(_))).count();
+                let images = scene.items.iter().filter(|i| matches!(i, super::scene::Item::Image { .. })).count();
+                println!("  bild {}: {ms:.0} ms (visningslista {s:.0} ms, {effects} effekter, {images} bilder)", i + 1);
+            }
+            total.push(ms);
+            scene_t.push(s);
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let worst = total.iter().copied().fold(0.0, f64::max);
+        all.extend(total.iter().copied());
+        println!("| {} | {open_ms:.0} | {:.0} | {worst:.0} | {:.0} |", dir.file_name().unwrap().to_string_lossy(), med(&mut total), med(&mut scene_t));
+    }
+    let mut all = all;
+    all.sort_by(|a, b| a.total_cmp(b));
+    println!("alla bilder: median {:.0} ms, 95:e percentilen {:.0} ms", all.get(all.len() / 2).unwrap_or(&0.0), all.get(all.len() * 95 / 100).unwrap_or(&0.0));
 }

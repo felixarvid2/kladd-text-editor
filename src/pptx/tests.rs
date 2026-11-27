@@ -371,6 +371,8 @@ fn dump_scene() {
             Item::Svg { t, alpha, .. } => println!("svg t={t:?} alpha={alpha}"),
             Item::PushClip { path } => println!("clip {:?}", path.bounds()),
             Item::PopClip => println!("pop"),
+            Item::BeginEffect(e) => println!("effect {e:?}"),
+            Item::EndEffect => println!("end effect"),
         }
     }
 }
