@@ -349,13 +349,14 @@ pub static ALL: &[Command] = &[
     Command::new("file.new_template", "Ny från mall…", File, "Ctrl+Shift+N", always, |a, _| a.open_templates()),
     Command::new("file.open", "Öppna…", File, "Ctrl+O", always, |a, c| a.request_open(c)),
     Command::new("file.save", "Spara", File, "Ctrl+S", |e| e.has_doc, |a, c| a.cmd_save(c)),
-    Command::new("file.save_as", "Spara som…", File, "Ctrl+Shift+S", |e| e.has_doc && !e.pdf && !e.pptx, |a, c| a.request_save_as(c, a.active, false, false)),
+    Command::new("file.save_as", "Spara som…", File, "Ctrl+Shift+S", |e| e.has_doc && !e.pdf, |a, c| a.request_save_as(c, a.active, false, false)),
     Command::new("file.save_template", "Spara som mall…", File, "", |e| e.has_doc && !e.pdf && !e.pptx, |a, _| a.open_save_template()),
     Command::new("file.save_copy", "Spara kopia…", File, "Ctrl+Shift+S", |e| e.pdf, |a, c| a.request_save_copy(c, a.active)),
     Command::new("file.export_html", "Exportera som webbsida…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "html")),
     Command::new("file.export_epub", "Exportera som e-bok…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "epub")),
     Command::new("file.export_notes", "Exportera anteckningar…", File, "", |e| e.epub, |a, c| a.epub_export_notes(c)),
     Command::new("file.pptx_export_pdf", "Exportera som PDF…", File, "", |e| e.pptx, |a, c| a.pptx_export_pdf(c)).scope(Scope::Pptx),
+    Command::new("file.pptx_edit", "Redigera presentationen", File, "Ctrl+E", |e| e.pptx, |a, _| a.pptx_toggle_edit()).scope(Scope::Pptx),
     Command::new("file.pptx_edit_copy", "Redigera en kopia", File, "", |e| e.pptx, |a, c| a.pptx_action(c, crate::pptx::view::Action::EditCopy)).scope(Scope::Pptx),
     Command::new("file.print", "Skriv ut…", File, "Ctrl+P", |e| e.has_doc, |a, c| a.open_print(c)),
     Command::new("file.history", "Versionshistorik…", File, "", |e| e.has_path && !e.pdf && !e.pptx, |a, c| a.open_history(c)),
@@ -604,7 +605,8 @@ mod tests {
         assert!(get("view.pptx_show").available(&pptx));
         assert!(get("file.pptx_export_pdf").available(&pptx));
         assert!(get("edit.find").available(&pptx));
-        assert!(!get("file.save_as").available(&pptx), "presentationen sparas inte");
+        assert!(get("file.save_as").available(&pptx), "presentationen kan sparas som .pptx");
+        assert!(get("file.pptx_edit").available(&pptx));
         assert!(!get("edit.replace").available(&pptx));
         assert!(!get("insert.image").available(&pptx));
         assert!(!get("view.pptx_show").available(&text));

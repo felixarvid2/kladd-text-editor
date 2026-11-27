@@ -38,6 +38,13 @@ pub mod table_builtin;
 pub mod effects;
 pub mod fills;
 pub mod mtx;
+// Redigering och sparande (w-pedit).
+pub mod edit;
+pub mod edit_ops;
+pub mod edit_text;
+pub mod edit_view;
+pub mod edit_xml;
+pub mod save;
 
 #[cfg(test)]
 mod tests;
@@ -45,6 +52,8 @@ mod tests;
 mod view_tests;
 #[cfg(test)]
 mod chart_tests;
+#[cfg(test)]
+mod edit_tests;
 
 pub use model::Deck;
 

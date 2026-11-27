@@ -1,0 +1,1236 @@
+//! Redigeringsläget i presentationsvyn: markera, flytta, ändra storlek och vrida former med
+//! handtag, ta bort, duplicera och ordna; skriva i former (markör och markering ur textmotorn);
+//! bilder i sidopanelen (ny med layout, duplicera, ta bort, dölja, flytta); anteckningar; infoga
+//! textruta och bild; ångra/gör om och sparande. Ändringarna görs i `edit.rs`/`edit_ops.rs`.
+//!
+//! Medan en form dras ritas bara dess kontur; ändringen görs när musen släpps. Text ändras direkt
+//! (en ombyggnad per tangent) och bilden renderas om i bakgrunden.
+
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::Arc;
+use std::time::Duration;
+
+use egui::{Align2, Color32, CursorIcon, Event, FontFamily, FontId, Id, Key, Modifiers, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
+
+use super::edit::Session;
+use super::edit_ops::{self, Kind, Order, ShapeInfo, Xf};
+use super::edit_text::{Carets, Pos, TextModel};
+use super::edit_xml;
+use super::view::PptxTab;
+use super::Deck;
+use crate::i18n::t;
+use crate::theme::Palette;
+
+/// En markerad form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sel {
+    pub slide: usize,
+    pub index: usize,
+    pub id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Grip {
+    Move,
+    /// Handtag 0–7 medurs från övre vänstra hörnet.
+    Handle(u8),
+    Rotate,
+}
+
+struct Drag {
+    grip: Grip,
+    shape: ShapeInfo,
+    start: (f32, f32),
+    cur: Xf,
+}
+
+/// Text under redigering.
+pub struct TextState {
+    pub sel: Sel,
+    pub model: TextModel,
+    pub caret: Pos,
+    pub anchor: Pos,
+    carets: Option<Carets>,
+    /// Dras en markering med musen?
+    selecting: bool,
+}
+
+/// Redigeringstillståndet i en presentationsflik.
+pub struct Editor {
+    pub session: Session,
+    /// Redigeringsläget är på (annars visning).
+    pub on: bool,
+    pub sel: Option<Sel>,
+    drag: Option<Drag>,
+    pub text: Option<TextState>,
+    /// Anteckningarna under redigering (bild, text).
+    notes: Option<(usize, String)>,
+    /// Meddelanden till appen (text, fel?).
+    pub notices: Vec<(String, bool)>,
+    picture: Option<Receiver<Option<PathBuf>>>,
+    /// Miniatyr som dras i sidopanelen (bild, pekarens y).
+    thumb_drag: Option<(usize, f32)>,
+    /// Formerna på bilden (cache: presentationens adress, bild).
+    shapes: Option<(usize, usize, Vec<ShapeInfo>)>,
+    /// Redigeringslagrets id: det har tangentbordsfokus medan en form är markerad, så att Tab och
+    /// pilarna går till redigeringen och inte flyttar fokus mellan knapparna.
+    overlay: Option<Id>,
+}
+
+impl Editor {
+    pub fn new(source: Vec<u8>, deck: &Deck) -> Editor {
+        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None }
+    }
+}
+
+/// Handtagens storlek (punkter på skärmen).
+const HANDLE: f32 = 7.0;
+/// Rotationshandtagets avstånd ovanför formen.
+const ROT_GAP: f32 = 22.0;
+/// Pilstegen i EMU (1 pt, med Skift 10 pt).
+const NUDGE: i64 = 12_700;
+
+/// Ledtexten för en tom platshållare.
+fn prompt(ph: &str) -> &'static str {
+    match ph {
+        "title" | "ctrTitle" => t("Klicka för att lägga till rubrik"),
+        "subTitle" => t("Klicka för att lägga till underrubrik"),
+        _ => t("Klicka för att lägga till text"),
+    }
+}
+
+impl PptxTab {
+    /// Är redigeringsläget på?
+    pub fn editing(&self) -> bool {
+        self.edit.on
+    }
+
+    /// Finns osparade ändringar?
+    pub fn unsaved(&self) -> bool {
+        self.edit.session.dirty()
+    }
+
+    /// Slår på/av redigeringsläget.
+    pub fn toggle_edit(&mut self) {
+        self.edit.on = !self.edit.on;
+        if !self.edit.on {
+            self.end_text();
+            self.edit.sel = None;
+            self.edit.drag = None;
+        }
+    }
+
+    /// Redigeringslagrets id (för att skilja dess fokus från textfältens).
+    pub(super) fn edit_focus_id(&self) -> Option<Id> {
+        self.edit.overlay
+    }
+
+    /// Formerna på bild `slide` (cachade per presentation).
+    pub(super) fn shapes_on(&mut self, slide: usize) -> Vec<ShapeInfo> {
+        let key = Arc::as_ptr(&self.deck) as usize;
+        if let Some((k, s, v)) = &self.edit.shapes {
+            if *k == key && *s == slide {
+                return v.clone();
+            }
+        }
+        let v = edit_ops::shapes(&self.deck, slide);
+        self.edit.shapes = Some((key, slide, v.clone()));
+        v
+    }
+
+    fn shape_of(&mut self, sel: Sel) -> Option<ShapeInfo> {
+        self.shapes_on(sel.slide).into_iter().find(|s| s.index == sel.index && s.id == sel.id)
+    }
+
+    /// Gör en ändring och byter till den nya presentationen. Falskt om inget ändrades eller det
+    /// inte gick (felet blir en notis).
+    pub fn apply(&mut self, merge: Option<String>, f: impl FnOnce(&mut super::edit::Txn) -> Result<(), String>) -> bool {
+        let deck = self.deck.clone();
+        match self.edit.session.apply(&deck, merge, f) {
+            Ok(Some(a)) => {
+                if a.signature_removed {
+                    self.edit.notices.push((t("Presentationen var digitalt signerad. Signaturen togs bort eftersom filen ändrades.").to_owned(), false));
+                }
+                self.set_deck(a.deck);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                self.edit.notices.push((e, true));
+                false
+            }
+        }
+    }
+
+    /// Byter presentation efter en ändring: bilder som ändrats renderas om, registret och
+    /// anteckningarna läses om.
+    pub(super) fn set_deck(&mut self, deck: Deck) {
+        let old = self.deck.clone();
+        let same_layout = old.slides.len() == deck.slides.len() && old.slides.iter().zip(&deck.slides).all(|(a, b)| a.part == b.part);
+        let changed: Vec<usize> = if same_layout {
+            (0..deck.slides.len())
+                .filter(|&i| {
+                    let p = &deck.slides[i].part;
+                    match (old.pkg.parts.get(p), deck.pkg.parts.get(p)) {
+                        (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                        _ => true,
+                    }
+                })
+                .collect()
+        } else {
+            (0..deck.slides.len()).collect()
+        };
+        self.deck = Arc::new(deck);
+        self.invalidate(&changed, !same_layout);
+        self.notes_changed();
+        let n = self.count();
+        if n > 0 && self.current >= n {
+            self.current = n - 1;
+        }
+        if let Some(s) = self.edit.sel {
+            if s.slide >= n {
+                self.edit.sel = None;
+            }
+        }
+        // Markörlägena gäller den nya presentationen.
+        if let Some(ts) = &mut self.edit.text {
+            ts.carets = edit_ops::node(&self.deck, ts.sel.slide, ts.sel.index).and_then(|node| ts.model.carets(&self.deck, ts.sel.slide, node));
+        }
+    }
+
+    pub fn undo(&mut self, redo: bool) {
+        self.end_text();
+        self.edit.drag = None;
+        let deck = self.deck.clone();
+        let r = if redo { self.edit.session.redo(&deck) } else { self.edit.session.undo(&deck) };
+        match r {
+            Ok(Some(d)) => {
+                self.set_deck(d);
+                // Markeringen kan ha försvunnit.
+                if let Some(s) = self.edit.sel {
+                    if self.shape_of(s).is_none() {
+                        self.edit.sel = None;
+                    }
+                }
+                self.edit.notes = None;
+            }
+            Ok(None) => {}
+            Err(e) => self.edit.notices.push((e, true)),
+        }
+    }
+
+    /// Filens innehåll för att spara som `ext` (filen hade `from_ext`).
+    pub fn save_bytes(&mut self, ext: &str, from_ext: &str) -> Result<Vec<u8>, String> {
+        // Man kan fortsätta skriva efter sparningen (också den automatiska); nästa tangent blir ett nytt ångra-steg.
+        self.edit.session.break_merge();
+        let deck = self.deck.clone();
+        let (bytes, rebuilt) = self.edit.session.save_bytes(&deck, ext, from_ext)?;
+        if let Some(d) = rebuilt {
+            self.set_deck(d);
+        }
+        Ok(bytes)
+    }
+
+    pub fn mark_saved(&mut self, bytes: Vec<u8>) {
+        self.edit.session.mark_saved(bytes);
+    }
+
+    // ---------------------------------------------------------------- text
+
+    /// Börjar skriva i formen (markören sist, eller vid punkten).
+    pub fn begin_text(&mut self, sel: Sel, at: Option<(f32, f32)>) {
+        let Some(info) = self.shape_of(sel) else { return };
+        if info.kind != Kind::Shape || info.alternate {
+            return;
+        }
+        let Some(bytes) = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec) else { return };
+        let Some(doc) = edit_xml::parse(&bytes) else {
+            self.edit.notices.push((t("Bilden kan inte ändras (XML som inte är UTF-8).").to_owned(), true));
+            return;
+        };
+        let Some(sp) = edit_ops::raw_shape(&doc, sel.index) else { return };
+        let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
+        let model = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), &a);
+        let carets = edit_ops::node(&self.deck, sel.slide, sel.index).and_then(|n| model.carets(&self.deck, sel.slide, n));
+        let mut caret = model.end();
+        if let (Some(c), Some((x, y))) = (&carets, at) {
+            if let Some(p) = c.hit(x, y) {
+                caret = p;
+            }
+        }
+        self.edit.sel = Some(sel);
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false });
+    }
+
+    /// Slutar skriva (formen förblir markerad).
+    pub fn end_text(&mut self) {
+        if self.edit.text.take().is_some() {
+            self.edit.session.break_merge();
+        }
+    }
+
+    /// Skriver modellen till bilden (ett ångra-steg per textruta och skrivstund).
+    fn commit_text(&mut self) {
+        let Some(ts) = &self.edit.text else { return };
+        let (sel, model) = (ts.sel, ts.model.clone());
+        let ok = self.apply(Some(format!("text:{}:{}", sel.slide, sel.id)), |txn| edit_ops::set_text(txn, sel.slide, sel.index, sel.id, &model));
+        let _ = ok;
+    }
+
+    /// Tangenter och text medan man skriver i en form. Händelserna som hanteras tas bort ur kön.
+    fn text_keys(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|i| i.events.clone());
+        let mut handled = Vec::new();
+        for (k, ev) in events.iter().enumerate() {
+            let Some(ts) = &mut self.edit.text else { break };
+            let mut changed = false;
+            let sel_range = (ts.anchor.min(ts.caret), ts.anchor.max(ts.caret));
+            let has_sel = ts.anchor != ts.caret;
+            match ev {
+                Event::Text(s) | Event::Paste(s) if !s.is_empty() => {
+                    let s = s.replace("\r\n", "\n");
+                    let at = if has_sel { ts.model.delete(sel_range.0, sel_range.1) } else { ts.caret };
+                    ts.caret = ts.model.insert(at, &s);
+                    ts.anchor = ts.caret;
+                    changed = true;
+                    handled.push(k);
+                }
+                Event::Ime(egui::ImeEvent::Commit(s)) if !s.is_empty() => {
+                    let at = if has_sel { ts.model.delete(sel_range.0, sel_range.1) } else { ts.caret };
+                    ts.caret = ts.model.insert(at, s);
+                    ts.anchor = ts.caret;
+                    changed = true;
+                    handled.push(k);
+                }
+                Event::Copy | Event::Cut => {
+                    if has_sel {
+                        ctx.copy_text(ts.model.slice(sel_range.0, sel_range.1));
+                        if matches!(ev, Event::Cut) {
+                            ts.caret = ts.model.delete(sel_range.0, sel_range.1);
+                            ts.anchor = ts.caret;
+                            changed = true;
+                        }
+                    }
+                    handled.push(k);
+                }
+                Event::Key { key, pressed: true, modifiers, .. } => {
+                    let m = *modifiers;
+                    let shift = m.shift;
+                    let word = m.command || m.alt && cfg!(target_os = "macos");
+                    let mv = |ts: &mut TextState, p: Pos| {
+                        ts.caret = p;
+                        if !shift {
+                            ts.anchor = p;
+                        }
+                    };
+                    match key {
+                        Key::ArrowLeft | Key::ArrowRight => {
+                            let fwd = *key == Key::ArrowRight;
+                            let p = if has_sel && !shift {
+                                if fwd { sel_range.1 } else { sel_range.0 }
+                            } else if word {
+                                ts.model.word(ts.caret, fwd)
+                            } else {
+                                ts.model.step(ts.caret, fwd)
+                            };
+                            mv(ts, p);
+                            handled.push(k);
+                        }
+                        Key::ArrowUp | Key::ArrowDown => {
+                            let dir = if *key == Key::ArrowUp { -1 } else { 1 };
+                            let p = ts.carets.as_ref().and_then(|c| c.vertical(ts.caret, dir)).unwrap_or(if dir < 0 { Pos::default() } else { ts.model.end() });
+                            mv(ts, p);
+                            handled.push(k);
+                        }
+                        Key::Home | Key::End => {
+                            let end = *key == Key::End;
+                            let p = if m.command {
+                                if end { ts.model.end() } else { Pos::default() }
+                            } else {
+                                ts.carets.as_ref().and_then(|c| c.line_edge(ts.caret, end)).unwrap_or(ts.caret)
+                            };
+                            mv(ts, p);
+                            handled.push(k);
+                        }
+                        Key::Backspace | Key::Delete => {
+                            let fwd = *key == Key::Delete;
+                            let (a, b) = if has_sel {
+                                sel_range
+                            } else {
+                                let o = if word { ts.model.word(ts.caret, fwd) } else { ts.model.step(ts.caret, fwd) };
+                                (ts.caret.min(o), ts.caret.max(o))
+                            };
+                            ts.caret = ts.model.delete(a, b);
+                            ts.anchor = ts.caret;
+                            changed = true;
+                            handled.push(k);
+                        }
+                        Key::Enter => {
+                            let at = if has_sel { ts.model.delete(sel_range.0, sel_range.1) } else { ts.caret };
+                            ts.caret = if shift { ts.model.insert_break(at) } else { ts.model.split_para(at) };
+                            ts.anchor = ts.caret;
+                            changed = true;
+                            handled.push(k);
+                        }
+                        Key::Tab if !m.command => {
+                            // Nivå i punktlistor när markören står först i stycket eller flera stycken är markerade.
+                            if shift || has_sel && sel_range.0.para != sel_range.1.para || ts.caret.ch == 0 {
+                                ts.model.indent(sel_range.0, sel_range.1, if shift { -1 } else { 1 });
+                            } else {
+                                ts.caret = ts.model.insert(ts.caret, "\t");
+                                ts.anchor = ts.caret;
+                            }
+                            changed = true;
+                            handled.push(k);
+                        }
+                        Key::A if m.command => {
+                            ts.anchor = Pos::default();
+                            ts.caret = ts.model.end();
+                            handled.push(k);
+                        }
+                        Key::B | Key::I | Key::U if m.command && !shift => {
+                            let attr = match key {
+                                Key::B => "b",
+                                Key::I => "i",
+                                _ => "u",
+                            };
+                            ts.model.toggle(ts.anchor, ts.caret, attr);
+                            changed = true;
+                            handled.push(k);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            if changed {
+                self.commit_text();
+            }
+        }
+        if !handled.is_empty() {
+            ctx.input_mut(|i| {
+                let mut k = 0;
+                i.events.retain(|_| {
+                    let keep = !handled.contains(&k);
+                    k += 1;
+                    keep
+                });
+            });
+        }
+        let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+        if key(Modifiers::NONE, Key::Escape) {
+            self.end_text();
+        }
+    }
+
+    // ---------------------------------------------------------------- tangenter
+
+    /// Tangenterna i redigeringsläget. Körs före vyns egna; tangenter som används tas bort.
+    pub(super) fn edit_keys(&mut self, ctx: &egui::Context) {
+        let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+        let cmd = Modifiers::COMMAND;
+        if key(cmd, Key::E) {
+            self.toggle_edit();
+            return;
+        }
+        let overlay = self.edit.overlay;
+        if !self.edit.on || ctx.memory(|m| m.focused().is_some_and(|f| Some(f) != overlay)) {
+            return;
+        }
+        // Ctrl+Skift+Z före Ctrl+Z: `consume_key` bryr sig inte om extra Skift.
+        if key(cmd | Modifiers::SHIFT, Key::Z) || key(cmd, Key::Y) {
+            self.undo(true);
+            return;
+        }
+        if key(cmd, Key::Z) {
+            self.undo(false);
+            return;
+        }
+        if key(cmd, Key::M) {
+            let layout = self.deck.slides.get(self.current).and_then(|s| s.layout).unwrap_or(0);
+            self.new_slide(layout);
+            return;
+        }
+        if self.edit.text.is_some() {
+            self.text_keys(ctx);
+            return;
+        }
+        let shapes = self.shapes_on(self.current);
+        let sel = self.edit.sel.filter(|s| s.slide == self.current);
+        if key(Modifiers::SHIFT, Key::Tab) || key(Modifiers::NONE, Key::Tab) {
+            let back = ctx.input(|i| i.modifiers.shift);
+            if !shapes.is_empty() {
+                let pos = sel.and_then(|s| shapes.iter().position(|x| x.index == s.index));
+                let n = shapes.len();
+                let next = match pos {
+                    Some(p) if back => (p + n - 1) % n,
+                    Some(p) => (p + 1) % n,
+                    None if back => n - 1,
+                    None => 0,
+                };
+                let s = &shapes[next];
+                self.edit.sel = Some(Sel { slide: self.current, index: s.index, id: s.id });
+            }
+            return;
+        }
+        let Some(sel) = sel else { return };
+        if key(Modifiers::NONE, Key::Escape) {
+            self.edit.sel = None;
+            return;
+        }
+        if key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace) {
+            self.delete_selected();
+            return;
+        }
+        if key(cmd, Key::D) {
+            self.duplicate_selected();
+            return;
+        }
+        if key(Modifiers::NONE, Key::Enter) || key(Modifiers::NONE, Key::F2) {
+            self.begin_text(sel, None);
+            return;
+        }
+        let mut d = (0i64, 0i64);
+        for (k, v) in [(Key::ArrowLeft, (-1, 0)), (Key::ArrowRight, (1, 0)), (Key::ArrowUp, (0, -1)), (Key::ArrowDown, (0, 1))] {
+            if key(Modifiers::SHIFT, k) {
+                d = (v.0 * 10, v.1 * 10);
+            } else if key(Modifiers::NONE, k) {
+                d = v;
+            }
+        }
+        if d != (0, 0) {
+            if let Some(info) = self.shape_of(sel) {
+                let xf = Xf { x: info.xf.x + d.0 * NUDGE, y: info.xf.y + d.1 * NUDGE, ..info.xf };
+                self.apply(Some(format!("nudge:{}:{}", sel.slide, sel.id)), |txn| edit_ops::set_xf(txn, sel.slide, sel.index, sel.id, xf));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- åtgärder
+
+    pub fn delete_selected(&mut self) {
+        let Some(sel) = self.edit.sel else { return };
+        self.end_text();
+        if self.apply(None, |txn| edit_ops::delete_shape(txn, sel.slide, sel.index, sel.id)) {
+            self.edit.sel = None;
+        }
+    }
+
+    pub fn duplicate_selected(&mut self) {
+        let Some(sel) = self.edit.sel else { return };
+        self.end_text();
+        let mut new = None;
+        if self.apply(None, |txn| {
+            new = Some(edit_ops::duplicate_shape(txn, sel.slide, sel.index, sel.id)?);
+            Ok(())
+        }) {
+            if let Some(i) = new {
+                let s = self.shapes_on(sel.slide).into_iter().find(|s| s.index == i);
+                self.edit.sel = s.map(|s| Sel { slide: sel.slide, index: s.index, id: s.id });
+            }
+        }
+    }
+
+    pub fn reorder_selected(&mut self, order: Order) {
+        let Some(sel) = self.edit.sel else { return };
+        self.end_text();
+        let before: Vec<u32> = self.shapes_on(sel.slide).iter().map(|s| s.id).collect();
+        if self.apply(None, |txn| edit_ops::reorder_shape(txn, sel.slide, sel.index, sel.id, order)) {
+            let _ = before;
+            let s = self.shapes_on(sel.slide).into_iter().find(|s| s.id == sel.id);
+            self.edit.sel = s.map(|s| Sel { slide: sel.slide, index: s.index, id: s.id });
+        }
+    }
+
+    /// Ny bild efter aktuell med layouten.
+    pub fn new_slide(&mut self, layout: usize) {
+        self.end_text();
+        let after = (self.count() > 0).then_some(self.current);
+        let mut at = 0;
+        if self.apply(None, |txn| {
+            at = edit_ops::new_slide(txn, after, layout)?;
+            Ok(())
+        }) {
+            self.edit.sel = None;
+            self.go_to(at);
+        }
+    }
+
+    pub fn duplicate_slide(&mut self, i: usize) {
+        self.end_text();
+        if self.apply(None, |txn| edit_ops::duplicate_slide(txn, i).map(|_| ())) {
+            self.go_to(i + 1);
+        }
+    }
+
+    pub fn delete_slide(&mut self, i: usize) {
+        self.end_text();
+        self.edit.sel = None;
+        if self.apply(None, |txn| edit_ops::delete_slide(txn, i)) {
+            self.go_to(i.min(self.count().saturating_sub(1)));
+        }
+    }
+
+    pub fn move_slide(&mut self, from: usize, to: usize) {
+        self.end_text();
+        self.edit.sel = None;
+        if self.apply(None, |txn| edit_ops::move_slide(txn, from, to)) {
+            self.go_to(to);
+        }
+    }
+
+    pub fn toggle_hidden(&mut self, i: usize) {
+        let hidden = self.deck.slides.get(i).is_some_and(|s| s.hidden);
+        self.apply(None, |txn| edit_ops::set_hidden(txn, i, !hidden));
+    }
+
+    /// Ny textruta mitt på bilden; man skriver direkt i den.
+    pub fn insert_textbox(&mut self) {
+        self.end_text();
+        let slide = self.current;
+        let (w, h) = self.deck.size_emu;
+        let xf = Xf { x: w / 4, y: h * 2 / 5, cx: w / 2, cy: 457_200, ..Default::default() };
+        let mut idx = 0;
+        if self.apply(None, |txn| {
+            idx = edit_ops::insert_textbox(txn, slide, xf)?;
+            Ok(())
+        }) {
+            self.edit.on = true;
+            if let Some(s) = self.shapes_on(slide).into_iter().find(|s| s.index == idx) {
+                self.begin_text(Sel { slide, index: s.index, id: s.id }, None);
+            }
+        }
+    }
+
+    /// Frågar efter en bild (PNG/JPEG/GIF) att infoga på aktuell bild.
+    pub fn begin_insert_picture(&mut self, ctx: &egui::Context, dir: Option<PathBuf>) {
+        if self.edit.picture.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.edit.picture = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().set_title(t("Infoga bild")).add_filter(t("Bilder"), &["png", "jpg", "jpeg", "gif"]);
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let _ = tx.send(dlg.pick_file());
+            ctx.request_repaint();
+        });
+    }
+
+    /// Infogar en bild ur en fil.
+    pub fn insert_picture_file(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.edit.notices.push((crate::doc::describe_io_error(&e, path), true));
+                return;
+            }
+        };
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let slide = self.current;
+        let mut idx = 0;
+        if self.apply(None, |txn| {
+            idx = edit_ops::insert_picture(txn, slide, bytes, &name)?;
+            Ok(())
+        }) {
+            self.edit.on = true;
+            self.end_text();
+            if let Some(s) = self.shapes_on(slide).into_iter().find(|s| s.index == idx) {
+                self.edit.sel = Some(Sel { slide, index: s.index, id: s.id });
+            }
+        }
+    }
+
+    /// Tar emot bilddialogens svar och appens notiser.
+    pub fn poll_edit(&mut self) -> Vec<(String, bool)> {
+        if let Some(rx) = &self.edit.picture {
+            match rx.try_recv() {
+                Ok(Some(p)) => {
+                    self.edit.picture = None;
+                    self.insert_picture_file(&p);
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => self.edit.picture = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        std::mem::take(&mut self.edit.notices)
+    }
+
+    // ---------------------------------------------------------------- ritning och mus
+
+    /// Redigeringslagret över bilden `slide` i `rect` (skärmkoordinater).
+    pub(super) fn edit_overlay(&mut self, ui: &mut Ui, rect: Rect, slide: usize, p: &Palette) {
+        if !self.edit.on {
+            // Dubbelklick på en form startar redigeringen.
+            let resp = ui.interact(rect, Id::unique(("kladd-pptx-view", slide)), Sense::click());
+            if resp.double_clicked() {
+                if let Some(pt) = resp.interact_pointer_pos() {
+                    let (sw, _) = self.deck.size_pt();
+                    let k = rect.width() / sw.max(1.0);
+                    let (x, y) = ((pt.x - rect.left()) / k, (pt.y - rect.top()) / k);
+                    self.edit.on = true;
+                    if let Some(s) = self.shapes_on(slide).into_iter().rev().find(|s| s.hit(x, y, 2.0)) {
+                        let sel = Sel { slide, index: s.index, id: s.id };
+                        self.edit.sel = Some(sel);
+                        if s.kind == Kind::Shape && !s.alternate {
+                            self.begin_text(sel, Some((x, y)));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let (sw, _) = self.deck.size_pt();
+        let k = rect.width() / sw.max(1.0);
+        let to_screen = |x: f32, y: f32| pos2(rect.left() + x * k, rect.top() + y * k);
+        let to_slide = |pt: Pos2| ((pt.x - rect.left()) / k, (pt.y - rect.top()) / k);
+        let shapes = self.shapes_on(slide);
+        let id = Id::unique(("kladd-pptx-edit", slide));
+        self.edit.overlay = Some(id);
+        let resp = ui.interact(rect.expand(ROT_GAP + HANDLE), id, Sense::click_and_drag());
+        if resp.is_pointer_button_down_on() {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let sel = self.edit.sel.filter(|s| s.slide == slide);
+        let sel_info = sel.and_then(|s| shapes.iter().find(|x| x.index == s.index && x.id == s.id).cloned());
+        let text_sel = self.edit.text.as_ref().map(|t| t.sel).filter(|s| s.slide == slide);
+
+        // Vad ligger under pekaren?
+        let grip_at = |pt: Pos2, info: &ShapeInfo| -> Option<Grip> {
+            let corners = handle_points(info);
+            for (i, (x, y)) in corners.iter().enumerate() {
+                if to_screen(*x, *y).distance(pt) <= HANDLE + 2.0 && info.kind != Kind::Connector || to_screen(*x, *y).distance(pt) <= HANDLE + 2.0 && i % 2 == 0 {
+                    return Some(Grip::Handle(i as u8));
+                }
+            }
+            let (rx, ry) = rot_point(info, ROT_GAP / k);
+            if info.kind != Kind::Frame && to_screen(rx, ry).distance(pt) <= HANDLE + 2.0 {
+                return Some(Grip::Rotate);
+            }
+            None
+        };
+        let hit_shape = |pt: Pos2| -> Option<ShapeInfo> {
+            let (x, y) = to_slide(pt);
+            shapes.iter().rev().find(|s| s.hit(x, y, 3.0 / k)).cloned()
+        };
+
+        // Pekaren.
+        if let Some(pt) = pointer.filter(|pt| rect.expand(ROT_GAP + HANDLE).contains(*pt)) {
+            let cursor = match sel_info.as_ref().and_then(|i| grip_at(pt, i)) {
+                Some(Grip::Rotate) => Some(CursorIcon::Alias),
+                Some(Grip::Handle(h)) => Some(handle_cursor(h, sel_info.as_ref().map_or(0.0, |i| i.xf.rot_deg()))),
+                _ => match hit_shape(pt) {
+                    Some(s) if Some(Sel { slide, index: s.index, id: s.id }) == text_sel => Some(CursorIcon::Text),
+                    Some(_) => Some(CursorIcon::Move),
+                    None => None,
+                },
+            };
+            if let Some(c) = cursor {
+                ui.ctx().set_cursor_icon(c);
+            }
+        }
+
+        // Musen.
+        if resp.drag_started_by(PointerButton::Primary) {
+            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                let start = to_slide(origin);
+                let in_text = text_sel.and_then(|ts| shapes.iter().find(|s| s.index == ts.index)).is_some_and(|s| s.hit(start.0, start.1, 0.0));
+                if in_text {
+                    if let Some(ts) = &mut self.edit.text {
+                        if let Some(p) = ts.carets.as_ref().and_then(|c| c.hit(start.0, start.1)) {
+                            ts.anchor = p;
+                            ts.caret = p;
+                        }
+                        ts.selecting = true;
+                    }
+                } else {
+                    let grip = sel_info.as_ref().and_then(|i| grip_at(origin, i).map(|g| (g, i.clone())));
+                    let target = match grip {
+                        Some(g) => Some(g),
+                        None => hit_shape(origin).map(|s| (Grip::Move, s)),
+                    };
+                    match target {
+                        Some((grip, shape)) => {
+                            if grip == Grip::Move {
+                                self.end_text();
+                            }
+                            self.edit.sel = Some(Sel { slide, index: shape.index, id: shape.id });
+                            self.edit.drag = Some(Drag { grip, cur: shape.xf, shape, start });
+                        }
+                        None => {
+                            self.end_text();
+                            self.edit.sel = None;
+                        }
+                    }
+                }
+            }
+        }
+        if resp.dragged_by(PointerButton::Primary) {
+            if let Some(pt) = ui.input(|i| i.pointer.interact_pos()) {
+                let (x, y) = to_slide(pt);
+                let shift = ui.input(|i| i.modifiers.shift);
+                if let Some(ts) = self.edit.text.as_mut().filter(|t| t.selecting) {
+                    if let Some(p) = ts.carets.as_ref().and_then(|c| c.hit(x, y)) {
+                        ts.caret = p;
+                    }
+                } else if let Some(d) = &mut self.edit.drag {
+                    d.cur = drag_xf(d, (x, y), shift);
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some(ts) = &mut self.edit.text {
+                ts.selecting = false;
+            }
+            if let Some(d) = self.edit.drag.take() {
+                if d.cur != d.shape.xf {
+                    let (index, id, xf) = (d.shape.index, d.shape.id, d.cur);
+                    self.apply(None, |txn| edit_ops::set_xf(txn, slide, index, id, xf));
+                }
+            }
+        }
+        if resp.clicked_by(PointerButton::Primary) {
+            if let Some(pt) = resp.interact_pointer_pos() {
+                let (x, y) = to_slide(pt);
+                let shift = ui.input(|i| i.modifiers.shift);
+                match hit_shape(pt) {
+                    Some(s) if Some(Sel { slide, index: s.index, id: s.id }) == text_sel => {
+                        if let Some(ts) = &mut self.edit.text {
+                            if let Some(p) = ts.carets.as_ref().and_then(|c| c.hit(x, y)) {
+                                ts.caret = p;
+                                if !shift {
+                                    ts.anchor = p;
+                                }
+                            }
+                        }
+                    }
+                    Some(s) => {
+                        let new = Sel { slide, index: s.index, id: s.id };
+                        let again = self.edit.sel == Some(new);
+                        self.end_text();
+                        self.edit.sel = Some(new);
+                        // Ett andra klick på en markerad form med text börjar skriva.
+                        if again && s.kind == Kind::Shape && !s.alternate && (s.text || s.empty_ph) {
+                            self.begin_text(new, Some((x, y)));
+                        }
+                    }
+                    None => {
+                        self.end_text();
+                        self.edit.sel = None;
+                    }
+                }
+            }
+        }
+        if resp.double_clicked() {
+            if let Some(pt) = resp.interact_pointer_pos() {
+                let (x, y) = to_slide(pt);
+                if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate) {
+                    let sel = Sel { slide, index: s.index, id: s.id };
+                    if text_sel != Some(sel) {
+                        self.begin_text(sel, Some((x, y)));
+                    } else if let Some(ts) = &mut self.edit.text {
+                        // Dubbelklick i texten markerar ordet.
+                        let a = ts.model.word(ts.caret, false);
+                        let b = ts.model.word(ts.caret, true);
+                        ts.anchor = Pos { para: ts.caret.para, ch: a.ch.min(ts.caret.ch) };
+                        ts.caret = Pos { para: ts.caret.para, ch: if b.para == ts.caret.para { b.ch } else { ts.model.paras[ts.caret.para].len() } };
+                    }
+                }
+            }
+        }
+        if resp.secondary_clicked() {
+            if let Some(pt) = resp.interact_pointer_pos() {
+                if let Some(s) = hit_shape(pt) {
+                    let new = Sel { slide, index: s.index, id: s.id };
+                    if text_sel != Some(new) {
+                        self.end_text();
+                    }
+                    self.edit.sel = Some(new);
+                }
+            }
+        }
+        let has_sel = self.edit.sel.is_some_and(|s| s.slide == slide);
+        resp.context_menu(|ui| {
+            ui.set_min_width(220.0);
+            ui.set_max_width(240.0);
+            if !has_sel {
+                if crate::app::menu_item(ui, p, t("Infoga textruta"), "", None, true) {
+                    self.insert_textbox();
+                    ui.close();
+                }
+                return;
+            }
+            if crate::app::menu_item(ui, p, t("Redigera text"), "Enter", None, true) {
+                if let Some(sel) = self.edit.sel {
+                    self.begin_text(sel, None);
+                }
+                ui.close();
+            }
+            crate::app::menu_divider(ui, p);
+            for (label, order) in [(t("Längst fram"), Order::Front), (t("Framåt"), Order::Forward), (t("Bakåt"), Order::Backward), (t("Längst bak"), Order::Back)] {
+                if crate::app::menu_item(ui, p, label, "", None, true) {
+                    self.reorder_selected(order);
+                    ui.close();
+                }
+            }
+            crate::app::menu_divider(ui, p);
+            if crate::app::menu_item(ui, p, t("Duplicera"), &crate::keys::shortcut("Ctrl+D"), None, true) {
+                self.duplicate_selected();
+                ui.close();
+            }
+            if crate::app::menu_item(ui, p, t("Ta bort"), "Delete", None, true) {
+                self.delete_selected();
+                ui.close();
+            }
+        });
+
+        self.keep_focus(ui, id, slide);
+        // Ritning.
+        let painter = ui.painter_at(rect.expand(ROT_GAP + HANDLE + 2.0));
+        let accent = p.accent;
+        let outline = |painter: &egui::Painter, info: &ShapeInfo, xf: Xf, stroke: Stroke| {
+            let pts: Vec<Pos2> = corners(info, xf).iter().map(|&(x, y)| to_screen(x, y)).collect();
+            painter.add(Shape::closed_line(pts, stroke));
+        };
+        // Tomma platshållare: streckad ram och ledtext.
+        for s in shapes.iter().filter(|s| s.empty_ph) {
+            if text_sel.is_some_and(|t| t.index == s.index) {
+                continue;
+            }
+            let pts: Vec<Pos2> = corners(s, s.xf).iter().map(|&(x, y)| to_screen(x, y)).collect();
+            for i in 0..4 {
+                painter.add(Shape::dashed_line(&[pts[i], pts[(i + 1) % 4]], Stroke::new(1.0, Color32::from_gray(150)), 4.0, 3.0));
+            }
+            let c = to_screen(s.xf.rect_pt()[0] + s.xf.rect_pt()[2] / 2.0, s.xf.rect_pt()[1] + s.xf.rect_pt()[3] / 2.0);
+            let size = (s.xf.rect_pt()[3] * k * 0.3).clamp(9.0, 22.0);
+            painter.text(c, Align2::CENTER_CENTER, prompt(s.ph.as_deref().unwrap_or("")), FontId::new(size, FontFamily::Proportional), Color32::from_gray(120));
+        }
+        // Formen under pekaren.
+        if let Some(h) = pointer.filter(|_| self.edit.drag.is_none()).and_then(hit_shape) {
+            if sel_info.as_ref().is_none_or(|s| s.index != h.index) {
+                outline(&painter, &h, h.xf, Stroke::new(1.0, accent.gamma_multiply(0.6)));
+            }
+        }
+        // Markeringen med handtag (eller konturen som dras).
+        let show = self.edit.drag.as_ref().map(|d| (d.shape.clone(), d.cur)).or(sel_info.clone().map(|s| (s.clone(), s.xf)));
+        if let Some((info, xf)) = show {
+            let in_text = text_sel.is_some_and(|t| t.index == info.index);
+            let shown = ShapeInfo { xf, ..info.clone() };
+            outline(&painter, &shown, xf, Stroke::new(if in_text { 1.0 } else { 1.5 }, accent));
+            if !in_text {
+                for (i, (x, y)) in handle_points(&shown).into_iter().enumerate() {
+                    if info.kind == Kind::Connector && i % 2 == 1 {
+                        continue;
+                    }
+                    let r = Rect::from_center_size(to_screen(x, y), vec2(HANDLE, HANDLE));
+                    painter.rect_filled(r, 1.5, Color32::WHITE);
+                    painter.rect_stroke(r, 1.5, Stroke::new(1.2, accent), egui::StrokeKind::Middle);
+                }
+                if info.kind != Kind::Frame {
+                    let (rx, ry) = rot_point(&shown, ROT_GAP / k);
+                    let top = handle_points(&shown)[1];
+                    painter.line_segment([to_screen(top.0, top.1), to_screen(rx, ry)], Stroke::new(1.0, accent));
+                    painter.circle(to_screen(rx, ry), HANDLE / 2.0 + 1.0, Color32::WHITE, Stroke::new(1.2, accent));
+                }
+            }
+        }
+        // Texten: markering och markör.
+        if let Some(ts) = self.edit.text.as_ref().filter(|t| t.sel.slide == slide) {
+            if let Some(c) = &ts.carets {
+                if ts.anchor != ts.caret {
+                    for q in c.selection(ts.anchor, ts.caret) {
+                        let pts: Vec<Pos2> = q.iter().map(|&(x, y)| to_screen(x, y)).collect();
+                        painter.add(Shape::convex_polygon(pts, accent.gamma_multiply(0.3), Stroke::NONE));
+                    }
+                }
+                if let Some((a, b)) = c.caret(ts.caret) {
+                    let blink = ui.input(|i| i.time) % 1.0 < 0.6;
+                    if blink {
+                        painter.line_segment([to_screen(a.0, a.1), to_screen(b.0, b.1)], Stroke::new(1.5, p.text));
+                    }
+                    ui.ctx().request_repaint_after(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+
+    /// Håller tangentbordsfokus på redigeringslagret medan något är markerat (se `Editor::overlay`).
+    fn keep_focus(&self, ui: &Ui, id: Id, slide: usize) {
+        let active = self.edit.text.is_some() || self.edit.sel.is_some_and(|s| s.slide == slide);
+        ui.memory_mut(|m| {
+            if active {
+                if m.focused().is_none() {
+                    m.request_focus(id);
+                }
+                if m.has_focus(id) {
+                    m.set_focus_lock_filter(id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true });
+                }
+            } else if m.has_focus(id) {
+                m.surrender_focus(id);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- anteckningar
+
+    /// Anteckningarna som ett textfält (redigeringsläget). Ändringar sparas direkt i presentationen.
+    pub(super) fn notes_editor(&mut self, ui: &mut Ui, p: &Palette) {
+        let i = self.current;
+        let fresh = !matches!(&self.edit.notes, Some((s, _)) if *s == i);
+        let id = Id::unique(("kladd-pptx-notes-edit", i));
+        let focused = ui.ctx().memory(|m| m.has_focus(id));
+        if fresh || !focused {
+            let cur = super::notes::notes_text(&self.deck, i);
+            if fresh || self.edit.notes.as_ref().is_some_and(|(_, t)| *t != cur) {
+                self.edit.notes = Some((i, cur));
+            }
+        }
+        let Some((_, text)) = &mut self.edit.notes else { return };
+        let before = text.clone();
+        let resp = ui.add(
+            egui::TextEdit::multiline(text)
+                .id(id)
+                .hint_text(t("Klicka för att lägga till anteckningar"))
+                .desired_width(f32::INFINITY)
+                .desired_rows(4)
+                .frame(egui::Frame::NONE)
+                .font(FontId::new(14.0, FontFamily::Proportional))
+                .text_color(p.text),
+        );
+        if resp.changed() && *text != before {
+            let text = text.clone();
+            self.apply(Some(format!("notes:{i}")), |txn| edit_ops::set_notes(txn, i, &text));
+        }
+    }
+
+    // ---------------------------------------------------------------- sidopanelen
+
+    /// Högerklicksmenyn för en miniatyr.
+    pub(super) fn slide_menu(&mut self, ui: &mut Ui, p: &Palette, i: usize) {
+        ui.set_min_width(240.0);
+        ui.set_max_width(260.0);
+        ui.menu_button(t("Ny bild"), |ui| {
+            self.layout_items(ui, p, Some(i));
+        });
+        if crate::app::menu_item(ui, p, t("Duplicera bilden"), "", None, true) {
+            self.duplicate_slide(i);
+            ui.close();
+        }
+        if crate::app::menu_item(ui, p, t("Ta bort bilden"), "", None, self.count() > 1) {
+            self.delete_slide(i);
+            ui.close();
+        }
+        let hidden = self.deck.slides.get(i).is_some_and(|s| s.hidden);
+        if crate::app::menu_item(ui, p, if hidden { t("Visa bilden") } else { t("Dölj bilden") }, "", None, true) {
+            self.toggle_hidden(i);
+            ui.close();
+        }
+        crate::app::menu_divider(ui, p);
+        if crate::app::menu_item(ui, p, t("Flytta upp"), "", None, i > 0) {
+            self.move_slide(i, i - 1);
+            ui.close();
+        }
+        if crate::app::menu_item(ui, p, t("Flytta ned"), "", None, i + 1 < self.count()) {
+            self.move_slide(i, i + 1);
+            ui.close();
+        }
+    }
+
+    /// Mallens layouter som menyval ("Ny bild").
+    pub(super) fn layout_items(&mut self, ui: &mut Ui, p: &Palette, after: Option<usize>) {
+        ui.set_max_width(260.0);
+        let names: Vec<String> = self.deck.layouts.iter().enumerate().map(|(k, l)| l.root.child("p:cSld").and_then(|c| c.attr("name")).filter(|n| !n.is_empty()).map(str::to_owned).unwrap_or_else(|| crate::tf!("Layout {n}", n = k + 1))).collect();
+        for (k, name) in names.iter().enumerate() {
+            if crate::app::menu_item(ui, p, name, "", None, true) {
+                if let Some(a) = after {
+                    self.current = a;
+                }
+                self.new_slide(k);
+                ui.close();
+            }
+        }
+        if names.is_empty() {
+            ui.label(t("Presentationen har inga layouter."));
+        }
+    }
+
+    /// Dra miniatyrer för att ändra ordning: `resp` är radens svar, `row` dess rektangel.
+    pub(super) fn thumb_drag(&mut self, ui: &Ui, i: usize, resp: &egui::Response, row: Rect, p: &Palette) {
+        if !self.edit.on {
+            return;
+        }
+        if resp.drag_started() {
+            self.edit.thumb_drag = Some((i, row.center().y));
+        }
+        if let Some((from, _)) = self.edit.thumb_drag {
+            if let Some(pt) = ui.input(|inp| inp.pointer.interact_pos()) {
+                self.edit.thumb_drag = Some((from, pt.y));
+                // Infogningslinjen över eller under raden pekaren står på.
+                if row.y_range().contains(pt.y) && from != i {
+                    let y = if pt.y < row.center().y { row.top() } else { row.bottom() };
+                    ui.painter().hline(row.x_range(), y, Stroke::new(2.5, p.accent));
+                }
+            }
+            if resp.drag_stopped() || (from == i && ui.input(|inp| inp.pointer.any_released())) {
+                let y = self.edit.thumb_drag.map_or(0.0, |d| d.1);
+                self.edit.thumb_drag = None;
+                ui.ctx().data_mut(|d| d.insert_temp(Id::unique("kladd-pptx-thumb-drop"), (from, y)));
+            }
+        }
+    }
+
+    /// Avslutar en dragning av miniatyrer: `rows` är radernas rektanglar (bild, rektangel).
+    pub(super) fn thumb_drop(&mut self, ctx: &egui::Context, rows: &[(usize, Rect)]) {
+        let Some((from, y)) = ctx.data_mut(|d| d.remove_temp::<(usize, f32)>(Id::unique("kladd-pptx-thumb-drop"))) else { return };
+        let Some(&(i, r)) = rows.iter().find(|(_, r)| r.y_range().contains(y)) else { return };
+        let mut to = if y < r.center().y { i } else { i + 1 };
+        if to > from {
+            to -= 1;
+        }
+        if to != from {
+            self.move_slide(from, to.min(self.count().saturating_sub(1)));
+        }
+    }
+}
+
+/// Formens hörn (bildens punkter) för placeringen `xf`.
+fn corners(info: &ShapeInfo, xf: Xf) -> [(f32, f32); 4] {
+    let s = ShapeInfo { xf, ..info.clone() };
+    let t = s.affine();
+    let [_, _, w, h] = xf.rect_pt();
+    [t.apply(0.0, 0.0), t.apply(w, 0.0), t.apply(w, h), t.apply(0.0, h)]
+}
+
+/// Handtagen 0–7 (medurs från övre vänstra hörnet).
+fn handle_points(info: &ShapeInfo) -> [(f32, f32); 8] {
+    let t = info.affine();
+    let [_, _, w, h] = info.xf.rect_pt();
+    let l = [(0.0, 0.0), (w / 2.0, 0.0), (w, 0.0), (w, h / 2.0), (w, h), (w / 2.0, h), (0.0, h), (0.0, h / 2.0)];
+    l.map(|(x, y)| t.apply(x, y))
+}
+
+fn rot_point(info: &ShapeInfo, gap: f32) -> (f32, f32) {
+    let [_, _, w, _] = info.xf.rect_pt();
+    info.affine().apply(w / 2.0, -gap)
+}
+
+fn handle_cursor(h: u8, rot: f32) -> CursorIcon {
+    let step = ((rot / 45.0).round() as i32).rem_euclid(8) as u8;
+    match (h + step) % 4 {
+        0 => CursorIcon::ResizeNwSe,
+        1 => CursorIcon::ResizeVertical,
+        2 => CursorIcon::ResizeNeSw,
+        _ => CursorIcon::ResizeHorizontal,
+    }
+}
+
+/// Den nya placeringen när ett handtag dras till punkten `pt` (bildens punkter). Storleksändringen
+/// görs i formens egna (vridna) koordinater med motsatt kant fast; Skift behåller proportionerna
+/// (hörn) eller vrider i steg om 15°.
+fn drag_xf(d: &Drag, pt: (f32, f32), shift: bool) -> Xf {
+    let o = d.shape.xf;
+    let emu = |v: f32| (v as f64 * super::model::EMU_PER_PT).round() as i64;
+    let [x, y, w, h] = o.rect_pt();
+    let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+    match d.grip {
+        Grip::Move => {
+            let (mut dx, mut dy) = (pt.0 - d.start.0, pt.1 - d.start.1);
+            if shift {
+                // Skift: bara vågrätt eller lodrätt.
+                if dx.abs() > dy.abs() { dy = 0.0 } else { dx = 0.0 }
+            }
+            Xf { x: o.x + emu(dx), y: o.y + emu(dy), ..o }
+        }
+        Grip::Rotate => {
+            let mut a = (pt.1 - cy).atan2(pt.0 - cx).to_degrees() + 90.0;
+            if shift {
+                a = (a / 15.0).round() * 15.0;
+            }
+            let a = a.rem_euclid(360.0);
+            Xf { rot: ((a * 60000.0).round() as i64) % 21_600_000, ..o }
+        }
+        Grip::Handle(hd) => {
+            // Punkten i formens ursprungliga, ovridna koordinater.
+            let th = -o.rot_deg().to_radians();
+            let (px, py) = (pt.0 - cx, pt.1 - cy);
+            let (u, v) = (px * th.cos() - py * th.sin() + w / 2.0, px * th.sin() + py * th.cos() + h / 2.0);
+            let (mut u0, mut v0, mut u1, mut v1) = (0.0f32, 0.0f32, w, h);
+            match hd {
+                0 => (u0, v0) = (u, v),
+                1 => v0 = v,
+                2 => (u1, v0) = (u, v),
+                3 => u1 = u,
+                4 => (u1, v1) = (u, v),
+                5 => v1 = v,
+                6 => (u0, v1) = (u, v),
+                _ => u0 = u,
+            }
+            const MIN: f32 = 2.0;
+            if u1 - u0 < MIN {
+                if matches!(hd, 0 | 6 | 7) { u0 = u1 - MIN } else { u1 = u0 + MIN }
+            }
+            if v1 - v0 < MIN {
+                if matches!(hd, 0 | 1 | 2) { v0 = v1 - MIN } else { v1 = v0 + MIN }
+            }
+            if shift && hd % 2 == 0 && w > 0.0 && h > 0.0 {
+                let s = ((u1 - u0) / w).max((v1 - v0) / h);
+                let (nw, nh) = (w * s, h * s);
+                if matches!(hd, 0 | 6) { u0 = u1 - nw } else { u1 = u0 + nw }
+                if matches!(hd, 0 | 2) { v0 = v1 - nh } else { v1 = v0 + nh }
+            }
+            let (nw, nh) = (u1 - u0, v1 - v0);
+            // Den nya mittpunkten tillbaka till bilden.
+            let (lx, ly) = ((u0 + u1) / 2.0 - w / 2.0, (v0 + v1) / 2.0 - h / 2.0);
+            let r = o.rot_deg().to_radians();
+            let (ncx, ncy) = (cx + lx * r.cos() - ly * r.sin(), cy + lx * r.sin() + ly * r.cos());
+            Xf { x: emu(ncx - nw / 2.0), y: emu(ncy - nh / 2.0), cx: emu(nw), cy: emu(nh), ..o }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drag(grip: Grip, xf: Xf) -> Drag {
+        let shape = ShapeInfo { index: 0, id: 1, name: String::new(), kind: Kind::Shape, xf, ph: None, text: true, empty_ph: false, alternate: false };
+        Drag { grip, shape, start: (0.0, 0.0), cur: xf }
+    }
+
+    const PT: i64 = 12_700;
+
+    #[test]
+    fn storleksandring_med_fast_motsatt_horn() {
+        let xf = Xf { x: 100 * PT, y: 100 * PT, cx: 200 * PT, cy: 100 * PT, ..Default::default() };
+        // Nedre högra hörnet till (400, 300): övre vänstra står kvar.
+        let n = drag_xf(&drag(Grip::Handle(4), xf), (400.0, 300.0), false);
+        assert_eq!((n.x, n.y, n.cx, n.cy), (100 * PT, 100 * PT, 300 * PT, 200 * PT));
+        // Med Skift: proportionerna 2:1 behålls.
+        let n = drag_xf(&drag(Grip::Handle(4), xf), (400.0, 300.0), true);
+        assert_eq!((n.cx, n.cy), (400 * PT, 200 * PT));
+        // Vänsterkanten förbi högerkanten: minsta bredd, högerkanten står kvar.
+        let n = drag_xf(&drag(Grip::Handle(7), xf), (500.0, 150.0), false);
+        assert_eq!(n.x + n.cx, 300 * PT);
+    }
+
+    #[test]
+    fn storleksandring_av_vriden_form_och_vridning() {
+        // 90° vriden: formens högerkant pekar nedåt på bilden.
+        let xf = Xf { x: 0, y: 0, cx: 200 * PT, cy: 100 * PT, rot: 90 * 60000, ..Default::default() };
+        // Mitt (100, 50); högerkantens handtag ligger vid (100, 150). Dra det 50 pt nedåt.
+        let n = drag_xf(&drag(Grip::Handle(3), xf), (100.0, 200.0), false);
+        assert_eq!(n.cx, 250 * PT);
+        assert_eq!(n.cy, 100 * PT);
+        // Mitten flyttas 25 pt nedåt: (100, 75).
+        assert_eq!((n.x + n.cx / 2, n.y + n.cy / 2), (100 * PT, 75 * PT));
+        let r = drag_xf(&drag(Grip::Rotate, Xf { rot: 0, ..xf }), (200.0, 50.0), false);
+        assert_eq!(r.rot, 90 * 60000);
+        let r = drag_xf(&drag(Grip::Rotate, Xf { rot: 0, ..xf }), (190.0, 20.0), true);
+        assert_eq!(r.rot % (15 * 60000), 0, "Skift: steg om 15°");
+    }
+}

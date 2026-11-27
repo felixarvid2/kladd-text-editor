@@ -171,8 +171,9 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 Sammanställt efter omgång 2 (detaljer i respektive avsnitt nedan):
 
-- **Redigering:** presentationen kan inte ändras eller sparas (de råa delarna behålls i `Package` för senare
-  källbevarande redigering).
+- **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
+  SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
+  understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
 - **Visning:** bildövergångar, animeringar, föredragsvy, länkar i bildspelet, markering av text på bilden;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
@@ -516,3 +517,83 @@ LibreOffice-rendering är Kladd nu närmare PowerPoint på 573 av 632 bilder (53
 | covid-infographic-hospitalized-fr | 1 | 0.640 | 0.640 | – |
 | covid-infographic-waiting-fr | 1 | 0.787 | 0.787 | – |
 | **alla 33** | 1124 | 0.871 | 0.880 | |
+
+## Redigering och sparande (omgång 3)
+
+Presentationen kan ändras i redigeringsläget och sparas källbevarande. Moduler:
+
+| Modul | Gränssnitt |
+|---|---|
+| `edit_xml.rs` | Förlustfri XML: `parse(&[u8]) -> XDoc` (UTF-8; UTF-16 och trasig XML ger `None`, delen redigeras inte), `XElem` med normaliserade namn (`p:sp` oavsett prefix, samma tabell som `xml.rs`) och originalets start-/sluttaggar, text och kommentarer; `to_bytes()` ger byte för byte samma del om inget ändrats. En attributändring skriver bara om den taggen. Nya element skapas som text med dokumentets prefix (`XDoc::fragment`, `ensure_prefix`). |
+| `edit.rs` | `Session` (utgångsläget: zip-filen som öppnades eller sparades, rörda delar, ångra/gör om som ögonblicksbilder av de delar ett steg ändrade, sammanslagen skrivning inom 1,5 s, `dirty`), `Txn` (delar tolkade för ändring, relationer `add_rel`/`remove_rel`, innehållstyper `ct_override`/`ct_default`, unika delnamn som aldrig återanvänds), `save_bytes(deck, ext)` och `mark_saved`. Efter varje ändring byggs `Deck` om ur de nya delarna (`Deck::from_package` med typsnitt och bildcachar från den förra), så ritmodellen tolkas alltid ur samma byte som sparas. |
+| `save.rs` | `write_zip(base, pkg, touched)`: originalets poster i ordning, orörda (och rörda men lika) kopieras komprimerade som de är (`raw_copy_file`), ändrade skrivs om, borttagna utelämnas, nya läggs sist. |
+| `edit_ops.rs` | Former: `shapes(deck, bild)` (toppnivåformer med ärvd placering för träffprov), `set_xf`, `delete_shape`, `duplicate_shape`, `reorder_shape`, `insert_textbox`, `insert_picture`, `set_text`. Bilder: `new_slide(after, layout)`, `duplicate_slide`, `delete_slide`, `move_slide`, `set_hidden`. `set_notes`. |
+| `edit_text.rs` | `TextModel` (stycken med `a:pPr`, körningar med `a:rPr`, `a:br`, fält och okända element som följer med), redigering med `Pos { para, ch }`, `write_into` (orörda stycken skrivs som de var), `carets` → `Carets` (markör, markering, upp/ned, radens början/slut, träff). |
+| `edit_view.rs` | `Editor` i `PptxTab` (redigeringsläget, markering, dragning, text, anteckningar), lagret över bilden, tangenterna, sidopanelens meny och dragning. |
+
+- **Former adresseras** med läget bland bildens toppnivåformer i ritmodellen och `p:cNvPr/@id` som kontroll (id kan
+  förekomma två gånger i verkliga filer). I den förlustfria XML:en räknas ett `mc:AlternateContent` som så många
+  former som dess valda gren har (samma val som `xml.rs`); en sådan form flyttas i alla grenar (samma id), tas bort
+  och dupliceras som helhet, men dess text redigeras inte.
+- **Schemaordning:** `a:xfrm` först i `spPr` (skapas när placeringen ärvdes från layouten, med ärvda värden),
+  `p:txBody` före `p:extLst`, `sldIdLst` efter mall-/anteckningsmall-/utdelningslistorna, `notesMasterIdLst` direkt
+  efter `sldMasterIdLst`, `a:pPr` först och `a:endParaRPr` sist i `a:p`.
+- **Ta bort form:** kopplingar (`a:stCxn`/`a:endCxn`) till formen tas bort, effekter i `p:timing` som riktar sig mot
+  den (`p:spTgt/@spid`) och `p:bldP` likaså; blir en referens kvar (t.ex. en utlösare) tas hela tidsträdet bort.
+- **Duplicera form:** nya id (samma nya id i alla grenar), `a16:creationId` tas bort, förskjutning 0,25 tum.
+  Grafiska ramar med diagram/SmartArt/OLE vägras (de skulle dela delar).
+- **Ny bild:** layoutens platshållare utom datum, sidfot, bildnummer och sidhuvud, tomma (`p:spPr` tom, `p:txBody`
+  med ett tomt stycke om layoutens har text). `sldId` = största + 1 (minst 256); bilden läggs i samma avsnitt
+  (`p14:sectionLst`) som bilden före. `docProps/app.xml` `Slides` räknas om.
+- **Ta bort bild:** `sldId`, relationen, delen, dess relationer och innehållstyp, anteckningssidan, länkar från andra
+  delar (relationen och `a:hlinkClick`/`a:hlinkHover` med det id:t), anpassade visningar och avsnitt; delar som bara
+  bilden använde (media, diagram) tas bort om ingen annan relation pekar på dem.
+- **Duplicera bild:** delen och dess relationer kopieras; layout, media, länkar och teman delas; anteckningssidan,
+  diagram, SmartArt-delar och inbäddningar kopieras (med samma relations-id, så XML:en behöver inte ändras);
+  `p14:creationId` får ett nytt värde.
+- **Flytta bild:** `sldId` flyttas; i avsnitten flyttar bilden till grannens avsnitt.
+- **Anteckningar:** brödtextplatshållaren får en körning per rad med formateringen från första körningen. Saknas
+  anteckningssidan skapas den (bildplatshållare och brödtext, relationer åt båda hållen); saknas anteckningsmallen
+  skapas en enkel mall med en kopia av första mallens tema.
+- **Spara:** `Ctrl+S` → `Document::save_to` → `PptxTab::save_bytes(filändelse)`. Innehållstypen för
+  `presentation.xml` ändras bara när filändelsen byter format (`.pptx`/`.ppsx`/`.potx` och makrovarianterna; till ett
+  format utan makron tas `vbaProject` bort). Digitala signaturer (`_xmlsignatures/`, ursprungsrelationen och
+  innehållstyperna) tas bort vid första ändringen. En `.ppt` som konverterats kräver *Spara som* (`needs_save_as`).
+  Automatisk sparning går genom `save_to`; `autosave.rs` mäter tystnad med textens kontrollsumma, som för en
+  presentation alltid är tom, så den sparar ~3 s efter att fliken blivit ändrad (också mitt i skrivandet; man kan
+  fortsätta skriva, sparningen avslutar bara ångra-sammanslagningen). Återställning efter krasch (`recovery.rs`)
+  sparar text och hoppar över presentationer.
+- **Markören:** `text::layout_carets` är samma utläggning som `text::layout` och ger dessutom markörlägen (klustrens
+  början, radbrytningar och styckenas slut; `Seg` vet vilken körning och vilket tecken det börjar i).
+  `TextModel::carets` bygger textramen som `render::Builder::text_body`/`place_text` (arv, `bodyPr`, geometrins
+  textrektangel, vridning, lodrät text) med en körning per modellens del. Provet `markorlagen_foljer_texten` jämför
+  med glyfernas lägen i den ritade bilden. Höger-till-vänster: markören står vid klustrens logiska ordning (ungefärligt).
+- **Rendering under redigering:** `Pool` har en version per bild; en ändrad bild renderas om i bakgrunden och den
+  gamla texturen visas tills den nya är klar (en äldre rendering ersätter aldrig en nyare). Ändras antalet eller
+  ordningen släpps alla texturer. Sökregistret byggs om.
+- **Prov** (`edit_tests.rs`, egen fixtur med tema, mall, två layouter, anteckningar och anteckningsmall, animering,
+  grupp, `mc:AlternateContent`, länk mellan bilder, avsnitt, `customXml` och en okänd del): tur och retur utan
+  ändring (samma delar i samma ordning, också för alla korpusfiler, och förlustfri XML för varje del), ändrad text
+  (formatering kvar, alla andra delar byte för byte lika), flytta/storlek (också ärvd placering och grupp), ångra/
+  gör om, ta bort form (animering städas) och duplicera (nya id), ordning, `mc:AlternateContent`, ny bild med
+  layout (avsnitt, `app.xml`), ta bort bild (länkar, anteckningar, media), flytta/duplicera/dölja bild, anteckningar
+  med och utan mall, infoga textruta och bild, signaturer, format, sammanslagen skrivning och markörlägen. Varje
+  sparad fil går genom `validate` (zip läsbar, varje del har innehållstyp och varje `Override` en del, relationernas
+  ägare och mål finns, alla `r:id`/`r:embed` finns bland delens relationer, unika form-id per bild, `sldId` ≥ 256 och
+  unika, avsnitten nämner bara bilder som finns, Kladd öppnar filen). Ignorerade prov: `validera_fil`
+  (`KLADD_PPTX_VALIDATE=fil`) och `redigera_alla` (`KLADD_PPTX_SWEEP=mapp`, `KLADD_PPTX_SWEEP_OUT=mapp`: varje
+  presentation sparas oförändrad, redigeras i fem steg, kontrolleras, öppnas och renderas).
+- `validate` kontrollerar också sluttaggarnas namn och att alla prefix är deklarerade (med `quick_xml::NsReader`):
+  `edit_xml` och `xml.rs` släpper igenom båda. Det hittade två fel som är rättade: ett `a:endParaRPr` som blev
+  `a:rPr` behöll sin sluttagg, och en fil som deklarerar `a:` bara på enskilda element fick nya element med ett
+  odeklarerat prefix (nu deklareras det på roten).
+- **Resultat:** `redigera_alla` på hela materialet under `pptx/downloads` (543 `.pptx`, med python-pptx-, POI-,
+  Open-XML-SDK- och ShapeCrawler-proven): oförändrad sparning ger samma delar i alla, och efter sex redigeringar
+  (flytta, skriva/backsteg/Enter/fetstil, ny bild, anteckningar, duplicera, ta bort) går alla igenom `validate`
+  (utöver fel som originalet redan hade), öppnas igen och renderas. python-pptx öppnar alla redigerade filer vars
+  original den öppnar (de som inte öppnas är ISO Strict-filer och en trasig krasch-provfil, som python-pptx inte
+  heller öppnar i original). LibreOffice 24.2 (`soffice --convert-to pdf`) konverterade 34 av 40 slumpvis valda
+  redigerade filer; de 6 andra konverteras inte heller i original (kontrollerat för 4). Jämförelseprovet mot
+  PowerPoint är oförändrat för alla 1 124 bilder (medel 0,8842, samma värde per bild som `integ2`).
+- **Inte kontrollerat mot PowerPoint** (finns inte i behållaren), så att PowerPoint öppnar filerna utan
+  reparationsdialog är inte bevisat; ordningen i schemat och relationerna är gjorda för det.

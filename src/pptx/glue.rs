@@ -71,6 +71,17 @@ impl KladdApp {
         if let Some(tab) = self.docs.get_mut(self.active).and_then(|d| d.pptx.as_deref_mut()) {
             tab.find_bar(ctx, p, prefs, anchor);
         }
+        // Redigeringen: bilddialogen, notiser och ändrat-läget (fråga vid stängning, • i fliken).
+        let mut notices = Vec::new();
+        for d in &mut self.docs {
+            if let Some(tab) = d.pptx.as_deref_mut() {
+                notices.extend(tab.poll_edit());
+                d.dirty = tab.unsaved();
+            }
+        }
+        for (text, err) in notices {
+            self.notify(ctx, text, err);
+        }
         // Exporten fortsätter även om man byter flik.
         for d in &mut self.docs {
             if let Some(tab) = d.pptx.as_deref_mut()
@@ -125,6 +136,55 @@ impl KladdApp {
             Action::ExportPdf => self.pptx_export_pdf(ctx),
             Action::Print => self.open_print(ctx),
             Action::Show(from_current) => self.pptx_start_show(ctx, from_current),
+            Action::InsertPicture => self.pptx_insert_picture(ctx),
+        }
+    }
+
+    /// Infoga bild (redigeringsläget slås på).
+    pub(crate) fn pptx_insert_picture(&mut self, ctx: &egui::Context) {
+        let dir = self.docs.get(self.active).and_then(|d| d.path.as_ref()).and_then(|p| p.parent().map(std::path::Path::to_path_buf)).or_else(|| self.start_dir());
+        if let Some(tab) = self.pptx_tab_mut() {
+            tab.begin_insert_picture(ctx, dir);
+        }
+    }
+
+    /// *Spara som* för en presentation: .pptx, .ppsx (bildspel) eller .potx (mall), och varianterna
+    /// med makron om filen har makron.
+    pub(super) fn request_save_as_pptx(&mut self, ctx: &egui::Context, idx: usize, then_close: bool, exit: bool) {
+        let Some(doc) = self.docs.get(idx) else { return };
+        let ext = doc.extension();
+        let ext = if crate::pptx::is_ext(&ext) { ext } else { "pptx".to_owned() };
+        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| doc.title());
+        let name = format!("{stem}.{ext}");
+        let dir = doc.path.as_ref().and_then(|p| p.parent().map(std::path::Path::to_path_buf)).or_else(|| self.start_dir());
+        let doc_id = doc.id;
+        let macros = ext.ends_with('m');
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dialog = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title(t("Spara som"))
+                .set_file_name(name)
+                .add_filter(t("PowerPoint-presentation (.pptx)"), &["pptx"])
+                .add_filter(t("PowerPoint-bildspel (.ppsx)"), &["ppsx"])
+                .add_filter(t("PowerPoint-mall (.potx)"), &["potx"]);
+            if macros {
+                dlg = dlg.add_filter(t("Med makron (.pptm, .ppsm, .potm)"), &["pptm", "ppsm", "potm"]);
+            }
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let path = dlg.save_file();
+            let _ = tx.send(super::DialogResult::SaveAs { doc_id, path, then_close, exit });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Slår på/av redigeringsläget (kommandot och menyn).
+    pub(crate) fn pptx_toggle_edit(&mut self) {
+        if let Some(tab) = self.pptx_tab_mut() {
+            tab.toggle_edit();
         }
     }
 

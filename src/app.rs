@@ -838,7 +838,7 @@ impl KladdApp {
             return;
         }
         if doc.pptx.is_some() {
-            self.notify(ctx, t("Presentationen visas bara; den kan inte sparas från Kladd än."), false);
+            self.request_save_as_pptx(ctx, idx, then_close, exit);
             return;
         }
         let (tx, rx) = channel();
@@ -884,6 +884,10 @@ impl KladdApp {
     }
 
     pub(crate) fn request_insert_image(&mut self, ctx: &egui::Context) {
+        if self.pptx_mode() && self.dialog.is_none() {
+            self.pptx_insert_picture(ctx);
+            return;
+        }
         if self.dialog.is_some() || self.docs.is_empty() || self.pdf_mode() || self.epub_mode() || self.pptx_mode() {
             return;
         }
@@ -957,10 +961,6 @@ impl KladdApp {
         }
         if doc.epub.is_some() {
             self.notify(ctx, t("Boken sparas inte. Använd Redigera en kopia för att ändra texten."), false);
-            return;
-        }
-        if doc.pptx.is_some() {
-            self.notify(ctx, t("Presentationen visas bara; den kan inte sparas från Kladd än."), false);
             return;
         }
         let Some(path) = doc.path.clone().filter(|_| !doc.needs_save_as()) else {

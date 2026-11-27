@@ -107,11 +107,13 @@ pub struct Deck {
     /// `ppt/tableStyles.xml`.
     #[allow(dead_code)]
     pub table_styles: Option<Node>,
-    pub fonts: FontBook,
+    /// Typsnitten (delas med en ombyggd presentation efter en redigering, se `from_package`).
+    pub fonts: Arc<FontBook>,
     /// SmartArt-ritdelar efter delnamn.
     pub drawings: HashMap<String, Drawing>,
-    images: Mutex<ImageCache>,
-    svgs: Mutex<HashMap<String, Option<Arc<resvg::usvg::Tree>>>>,
+    /// Avkodade bilder och SVG; delas mellan ombyggnader (delnamn återanvänds aldrig för annat innehåll).
+    images: Arc<Mutex<ImageCache>>,
+    svgs: Arc<Mutex<HashMap<String, Option<Arc<resvg::usvg::Tree>>>>>,
 }
 
 /// Grovt innehåll på en bild (för jämförelseprovet och statusraden).
@@ -131,7 +133,12 @@ fn rel_target<'a>(rels: &'a [Rel], kind: &str) -> Option<&'a str> {
 impl Deck {
     /// Öppnar en .pptx ur minnet. Fel ger ett meddelande för användaren, aldrig panik.
     pub fn open(bytes: &[u8]) -> Result<Deck, String> {
-        let pkg = Package::open(bytes)?;
+        Self::from_package(Package::open(bytes)?, None)
+    }
+
+    /// Bygger presentationen ur ett paket. `reuse` (presentationen före en redigering) ger typsnitten
+    /// (om de inbäddade typsnitten är desamma) och bildcacharna, så att en ombyggnad går fort.
+    pub fn from_package(pkg: Package, reuse: Option<&Deck>) -> Result<Deck, String> {
         let root_rels = pkg.rels("");
         let pres_part = package::rel_of_kind(&root_rels, "officeDocument")
             .map(|r| r.target.clone())
@@ -163,10 +170,10 @@ impl Deck {
             themes: Vec::new(),
             embedded_fonts: Vec::new(),
             table_styles: rel_target(&pres_rels, "tableStyles").and_then(|p| pkg.xml(p)),
-            fonts: FontBook::default(),
+            fonts: Arc::default(),
             drawings: HashMap::new(),
-            images: Mutex::default(),
-            svgs: Mutex::default(),
+            images: reuse.map(|d| d.images.clone()).unwrap_or_default(),
+            svgs: reuse.map(|d| d.svgs.clone()).unwrap_or_default(),
             pkg,
         };
 
@@ -241,7 +248,10 @@ impl Deck {
                 });
             }
         }
-        deck.fonts = FontBook::with_embedded(&deck.pkg, &deck.embedded_fonts);
+        deck.fonts = match reuse.filter(|d| same_fonts(d, &deck)) {
+            Some(old) => old.fonts.clone(),
+            None => Arc::new(FontBook::with_embedded(&deck.pkg, &deck.embedded_fonts)),
+        };
         Ok(deck)
     }
 
@@ -394,6 +404,14 @@ impl Deck {
         });
         f
     }
+}
+
+/// Samma inbäddade typsnitt (namn, delar och delarnas innehåll) i båda presentationerna?
+fn same_fonts(a: &Deck, b: &Deck) -> bool {
+    a.embedded_fonts.len() == b.embedded_fonts.len()
+        && a.embedded_fonts.iter().zip(&b.embedded_fonts).all(|(x, y)| {
+            x.typeface == y.typeface && x.parts == y.parts && x.parts.iter().flatten().all(|p| a.pkg.read(p) == b.pkg.read(p))
+        })
 }
 
 /// Avkodade bilder, högst `IMAGE_CACHE_BYTES` (de minst nyligen använda släpps; bilder som en

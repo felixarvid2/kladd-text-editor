@@ -387,7 +387,7 @@ fn paint_desc(p: &Paint) -> String {
 }
 
 #[test]
-fn presentationsflik_skriver_aldrig_over_filen() {
+fn presentationsflik_sparas_bara_som_presentation() {
     let dir = std::env::temp_dir().join(format!("kladd-pptx-flik-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("prov.pptx");
@@ -396,12 +396,37 @@ fn presentationsflik_skriver_aldrig_over_filen() {
     let mut doc = crate::doc::Document::load(1, &path).unwrap();
     assert!(doc.pptx.is_some() && !doc.dirty);
     assert_eq!(doc.language(), "PowerPoint");
-    // Ett kommando som ändrar texten gör inte fliken ändrad, och sparning vägras.
+    // Ett kommando som ändrar texten gör inte fliken ändrad; sparning utan ändringar ger samma delar,
+    // och en fil som inte är en presentation vägras.
     doc.text.push_str("skräp");
     doc.on_edited();
     assert!(!doc.dirty && doc.text.is_empty());
-    assert!(doc.save_to(&path).is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), bytes, "filen är orörd");
+    assert!(!doc.needs_save_as());
+    assert!(doc.save_to(&dir.join("prov.docx")).is_err());
+    assert!(doc.save_to(&path).unwrap().is_empty());
+    let parts = |b: &[u8]| {
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(b.to_vec())).unwrap();
+        (0..z.len()).map(|i| {
+            let mut f = z.by_index(i).unwrap();
+            let mut v = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut v).unwrap();
+            (f.name().to_owned(), v)
+        }).collect::<Vec<_>>()
+    };
+    assert_eq!(parts(&std::fs::read(&path).unwrap()), parts(&bytes), "samma delar");
+    // En ändring gör fliken ändrad; sparningen skriver den.
+    let tab = doc.pptx.as_deref_mut().unwrap();
+    assert!(tab.apply(None, |t| super::edit_ops::set_hidden(t, 0, true)));
+    doc.on_edited();
+    assert!(doc.dirty);
+    doc.save_to(&path).unwrap();
+    assert!(!doc.dirty);
+    assert!(Deck::open(&std::fs::read(&path).unwrap()).unwrap().slides[0].hidden);
+    // En .ppt som konverterats kräver Spara som (.pptx).
+    let mut conv = crate::doc::Document::from_converted(3, &dir.join("gammal.ppt"), bytes.clone()).unwrap();
+    assert!(conv.needs_save_as());
+    assert!(conv.save_to(&dir.join("gammal.ppt")).is_err());
+    assert!(conv.save_to(&dir.join("ny.pptx")).is_ok());
     // En trasig .pptx ger ett felmeddelande, ingen panik.
     let bad = dir.join("trasig.pptx");
     std::fs::write(&bad, b"inte en zip").unwrap();

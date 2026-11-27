@@ -452,7 +452,7 @@ impl KladdApp {
         let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(m, k)));
         if !self.word_mode() && hit(ctrl | Modifiers::SHIFT, Key::E) {
             self.toggle_workspace_panel(ctx);
-        } else if !self.word_mode() && hit(ctrl, Key::E) {
+        } else if !self.word_mode() && !self.pptx_mode() && hit(ctrl, Key::E) {
             // I dokumentläget är Ctrl+E "centrera"; där finns snabböppna bara i menyn.
             self.open_quick(ctx);
         }
