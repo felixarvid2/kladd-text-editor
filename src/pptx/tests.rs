@@ -21,7 +21,7 @@ const THEME: &str = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawi
 </a:themeElements></a:theme>"#;
 
 /// Bygger en .pptx med en mall, en layout och bilderna (`p:sld`-innehåll utan rotelement).
-struct Builder {
+pub(super) struct Builder {
     master_tree: String,
     master_extra: String,
     layout_tree: String,
@@ -41,7 +41,7 @@ fn tree(inner: &str) -> String {
 }
 
 impl Builder {
-    fn new() -> Builder {
+    pub(super) fn new() -> Builder {
         // Mallen: rubrik och brödtext med egna nivåstilar.
         let master_tree = sp_ph(2, "Rubrik", r#"<p:ph type="title"/>"#, Some((457200, 274638, 8229600, 1143000)), r#"<p:txBody><a:bodyPr anchor="ctr"/><a:lstStyle/><a:p><a:r><a:t>Rubrik</a:t></a:r></a:p></p:txBody>"#)
             + &sp_ph(3, "Text", r#"<p:ph type="body" idx="1"/>"#, Some((457200, 1600200, 8229600, 4525963)), r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Text</a:t></a:r></a:p></p:txBody>"#)
@@ -58,18 +58,18 @@ impl Builder {
         Builder { master_tree, master_extra, layout_tree, slides: Vec::new(), pres_attrs: String::new(), tails: Vec::new() }
     }
 
-    fn slide(mut self, attrs: &str, inner: &str) -> Builder {
+    pub(super) fn slide(mut self, attrs: &str, inner: &str) -> Builder {
         self.slides.push((attrs.to_owned(), inner.to_owned()));
         self
     }
 
     /// XML efter `p:cSld` på senaste bilden (`p:transition`, `p:timing`).
-    fn tail(mut self, xml: &str) -> Builder {
+    pub(super) fn tail(mut self, xml: &str) -> Builder {
         self.tails.push((self.slides.len().saturating_sub(1), xml.to_owned()));
         self
     }
 
-    fn build(&self) -> Vec<u8> {
+    pub(super) fn build(&self) -> Vec<u8> {
         let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let opt = zip::write::SimpleFileOptions::default();
         let mut put = |name: &str, data: &str| {

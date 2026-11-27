@@ -175,8 +175,8 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
   understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** länkar och åtgärdsknappar i bildspelet, video/ljud (kommandona finns: *Utlösare …, omgång 4*), morph som riktig
-  forminterpolering, föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
+- **Visning:** länkar och åtgärdsknappar i bildspelet, video/ljud (kommandona finns: *Utlösare …, omgång 4*),
+  föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
 - **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
@@ -643,9 +643,9 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
 - **Referensmaterialet:** 257 bilder har övergångar (toning 147, genom svart/`p14:reveal` 81, torka 18, push 11) och
   614 klick-steg; alla 1 081 mål hittas i visningslistan (`anim_layers::tests::referensmaterialets_animeringar`,
   ignorerat, `KLADD_PPTX_REFS`).
-- **Kvar:** morph som forminterpolering, `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i
-  betoningar (kräver omrendering), ljud och video (själva uppspelningen; kommandona ges ut, se omgång 4), val av
-  skärm. (`iterate` och utlösare gjordes i omgång 4.)
+- **Kvar:** `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i betoningar (kräver
+  omrendering), ljud och video (själva uppspelningen; kommandona ges ut, se omgång 4), val av skärm. (Morph,
+  `iterate` och utlösare gjordes i omgång 4.)
 
 ## 3D i diagram och former (omgång 3)
 
@@ -867,3 +867,43 @@ in-effekt, att allt utan ut-effekt syns till slut (en uppdelad text ritas då so
 **Kvar:** utlösare på former i grupper, på layouten och på text inom stycken (delar av text som utlösare); `p:bldP`
 `animBg`; `iterate type="el"` (element, ritas som en effekt för hela texten); fler än en klickgrupp i en utlösare
 (alla spelas vid ett klick); färgbyten i delar; uppspelningen av ljud och video (en annan omgång).
+
+## Morph (omgång 4)
+
+`p159:morph` är ett eget övergångsslag (`transition::Kind::Morph(MorphBy)`) i stället för reservens toning.
+`xml.rs` väljer nu `mc:Choice Requires="p159"` (namnrymd `http://schemas.microsoft.com/office/powerpoint/2015/09/main`);
+alla 65 `p159`-användningar i referensmaterialet är `p159:morph`. Utan `p14:dur` är längden två sekunder (PowerPoints
+standard; filen skriver bara `spd="slow"`). `byWord` och `byChar` tolkas men paras som `byObject`.
+
+`morph.rs`:
+
+- **Parning** (`pair`, ur toppnivåformerna i bildens formträd, `infos`): namn som börjar med `!!` paras bara mot samma namn;
+  därefter samma namn och samma slag (form, textruta, bild, grupp, tabell, diagram, annat); flera med samma namn paras
+  en till en efter samma bild/geometri och text, sedan ordningen; sist omdöpta former av samma slag: samma bild
+  (bilder), samma text (textrutor) eller samma geometri och text (övriga). Tomma namnlösa former paras inte på måfå.
+- **Ritsteg** (`Plan::ops(p)`): vid mjukat förlopp `e = ease(p)` ligger gamla bildens fasta del (bakgrund, mall, layout)
+  under den nya (alfa `e`), därefter den gamla bildens former i sin ordning och den nya bildens i sin, den nya ovanpå.
+  Ett par flyttas från sitt läge till det andras (mitt, storlek, vridning närmaste vägen; `xfrm` när båda har det,
+  annars lagrens omslutande rektangel) med en affin avbildning per form (`morph_map`), den gamla med alfa
+  `min(1, 2(1-e))` och den nya med `min(1, 2e)`: en sida täcker alltid, så en oförändrad form inte blir genomskinlig mitt
+  i, och ändpunkterna är exakta. Former utan par tonar ut (`1-e`) respektive in (`e`). Ordningen gör att p=0 är exakt
+  den gamla bilden och p=1 exakt den nya (±2 per kanal).
+- **Lager** (`Side::build`): `anim_layers::split` med bildspelets animeringsmål och dessutom en hel-form-mål per
+  toppnivåform, så att bildspelets animeringstillstånd (`layer_state`) gäller lagren i båda bilderna (den gamla i vila
+  efter sista steget, den nya i sitt utgångsläge). Lagrens ytor får luft åt sidorna för text, eftersom
+  `anim_layers::extent` räknar textbredd för snävt (sista tecknet kapades). `anim_layers.rs` är oförändrad.
+- **Bildspelet** (`presenter.rs`): `paint_morph` ritar stegen med samma `draw_layer` som vanliga bilder (en extra
+  avbildning per steg). Paret (föregående bild, bilden) renderas i bakgrunden när övergången börjar, och i förväg för
+  nästa bild om den morphar (`peek_next`); tills det är klart, eller utan föregående bild, ritas toningen (`transition::pieces`).
+  Bilder utan morph berörs inte.
+
+**Prov** (`morph_tests.rs`): parningsreglerna (egna namn, dubbletter, `!!`, omdöpta), rörelsen (identitet i ändpunkterna,
+mitt, storlek, vridning närmaste vägen), alfa, ändpunkterna mot den statiska renderingen och en mellanbild (`compose` med
+tiny-skia), ordningen. `referensmaterialets_morph` (ignorerat, `KLADD_PPTX_REFS`): alla 65 övergångar i fyra
+presentationer (`msrc-win32k` 24, `ms-copilot-workshop` 37, `msrc-identity` 2, `msrc-eko19` 2) ger ändliga ramar och
+ändpunkter som stämmer (som lager skiljer enstaka kantpunkter där former möts; högst 1 % av bytes över 8); 627 former på de nya
+bilderna, 95 par.
+
+**Kvar:** fyllnadsfärg och linje interpoleras inte (renderingarna tonas i varandra), text som ändras tonas som helhet
+(ingen morph per ord eller tecken), grupper, tabeller och diagram flyttas som en enhet, spegling (`flipH`/`flipV`)
+interpoleras inte, och den nya bildens in-animeringar syns inte under övergången (som övriga övergångar).

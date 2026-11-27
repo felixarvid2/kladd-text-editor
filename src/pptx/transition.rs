@@ -7,7 +7,9 @@
 //! upplösning, hjul, kil) används av animeringarnas in- och ut-effekter (`anim.rs`).
 //!
 //! Övergångar som saknar en enkel motsvarighet (`p14:vortex`, `ripple`, `glitter` …) blir en toning.
-//! Morph (`p159:morph`) kommer som reservens `p:fade` eftersom `p159` inte väljs i `xml.rs`.
+//! Morph (`p159:morph`) är ett eget slag (`Kind::Morph`): `morph.rs` paras ihop formerna och bildspelet
+//! ritar dem som en forminterpolering. Utan färdiga lager (eller utan föregående bild) ritas den som en
+//! toning (`pieces`).
 
 use super::xml::Node;
 
@@ -101,6 +103,17 @@ pub enum Kind {
     Comb { vertical: bool },
     /// Zoom: den nya bilden växer fram (in) eller den gamla krymper bort (ut).
     Zoom { inward: bool },
+    /// Morph: formerna paras ihop och flyttas, ändrar storlek och vrids från den gamla bildens läge till
+    /// den nya (se `morph.rs`).
+    Morph(MorphBy),
+}
+
+/// Vad morph paras ihop efter (`option`). Ord och tecken paras för tillfället som hela objekt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MorphBy {
+    Object,
+    Word,
+    Char,
 }
 
 /// En bilds övergång.
@@ -140,6 +153,9 @@ pub fn parse(n: &Node) -> Transition {
         Some("med") => 0.75,
         _ => 0.5,
     };
+    // Morph har två sekunder som standard i PowerPoint (filen skriver bara `spd`).
+    let is_morph = n.children.iter().any(|c| c.name == "p159:morph");
+    let spd = if is_morph && n.attr("spd") != Some("fast") && n.attr("spd") != Some("med") { 2.0 } else { spd };
     let dur = n.attr_f64("p14:dur").map(|ms| (ms / 1000.0) as f32).unwrap_or(spd).clamp(0.0, 60.0);
     let adv_click = n.attr_bool("advClick").unwrap_or(true);
     let adv_after = n.attr_f64("advTm").map(|ms| (ms / 1000.0) as f32).filter(|t| t.is_finite() && *t >= 0.0);
@@ -189,6 +205,11 @@ fn kind_of(e: &Node) -> Kind {
         "wheel" | "wheelReverse" => Kind::Reveal(Reveal::Wheel { spokes: e.attr_i64("spokes").unwrap_or(4).clamp(1, 16) as u32 }),
         "wedge" => Kind::Reveal(Reveal::Wedge),
         "newsflash" => Kind::Zoom { inward: true },
+        "morph" => Kind::Morph(match e.attr("option") {
+            Some("byWord") => MorphBy::Word,
+            Some("byChar") => MorphBy::Char,
+            _ => MorphBy::Object,
+        }),
         // p14: närmaste enkla.
         "reveal" => Kind::Fade { black: true },
         "conveyor" | "ferris" | "gallery" => Kind::Push(dir(Dir::Left)),
@@ -262,7 +283,7 @@ pub fn pieces(kind: Kind, p: f32, aspect: f32) -> Vec<Piece> {
         Kind::Cut { black: true } => {
             if p < 0.5 { vec![full(Layer::Black, 1.0)] } else { vec![full(Layer::New, 1.0)] }
         }
-        Kind::Fade { black: false } => vec![full(Layer::Old, 1.0), full(Layer::New, p)],
+        Kind::Fade { black: false } | Kind::Morph(_) => vec![full(Layer::Old, 1.0), full(Layer::New, p)],
         Kind::Fade { black: true } => {
             if p < 0.5 {
                 vec![full(Layer::Black, 1.0), full(Layer::Old, 1.0 - p * 2.0)]
@@ -637,10 +658,13 @@ mod tests {
         let t = tr(r#"<mc:AlternateContent><mc:Choice Requires="p14"><p:transition p14:dur="400"><p14:reveal/></p:transition></mc:Choice><mc:Fallback><p:transition><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>"#);
         assert_eq!(t.kind, Kind::Fade { black: true });
         assert!((t.dur - 0.4).abs() < 1e-6);
-        // Morph: reserven (toning) eftersom p159 inte väljs.
+        // Morph väljs ur mc:AlternateContent (reserven är en toning); två sekunder om inget annat sägs.
         let t = tr(r#"<mc:AlternateContent><mc:Choice Requires="p159"><p:transition spd="slow"><p159:morph option="byObject"/></p:transition></mc:Choice><mc:Fallback><p:transition spd="slow"><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>"#);
-        assert_eq!(t.kind, Kind::Fade { black: false });
-        assert_eq!(t.dur, 1.0);
+        assert_eq!(t.kind, Kind::Morph(MorphBy::Object));
+        assert_eq!(t.dur, 2.0);
+        let t = tr(r#"<mc:AlternateContent><mc:Choice Requires="p159"><p:transition p14:dur="750"><p159:morph option="byWord"/></p:transition></mc:Choice><mc:Fallback><p:transition><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>"#);
+        assert_eq!(t.kind, Kind::Morph(MorphBy::Word));
+        assert!((t.dur - 0.75).abs() < 1e-6);
         let t = tr(r#"<mc:AlternateContent><mc:Choice Requires="p14"><p:transition p14:dur="1200"><p14:vortex dir="r"/></p:transition></mc:Choice><mc:Fallback><p:transition><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>"#);
         assert_eq!(t.kind, Kind::Fade { black: false });
         assert!((t.dur - 1.2).abs() < 1e-6);
