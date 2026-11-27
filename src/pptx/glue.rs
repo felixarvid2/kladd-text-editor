@@ -190,7 +190,9 @@ impl KladdApp {
 
     pub(crate) fn pptx_start_show(&mut self, ctx: &egui::Context, from_current: bool) {
         let animate = self.settings.pptx.animate;
+        let dir = self.docs.get(self.active).and_then(|d| d.path.as_ref()).and_then(|p| p.parent()).map(std::path::Path::to_path_buf);
         let Some(tab) = self.pptx_tab_mut() else { return };
+        tab.media_dir = dir;
         if !tab.start_show(from_current, animate) {
             self.notify(ctx, t("Presentationen har inga bilder att visa (alla är dolda)."), false);
         }

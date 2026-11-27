@@ -175,7 +175,7 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
   understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** länkar och åtgärdsknappar i bildspelet, föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
+- **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
@@ -244,8 +244,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
   enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
   `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
-- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3, ljud och video i omgång 4) länkar och åtgärdsknappar i bildspelet, hoppa till bildnummer med siffror + Enter i
-  bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
+- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3, ljud och video i omgång 4, länkar och bildnummer i omgång 5) markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
 - **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
   anteckningar, `.ppt` via LibreOffice, handboken.
 
@@ -917,10 +916,9 @@ cpal-utmatning), `media_video.rs` (ffmpeg), `media_play.rs` (`MediaHub`, ägd av
 gjorda med ffmpeg `sine`/`testsrc`).
 
 - **Källa:** `p14:media/@r:embed` före `r:link` (länken är ofta en död extern `Target="NULL"`). Länkade filer spelas om de
-  finns som sökväg eller `file:`-adress (relativa sökvägar mot presentationen är inte kopplade: `Deck` känner inte
-  filens plats). `p14:trim/@st` och `@end` är millisekunder som klipps i början respektive slutet (`end` mot
+  finns som sökväg eller `file:`-adress (relativa sökvägar läses från presentationens mapp, omgång 5). `p14:trim/@st` och `@end` är millisekunder som klipps i början respektive slutet (`end` mot
   materialet: `end="113.45"` på en ca 0,3 s lång WAV). `p:cMediaNode`: `vol` (100000 = full), `mute`, `numSld`
-  (antal bildbyten mediet överlever, standard 1), `showWhenStopped` (tolkas, men stillbilden döljs inte efter slutet).
+  (antal bildbyten mediet överlever, standard 1), `showWhenStopped` (döljer formen när mediet inte spelas, omgång 5).
 - **Ljud:** `media_audio::spawn` avkodar i en egen tråd med symphonia (`mp3`, `wav`, `pcm`, `isomp4`, `aac`) och skickar
   stereoblock i en begränsad kö (32 block). Sökning till startpunkten med `SeekMode::Accurate`, annars avkodning och
   kassering. `Mixer` omsamplar linjärt till enhetens takt och kanaler och räknar utmatade bildrutor per röst: det är
@@ -950,6 +948,38 @@ gjorda med ffmpeg `sine`/`testsrc`).
 - **Vid sammanslagning med w-ptrig:** byt `media_model::MediaCmd`/`CmdKind`/`step_commands` mot uppspelningens
   `take_media()` (mata `MediaHub::apply(ctx, slide, cmd)` och ta bort `step_commands`-delen i `on_position`), och låt
   en utlösare som förbrukat ett klick gå före `MediaHub::click`.
-- **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
-  videon bara när ingen övergång pågår och ovanpå lagren); rotation och formens geometri (rundade hörn) för videon;
-  `showWhenStopped`; länkar relativa mot presentationen; ffmpeg i flatpak; spolning av video med ljud utan ffmpeg.
+- **Kvar:** ffmpeg i flatpak; spolning av video med ljud utan ffmpeg (lager, rotation, beskärning, `showWhenStopped` och relativa
+  länkar gjordes i omgång 5, se nedan).
+
+## Länkar, bildnummer och video i lager (omgång 5, w-pshow2)
+
+- **`show_links.rs`** (rent): `of_slide(deck, i) -> SlideLinks`. Områden: formens egen länk (`p:cNvPr/a:hlinkClick|hlinkHover`, träff med
+  `ShapeInfo::hit`, översta formen vinner) och textlänkar (`a:rPr/a:hlinkClick`). Glyfkörningarna känner inte till länkar, så
+  formens körningar paras ihop med dem: körningstexten utan blanktecken letas upp i ordning bland glyfkörningarna vars mitt
+  ligger i formen (`find::slide_text`, `find::hit_rects` ger rektanglarna per körning, exakta per tecken när glyferna går ett
+  till ett). Punkttecken och fält som inte finns i XML-texten hoppas över. Textlänkar går före formlänkar. Bara toppnivåformer
+  (och deras gruppbarns/tabellcellers text) får områden; en länk på ett gruppbarn själv gör det inte.
+- **Åtgärder (`Action`):** `ppaction://hlinkshowjump?jump=` (`nextslide`, `previousslide`, `firstslide`, `lastslide`,
+  `lastslideviewed`, `endshow`), `hlinksldjump` + relation av slag `slide` (mål via delnamn), annars en extern relation: bara
+  `http:`, `https:` och `mailto:` (en presentation ska inte kunna starta filer), öppnas med `platform::open`. `hlinkfile`,
+  `hlinkpres`, `program`, `macro` utförs inte.
+- **`ShowView`:** `click_slide_in` kollar utlösare, media, sedan länk, sedan nästa steg. `hover_trigger` ger handen och utför
+  `hlinkHover` en gång när pekaren kommer in (spärr tills pekaren rört sig, så att två bilder med knappar på samma plats inte
+  studsar). En animerad form som inte syns (`media_opacity` = 0) går inte att klicka. `Playback::goto` hoppar med bildens
+  övergång och animeringar, och `Show::goto` tar med en dold bild i ordningen; `Playback::last_viewed` minns föregående bild.
+- **Bildnummer:** siffror samlas i `ShowView::digits` (högst 5, glöms efter 4 s, ritas nere till vänster); `Enter` hoppar till
+  nummer 1..=antal (position i presentationen, inte `firstSlideNum`), `Backsteg` tar bort en siffra, annan navigering avbryter.
+- **Video i lager:** videoformer får eget lager (`ShowView::layer_targets` lägger dem till de animerade målen, även i morph),
+  så videobilden ritas i `draw_layer` ovanpå formens stillbild i formens ritordning och med dess animeringstillstånd,
+  övergångens flyttning/klippning och morphens förflyttning (`draw_video`: formens rektangel vriden och speglad, beskuren
+  som `Crop::Rect|Ellipse|RoundRect`, andra geometrier ritas som rektangel). `MediaHub::paint` ritar bara kontroller och notis
+  nu. `showWhenStopped="0"`: `hidden_when_stopped` döljer hela lagret när mediet inte spelas (före start, efter slutet; paus
+  räknas som spelande). Mediaformer i grupper får ingen videobild (som förut: `rect_pt` saknas).
+- **Länkade mediefiler:** `media_model::resolve_file` (percent-avkodning, `file:`, Windows-snedstreck, relativt `base_dir`).
+  `PptxTab::media_dir` sätts av `pptx_start_show` ur dokumentets sökväg.
+- **Prov:** `show_links_tests.rs` (länkdäck byggt i provet; åtgärder, textlänkens träffyta, klick, senast visade, siffror +
+  Enter), `media_model::tests`, `media_tests`. Ignorerade `skriv_provfil` (`KLADD_PLINK_OUT`, `KLADD_PMEDIA_OUT`) skriver
+  provpresentationer att titta på för hand.
+- **Kvar:** föredragsvyns val av skärm (winit ger ingen skärmlista via egui här: inte gjort); länkar på gruppbarn och i
+  SmartArt; `hlinkfile`/`hlinkpres`; markering av länkar vid tangentbordsnavigering (Tab); `p:quickTimeFile` som video utan
+  `rect_pt` i grupper; videoformer med andra geometrier än rektangel, rundad rektangel och ellips beskärs som rektangel.

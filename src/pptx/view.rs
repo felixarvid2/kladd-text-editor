@@ -322,6 +322,8 @@ pub struct PptxTab {
     pub fullscreen_sent: bool,
     /// Nästa bildspel startar med föredragsvyn (Alt+F5).
     presenter_on_start: bool,
+    /// Presentationens katalog (länkade mediafiler med relativ sökväg läses därifrån); sätts av appen.
+    pub media_dir: Option<PathBuf>,
     wheel: f32,
     /// Skalan i senaste bilden (för zoomstegen).
     last_k: f32,
@@ -354,6 +356,7 @@ impl PptxTab {
             show: None,
             fullscreen_sent: false,
             presenter_on_start: false,
+            media_dir: None,
             wheel: 0.0,
             last_k: 1.0,
             page_text: String::new(),
@@ -444,7 +447,7 @@ impl PptxTab {
         let hidden: Vec<bool> = self.deck.slides.iter().map(|s| s.hidden).collect();
         let show = if from_current { Show::new(&hidden, self.current) } else { Show::from_beginning(&hidden) };
         let presenter = std::mem::take(&mut self.presenter_on_start);
-        self.show = show.map(|s| super::presenter::ShowView::new(self.deck.clone(), s, animate).with_presenter(presenter));
+        self.show = show.map(|s| super::presenter::ShowView::new(self.deck.clone(), s, animate).with_presenter(presenter).with_media_dir(self.media_dir.clone()));
         self.show.is_some()
     }
 

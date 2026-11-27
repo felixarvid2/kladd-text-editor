@@ -26,6 +26,12 @@ fn poster() -> Vec<u8> {
 /// Bild 1: en video (id 8, startar vid första klicket) och en ljudfil (id 9, en sekund ton). Bild 2: ett
 /// övergångsljud. Bild 3: tom.
 pub fn media_deck_bytes() -> Vec<u8> {
+    media_deck_with("", "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>", "")
+}
+
+/// Som `media_deck_bytes`; `video_attrs` läggs på videons `p:cMediaNode`, `video_geom` ersätter dess form och
+/// `xfrm_attrs` läggs på dess `a:xfrm` (vridning, spegling).
+pub fn media_deck_with(video_attrs: &str, video_geom: &str, xfrm_attrs: &str) -> Vec<u8> {
     let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opt = zip::write::SimpleFileOptions::default();
     let mut put = |name: &str, data: &[u8]| {
@@ -36,13 +42,15 @@ pub fn media_deck_bytes() -> Vec<u8> {
     put("_rels/.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#).as_bytes());
     let pic = |id: u32, name: &str, kind: &str, rect: (i64, i64, i64, i64)| {
         let (x, y, w, h) = rect;
+        let (geom, xa) = if id == 8 { (video_geom, xfrm_attrs) } else { ("<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>", "") };
+        let xa_sp = if xa.is_empty() { String::new() } else { format!(" {xa}") };
         format!(
-            r#"<p:pic><p:nvPicPr><p:cNvPr id="{id}" name="{name}"/><p:cNvPicPr/><p:nvPr><a:{kind}File r:link="rIdL{id}"/><p:extLst><p:ext uri="{{DAA4B4D4-6D71-4841-9C94-3DE7FCFB9230}}"><p14:media r:embed="rIdM{id}"/></p:ext></p:extLst></p:nvPr></p:nvPicPr><p:blipFill><a:blip r:embed="rIdImg"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>"#
+            r#"<p:pic><p:nvPicPr><p:cNvPr id="{id}" name="{name}"/><p:cNvPicPr/><p:nvPr><a:{kind}File r:link="rIdL{id}"/><p:extLst><p:ext uri="{{DAA4B4D4-6D71-4841-9C94-3DE7FCFB9230}}"><p14:media r:embed="rIdM{id}"/></p:ext></p:extLst></p:nvPr></p:nvPicPr><p:blipFill><a:blip r:embed="rIdImg"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm{xa_sp}><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/></a:xfrm>{geom}</p:spPr></p:pic>"#
         )
     };
     let cmd = |spid: u32, c: &str| format!(r#"<p:cmd type="call" cmd="{c}"><p:cBhvr><p:cTn id="{}" dur="1" fill="hold"/><p:tgtEl><p:spTgt spid="{spid}"/></p:tgtEl></p:cBhvr></p:cmd>"#, 20 + spid);
     let timing = format!(
-        r#"<p:timing><p:tnLst><p:par><p:cTn id="1" nodeType="tmRoot"><p:childTnLst><p:seq><p:cTn id="2" nodeType="mainSeq"><p:childTnLst><p:par><p:cTn id="3"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="4" presetClass="mediacall"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst>{}</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:seq><p:video><p:cMediaNode vol="80000"><p:cTn id="5"/><p:tgtEl><p:spTgt spid="8"/></p:tgtEl></p:cMediaNode></p:video><p:audio><p:cMediaNode vol="50000"><p:cTn id="6"/><p:tgtEl><p:spTgt spid="9"/></p:tgtEl></p:cMediaNode></p:audio></p:childTnLst></p:cTn></p:par></p:tnLst></p:timing>"#,
+        r#"<p:timing><p:tnLst><p:par><p:cTn id="1" nodeType="tmRoot"><p:childTnLst><p:seq><p:cTn id="2" nodeType="mainSeq"><p:childTnLst><p:par><p:cTn id="3"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="4" presetClass="mediacall"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst>{}</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:seq><p:video><p:cMediaNode vol="80000"{video_attrs}><p:cTn id="5"/><p:tgtEl><p:spTgt spid="8"/></p:tgtEl></p:cMediaNode></p:video><p:audio><p:cMediaNode vol="50000"><p:cTn id="6"/><p:tgtEl><p:spTgt spid="9"/></p:tgtEl></p:cMediaNode></p:audio></p:childTnLst></p:cTn></p:par></p:tnLst></p:timing>"#,
         cmd(8, "playFrom(0.0)")
     );
     let tree = |inner: &str| format!(r#"<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{inner}</p:spTree></p:cSld>"#);
@@ -100,7 +108,10 @@ fn cmd(shape_id: u32, kind: MediaKind) -> MediaCmd {
 #[ignore]
 fn skriv_provfil() {
     let Ok(p) = std::env::var("KLADD_PMEDIA_OUT") else { return };
-    std::fs::write(p, media_deck_bytes()).unwrap();
+    std::fs::write(&p, media_deck_bytes()).unwrap();
+    // Och en vriden, rundad video som döljs när den inte spelas.
+    let geom = r#"<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 30000"/></a:avLst></a:prstGeom>"#;
+    std::fs::write(format!("{p}.rund.pptx"), media_deck_with(r#" showWhenStopped="0""#, geom, r#"rot="900000""#)).unwrap();
 }
 
 #[test]
@@ -237,4 +248,25 @@ fn video_via_ffmpeg_ger_bildrutor_och_dödas_vid_stopp() {
     #[cfg(target_os = "linux")]
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     let _ = pid;
+}
+
+#[test]
+fn video_med_showwhenstopped_noll_döljs_när_den_inte_spelas() {
+    let ctx = egui::Context::default();
+    let d = Arc::new(Deck::open(&media_deck_with(r#" showWhenStopped="0""#, "<a:prstGeom prst=\"ellipse\"><a:avLst/></a:prstGeom>", r#"rot="1200000" flipH="1""#)).unwrap());
+    let mut hub = MediaHub::new(d, true).with_backends(AudioOut::test_ready(8000), None);
+    hub.ensure(0);
+    // Före start: dold. Ljudformen (id 9) har standardvärdet och syns.
+    assert!(hub.hidden_when_stopped(0, 8));
+    assert!(!hub.hidden_when_stopped(0, 9));
+    // Okänd bild eller form döljs inte.
+    assert!(!hub.hidden_when_stopped(7, 8));
+    hub.apply(&ctx, 0, cmd(8, MediaKind::Play { from_s: 0.0 }));
+    if !hub.playing_on(0).is_empty() {
+        assert!(!hub.hidden_when_stopped(0, 8));
+    }
+    let m = super::media_model::of_slide(&Deck::open(&media_deck_with("", "<a:prstGeom prst=\"ellipse\"><a:avLst/></a:prstGeom>", r#"rot="1200000" flipH="1""#)).unwrap(), 0);
+    let v = m.shape(8).unwrap();
+    assert_eq!((v.rot_deg, v.flip_h, v.crop), (20.0, true, super::media_model::Crop::Ellipse));
+    assert!(v.show_when_stopped);
 }
