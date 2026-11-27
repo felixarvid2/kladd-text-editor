@@ -44,6 +44,9 @@ pub mod fills;
 pub mod mtx;
 // Redigering och sparande (w-pedit).
 pub mod edit;
+pub mod edit_bar;
+pub mod edit_fit;
+pub mod edit_format;
 pub mod edit_ops;
 pub mod edit_text;
 pub mod edit_view;

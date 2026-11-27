@@ -174,7 +174,9 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
-  understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
+  understruken, storlek, färg, justering och punkter (omgång 5, se *Textformat och autoanpassning (omgång 5)*:
+  teckensnitt, marginaler, radavstånd, numrerade listor och markeringsfärg saknas); återställning efter krasch
+  (bara automatisk sparning).
 - **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
@@ -1036,3 +1038,53 @@ punktlistan). Det finns ingen PowerPoint-referens för dem, så utseendet är in
 
 **Prov:** `hierarki_med_roten_over_barnen_och_linjer` (rutor, avstånd, centrering och linjernas ändpunkter),
 `bojd_koppling_blir_en_cirkelbagspil` (läge, storlek och vinklar), `langt_ord_krymps_inom_rutan_och_gruppen_far_samma_storlek`.
+
+
+## Textformat och autoanpassning (omgång 5)
+
+Moduler: `edit_format.rs` (modellens formatfunktioner), `edit_fit.rs` (autoanpassning), `edit_bar.rs` (formatraden,
+`PptxTab::format_text`); tangenterna står i `text_keys` i `edit_view.rs`.
+
+- **Formatfunktioner** på `TextModel` mellan två lägen (`edit_runs` delar körningarna vid gränserna som `toggle`
+  gör): `set_size`/`step_size`, `set_color`, `set_align`, `set_bullet`. Utan markering gäller ordet vid markören;
+  ett intervall som når styckets slut sätter formatet också på `a:endParaRPr` (som tomma stycken och nästa skrivna
+  tecken ärver). `sz` skrivs i hundradels punkt; storlekssteget utgår från körningens ärvda storlek
+  (`Carets::paras[..].runs`, utan autoanpassningens `fontScale`, annars skulle krympningen skrivas in i filen) och
+  följer PowerPoints lista (8 … 96). Färgen byter ut alla fyllningar i `a:rPr` mot `a:solidFill` med `a:schemeClr`
+  (temats `tx1`, `bg1`, `accent1` …) eller `a:srgbClr`, placerad efter `a:ln` och före effekter, markering,
+  understrykningar, typsnitt och länkar (schemats ordning; prov i `edit_format.rs`). Justering sätter `algn` på
+  varje stycke i intervallet (`l` skrivs alltid ut, eftersom layouter ofta centrerar). Punkter på: `marL`/`indent`,
+  `a:buFont` + `a:buChar` före `a:tabLst`/`a:defRPr`; av: `a:buNone` med `marL="0" indent="0"`.
+- **Formatraden** syns när formen är markerad eller man skriver i den och formen är en vanlig textform
+  (`Kind::Shape`, inte `mc:AlternateContent`). Visat format kommer från `Carets::paras` (ärvt värde ur samma
+  utläggning som ritar bilden); när bara formen är markerad cachas det per presentation och form. Storleksfältet
+  lämnar tillbaka tangentbordsfokus till redigeringslagret efter `Enter`. `Ctrl+E` är bara redigeringsläget på/av
+  när man inte skriver (annars centrerar det). `Ctrl+Skift+>`/`<` kommer som `Key::Period`/`Key::Comma` med Skift
+  (US) respektive `Key::IntlBackslash` (nordiskt `<>`: `>` med Skift); `Ctrl+]`/`Ctrl+[` fungerar på alla
+  layouter.
+- **Autoanpassning** (`edit_fit::TextModel::autofit`, anropas bara av `commit_text`, alltså när texten ändras):
+  `Carets::carets_fit(.., Some((skala, minskning)))` lägger ut texten med ett prövat steg och ger textens höjd mot
+  rutans (`text_h`/`avail_h`). Stegen (`LADDER`): (100 %, 0), (100 %, 10 %), (100 %, 20 %), 92,5 %, 85 %, … 25 % med
+  20 % minskning. Värdet på formen behålls om det ryms och inget mjukare steg ryms; ryms det inte väljs första
+  steget som är kraftigare och ryms (annars det sista); ryms ett mjukare steg växer texten tillbaka (binärsökning,
+  eftersom "ryms" är monotont). Normalfallet kostar ett–två utläggningar per tecken. `a:normAutofit` skapas på
+  formens egen `a:bodyPr` (före `a:scene3d`/`a:sp3d`/`a:flatTx`/`a:extLst`) om den ärvdes; vid 100 % skrivs ett
+  tomt `<a:normAutofit/>`. Vertikal text, flera spalter och `wrap="none"` hoppas över (`Carets::fit_ok`).
+  `a:spAutoFit`: höjden blir textens höjd + övre och nedre insättning när texten inte ryms; krymper texten
+  minskar höjden lika mycket som texten men aldrig under det som behövs; ankaret (`ctr`, `b`) flyttar `y` så att
+  mitten respektive nederkanten står kvar (vridna former behåller överkanten). Allt skrivs i samma transaktion som
+  texten (`set_text_fit`, ett ångra-steg).
+- **Jämförelse mot PowerPoint** (`autoanpassning_mot_materialet`, ignorerat prov): av 357 former i materialet med
+  lagrad `fontScale`/`lnSpcReduction` ger en omräkning från grunden exakt samma steg i 128 (36 %), ett mildare i
+  115 och ett kraftigare i 114; det lagrade steget ryms i vår utläggning i 216 (60 %). Skillnaderna är lika många
+  åt båda hållen, så det är inget systematiskt fel i stegen utan skillnader i utläggningen (typsnitt som saknas,
+  radavstånd, att PowerPoint inte räknar om förrän man redigerar). Därför räknas värdet bara om vid textändring och
+  behålls annars om det ryms.
+- **Prov:** `edit_format.rs` (varje funktion, schemaordning), `edit_tests.rs`: `autoanpassning_*` (steg ryms/ryms
+  inte, monotont, tillbaka till 100 %, behåll värde som ryms), `spautofit_*`, `textformat_tur_och_retur_*`
+  (sparad fil går genom `validate`, öppnas igen och ritas med nya storlek, färg, justering och punkter);
+  `redigera_alla` gör också ett textformatssteg med autoanpassning.
+- **Kvar:** text i tabellceller, flervalsmarkering och text i former i grupper (omgång 5 hann bara textformat och
+  autoanpassning); teckensnitt, radavstånd, nivåspecifika punkttecken och numrerade listor i formatraden; format på
+  markeringen som visas blandat (raden visar värdet i körningen vid markören); autoanpassning efter att en form
+  ändrar storlek med handtagen (PowerPoint räknar då om).

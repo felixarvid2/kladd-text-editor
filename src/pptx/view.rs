@@ -1108,6 +1108,7 @@ impl PptxTab {
                     });
                 });
             });
+        self.format_bar(ui, p);
         act
     }
 

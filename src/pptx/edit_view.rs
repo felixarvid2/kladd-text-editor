@@ -51,7 +51,7 @@ pub struct TextState {
     pub model: TextModel,
     pub caret: Pos,
     pub anchor: Pos,
-    carets: Option<Carets>,
+    pub(super) carets: Option<Carets>,
     /// Dras en markering med musen?
     selecting: bool,
 }
@@ -76,11 +76,13 @@ pub struct Editor {
     /// Redigeringslagrets id: det har tangentbordsfokus medan en form är markerad, så att Tab och
     /// pilarna går till redigeringen och inte flyttar fokus mellan knapparna.
     overlay: Option<Id>,
+    /// Formatraden (storleksfält, senast använd färg, formatet för markerad form).
+    pub(super) fmt: super::edit_bar::FormatBar,
 }
 
 impl Editor {
     pub fn new(source: Vec<u8>, deck: &Deck) -> Editor {
-        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None }
+        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None, fmt: Default::default() }
     }
 }
 
@@ -238,21 +240,27 @@ impl PptxTab {
 
     // ---------------------------------------------------------------- text
 
-    /// Börjar skriva i formen (markören sist, eller vid punkten).
-    pub fn begin_text(&mut self, sel: Sel, at: Option<(f32, f32)>) {
-        let Some(info) = self.shape_of(sel) else { return };
+    /// Formens text som modell, och dess markörlägen. `None` om formen inte kan få text.
+    pub(super) fn text_of(&mut self, sel: Sel) -> Option<(TextModel, Option<Carets>)> {
+        let info = self.shape_of(sel)?;
         if info.kind != Kind::Shape || info.alternate {
-            return;
+            return None;
         }
-        let Some(bytes) = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec) else { return };
+        let bytes = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec)?;
         let Some(doc) = edit_xml::parse(&bytes) else {
             self.edit.notices.push((t("Bilden kan inte ändras (XML som inte är UTF-8).").to_owned(), true));
-            return;
+            return None;
         };
-        let Some(sp) = edit_ops::raw_shape(&doc, sel.index) else { return };
+        let sp = edit_ops::raw_shape(&doc, sel.index)?;
         let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
         let model = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), &a);
         let carets = edit_ops::node(&self.deck, sel.slide, sel.index).and_then(|n| model.carets(&self.deck, sel.slide, n));
+        Some((model, carets))
+    }
+
+    /// Börjar skriva i formen (markören sist, eller vid punkten).
+    pub fn begin_text(&mut self, sel: Sel, at: Option<(f32, f32)>) {
+        let Some((model, carets)) = self.text_of(sel) else { return };
         let mut caret = model.end();
         if let (Some(c), Some((x, y))) = (&carets, at) {
             if let Some(p) = c.hit(x, y) {
@@ -271,11 +279,13 @@ impl PptxTab {
     }
 
     /// Skriver modellen till bilden (ett ångra-steg per textruta och skrivstund).
-    fn commit_text(&mut self) {
+    pub(super) fn commit_text(&mut self) {
         let Some(ts) = &self.edit.text else { return };
-        let (sel, model) = (ts.sel, ts.model.clone());
-        let ok = self.apply(Some(format!("text:{}:{}", sel.slide, sel.id)), |txn| edit_ops::set_text(txn, sel.slide, sel.index, sel.id, &model));
-        let _ = ok;
+        let (sel, model, before) = (ts.sel, ts.model.clone(), ts.carets.as_ref().map(|c| c.text_h));
+        let Some(info) = self.shape_of(sel) else { return };
+        // Autoanpassningen räknas om här och bara här: när texten ändras (inte när filen öppnas eller sparas).
+        let fit = edit_ops::node(&self.deck, sel.slide, sel.index).and_then(|n| model.autofit(&self.deck, sel.slide, n, info.xf, before));
+        self.apply(Some(format!("text:{}:{}", sel.slide, sel.id)), |txn| super::edit_fit::set_text_fit(txn, sel.slide, sel.index, sel.id, &model, fit, info.xf));
     }
 
     /// Tangenter och text medan man skriver i en form. Händelserna som hanteras tas bort ur kön.
@@ -384,6 +394,27 @@ impl PptxTab {
                             changed = true;
                             handled.push(k);
                         }
+                        Key::L | Key::E | Key::R | Key::J if m.command && !shift && !m.alt => {
+                            let algn = match key {
+                                Key::L => "l",
+                                Key::E => "ctr",
+                                Key::R => "r",
+                                _ => "just",
+                            };
+                            ts.model.set_align(ts.anchor, ts.caret, algn);
+                            changed = true;
+                            handled.push(k);
+                        }
+                        // Större/mindre text: Ctrl+Skift+> och Ctrl+Skift+< (och Ctrl+] och Ctrl+[, som
+                        // också finns i PowerPoint och inte beror på tangentbordslayouten).
+                        Key::Period | Key::Comma | Key::IntlBackslash | Key::CloseBracket | Key::OpenBracket if m.command && (shift || matches!(key, Key::CloseBracket | Key::OpenBracket | Key::IntlBackslash)) => {
+                            // `<>`-tangenten på nordiska tangentbord är IntlBackslash: `>` med Skift, `<` utan.
+                            let up = matches!(key, Key::Period | Key::CloseBracket) || *key == Key::IntlBackslash && shift;
+                            let fmts = ts.carets.as_ref().map(|c| c.paras.clone()).unwrap_or_default();
+                            ts.model.step_size(ts.anchor, ts.caret, up, &fmts);
+                            changed = true;
+                            handled.push(k);
+                        }
                         Key::A if m.command => {
                             ts.anchor = Pos::default();
                             ts.caret = ts.model.end();
@@ -430,7 +461,8 @@ impl PptxTab {
     pub(super) fn edit_keys(&mut self, ctx: &egui::Context) {
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let cmd = Modifiers::COMMAND;
-        if key(cmd, Key::E) {
+        // Ctrl+E centrerar när man skriver i en form.
+        if self.edit.text.is_none() && key(cmd, Key::E) {
             self.toggle_edit();
             return;
         }
