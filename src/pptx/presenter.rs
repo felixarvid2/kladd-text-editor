@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 use egui::emath::GuiRounding;
 use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect, RichText, Sense, Ui, pos2, vec2};
 
-use super::anim::{State, Target, Timeline};
+use super::anim::{MediaCmd, MediaShape, State, Timeline};
 use super::anim_layers::{self, LayerKind};
 use super::scene::Affine;
-use super::slideshow::{Blank, Frame, Playback, Screen, Show, SlideState, SlideTiming, Timer, clock_text};
+use super::edit_ops::{self, ShapeInfo};
+use super::slideshow::{Blank, Frame, Playback, Screen, Show, SlideState, SlideTiming, Timer, TriggerTiming, clock_text};
 use super::transition::{self, Layer, Transition};
 use super::Deck;
 use crate::i18n::t;
@@ -57,6 +58,10 @@ pub struct ShowView {
     deck: Arc<Deck>,
     play: Playback,
     timelines: Vec<Arc<Timeline>>,
+    /// Ljud- och videoformerna per bild (alltid, även utan animeringar).
+    media: Vec<Vec<MediaShape>>,
+    /// Formerna på bilderna som klickats eller hålls över (träffprov för utlösare).
+    trigger_hits: HashMap<usize, Vec<ShapeInfo>>,
     origin: Instant,
     prepared: HashMap<usize, Prepared>,
     pending: HashSet<usize>,
@@ -82,8 +87,22 @@ pub struct ShowView {
 impl ShowView {
     /// `animate` = falskt: inga övergångar eller animeringar (bilderna visas i sitt vanliga utseende).
     pub fn new(deck: Arc<Deck>, show: Show, animate: bool) -> ShowView {
-        let timelines: Vec<Arc<Timeline>> =
-            deck.slides.iter().map(|s| Arc::new(if animate { Timeline::of_slide(&s.root) } else { Timeline::default() })).collect();
+        let timelines: Vec<Arc<Timeline>> = deck
+            .slides
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut tl = if animate { Timeline::of_slide(&s.root) } else { Timeline::default() };
+                if !tl.triggers.is_empty() {
+                    // En utlösare vars form inte går att träffa (i grupp, på layouten, saknas, utan yta)
+                    // tas bort: dess mål visas som vanligt.
+                    let ok: HashSet<u32> = edit_ops::shapes(&deck, i).iter().filter(|h| !h.empty_ph && h.xf.cx > 0 && h.xf.cy > 0).map(|h| h.id).collect();
+                    tl.retain_triggers(|id| ok.contains(&id));
+                }
+                Arc::new(tl)
+            })
+            .collect();
+        let media = deck.slides.iter().map(|s| super::anim::media_shapes(&s.root)).collect();
         let timing = timings(&deck, &timelines, animate);
         let origin = Instant::now();
         let (tx, rx) = channel();
@@ -91,6 +110,8 @@ impl ShowView {
             play: Playback::new(show, timing, 0.0),
             deck,
             timelines,
+            media,
+            trigger_hits: HashMap::new(),
             origin,
             prepared: HashMap::new(),
             pending: HashSet::new(),
@@ -128,6 +149,60 @@ impl ShowView {
     /// Bilden som visas eller senast visades.
     pub fn slide(&self) -> usize {
         self.play.show.slide()
+    }
+
+    /// Mediakommandona (`p:cmd`) som kommit sedan sist, i ordning, för aktuell bild; se
+    /// `Playback::take_media`. Läses av ljud- och videouppspelningen.
+    #[allow(dead_code)]
+    pub fn take_media(&mut self) -> Vec<MediaCmd> {
+        self.play.take_media()
+    }
+
+    #[cfg(test)]
+    pub(super) fn slide_screen(&self) -> Screen {
+        self.play.show.screen()
+    }
+
+    #[cfg(test)]
+    pub(super) fn timelines(&self) -> &[Arc<Timeline>] {
+        &self.timelines
+    }
+
+    /// Ljud- och videoformerna på bild `slide` (id = `p:cNvPr/@id`, det som `MediaCmd::shape_id` pekar på).
+    #[allow(dead_code)]
+    pub fn media_shapes(&self, slide: usize) -> &[MediaShape] {
+        self.media.get(slide).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Utlösaren under `pos` (skärmläge) när bilden ritas i `rect`: formens id. Den översta formen vinner.
+    pub(super) fn trigger_at(&mut self, rect: Rect, pos: Pos2) -> Option<u32> {
+        let Screen::Slide(slide) = self.play.show.screen() else { return None };
+        let shapes = self.play.trigger_shapes();
+        if shapes.is_empty() || rect.width() <= 0.0 || !rect.contains(pos) {
+            return None;
+        }
+        let k = self.deck.size_pt().0 / rect.width();
+        let (px, py) = ((pos.x - rect.left()) * k, (pos.y - rect.top()) * k);
+        let deck = &self.deck;
+        let hits = self.trigger_hits.entry(slide).or_insert_with(|| edit_ops::shapes(deck, slide));
+        hits.iter().filter(|h| shapes.contains(&h.id) && h.hit(px, py, 0.0)).max_by_key(|h| h.index).map(|h| h.id)
+    }
+
+    /// Klick på bilden i `rect` vid `pos`: en utlösare spelas, annars nästa steg. Falskt = avsluta.
+    pub(super) fn click_slide(&mut self, rect: Rect, pos: Option<Pos2>, now: f64) -> bool {
+        if let Some(id) = pos.and_then(|p| self.trigger_at(rect, p)) {
+            if self.play.click_shape(id, now) {
+                return true;
+            }
+        }
+        self.play.next(now, true)
+    }
+
+    /// Handen över en utlösare.
+    fn hover_trigger(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) {
+        if pos.and_then(|p| self.trigger_at(rect, p)).is_some() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
     }
 
     /// Tangenterna (från publikens fönster och föredragsvyns). Falskt = avsluta.
@@ -240,8 +315,9 @@ impl ShowView {
         // Mus: klick framåt, högerklick bakåt, hjulet bläddrar.
         let now = self.now();
         let mut keep = true;
+        self.hover_trigger(&ctx, slide_rect, resp.hover_pos());
         if resp.clicked_by(PointerButton::Primary) {
-            keep = self.play.next(now, true);
+            keep = self.click_slide(slide_rect, resp.interact_pointer_pos(), now);
         } else if resp.clicked_by(PointerButton::Secondary) {
             self.play.prev(now);
         }
@@ -322,18 +398,17 @@ impl ShowView {
         }
     }
 
-    /// Lagrets tillstånd i bildens läge.
+    /// Lagrets tillstånd i bildens läge: huvudsekvensen och utlösarna, stycket ovanpå formen.
     fn layer_state(&self, st: &SlideState, kind: LayerKind, geom: super::anim::Geom) -> State {
-        let LayerKind::Target(tg) = kind else { return State::SHOWN };
+        let (tg, unit) = match kind {
+            LayerKind::Static => return State::SHOWN,
+            LayerKind::Target(t) => (t, None),
+            LayerKind::Piece { scope, unit } => (scope, Some(unit)),
+            // Resten (punkt, understrykning) följer första delen.
+            LayerKind::Rest(scope) => (scope, Some(0)),
+        };
         let Some(tl) = self.timelines.get(st.slide) else { return State::SHOWN };
-        let own = tl.state(tg, geom, st.chain.clone(), st.t);
-        match tg.para {
-            // Ett stycke följer också formens egna effekter.
-            Some(_) if tl.targets().contains(&Target { shape: tg.shape, para: None }) => {
-                tl.state(Target { shape: tg.shape, para: None }, geom, st.chain.clone(), st.t).compose(&own)
-            }
-            _ => own,
-        }
+        tl.layer_state(tg, unit, geom, st.chain.clone(), st.t, &st.trig)
     }
 
     /// Ritar bilden i läget `st` i `rect`, klippt till `clip` (bildens enhetskoordinater) och flyttad med
@@ -350,8 +425,10 @@ impl ShowView {
         let to_dst = s.invert().unwrap_or(Affine::IDENTITY).then(&m).then(&s);
         let clip_pts: Option<Vec<[f32; 2]>> = clip.map(|c| c.iter().map(|q| [q[0] * sw, q[1] * sh]).collect());
         let scr = rect.width() / sw.max(1.0);
-        for l in &prep.layers {
-            let state = self.layer_state(st, l.kind, l.geom);
+        let kinds: Vec<LayerKind> = prep.layers.iter().map(|l| l.kind).collect();
+        let plan = anim_layers::plan(&kinds, &|i| self.layer_state(st, prep.layers[i].kind, prep.layers[i].geom));
+        for (l, state) in prep.layers.iter().zip(plan) {
+            let Some(state) = state else { continue };
             if !state.drawn() {
                 continue;
             }
@@ -492,7 +569,7 @@ impl ShowView {
             Some((s, step)) => {
                 painter.rect_filled(next_rect, 0.0, Color32::BLACK);
                 let end = self.play_chain_end(s, step);
-                let st = SlideState { slide: s, step, chain: end..end, t: f32::INFINITY };
+                let st = SlideState { slide: s, step, chain: end..end, t: f32::INFINITY, trig: Vec::new() };
                 self.paint_slide(&painter, next_rect, &st, None, &transition::IDENTITY, 1.0);
             }
             None => {
@@ -520,8 +597,9 @@ impl ShowView {
         }
         // Klick på aktuell bild går framåt.
         let resp = ui.interact(cur_rect, ui.scope_id().with("kladd-pptx-presenter-cur"), Sense::click());
+        self.hover_trigger(&ctx, cur_rect, resp.hover_pos());
         if resp.clicked() {
-            keep &= self.play.next(now, true);
+            keep &= self.click_slide(cur_rect, resp.interact_pointer_pos(), now);
         }
         keep
     }
@@ -591,7 +669,7 @@ impl ShowView {
             let _ = std::thread::Builder::new().name("pptx-bildspel".into()).stack_size(8 << 20).spawn(move || {
                 let layers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let scene = super::render::slide_scene(&deck, i);
-                    let split = anim_layers::split(&scene, &tl.targets());
+                    let split = anim_layers::split_units(&scene, &tl.targets(), &tl.unit_scopes());
                     anim_layers::render(&scene, &split, width, height)
                 }))
                 .ok();
@@ -613,7 +691,9 @@ pub fn timings(deck: &Deck, timelines: &[Arc<Timeline>], animate: bool) -> Vec<S
             let parsed = Transition::of_slide(&s.root);
             let transition = if animate { parsed } else { Transition { adv_after: parsed.adv_after, ..Transition::default() } };
             let chains = (0..=tl.clicks()).map(|k| (tl.chain(k), tl.chain_dur(k))).collect();
-            SlideTiming { chains, transition }
+            let cmds = (0..=tl.clicks()).map(|k| tl.chain_cmds(k)).collect();
+            let triggers = tl.triggers.iter().map(|t| TriggerTiming { shape: t.shape, dur: t.dur(), cmds: t.cmds() }).collect();
+            SlideTiming { chains, transition, cmds, triggers }
         })
         .collect()
 }

@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **PowerPoint: utlösare, text bokstav för bokstav och mediakommandon i bildspelet.** Animeringar som startas av ett klick på en viss form (`interactiveSeq`) spelas upp: klicket på formen (handen visas över den) spelar dess sekvens i stället för att gå till nästa steg, och former som en utlösare visar in är dolda tills den klickats – men en utlösare som inte går att träffa (formen ligger i en grupp, på layouten eller saknas) lämnar sina mål synliga. Text som kommer in bokstav för bokstav eller ord för ord (`iterate`) och animeringar av ett teckenintervall (`charRg`) delas per tecken eller ord med sin fördröjning; när alla delar är framme ritas texten som helhet, exakt som den statiska bilden. Mediakommandon i tidsträdet (`playFrom`, `togglePause` …) ges ut av uppspelningen för ljud och video (själva uppspelningen kommer separat). Se `docs/dev/pptx.md`.
+
 ## [2.12.0] – 2026-11-27
 
 ### Nytt

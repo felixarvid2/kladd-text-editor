@@ -68,6 +68,9 @@ mod chart_tests;
 mod edit_tests;
 #[cfg(test)]
 mod smartart_tests;
+// Omgång 4, utlösare och bokstav för bokstav (w-ptrig).
+#[cfg(test)]
+mod anim_pieces_tests;
 
 pub use model::Deck;
 

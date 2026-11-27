@@ -175,7 +175,7 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
   understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** länkar och åtgärdsknappar i bildspelet, utlösare (`interactiveSeq`), video/ljud, morph som riktig
+- **Visning:** länkar och åtgärdsknappar i bildspelet, video/ljud (kommandona finns: *Utlösare …, omgång 4*), morph som riktig
   forminterpolering, föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
@@ -623,9 +623,9 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   och formler), `p:animScale`, `p:animRot`, `p:animMotion` (banan som polylinje, kurvor i 8 steg, längs båglängden),
   färgbyten (`p:animClr`, `p:set` av färger i betoningar) som en blinkning. `accel`/`decel`, `autoRev` och
   `repeatCount` gäller; `fill="remove"` tar bort effekten när den är klar. `p:txEl/p:pRg` ger ett mål per stycke;
-  `charRg`, `graphicEl` (SmartArt/diagram i delar) och `bg` gäller hela formen. Utlösare (`interactiveSeq`) räknas inte:
-  de formerna syns som vanligt. Ett mål som inte finns i visningslistan (t.ex. på layouten) ritas som vanligt –
-  aldrig "dolt för alltid".
+  `graphicEl` (SmartArt/diagram i delar) och `bg` gäller hela formen; `charRg` och `p:iterate` delar texten
+  (*omgång 4* nedan), utlösare (`interactiveSeq`) likaså. Ett mål som inte finns i visningslistan (t.ex. på
+  layouten) ritas som vanligt – aldrig "dolt för alltid".
 - **Lagren:** en bild utan mål är ett enda lager (samma bild som förut). Med mål delas listan vid varje animerad form
   så att ritordningen behålls (en animerad form under en fast hamnar under den). Stycken i samma form blir egna lager;
   formens geometri och övriga stycken stannar i det fasta lagret. Provet `lagren_ger_samma_bild_som_hela_renderingen`
@@ -644,7 +644,8 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   614 klick-steg; alla 1 081 mål hittas i visningslistan (`anim_layers::tests::referensmaterialets_animeringar`,
   ignorerat, `KLADD_PPTX_REFS`).
 - **Kvar:** morph som forminterpolering, `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i
-  betoningar (kräver omrendering), `iterate` (bokstav för bokstav), ljud och video, utlösare, val av skärm.
+  betoningar (kräver omrendering), ljud och video (själva uppspelningen; kommandona ges ut, se omgång 4), val av
+  skärm. (`iterate` och utlösare gjordes i omgång 4.)
 
 ## 3D i diagram och former (omgång 3)
 
@@ -802,3 +803,67 @@ typsnitt och radbrytning (koreansk, japansk och rysk text i `owasp-top10-2017-ko
 egen skalning och förskjutning, `composite` med `ar`, `snake`, `cycle`, `pyra`, hierarki (trädet direkt),
 datamodellens axlar och urval, `choose`/`if` efter antal, tom ritdel → layoutmotorn, oläslig layout → reserven,
 ritdel i skalad grupp.
+
+## Utlösare, bokstav för bokstav och mediekommandon (omgång 4)
+
+Allt i `anim.rs`, `anim_layers.rs`, `slideshow.rs` och klickdelen av `presenter.rs`; prov i `anim_pieces_tests.rs`
+(egna minimala bilder) och i modulernas `tests`.
+
+**Utlösare (`interactiveSeq`).** `Timeline::triggers: Vec<Trigger { shape, groups }>`: varje `p:seq` med
+`nodeType="interactiveSeq"` och `p:cond evt="onClick"`/`p:tgtEl/p:spTgt` är en utlösare. Gruppernas tolkning delas
+med huvudsekvensen (`parse_groups`); ett klick på formen spelar alla grupperna efter varandra (`Trigger::state(target,
+unit, geom, t)`: `t < 0` = inte klickad, `INFINITY` = klar). Utlösarnas mål ingår i `Timeline::targets()` (egna lager)
+och döljs tills klicket; `Timeline::layer_state` lägger huvudsekvensens och utlösarnas tillstånd ovanpå varandra
+(`State::compose`). `ShowView::new` tar bort utlösare vars form inte går att träffa (`Timeline::retain_triggers`:
+formen ska vara en toppnivåform i `edit_ops::shapes`, inte en tom platshållare, med yta), så att deras mål visas
+som vanligt. `Playback` håller utlösarnas lägen för aktuell bild (`click_shape(shape, now)`, `trigger_shapes()`,
+`SlideState::trig`); de nollställs när bilden byts (inte under en övergång) och en utlösare som spelas startar inte
+om av ett nytt klick (`restart="whenNotActive"`), men spelas igen när den är klar. Träffprovet (`ShowView::trigger_at`)
+använder `ShapeInfo::hit` (vridning inräknad, översta formen vinner); handen visas över en utlösare. I föredragsvyn
+gäller samma klick på den aktuella bilden. Tangenterna går i huvudsekvensen som förut. Utan animeringar
+(*Spela upp animeringar* av) finns inga utlösare.
+
+**Bokstav för bokstav och ord för ord (`p:iterate`, `p:charRg`).** `Effect::iter: Option<Iter { kind, step, n,
+backwards }>` (`type="lt"` tecken, `"wd"` ord; `tmAbs` ms eller `tmPct` av en dels längd; `"el"` delar inte) och
+`Effect::chars` (`p:charRg st/end`, tecknen i formens hela text, delas alltid i tecken). Delarna räknas ur bildens
+text (`Texts`: `a:t` i körningar och fält, ett tecken för `a:br`) med samma uppdelning som ritningen
+(`scene::word_index`: ett ord är tecknen fram till och med blanksteget efter), och effektens längd blir
+`dur + (n − 1) · step`, så att `chain_dur`/`advTm` stämmer innan någon bild är renderad; fler än 600 delar delas
+inte. `Effect::shift(unit)` ger fördröjningen för del `unit` (delar bortom `n` följer den sista); `Timeline::state_unit`
+räknar delens tillstånd. Texten delas i delar för stycket (`pRg`) eller hela formens text (utan `txEl`; delarna
+räknas då över styckena efter varandra); mellan stycken börjar inte räkningen om. `PlacedGlyph::ch`/`word` bär
+styckets tecken- och ordnummer (satta i `text.rs`, `NO_CHAR` för punkter och EMF-text; ritningen bryr sig inte).
+
+*Lagerdelning:* `anim_layers::split_units(scene, targets, scopes)` ger förutom formens/styckets helhetslager
+(`LayerKind::Target`) ett lager per del (`LayerKind::Piece { scope, unit }`, glyferna delade per tecken med oförändrad
+placering och effektmarkörerna kopierade) och ett med resten (`LayerKind::Rest`: punkt, understrykning, markering).
+`anim_layers::plan` väljer vad som ritas: har alla delar samma tillstånd (`State::approx_eq`) ritas helhetslagret
+med det, annars delarna och resten. Det gör att början och slutet är exakt den statiska bilden (±2, provat med
+skuggor på texten) trots att varje del har egen skugga, och att bara medan något rör sig kostar det delarna.
+`LayerKind` har fått två varianter (`Piece`, `Rest`); `split` är oförändrad.
+
+**Mediakommandon.** `p:cmd type="call"` (`playFrom(t)`, `play`, `togglePause`, `stop`, `pause`, `resume`) i
+huvudsekvensen och i utlösare blir `anim::MediaCmd { shape_id, kind: MediaKind }`:
+
+```rust
+pub enum MediaKind { Play { from_s: f32 }, TogglePause, Stop, Pause, Resume }
+pub struct MediaCmd { pub shape_id: u32, pub kind: MediaKind }     // shape_id = p:cNvPr/@id
+pub struct MediaShape { pub id: u32, pub video: bool }             // Timeline::media / anim::media_shapes(root)
+```
+
+`Group::cmds: Vec<(f32, MediaCmd)>` (tid från gruppens start; kommandots egen längd, t.ex. 30 503 ms i `playFrom`,
+räknas inte in i gruppens längd), `Timeline::chain_cmds(step)`, `Trigger::cmds()`. `Playback::take_media(&mut self)
+-> Vec<MediaCmd>` ger de som kommit sedan sist, i ordning: kommandona för ett klick-steg ges när steget börjar (efter
+bildens övergång), utlösarens när man klickat, båda med sin fördröjning, och räknas av `Playback::tick`. Bakåt och
+hopp (`prev`, `jump`) och bildbyte kastar kommandon som inte hunnit ges; kön rymmer 256 (äldre kastas om ingen
+läser). `ShowView::take_media()` och `ShowView::media_shapes(slide)` är gränssnittet för ljud-/videouppspelningen
+(ingen ljud- eller videokod finns här). `play` tolkas som `Play { from_s: 0.0 }`.
+
+**Referensmaterialet** (`referensmaterialets_animeringar`, ignorerat; går nu rekursivt genom `KLADD_PPTX_REFS`):
+se resultatet i omgångens rapport; kontrollerar att alla `p:cmd` blir mediakommandon, att inget syns före sin
+in-effekt, att allt utan ut-effekt syns till slut (en uppdelad text ritas då som helhet) och att materialet har
+`iterate`, utlösare och kommandon.
+
+**Kvar:** utlösare på former i grupper, på layouten och på text inom stycken (delar av text som utlösare); `p:bldP`
+`animBg`; `iterate type="el"` (element, ritas som en effekt för hela texten); fler än en klickgrupp i en utlösare
+(alla spelas vid ett klick); färgbyten i delar; uppspelningen av ljud och video (en annan omgång).

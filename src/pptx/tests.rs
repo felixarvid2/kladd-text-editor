@@ -620,7 +620,7 @@ fn bildspel_former_och_stycken_visas_per_klick() {
     // Rutans mitt (36, 36 pt) per steg: dold, röd efter första klicket.
     let (w, h) = (360u32, 270u32);
     let px = |rgba: &[u8], x: u32, y: u32| { let o = ((y * w + x) * 4) as usize; [rgba[o], rgba[o + 1], rgba[o + 2]] };
-    let rest = |step| { let e = tl.groups_at_step(step); SlideState { slide: 0, step, chain: e..e, t: f32::INFINITY } };
+    let rest = |step| { let e = tl.groups_at_step(step); SlideState { slide: 0, step, chain: e..e, t: f32::INFINITY, trig: Vec::new() } };
     assert_eq!(px(&composite(&deck, &tl, &rest(0), w, h), 18, 18), [255, 255, 255]);
     assert_eq!(px(&composite(&deck, &tl, &rest(1), w, h), 18, 18), [255, 0, 0]);
     // Steg 2 är samma bild som den vanliga renderingen (allt synligt).
