@@ -5,6 +5,7 @@
 //! Koordinater är i punkter (1/72 tum) på bilden, origo uppe till vänster, y nedåt. Banor och
 //! övertoningar lagras i bildkoordinater; bilder och glyfer har en egen transform.
 
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use super::color::Rgba;
@@ -325,6 +326,14 @@ pub enum Effect {
     /// Tunnare text (syntetiskt tunt typsnitt, t.ex. Calibri Light): glyferna skrapas `width` punkter
     /// in från kanten.
     Thin { width: f32 },
+    /// 3D-fasning sedd framifrån (`a:sp3d/a:bevelT`, `bevel.rs`): en skuggad zon `width` punkter in från
+    /// kanten med profilen `kind` och höjden `height`.
+    Bevel { width: f32, height: f32, kind: super::bevel::BevelType, lighting: super::bevel::Lighting },
+    /// 3D-kontur (`a:sp3d/@contourW`): ett band runt formen.
+    Contour { width: f32, color: Rgba },
+    /// Kamera som inte tittar rakt framifrån (`a:scene3d/a:camera`): formen förvrängs med `t` (bildens
+    /// koordinater) och extruderas `extrude` punkter (förskjutning på skärmen) i färgen `color`.
+    Camera { t: Affine, extrude: (f32, f32), color: Rgba },
 }
 
 /// Ett element i visningslistan.
@@ -345,6 +354,14 @@ pub enum Item {
     /// platt: den som bara läser glyfkörningar (sökning) kan hoppa över markörerna.
     BeginEffect(Vec<Effect>),
     EndEffect,
+    /// Början på en toppnivåform på bilden (`id` = `p:cNvPr/@id`), till motsvarande `EndShape`. Bara
+    /// bildens egna former märks (inte mallens/layoutens, grupper och SmartArt som helhet). Ritas inte;
+    /// bildspelet ritar animerade former som egna lager (`Scene::shape_ranges`).
+    BeginShape { id: u32 },
+    EndShape,
+    /// Elementen härifrån till nästa `Para`/`EndShape` hör till stycke nummer n (0-baserat, `a:p` i
+    /// ordning) i formens text. Ritas inte; används för animeringar stycke för stycke (`p:bldP`).
+    Para(u32),
 }
 
 /// En bild som visningslista.
@@ -371,6 +388,26 @@ impl Scene {
         if !path.is_empty() && stroke.width > 0.0 {
             self.items.push(Item::Stroke { path, stroke });
         }
+    }
+
+    /// Toppnivåformerna på bilden: (`p:cNvPr/@id`, elementen mellan `BeginShape` och `EndShape`, utan
+    /// markörerna), i ritordning. (Används av proven och av redigeringens träffprov.)
+    #[allow(dead_code)]
+    pub fn shape_ranges(&self) -> Vec<(u32, Range<usize>)> {
+        let mut out = Vec::new();
+        let mut open: Option<(u32, usize)> = None;
+        for (i, it) in self.items.iter().enumerate() {
+            match it {
+                Item::BeginShape { id } => open = Some((*id, i + 1)),
+                Item::EndShape => {
+                    if let Some((id, s)) = open.take() {
+                        out.push((id, s..i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// All text i visningslistan (för prov och sökning).

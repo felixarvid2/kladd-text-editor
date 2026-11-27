@@ -38,6 +38,25 @@ pub mod table_builtin;
 pub mod effects;
 pub mod fills;
 pub mod mtx;
+// Redigering och sparande (w-pedit).
+pub mod edit;
+pub mod edit_ops;
+pub mod edit_text;
+pub mod edit_view;
+pub mod edit_xml;
+pub mod save;
+// Omgång 3, bildspelet (w-panim): övergångar, animeringar och föredragsvy.
+pub mod anim;
+pub mod anim_expr;
+pub mod anim_layers;
+pub mod presenter;
+pub mod transition;
+// Omgång 3, 3D i diagram och former (w-p3d).
+pub mod bevel;
+pub mod chart_3d;
+
+// Omgång 3, SmartArt-layout (w-psmart).
+pub mod dgm;
 
 #[cfg(test)]
 mod tests;
@@ -45,6 +64,10 @@ mod tests;
 mod view_tests;
 #[cfg(test)]
 mod chart_tests;
+#[cfg(test)]
+mod edit_tests;
+#[cfg(test)]
+mod smartart_tests;
 
 pub use model::Deck;
 

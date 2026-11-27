@@ -244,11 +244,11 @@ fn pdf_exporten_skriver_filen_i_bakgrunden() {
 fn bildspel_i_fliken_hoppar_över_dolda_och_står_kvar() {
     let mut tab = PptxTab::new(deck());
     tab.go_to(2);
-    assert!(tab.start_show(false) && tab.presenting());
+    assert!(tab.start_show(false, true) && tab.presenting());
     tab.stop_show();
     assert_eq!(tab.current, 0, "slutar där bildspelet stod");
     tab.go_to(1);
-    assert!(tab.start_show(true));
+    assert!(tab.start_show(true, true));
     tab.stop_show();
     assert_eq!(tab.current, 1, "Skift+F5 på en dold bild visar den");
     tab.go_to(50);

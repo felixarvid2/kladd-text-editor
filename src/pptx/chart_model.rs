@@ -112,6 +112,12 @@ pub struct Plot<'n> {
     /// Linjediagram: markörer som standard (`c:marker val="1"`).
     pub markers: bool,
     pub ax_ids: Vec<String>,
+    /// 3D-typ (`c:bar3DChart`, `c:line3DChart`, `c:area3DChart`; cirkeln har det i `Kind::Pie`).
+    pub three_d: bool,
+    /// Staplarnas form i 3D (`c:shape`: `box`, `cylinder`, `cone`, `coneToMax`, `pyramid`, `pyramidToMax`).
+    pub shape: String,
+    /// Mellanrum mellan serierna på djupet i procent (`c:gapDepth`, standard 150).
+    pub gap_depth: f32,
 }
 
 /// En axel.
@@ -177,12 +183,29 @@ pub struct Legend<'n> {
     pub deleted: Vec<usize>,
 }
 
-/// `c:view3D`.
+/// `c:view3D`. Saknade värden är `None` (standardvärdena beror på diagramtypen).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct View3D {
-    pub rot_x: f32,
-    pub rot_y: f32,
+    /// Lutning i grader (`rotX`).
+    pub rot_x: Option<f32>,
+    /// Vridning i grader (`rotY`).
+    pub rot_y: Option<f32>,
+    /// Djup i procent av basen (`depthPercent`).
     pub depth: f32,
+    /// Höjd i procent av basen (`hPercent`).
+    pub h_percent: Option<f32>,
+    /// Rätvinkliga axlar (`rAngAx`): parallellprojektion med lutning.
+    pub right_angle: Option<bool>,
+    /// Perspektiv (`perspective`, 0–240; 30 som standard).
+    pub perspective: Option<f32>,
+}
+
+/// Golv och väggar i ett 3D-diagram (`c:floor`, `c:sideWall`, `c:backWall`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Walls<'n> {
+    pub floor: Option<&'n Node>,
+    pub side: Option<&'n Node>,
+    pub back: Option<&'n Node>,
 }
 
 /// Hela diagrammet.
@@ -198,6 +221,11 @@ pub struct Chart<'n> {
     pub space_txpr: Option<&'n Node>,
     pub plot_sppr: Option<&'n Node>,
     pub view3d: Option<View3D>,
+    /// Golvets och väggarnas `c:spPr`.
+    pub walls: Walls<'n>,
+    /// Tomma celler (`c:dispBlanksAs`): `gap`, `zero` eller `span`. Saknas elementet gäller
+    /// standardvärdet i ECMA-376, `zero` (Office skriver alltid ut det). Används bara i 3D-linjer och -ytor.
+    pub blanks: String,
 }
 
 fn val<'a>(n: &'a Node, child: &str) -> Option<&'a str> {
@@ -413,6 +441,9 @@ fn plot(n: &Node) -> Option<Plot<'_>> {
         first_angle: num(n, "c:firstSliceAng").unwrap_or(0.0) as f32,
         markers: flag(n, "c:marker", true),
         ax_ids: n.children_named("c:axId").filter_map(|a| a.attr("val")).map(str::to_owned).collect(),
+        three_d: matches!(n.local(), "bar3DChart" | "line3DChart" | "area3DChart"),
+        shape: val(n, "c:shape").unwrap_or("box").to_owned(),
+        gap_depth: num(n, "c:gapDepth").unwrap_or(150.0).clamp(0.0, 500.0) as f32,
     })
 }
 
@@ -449,10 +480,15 @@ pub fn parse(root: &Node) -> Option<Chart<'_>> {
         space_txpr: root.child("c:txPr"),
         plot_sppr: pa.child("c:spPr"),
         view3d: chart.child("c:view3D").map(|v| View3D {
-            rot_x: num(v, "c:rotX").unwrap_or(30.0) as f32,
-            rot_y: num(v, "c:rotY").unwrap_or(0.0) as f32,
-            depth: num(v, "c:depthPercent").unwrap_or(100.0) as f32,
+            rot_x: num(v, "c:rotX").map(|x| x as f32),
+            rot_y: num(v, "c:rotY").map(|x| x as f32),
+            depth: num(v, "c:depthPercent").unwrap_or(100.0).clamp(20.0, 2000.0) as f32,
+            h_percent: num(v, "c:hPercent").map(|x| x.clamp(5.0, 500.0) as f32),
+            right_angle: v.child("c:rAngAx").map(|_| flag(v, "c:rAngAx", true)),
+            perspective: num(v, "c:perspective").map(|x| x.clamp(0.0, 240.0) as f32),
         }),
+        blanks: chart.child("c:dispBlanksAs").map_or("zero", |d| d.attr("val").unwrap_or("zero")).to_owned(),
+        walls: Walls { floor: chart.path(&["c:floor", "c:spPr"]), side: chart.path(&["c:sideWall", "c:spPr"]), back: chart.path(&["c:backWall", "c:spPr"]) },
     })
 }
 

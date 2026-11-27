@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
 
 use super::xml::{self, Node};
 
@@ -22,8 +23,8 @@ pub struct Rel {
 
 /// Ett uppackat paket.
 pub struct Package {
-    /// Delnamn (utan inledande `/`) → innehåll.
-    pub parts: HashMap<String, Vec<u8>>,
+    /// Delnamn (utan inledande `/`) → innehåll (delat, så att en redigering inte kopierar allt).
+    pub parts: HashMap<String, Arc<Vec<u8>>>,
     /// Delnamn → innehållstyp (från `Override`, annars `Default` efter filändelse).
     pub content_types: HashMap<String, String>,
     defaults: HashMap<String, String>,
@@ -56,8 +57,13 @@ impl Package {
             if f.read_to_end(&mut buf).is_err() {
                 continue;
             }
-            parts.insert(name, buf);
+            parts.insert(name, Arc::new(buf));
         }
+        Ok(Package::from_parts(parts))
+    }
+
+    /// Ett paket ur redan uppackade delar (efter en redigering, se `edit.rs`).
+    pub fn from_parts(parts: HashMap<String, Arc<Vec<u8>>>) -> Package {
         let mut pkg = Package { parts, content_types: HashMap::new(), defaults: HashMap::new() };
         if let Some(ct) = pkg.parts.get("[Content_Types].xml").and_then(|b| xml::parse(b)) {
             for c in &ct.children {
@@ -76,7 +82,7 @@ impl Package {
                 }
             }
         }
-        Ok(pkg)
+        pkg
     }
 
     /// Delens innehållstyp.
@@ -93,7 +99,7 @@ impl Package {
     pub fn read(&self, part: &str) -> Option<&[u8]> {
         let part = part.trim_start_matches('/');
         if let Some(b) = self.parts.get(part) {
-            return Some(b);
+            return Some(b.as_slice());
         }
         let low = part.to_lowercase();
         self.parts.iter().find(|(k, _)| k.to_lowercase() == low).map(|(_, v)| v.as_slice())

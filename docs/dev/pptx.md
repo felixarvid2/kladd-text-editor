@@ -1,7 +1,8 @@
 # PowerPoint (.pptx) i Kladd
 
 Första omgången: läsning, arv, ritmotor, jämförelse mot PowerPoint och en enkel visning. Allt ligger i
-`src/pptx/`. Presentationen kan inte ändras eller sparas än.
+`src/pptx/`. Omgång 3 lade till redigering och källbevarande sparning, övergångar, animeringar och föredragsvy,
+3D och SmartArt-layout (se avsnitten längre ned).
 
 ## Arkitektur
 
@@ -169,18 +170,27 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 2 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 
-- **Redigering:** presentationen kan inte ändras eller sparas (de råa delarna behålls i `Package` för senare
-  källbevarande redigering).
-- **Visning:** bildövergångar, animeringar, föredragsvy, länkar i bildspelet, markering av text på bilden;
+- **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
+  SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
+  understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
+- **Visning:** länkar och åtgärdsknappar i bildspelet, utlösare (`interactiveSeq`), video/ljud, morph som riktig
+  forminterpolering, föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
-- **Diagram:** riktig 3D, sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, chartex (`cx:`).
+- **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
+  3D-diagrammen utan referensbilder (stapel/linje/yta) är inte kalibrerade (se *3D i diagram och former*).
 - **EMF/WMF:** `ExcludeClipRect`, fler regionoperationer, streckade/mönstrade penslar, `ETO_GLYPH_INDEX`, EMF+.
 - **Tabeller:** lodrät text i celler låter inte raden växa; några val är inte prövade mot referensbilder (se
   avsnittet).
 - **SmartArt:** layouter som PowerPoint lägger om (kugghjulen i `msrc-win32k` bild 4/22) kräver en layoutmotor.
+- **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
+  `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
+- **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)*) används bara när ritdelen saknas eller är tom;
+  hierarkier (`hierRoot`/`hierChild`, organisationsscheman) ger ännu reserven, och böjda kopplingar
+  (kugghjulens pilar), linjer i hierarkier, text som får rutan att växa (`rule type="h" val="INF"`), ikoner
+  (`blipPhldr`) och egna förskjutningar i `composite` saknas.
 - **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
@@ -198,7 +208,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 |---|---|
 | `view.rs` | `PptxTab { deck, current, find, … }`: `toolbar`, `sidebar` (miniatyrer), `show` (bild för bild eller rullande lista, anteckningspanel), `find_bar`, `handle_keys`; bildspel `start_show`/`show_page`/`show_keys`/`stop_show`; `pdf_bytes`, `begin_export`/`poll_export`; `memory`/`restore`. `Prefs` (miniatyrer, anteckningar, läge, `Zoom`) och `Memory` ligger i inställningarna (`settings.pptx`, `settings.pptx_memory`). Rena hjälpare: `scale_for`, `zoom_step`, `parse_slide_input`, `pdf_of`. |
 | `glue.rs` | `KladdApp::pptx_*`: verktygsrad, sidopanel, sökfält, tangenter, helskärm (`pptx_sync_fullscreen`), PDF-export, lägesminne, *Redigera en kopia*. |
-| `slideshow.rs` | `Show::new(hidden, start)`, `screen()` (bild, svart/vit skärm, slutskärm), `next`/`prev`/`first`/`last`, `toggle_blank`, `upcoming` (förrendering). |
+| `slideshow.rs` | `Show::new(hidden, start)`, `screen()` (bild, svart/vit skärm, slutskärm), `next`/`prev`/`first`/`last`, `toggle_blank`, `upcoming` (förrendering); klick-steg och uppspelning, se *Bildspel: övergångar, animeringar och föredragsvy*. |
 | `find.rs` | `slide_text(&Scene) -> SlideText` (bildens text ur glyfkörningarna med tecknens lägen), `find_all`, `hits_for`, `hit_rects` (rektanglar i punkter). |
 | `notes.rs` | `notes(deck, i)`/`notes_text` (anteckningssidans brödtextplatshållare), `paragraphs(txBody)` (nivå, fet, kursiv), `shapes(tree)`. |
 | `copy_md.rs` | `deck_to_markdown(deck) -> (String, bilder)` för *Redigera en kopia*. |
@@ -234,8 +244,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
   enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
   `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
-- **Kvar:** bildövergångar och animeringar (bildspelet visar slutläget direkt), föredragsvy med nästa bild och
-  timer, länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
+- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3) länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
   bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
 - **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
   anteckningar, `.ppt` via LibreOffice, handboken.
@@ -251,8 +260,8 @@ ritning till `Scene`) med `chart_fmt.rs` (Excels talformat inklusive datum). For
 i formerna.
 
 - **Typer:** stapel och liggande stapel (grupperad/staplad/100 %, `gapWidth`, `overlap`), linje (markörer,
-  `smooth`), yta, cirkel/ring (`firstSliceAng`, `explosion`, `holeSize`), 3D-cirkel (lutning ur `rotX`, en kant
-  i mörkare färg; ingen riktig 3D), punktdiagram. Okända typer (radar, yta 3D, aktie …) och `cx:` (chartex) →
+  `smooth`), yta, cirkel/ring (`firstSliceAng`, `explosion`, `holeSize`), 3D-cirkel, 3D-stapel/linje/yta
+  (se *3D i diagram och former*), punktdiagram. Okända typer (radar, yta 3D, aktie …) och `cx:` (chartex) →
   platshållaren. Flera plottar i samma rityta ritas på samma axlar (ingen sekundäraxel).
 - **Färger:** seriens/punktens `spPr`, annars diagramformatet `c:style` (1 = gråskala, 2 = accent 1–6 med
   ljusare/mörkare varianter efter sex serier, 3–8 = en accentfärg i nyanser).
@@ -313,8 +322,7 @@ presentation fick lägre medel, ingen bild blev sämre och alla bilder med diagr
 | msrc-eko19 6 | 100 % staplad yta med etiketter | 0,645 | 0,768 |
 | msrc-win32k 8 | 3D-cirkel, utskjuten sektor | 0,784 | 0,865 |
 
-Kvar: diagramytans radiella övertoning i `msrc-eko19` (banövertoningen ritas för ljus, `render.rs`), riktig
-3D (sidornas skuggning, väggar och golv), sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar- och
+Kvar: diagramytans radiella övertoning i `msrc-eko19` (banövertoningen ritas för ljus, `render.rs`), sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar- och
 yt-3D-diagram, `cx:` (chartex). Tid i debug för den tyngsta EMF-bilden (`cppcon15` bild 83, 22 000 element):
 visningslistan 60 ms, rastret 1,8 s (en bild utan EMF i samma presentation: 1,2 s), PDF 0,56 s.
 
@@ -369,8 +377,7 @@ oxml-drawing, MIT OR Apache-2.0) och Dark Style 2 – Accent 3/4 och 5/6. GUID-l
   presentationen läses in (`model.rs`, en rad).
 - Utan ritdel: datamodellens noder (`dgm:pt` utan typ, `node`, `asst`) i `parOf`-ordning som punktlista
   i en ruta med accent 1, storleken nedskalad tills texten får plats. Utan text: platshållaren som förut.
-- Kvar: PowerPoint lägger om vissa layouter (kugghjulen i `msrc-win32k` bild 4) i stället för att
-  använda ritdelen; layoutmotorn för SmartArt (`layoutN.xml`) finns inte.
+- Kugghjulen i `msrc-win32k` och layoutmotorn för SmartArt: se *SmartArt-layout (omgång 3)*.
 
 **Resultat** (jämförelseprovet, SSIM-medel, alla 30 presentationer med PowerPoint-PDF, 1121 bilder; före =
 omgång 1). Ingen presentation blev sämre; fyra enskilda bilder sjönk 0,003–0,013 (förklaring nedan).
@@ -516,3 +523,282 @@ LibreOffice-rendering är Kladd nu närmare PowerPoint på 573 av 632 bilder (53
 | covid-infographic-hospitalized-fr | 1 | 0.640 | 0.640 | – |
 | covid-infographic-waiting-fr | 1 | 0.787 | 0.787 | – |
 | **alla 33** | 1124 | 0.871 | 0.880 | |
+
+## Redigering och sparande (omgång 3)
+
+Presentationen kan ändras i redigeringsläget och sparas källbevarande. Moduler:
+
+| Modul | Gränssnitt |
+|---|---|
+| `edit_xml.rs` | Förlustfri XML: `parse(&[u8]) -> XDoc` (UTF-8; UTF-16 och trasig XML ger `None`, delen redigeras inte), `XElem` med normaliserade namn (`p:sp` oavsett prefix, samma tabell som `xml.rs`) och originalets start-/sluttaggar, text och kommentarer; `to_bytes()` ger byte för byte samma del om inget ändrats. En attributändring skriver bara om den taggen. Nya element skapas som text med dokumentets prefix (`XDoc::fragment`, `ensure_prefix`). |
+| `edit.rs` | `Session` (utgångsläget: zip-filen som öppnades eller sparades, rörda delar, ångra/gör om som ögonblicksbilder av de delar ett steg ändrade, sammanslagen skrivning inom 1,5 s, `dirty`), `Txn` (delar tolkade för ändring, relationer `add_rel`/`remove_rel`, innehållstyper `ct_override`/`ct_default`, unika delnamn som aldrig återanvänds), `save_bytes(deck, ext)` och `mark_saved`. Efter varje ändring byggs `Deck` om ur de nya delarna (`Deck::from_package` med typsnitt och bildcachar från den förra), så ritmodellen tolkas alltid ur samma byte som sparas. |
+| `save.rs` | `write_zip(base, pkg, touched)`: originalets poster i ordning, orörda (och rörda men lika) kopieras komprimerade som de är (`raw_copy_file`), ändrade skrivs om, borttagna utelämnas, nya läggs sist. |
+| `edit_ops.rs` | Former: `shapes(deck, bild)` (toppnivåformer med ärvd placering för träffprov), `set_xf`, `delete_shape`, `duplicate_shape`, `reorder_shape`, `insert_textbox`, `insert_picture`, `set_text`. Bilder: `new_slide(after, layout)`, `duplicate_slide`, `delete_slide`, `move_slide`, `set_hidden`. `set_notes`. |
+| `edit_text.rs` | `TextModel` (stycken med `a:pPr`, körningar med `a:rPr`, `a:br`, fält och okända element som följer med), redigering med `Pos { para, ch }`, `write_into` (orörda stycken skrivs som de var), `carets` → `Carets` (markör, markering, upp/ned, radens början/slut, träff). |
+| `edit_view.rs` | `Editor` i `PptxTab` (redigeringsläget, markering, dragning, text, anteckningar), lagret över bilden, tangenterna, sidopanelens meny och dragning. |
+
+- **Former adresseras** med läget bland bildens toppnivåformer i ritmodellen och `p:cNvPr/@id` som kontroll (id kan
+  förekomma två gånger i verkliga filer). I den förlustfria XML:en räknas ett `mc:AlternateContent` som så många
+  former som dess valda gren har (samma val som `xml.rs`); en sådan form flyttas i alla grenar (samma id), tas bort
+  och dupliceras som helhet, men dess text redigeras inte.
+- **Schemaordning:** `a:xfrm` först i `spPr` (skapas när placeringen ärvdes från layouten, med ärvda värden),
+  `p:txBody` före `p:extLst`, `sldIdLst` efter mall-/anteckningsmall-/utdelningslistorna, `notesMasterIdLst` direkt
+  efter `sldMasterIdLst`, `a:pPr` först och `a:endParaRPr` sist i `a:p`.
+- **Ta bort form:** kopplingar (`a:stCxn`/`a:endCxn`) till formen tas bort, effekter i `p:timing` som riktar sig mot
+  den (`p:spTgt/@spid`) och `p:bldP` likaså; blir en referens kvar (t.ex. en utlösare) tas hela tidsträdet bort.
+- **Duplicera form:** nya id (samma nya id i alla grenar), `a16:creationId` tas bort, förskjutning 0,25 tum.
+  Grafiska ramar med diagram/SmartArt/OLE vägras (de skulle dela delar).
+- **Ny bild:** layoutens platshållare utom datum, sidfot, bildnummer och sidhuvud, tomma (`p:spPr` tom, `p:txBody`
+  med ett tomt stycke om layoutens har text). `sldId` = största + 1 (minst 256); bilden läggs i samma avsnitt
+  (`p14:sectionLst`) som bilden före. `docProps/app.xml` `Slides` räknas om.
+- **Ta bort bild:** `sldId`, relationen, delen, dess relationer och innehållstyp, anteckningssidan, länkar från andra
+  delar (relationen och `a:hlinkClick`/`a:hlinkHover` med det id:t), anpassade visningar och avsnitt; delar som bara
+  bilden använde (media, diagram) tas bort om ingen annan relation pekar på dem.
+- **Duplicera bild:** delen och dess relationer kopieras; layout, media, länkar och teman delas; anteckningssidan,
+  diagram, SmartArt-delar och inbäddningar kopieras (med samma relations-id, så XML:en behöver inte ändras);
+  `p14:creationId` får ett nytt värde.
+- **Flytta bild:** `sldId` flyttas; i avsnitten flyttar bilden till grannens avsnitt.
+- **Anteckningar:** brödtextplatshållaren får en körning per rad med formateringen från första körningen. Saknas
+  anteckningssidan skapas den (bildplatshållare och brödtext, relationer åt båda hållen); saknas anteckningsmallen
+  skapas en enkel mall med en kopia av första mallens tema.
+- **Spara:** `Ctrl+S` → `Document::save_to` → `PptxTab::save_bytes(filändelse)`. Innehållstypen för
+  `presentation.xml` ändras bara när filändelsen byter format (`.pptx`/`.ppsx`/`.potx` och makrovarianterna; till ett
+  format utan makron tas `vbaProject` bort). Digitala signaturer (`_xmlsignatures/`, ursprungsrelationen och
+  innehållstyperna) tas bort vid första ändringen. En `.ppt` som konverterats kräver *Spara som* (`needs_save_as`).
+  Automatisk sparning går genom `save_to`; `autosave.rs` mäter tystnad med textens kontrollsumma, som för en
+  presentation alltid är tom, så den sparar ~3 s efter att fliken blivit ändrad (också mitt i skrivandet; man kan
+  fortsätta skriva, sparningen avslutar bara ångra-sammanslagningen). Återställning efter krasch (`recovery.rs`)
+  sparar text och hoppar över presentationer.
+- **Markören:** `text::layout_carets` är samma utläggning som `text::layout` och ger dessutom markörlägen (klustrens
+  början, radbrytningar och styckenas slut; `Seg` vet vilken körning och vilket tecken det börjar i).
+  `TextModel::carets` bygger textramen som `render::Builder::text_body`/`place_text` (arv, `bodyPr`, geometrins
+  textrektangel, vridning, lodrät text) med en körning per modellens del. Provet `markorlagen_foljer_texten` jämför
+  med glyfernas lägen i den ritade bilden. Höger-till-vänster: markören står vid klustrens logiska ordning (ungefärligt).
+- **Rendering under redigering:** `Pool` har en version per bild; en ändrad bild renderas om i bakgrunden och den
+  gamla texturen visas tills den nya är klar (en äldre rendering ersätter aldrig en nyare). Ändras antalet eller
+  ordningen släpps alla texturer. Sökregistret byggs om.
+- **Prov** (`edit_tests.rs`, egen fixtur med tema, mall, två layouter, anteckningar och anteckningsmall, animering,
+  grupp, `mc:AlternateContent`, länk mellan bilder, avsnitt, `customXml` och en okänd del): tur och retur utan
+  ändring (samma delar i samma ordning, också för alla korpusfiler, och förlustfri XML för varje del), ändrad text
+  (formatering kvar, alla andra delar byte för byte lika), flytta/storlek (också ärvd placering och grupp), ångra/
+  gör om, ta bort form (animering städas) och duplicera (nya id), ordning, `mc:AlternateContent`, ny bild med
+  layout (avsnitt, `app.xml`), ta bort bild (länkar, anteckningar, media), flytta/duplicera/dölja bild, anteckningar
+  med och utan mall, infoga textruta och bild, signaturer, format, sammanslagen skrivning och markörlägen. Varje
+  sparad fil går genom `validate` (zip läsbar, varje del har innehållstyp och varje `Override` en del, relationernas
+  ägare och mål finns, alla `r:id`/`r:embed` finns bland delens relationer, unika form-id per bild, `sldId` ≥ 256 och
+  unika, avsnitten nämner bara bilder som finns, Kladd öppnar filen). Ignorerade prov: `validera_fil`
+  (`KLADD_PPTX_VALIDATE=fil`) och `redigera_alla` (`KLADD_PPTX_SWEEP=mapp`, `KLADD_PPTX_SWEEP_OUT=mapp`: varje
+  presentation sparas oförändrad, redigeras i fem steg, kontrolleras, öppnas och renderas).
+- `validate` kontrollerar också sluttaggarnas namn och att alla prefix är deklarerade (med `quick_xml::NsReader`):
+  `edit_xml` och `xml.rs` släpper igenom båda. Det hittade två fel som är rättade: ett `a:endParaRPr` som blev
+  `a:rPr` behöll sin sluttagg, och en fil som deklarerar `a:` bara på enskilda element fick nya element med ett
+  odeklarerat prefix (nu deklareras det på roten).
+- **Resultat:** `redigera_alla` på hela materialet under `pptx/downloads` (543 `.pptx`, med python-pptx-, POI-,
+  Open-XML-SDK- och ShapeCrawler-proven): oförändrad sparning ger samma delar i alla, och efter sex redigeringar
+  (flytta, skriva/backsteg/Enter/fetstil, ny bild, anteckningar, duplicera, ta bort) går alla igenom `validate`
+  (utöver fel som originalet redan hade), öppnas igen och renderas. python-pptx öppnar alla redigerade filer vars
+  original den öppnar (de som inte öppnas är ISO Strict-filer och en trasig krasch-provfil, som python-pptx inte
+  heller öppnar i original). LibreOffice 24.2 (`soffice --convert-to pdf`) konverterade 34 av 40 slumpvis valda
+  redigerade filer; de 6 andra konverteras inte heller i original (kontrollerat för 4). Jämförelseprovet mot
+  PowerPoint är oförändrat för alla 1 124 bilder (medel 0,8842, samma värde per bild som `integ2`).
+- **Inte kontrollerat mot PowerPoint** (finns inte i behållaren), så att PowerPoint öppnar filerna utan
+  reparationsdialog är inte bevisat; ordningen i schemat och relationerna är gjorda för det.
+
+## Bildspel: övergångar, animeringar och föredragsvy (omgång 3)
+
+| `scene.rs` | `Item::BeginShape { id }`/`EndShape` runt varje toppnivåform på bilden (`p:cNvPr/@id`; bara bildens eget formträd, inte mall/layout eller former inuti grupper och SmartArt), `Item::Para(n)` före varje stycke i en textram (från `text.rs`), `Scene::shape_ranges() -> Vec<(u32, Range<usize>)>`. Markörerna ritas inte (raster, PDF och sökningen hoppar över dem). |
+| `transition.rs` | `Transition::of_slide(root)` (`kind`, `dur`, `adv_click`, `adv_after`); `pieces(kind, p, aspect) -> Vec<Piece>` (konvexa polygoner i texturens koordinater med avbildning till målet och alfa, lager gammal/ny/svart); `reveal(Reveal, p, aspect)` för avslöjningsformerna (används också av animeringarna). |
+| `anim.rs` + `anim_expr.rs` | `Timeline::of_slide(root)`: klickgrupper (`Group { auto, effects, dur }`), `clicks()`, `groups_at_step(k)`, `chain(k)` (grupperna som spelas när man kommer till steg k), `targets()`, `initially_hidden(t)`, `state(target, geom, chain, t) -> State` (synlig, opacitet, förskjutning, skala, vridning, avslöjning). Formlerna i `p:tav`/`by`/`from`/`to` räknas av `anim_expr::eval`. |
+| `anim_layers.rs` | `split(&Scene, &[Target]) -> Vec<LayerItems>` (fasta lager och mål i ritordning), `filter` (styckeval med balanserade effekt-/klippmarkörer), `render(..) -> Vec<Rendered>` (förmultiplicerad RGBA beskuren till innehållet + marginal för skugga/glöd/spegling, i samma bildpunktsrutnät som hela bilden). |
+| `slideshow.rs` | `Show` har klick-steg per bild (`with_steps`, `step`, `peek_next`, `position`); `Playback` (`next(now, click)`, `prev`, `jump`, `tick`, `frame(now) -> Frame`, `animating`, `auto_due`); `Timer` och `clock_text` för föredragsvyn. Rent, provat utan GUI. |
+| `presenter.rs` | `ShowView` (ägs av `PptxTab` under bildspelet): bakgrundsrendering av lagren (högst två trådar), bildrutan som egui-nät (`paint_slide`, `clip_convex`), föredragsvyn; `timings(deck, timelines, animate)`. |
+
+- **Tidsträdet:** huvudsekvensens `p:par` är klickgrupper. En grupp med `evt="onBegin"` (eller en fördröjning utan
+  `indefinite`) startar själv: först på bilden när övergången är klar, annars när gruppen före är klar. Inom gruppen
+  börjar en tidsförskjuten del med *efter föregående* vid max(skriven fördröjning, förra delens slut) – PowerPoint
+  skriver den summerade fördröjningen (t.ex. 1000, 3560), men 0 förekommer efter effekter på 1 ms.
+  Beteendena tolkas generellt (inte per `presetID`): `p:set style.visibility`, `p:animEffect` (`fade`, `wipe(dir)`,
+  `barn`, `circle`, `diamond`, `plus`, `box`, `blinds`, `checkerboard`, `randombar`, `dissolve`, `wheel`, `wedge`,
+  `strips`; annat = toning), `p:anim` (`ppt_x`/`ppt_y`/`ppt_w`/`ppt_h`/`style.rotation`/`r`/`style.opacity` med nyckelbilder
+  och formler), `p:animScale`, `p:animRot`, `p:animMotion` (banan som polylinje, kurvor i 8 steg, längs båglängden),
+  färgbyten (`p:animClr`, `p:set` av färger i betoningar) som en blinkning. `accel`/`decel`, `autoRev` och
+  `repeatCount` gäller; `fill="remove"` tar bort effekten när den är klar. `p:txEl/p:pRg` ger ett mål per stycke;
+  `charRg`, `graphicEl` (SmartArt/diagram i delar) och `bg` gäller hela formen. Utlösare (`interactiveSeq`) räknas inte:
+  de formerna syns som vanligt. Ett mål som inte finns i visningslistan (t.ex. på layouten) ritas som vanligt –
+  aldrig "dolt för alltid".
+- **Lagren:** en bild utan mål är ett enda lager (samma bild som förut). Med mål delas listan vid varje animerad form
+  så att ritordningen behålls (en animerad form under en fast hamnar under den). Stycken i samma form blir egna lager;
+  formens geometri och övriga stycken stannar i det fasta lagret. Provet `lagren_ger_samma_bild_som_hela_renderingen`
+  visar att lagren ihoplagda ger samma bildpunkter (±2) som hela renderingen.
+- **Uppspelning:** övergången ritar den gamla bilden i sitt slutläge och den nya i läget före sina animeringar; nästa
+  bild förrenderas. Bakåt hoppar utan animering. `advTm` räknas från stegets början (efter övergången) men väntar
+  tills stegets animeringar är klara; finns klick-steg kvar tar den automatiska övergången nästa steg. `advClick="0"`
+  gör att musklick inte byter bild (tangenter gör det). Medan lagren renderas visas inget av bilden (svart), så att en
+  form med in-effekt aldrig syns för tidigt, och uppspelningens klocka står still så att övergången och de
+  självstartande animeringarna inte hinner gå under väntan (föredragsvyns förflutna tid går som vanligt).
+- **Föredragsvyn** öppnas med `Alt+F5` i vyn (bildspel från början med föredragsvyn, `PptxTab::handle_keys`) eller
+  under bildspelet. Den är en egui-viewport (`show_viewport_immediate`); utan stöd för flera fönster
+  (`ctx.embed_viewports()`) växlar `Alt+F5` vyn i samma fönster. Kladd avgör inte själv om det finns två skärmar och
+  öppnar inte föredragsvyn automatiskt: talarens fönster öppnas som ett vanligt fönster och publikens är helskärm.
+- **Referensmaterialet:** 257 bilder har övergångar (toning 147, genom svart/`p14:reveal` 81, torka 18, push 11) och
+  614 klick-steg; alla 1 081 mål hittas i visningslistan (`anim_layers::tests::referensmaterialets_animeringar`,
+  ignorerat, `KLADD_PPTX_REFS`).
+- **Kvar:** morph som forminterpolering, `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i
+  betoningar (kräver omrendering), `iterate` (bokstav för bokstav), ljud och video, utlösare, val av skärm.
+
+## 3D i diagram och former (omgång 3)
+
+Nya moduler: `chart_3d.rs` (kamera, projektion, belysning, cirkelns och staplarnas ytor, målarordning; rena
+funktioner), `chart_3d_draw.rs` (undermodul till `chart_draw.rs`, delar `Draw`) och `bevel.rs` (`a:sp3d`/
+`a:scene3d` på former). `scene::Effect` har fått `Bevel`, `Contour` och `Camera` (sist i listan); kroken i
+`render.rs` är `bevel::with_3d` för former och bilder, och `pdf.rs` ritar fasningen som ett rasteröverlägg
+(`effects::overlay`, bara kantzonen) och former med en 3D-kamera helt som rasterbild (`effects::rasterized`).
+
+**Diagram.**
+
+- **Modellen:** `View3D` har `rotX`/`rotY` som `Option` (standardvärdena beror på typen: cirkel 30/0,
+  stapel/linje/yta 15/20), `depthPercent`, `hPercent`, `rAngAx`, `perspective`; `Chart::walls` (`c:floor`,
+  `c:sideWall`, `c:backWall`); `Plot::three_d`, `shape` (`c:shape`) och `gap_depth`.
+- **Kameran:** rätvinkliga axlar (`rAngAx`, standard) ger en sned parallellprojektion där framsidan är
+  oförvrängd och en enhet bakåt flyttar punkten (sin `rotY`, sin `rotX` · cos `rotY`); annars vrids världen
+  `rotY` och `rotX` och `perspective` ger synfältet `perspective / 2` grader. Ytornas skuggning räknas alltid
+  med den riktiga vridningen.
+- **Belysningen:** en riktad ljuskälla (40° till vänster om rakt upp, 36° ut från skärmen i kamerans
+  koordinater) och 35 % omgivningsljus, anpassat med minsta kvadrat till sidornas färger i de två 3D-cirklarna
+  i PowerPoints PDF-export (`msrc-win32k` bild 8, `rotX` 30: sidan rakt fram 55 % av toppens ljushet,
+  vänsterkanten 77 %, högerkanten 39 %; `cppcon17-inherited-codebase-mac` bild 7, `rotX` 50: 38 %).
+- **3D-cirkeln:** toppar, sidor (de delar av bågen som vetter mot betraktaren, med en vågrät övertoning i
+  ljusheten) och snittytor där en sektor är utskjuten; sidor och snittytor bakifrån och fram, topparna sist.
+  Tjockleken 0,30 r vid `hPercent` 100 och storleken 84 % av det största som får plats valdes mot de två
+  bilderna (uppmätt tjocklek 0,22–0,28 r; PowerPoints perspektiv i cirkeln görs inte).
+- **Stapel, linje och yta:** en låda med bakvägg, sidovägg och golv (deras `spPr`; utan fyllning som
+  standard), värdeaxelns rutnät på väggarna, serierna som föremål ritade bakifrån och fram (varje föremåls
+  ytor med baksidesgallring och ljushet relativt framsidan). Staplar: lådor, cylindrar (36 sidor), koner och
+  pyramider (`coneToMax`/`pyramidToMax` som stympade mot axelns största värde), grupperade, staplade, 100 %
+  och `standard` (serierna på djupet när diagrammet har en `serAx`). Linjer som band (ovansida, framsida så tjock
+  som 1,6 × linjebredden, minst 2,25 pt, undersida och ändar) och ytor som skivor, på var sin rad på djupet,
+  lika djupa som staplarna (`gapDepth`), första serien närmast. Tomma punkter följer `c:dispBlanksAs` (`zero`
+  när elementet saknas, som standardvärdet i ECMA-376; `gap`, `span`); ytor har alltid noll. 2D-linjerna
+  är oförändrade (luckor). I förklaringen har 3D-linjer en ruta i bandets färg. Axeletiketterna längs lådans främre kanter,
+  seriernas namn till höger om djupet.
+- **Inte gjort:** `surface3DChart`, perspektiv i 3D-cirkeln, datatabeller i 3D, att räkna in etikettbredden i
+  lådans placering vid stor vridning. Stapel/linje/yta i 3D finns inte i referensmaterialet och är bara
+  prövade med egna fixturer (`chart_tests.rs`) och genom att titta på bilderna.
+
+**Former** (`bevel.rs`):
+
+- **Arv:** `a:scene3d` och `a:sp3d` var för sig ur första `spPr` i platshållarkedjan, annars ur temats
+  effektstil via `effectRef` (Office 2007-temans tredje effektstil har en fasning; `bevel::THEME_3D`).
+  `effectRef idx="3"` förekommer bara i `cppcon14-parallel-overview` (1), `cppcon17-inherited-codebase-mac`
+  (2) och `owasp-top10-2010-es` (101, SmartArt); med och utan temats 3D gav samma mått i de åtta
+  presentationerna med fasningar (cppcon14 ×2, msrc-eko19, owasp-2017 ×5), och owasp-2010-es blev bättre.
+- **Fasning** (`bevelT`; `bevelB` och `extrusionH` syns inte framifrån): avståndet till formens kant
+  (exakt euklidiskt avståndsfält, Felzenszwalb–Huttenlocher, ur lagrets täckning) → läget i profilen →
+  normalen (profilens lutning × `h` / bredden) → ljusheten (omgivning + Lambert + Blinn-glans, relativt en
+  plan yta) gånger färgen. De tolv profilerna är uppskattade ur PowerPoints galleri. `threePt` är anpassad
+  till kvadraterna i `cppcon14-parallel-overview` bild 14 (PowerPoint rastrerar fasningar i PDF:en i
+  200 dpi; fasetternas ljushet uppåt 1,04, nedåt 0,52, vänster 0,81, höger 0,57 → omgivning 0,29, ljuset 25°
+  vänster om rakt upp och 61° ut från planet). Ljuset vrids med formens och gruppens rotation men inte med
+  speglingar (kvadraterna sitter i en grupp vriden 90° med `flipV` och är ljusast åt höger). `rev` vrider
+  riggen (125° i SmartArt-pilarna på samma bild stämmer), utom för de jämna riggarna (`balanced` …).
+  Glansen efter materialet (`warmMatte` 0,77, `plastic`/`metal` 1, `flat`/`matte`/`dkEdge` 0), riggen
+  `flat` ger ingen skuggning. Den synliga zonen är halva `w` (`bevel::ZONE`): uppmätt 6–8 pt för `w` 13 pt,
+  och 0,5 gav bäst mått av 0,3–1,0.
+- **Kontur** (`contourW`, `contourClr`): ett band runt formen ur avståndsfältet utanför.
+- **Kameror** som inte tittar rakt framifrån (isometriska, perspektiv, egna `a:rot`): formen förvrängs
+  affint runt sin mitt (planet vridet `lon`/`lat`, parallellprojektion) och extruderas `extrusionH` längs
+  den projicerade djupaxeln i `extrusionClr` (annars 60 % av fyllningen); sneda kameror bara extruderar.
+  Texten förvrängs inte. Ingen form i materialet har en sådan kamera.
+- **Inte gjort:** 3D-text (`sp3d` på `a:bodyPr`), riktigt perspektiv, ljusare/mörkare extruderingssidor.
+
+**Prov:** `chart_3d.rs` (hörnens lägen vid rätvinklig vy, vridning och perspektiv, belysningen mot
+PowerPoints cirklar, cirkelns ytor och ritordning, framsidans vinkelintervall, lådans synliga sidor och
+ordning, utåtriktade normaler för alla former), `chart_tests.rs` (3D-stapel genom hela ritvägen med
+skuggade sidor, alla typer och former inom ramen, 3D-cirkel med övertonade sidor före topparna),
+`bevel.rs` (avståndsfältet, profilernas form, ljuset som i PowerPoint, ljuset vrids med formen men inte med
+speglingar, `orthographicFront` utan fasning ger samma visningslista som utan `scene3d`, fasning/kontur/
+kamera i rastret och PDF-överlägget, kamerornas förvrängning).
+
+**Resultat** (jämförelseprovet, alla 33 presentationer, 1 124 bilder; före = 2.11.0, `integ2`): medel
+0,88424 → 0,88441. Ingen presentation blev sämre; en bild sjönk 0,0009 (`owasp-top10-2017-ko` bild 15,
+fasningen på en liten ruta i hörnet), 136 bilder blev bättre.
+
+| Bild | Innehåll | Före | Efter |
+|---|---|---:|---:|
+| cppcon14-parallel-overview 14 | `coolSlant` på kvadrater och cirklar, SmartArt-pilar | 0,8813 | 0,8998 |
+| cppcon14-parallel-overview 33 | fasade former | 0,8145 | 0,8260 |
+| cppcon14-parallel-overview 10 / 4 | fasade former | 0,6420 / 0,8794 | 0,6492 / 0,8827 |
+| owasp-top10-2010-es 6 / 17 / 19 | fasade SmartArt-former | 0,8863 / 0,9213 / 0,8179 | 0,9003 / 0,9263 / 0,8223 |
+| owasp-top10-2017-* (alla fem) | `circle` på rubrikrutan på varje bild | | +0,0009–0,0010 per presentation |
+| cppcon14-decomposing 5 / 39 | `coolSlant`, `balanced` vriden 145° | 0,8773 / 0,8912 | 0,8788 / 0,8921 |
+| msrc-win32k 8 | 3D-cirkel, utskjuten | 0,8669 | 0,8695 |
+| cppcon17-inherited-codebase-mac 7 | 3D-cirkel, `rotX` 50 | 0,9454 | 0,9462 |
+## SmartArt-layout (omgång 3)
+
+**Varför kugghjulen hamnade fel.** Alla 35 SmartArt i referensmaterialet (10 presentationer, 28 bilder) har en
+ritdel, och 33 av dem har former. Ingen av ritdelarna med former är inaktuell: PowerPoints PDF visar
+ritdelens former (jämfört bild för bild för kugghjulen, `vList5` i owasp en/ko/ja och pyramiden), och för de
+layouter motorn klarar (`vList5`, `pyramid3`, kugghjulens lägen) ger den samma former som ritdelen. Kugghjulen i `msrc-win32k` (bild 4, 5, 6 och
+22) ligger i **grupper som skalar sina barn** (`chExt` ≠ `ext`, 16–92 %). Ritdelen är sparad i ramens *visade*
+storlek, så gruppens skalning gäller ramens läge och storlek men inte formerna i ritdelen; Kladd skalade dem en
+gång till (bild 4: 79 %). `smartart::drawing_transform` tar bort gruppskalningen (rotation och spegling gäller
+fortfarande). Hypotesen att PowerPoint lägger om layouten när filen öppnas stämmer alltså inte för materialet;
+färg- och stildefinitionerna tillämpas också rätt (ingen skillnad hittad).
+
+**Regel för ritdelen.** Ritdelen (`dsp:dataModelExt@relId`, annars den enda på bladet) används när den har
+former. Saknas den eller är `dsp:spTree` tom (PowerPoint sparar ibland en tom ritdel; `owasp-top10-2017-he`
+bild 20–21, där PowerPoint lägger ut diagrammet ur datamodellen) lägger layoutmotorn ut diagrammet när
+presentationen läses in (`smartart::lay_out_missing`, efter typsnitten) i ramens visade storlek, och resultatet
+ritas som en ritdel (nyckel `<datadel>#kladd` i `Deck::drawings`). Saknas layoutdefinitionen, används
+hierarkialgoritmerna, eller går resultatet inte att läsa (text under 5 punkter, text som inte får plats ens i
+regelns minsta storlek, eller mer än hälften av datamodellens text utan form) blir det som förut datamodellens
+text som punktlista. Ett panik i motorn ger också reserven (`catch_unwind`).
+
+**Layoutmotorn** (`dgm/`, ECMA-376 del 1 §21.4):
+
+| Fil | Innehåll |
+| `dgm/data.rs` | `Model`: punkterna, `parOf`-trädet med `parTrans`/`sibTrans`, axlarna (`ch`, `des`, `followSib`, `precedSib`, `par`, `ancst`, `root`, `self`, listor som `axis="par ch"`), typfilter, `st`/`cnt`/`step`, `hideLastTrans`. |
+| `dgm/tree.rs` | `Tree`: `layoutNode`, `forEach` (även `ref`), `choose`/`if` (`cnt`, `pos`, `revPos`, `posEven`/`posOdd`, `depth`, `maxDepth`, `var` ur `presLayoutVars`/`varLst`), villkor (`constrLst`: `for`/`forName`/`ptType`, `refType`/`refFor`/`refForName`, `fact`, `op`; längder i mm, en längd ur en teckenstorlek räknas i mm per punkt), regler (`ruleLst`, även förälderns `for="ch"`/`"des"`), algoritmerna och presentationspunkternas egna värden (`custScaleX/Y`, `custLinFactX/Y`, `custLinFactNeighborX/Y`, `custAng`). |
+| `dgm/emit.rs` | Formerna som `p:spTree`: geometri (`adjLst` i formdefinitionens ordning), `p:style` ur stildefinitionen med färgerna ur färgdefinitionen (`repeat`/`cycle`/`span`, index ur `presStyleIdx`/`presStyleCnt`), `scene3d`/`sp3d` ur stildefinitionen, formatering ur punkten och presentationspunkten (`dgm:spPr`), text ur `presOf` med PowerPoints styckeformat (90 % radavstånd, 35 %/15 % efter stycket, punkter från `stBulletLvl`), `txXfrm` (upprätt text i vridna former), marginaler i förhållande till teckenstorleken och teckenstorleken krympt i halva punkter tills texten får plats (minst regelns värde; `op="equ"` ger gruppen den minsta). Text med egen formatering (`custT`) behåller sina storlekar. |
+
+Algoritmer: `lin` (barnen efter varandra längs `linDir`; flödet krymps lika för alla när de inte får plats,
+tvärs över bara storlekar räknade ur flödesriktningen; ihop centrerade längs flödet efter utbredningen,
+justerade tvärs över efter rutan; uppmätt mot `vList5`, `vList2`, `hProcess9`), `composite` (`l`/`t`/`r`/`b`/
+`ctrX`/`ctrY`/`w`/`h` och förskjutningar, `ar`), `snake` (det antal per rad som ger störst noder, sista raden
+centrerad), `cycle` (lika vinkelsteg från `stAng`, radien så att noderna inte överlappar), `pyra` (nivåer som
+trapetser med pyramidens sidor; `fromT` = omvänd pyramid), `hierRoot`/`hierChild` (roten centrerad över barnens
+rad), `tx`, `sp`, `conn` (pil i sin ruta; böjda kopplingar ritas inte). Bara noder med `tx` visar text. En
+nods egna villkor är standardvärden: förälderns villkor för den går före. Får helheten inte plats krymps och
+centreras den.
+
+**Jämförelse mot ritdelarna.** Det ignorerade provet `smartart_tests::oracle` (`KLADD_DGM_ORACLE`, en lista med
+presentationer) lägger ut varje diagram som har en ritdel och jämför formerna med PowerPoints (överlapp per
+presentationspunkt). 57 diagram i referensmaterialet och provsamlingarna: `vList5` 0,95–1,00 (12 diagram),
+`pyramid3` 1,00, `hProcess9` 1,00, `default` 1,00, `venn1` 1,00, `IconCircleLabelList` (små) 0,86–0,94,
+`VerticalCurvedList` 0,82, `hChevron3` 0,78, `AlternatingHexagons` 0,75, `process1` 0,68, `vList2` 0,50–0,74
+(texten som får rutan att växa saknas), `gear1` med tre kugghjul 0,44 (kugghjulen stämmer, pilarna saknas; med
+ett och två kugghjul har PowerPoint egna förskjutningar i `composite`), `hList1`, `list1`, `pyramid2`,
+`lProcess2`, `vList3` 0,12–0,43, `IconLabelList` 0,01, `hierarchy4` 0–0,92, medel 0,64. `rita_layoutmotorns_bilder`
+(`KLADD_DGM_RENDER`, `KLADD_DGM_OUT`) ritar bilderna där motorn används till PNG.
+
+**Resultat** (jämförelseprovet, SSIM; före = 2.11.0, `integ2`). Alla 1 124 bilder: 0,8842 → 0,8846; ingen
+presentation blev sämre. Presentationer som ändrades: `msrc-win32k` (35 bilder) 0,8843 → 0,8913,
+`owasp-top10-2017-he` (25) 0,7025 → 0,7112. Bilder med SmartArt som ändrades:
+
+| Bild | Före | Efter | Orsak |
+|---|---:|---:|---|
+| msrc-win32k 4 | 0.798 | 0.891 | ritdel i skalad grupp (79/80 %) |
+| msrc-win32k 5 | 0.884 | 0.904 | två ritdelar i grupper (16–33 %) |
+| msrc-win32k 6 | 0.846 | 0.899 | ritdel i skalad grupp (87/90 %) |
+| msrc-win32k 22 | 0.614 | 0.693 | ritdel i skalad grupp (92/93 %); resten är rubrikens radbrytning |
+| owasp-top10-2017-he 20 | 0.602 | 0.752 | tom ritdel → layoutmotorn (`vList5`) |
+| owasp-top10-2017-he 21 | 0.522 | 0.589 | tom ritdel → layoutmotorn (`vList5`) |
+
+Övriga 22 bilder med SmartArt är oförändrade: ritdelen stämmer med PowerPoints PDF, och skillnaderna där är
+typsnitt och radbrytning (koreansk, japansk och rysk text i `owasp-top10-2017-ko/ja/ru` 20–21, rubrikerna i
+`msrc-win32k` 22), `buChar="••"` i `owasp-top10-2010-es` 17–20 och ikonerna i `msrc-identity`.
+
+**Prov** (`smartart_tests.rs`, egna minimala diagram): `lin` med mellanrum, krympning och teckenstorlek i grupp,
+egen skalning och förskjutning, `composite` med `ar`, `snake`, `cycle`, `pyra`, hierarki (trädet direkt),
+datamodellens axlar och urval, `choose`/`if` efter antal, tom ritdel → layoutmotorn, oläslig layout → reserven,
+ritdel i skalad grupp.

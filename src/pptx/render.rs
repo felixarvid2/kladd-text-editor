@@ -74,7 +74,7 @@ struct GroupFill<'a> {
 /// Bygger visningslistan för bild `idx`.
 pub fn slide_scene(deck: &Deck, idx: usize) -> Scene {
     let (w, h) = deck.size_pt();
-    let mut b = Builder { sheets: Sheets::for_slide(deck, idx), scene: Scene::new(w, h), slide_no: deck.slide_number(idx), group_fill: Vec::new(), rels_override: None, bg_paint: None };
+    let mut b = Builder { sheets: Sheets::for_slide(deck, idx), scene: Scene::new(w, h), slide_no: deck.slide_number(idx), group_fill: Vec::new(), rels_override: None, bg_paint: None, mark_shapes: false };
     b.background();
     let slide_shows_master = b.sheets.slide.is_none_or(|s| s.root.attr("showMasterSp") != Some("0"));
     let layout_shows_master = b.sheets.layout.is_none_or(|l| l.root.attr("showMasterSp") != Some("0"));
@@ -89,6 +89,7 @@ pub fn slide_scene(deck: &Deck, idx: usize) -> Scene {
         }
     }
     if let Some(t) = b.sheets.tree(Owner::Slide) {
+        b.mark_shapes = true;
         b.tree(t, Owner::Slide, &Affine::IDENTITY);
     }
     b.scene
@@ -103,6 +104,8 @@ pub struct Builder<'a> {
     pub rels_override: Option<&'a [package::Rel]>,
     /// Bildens bakgrund (för `useBgFill`).
     bg_paint: Option<Paint>,
+    /// Märk trädets former med `BeginShape`/`EndShape` (bara bildens eget formträd, inte grupper inuti).
+    mark_shapes: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -154,6 +157,7 @@ impl<'a> Builder<'a> {
 
     /// Ritar ett formträd. `parent` avbildar trädets koordinater på bilden.
     pub fn tree(&mut self, tree: &'a Node, owner: Owner, parent: &Affine) {
+        let mark = std::mem::replace(&mut self.mark_shapes, false);
         for c in &tree.children {
             // Platshållare på mall och layout ritas inte (bara deras utseende ärvs).
             if owner != Owner::Slide && inherit::placeholder(c).is_some() {
@@ -163,6 +167,11 @@ impl<'a> Builder<'a> {
             if c.children.first().and_then(|nv| nv.child("p:cNvPr")).is_some_and(|n| n.attr_bool("hidden") == Some(true)) {
                 continue;
             }
+            let id = c.children.first().and_then(|nv| nv.child("p:cNvPr")).and_then(|n| n.attr_i64("id")).filter(|_| mark);
+            let id = id.and_then(|i| u32::try_from(i).ok());
+            if let Some(id) = id {
+                self.scene.items.push(Item::BeginShape { id });
+            }
             match c.name.as_str() {
                 "p:sp" | "p:cxnSp" => self.shape(c, owner, parent),
                 "p:pic" => self.picture(c, owner, parent),
@@ -170,7 +179,11 @@ impl<'a> Builder<'a> {
                 "p:graphicFrame" => self.graphic_frame(c, owner, parent),
                 _ => {}
             }
+            if id.is_some() {
+                self.scene.items.push(Item::EndShape);
+            }
         }
+        self.mark_shapes = mark;
     }
 
     fn group(&mut self, g: &'a Node, owner: Owner, parent: &Affine) {
@@ -228,7 +241,9 @@ impl<'a> Builder<'a> {
         // Effekterna gäller formen; utan fyllning och linje gäller de texten.
         let geom_drawn = self.scene.items.len() > start;
         if geom_drawn {
-            self.wrap_effects(start, effects.clone());
+            // 3D (`sp3d`/`scene3d`): fasning, kontur och kamera gäller bara formen, inte texten.
+            let fx = super::bevel::with_3d(&self.sheets, effects.clone(), &chain, style, &f, &self.scene.items[start..]);
+            self.wrap_effects(start, fx);
         }
         let text_start = self.scene.items.len();
         if let Some(body) = body.filter(|_| has_text) {
@@ -568,6 +583,7 @@ impl<'a> Builder<'a> {
         // 11 och 17; osäkert om det gäller generellt).
         let transparent = effects.iter().any(|e| matches!(e, super::scene::Effect::OuterShadow { .. })) && self.scene.items[start..].iter().any(|it| matches!(it, Item::Image { image, .. } if image.rgba.chunks_exact(4).any(|p| p[3] < 250)));
         let effects: Vec<_> = effects.into_iter().filter(|e| !(transparent && matches!(e, super::scene::Effect::OuterShadow { .. }))).collect();
+        let effects = super::bevel::with_3d(&self.sheets, effects, &chain, style, &f, &self.scene.items[start..]);
         self.wrap_effects(start, effects);
     }
 

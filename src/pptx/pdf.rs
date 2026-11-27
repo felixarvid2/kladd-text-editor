@@ -131,11 +131,31 @@ fn draw_image(s: &mut krilla::surface::Surface<'_>, image: krilla::image::Image,
 
 fn draw_scene(s: &mut krilla::surface::Surface<'_>, scene: &Scene) {
     let mut depth = 0usize;
+    // 3D (w-p3d): fasningar som rasterbild ovanpå innehållet (ritas vid `EndEffect`), och former med
+    // en 3D-kamera helt som rasterbild (innehållet hoppas över).
+    let mut overlays: Vec<(usize, krilla::image::Image, Affine)> = Vec::new();
+    let mut skip_to = 0usize;
     for (idx, it) in scene.items.iter().enumerate() {
+        if idx < skip_to {
+            continue;
+        }
         match it {
             Item::BeginEffect(effects) => {
                 // Skugga, glöd och spegling som rasterbild under innehållet (144 dpi); innehållet ritas som vanligt.
                 let end = super::raster::matching_end(&scene.items, idx).min(scene.items.len());
+                let raster = |r: Option<(resvg::tiny_skia::Pixmap, Affine)>| {
+                    let (pm, t) = r?;
+                    let (w, h, rgba) = super::raster::to_rgba(pm);
+                    Some((kimage(&super::scene::ImageData::new(w, h, rgba, None))?, Affine::scale(w as f32, h as f32).then(&t)))
+                };
+                if let Some((k, t)) = raster(super::effects::rasterized(&scene.items[idx + 1..end], effects, scene.width, scene.height, 2.0)) {
+                    draw_image(s, k, &t, [0.0; 4], 1.0);
+                    skip_to = end + 1;
+                    continue;
+                }
+                if let Some((k, t)) = raster(super::effects::overlay(&scene.items[idx + 1..end], effects, scene.width, scene.height, 2.0)) {
+                    overlays.push((end, k, t));
+                }
                 if let Some((pm, t)) = super::effects::underlay(&scene.items[idx + 1..end], effects, scene.width, scene.height, 2.0) {
                     let (w, h, rgba) = super::raster::to_rgba(pm);
                     let img = super::scene::ImageData::new(w, h, rgba, None);
@@ -144,7 +164,13 @@ fn draw_scene(s: &mut krilla::surface::Surface<'_>, scene: &Scene) {
                     }
                 }
             }
-            Item::EndEffect => {}
+            Item::EndEffect => {
+                while let Some(i) = overlays.iter().position(|o| o.0 == idx) {
+                    let (_, k, t) = overlays.remove(i);
+                    draw_image(s, k, &t, [0.0; 4], 1.0);
+                }
+            }
+            Item::BeginShape { .. } | Item::EndShape | Item::Para(_) => {}
             Item::Fill { path, paint, even_odd } => {
                 if let Paint::Image { image, alpha, tile: true, .. } = paint {
                     // Upprepad bild (mönster, `a:tile`): bildens medelfärg.

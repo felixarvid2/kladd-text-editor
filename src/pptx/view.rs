@@ -8,18 +8,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 
 use egui::emath::GuiRounding;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align, Align2, Color32, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, Panel, PointerButton,
+    Align, Align2, Color32, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, Panel,
     Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
 };
 use serde::{Deserialize, Serialize};
 
 use super::find::{self, Hit, Place, SlideText};
-use super::slideshow::{Blank, Screen, Show};
+use super::slideshow::Show;
 use super::Deck;
 use crate::i18n::t;
 use crate::icons::{self, Icon};
@@ -37,8 +37,6 @@ pub const MAX_MEMORY: usize = 100;
 const PT_TO_PX: f32 = 96.0 / 72.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 4.0;
-/// Pekaren göms i bildspelet när musen stått still så här länge.
-const HIDE_POINTER: Duration = Duration::from_secs(2);
 
 /// Zoomläge.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -62,11 +60,13 @@ pub struct Prefs {
     /// Alla bilder i en rullande lista i stället för en bild i taget.
     pub scroll: bool,
     pub zoom: Zoom,
+    /// Bildspelet spelar upp övergångar och animeringar.
+    pub animate: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { thumbs: true, notes: true, scroll: false, zoom: Zoom::Window }
+        Prefs { thumbs: true, notes: true, scroll: false, zoom: Zoom::Window, animate: true }
     }
 }
 
@@ -124,6 +124,8 @@ pub enum Action {
     Print,
     /// Bildspel från början (`false`) eller från aktuell bild (`true`).
     Show(bool),
+    /// Infoga en bild ur en fil (redigeringsläget).
+    InsertPicture,
 }
 
 // ------------------------------------------------------------ rendering
@@ -131,8 +133,6 @@ pub enum Action {
 /// Vilken sorts textur.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 enum Kind {
-    /// Bildspelet (högst prioritet).
-    Show,
     /// Bilden i vyn.
     Page,
     /// Miniatyr i sidopanelen.
@@ -143,12 +143,17 @@ struct Done {
     kind: Kind,
     slide: usize,
     width: u32,
+    /// Bildens version när renderingen startades (se `Pool::gens`).
+    ver: u64,
     image: egui::ColorImage,
 }
 
 /// Texturer och renderingar i bakgrunden.
 struct Pool {
-    tex: HashMap<(Kind, usize), (egui::TextureHandle, u32)>,
+    tex: HashMap<(Kind, usize), (egui::TextureHandle, u32, u64)>,
+    /// Version per bild: räknas upp när bilden ändras (redigering), så att texturen renderas om.
+    gens: HashMap<usize, u64>,
+    next_gen: u64,
     pending: HashSet<(Kind, usize)>,
     wants: Vec<(Kind, usize, u32)>,
     tx: Sender<Done>,
@@ -158,16 +163,34 @@ struct Pool {
 impl Pool {
     fn new() -> Pool {
         let (tx, rx) = channel();
-        Pool { tex: HashMap::new(), pending: HashSet::new(), wants: Vec::new(), tx, rx }
+        Pool { tex: HashMap::new(), gens: HashMap::new(), next_gen: 1, pending: HashSet::new(), wants: Vec::new(), tx, rx }
     }
 
     fn get(&self, kind: Kind, slide: usize) -> Option<&egui::TextureHandle> {
-        self.tex.get(&(kind, slide)).map(|(t, _)| t)
+        self.tex.get(&(kind, slide)).map(|(t, _, _)| t)
+    }
+
+    fn ver(&self, slide: usize) -> u64 {
+        self.gens.get(&slide).copied().unwrap_or(0)
+    }
+
+    /// Bilderna har ändrats: texturerna behålls tills nya renderingar är klara. `all` = bildernas
+    /// ordning eller antal ändrades (texturerna gäller inte längre sina index).
+    fn bump(&mut self, slides: &[usize], all: bool) {
+        if all {
+            self.tex.clear();
+            self.gens.clear();
+        }
+        for &s in slides {
+            self.gens.insert(s, self.next_gen);
+        }
+        self.next_gen += 1;
     }
 
     /// Önskar en rendering om texturen saknas eller har fel bredd.
     fn want(&mut self, kind: Kind, slide: usize, width: u32) {
-        let stale = self.tex.get(&(kind, slide)).is_none_or(|(_, w)| (*w as i64 - width as i64).abs() > 2);
+        let ver = self.ver(slide);
+        let stale = self.tex.get(&(kind, slide)).is_none_or(|(_, w, g)| (*w as i64 - width as i64).abs() > 2 || *g != ver);
         if stale {
             self.wants.push((kind, slide, width));
         }
@@ -177,11 +200,15 @@ impl Pool {
         while let Ok(d) = self.rx.try_recv() {
             self.pending.remove(&(d.kind, d.slide));
             let tex = ctx.load_texture(format!("pptx-{:?}-{}", d.kind, d.slide), d.image, egui::TextureOptions::LINEAR);
-            self.tex.insert((d.kind, d.slide), (tex, d.width));
+            // En rendering av en äldre version ersätter inte en nyare textur.
+            if self.tex.get(&(d.kind, d.slide)).is_some_and(|(_, _, g)| *g > d.ver) {
+                continue;
+            }
+            self.tex.insert((d.kind, d.slide), (tex, d.width, d.ver));
         }
     }
 
-    /// Startar de viktigaste önskningarna (bildspel före vyn före miniatyrer).
+    /// Startar de viktigaste önskningarna (vyn före miniatyrer).
     fn dispatch(&mut self, ctx: &egui::Context, deck: &Arc<Deck>) {
         let mut wants = std::mem::take(&mut self.wants);
         wants.sort_by_key(|w| w.0);
@@ -193,6 +220,7 @@ impl Pool {
                 continue;
             }
             self.pending.insert((kind, slide));
+            let ver = self.ver(slide);
             let deck = deck.clone();
             let tx = self.tx.clone();
             let ctx = ctx.clone();
@@ -207,7 +235,7 @@ impl Pool {
                     .map(|(_, _, px)| px)
                     .unwrap_or_else(|| vec![255; (width * height * 4) as usize]);
                 let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
-                let _ = tx.send(Done { kind, slide, width, image });
+                let _ = tx.send(Done { kind, slide, width, ver, image });
                 ctx.request_repaint();
             });
         }
@@ -289,19 +317,30 @@ pub struct PptxTab {
     notes: HashMap<usize, String>,
     has_notes: bool,
     pub find: FindState,
-    show: Option<Show>,
+    show: Option<super::presenter::ShowView>,
     /// Helskärm har begärts för bildspelet (appen återställer när det slutar).
     pub fullscreen_sent: bool,
-    pointer_moved: Instant,
+    /// Nästa bildspel startar med föredragsvyn (Alt+F5).
+    presenter_on_start: bool,
     wheel: f32,
     /// Skalan i senaste bilden (för zoomstegen).
     last_k: f32,
     page_text: String,
     export: Export,
+    /// Redigeringen (`edit_view.rs`).
+    pub(super) edit: super::edit_view::Editor,
 }
 
 impl PptxTab {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(deck: Deck) -> PptxTab {
+        Self::with_source(deck, Vec::new())
+    }
+
+    /// En flik för en presentation som öppnats ur `source` (filens byte; orörda delar sparas
+    /// därifrån oförändrade).
+    pub fn with_source(deck: Deck, source: Vec<u8>) -> PptxTab {
+        let edit = super::edit_view::Editor::new(source, &deck);
         let has_notes = (0..deck.slides.len()).any(|i| deck.slides[i].notes.is_some() && !super::notes::notes(&deck, i).is_empty());
         PptxTab {
             deck: Arc::new(deck),
@@ -314,12 +353,33 @@ impl PptxTab {
             find: FindState::default(),
             show: None,
             fullscreen_sent: false,
-            pointer_moved: Instant::now(),
+            presenter_on_start: false,
             wheel: 0.0,
             last_k: 1.0,
             page_text: String::new(),
             export: Export::default(),
+            edit,
         }
+    }
+
+    /// Bilder har ändrats (redigering): de renderas om, och sökregistret byggs om.
+    pub(super) fn invalidate(&mut self, slides: &[usize], all: bool) {
+        self.pool.bump(slides, all);
+        if !self.find.index.is_empty() || self.find.index_rx.is_some() {
+            self.find.index.clear();
+            self.find.index_rx = None;
+            self.find.done_for = None;
+            if self.find.open {
+                self.start_index();
+            }
+        }
+    }
+
+    /// Anteckningarna kan ha ändrats.
+    pub(super) fn notes_changed(&mut self) {
+        self.notes.clear();
+        let deck = self.deck.clone();
+        self.has_notes = (0..deck.slides.len()).any(|i| deck.slides[i].notes.is_some() && !super::notes::notes(&deck, i).is_empty());
     }
 
     /// Meddelande om sådant som inte visas än (diagram, EMF, inbäddade typsnitt som inte kan läsas).
@@ -379,11 +439,12 @@ impl PptxTab {
         self.show.is_some()
     }
 
-    /// Startar bildspelet. Falskt om ingen bild kan visas.
-    pub fn start_show(&mut self, from_current: bool) -> bool {
+    /// Startar bildspelet (`animate`: övergångar och animeringar). Falskt om ingen bild kan visas.
+    pub fn start_show(&mut self, from_current: bool, animate: bool) -> bool {
         let hidden: Vec<bool> = self.deck.slides.iter().map(|s| s.hidden).collect();
-        self.show = if from_current { Show::new(&hidden, self.current) } else { Show::from_beginning(&hidden) };
-        self.pointer_moved = Instant::now();
+        let show = if from_current { Show::new(&hidden, self.current) } else { Show::from_beginning(&hidden) };
+        let presenter = std::mem::take(&mut self.presenter_on_start);
+        self.show = show.map(|s| super::presenter::ShowView::new(self.deck.clone(), s, animate).with_presenter(presenter));
         self.show.is_some()
     }
 
@@ -392,126 +453,18 @@ impl PptxTab {
         if let Some(s) = self.show.take() {
             self.go_to(s.slide());
         }
-        self.pool.retain(Kind::Show, |_| false);
     }
 
     /// Tangenterna i bildspelet (appen skickar alla tangenter hit medan det pågår).
     pub fn show_keys(&mut self, ctx: &egui::Context) {
-        let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-        let Some(show) = self.show.as_mut() else { return };
-        if key(Modifiers::NONE, Key::Escape) {
+        if self.show.as_mut().is_some_and(|s| !s.keys(ctx)) {
             self.stop_show();
-            return;
-        }
-        // Skift-varianterna först: `consume_key` bryr sig inte om extra Skift.
-        let prev = key(Modifiers::SHIFT, Key::Space)
-            | key(Modifiers::NONE, Key::ArrowLeft)
-            | key(Modifiers::NONE, Key::ArrowUp)
-            | key(Modifiers::NONE, Key::PageUp)
-            | key(Modifiers::NONE, Key::Backspace)
-            | key(Modifiers::NONE, Key::P);
-        let next = key(Modifiers::NONE, Key::ArrowRight)
-            | key(Modifiers::NONE, Key::ArrowDown)
-            | key(Modifiers::NONE, Key::PageDown)
-            | key(Modifiers::NONE, Key::Space)
-            | key(Modifiers::NONE, Key::Enter)
-            | key(Modifiers::NONE, Key::N);
-        if prev {
-            show.prev();
-        }
-        if next && !show.next() {
-            self.stop_show();
-            return;
-        }
-        if key(Modifiers::NONE, Key::Home) {
-            show.first();
-        }
-        if key(Modifiers::NONE, Key::End) {
-            show.last();
-        }
-        if key(Modifiers::NONE, Key::B) || key(Modifiers::NONE, Key::Period) {
-            show.toggle_blank(Blank::Black);
-        }
-        if key(Modifiers::NONE, Key::W) || key(Modifiers::NONE, Key::Comma) {
-            show.toggle_blank(Blank::White);
         }
     }
 
-    /// Bildspelet: hela fönstret svart med bilden anpassad till skärmen.
+    /// Bildspelet (och föredragsvyn), se `presenter.rs`.
     pub fn show_page(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        self.pool.receive(&ctx);
-        let rect = ui.max_rect();
-        let resp = ui.allocate_rect(rect, Sense::click());
-        let Some(show) = self.show.as_mut() else { return };
-        let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
-        let (sw, sh) = self.deck.size_pt();
-        let k = scale_for(Zoom::Window, rect.width(), rect.height(), sw, sh);
-        let slide_rect = Rect::from_center_size(rect.center(), vec2(sw * k, sh * k)).round_to_pixels(ctx.pixels_per_point());
-        let px = (slide_rect.width() * ctx.pixels_per_point()).round().max(1.0) as u32;
-        match show.screen() {
-            Screen::Slide(i) => {
-                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                // Medan bilden renderas i skärmens storlek visas vyns textur (suddigare) i stället.
-                match self.pool.get(Kind::Show, i).or_else(|| self.pool.get(Kind::Page, i)) {
-                    Some(tex) => {
-                        painter.image(tex.id(), slide_rect, uv, Color32::WHITE);
-                    }
-                    None => {
-                        painter.rect_filled(slide_rect, 0.0, Color32::WHITE);
-                    }
-                }
-                self.pool.want(Kind::Show, i, px);
-            }
-            Screen::Blank(Blank::Black) => {}
-            Screen::Blank(Blank::White) => {
-                painter.rect_filled(rect, 0.0, Color32::WHITE);
-            }
-            Screen::End => {
-                painter.text(
-                    pos2(rect.center().x, rect.top() + 40.0),
-                    Align2::CENTER_TOP,
-                    t("Slut på bildspelet. Klicka för att avsluta."),
-                    FontId::new(16.0, FontFamily::Proportional),
-                    Color32::from_gray(170),
-                );
-            }
-        }
-        // Förrendera nästa bild.
-        if let Some(n) = show.upcoming() {
-            self.pool.want(Kind::Show, n, px);
-        }
-        let keep: Vec<usize> = [Some(show.slide()), show.upcoming()].into_iter().flatten().collect();
-        // Mus: klick framåt, högerklick bakåt, hjulet bläddrar.
-        let mut exit = false;
-        if resp.clicked_by(PointerButton::Primary) {
-            exit = !show.next();
-        } else if resp.clicked_by(PointerButton::Secondary) {
-            show.prev();
-        }
-        let dy = ui.input(|i| i.smooth_scroll_delta.y);
-        self.wheel += dy;
-        if self.wheel <= -60.0 {
-            self.wheel = 0.0;
-            exit |= !show.next();
-        } else if self.wheel >= 60.0 {
-            self.wheel = 0.0;
-            show.prev();
-        }
-        // Pekaren göms när musen står still.
-        let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed());
-        if moved {
-            self.pointer_moved = Instant::now();
-        }
-        if self.pointer_moved.elapsed() >= HIDE_POINTER {
-            ctx.set_cursor_icon(CursorIcon::None);
-        } else {
-            ctx.request_repaint_after(HIDE_POINTER);
-        }
-        self.pool.retain(Kind::Show, |s| keep.contains(&s));
-        self.pool.dispatch(&ctx, &self.deck);
-        if exit {
+        if self.show.as_mut().is_some_and(|s| !s.ui(ui)) {
             self.stop_show();
         }
     }
@@ -747,10 +700,11 @@ impl PptxTab {
             return;
         }
         self.current = self.current.min(n - 1);
-        if prefs.notes && self.has_notes {
+        if prefs.notes && (self.has_notes || self.editing()) {
             self.notes_panel(ui, p);
         }
-        if prefs.scroll {
+        // Redigeringen sker bild för bild.
+        if prefs.scroll && !self.editing() {
             self.show_scroll(ui, p, prefs);
         } else {
             self.show_single(ui, p, prefs);
@@ -770,8 +724,9 @@ impl PptxTab {
             let resp = ui.allocate_rect(avail, Sense::hover());
             let rect = Rect::from_center_size(avail.center(), size).round_to_pixels(ui.ctx().pixels_per_point());
             self.paint_slide(ui, rect, i, p);
+            self.edit_overlay(ui, rect, i, p);
             // Hjulet bläddrar mellan bilderna när hela bilden syns.
-            if resp.hovered() {
+            if resp.hovered() && !self.editing() {
                 let dy = ui.input(|inp| if inp.modifiers.command { 0.0 } else { inp.smooth_scroll_delta.y });
                 self.wheel += dy;
                 if self.wheel <= -60.0 {
@@ -788,6 +743,7 @@ impl PptxTab {
                 let (area, _) = ui.allocate_exact_size(vec2(w, size.y + 2.0 * GAP), Sense::hover());
                 let rect = Rect::from_min_size(pos2(area.center().x - size.x / 2.0, area.top() + GAP), size);
                 self.paint_slide(ui, rect, i, p);
+                self.edit_overlay(ui, rect, i, p);
             });
         }
         self.pool.retain(Kind::Page, |s| s + 1 >= i && s <= i + 1);
@@ -855,6 +811,10 @@ impl PptxTab {
                 ui.painter().hline((r.left() - 16.0)..=(r.right() + 12.0), r.top() - 8.0, Stroke::new(1.0, p.line));
                 ui.label(RichText::new(t("Anteckningar")).font(FontId::new(11.5, theme::medium())).color(p.muted));
                 ui.add_space(4.0);
+                if self.editing() {
+                    ScrollArea::vertical().id_salt(("kladd-pptx-notes-edit", i)).auto_shrink([false, false]).show(ui, |ui| self.notes_editor(ui, p));
+                    return;
+                }
                 ScrollArea::vertical().id_salt(("kladd-pptx-notes-text", i)).auto_shrink([false, false]).show(ui, |ui| {
                     if text.trim().is_empty() {
                         ui.label(RichText::new(t("Inga anteckningar till den här bilden.")).color(p.faint));
@@ -902,6 +862,8 @@ impl PptxTab {
         let follow = self.thumb_follow.take();
         let mut clicked = None;
         let mut visible: Vec<usize> = Vec::new();
+        let mut rows: Vec<(usize, Rect)> = Vec::new();
+        let editing = self.editing();
         Panel::left("kladd-pptx-sidebar")
             .resizable(true)
             .default_size(200.0)
@@ -914,7 +876,17 @@ impl PptxTab {
                     // Bredden avrundas uppåt så att små storleksändringar inte ger nya renderingar.
                     let px = ((tw * ppp / 32.0).ceil() * 32.0) as u32;
                     for i in 0..self.count() {
-                        let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), th + 12.0), Sense::click());
+                        // En åtgärd i högerklicksmenyn kan ha ändrat antalet bilder.
+                        if i >= self.count() {
+                            break;
+                        }
+                        let sense = if editing { Sense::click_and_drag() } else { Sense::click() };
+                        let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), th + 12.0), sense);
+                        rows.push((i, row));
+                        if editing {
+                            self.thumb_drag(ui, i, &resp, row, p);
+                            resp.context_menu(|ui| self.slide_menu(ui, p, i));
+                        }
                         let rect = Rect::from_min_size(pos2(row.left() + 26.0, row.top() + 4.0), vec2(tw, th));
                         if follow == Some(i) {
                             ui.scroll_to_rect(row, None);
@@ -958,8 +930,20 @@ impl PptxTab {
                         }
                         self.pool.want(Kind::Thumb, i, px);
                     }
+                    if editing {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(22.0);
+                            ui.menu_button(t("+ Ny bild"), |ui| {
+                                let last = self.count().checked_sub(1);
+                                self.layout_items(ui, p, last.map(|_| self.current));
+                            });
+                        });
+                        ui.add_space(10.0);
+                    }
                 });
             });
+        self.thumb_drop(&ctx, &rows);
         if let (Some(&lo), Some(&hi)) = (visible.first(), visible.last()) {
             self.pool.retain(Kind::Thumb, |s| s + 40 >= lo && s <= hi + 40);
         }
@@ -1044,6 +1028,9 @@ impl PptxTab {
                         if crate::app::menu_item(ui, p, t("Bildspel från aktuell bild"), "Shift+F5", None, true) {
                             act = Some(Action::Show(true));
                         }
+                        if crate::app::menu_item(ui, p, t("Spela upp övergångar och animeringar"), "", Some(prefs.animate), true) {
+                            prefs.animate = !prefs.animate;
+                        }
                         crate::app::menu_divider(ui, p);
                         if crate::app::menu_item(ui, p, t("Exportera som PDF…"), "", None, true) {
                             act = Some(Action::ExportPdf);
@@ -1065,6 +1052,36 @@ impl PptxTab {
                     if ui.add(show).on_hover_text(crate::keys::shortcut(t("Bildspel från början (F5), från aktuell bild (Shift+F5)"))).clicked() {
                         act = Some(Action::Show(false));
                     }
+                    if self.editing() {
+                        bar_divider(ui, p);
+                        if tool_btn(ui, p, G::Std(Icon::Undo), false, self.edit.session.can_undo(), t("Ångra (Ctrl+Z)")).clicked() {
+                            self.undo(false);
+                        }
+                        if tool_btn(ui, p, G::Std(Icon::Redo), false, self.edit.session.can_redo(), t("Gör om (Ctrl+Y)")).clicked() {
+                            self.undo(true);
+                        }
+                        let new_btn = menu_trigger(ui, p, t("Ny bild"));
+                        egui::Popup::menu(&new_btn).width(260.0).align(egui::RectAlign::BOTTOM_START).gap(6.0).show(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            menu_heading(ui, p, t("Layout (Ctrl+M: samma som aktuell bild)"));
+                            let cur = (n > 0).then_some(self.current);
+                            self.layout_items(ui, p, cur);
+                        });
+                        let ins = menu_trigger(ui, p, t("Infoga"));
+                        egui::Popup::menu(&ins).width(220.0).align(egui::RectAlign::BOTTOM_START).gap(6.0).show(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            if crate::app::menu_item(ui, p, t("Textruta"), "", None, n > 0) {
+                                self.insert_textbox();
+                            }
+                            if crate::app::menu_item(ui, p, t("Bild…"), "Ctrl+Shift+I", None, n > 0) {
+                                act = Some(Action::InsertPicture);
+                            }
+                        });
+                        let has_sel = self.edit.sel.is_some();
+                        if tool_btn(ui, p, G::Std(Icon::Close), false, has_sel, t("Ta bort formen (Delete)")).clicked() {
+                            self.delete_selected();
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let edit = egui::Button::new(RichText::new(t("Redigera en kopia")).font(FontId::new(13.5, theme::medium())).color(p.on_accent))
                             .fill(p.accent)
@@ -1074,6 +1091,17 @@ impl PptxTab {
                         if ui.add(edit).on_hover_text(t("Presentationens text som ett nytt dokument (presentationen ändras inte)")).clicked() {
                             act = Some(Action::EditCopy);
                         }
+                        let on = self.editing();
+                        let label = if on { t("Klar") } else { t("Redigera") };
+                        let toggle = egui::Button::new(RichText::new(label).font(FontId::new(13.5, theme::medium())).color(p.text))
+                            .fill(if on { p.accent.gamma_multiply(0.16) } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::new(1.0, p.line))
+                            .corner_radius(8)
+                            .min_size(vec2(72.0, 28.0));
+                        let tip = if on { t("Tillbaka till visning (Ctrl+E)") } else { t("Ändra presentationen: flytta och ändra former, skriv text, lägg till bilder (Ctrl+E)") };
+                        if ui.add(toggle).on_hover_text(crate::keys::shortcut(tip)).clicked() {
+                            self.toggle_edit();
+                        }
                     });
                 });
             });
@@ -1082,10 +1110,15 @@ impl PptxTab {
 
     /// Kortkommandon i vyn (utanför bildspelet).
     pub fn handle_keys(&mut self, ctx: &egui::Context, prefs: &mut Prefs) -> Option<Action> {
+        // Redigeringens tangenter först (de som används tas bort ur kön).
+        self.edit_keys(ctx);
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let mut act = None;
-        // Skift+F5 före F5: `consume_key` bryr sig inte om extra Skift.
-        if key(Modifiers::SHIFT, Key::F5) {
+        // Alt+F5 (bildspel med föredragsvyn) och Skift+F5 före F5: `consume_key` bryr sig inte om extra Alt/Skift.
+        if key(Modifiers::ALT, Key::F5) {
+            self.presenter_on_start = true;
+            act = Some(Action::Show(false));
+        } else if key(Modifiers::SHIFT, Key::F5) {
             act = Some(Action::Show(true));
         } else if key(Modifiers::NONE, Key::F5) {
             act = Some(Action::Show(false));
@@ -1119,8 +1152,9 @@ impl PptxTab {
         if key(cmd, Key::Num2) {
             prefs.zoom = Zoom::Width;
         }
-        // Bläddring: inte när ett textfält (sök, bildnummer) har fokus.
-        if ctx.memory(|m| m.focused().is_some()) {
+        // Bläddring: inte när ett textfält (sök, bildnummer) har fokus eller man skriver i en form.
+        let overlay = self.edit_focus_id();
+        if ctx.memory(|m| m.focused().is_some_and(|f| Some(f) != overlay)) || self.edit.text.is_some() {
             return act;
         }
         let single = !prefs.scroll;
@@ -1236,7 +1270,14 @@ pub fn status(ui: &mut Ui, p: &Palette, font: &FontId, tab: &PptxTab) {
         let hidden = tab.deck.slides.get(cur).is_some_and(|s| s.hidden);
         let text = if hidden { tf!("Bild {n} av {total} (dold)", n = cur + 1, total = n) } else { tf!("Bild {n} av {total}", n = cur + 1, total = n) };
         label(ui, text);
-        label(ui, t("Bara läsning").to_owned());
+        let mode = if tab.editing() {
+            t("Redigering")
+        } else if tab.unsaved() {
+            t("Osparade ändringar")
+        } else {
+            t("Bara läsning")
+        };
+        label(ui, mode.to_owned());
     });
 }
 

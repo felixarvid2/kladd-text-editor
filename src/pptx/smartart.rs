@@ -10,25 +10,39 @@
 use std::collections::{HashMap, HashSet};
 
 use super::color::Rgba;
+use super::dgm;
 use super::inherit::{self, Owner};
+use super::model::Drawing;
 use super::package;
 use super::render::{Builder, Frame};
 use super::scene::{Affine, Cap, Join, Paint, Path, Stroke};
 use super::text;
 use super::xml::Node;
 
-/// Datamodellen för ett SmartArt-objekt (`dgm:relIds@r:dm`).
-fn data_model<'a>(b: &Builder<'a>, gd: &Node, owner: Owner) -> Option<Node> {
-    let rels = b.rels(owner);
-    let dm = gd.child("dgm:relIds")?.attr("r:dm").and_then(|id| package::rel(rels, id))?;
-    b.sheets.deck.pkg.xml(&dm.target)
+/// Datamodellens del för ett SmartArt-objekt (`dgm:relIds@r:dm`).
+fn data_part(rels: &[package::Rel], gd: &Node) -> Option<String> {
+    gd.child("dgm:relIds")?.attr("r:dm").and_then(|id| package::rel(rels, id)).map(|r| r.target.clone())
 }
 
-/// Ritdelen för ett SmartArt-objekt: datamodellens `dsp:dataModelExt@relId` pekar på bladets relation.
-fn drawing_part(b: &Builder<'_>, gd: &Node, owner: Owner) -> Option<String> {
-    let rels = b.rels(owner);
+/// Datamodellen för ett SmartArt-objekt.
+fn data_model<'a>(b: &Builder<'a>, gd: &Node, owner: Owner) -> Option<Node> {
+    b.sheets.deck.pkg.xml(&data_part(b.rels(owner), gd)?)
+}
+
+/// Nyckeln för en ritdel som layoutmotorn gjort (efter datamodellens del).
+fn laid_out_key(data_part: &str) -> String {
+    format!("{data_part}#kladd")
+}
+
+/// Har ritdelen några former? PowerPoint sparar ibland en tom `dsp:spTree`.
+fn usable(d: &Drawing) -> bool {
+    d.root.child("p:spTree").is_some_and(|t| t.children.iter().any(|c| matches!(c.name.as_str(), "p:sp" | "p:grpSp" | "p:cxnSp" | "p:pic")))
+}
+
+/// Ritdelens namn för diagrammet ur datamodellens `dsp:dataModelExt@relId` (eller den enda på bladet).
+fn drawing_part_of(rels: &[package::Rel], data: Option<&Node>) -> Option<String> {
     let mut rel_id = None;
-    if let Some(dm_xml) = data_model(b, gd, owner) {
+    if let Some(dm_xml) = data {
         dm_xml.walk(&mut |n| {
             if n.local() == "dataModelExt" {
                 if let Some(r) = n.attr("relId") {
@@ -40,12 +54,91 @@ fn drawing_part(b: &Builder<'_>, gd: &Node, owner: Owner) -> Option<String> {
     if let Some(r) = rel_id.and_then(|id| package::rel(rels, &id).map(|r| r.target.clone())) {
         return Some(r);
     }
-    // Reserv: den enda ritdelen på bladet.
     let mut drawings = rels.iter().filter(|r| r.kind == "diagramDrawing");
     match (drawings.next(), drawings.next()) {
         (Some(d), None) => Some(d.target.clone()),
         _ => None,
     }
+}
+
+/// SmartArt-ramarna på bild `i` med gruppernas skalning (x, y).
+pub fn diagram_frames(deck: &super::Deck, i: usize) -> Vec<(&Node, f64, f64)> {
+    let mut frames = Vec::new();
+    fn walk<'n>(n: &'n Node, sx: f64, sy: f64, out: &mut Vec<(&'n Node, f64, f64)>) {
+        for c in &n.children {
+            match c.name.as_str() {
+                "p:grpSp" => {
+                    let x = c.path(&["p:grpSpPr", "a:xfrm"]);
+                    let k = |at: &str| -> Option<f64> {
+                        let e = x?.child("a:ext")?.attr_f64(at)?;
+                        let ch = x?.child("a:chExt")?.attr_f64(at)?;
+                        (ch > 0.0).then_some(e / ch)
+                    };
+                    walk(c, sx * k("cx").unwrap_or(1.0), sy * k("cy").unwrap_or(1.0), out);
+                }
+                "p:graphicFrame" if c.path(&["a:graphic", "a:graphicData"]).is_some_and(|g| g.attr("uri").is_some_and(|u| u.ends_with("/diagram"))) => out.push((c, sx, sy)),
+                _ => {}
+            }
+        }
+    }
+    if let Some(tree) = deck.slides.get(i).and_then(|s| s.root.path(&["p:cSld", "p:spTree"])) {
+        walk(tree, 1.0, 1.0, &mut frames);
+    }
+    frames
+}
+
+/// Har diagrammet i ramen en användbar sparad ritdel?
+pub fn has_drawing(deck: &super::Deck, i: usize, gf: &Node) -> bool {
+    let Some(slide) = deck.slides.get(i) else { return false };
+    let Some(gd) = gf.path(&["a:graphic", "a:graphicData"]) else { return false };
+    let data = data_part(&slide.rels, gd).and_then(|dm| deck.pkg.xml(&dm));
+    drawing_part_of(&slide.rels, data.as_ref()).and_then(|p| deck.drawing(&p)).is_some_and(usable)
+}
+
+/// Layoutmotorns ritdel för diagrammet i ramen (`sx`, `sy`: gruppernas skalning): (datamodellens
+/// del, ritdelens rot).
+pub fn lay_out_frame(deck: &super::Deck, i: usize, gf: &Node, sx: f64, sy: f64) -> Option<(String, Node)> {
+    let slide = deck.slides.get(i)?;
+    let gd = gf.path(&["a:graphic", "a:graphicData"])?;
+    let ids = gd.child("dgm:relIds")?;
+    let dm = data_part(&slide.rels, gd)?;
+    let data = deck.pkg.xml(&dm)?;
+    let part = |a: &str| ids.attr(a).and_then(|id| package::rel(&slide.rels, id)).and_then(|r| deck.pkg.xml(&r.target));
+    let layout = part("r:lo")?;
+    let (quick, colors) = (part("r:qs"), part("r:cs"));
+    let ext = gf.path(&["p:xfrm", "a:ext"])?;
+    let w = ext.attr_f64("cx").unwrap_or(0.0) / 12_700.0 * sx;
+    let h = ext.attr_f64("cy").unwrap_or(0.0) / 12_700.0 * sy;
+    let sheets = inherit::Sheets::for_slide(deck, i);
+    let parts = dgm::Parts { data: &data, layout: &layout, quick_style: quick.as_ref(), colors: colors.as_ref() };
+    dgm::lay_out(&sheets, &parts, w, h).map(|root| (dm, root))
+}
+
+/// Lägger ut SmartArt-diagram på bilderna som saknar en användbar ritdel (`dgm::lay_out`) när
+/// presentationen läses in; resultatet ritas som en sparad ritdel. Ramens visade storlek
+/// (med gruppernas skalning) är layoutens storlek, som för PowerPoints ritdel.
+pub fn lay_out_missing(deck: &super::Deck) -> Vec<(String, Drawing)> {
+    let mut out: Vec<(String, Drawing)> = Vec::new();
+    for i in 0..deck.slides.len() {
+        for (gf, sx, sy) in diagram_frames(deck, i) {
+            if has_drawing(deck, i, gf) {
+                continue;
+            }
+            if let Some((dm, root)) = lay_out_frame(deck, i, gf, sx, sy) {
+                let key = laid_out_key(&dm);
+                if !out.iter().any(|o| o.0 == key) {
+                    let rels = deck.pkg.rels(&dm);
+                    out.push((key, Drawing { root, rels }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Ritdelen för ett SmartArt-objekt: datamodellens `dsp:dataModelExt@relId` pekar på bladets relation.
+fn drawing_part(b: &Builder<'_>, gd: &Node, owner: Owner) -> Option<String> {
+    drawing_part_of(b.rels(owner), data_model(b, gd, owner).as_ref())
 }
 
 /// Datamodellens text i ordning: (nivå, text). Nivå 0 är noderna direkt under dokumentet.
@@ -230,8 +323,25 @@ pub fn prepare_drawing(pkg: &package::Package, part: &str, root: &mut Node) {
     });
 }
 
+/// Avbildningen av ritdelens koordinater på bilden.
+///
+/// Ritdelens koordinater är relativa ramens övre vänstra hörn och i ramens **visade** storlek:
+/// ligger SmartArt-ramen i en skalad grupp (`chExt` ≠ `ext`) har PowerPoint lagt ut och sparat
+/// ritdelen i den storlek ramen har på bilden, så gruppens skalning gäller ramens läge och storlek
+/// men inte formerna i ritdelen (kugghjulen i `msrc-win32k` bild 4–6 och 22 ligger i grupper
+/// skalade 16–92 %). Grupprotation och spegling gäller fortfarande.
+pub fn drawing_transform(f: &Frame) -> Affine {
+    let p = &f.parent;
+    let sx = p.a.hypot(p.b);
+    let sy = p.c.hypot(p.d);
+    let unscale = if sx.is_finite() && sy.is_finite() && sx > 1e-6 && sy > 1e-6 { Affine::scale(1.0 / sx, 1.0 / sy) } else { Affine::IDENTITY };
+    unscale.then(&Affine::translate(f.x, f.y)).then(p)
+}
+
 pub fn draw_diagram<'a>(b: &mut Builder<'a>, gd: &'a Node, f: &Frame, owner: Owner) {
-    let drawing = drawing_part(b, gd, owner).and_then(|part| b.sheets.deck.drawing(&part));
+    // En ritdel utan former räknas som saknad; då används layoutmotorns ritdel om den finns.
+    let drawing = drawing_part(b, gd, owner).and_then(|part| b.sheets.deck.drawing(&part)).filter(|d| usable(d));
+    let drawing = drawing.or_else(|| data_part(b.rels(owner), gd).and_then(|dm| b.sheets.deck.drawing(&laid_out_key(&dm))));
     let Some(d) = drawing else {
         let items = data_model(b, gd, owner).map(|dm| outline(&dm)).unwrap_or_default();
         if items.is_empty() {
@@ -242,8 +352,7 @@ pub fn draw_diagram<'a>(b: &mut Builder<'a>, gd: &'a Node, f: &Frame, owner: Own
         return;
     };
     let Some(tree) = d.root.child("p:spTree") else { return };
-    // Ritdelens koordinater är relativa ramens övre vänstra hörn.
-    let t = Affine::translate(f.x, f.y).then(&f.parent);
+    let t = drawing_transform(f);
     let saved = b.rels_override.replace(&d.rels);
     b.tree(tree, Owner::Slide, &t);
     b.rels_override = saved;

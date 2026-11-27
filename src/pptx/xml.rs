@@ -21,7 +21,7 @@ pub struct Node {
 }
 
 /// Namnrymder och deras fasta prefix.
-const NAMESPACES: &[(&str, &str)] = &[
+pub(crate) const NAMESPACES: &[(&str, &str)] = &[
     ("http://schemas.openxmlformats.org/presentationml/2006/main", "p"),
     ("http://schemas.openxmlformats.org/drawingml/2006/main", "a"),
     ("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "r"),

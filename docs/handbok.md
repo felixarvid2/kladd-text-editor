@@ -327,7 +327,7 @@ Klick i marginalen utanför spalten går en skärm bakåt (vänster) eller fram�
 
 ## PowerPoint
 
-En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öppnas i en presentationsvy för bara läsning. Bilderna ritas med Kladds egen ritmotor (former, bilder, text med PowerPoints radavstånd och autoanpassning, tabeller och SmartArt) i bakgrundstrådar, så att gränssnittet inte fryser. Makron i `.pptm` körs aldrig. Gamla `.ppt`-filer konverteras till `.pptx` med LibreOffice när de öppnas (som `.doc`), och utan LibreOffice säger Kladd det. Presentationen skrivs aldrig över: *Spara* visar ett meddelande.
+En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öppnas i en presentationsvy. Bilderna ritas med Kladds egen ritmotor (former, bilder, text med PowerPoints radavstånd och autoanpassning, tabeller och SmartArt) i bakgrundstrådar, så att gränssnittet inte fryser. Makron i `.pptm` körs aldrig. Gamla `.ppt`-filer konverteras till `.pptx` med LibreOffice när de öppnas (som `.doc`), och utan LibreOffice säger Kladd det. Presentationen kan ändras i redigeringsläget (se *Redigera* nedan) och sparas som `.pptx`, `.ppsx` eller `.potx`.
 
 **Vyn.** Till vänster ligger miniatyrlisten (`F4`) med bildnummer; aktuell bild är markerad, ett klick hoppar dit, och dolda bilder är tonade med överstruket nummer. *Visa* i verktygsraden växlar mellan *Bild för bild* (en bild i taget, som PowerPoints normalvy) och *Rullande lista* (alla bilder under varandra). Zoomen har lägena *Hel bild* (hela bilden syns), *Bildbredd* och fasta procent. I läget bild för bild bläddrar mushjulet mellan bilderna när hela bilden syns. Talaranteckningarna visas i en panel under bilden när presentationen har anteckningar (av och på under *Visa*; dra i kanten för att ändra höjden). Statusraden visar *Bild 4 av 12*. Bilden du var på sparas per fil för de 100 senaste presentationerna.
 
@@ -335,11 +335,16 @@ En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öp
 
 | Kommando | Funktion |
 |---|---|
-| `Höger` / `Ner` / `Mellanslag` / `Page Down` / `Enter` / `N` / klick / hjulet nedåt | Nästa bild |
-| `Vänster` / `Upp` / `Backsteg` / `Page Up` / `P` / högerklick / hjulet uppåt | Föregående bild |
+| `Höger` / `Ner` / `Mellanslag` / `Page Down` / `Enter` / `N` / klick / hjulet nedåt | Nästa steg (animering eller bild) |
+| `Vänster` / `Upp` / `Backsteg` / `Page Up` / `P` / högerklick / hjulet uppåt | Föregående steg (bakåt från bildens början: föregående bild i slutläget) |
 | `Home` / `End` | Första / sista bilden |
 | `B` eller `.` / `W` eller `,` | Svart / vit skärm (samma tangent igen, eller nästa, tar tillbaka bilden) |
 | `Esc` | Avsluta bildspelet |
+| `Alt+F5` | Föredragsvy på/av |
+
+**Övergångar, animeringar och föredragsvy.** Bildspelet spelar upp presentationens bildövergångar (tona, även genom svart, push, torka, dela, täck, dra undan, slumpstaplar, cirkel, romb, plus, zoom, upplösning, schack, jalusi, kam, hjul och kil; PowerPoints nyare effekter som virvel och glitter blir en toning, och morph tonar mellan bilderna) och animeringarna i den ordning de är gjorda: in-effekter (visas, tona, flyg in, torka, dela, zooma och liknande), ut-effekter, betoning (snurra, växa/krympa, färgbyte som en blinkning) och rörelsebanor, även stycke för stycke. Former med en in-effekt är dolda tills effekten körs, och effekter som Kladd inte kan rita visas eller göms direkt i rätt ordning. Nästa-tangenterna och klick tar nästa klick-steg innan de går till nästa bild, och bakåt går ett klick-steg tillbaka (från bildens början till föregående bild som den ser ut när alla steg är klara). Bilder med *Gå vidare efter* byter själva. *Spela upp övergångar och animeringar* i *Visa*-menyn stänger av alltihop; då visas varje bild som i vyn.
+
+`Alt+F5` startar bildspelet med föredragsvyn, och under bildspelet växlar `Alt+F5` föredragsvyn av och på. Den öppnas i ett eget fönster (flytta det till skärmen du själv ser): aktuell bild, nästa klick-steg eller bild, anteckningarna (`A−`/`A+` ändrar textstorleken), klockan och förfluten tid (*Pausa*/*Nollställ*), bildnummer och knappar för föregående, nästa, svart skärm och avsluta. Tangenterna fungerar i båda fönstren, och att stänga föredragsvyns fönster stänger bara föredragsvyn. Kan Kladd inte öppna fler fönster växlar `Alt+F5` mellan publikens vy och föredragsvyn i samma fönster.
 
 **Sök.** `Ctrl+F` söker i bildernas text och i anteckningarna. Träffarna markeras på bilden (gult, den aktuella orange) och i anteckningspanelen, fältet visar *träff av antal*, och `Enter`/`Skift+Enter` (eller `F3`/`Skift+F3`) går mellan träffarna; en träff i anteckningarna öppnar panelen. Texten tas ur samma ritning som visas, så det som syns på bilden är det som hittas.
 
@@ -347,8 +352,24 @@ En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öp
 
 **Redigera en kopia** (knappen uppe till höger, eller Arkiv-menyn) öppnar presentationens text som ett nytt, osparat dokument i dokumentläget: en rubrik per bild (bildens titel, annars *Bild 3*), punktlistor med nivåer ur textplatshållarna, vanliga stycken ur textrutor, tabeller som tabeller, bilder (PNG, JPEG, GIF, SVG; inte EMF/WMF) och anteckningarna som citat. Presentationen själv ändras inte; kopian kan sparas som `.md`, `.docx` eller `.pdf`.
 
+**Redigera.** Knappen *Redigera* uppe till höger (eller `Ctrl+E`, eller dubbelklick på en form) slår på redigeringsläget; *Klar* går tillbaka till visning. Redigeringen sker bild för bild.
+
+- *Former:* klicka för att markera (eller `Tab`/`Skift+Tab` mellan formerna, `Esc` avmarkerar). Dra formen för att flytta den (`Skift` = bara vågrätt eller lodrätt) eller flytta med pilarna (1 pt, med `Skift` 10 pt). Handtagen i hörnen och på sidorna ändrar storleken (`Skift` i ett hörn behåller proportionerna), och den runda pricken ovanför formen vrider den (`Skift` i steg om 15°). `Delete` tar bort formen, `Ctrl+D` duplicerar den, och högerklick ger *Längst fram*, *Framåt*, *Bakåt*, *Längst bak*. Medan du drar visas formens nya kontur; ändringen görs när du släpper.
+- *Text:* dubbelklicka i en form (eller tryck `Enter` på en markerad form) för att skriva i den. Tomma platshållare visar *Klicka för att lägga till rubrik/text* i redigeringsläget. Markören och markeringen följer samma textmotor som ritar bilden. `Enter` ger ett nytt stycke (med samma styckeformat), `Skift+Enter` en radbrytning, `Tab`/`Skift+Tab` först i ett stycke höjer/sänker nivån i punktlistor, `Ctrl+B`/`Ctrl+I`/`Ctrl+U` gör fet/kursiv/understruken (utan markering: ordet vid markören), `Ctrl+A` markerar allt, och klipp ut, kopiera och klistra in fungerar som vanligt. Det du skriver får formateringen i körningen du står i. `Esc` slutar skriva.
+- *Bilder:* högerklicka på en miniatyr för *Ny bild* (välj layout ur mallen; platshållarna skapas tomma), *Duplicera bilden*, *Ta bort bilden*, *Dölj/Visa bilden* och *Flytta upp/ned*, eller dra miniatyren dit den ska. *+ Ny bild* under miniatyrerna, *Ny bild* i verktygsraden och `Ctrl+M` (samma layout som aktuell bild) lägger till en bild efter den aktuella.
+- *Anteckningar:* skriv direkt i anteckningspanelen under bilden. Saknar bilden anteckningar skapas anteckningssidan (och vid behov en anteckningsmall).
+- *Infoga:* *Infoga → Textruta* lägger en textruta mitt på bilden där du kan skriva direkt; *Infoga → Bild…* (`Ctrl+Shift+I`) lägger in en PNG-, JPEG- eller GIF-bild.
+- *Ångra och spara:* `Ctrl+Z`/`Ctrl+Y` (eller knapparna i verktygsraden) ångrar och gör om alla ändringar; skrivande i samma textruta blir ett steg. `Ctrl+S` sparar och *Spara som* (`Ctrl+Shift+S`) kan byta till bildspel (`.ppsx`) eller mall (`.potx`). Bara de delar av filen som ändrats skrivs om; allt annat (även sådant Kladd inte visar) följer med oförändrat. En digitalt signerad presentation förlorar signaturen när den ändras (Kladd säger det). En `.ppt` som konverterats sparas som `.pptx` med *Spara som*. Fliken märks med • när det finns osparade ändringar, och Kladd frågar innan den stängs. Diagram, SmartArt och inbäddade objekt kan flyttas men inte dupliceras som enskilda former (duplicera hela bilden).
+
 | Kommando | Funktion |
 |---|---|
+| `Ctrl+E` | Redigeringsläget på/av |
+| `Tab` / `Skift+Tab`, `Esc` | Nästa / föregående form, avmarkera (redigeringsläget) |
+| Pilarna (`Skift` = 10 pt) | Flytta markerad form |
+| `Delete`, `Ctrl+D` | Ta bort / duplicera markerad form |
+| `Enter`, dubbelklick | Skriv i markerad form |
+| `Ctrl+M` | Ny bild |
+| `Ctrl+Z` / `Ctrl+Y` | Ångra / gör om |
 | `F4` | Miniatyrer på/av |
 | `F5` / `Skift+F5` | Bildspel från början / från aktuell bild |
 | `Page Down` / `Page Up`, `Höger` / `Vänster` | Nästa / föregående bild (i bild för bild även `Mellanslag`, `Ner`/`Upp`) |
@@ -356,6 +377,8 @@ En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öp
 | `Ctrl+F`, `F3` / `Skift+F3` | Sök, nästa / föregående träff |
 | `Ctrl++` / `Ctrl+-` | Zooma in / ut |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` (eller `Ctrl+0`) | Verklig storlek / bildbredd / hel bild |
+
+**3D.** Diagram i 3D (cirkel, stapel, linje och yta) ritas med djup, sidor och belysning, och former med 3D-kant (fasning) får skuggade kanter som i PowerPoint. Former som är vridna i 3D (isometriska och perspektiviska kameror) visas förenklat: formen trycks ihop och djupet ritas som en enfärgad extrudering, men texten står kvar rakt framifrån.
 
 ## Kortkommandon
 
@@ -377,7 +400,7 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Ctrl+Shift+I` | Infoga bild |
 | `Ctrl+F` / `Ctrl+H` | Sök / ersätt |
 | `Ctrl+Shift+F` | Sök i filer (arbetsmappen eller alla flikar) |
-| `Ctrl+E` | Snabböppna fil i arbetsmappen (inte i dokumentläget, där är det centrera) |
+| `Ctrl+E` | Snabböppna fil i arbetsmappen (inte i dokumentläget, där är det centrera, och inte i presentationer, där är det redigeringsläget) |
 | `Ctrl+Shift+E` | Mappträd (arbetsmapp) på/av; i dokumentläget Spåra ändringar |
 | `Ctrl+Shift+G` | Källkontroll (Git) i sidopanelen |
 | `Ctrl+Enter` | Checka in (i meddelanderutan i källkontrollen) |

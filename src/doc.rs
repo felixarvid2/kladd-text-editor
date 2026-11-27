@@ -401,7 +401,7 @@ impl Document {
         // En PowerPoint-presentation öppnas i presentationsvyn.
         if crate::pptx::is_ext(&ext) {
             let deck = crate::pptx::Deck::open(&bytes)?;
-            return Ok(Self::pptx_tab(id, path, crate::pptx::view::PptxTab::new(deck)));
+            return Ok(Self::pptx_tab(id, path, crate::pptx::view::PptxTab::with_source(deck, bytes)));
         }
         // En EPUB-bok öppnas i läsläget.
         if ext == "epub" {
@@ -505,9 +505,16 @@ impl Document {
 
     /// Sparar dokumentet. Returnerar varningar (t.ex. bilder som inte hittades).
     pub fn save_to(&mut self, path: &Path) -> Result<Vec<String>, String> {
-        // En presentation har ingen text att spara: skriv aldrig över .pptx-filen.
-        if self.pptx.is_some() {
-            return Err(crate::i18n::t("Presentationen visas bara; den kan inte sparas från Kladd än.").to_owned());
+        // En presentation sparas som .pptx/.ppsx/.potx: bara ändrade delar skrivs om.
+        let from_ext = self.extension();
+        if let Some(tab) = self.pptx.as_deref_mut() {
+            let path = if ext_of(path).is_empty() { path.with_extension("pptx") } else { path.to_path_buf() };
+            let bytes = tab.save_bytes(&ext_of(&path), &from_ext)?;
+            write_atomic(&path, &bytes).map_err(|e| describe_io_error(&e, &path))?;
+            tab.mark_saved(bytes);
+            self.path = Some(path.canonicalize().unwrap_or(path));
+            self.dirty = false;
+            return Ok(Vec::new());
         }
         if self.is_export_target(path) {
             // Export (webbsida, e-bok): filen skrivs men fliken behåller sin sökväg, sitt format
@@ -621,10 +628,10 @@ impl Document {
 
     /// Ska anropas när texten har ändrats i editorn.
     pub fn on_edited(&mut self) {
-        // Presentationsfliken har ingen text; inget kommando får göra den ändrad.
-        if self.pptx.is_some() {
+        // Presentationsfliken har ingen text; den är ändrad bara när presentationen är det.
+        if let Some(tab) = self.pptx.as_deref() {
             self.text.clear();
-            self.dirty = false;
+            self.dirty = tab.unsaved();
             return;
         }
         self.rev = self.rev.wrapping_add(1);
@@ -666,6 +673,10 @@ impl Document {
 
     /// Word-filer som inte kan sparas tillbaka i samma format (makron, mallar).
     pub fn needs_save_as(&self) -> bool {
+        // En presentation konverterad från .ppt sparas som .pptx (Spara som).
+        if self.pptx.is_some() {
+            return !crate::pptx::is_ext(&self.extension());
+        }
         self.docx && matches!(self.extension().as_str(), "docm" | "dotx" | "dotm" | "ott" | "doc" | "rtf" | "wpd" | "wps")
     }
 

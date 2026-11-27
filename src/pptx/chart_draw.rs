@@ -20,6 +20,9 @@ use super::scene::{Affine, Cap, Item, Join, Paint, Path, Stroke};
 use super::text::{self, Align, Anchor, Para, Run, RunStyle};
 use super::xml::Node;
 
+#[path = "chart_3d_draw.rs"]
+mod three_d;
+
 /// Yttre marginal (punkter).
 const PAD: f32 = 7.0;
 
@@ -407,7 +410,11 @@ impl<'b, 'a> Draw<'b, 'a> {
             }
             return;
         }
-        self.axes_plot(c, outer, inner_fixed);
+        if c.plots.iter().any(|p| p.three_d) {
+            self.axes_plot_3d(c, outer, inner_fixed);
+        } else {
+            self.axes_plot(c, outer, inner_fixed);
+        }
     }
 
     // ---- Förklaring ----
@@ -434,7 +441,8 @@ impl<'b, 'a> Draw<'b, 'a> {
                         entries.push(Entry { text: ser.cats.get(i).cloned().unwrap_or_else(|| (i + 1).to_string()), sppr: sp, color: self.auto_color(c.style, i, n), line: false });
                     }
                 } else {
-                    let line = matches!(p.kind, Kind::Line | Kind::Scatter);
+                    // 3D-linjer är band: nyckeln är en ruta i bandets färg.
+                    let line = matches!(p.kind, Kind::Line | Kind::Scatter) && !p.three_d;
                     entries.push(Entry { text: ser.name.clone(), sppr: ser.sppr, color: self.auto_color(c.style, ser.idx, total), line });
                 }
             }
@@ -519,6 +527,10 @@ impl<'b, 'a> Draw<'b, 'a> {
 
     fn pie(&mut self, c: &Chart<'_>, p: &Plot<'_>, area: R) {
         let Kind::Pie { hole, three_d } = p.kind else { return };
+        if three_d {
+            self.pie3d(c, p, area);
+            return;
+        }
         let Some(ser) = p.series.first() else { return };
         let vals: Vec<f64> = ser.vals.iter().map(|v| v.unwrap_or(0.0).abs()).collect();
         let total: f64 = vals.iter().sum();
@@ -528,15 +540,13 @@ impl<'b, 'a> Draw<'b, 'a> {
         let n = vals.len();
         let expl = |i: usize| ser.point(i).and_then(|d| d.explosion).unwrap_or(ser.explosion).max(0.0) / 100.0;
         let max_expl = (0..n).map(expl).fold(0.0f32, f32::max);
-        let tilt = if three_d { (c.view3d.map_or(30.0, |v| v.rot_x).clamp(10.0, 90.0)).to_radians().sin() } else { 1.0 };
-        let depth = if three_d { 0.07 } else { 0.0 };
-        // Diameter: 92,5 % av den minsta sidan (uppmätt i PowerPoints PDF för p4-pie); 3D-cirklar är
-        // mindre (88 % av det, uppmätt i msrc-win32k).
-        let d = (area.w.min(area.h / (tilt + depth))) * 0.925 * if three_d { 0.88 } else { 1.0 } / (1.0 + max_expl);
+        let tilt = 1.0;
+        // Diameter: 92,5 % av den minsta sidan (uppmätt i PowerPoints PDF för p4-pie). 3D: `chart_3d_draw.rs`.
+        let d = area.w.min(area.h) * 0.925 / (1.0 + max_expl);
         let r = d / 2.0;
-        let th = r * 2.0 * depth * c.view3d.map_or(1.0, |v| v.depth / 100.0).clamp(0.2, 2.0);
-        let (cx, cy) = (area.x + area.w / 2.0, area.y + area.h / 2.0 - th / 2.0);
-        let first = if three_d { c.view3d.map_or(0.0, |v| v.rot_y) } else { p.first_angle };
+        let th = 0.0;
+        let (cx, cy) = (area.x + area.w / 2.0, area.y + area.h / 2.0);
+        let first = p.first_angle;
         // Vinklar (grader medurs från klockan 12).
         let mut angles = Vec::with_capacity(n);
         let mut a = first;
@@ -584,42 +594,6 @@ impl<'b, 'a> Draw<'b, 'a> {
             path
         };
         let def_line = |_: usize| -> Option<Stroke> { None };
-        // 3D: sidorna (den del av kanten som vetter mot betraktaren) först, mörkare.
-        if three_d && th > 0.0 {
-            for i in 0..n {
-                let (a0, sw) = angles[i];
-                let (ox, oy) = offs[i];
-                // Kanten syns där vinkeln ligger på nedre halvan (90°..270°).
-                let steps = ((sw / 3.0).ceil() as usize).clamp(2, 180);
-                let mut seg: Vec<(f32, f32)> = Vec::new();
-                let flush = |seg: &mut Vec<(f32, f32)>, d: &mut Self| {
-                    if seg.len() >= 2 {
-                        let mut path = Path::default();
-                        path.move_to(seg[0].0, seg[0].1);
-                        for q in &seg[1..] {
-                            path.line_to(q.0, q.1);
-                        }
-                        for q in seg.iter().rev() {
-                            path.line_to(q.0, q.1 + th);
-                        }
-                        path.close();
-                        let base = d.fill_of(ser.point(i).and_then(|x| x.sppr).or(ser.sppr), area).flatten().map(|p| p.average()).unwrap_or_else(|| color(i));
-                        d.fill(path, Paint::Solid(lum(base, 0.65, 0.0)));
-                    }
-                    seg.clear();
-                };
-                for k in 0..=steps {
-                    let ang = a0 + sw * k as f32 / steps as f32;
-                    let front = ang.to_radians().cos() < 0.0;
-                    if front {
-                        seg.push(pt(ang, r, ox, oy));
-                    } else {
-                        flush(&mut seg, self);
-                    }
-                }
-                flush(&mut seg, self);
-            }
-        }
         for i in 0..n {
             let path = slice_path(i, 0.0);
             let sp = ser.point(i).and_then(|x| x.sppr).or(ser.sppr);

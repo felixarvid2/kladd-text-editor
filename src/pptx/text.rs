@@ -260,6 +260,10 @@ struct Seg {
     res: Resolved,
     style: RunStyle,
     text: String,
+    /// Körningen (index i `Para::runs`) och tecknet i körningens text där segmentet börjar
+    /// (för redigeringens markörlägen, `layout_carets`).
+    run: usize,
+    run_char: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -362,7 +366,7 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
     let size = if style.baseline != 0.0 { style.size * SCRIPT_SIZE } else { style.size };
     if run.line_break {
         let res = book.resolve(&style.latin, style.bold, style.italic);
-        segs.push(Seg { face: res.face.clone(), res, style: style.clone(), text: String::new() });
+        segs.push(Seg { face: res.face.clone(), res, style: style.clone(), text: String::new(), run: 0, run_char: 0 });
         cls.push(Cl { seg: segs.len() - 1, range: (0, 0), glyphs: Vec::new(), width: 0.0, kind: Kind::Break, break_after: true, level: levels.first().copied().unwrap_or(0) });
         return;
     }
@@ -448,7 +452,7 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
         let mut st = style.clone();
         st.size = size;
         let spacing = st.spacing;
-        segs.push(Seg { face: face.clone(), res: res.clone(), style: st, text: piece.clone() });
+        segs.push(Seg { face: face.clone(), res: res.clone(), style: st, text: piece.clone(), run: 0, run_char: 0 });
         let Some(rb) = face.shaper() else { continue };
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(&piece);
@@ -541,8 +545,38 @@ pub struct Laid {
     pub height: f32,
 }
 
+/// Ett markörläge i en utlagd textruta (för redigeringen): början av ett kluster, en radbrytning
+/// eller styckets slut. Koordinaterna är textrutans, som `Laid::items`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaretStop {
+    pub para: usize,
+    /// Körningen i `Para::runs` (`usize::MAX` = styckets slut).
+    pub run: usize,
+    /// Tecknet i körningens text.
+    pub ch: usize,
+    /// Klustrets vänsterkant och bredd.
+    pub x: f32,
+    pub w: f32,
+    pub base: f32,
+    pub asc: f32,
+    pub desc: f32,
+    /// Radens nummer i rutan (räknat över alla stycken).
+    pub line: usize,
+}
+
 /// Lägger ut en textruta med storleken `w`×`h` (punkter).
 pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
+    layout_impl(frame, w, h, book, None)
+}
+
+/// Som `layout`, och dessutom markörlägena (samma utläggning, så markören står där texten ritas).
+pub fn layout_carets(frame: &Frame, w: f32, h: f32, book: &FontBook) -> (Laid, Vec<CaretStop>) {
+    let mut stops = Vec::new();
+    let laid = layout_impl(frame, w, h, book, Some(&mut stops));
+    (laid, stops)
+}
+
+fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Option<&mut Vec<CaretStop>>) -> Laid {
     let (il, it, ir, ib) = frame.insets;
     let ncol = frame.columns.0.max(1) as usize;
     let col_gap = frame.columns.1.max(0.0);
@@ -566,8 +600,15 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
         let mut segs = Vec::new();
         let mut cls = Vec::new();
         let levels = para_levels(&p.runs, p.rtl);
-        for (r, lv) in p.runs.iter().zip(&levels) {
+        for (ri, (r, lv)) in p.runs.iter().zip(&levels).enumerate() {
+            let s0 = segs.len();
             shape_run(r, book, &mut segs, &mut cls, lv);
+            let mut ch = 0;
+            for s in &mut segs[s0..] {
+                s.run = ri;
+                s.run_char = ch;
+                ch += s.text.chars().count();
+            }
         }
         // Punkten (bara om stycket har text).
         let has_text = p.runs.iter().any(|r| !r.line_break && !r.text.is_empty());
@@ -784,7 +825,13 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
 
     // 3. Utritning.
     let mut items = Vec::new();
+    let mut cur_para = None;
     for pl_ref in &placed {
+        // Styckemärke (för animeringar stycke för stycke).
+        if cur_para != Some(pl_ref.para) {
+            cur_para = Some(pl_ref.para);
+            items.push(Item::Para(pl_ref.para as u32));
+        }
         let pl = &plaid[pl_ref.para];
         let p = &frame.paras[pl_ref.para];
         let line = &pl.lines[pl_ref.line];
@@ -812,6 +859,33 @@ pub fn layout(frame: &Frame, w: f32, h: f32, book: &FontBook) -> Laid {
             if let Some((bseg, bglyphs, bw)) = &pl.bullet {
                 let bx = if p.rtl { col_x + col_w - (p.mar_l + p.indent).max(0.0) - bw } else { col_x + (p.mar_l + p.indent).max(0.0) };
                 emit_glyphs(&mut items, bseg, bglyphs.iter().copied(), bx, base_y, &bseg.text);
+            }
+        }
+        // Markörlägen (redigeringen): klustren i logisk ordning, med avslutande blanksteg.
+        if let Some(stops) = carets.as_deref_mut() {
+            let line_no = stops.last().map_or(0, |s: &CaretStop| s.line + 1);
+            let mut xx = x;
+            for c in &pl.cls[line.from..line.to] {
+                let seg = &pl.segs[c.seg];
+                let cw = match c.kind {
+                    Kind::Tab => {
+                        let abs = xx - col_x;
+                        let next = p.tabs.iter().copied().find(|&t| t > abs + 0.01).unwrap_or_else(|| {
+                            let tab = p.def_tab.max(1.0);
+                            ((abs / tab).floor() + 1.0) * tab
+                        });
+                        next - abs
+                    }
+                    Kind::Space => c.width + extra_per_space,
+                    Kind::Break => 0.0,
+                    Kind::Normal => c.width,
+                };
+                let ch = seg.run_char + seg.text.get(..c.range.0 as usize).map_or(0, |t| t.chars().count());
+                stops.push(CaretStop { para: pl_ref.para, run: seg.run, ch, x: xx, w: cw, base: base_y, asc: line.ascent, desc: line.descent, line: line_no });
+                xx += cw;
+            }
+            if pl_ref.line + 1 == pl.lines.len() {
+                stops.push(CaretStop { para: pl_ref.para, run: usize::MAX, ch: 0, x: xx, w: 0.0, base: base_y, asc: line.ascent, desc: line.descent, line: line_no });
             }
         }
         // Visuell ordning: höger-till-vänster-kluster i följd vänds.
@@ -1041,6 +1115,9 @@ pub fn transform_items(items: Vec<Item>, t: &Affine) -> Vec<Item> {
                 Item::BeginEffect(e)
             }
             Item::EndEffect => Item::EndEffect,
+            Item::BeginShape { id } => Item::BeginShape { id },
+            Item::EndShape => Item::EndShape,
+            Item::Para(n) => Item::Para(n),
         })
         .collect()
 }
