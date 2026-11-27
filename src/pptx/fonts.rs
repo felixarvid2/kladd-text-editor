@@ -795,10 +795,11 @@ mod tests {
     #[test]
     fn calibri_blir_carlito_och_okant_far_reserv() {
         let book = FontBook::default();
+        // Där Calibri finns i systemet (Windows, macOS med Office) används det; annars Carlito.
         let r = book.resolve("Calibri", false, false);
-        assert!(r.face.family.contains("Carlito"), "{}", r.face.family);
+        assert!(r.face.family.contains("Carlito") || r.face.family.contains("Calibri"), "{}", r.face.family);
         let r = book.resolve("Calibri Light", true, false);
-        assert!(r.face.bold);
+        assert!(r.face.bold || r.fake_bold);
         let r = book.resolve("Cambria", false, true);
         assert!(r.face.family.contains("Caladea") || r.face.family.contains("Cambria"));
         // Okänt namn ger alltid något typsnitt.
