@@ -38,6 +38,7 @@ pub(crate) const NAMESPACES: &[(&str, &str)] = &[
     ("http://schemas.microsoft.com/office/drawing/2010/main", "a14"),
     ("http://schemas.microsoft.com/office/drawing/2016/SVG/main", "asvg"),
     ("http://schemas.microsoft.com/office/drawing/2014/main", "a16"),
+    ("http://schemas.microsoft.com/office/powerpoint/2015/09/main", "p159"),
     ("http://schemas.openxmlformats.org/officeDocument/2006/math", "m"),
     ("urn:schemas-microsoft-com:vml", "v"),
 ];
@@ -47,6 +48,8 @@ pub(crate) const NAMESPACES: &[(&str, &str)] = &[
 const SUPPORTED_CHOICE: &[&str] = &[
     "http://schemas.microsoft.com/office/powerpoint/2010/main",
     "http://schemas.microsoft.com/office/powerpoint/2012/main",
+    // Morph (`p159:morph`); reserven är en toning.
+    "http://schemas.microsoft.com/office/powerpoint/2015/09/main",
 ];
 
 

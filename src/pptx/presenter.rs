@@ -20,11 +20,14 @@ use std::time::{Duration, Instant};
 use egui::emath::GuiRounding;
 use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect, RichText, Sense, Ui, pos2, vec2};
 
-use super::anim::{State, Target, Timeline};
+use super::anim::{MediaCmd, MediaShape, State, Target, Timeline};
 use super::anim_layers::{self, LayerKind};
+use super::media_play::MediaHub;
 use super::scene::Affine;
-use super::slideshow::{Blank, Frame, Playback, Screen, Show, SlideState, SlideTiming, Timer, clock_text};
-use super::transition::{self, Layer, Transition};
+use super::edit_ops::{self, ShapeInfo};
+use super::morph;
+use super::slideshow::{Blank, Frame, Playback, Screen, Show, SlideState, SlideTiming, Timer, TriggerTiming, clock_text};
+use super::transition::{self, Kind, Layer, Transition};
 use super::Deck;
 use crate::i18n::t;
 use crate::tf;
@@ -52,16 +55,51 @@ struct Prepared {
 
 type Done = (usize, u32, u32, Option<Vec<anim_layers::Rendered>>);
 
+/// Två bilder renderade för morph (lager per toppnivåform) och hur formerna rör sig mellan dem.
+struct MorphReady {
+    width: u32,
+    plan: morph::Plan,
+    old: Prepared,
+    new: Prepared,
+}
+
+type MorphDone = ((usize, usize), u32, u32, Option<(morph::Plan, Vec<anim_layers::Rendered>, Vec<anim_layers::Rendered>)>);
+
+/// Allt `draw_layer` behöver om ytan lagren ritas på.
+struct Canvas {
+    painter: Painter,
+    rect: Rect,
+    /// Bildpunkter i rastret → punkter på bilden.
+    kx: f32,
+    ky: f32,
+    /// Punkter på bilden → punkter på målet (övergångens flyttning).
+    to_dst: Affine,
+    clip: Option<Vec<[f32; 2]>>,
+    /// Skärmpunkter per bildpunkt.
+    scr: f32,
+}
+
 /// Pågående bildspel.
 pub struct ShowView {
     deck: Arc<Deck>,
     play: Playback,
     timelines: Vec<Arc<Timeline>>,
+    /// Ljud- och videoformerna per bild (alltid, även utan animeringar).
+    media: Vec<Vec<MediaShape>>,
+    /// Formerna på bilderna som klickats eller hålls över (träffprov för utlösare).
+    trigger_hits: HashMap<usize, Vec<ShapeInfo>>,
     origin: Instant,
     prepared: HashMap<usize, Prepared>,
     pending: HashSet<usize>,
     tx: Sender<Done>,
     rx: Receiver<Done>,
+    /// Morph: renderade par av bilder (gamla, nya) och pågående jobb.
+    morphs: HashMap<(usize, usize), MorphReady>,
+    morph_pending: HashSet<(usize, usize)>,
+    morph_tx: Sender<MorphDone>,
+    morph_rx: Receiver<MorphDone>,
+    /// Bilder vars egen övergång är morph.
+    morph_in: Vec<bool>,
     /// Bredd i bildpunkter som bilderna renderas i (den största ytan de ritas på).
     width: u32,
     /// Största ytan bilden ritats på i den här bildrutan (publikens vy och föredragsvyn).
@@ -77,25 +115,51 @@ pub struct ShowView {
     /// övergång eller självstartande animering inte hinner gå medan bilden är svart.
     stalled: f64,
     last_real: f64,
+    /// Ljud och video (`media_play.rs`).
+    hub: MediaHub,
 }
 
 impl ShowView {
     /// `animate` = falskt: inga övergångar eller animeringar (bilderna visas i sitt vanliga utseende).
     pub fn new(deck: Arc<Deck>, show: Show, animate: bool) -> ShowView {
-        let timelines: Vec<Arc<Timeline>> =
-            deck.slides.iter().map(|s| Arc::new(if animate { Timeline::of_slide(&s.root) } else { Timeline::default() })).collect();
+        let timelines: Vec<Arc<Timeline>> = deck
+            .slides
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut tl = if animate { Timeline::of_slide(&s.root) } else { Timeline::default() };
+                if !tl.triggers.is_empty() {
+                    // En utlösare vars form inte går att träffa (i grupp, på layouten, saknas, utan yta)
+                    // tas bort: dess mål visas som vanligt.
+                    let ok: HashSet<u32> = edit_ops::shapes(&deck, i).iter().filter(|h| !h.empty_ph && h.xf.cx > 0 && h.xf.cy > 0).map(|h| h.id).collect();
+                    tl.retain_triggers(|id| ok.contains(&id));
+                }
+                Arc::new(tl)
+            })
+            .collect();
+        let media = deck.slides.iter().map(|s| super::anim::media_shapes(&s.root)).collect();
         let timing = timings(&deck, &timelines, animate);
         let origin = Instant::now();
         let (tx, rx) = channel();
+        let (morph_tx, morph_rx) = channel();
+        let morph_in = deck.slides.iter().map(|s| animate && matches!(Transition::of_slide(&s.root).kind, Kind::Morph(_))).collect();
         ShowView {
+            hub: MediaHub::new(deck.clone(), animate),
             play: Playback::new(show, timing, 0.0),
             deck,
             timelines,
+            media,
+            trigger_hits: HashMap::new(),
             origin,
             prepared: HashMap::new(),
             pending: HashSet::new(),
             tx,
             rx,
+            morphs: HashMap::new(),
+            morph_pending: HashSet::new(),
+            morph_tx,
+            morph_rx,
+            morph_in,
             width: 0,
             frame_px: 0,
             presenter: false,
@@ -128,6 +192,72 @@ impl ShowView {
     /// Bilden som visas eller senast visades.
     pub fn slide(&self) -> usize {
         self.play.show.slide()
+    }
+
+    /// Mediakommandona (`p:cmd`) som kommit sedan sist, i ordning, för aktuell bild; se
+    /// `Playback::take_media`. Läses av ljud- och videouppspelningen.
+    pub fn take_media(&mut self) -> Vec<MediaCmd> {
+        self.play.take_media()
+    }
+
+    #[cfg(test)]
+    pub(super) fn slide_screen(&self) -> Screen {
+        self.play.show.screen()
+    }
+
+    #[cfg(test)]
+    pub(super) fn timelines(&self) -> &[Arc<Timeline>] {
+        &self.timelines
+    }
+
+    /// Ljud- och videoformerna på bild `slide` (id = `p:cNvPr/@id`, det som `MediaCmd::shape_id` pekar på).
+    #[allow(dead_code)]
+    pub fn media_shapes(&self, slide: usize) -> &[MediaShape] {
+        self.media.get(slide).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Utlösaren under `pos` (skärmläge) när bilden ritas i `rect`: formens id. Den översta formen vinner.
+    pub(super) fn trigger_at(&mut self, rect: Rect, pos: Pos2) -> Option<u32> {
+        let Screen::Slide(slide) = self.play.show.screen() else { return None };
+        let shapes = self.play.trigger_shapes();
+        if shapes.is_empty() || rect.width() <= 0.0 || !rect.contains(pos) {
+            return None;
+        }
+        let k = self.deck.size_pt().0 / rect.width();
+        let (px, py) = ((pos.x - rect.left()) * k, (pos.y - rect.top()) * k);
+        let deck = &self.deck;
+        let hits = self.trigger_hits.entry(slide).or_insert_with(|| edit_ops::shapes(deck, slide));
+        hits.iter().filter(|h| shapes.contains(&h.id) && h.hit(px, py, 0.0)).max_by_key(|h| h.index).map(|h| h.id)
+    }
+
+    /// Klick på bilden i `rect` vid `pos`: en utlösare spelas, annars nästa steg. Falskt = avsluta.
+    #[cfg(test)]
+    pub(super) fn click_slide(&mut self, rect: Rect, pos: Option<Pos2>, now: f64) -> bool {
+        self.click_slide_in(None, rect, pos, now)
+    }
+
+    /// Som `click_slide`; med `ctx` får också mediaformer utan utlösare klicket.
+    fn click_slide_in(&mut self, ctx: Option<&egui::Context>, rect: Rect, pos: Option<Pos2>, now: f64) -> bool {
+        if let Some(id) = pos.and_then(|p| self.trigger_at(rect, p)) {
+            if self.play.click_shape(id, now) {
+                return true;
+            }
+        }
+        // En mediaform utan utlösare spelas/pausas av klicket (en med utlösare har redan fått sitt kommando).
+        if ctx.is_some_and(|c| self.media_click(c, rect, pos)) {
+            return true;
+        }
+        self.play.next(now, true)
+    }
+
+    /// Handen över en utlösare.
+    fn hover_trigger(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) {
+        if pos.and_then(|p| self.trigger_at(rect, p)).is_some() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if let Some(s) = self.media_slide(&self.play.frame(self.now())) {
+            self.hub.hover(ctx, s, rect, self.deck.size_pt().0, pos);
+        }
     }
 
     /// Tangenterna (från publikens fönster och föredragsvyns). Falskt = avsluta.
@@ -189,6 +319,16 @@ impl ShowView {
         if !self.play.tick(now) {
             return false;
         }
+        let at = match self.play.show.screen() {
+            Screen::Slide(i) => Some((i, self.play.show.step())),
+            _ => None,
+        };
+        self.hub.on_position(at);
+        let slide = self.play.show.slide();
+        for c in self.take_media() {
+            self.hub.apply(&ctx, slide, c);
+        }
+        self.hub.update(&ctx);
         let rect = ui.max_rect();
         let mut keep = true;
         let embedded = ctx.embed_viewports();
@@ -237,11 +377,12 @@ impl ShowView {
         self.want_width((slide_rect.width() * ctx.pixels_per_point()).round() as u32);
         let frame = self.play.frame(self.now());
         self.paint_frame(&painter, slide_rect, rect, &frame);
-        // Mus: klick framåt, högerklick bakåt, hjulet bläddrar.
+        // Mus: klick framåt (på en mediaform utan utlösare: spela/paus), högerklick bakåt, hjulet bläddrar.
         let now = self.now();
         let mut keep = true;
+        self.hover_trigger(&ctx, slide_rect, resp.hover_pos());
         if resp.clicked_by(PointerButton::Primary) {
-            keep = self.play.next(now, true);
+            keep = self.click_slide_in(Some(&ctx), slide_rect, resp.interact_pointer_pos(), now);
         } else if resp.clicked_by(PointerButton::Secondary) {
             self.play.prev(now);
         }
@@ -290,6 +431,8 @@ impl ShowView {
             Screen::Slide(_) => {
                 let Some(cur) = &frame.cur else { return };
                 match &frame.transition {
+                    // Morph: formerna flyttas mellan bilderna när lagren är renderade, annars en toning.
+                    Some((Some(o), Kind::Morph(_), p)) if self.paint_morph(painter, slide_rect, o, cur, *p) => {}
                     Some((old, kind, p)) => {
                         let (sw, sh) = self.deck.size_pt();
                         for piece in transition::pieces(*kind, *p, sw / sh.max(1.0)) {
@@ -303,7 +446,11 @@ impl ShowView {
                             }
                         }
                     }
-                    None => self.paint_slide(painter, slide_rect, cur, None, &transition::IDENTITY, 1.0),
+                    None => {
+                        self.paint_slide(painter, slide_rect, cur, None, &transition::IDENTITY, 1.0);
+                        let opacity = |id: u32| Self::media_opacity(&self.timelines, cur, id);
+                        self.hub.paint(painter, cur.slide, slide_rect, self.deck.size_pt().0, painter.ctx().pointer_hover_pos(), &opacity);
+                    }
                 }
             }
             Screen::Blank(Blank::Black) => {}
@@ -322,18 +469,17 @@ impl ShowView {
         }
     }
 
-    /// Lagrets tillstånd i bildens läge.
+    /// Lagrets tillstånd i bildens läge: huvudsekvensen och utlösarna, stycket ovanpå formen.
     fn layer_state(&self, st: &SlideState, kind: LayerKind, geom: super::anim::Geom) -> State {
-        let LayerKind::Target(tg) = kind else { return State::SHOWN };
+        let (tg, unit) = match kind {
+            LayerKind::Static => return State::SHOWN,
+            LayerKind::Target(t) => (t, None),
+            LayerKind::Piece { scope, unit } => (scope, Some(unit)),
+            // Resten (punkt, understrykning) följer första delen.
+            LayerKind::Rest(scope) => (scope, Some(0)),
+        };
         let Some(tl) = self.timelines.get(st.slide) else { return State::SHOWN };
-        let own = tl.state(tg, geom, st.chain.clone(), st.t);
-        match tg.para {
-            // Ett stycke följer också formens egna effekter.
-            Some(_) if tl.targets().contains(&Target { shape: tg.shape, para: None }) => {
-                tl.state(Target { shape: tg.shape, para: None }, geom, st.chain.clone(), st.t).compose(&own)
-            }
-            _ => own,
-        }
+        tl.layer_state(tg, unit, geom, st.chain.clone(), st.t, &st.trig)
     }
 
     /// Ritar bilden i läget `st` i `rect`, klippt till `clip` (bildens enhetskoordinater) och flyttad med
@@ -341,57 +487,92 @@ impl ShowView {
     /// former med in-effekter aldrig syns för tidigt).
     fn paint_slide(&self, painter: &Painter, rect: Rect, st: &SlideState, clip: Option<&[[f32; 2]]>, map: &transition::Map, alpha: f32) {
         let Some(prep) = self.prepared.get(&st.slide) else { return };
+        let cv = self.canvas(painter, rect, prep, clip, map);
+        let kinds: Vec<LayerKind> = prep.layers.iter().map(|l| l.kind).collect();
+        let plan = anim_layers::plan(&kinds, &|i| self.layer_state(st, prep.layers[i].kind, prep.layers[i].geom));
+        for (l, state) in prep.layers.iter().zip(plan) {
+            let Some(state) = state else { continue };
+            self.draw_layer(&cv, l, &state, &Affine::IDENTITY, alpha);
+        }
+    }
+
+    /// Ytan en bild ritas på: klippt till `clip` (bildens enhetskoordinater) och flyttad med `map`.
+    fn canvas(&self, painter: &Painter, rect: Rect, prep: &Prepared, clip: Option<&[[f32; 2]]>, map: &transition::Map) -> Canvas {
         let (sw, sh) = self.deck.size_pt();
         let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-        // Bildpunkter i rastret → punkter på bilden.
-        let (kx, ky) = (sw / prep.width.max(1) as f32, sh / prep.height.max(1) as f32);
         let s = Affine::scale(sw, sh);
         let m = Affine { a: map[0], b: map[1], c: map[2], d: map[3], e: map[4], f: map[5] };
-        let to_dst = s.invert().unwrap_or(Affine::IDENTITY).then(&m).then(&s);
-        let clip_pts: Option<Vec<[f32; 2]>> = clip.map(|c| c.iter().map(|q| [q[0] * sw, q[1] * sh]).collect());
-        let scr = rect.width() / sw.max(1.0);
-        for l in &prep.layers {
-            let state = self.layer_state(st, l.kind, l.geom);
-            if !state.drawn() {
+        Canvas {
+            painter,
+            rect,
+            kx: sw / prep.width.max(1) as f32,
+            ky: sh / prep.height.max(1) as f32,
+            to_dst: s.invert().unwrap_or(Affine::IDENTITY).then(&m).then(&s),
+            clip: clip.map(|c| c.iter().map(|q| [q[0] * sw, q[1] * sh]).collect()),
+            scr: rect.width() / sw.max(1.0),
+        }
+    }
+
+    /// Ritar ett lager i tillståndet `state`; `extra` (punkter på bilden) flyttar det ytterligare (morph).
+    fn draw_layer(&self, cv: &Canvas, l: &Tex, state: &State, extra: &Affine, alpha: f32) {
+        if !state.drawn() {
+            return;
+        }
+        let (kx, ky, rect, scr) = (cv.kx, cv.ky, cv.rect, cv.scr);
+        let (sw, sh) = self.deck.size_pt();
+        let (x0, y0, w, h) = (l.px.0 as f32 * kx, l.px.1 as f32 * ky, l.px.2 as f32 * kx, l.px.3 as f32 * ky);
+        let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
+        let base = Affine::scale(w, h).then(&Affine::translate(x0, y0));
+        let anim = Affine::translate(-cx, -cy)
+            .then(&Affine::scale(state.sx, state.sy))
+            .then(&Affine::rotate(state.rot))
+            .then(&Affine::translate(cx + state.dx * sw, cy + state.dy * sh));
+        let a = base.then(&anim).then(extra);
+        let Some(inv) = a.invert() else { return };
+        let polys = match state.reveal {
+            Some((r, p)) => transition::reveal(r, p, w / h.max(0.01)),
+            None => vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+        };
+        let color = Color32::from_white_alpha((state.opacity * alpha * 255.0).round().clamp(0.0, 255.0) as u8);
+        let mut mesh = egui::Mesh::with_texture(l.tex.id());
+        for poly in polys {
+            let mut pts: Vec<[f32; 2]> = poly.iter().map(|q| { let (x, y) = a.apply(q[0], q[1]); [x, y] }).collect();
+            if let Some(c) = &cv.clip {
+                pts = clip_convex(&pts, c);
+            }
+            if pts.len() < 3 {
                 continue;
             }
-            let (x0, y0, w, h) = (l.px.0 as f32 * kx, l.px.1 as f32 * ky, l.px.2 as f32 * kx, l.px.3 as f32 * ky);
-            let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
-            let base = Affine::scale(w, h).then(&Affine::translate(x0, y0));
-            let anim = Affine::translate(-cx, -cy)
-                .then(&Affine::scale(state.sx, state.sy))
-                .then(&Affine::rotate(state.rot))
-                .then(&Affine::translate(cx + state.dx * sw, cy + state.dy * sh));
-            let a = base.then(&anim);
-            let Some(inv) = a.invert() else { continue };
-            let polys = match state.reveal {
-                Some((r, p)) => transition::reveal(r, p, w / h.max(0.01)),
-                None => vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
-            };
-            let color = Color32::from_white_alpha((state.opacity * alpha * 255.0).round().clamp(0.0, 255.0) as u8);
-            let mut mesh = egui::Mesh::with_texture(l.tex.id());
-            for poly in polys {
-                let mut pts: Vec<[f32; 2]> = poly.iter().map(|q| { let (x, y) = a.apply(q[0], q[1]); [x, y] }).collect();
-                if let Some(c) = &clip_pts {
-                    pts = clip_convex(&pts, c);
-                }
-                if pts.len() < 3 {
-                    continue;
-                }
-                let first = mesh.vertices.len() as u32;
-                for p in &pts {
-                    let (u, v) = inv.apply(p[0], p[1]);
-                    let (dx, dy) = to_dst.apply(p[0], p[1]);
-                    mesh.vertices.push(egui::epaint::Vertex { pos: pos2(rect.left() + dx * scr, rect.top() + dy * scr), uv: pos2(u, v), color });
-                }
-                for k in 1..pts.len() as u32 - 1 {
-                    mesh.add_triangle(first, first + k, first + k + 1);
-                }
+            let first = mesh.vertices.len() as u32;
+            for p in &pts {
+                let (u, v) = inv.apply(p[0], p[1]);
+                let (dx, dy) = cv.to_dst.apply(p[0], p[1]);
+                mesh.vertices.push(egui::epaint::Vertex { pos: pos2(rect.left() + dx * scr, rect.top() + dy * scr), uv: pos2(u, v), color });
             }
-            if !mesh.is_empty() {
-                painter.add(egui::Shape::mesh(mesh));
+            for k in 1..pts.len() as u32 - 1 {
+                mesh.add_triangle(first, first + k, first + k + 1);
             }
         }
+        if !mesh.is_empty() {
+            cv.painter.add(egui::Shape::mesh(mesh));
+        }
+    }
+
+    /// Ritar en morph-bildruta (förloppet `p`): `false` om lagren inte är renderade än.
+    fn paint_morph(&self, painter: &Painter, rect: Rect, old: &SlideState, cur: &SlideState, p: f32) -> bool {
+        let Some(m) = self.morphs.get(&(old.slide, cur.slide)) else { return false };
+        if m.width != self.width || m.width == 0 {
+            return false;
+        }
+        let cv = self.canvas(painter, rect, &m.old, None, &transition::IDENTITY);
+        for op in m.plan.ops(p) {
+            let (prep, st) = if op.which == morph::Which::Old { (&m.old, old) } else { (&m.new, cur) };
+            for l in prep.layers.iter().filter(|l| morph::belongs(l.kind, op.shape)) {
+                let state = self.layer_state(st, l.kind, l.geom);
+                self.draw_layer(&cv, l, &state, &op.map, op.alpha);
+            }
+        }
+        true
     }
 
     // ------------------------------------------------------------ föredragsvyn
@@ -492,7 +673,7 @@ impl ShowView {
             Some((s, step)) => {
                 painter.rect_filled(next_rect, 0.0, Color32::BLACK);
                 let end = self.play_chain_end(s, step);
-                let st = SlideState { slide: s, step, chain: end..end, t: f32::INFINITY };
+                let st = SlideState { slide: s, step, chain: end..end, t: f32::INFINITY, trig: Vec::new() };
                 self.paint_slide(&painter, next_rect, &st, None, &transition::IDENTITY, 1.0);
             }
             None => {
@@ -520,10 +701,41 @@ impl ShowView {
         }
         // Klick på aktuell bild går framåt.
         let resp = ui.interact(cur_rect, ui.scope_id().with("kladd-pptx-presenter-cur"), Sense::click());
+        self.hover_trigger(&ctx, cur_rect, resp.hover_pos());
         if resp.clicked() {
-            keep &= self.play.next(now, true);
+            keep &= self.click_slide_in(Some(&ctx), cur_rect, resp.interact_pointer_pos(), now);
         }
         keep
+    }
+
+    /// Bilden vars media får ritas och klickas på: aktuell bild när ingen övergång pågår.
+    fn media_slide(&self, frame: &Frame) -> Option<usize> {
+        match (&frame.screen, &frame.transition) {
+            (Screen::Slide(i), None) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Formens genomskinlighet ur animeringarna (0 = dold före sin in-effekt eller efter sin ut-effekt).
+    fn media_opacity(timelines: &[Arc<Timeline>], st: &SlideState, shape: u32) -> f32 {
+        let Some(tl) = timelines.get(st.slide) else { return 1.0 };
+        let tg = Target { shape, para: None };
+        if !tl.targets().contains(&tg) {
+            return 1.0;
+        }
+        let s = tl.layer_state(tg, None, super::anim::Geom { cx: 0.5, cy: 0.5, w: 1.0, h: 1.0 }, st.chain.clone(), st.t, &st.trig);
+        if s.drawn() { s.opacity } else { 0.0 }
+    }
+
+    /// Klick på en mediaform (spela/paus, tidslinje). Sant = klicket är förbrukat.
+    fn media_click(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) -> bool {
+        let frame = self.play.frame(self.now());
+        let (Some(s), Some(p), Some(cur)) = (self.media_slide(&frame), pos, frame.cur.as_ref()) else { return false };
+        let sw = self.deck.size_pt().0;
+        let tls = &self.timelines;
+        let opacity = |id: u32| Self::media_opacity(tls, cur, id);
+        let hub = &mut self.hub;
+        hub.click(ctx, s, rect, sw, p, &opacity)
     }
 
     /// Antal klara animeringsgrupper efter `step` klick på bild `slide`.
@@ -552,6 +764,25 @@ impl ShowView {
                 .collect();
             self.prepared.insert(slide, Prepared { width: w, height: h, layers });
         }
+        while let Ok((key, width, height, ready)) = self.morph_rx.try_recv() {
+            self.morph_pending.remove(&key);
+            // Ett misslyckat jobb ger ingen morph (toningen ritas).
+            let Some((plan, old, new)) = ready else { continue };
+            let load = |tag: &str, layers: Vec<anim_layers::Rendered>| Prepared {
+                width,
+                height,
+                layers: layers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, r)| {
+                        let image = egui::ColorImage::from_rgba_premultiplied([r.px.2 as usize, r.px.3 as usize], &r.rgba);
+                        let tex = ctx.load_texture(format!("pptx-morph-{}-{}-{tag}-{n}", key.0, key.1), image, egui::TextureOptions::LINEAR);
+                        Tex { kind: r.kind, tex, px: r.px, geom: r.geom }
+                    })
+                    .collect(),
+            };
+            self.morphs.insert(key, MorphReady { width, plan, old: load("a", old), new: load("b", new) });
+        }
     }
 
     /// Släpper bilder som inte behövs och startar renderingar av de som saknas (aktuell bild först).
@@ -569,8 +800,43 @@ impl ShowView {
         }
         need.push(self.play.show.slide());
         self.prepared.retain(|k, _| need.contains(k));
+        // Morph: paret pågående övergång, och paret till nästa bild om den morphar.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        if let (Some((Some(o), Kind::Morph(_), _)), Some(c)) = (&frame.transition, &frame.cur) {
+            pairs.push((o.slide, c.slide));
+        }
+        if let Some((n, _)) = self.play.show.peek_next() {
+            if self.morph_in.get(n).copied().unwrap_or(false) {
+                pairs.push((self.play.show.slide(), n));
+            }
+        }
+        self.morphs.retain(|k, _| pairs.contains(k));
         if self.width == 0 {
             return;
+        }
+        for key in pairs {
+            let fresh = self.morphs.get(&key).is_some_and(|m| m.width == self.width);
+            if fresh || self.morph_pending.len() >= 1 || self.morph_pending.contains(&key) {
+                continue;
+            }
+            self.morph_pending.insert(key);
+            let deck = self.deck.clone();
+            let (to, tn) = (self.timelines.get(key.0).cloned().unwrap_or_default(), self.timelines.get(key.1).cloned().unwrap_or_default());
+            let tx = self.morph_tx.clone();
+            let ctx = ctx.clone();
+            let (sw, sh) = deck.size_pt();
+            let width = self.width;
+            let height = ((width as f32) * sh / sw.max(1.0)).round().clamp(1.0, 8192.0) as u32;
+            let _ = std::thread::Builder::new().name("pptx-morph".into()).stack_size(8 << 20).spawn(move || {
+                let ready = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let a = morph::Side::build(&deck, key.0, &to.targets(), width, height);
+                    let b = morph::Side::build(&deck, key.1, &tn.targets(), width, height);
+                    (morph::plan(&a, &b), a.layers, b.layers)
+                }))
+                .ok();
+                let _ = tx.send((key, width, height, ready));
+                ctx.request_repaint();
+            });
         }
         for i in need {
             if self.pending.len() >= MAX_JOBS {
@@ -591,7 +857,7 @@ impl ShowView {
             let _ = std::thread::Builder::new().name("pptx-bildspel".into()).stack_size(8 << 20).spawn(move || {
                 let layers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let scene = super::render::slide_scene(&deck, i);
-                    let split = anim_layers::split(&scene, &tl.targets());
+                    let split = anim_layers::split_units(&scene, &tl.targets(), &tl.unit_scopes());
                     anim_layers::render(&scene, &split, width, height)
                 }))
                 .ok();
@@ -613,7 +879,9 @@ pub fn timings(deck: &Deck, timelines: &[Arc<Timeline>], animate: bool) -> Vec<S
             let parsed = Transition::of_slide(&s.root);
             let transition = if animate { parsed } else { Transition { adv_after: parsed.adv_after, ..Transition::default() } };
             let chains = (0..=tl.clicks()).map(|k| (tl.chain(k), tl.chain_dur(k))).collect();
-            SlideTiming { chains, transition }
+            let cmds = (0..=tl.clicks()).map(|k| tl.chain_cmds(k)).collect();
+            let triggers = tl.triggers.iter().map(|t| TriggerTiming { shape: t.shape, dur: t.dur(), cmds: t.cmds() }).collect();
+            SlideTiming { chains, transition, cmds, triggers }
         })
         .collect()
 }

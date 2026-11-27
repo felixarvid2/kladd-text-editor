@@ -40,11 +40,13 @@ cp LICENSE README.md "$appdir/usr/share/doc/kladd/"
 # linuxdeploy tar med delade bibliotek utom dem på sin standardlista över systembibliotek
 # (libGL, libEGL, libwayland, libX*, libxkbcommon m.fl.): grafik och fönstersystem ska
 # komma från värdens drivrutiner, inte från paketet.
+# libasound lämnas till värden: ALSA-pluginen för PulseAudio/PipeWire måste matcha värdens ljudserver.
 # AppImagen skrivs till den aktuella katalogen, därför körs verktyget från dist/.
 root="$PWD"
 cd dist
 "$tools/linuxdeploy" \
   --appdir "$appdir" \
+  --exclude-library "libasound.so*" \
   --executable "$bin" \
   --desktop-file "$root/packaging/kladd.desktop" \
   --icon-file "$root/packaging/icons/kladd.svg" \

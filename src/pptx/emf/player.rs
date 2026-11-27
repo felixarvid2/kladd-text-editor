@@ -851,7 +851,7 @@ impl<'f> Player<'f> {
             let mut s = String::new();
             while i < glyphs.len() && glyphs[i].face.id == f0 {
                 let g = &glyphs[i];
-                placed.push(PlacedGlyph { id: g.id, x: x0 + g.x, y: y0, advance: g.adv });
+                placed.push(PlacedGlyph { id: g.id, x: x0 + g.x, y: y0, advance: g.adv, ch: super::super::scene::NO_CHAR, word: super::super::scene::NO_CHAR });
                 i += 1;
             }
             if f0 == face.id {

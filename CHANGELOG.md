@@ -4,6 +4,14 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.13.0] – 2026-11-27
+
+### Nytt
+
+- **PowerPoint: utlösare, text bokstav för bokstav och mediakommandon i bildspelet.** Animeringar som startas av ett klick på en viss form (`interactiveSeq`) spelas upp: klicket på formen (handen visas över den) spelar dess sekvens i stället för att gå till nästa steg, och former som en utlösare visar in är dolda tills den klickats – men en utlösare som inte går att träffa (formen ligger i en grupp, på layouten eller saknas) lämnar sina mål synliga. Text som kommer in bokstav för bokstav eller ord för ord (`iterate`) och animeringar av ett teckenintervall (`charRg`) delas per tecken eller ord med sin fördröjning; när alla delar är framme ritas texten som helhet, exakt som den statiska bilden. Mediakommandon i tidsträdet (`playFrom`, `togglePause` …) ges ut av uppspelningen för ljud och video (själva uppspelningen kommer separat). Se `docs/dev/pptx.md`.
+- **PowerPoint: morph är en riktig forminterpolering.** Övergången *Morph* (`p159:morph`) tonar inte längre bara mellan bilderna: former med samma namn och slag (eller samma bild eller text) på de två bilderna paras ihop (namn som börjar med `!!` bara mot samma namn) och flyttas, ändrar storlek och vrids från sitt läge på den gamla bilden till sitt läge på den nya med mjuk början och slut, medan renderingarna av paret tonas i varandra; former utan par tonas ut respektive in. Längden är två sekunder om filen inte anger något annat. `byWord` och `byChar` paras som objekt. Se `docs/dev/pptx.md`.
+- **PowerPoint: ljud och video spelas i bildspelet och föredragsvyn.** Ljud (MP3, WAV, AAC i MP4/M4A) avkodas inbyggt (symphonia, ren Rust) och spelas via ljudsystemet (cpal: ALSA, CoreAudio, WASAPI); video spelas med ffmpeg om det är installerat (annars visas videons stillbild och en notis en gång). Ljud- och videoformer startas av animeringarnas mediakommandon (`playFrom`, `togglePause`, stopp), klipps efter `p14:trim`, följer volym, ljud av och `numSld` (fortsätter över flera bilder) och spelas både inbäddade och länkade; övergångsljud (`p:sndAc`) spelas också. Håller man musen över en video eller ljudform visas spela/paus och tidslinje, och ett klick på formen spelar eller pausar. Saknas ljudenhet blir det tyst utan fel. På Linux krävs `libasound2` (deb och AppImage), och flatpak får ljudbehörighet.
+
 ## [2.12.0] – 2026-11-27
 
 ### Nytt

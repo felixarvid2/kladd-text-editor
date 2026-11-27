@@ -284,6 +284,34 @@ pub struct PlacedGlyph {
     /// Framflyttning (för PDF:ens textlager).
     #[allow(dead_code)]
     pub advance: f32,
+    /// Teckenets nummer i stycket (0-baserat, räknat över alla körningar; `NO_CHAR` för punkter och
+    /// glyfer utan text). Används av animeringar bokstav för bokstav (`anim_layers.rs`); ritningen bryr
+    /// sig inte om det.
+    pub ch: u32,
+    /// Ordets nummer i stycket (`word_index`), annars `NO_CHAR`.
+    pub word: u32,
+}
+
+/// `PlacedGlyph::ch`/`word` för glyfer som inte hör till styckets text.
+pub const NO_CHAR: u32 = u32::MAX;
+
+/// Ordnumret för varje tecken i ett stycke: ett ord är tecknen fram till och med blanksteget efter det
+/// (så att blanksteg hör till ordet före). Inledande blanksteg hör till ord 0. Samma uppdelning används för
+/// ritningens glyfer och för animeringens antal (`anim.rs`).
+pub fn word_index(chars: &[char]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut w = 0u32;
+    let (mut after_space, mut seen_word) = (false, false);
+    for c in chars {
+        let space = c.is_whitespace();
+        if after_space && !space && seen_word {
+            w += 1;
+        }
+        out.push(w);
+        after_space = space;
+        seen_word |= !space;
+    }
+    out
 }
 
 /// En glyfkörning: samma typsnitt, storlek och fyllning.
@@ -429,6 +457,14 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordnummer() {
+        let c: Vec<char> = "Hej du  glada".chars().collect();
+        assert_eq!(word_index(&c), vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]);
+        assert_eq!(word_index(&[' ', 'a', ' ', 'b']), vec![0, 0, 0, 1]);
+        assert!(word_index(&[]).is_empty());
+    }
 
     #[test]
     fn affin_ordning_och_invers() {

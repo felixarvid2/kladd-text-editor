@@ -12,6 +12,10 @@ pub mod fonts;
 pub mod geom;
 pub mod inherit;
 pub mod media;
+pub mod media_audio;
+pub mod media_model;
+pub mod media_play;
+pub mod media_video;
 pub mod model;
 pub mod package;
 pub mod pdf;
@@ -49,6 +53,7 @@ pub mod save;
 pub mod anim;
 pub mod anim_expr;
 pub mod anim_layers;
+pub mod morph;
 pub mod presenter;
 pub mod transition;
 // Omgång 3, 3D i diagram och former (w-p3d).
@@ -61,6 +66,8 @@ pub mod dgm;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod media_tests;
+#[cfg(test)]
 mod view_tests;
 #[cfg(test)]
 mod chart_tests;
@@ -68,6 +75,9 @@ mod chart_tests;
 mod edit_tests;
 #[cfg(test)]
 mod smartart_tests;
+// Omgång 4, utlösare och bokstav för bokstav (w-ptrig).
+#[cfg(test)]
+mod anim_pieces_tests;
 
 pub use model::Deck;
 

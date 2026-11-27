@@ -175,8 +175,8 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
   understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** länkar och åtgärdsknappar i bildspelet, utlösare (`interactiveSeq`), video/ljud, morph som riktig
-  forminterpolering, föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
+- **Visning:** länkar och åtgärdsknappar i bildspelet, föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
+  markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
 - **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
@@ -244,7 +244,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
   enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
   `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
-- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3) länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
+- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3, ljud och video i omgång 4) länkar och åtgärdsknappar i bildspelet, hoppa till bildnummer med siffror + Enter i
   bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
 - **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
   anteckningar, `.ppt` via LibreOffice, handboken.
@@ -623,9 +623,9 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   och formler), `p:animScale`, `p:animRot`, `p:animMotion` (banan som polylinje, kurvor i 8 steg, längs båglängden),
   färgbyten (`p:animClr`, `p:set` av färger i betoningar) som en blinkning. `accel`/`decel`, `autoRev` och
   `repeatCount` gäller; `fill="remove"` tar bort effekten när den är klar. `p:txEl/p:pRg` ger ett mål per stycke;
-  `charRg`, `graphicEl` (SmartArt/diagram i delar) och `bg` gäller hela formen. Utlösare (`interactiveSeq`) räknas inte:
-  de formerna syns som vanligt. Ett mål som inte finns i visningslistan (t.ex. på layouten) ritas som vanligt –
-  aldrig "dolt för alltid".
+  `graphicEl` (SmartArt/diagram i delar) och `bg` gäller hela formen; `charRg` och `p:iterate` delar texten
+  (*omgång 4* nedan), utlösare (`interactiveSeq`) likaså. Ett mål som inte finns i visningslistan (t.ex. på
+  layouten) ritas som vanligt – aldrig "dolt för alltid".
 - **Lagren:** en bild utan mål är ett enda lager (samma bild som förut). Med mål delas listan vid varje animerad form
   så att ritordningen behålls (en animerad form under en fast hamnar under den). Stycken i samma form blir egna lager;
   formens geometri och övriga stycken stannar i det fasta lagret. Provet `lagren_ger_samma_bild_som_hela_renderingen`
@@ -643,8 +643,8 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
 - **Referensmaterialet:** 257 bilder har övergångar (toning 147, genom svart/`p14:reveal` 81, torka 18, push 11) och
   614 klick-steg; alla 1 081 mål hittas i visningslistan (`anim_layers::tests::referensmaterialets_animeringar`,
   ignorerat, `KLADD_PPTX_REFS`).
-- **Kvar:** morph som forminterpolering, `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i
-  betoningar (kräver omrendering), `iterate` (bokstav för bokstav), ljud och video, utlösare, val av skärm.
+- **Kvar:** `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i betoningar (kräver
+  omrendering), val av skärm. (Morph, `iterate`, utlösare och ljud/video gjordes i omgång 4.)
 
 ## 3D i diagram och former (omgång 3)
 
@@ -802,3 +802,154 @@ typsnitt och radbrytning (koreansk, japansk och rysk text i `owasp-top10-2017-ko
 egen skalning och förskjutning, `composite` med `ar`, `snake`, `cycle`, `pyra`, hierarki (trädet direkt),
 datamodellens axlar och urval, `choose`/`if` efter antal, tom ritdel → layoutmotorn, oläslig layout → reserven,
 ritdel i skalad grupp.
+
+## Utlösare, bokstav för bokstav och mediekommandon (omgång 4)
+
+Allt i `anim.rs`, `anim_layers.rs`, `slideshow.rs` och klickdelen av `presenter.rs`; prov i `anim_pieces_tests.rs`
+(egna minimala bilder) och i modulernas `tests`.
+
+**Utlösare (`interactiveSeq`).** `Timeline::triggers: Vec<Trigger { shape, groups }>`: varje `p:seq` med
+`nodeType="interactiveSeq"` och `p:cond evt="onClick"`/`p:tgtEl/p:spTgt` är en utlösare. Gruppernas tolkning delas
+med huvudsekvensen (`parse_groups`); ett klick på formen spelar alla grupperna efter varandra (`Trigger::state(target,
+unit, geom, t)`: `t < 0` = inte klickad, `INFINITY` = klar). Utlösarnas mål ingår i `Timeline::targets()` (egna lager)
+och döljs tills klicket; `Timeline::layer_state` lägger huvudsekvensens och utlösarnas tillstånd ovanpå varandra
+(`State::compose`). `ShowView::new` tar bort utlösare vars form inte går att träffa (`Timeline::retain_triggers`:
+formen ska vara en toppnivåform i `edit_ops::shapes`, inte en tom platshållare, med yta), så att deras mål visas
+som vanligt. `Playback` håller utlösarnas lägen för aktuell bild (`click_shape(shape, now)`, `trigger_shapes()`,
+`SlideState::trig`); de nollställs när bilden byts (inte under en övergång) och en utlösare som spelas startar inte
+om av ett nytt klick (`restart="whenNotActive"`), men spelas igen när den är klar. Träffprovet (`ShowView::trigger_at`)
+använder `ShapeInfo::hit` (vridning inräknad, översta formen vinner); handen visas över en utlösare. I föredragsvyn
+gäller samma klick på den aktuella bilden. Tangenterna går i huvudsekvensen som förut. Utan animeringar
+(*Spela upp animeringar* av) finns inga utlösare.
+
+**Bokstav för bokstav och ord för ord (`p:iterate`, `p:charRg`).** `Effect::iter: Option<Iter { kind, step, n,
+backwards }>` (`type="lt"` tecken, `"wd"` ord; `tmAbs` ms eller `tmPct` av en dels längd; `"el"` delar inte) och
+`Effect::chars` (`p:charRg st/end`, tecknen i formens hela text, delas alltid i tecken). Delarna räknas ur bildens
+text (`Texts`: `a:t` i körningar och fält, ett tecken för `a:br`) med samma uppdelning som ritningen
+(`scene::word_index`: ett ord är tecknen fram till och med blanksteget efter), och effektens längd blir
+`dur + (n − 1) · step`, så att `chain_dur`/`advTm` stämmer innan någon bild är renderad; fler än 600 delar delas
+inte. `Effect::shift(unit)` ger fördröjningen för del `unit` (delar bortom `n` följer den sista); `Timeline::state_unit`
+räknar delens tillstånd. Texten delas i delar för stycket (`pRg`) eller hela formens text (utan `txEl`; delarna
+räknas då över styckena efter varandra); mellan stycken börjar inte räkningen om. `PlacedGlyph::ch`/`word` bär
+styckets tecken- och ordnummer (satta i `text.rs`, `NO_CHAR` för punkter och EMF-text; ritningen bryr sig inte).
+
+*Lagerdelning:* `anim_layers::split_units(scene, targets, scopes)` ger förutom formens/styckets helhetslager
+(`LayerKind::Target`) ett lager per del (`LayerKind::Piece { scope, unit }`, glyferna delade per tecken med oförändrad
+placering och effektmarkörerna kopierade) och ett med resten (`LayerKind::Rest`: punkt, understrykning, markering).
+`anim_layers::plan` väljer vad som ritas: har alla delar samma tillstånd (`State::approx_eq`) ritas helhetslagret
+med det, annars delarna och resten. Det gör att början och slutet är exakt den statiska bilden (±2, provat med
+skuggor på texten) trots att varje del har egen skugga, och att bara medan något rör sig kostar det delarna.
+`LayerKind` har fått två varianter (`Piece`, `Rest`); `split` är oförändrad.
+
+**Mediakommandon.** `p:cmd type="call"` (`playFrom(t)`, `play`, `togglePause`, `stop`, `pause`, `resume`) i
+huvudsekvensen och i utlösare blir `anim::MediaCmd { shape_id, kind: MediaKind }`:
+
+```rust
+pub enum MediaKind { Play { from_s: f32 }, TogglePause, Stop, Pause, Resume }
+pub struct MediaCmd { pub shape_id: u32, pub kind: MediaKind }     // shape_id = p:cNvPr/@id
+pub struct MediaShape { pub id: u32, pub video: bool }             // Timeline::media / anim::media_shapes(root)
+```
+
+`Group::cmds: Vec<(f32, MediaCmd)>` (tid från gruppens start; kommandots egen längd, t.ex. 30 503 ms i `playFrom`,
+räknas inte in i gruppens längd), `Timeline::chain_cmds(step)`, `Trigger::cmds()`. `Playback::take_media(&mut self)
+-> Vec<MediaCmd>` ger de som kommit sedan sist, i ordning: kommandona för ett klick-steg ges när steget börjar (efter
+bildens övergång), utlösarens när man klickat, båda med sin fördröjning, och räknas av `Playback::tick`. Bakåt och
+hopp (`prev`, `jump`) och bildbyte kastar kommandon som inte hunnit ges; kön rymmer 256 (äldre kastas om ingen
+läser). `ShowView::take_media()` och `ShowView::media_shapes(slide)` är gränssnittet för ljud-/videouppspelningen
+(ingen ljud- eller videokod finns här). `play` tolkas som `Play { from_s: 0.0 }`.
+
+**Referensmaterialet** (`referensmaterialets_animeringar`, ignorerat; går nu rekursivt genom `KLADD_PPTX_REFS`):
+se resultatet i omgångens rapport; kontrollerar att alla `p:cmd` blir mediakommandon, att inget syns före sin
+in-effekt, att allt utan ut-effekt syns till slut (en uppdelad text ritas då som helhet) och att materialet har
+`iterate`, utlösare och kommandon.
+
+**Kvar:** utlösare på former i grupper, på layouten och på text inom stycken (delar av text som utlösare); `p:bldP`
+`animBg`; `iterate type="el"` (element, ritas som en effekt för hela texten); fler än en klickgrupp i en utlösare
+(alla spelas vid ett klick); färgbyten i delar.
+
+## Morph (omgång 4)
+
+`p159:morph` är ett eget övergångsslag (`transition::Kind::Morph(MorphBy)`) i stället för reservens toning.
+`xml.rs` väljer nu `mc:Choice Requires="p159"` (namnrymd `http://schemas.microsoft.com/office/powerpoint/2015/09/main`);
+alla 65 `p159`-användningar i referensmaterialet är `p159:morph`. Utan `p14:dur` är längden två sekunder (PowerPoints
+standard; filen skriver bara `spd="slow"`). `byWord` och `byChar` tolkas men paras som `byObject`.
+
+`morph.rs`:
+
+- **Parning** (`pair`, ur toppnivåformerna i bildens formträd, `infos`): namn som börjar med `!!` paras bara mot samma namn;
+  därefter samma namn och samma slag (form, textruta, bild, grupp, tabell, diagram, annat); flera med samma namn paras
+  en till en efter samma bild/geometri och text, sedan ordningen; sist omdöpta former av samma slag: samma bild
+  (bilder), samma text (textrutor) eller samma geometri och text (övriga). Tomma namnlösa former paras inte på måfå.
+- **Ritsteg** (`Plan::ops(p)`): vid mjukat förlopp `e = ease(p)` ligger gamla bildens fasta del (bakgrund, mall, layout)
+  under den nya (alfa `e`), därefter den gamla bildens former i sin ordning och den nya bildens i sin, den nya ovanpå.
+  Ett par flyttas från sitt läge till det andras (mitt, storlek, vridning närmaste vägen; `xfrm` när båda har det,
+  annars lagrens omslutande rektangel) med en affin avbildning per form (`morph_map`), den gamla med alfa
+  `min(1, 2(1-e))` och den nya med `min(1, 2e)`: en sida täcker alltid, så en oförändrad form inte blir genomskinlig mitt
+  i, och ändpunkterna är exakta. Former utan par tonar ut (`1-e`) respektive in (`e`). Ordningen gör att p=0 är exakt
+  den gamla bilden och p=1 exakt den nya (±2 per kanal).
+- **Lager** (`Side::build`): `anim_layers::split` med bildspelets animeringsmål och dessutom en hel-form-mål per
+  toppnivåform, så att bildspelets animeringstillstånd (`layer_state`) gäller lagren i båda bilderna (den gamla i vila
+  efter sista steget, den nya i sitt utgångsläge). Lagrens ytor får luft åt sidorna för text, eftersom
+  `anim_layers::extent` räknar textbredd för snävt (sista tecknet kapades). `anim_layers.rs` är oförändrad.
+- **Bildspelet** (`presenter.rs`): `paint_morph` ritar stegen med samma `draw_layer` som vanliga bilder (en extra
+  avbildning per steg). Paret (föregående bild, bilden) renderas i bakgrunden när övergången börjar, och i förväg för
+  nästa bild om den morphar (`peek_next`); tills det är klart, eller utan föregående bild, ritas toningen (`transition::pieces`).
+  Bilder utan morph berörs inte.
+
+**Prov** (`morph_tests.rs`): parningsreglerna (egna namn, dubbletter, `!!`, omdöpta), rörelsen (identitet i ändpunkterna,
+mitt, storlek, vridning närmaste vägen), alfa, ändpunkterna mot den statiska renderingen och en mellanbild (`compose` med
+tiny-skia), ordningen. `referensmaterialets_morph` (ignorerat, `KLADD_PPTX_REFS`): alla 65 övergångar i fyra
+presentationer (`msrc-win32k` 24, `ms-copilot-workshop` 37, `msrc-identity` 2, `msrc-eko19` 2) ger ändliga ramar och
+ändpunkter som stämmer (som lager skiljer enstaka kantpunkter där former möts; högst 1 % av bytes över 8); 627 former på de nya
+bilderna, 95 par.
+
+**Kvar:** fyllnadsfärg och linje interpoleras inte (renderingarna tonas i varandra), text som ändras tonas som helhet
+(ingen morph per ord eller tecken), grupper, tabeller och diagram flyttas som en enhet, spegling (`flipH`/`flipV`)
+interpoleras inte, och den nya bildens in-animeringar syns inte under övergången (som övriga övergångar).
+
+## Ljud och video i bildspelet (omgång 4)
+
+Nya filer: `media_model.rs` (rent: `of_slide(deck, i) -> SlideMedia` med `MediaShape` per `p:pic` med `a:videoFile`/
+`a:audioFile`/`a:wavAudioFile`/`p14:media`, och `TransitionSound` ur `p:sndAc/p:stSnd`; samt en TILLFÄLLIG kopia av
+w-ptrigs `MediaCmd` och `step_commands` som tolkar `p:cmd` i huvudsekvensen), `media_audio.rs` (avkodning, mixer,
+cpal-utmatning), `media_video.rs` (ffmpeg), `media_play.rs` (`MediaHub`, ägd av `ShowView`), `media_tests.rs`
+(provpresentation byggd i provet) och fixturerna `media_fixtures/ton.mp3` och `film.mp4` (egna, 2 respektive 16 kB,
+gjorda med ffmpeg `sine`/`testsrc`).
+
+- **Källa:** `p14:media/@r:embed` före `r:link` (länken är ofta en död extern `Target="NULL"`). Länkade filer spelas om de
+  finns som sökväg eller `file:`-adress (relativa sökvägar mot presentationen är inte kopplade: `Deck` känner inte
+  filens plats). `p14:trim/@st` och `@end` är millisekunder som klipps i början respektive slutet (`end` mot
+  materialet: `end="113.45"` på en ca 0,3 s lång WAV). `p:cMediaNode`: `vol` (100000 = full), `mute`, `numSld`
+  (antal bildbyten mediet överlever, standard 1), `showWhenStopped` (tolkas, men stillbilden döljs inte efter slutet).
+- **Ljud:** `media_audio::spawn` avkodar i en egen tråd med symphonia (`mp3`, `wav`, `pcm`, `isomp4`, `aac`) och skickar
+  stereoblock i en begränsad kö (32 block). Sökning till startpunkten med `SeekMode::Accurate`, annars avkodning och
+  kassering. `Mixer` omsamplar linjärt till enhetens takt och kanaler och räknar utmatade bildrutor per röst: det är
+  ljudklockan. Strömmen byggs och hålls i en egen tråd (`AudioOut::open`, aldrig på gränssnittstråden); tillståndet
+  är `Opening`/`Ready`/`Failed`. Utan enhet (behållaren, CI) loggas en rad och inga röster skapas.
+- **Video:** `ffmpeg -nostdin -loglevel error -ss <från> -i <fil> -an -vf fps=25,scale=B:H:…,pad=… -pix_fmt rgba -f rawvideo -`
+  (stdin och stderr på null, så inget rör fastnar). Inbäddade filer skrivs till en temporär fil
+  (`kladd-media-<pid>-<n>.<ext>`). En läsartråd skickar bildrutor i en kö på sex; gränssnittet visar den senaste vars tid
+  (`index/25`) har kommit. `Drop` dödar och avvaktar processen, släpper läsaren och raderar filen. ffmpeg söks i `PATH`
+  samt `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`; på Windows `ffmpeg.exe` utan konsolfönster
+  (`CREATE_NO_WINDOW`). Windows- och macOS-grenarna är inte kompilerade här. Bildrutans storlek är formens storlek i
+  bildpunkter vid senaste klicket (annars 2 px per punkt), högst 1920.
+- **Klocka och synk:** med en ljudröst som börjat är rösten klockan (videon väntar högst 1,5 s på att ljudet ska börja),
+  annars väggklockan, som ankras i ljudklockan varje bildruta. Paus fryser klockan och pausar rösten; videoprocessen
+  står då stilla av sig själv när röret fylls. `playFrom` startar om.
+- **Gränssnitt i `presenter.rs`:** `ShowView::media` matas med `on_position(slide, step)` och `update()` varje bildruta,
+  ritar via `paint` (videobild, kontroller, notis) i `paint_frame` när ingen övergång pågår, och klick går först till
+  `click` (spela/paus eller tidslinjen) innan de går till nästa steg. Mediet stoppas vid bildbyte enligt `numSld`
+  och när bildspelet slutar.
+- **Reserv:** utan ffmpeg ritas bara stillbilden (`p:blipFill`) och en notis visas en gång per bildspel; videons
+  ljud spelas ändå. Utan ljudenhet går videon på väggklockan.
+- **Paket:** Linux bygger med `libasound2-dev` (ci.yml, perf.yml, release.yml för deb och AppImage), deb får
+  `Suggests: ffmpeg` och `$auto` ger `libasound2`; AppImage lämnar libasound till värden (`--exclude-library`, oprövat
+  här); flatpak får `--socket=pulseaudio`. Att ffmpeg går att nå i flatpak (t.ex. tillägget
+  `org.freedesktop.Platform.ffmpeg-full`, som innehåller bibliotek men inte säkert programmet `ffmpeg`) är INTE
+  undersökt; i flatpak visas därför stillbilden tills det är löst.
+- **Vid sammanslagning med w-ptrig:** byt `media_model::MediaCmd`/`CmdKind`/`step_commands` mot uppspelningens
+  `take_media()` (mata `MediaHub::apply(ctx, slide, cmd)` och ta bort `step_commands`-delen i `on_position`), och låt
+  en utlösare som förbrukat ett klick gå före `MediaHub::click`.
+- **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
+  videon bara när ingen övergång pågår och ovanpå lagren); rotation och formens geometri (rundade hörn) för videon;
+  `showWhenStopped`; länkar relativa mot presentationen; ffmpeg i flatpak; spolning av video med ljud utan ffmpeg.

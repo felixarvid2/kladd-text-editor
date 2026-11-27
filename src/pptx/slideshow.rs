@@ -3,8 +3,10 @@
 //! övergång efter `advTm`) och föredragsvyns klocka. Tillståndet är rent och provas här; vyn
 //! (`presenter.rs`) ritar.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
+use super::anim::MediaCmd;
 use super::transition::{Kind, Transition};
 
 /// Tom skärm i stället för bilden.
@@ -179,6 +181,18 @@ pub struct SlideTiming {
     /// hur länge de tar (s). Tom = inga animeringar.
     pub chains: Vec<(Range<usize>, f32)>,
     pub transition: Transition,
+    /// Mediakommandona (`p:cmd`) för varje steg, med tiden (s) efter stegets start.
+    pub cmds: Vec<Vec<(f32, MediaCmd)>>,
+    /// Utlösarna (`interactiveSeq`) på bilden.
+    pub triggers: Vec<TriggerTiming>,
+}
+
+/// En utlösare: klick på formen `shape` spelar en sekvens som tar `dur` sekunder.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TriggerTiming {
+    pub shape: u32,
+    pub dur: f32,
+    pub cmds: Vec<(f32, MediaCmd)>,
 }
 
 impl SlideTiming {
@@ -210,7 +224,21 @@ pub struct SlideState {
     pub step: usize,
     pub chain: Range<usize>,
     pub t: f32,
+    /// Utlösarnas lägen (index som `SlideTiming::triggers`): sekunder sedan klicket, `-1.0` = inte
+    /// klickad, `f32::INFINITY` = klar. Saknas ett värde är utlösaren inte klickad.
+    pub trig: Vec<f32>,
 }
+
+/// Hur långt en utlösare har kommit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TrigRun {
+    Idle,
+    Playing { start: f64 },
+    Done,
+}
+
+/// Flest mediakommandon som väntar på att läsas (äldre kastas om ingen läser dem).
+const MAX_QUEUED_CMDS: usize = 256;
 
 /// Bildrutan att rita.
 #[derive(Clone, Debug, PartialEq)]
@@ -230,6 +258,13 @@ pub struct Playback {
     phase: Phase,
     /// När aktuellt steg började (för `advTm`).
     step_start: f64,
+    /// Bilden som utlösarnas lägen (`trig_runs`) gäller; byter bild nollställs de.
+    trig_slide: Option<usize>,
+    trig_runs: Vec<TrigRun>,
+    /// Mediakommandon som är klara att läsas (`take_media`).
+    media: VecDeque<MediaCmd>,
+    /// Mediakommandon som ska ges vid en viss tid (bild, tid, kommando).
+    sched: Vec<(usize, f64, MediaCmd)>,
 }
 
 impl Playback {
@@ -237,7 +272,7 @@ impl Playback {
     pub fn new(show: Show, timing: Vec<SlideTiming>, now: f64) -> Playback {
         let steps = timing.iter().map(SlideTiming::clicks).collect();
         let show = show.with_steps(steps);
-        let mut p = Playback { show, timing, phase: Phase::Rest, step_start: now };
+        let mut p = Playback { show, timing, phase: Phase::Rest, step_start: now, trig_slide: None, trig_runs: Vec::new(), media: VecDeque::new(), sched: Vec::new() };
         p.enter_slide(None, now);
         p
     }
@@ -251,6 +286,102 @@ impl Playback {
         let t = self.timing_of(self.show.slide());
         self.step_start = now;
         self.phase = if t.transition.animated() { Phase::Transition { from, start: now } } else { Phase::Anim { start: now } };
+        if !t.transition.animated() {
+            self.schedule_step(self.show.slide(), 0, now);
+        }
+    }
+
+    // ---------------------------------------------------- mediakommandon och utlösare
+
+    /// Mediakommandona i bildens steg `step` ges från `start`.
+    fn schedule_step(&mut self, slide: usize, step: usize, start: f64) {
+        let cmds = self.timing.get(slide).and_then(|t| t.cmds.get(step)).cloned().unwrap_or_default();
+        self.sched.extend(cmds.into_iter().map(|(t, c)| (slide, start + t as f64, c)));
+    }
+
+    /// Flyttar kommandon vars tid kommit till kön; kommandon för en annan bild än den aktuella kastas.
+    fn release_media(&mut self, now: f64) {
+        let cur = match self.show.screen() {
+            Screen::Slide(s) => Some(s),
+            _ => None,
+        };
+        for (s, due, c) in std::mem::take(&mut self.sched) {
+            if Some(s) != cur {
+                continue;
+            }
+            if due <= now {
+                self.media.push_back(c);
+            } else {
+                self.sched.push((s, due, c));
+            }
+        }
+        while self.media.len() > MAX_QUEUED_CMDS {
+            self.media.pop_front();
+        }
+    }
+
+    /// Mediakommandona (`p:cmd`: spela från, spela/pausa, stoppa …) som har kommit sedan sist, i
+    /// ordning. De ges när steget eller utlösaren som har dem börjar (efter övergången, med kommandots
+    /// egen fördröjning); bakåt och hopp ger inga. Kommandon som ingen läser kastas efter 256. Själva
+    /// uppspelningen görs av den som läser kön.
+    pub fn take_media(&mut self) -> Vec<MediaCmd> {
+        self.media.drain(..).collect()
+    }
+
+    /// Nollställer utlösarna när bilden byts (inte under en övergång: den gamla bilden ritas kvar).
+    fn sync_triggers(&mut self) {
+        let Screen::Slide(cur) = self.show.screen() else { return };
+        if matches!(self.phase, Phase::Transition { .. }) || self.trig_slide == Some(cur) {
+            return;
+        }
+        self.trig_slide = Some(cur);
+        self.trig_runs = vec![TrigRun::Idle; self.timing.get(cur).map_or(0, |t| t.triggers.len())];
+    }
+
+    /// Formerna på aktuell bild som startar en utlösare (tom under övergångar).
+    pub fn trigger_shapes(&self) -> Vec<u32> {
+        match (self.show.screen(), self.phase) {
+            (Screen::Slide(s), p) if !matches!(p, Phase::Transition { .. }) => self.timing.get(s).map_or(Vec::new(), |t| t.triggers.iter().map(|t| t.shape).collect()),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Klick på formen `shape`: startar dess utlösare som inte redan spelas. Sant om formen har en
+    /// utlösare (klicket gäller då den och inte nästa steg).
+    pub fn click_shape(&mut self, shape: u32, now: f64) -> bool {
+        self.sync_triggers();
+        if !self.trigger_shapes().contains(&shape) {
+            return false;
+        }
+        let Screen::Slide(s) = self.show.screen() else { return false };
+        let starts: Vec<(usize, Vec<(f32, MediaCmd)>)> =
+            self.timing[s].triggers.iter().enumerate().filter(|(_, t)| t.shape == shape).map(|(i, t)| (i, t.cmds.clone())).collect();
+        for (i, cmds) in starts {
+            if !matches!(self.trig_runs.get(i), Some(TrigRun::Idle | TrigRun::Done)) {
+                continue;
+            }
+            self.trig_runs[i] = TrigRun::Playing { start: now };
+            self.sched.extend(cmds.into_iter().map(|(t, c)| (s, now + t as f64, c)));
+        }
+        true
+    }
+
+    /// Utlösarnas lägen på bild `slide` vid `now` (se `SlideState::trig`).
+    fn trig_state(&self, slide: usize, now: f64) -> Vec<f32> {
+        let n = self.timing.get(slide).map_or(0, |t| t.triggers.len());
+        if self.trig_slide != Some(slide) {
+            return vec![-1.0; n];
+        }
+        (0..n)
+            .map(|i| match self.trig_runs.get(i) {
+                Some(TrigRun::Playing { start }) => {
+                    let dur = self.timing[slide].triggers[i].dur as f64;
+                    if now - start >= dur { f32::INFINITY } else { (now - start).max(0.0) as f32 }
+                }
+                Some(TrigRun::Done) => f32::INFINITY,
+                _ => -1.0,
+            })
+            .collect()
     }
 
     /// Framåt (`click` = musklick; `advClick="0"` gör att klick inte byter bild). Falskt = avsluta.
@@ -272,6 +403,7 @@ impl Playback {
             ((Screen::Slide(a), sa), (Screen::Slide(b), sb)) if a == b && sb == sa + 1 => {
                 self.phase = Phase::Anim { start: now };
                 self.step_start = now;
+                self.schedule_step(b, sb, now);
             }
             ((Screen::Slide(a), sa), (Screen::Slide(b), _)) if a != b => self.enter_slide(Some((a, sa)), now),
             _ => {
@@ -285,6 +417,7 @@ impl Playback {
     /// Bakåt: föregående steg i vila (ingen animering eller övergång).
     pub fn prev(&mut self, now: f64) {
         self.show.prev();
+        self.sched.clear();
         self.phase = Phase::Rest;
         self.step_start = now;
     }
@@ -292,6 +425,7 @@ impl Playback {
     /// Hoppar (Home/End, svart/vit skärm …) utan övergång.
     pub fn jump(&mut self, now: f64, f: impl FnOnce(&mut Show)) {
         f(&mut self.show);
+        self.sched.clear();
         self.phase = Phase::Rest;
         self.step_start = now;
     }
@@ -299,6 +433,12 @@ impl Playback {
     /// Flyttar fram tiden: övergång → självstartande animeringar → vila, och automatisk övergång efter
     /// `advTm` (räknat från stegets början, tidigast när stegets animeringar är klara). Falskt = avsluta.
     pub fn tick(&mut self, now: f64) -> bool {
+        let keep = self.tick_phase(now);
+        self.release_media(now);
+        keep
+    }
+
+    fn tick_phase(&mut self, now: f64) -> bool {
         if !matches!(self.show.screen(), Screen::Slide(_)) {
             return true;
         }
@@ -308,6 +448,15 @@ impl Playback {
             if now - start >= t.transition.dur as f64 {
                 self.phase = Phase::Anim { start: start + t.transition.dur as f64 };
                 self.step_start = start + t.transition.dur as f64;
+                self.schedule_step(s, self.show.step(), start + t.transition.dur as f64);
+            }
+        }
+        self.sync_triggers();
+        for (i, run) in self.trig_runs.iter_mut().enumerate() {
+            if let TrigRun::Playing { start } = *run {
+                if now - start >= t.triggers.get(i).map_or(0.0, |x| x.dur) as f64 {
+                    *run = TrigRun::Done;
+                }
             }
         }
         if let Phase::Anim { start } = self.phase {
@@ -326,7 +475,7 @@ impl Playback {
 
     /// Pågår något som behöver nya bildrutor?
     pub fn animating(&self) -> bool {
-        !matches!(self.phase, Phase::Rest)
+        !matches!(self.phase, Phase::Rest) || self.trig_runs.iter().any(|r| matches!(r, TrigRun::Playing { .. }))
     }
 
     /// Tid kvar till nästa automatiska övergång (för omritning), om någon.
@@ -337,9 +486,9 @@ impl Playback {
         Some((self.step_start + (after as f64).max(t.chain(self.show.step()).1 as f64) - now).max(0.0))
     }
 
-    fn rest_state(&self, slide: usize, step: usize) -> SlideState {
+    fn rest_state(&self, slide: usize, step: usize, now: f64) -> SlideState {
         let end = self.timing_of(slide).chain(step).0.end;
-        SlideState { slide, step, chain: end..end, t: f32::INFINITY }
+        SlideState { slide, step, chain: end..end, t: f32::INFINITY, trig: self.trig_state(slide, now) }
     }
 
     /// Bildrutan vid `now`.
@@ -353,15 +502,15 @@ impl Playback {
                 let p = if t.transition.dur > 0.0 { ((now - start) / t.transition.dur as f64).clamp(0.0, 1.0) as f32 } else { 1.0 };
                 let (chain, _) = t.chain(step);
                 // Bildens egna animeringar börjar först när övergången är klar.
-                let cur = SlideState { slide: s, step, chain, t: -1.0 };
-                let old = from.map(|(fs, fstep)| self.rest_state(fs, fstep));
+                let cur = SlideState { slide: s, step, chain, t: -1.0, trig: self.trig_state(s, now) };
+                let old = from.map(|(fs, fstep)| self.rest_state(fs, fstep, now));
                 Frame { screen, cur: Some(cur), transition: Some((old, t.transition.kind, p)) }
             }
             Phase::Anim { start } => {
                 let (chain, _) = t.chain(step);
-                Frame { screen, cur: Some(SlideState { slide: s, step, chain, t: (now - start).max(0.0) as f32 }), transition: None }
+                Frame { screen, cur: Some(SlideState { slide: s, step, chain, t: (now - start).max(0.0) as f32, trig: self.trig_state(s, now) }), transition: None }
             }
-            Phase::Rest => Frame { screen, cur: Some(self.rest_state(s, step)), transition: None },
+            Phase::Rest => Frame { screen, cur: Some(self.rest_state(s, step, now)), transition: None },
         }
     }
 }
@@ -411,11 +560,12 @@ pub fn clock_text(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pptx::anim::MediaKind;
 
 
     fn timing(clicks: usize, dur: f32, kind: Kind, tdur: f32, adv_after: Option<f32>) -> SlideTiming {
         let chains = (0..=clicks).map(|k| (k.saturating_sub(1)..k, if k > 0 { dur } else { 0.0 })).collect();
-        SlideTiming { chains, transition: Transition { kind, dur: tdur, adv_click: true, adv_after } }
+        SlideTiming { chains, transition: Transition { kind, dur: tdur, adv_click: true, adv_after }, ..Default::default() }
     }
 
     #[test]
@@ -593,5 +743,91 @@ mod tests {
         s.toggle_blank(Blank::Black);
         s.toggle_blank(Blank::Black);
         assert_eq!(s.screen(), Screen::Slide(0));
+    }
+
+    fn cmd(shape_id: u32, kind: MediaKind) -> MediaCmd {
+        MediaCmd { shape_id, kind }
+    }
+
+    #[test]
+    fn utlösare_spelas_vid_klick_och_ger_mediakommandon() {
+        let mut t0 = timing(0, 0.0, Kind::Cut { black: false }, 0.0, None);
+        t0.triggers = vec![
+            TriggerTiming { shape: 5, dur: 1.0, cmds: vec![(0.0, cmd(8, MediaKind::TogglePause)), (0.5, cmd(8, MediaKind::Stop))] },
+            TriggerTiming { shape: 6, dur: 0.0, cmds: vec![] },
+        ];
+        let t1 = timing(0, 0.0, Kind::Cut { black: false }, 0.0, None);
+        let mut p = Playback::new(Show::new(&[false, false], 0).unwrap(), vec![t0, t1], 0.0);
+        assert!(p.tick(0.0));
+        assert_eq!(p.trigger_shapes(), vec![5, 6]);
+        assert_eq!(p.frame(1.0).cur.unwrap().trig, vec![-1.0, -1.0], "inte klickade än");
+        // Formen utan utlösare: klicket är inte ett.
+        assert!(!p.click_shape(99, 10.0));
+        assert!(p.take_media().is_empty());
+        // Klick på form 5: sekvensen spelas, första kommandot direkt, andra efter 0,5 s.
+        assert!(p.click_shape(5, 10.0));
+        assert_eq!(p.frame(10.25).cur.unwrap().trig, vec![0.25, -1.0]);
+        assert!(p.tick(10.25) && p.animating());
+        assert_eq!(p.take_media(), vec![cmd(8, MediaKind::TogglePause)]);
+        // Ett klick medan den spelas startar inte om den.
+        assert!(p.click_shape(5, 10.3));
+        assert_eq!(p.frame(10.5).cur.unwrap().trig[0], 0.5);
+        assert!(p.tick(10.6));
+        assert_eq!(p.take_media(), vec![cmd(8, MediaKind::Stop)]);
+        assert!(p.tick(11.5) && !p.animating());
+        assert_eq!(p.frame(12.0).cur.unwrap().trig, vec![f32::INFINITY, -1.0]);
+        assert!(p.take_media().is_empty());
+        // Klar: ett nytt klick spelar den igen.
+        assert!(p.click_shape(5, 20.0));
+        assert!(p.tick(20.0));
+        assert_eq!(p.take_media(), vec![cmd(8, MediaKind::TogglePause)]);
+        // Utlösare utan längd blir klar direkt.
+        assert!(p.click_shape(6, 21.0) && p.tick(21.0));
+        assert_eq!(p.frame(21.0).cur.unwrap().trig[1], f32::INFINITY);
+        // Byter man bild nollställs utlösarna.
+        assert!(p.next(30.0, false) && p.tick(30.0));
+        assert!(p.trigger_shapes().is_empty());
+        p.prev(31.0);
+        assert!(p.tick(31.0));
+        assert_eq!(p.frame(31.0).cur.unwrap().trig, vec![-1.0, -1.0]);
+    }
+
+    #[test]
+    fn mediakommandon_för_steg_ges_efter_övergången_och_kastas_vid_hopp() {
+        let mut t0 = timing(1, 1.0, Kind::Fade { black: false }, 2.0, None);
+        t0.cmds = vec![vec![(0.0, cmd(3, MediaKind::Play { from_s: 0.0 }))], vec![(0.5, cmd(3, MediaKind::Pause))]];
+        let t1 = timing(0, 0.0, Kind::Cut { black: false }, 0.0, None);
+        let mut p = Playback::new(Show::new(&[false, false], 0).unwrap(), vec![t1.clone(), t0, t1], 1.0);
+        // Bild 0 har inga kommandon; bildbyte till bild 1 med övergång på 2 s: kommandot kommer efter den.
+        assert!(p.tick(1.0));
+        assert!(p.next(10.0, true));
+        assert!(p.tick(11.0));
+        assert!(p.take_media().is_empty(), "övergången pågår");
+        assert!(p.tick(12.0));
+        assert_eq!(p.take_media(), vec![cmd(3, MediaKind::Play { from_s: 0.0 })]);
+        assert!(p.take_media().is_empty(), "läst en gång");
+        // Klick-steg 1: kommandot efter 0,5 s.
+        assert!(p.next(20.0, true));
+        assert!(p.tick(20.2));
+        assert!(p.take_media().is_empty());
+        assert!(p.tick(20.6));
+        assert_eq!(p.take_media(), vec![cmd(3, MediaKind::Pause)]);
+        // Bakåt kastar kommandon som inte hunnit ges (nytt uppspelning, direkt in på steg 1 och tillbaka).
+        let mut t0 = timing(1, 1.0, Kind::Cut { black: false }, 0.0, None);
+        t0.cmds = vec![vec![], vec![(0.5, cmd(3, MediaKind::Pause))]];
+        let mut p = Playback::new(Show::new(&[false], 0).unwrap(), vec![t0], 0.0);
+        assert!(p.next(1.0, true));
+        p.prev(1.1);
+        assert!(p.tick(5.0));
+        assert!(p.take_media().is_empty());
+    }
+
+    #[test]
+    fn kön_med_mediakommandon_är_begränsad() {
+        let mut t0 = timing(0, 0.0, Kind::Cut { black: false }, 0.0, None);
+        t0.cmds = vec![(0..300).map(|_| (0.0, cmd(1, MediaKind::TogglePause))).collect()];
+        let mut p = Playback::new(Show::new(&[false], 0).unwrap(), vec![t0], 0.0);
+        assert!(p.tick(0.0));
+        assert_eq!(p.take_media().len(), MAX_QUEUED_CMDS);
     }
 }

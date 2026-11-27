@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use super::color::Rgba;
 use super::fonts::{self, FontBook, FontFace, Resolved};
-use super::scene::{Affine, GlyphRun, Item, Paint, Path, PlacedGlyph, Stroke};
+use super::scene::{Affine, GlyphRun, Item, NO_CHAR, Paint, Path, PlacedGlyph, Stroke};
 
 /// Versaler.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -264,6 +264,8 @@ struct Seg {
     /// (för redigeringens markörlägen, `layout_carets`).
     run: usize,
     run_char: usize,
+    /// Segmentets första tecken i styckets text (för animeringar bokstav för bokstav).
+    para_char: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -366,7 +368,7 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
     let size = if style.baseline != 0.0 { style.size * SCRIPT_SIZE } else { style.size };
     if run.line_break {
         let res = book.resolve(&style.latin, style.bold, style.italic);
-        segs.push(Seg { face: res.face.clone(), res, style: style.clone(), text: String::new(), run: 0, run_char: 0 });
+        segs.push(Seg { face: res.face.clone(), res, style: style.clone(), text: String::new(), run: 0, run_char: 0, para_char: 0 });
         cls.push(Cl { seg: segs.len() - 1, range: (0, 0), glyphs: Vec::new(), width: 0.0, kind: Kind::Break, break_after: true, level: levels.first().copied().unwrap_or(0) });
         return;
     }
@@ -452,7 +454,7 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
         let mut st = style.clone();
         st.size = size;
         let spacing = st.spacing;
-        segs.push(Seg { face: face.clone(), res: res.clone(), style: st, text: piece.clone(), run: 0, run_char: 0 });
+        segs.push(Seg { face: face.clone(), res: res.clone(), style: st, text: piece.clone(), run: 0, run_char: 0, para_char: 0 });
         let Some(rb) = face.shaper() else { continue };
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(&piece);
@@ -594,12 +596,15 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
         spc_aft: f32,
         line_heights: Vec<f32>,
         asc_parts: Vec<f32>,
+        /// Ordnumret för varje tecken i stycket (`scene::word_index`).
+        words: Vec<u32>,
     }
     let mut plaid: Vec<PLaid> = Vec::new();
     for (pi, p) in frame.paras.iter().enumerate() {
         let mut segs = Vec::new();
         let mut cls = Vec::new();
         let levels = para_levels(&p.runs, p.rtl);
+        let mut para_chars = 0usize;
         for (ri, (r, lv)) in p.runs.iter().zip(&levels).enumerate() {
             let s0 = segs.len();
             shape_run(r, book, &mut segs, &mut cls, lv);
@@ -607,9 +612,12 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
             for s in &mut segs[s0..] {
                 s.run = ri;
                 s.run_char = ch;
+                s.para_char = para_chars + ch;
                 ch += s.text.chars().count();
             }
+            para_chars += ch;
         }
+        let words = super::scene::word_index(&segs.iter().flat_map(|s| s.text.chars()).collect::<Vec<char>>());
         // Punkten (bara om stycket har text).
         let has_text = p.runs.iter().any(|r| !r.line_break && !r.text.is_empty());
         let bullet = p.bullet.as_ref().filter(|_| has_text).and_then(|b| {
@@ -777,7 +785,7 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
             .collect();
         let spc_bef = if pi == 0 { 0.0 } else { spacing_pts(p.spc_bef, 0.0, first_single) };
         let spc_aft = spacing_pts(p.spc_aft, 0.0, lines.last().map_or(0.0, |l| l.single));
-        plaid.push(PLaid { segs, cls, lines, bullet, spc_bef, spc_aft, line_heights, asc_parts });
+        plaid.push(PLaid { segs, cls, lines, bullet, spc_bef, spc_aft, line_heights, asc_parts, words });
     }
 
     // 2. Lodrät placering: varje rad är en låda med radhöjden, baslinjen `asc_parts` ner i lådan.
@@ -858,7 +866,7 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
         if line.first {
             if let Some((bseg, bglyphs, bw)) = &pl.bullet {
                 let bx = if p.rtl { col_x + col_w - (p.mar_l + p.indent).max(0.0) - bw } else { col_x + (p.mar_l + p.indent).max(0.0) };
-                emit_glyphs(&mut items, bseg, bglyphs.iter().copied(), bx, base_y, &bseg.text);
+                emit_glyphs(&mut items, bseg, bglyphs.iter().map(|&(id, x, y, a)| (id, x, y, a, NO_CHAR, NO_CHAR)), bx, base_y, &bseg.text);
             }
         }
         // Markörlägen (redigeringen): klustren i logisk ordning, med avslutande blanksteg.
@@ -917,10 +925,10 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
         // Gruppera i körningar med samma segment.
         let mut run_start = x;
         let mut cur_seg: Option<usize> = None;
-        let mut buf: Vec<(u16, f32, f32, f32)> = Vec::new();
+        let mut buf: Vec<(u16, f32, f32, f32, u32, u32)> = Vec::new();
         let mut text = String::new();
         let mut deco: Vec<(usize, f32, f32)> = Vec::new();
-        let flush = |items: &mut Vec<Item>, seg: Option<usize>, buf: &mut Vec<(u16, f32, f32, f32)>, text: &mut String, start: f32| {
+        let flush = |items: &mut Vec<Item>, seg: Option<usize>, buf: &mut Vec<(u16, f32, f32, f32, u32, u32)>, text: &mut String, start: f32| {
             if let Some(s) = seg {
                 if !buf.is_empty() {
                     emit_glyphs(items, &pl.segs[s], buf.drain(..), start, base_y, text);
@@ -952,8 +960,10 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
             };
             if c.kind == Kind::Normal || c.kind == Kind::Space {
                 let mut gx = xx - run_start;
+                let ch = seg.para_char + seg.text.get(..c.range.0 as usize).map_or(0, |t| t.chars().count());
+                let word = pl.words.get(ch).copied().unwrap_or(NO_CHAR);
                 for &(gid, adv, xo, yo) in &c.glyphs {
-                    buf.push((gid, gx + xo, -yo, adv));
+                    buf.push((gid, gx + xo, -yo, adv, ch as u32, word));
                     gx += adv;
                 }
                 let (a, b) = (c.range.0 as usize, c.range.1 as usize);
@@ -1051,12 +1061,12 @@ fn underline(items: &mut Vec<Item>, st: &RunStyle, x0: f32, x1: f32, y: f32, thi
     }
 }
 
-/// Skriver en glyfkörning. `glyphs` är (id, x relativt start, y, framflyttning).
-fn emit_glyphs(items: &mut Vec<Item>, seg: &Seg, glyphs: impl Iterator<Item = (u16, f32, f32, f32)>, x: f32, y: f32, text: &str) {
+/// Skriver en glyfkörning. `glyphs` är (id, x relativt start, y, framflyttning, tecken, ord).
+fn emit_glyphs(items: &mut Vec<Item>, seg: &Seg, glyphs: impl Iterator<Item = (u16, f32, f32, f32, u32, u32)>, x: f32, y: f32, text: &str) {
     // Förskjutningen räknas på körningens fulla storlek (inte den förminskade).
     let full = if seg.style.baseline != 0.0 { seg.style.size / SCRIPT_SIZE } else { seg.style.size };
     let base_shift = -seg.style.baseline * full;
-    let placed: Vec<PlacedGlyph> = glyphs.map(|(id, gx, gy, adv)| PlacedGlyph { id, x: gx, y: gy, advance: adv }).collect();
+    let placed: Vec<PlacedGlyph> = glyphs.map(|(id, gx, gy, adv, ch, word)| PlacedGlyph { id, x: gx, y: gy, advance: adv, ch, word }).collect();
     if placed.is_empty() {
         return;
     }
