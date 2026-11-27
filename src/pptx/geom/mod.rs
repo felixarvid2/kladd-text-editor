@@ -59,6 +59,13 @@ pub fn has_preset(name: &str) -> bool {
     presets().contains_key(name)
 }
 
+/// Justeringarnas namn och standardformler (`a:avLst`) för en förinställd form, i ordning
+/// (SmartArts `dgm:adj@idx` räknar i den ordningen).
+pub fn adjust_names(name: &str) -> Vec<(String, String)> {
+    let Some(av) = presets().get(name).and_then(|d| child_local(d, "avLst")) else { return Vec::new() };
+    av.children.iter().filter(|c| c.local() == "gd").filter_map(|g| Some((g.attr("name")?.to_owned(), g.attr("fmla").unwrap_or("").to_owned()))).collect()
+}
+
 /// Utvärderar en förinställd form. `adjust` är formens egna `a:avLst`-värden (namn → formel).
 pub fn preset(name: &str, adjust: Option<&Node>, w: f64, h: f64) -> Option<Geometry> {
     let def = presets().get(name)?;

@@ -252,6 +252,10 @@ impl Deck {
             Some(old) => old.fonts.clone(),
             None => Arc::new(FontBook::with_embedded(&deck.pkg, &deck.embedded_fonts)),
         };
+        // SmartArt utan användbar ritdel läggs ut av layoutmotorn (behöver typsnitten).
+        for (k, d) in super::smartart::lay_out_missing(&deck) {
+            deck.drawings.insert(k, d);
+        }
         Ok(deck)
     }
 

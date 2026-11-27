@@ -186,6 +186,11 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 - **SmartArt:** layouter som PowerPoint lägger om (kugghjulen i `msrc-win32k` bild 4/22) kräver en layoutmotor.
 - **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
+- **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)*) används bara när ritdelen saknas eller är tom;
+  hierarkier (`hierRoot`/`hierChild`, organisationsscheman) ger ännu reserven, och böjda kopplingar
+  (kugghjulens pilar), linjer i hierarkier, text som får rutan att växa (`rule type="h" val="INF"`), ikoner
+  (`blipPhldr`) och egna förskjutningar i `composite` saknas.
+- **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
@@ -730,3 +735,72 @@ fasningen på en liten ruta i hörnet), 136 bilder blev bättre.
 | cppcon14-decomposing 5 / 39 | `coolSlant`, `balanced` vriden 145° | 0,8773 / 0,8912 | 0,8788 / 0,8921 |
 | msrc-win32k 8 | 3D-cirkel, utskjuten | 0,8669 | 0,8695 |
 | cppcon17-inherited-codebase-mac 7 | 3D-cirkel, `rotX` 50 | 0,9454 | 0,9462 |
+## SmartArt-layout (omgång 3)
+
+**Varför kugghjulen hamnade fel.** Alla 35 SmartArt i referensmaterialet (10 presentationer, 28 bilder) har en
+ritdel, och 33 av dem har former. Ingen av ritdelarna med former är inaktuell: PowerPoints PDF visar
+ritdelens former (jämfört bild för bild för kugghjulen, `vList5` i owasp en/ko/ja och pyramiden), och för de
+layouter motorn klarar (`vList5`, `pyramid3`, kugghjulens lägen) ger den samma former som ritdelen. Kugghjulen i `msrc-win32k` (bild 4, 5, 6 och
+22) ligger i **grupper som skalar sina barn** (`chExt` ≠ `ext`, 16–92 %). Ritdelen är sparad i ramens *visade*
+storlek, så gruppens skalning gäller ramens läge och storlek men inte formerna i ritdelen; Kladd skalade dem en
+gång till (bild 4: 79 %). `smartart::drawing_transform` tar bort gruppskalningen (rotation och spegling gäller
+fortfarande). Hypotesen att PowerPoint lägger om layouten när filen öppnas stämmer alltså inte för materialet;
+färg- och stildefinitionerna tillämpas också rätt (ingen skillnad hittad).
+
+**Regel för ritdelen.** Ritdelen (`dsp:dataModelExt@relId`, annars den enda på bladet) används när den har
+former. Saknas den eller är `dsp:spTree` tom (PowerPoint sparar ibland en tom ritdel; `owasp-top10-2017-he`
+bild 20–21, där PowerPoint lägger ut diagrammet ur datamodellen) lägger layoutmotorn ut diagrammet när
+presentationen läses in (`smartart::lay_out_missing`, efter typsnitten) i ramens visade storlek, och resultatet
+ritas som en ritdel (nyckel `<datadel>#kladd` i `Deck::drawings`). Saknas layoutdefinitionen, används
+hierarkialgoritmerna, eller går resultatet inte att läsa (text under 5 punkter, text som inte får plats ens i
+regelns minsta storlek, eller mer än hälften av datamodellens text utan form) blir det som förut datamodellens
+text som punktlista. Ett panik i motorn ger också reserven (`catch_unwind`).
+
+**Layoutmotorn** (`dgm/`, ECMA-376 del 1 §21.4):
+
+| Fil | Innehåll |
+| `dgm/data.rs` | `Model`: punkterna, `parOf`-trädet med `parTrans`/`sibTrans`, axlarna (`ch`, `des`, `followSib`, `precedSib`, `par`, `ancst`, `root`, `self`, listor som `axis="par ch"`), typfilter, `st`/`cnt`/`step`, `hideLastTrans`. |
+| `dgm/tree.rs` | `Tree`: `layoutNode`, `forEach` (även `ref`), `choose`/`if` (`cnt`, `pos`, `revPos`, `posEven`/`posOdd`, `depth`, `maxDepth`, `var` ur `presLayoutVars`/`varLst`), villkor (`constrLst`: `for`/`forName`/`ptType`, `refType`/`refFor`/`refForName`, `fact`, `op`; längder i mm, en längd ur en teckenstorlek räknas i mm per punkt), regler (`ruleLst`, även förälderns `for="ch"`/`"des"`), algoritmerna och presentationspunkternas egna värden (`custScaleX/Y`, `custLinFactX/Y`, `custLinFactNeighborX/Y`, `custAng`). |
+| `dgm/emit.rs` | Formerna som `p:spTree`: geometri (`adjLst` i formdefinitionens ordning), `p:style` ur stildefinitionen med färgerna ur färgdefinitionen (`repeat`/`cycle`/`span`, index ur `presStyleIdx`/`presStyleCnt`), `scene3d`/`sp3d` ur stildefinitionen, formatering ur punkten och presentationspunkten (`dgm:spPr`), text ur `presOf` med PowerPoints styckeformat (90 % radavstånd, 35 %/15 % efter stycket, punkter från `stBulletLvl`), `txXfrm` (upprätt text i vridna former), marginaler i förhållande till teckenstorleken och teckenstorleken krympt i halva punkter tills texten får plats (minst regelns värde; `op="equ"` ger gruppen den minsta). Text med egen formatering (`custT`) behåller sina storlekar. |
+
+Algoritmer: `lin` (barnen efter varandra längs `linDir`; flödet krymps lika för alla när de inte får plats,
+tvärs över bara storlekar räknade ur flödesriktningen; ihop centrerade längs flödet efter utbredningen,
+justerade tvärs över efter rutan; uppmätt mot `vList5`, `vList2`, `hProcess9`), `composite` (`l`/`t`/`r`/`b`/
+`ctrX`/`ctrY`/`w`/`h` och förskjutningar, `ar`), `snake` (det antal per rad som ger störst noder, sista raden
+centrerad), `cycle` (lika vinkelsteg från `stAng`, radien så att noderna inte överlappar), `pyra` (nivåer som
+trapetser med pyramidens sidor; `fromT` = omvänd pyramid), `hierRoot`/`hierChild` (roten centrerad över barnens
+rad), `tx`, `sp`, `conn` (pil i sin ruta; böjda kopplingar ritas inte). Bara noder med `tx` visar text. En
+nods egna villkor är standardvärden: förälderns villkor för den går före. Får helheten inte plats krymps och
+centreras den.
+
+**Jämförelse mot ritdelarna.** Det ignorerade provet `smartart_tests::oracle` (`KLADD_DGM_ORACLE`, en lista med
+presentationer) lägger ut varje diagram som har en ritdel och jämför formerna med PowerPoints (överlapp per
+presentationspunkt). 57 diagram i referensmaterialet och provsamlingarna: `vList5` 0,95–1,00 (12 diagram),
+`pyramid3` 1,00, `hProcess9` 1,00, `default` 1,00, `venn1` 1,00, `IconCircleLabelList` (små) 0,86–0,94,
+`VerticalCurvedList` 0,82, `hChevron3` 0,78, `AlternatingHexagons` 0,75, `process1` 0,68, `vList2` 0,50–0,74
+(texten som får rutan att växa saknas), `gear1` med tre kugghjul 0,44 (kugghjulen stämmer, pilarna saknas; med
+ett och två kugghjul har PowerPoint egna förskjutningar i `composite`), `hList1`, `list1`, `pyramid2`,
+`lProcess2`, `vList3` 0,12–0,43, `IconLabelList` 0,01, `hierarchy4` 0–0,92, medel 0,64. `rita_layoutmotorns_bilder`
+(`KLADD_DGM_RENDER`, `KLADD_DGM_OUT`) ritar bilderna där motorn används till PNG.
+
+**Resultat** (jämförelseprovet, SSIM; före = 2.11.0, `integ2`). Alla 1 124 bilder: 0,8842 → 0,8846; ingen
+presentation blev sämre. Presentationer som ändrades: `msrc-win32k` (35 bilder) 0,8843 → 0,8913,
+`owasp-top10-2017-he` (25) 0,7025 → 0,7112. Bilder med SmartArt som ändrades:
+
+| Bild | Före | Efter | Orsak |
+|---|---:|---:|---|
+| msrc-win32k 4 | 0.798 | 0.891 | ritdel i skalad grupp (79/80 %) |
+| msrc-win32k 5 | 0.884 | 0.904 | två ritdelar i grupper (16–33 %) |
+| msrc-win32k 6 | 0.846 | 0.899 | ritdel i skalad grupp (87/90 %) |
+| msrc-win32k 22 | 0.614 | 0.693 | ritdel i skalad grupp (92/93 %); resten är rubrikens radbrytning |
+| owasp-top10-2017-he 20 | 0.602 | 0.752 | tom ritdel → layoutmotorn (`vList5`) |
+| owasp-top10-2017-he 21 | 0.522 | 0.589 | tom ritdel → layoutmotorn (`vList5`) |
+
+Övriga 22 bilder med SmartArt är oförändrade: ritdelen stämmer med PowerPoints PDF, och skillnaderna där är
+typsnitt och radbrytning (koreansk, japansk och rysk text i `owasp-top10-2017-ko/ja/ru` 20–21, rubrikerna i
+`msrc-win32k` 22), `buChar="••"` i `owasp-top10-2010-es` 17–20 och ikonerna i `msrc-identity`.
+
+**Prov** (`smartart_tests.rs`, egna minimala diagram): `lin` med mellanrum, krympning och teckenstorlek i grupp,
+egen skalning och förskjutning, `composite` med `ar`, `snake`, `cycle`, `pyra`, hierarki (trädet direkt),
+datamodellens axlar och urval, `choose`/`if` efter antal, tom ritdel → layoutmotorn, oläslig layout → reserven,
+ritdel i skalad grupp.

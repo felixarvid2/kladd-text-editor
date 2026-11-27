@@ -55,6 +55,9 @@ pub mod transition;
 pub mod bevel;
 pub mod chart_3d;
 
+// Omgång 3, SmartArt-layout (w-psmart).
+pub mod dgm;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -63,6 +66,8 @@ mod view_tests;
 mod chart_tests;
 #[cfg(test)]
 mod edit_tests;
+#[cfg(test)]
+mod smartart_tests;
 
 pub use model::Deck;
 
