@@ -29,11 +29,17 @@ pub mod copy_md;
 pub mod find;
 pub mod notes;
 pub mod slideshow;
+pub mod emf;
+pub mod chart_draw;
+pub mod chart_fmt;
+pub mod chart_model;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod view_tests;
+#[cfg(test)]
+mod chart_tests;
 
 pub use model::Deck;
 

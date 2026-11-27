@@ -1,8 +1,6 @@
-//! EMF/WMF-bilder: om en EMF bara bär en bitmapp (`EMR_STRETCHDIBITS`) ritas den; annars en
-//! platshållare.
-//!
-//! Hook för nästa omgång: en delmängd av EMF/WMF-ritning (polygoner, linjer, text, bitmappar), med
-//! POI:s `hemf`/`hwmf` (Apache-2.0) som förebild.
+//! EMF/WMF-bilder: spelas upp med `emf::render` (vektorer, text, bitmappar). Ritar uppspelningen
+//! ingenting (t.ex. en fil med bara EMF+) men filen bär en bitmapp, ritas den största bitmappen;
+//! annars en platshållare.
 
 use std::sync::Arc;
 
@@ -61,10 +59,29 @@ pub fn emf_bitmap(bytes: &[u8]) -> Option<super::scene::ImageData> {
     Some(super::scene::ImageData::new(w, h, img.into_raw(), None))
 }
 
-pub fn metafile(b: &mut Builder<'_>, part: &str, f: &Frame) {
+/// Ritar metafilen `part` i formen `f`; `crop` är `a:srcRect` (vänster, topp, höger, botten) som andelar,
+/// negativa värden ger luft runt bilden.
+pub fn metafile(b: &mut Builder<'_>, part: &str, f: &Frame, crop: [f32; 4]) {
+    let deck = b.sheets.deck;
+    let [l, t, r, bo] = crop;
+    let (vw, vh) = ((1.0 - l - r).max(1e-3), (1.0 - t - bo).max(1e-3));
+    // Hela bilden i formens koordinater; den synliga delen fyller formen.
+    let (w, h) = (f.w / vw, f.h / vh);
+    let t_full = Affine::translate(-l * w, -t * h).then(&f.t);
+    if let Some(items) = deck.pkg.read(part).and_then(|bytes| super::emf::render(bytes, t_full, w, h, &deck.fonts)) {
+        let clip = crop.iter().any(|&c| c > 0.0);
+        if clip {
+            b.scene.items.push(Item::PushClip { path: super::scene::Path::rect(0.0, 0.0, f.w, f.h).transformed(&f.t) });
+        }
+        b.scene.items.extend(items);
+        if clip {
+            b.scene.items.push(Item::PopClip);
+        }
+        return;
+    }
     if let Some(img) = b.sheets.deck.pkg.read(part).and_then(emf_bitmap) {
         let t = Affine::scale(f.w, f.h).then(&f.t);
-        b.scene.items.push(Item::Image { image: Arc::new(img), t, crop: [0.0; 4], alpha: 1.0 });
+        b.scene.items.push(Item::Image { image: Arc::new(img), t, crop, alpha: 1.0 });
         return;
     }
     let label = if part.to_lowercase().ends_with(".wmf") { crate::i18n::t("Bild (WMF)") } else { crate::i18n::t("Bild (EMF)") };

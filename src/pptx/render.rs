@@ -510,6 +510,12 @@ impl<'a> Builder<'a> {
         let Some(xfrm) = Self::sppr_child(&chain, &["a:xfrm"]) else { return };
         let Some(f) = frame_of(xfrm, parent) else { return };
         let Some(bf) = pic.child("p:blipFill") else { return };
+        // Bildformens egen fyllning ligger bakom bilden (syns genom genomskinliga bilder och metafiler).
+        if let Some(paint) = Self::sppr_child(&chain[..chain.len().min(1)], inherit::FILLS).and_then(|n| self.paint(n, None, &f, owner)) {
+            for sp in self.geometry(&chain, f.w, f.h).iter().flat_map(|g| g.paths.iter()).filter(|p| p.fill != FillMode::None) {
+                self.fill_paint(sp.path.transformed(&f.t), paint.clone());
+            }
+        }
         self.draw_blip(bf, &chain, &f, owner);
         // Ram runt bilden.
         let style = chain.iter().find_map(|s| s.child("p:style"));
@@ -553,7 +559,7 @@ impl<'a> Builder<'a> {
             if let Some(r) = blip.attr("r:embed").and_then(|id| package::rel(rels, id)) {
                 let low = r.target.to_lowercase();
                 if low.ends_with(".emf") || low.ends_with(".wmf") {
-                    super::media::metafile(self, &r.target, f);
+                    super::media::metafile(self, &r.target, f, crop);
                 } else if let Some(img) = self.sheets.deck.image(&r.target) {
                     let img = apply_blip_effects(blip, img);
                     self.scene.items.push(Item::Image { image: img, t, crop, alpha });

@@ -239,3 +239,83 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Kvar:** bildövergångar och animeringar (bildspelet visar slutläget direkt), föredragsvy med nästa bild och
   timer, länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
   bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
+- **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
+  anteckningar, `.ppt` via LibreOffice, handboken.
+
+## Diagram och EMF/WMF (omgång 2)
+
+### Diagram
+
+`charts.rs` (hooken) → `chart_model.rs` (`c:chartSpace` → `Chart`: plottar, serier ur `c:numCache`/`c:strCache`/
+`c:numLit`/`c:strLit`, axlar, förklaring, titel, `c:manualLayout`, `c:view3D`) → `chart_draw.rs` (layout och
+ritning till `Scene`) med `chart_fmt.rs` (Excels talformat inklusive datum). Formateringen (`c:spPr`, `c:txPr`,
+`c:rich`) går genom `Builder::paint` och `TextEnv::run_style`, så temafärger, övertoningar och typsnitt blir som
+i formerna.
+
+- **Typer:** stapel och liggande stapel (grupperad/staplad/100 %, `gapWidth`, `overlap`), linje (markörer,
+  `smooth`), yta, cirkel/ring (`firstSliceAng`, `explosion`, `holeSize`), 3D-cirkel (lutning ur `rotX`, en kant
+  i mörkare färg; ingen riktig 3D), punktdiagram. Okända typer (radar, yta 3D, aktie …) och `cx:` (chartex) →
+  platshållaren. Flera plottar i samma rityta ritas på samma axlar (ingen sekundäraxel).
+- **Färger:** seriens/punktens `spPr`, annars diagramformatet `c:style` (1 = gråskala, 2 = accent 1–6 med
+  ljusare/mörkare varianter efter sex serier, 3–8 = en accentfärg i nyanser).
+- **Layout** (uppmätt i PowerPoints PDF-export av docx4j:s `p4-*`, 432 × 252 pt, text 11,97 pt): yttre marginal
+  7 pt; värdeetiketterna slutar 0,92 em före ritytan; kategorietiketternas baslinje 1,57 em under axeln;
+  förklaringens baslinje 0,48 em ovanför marginalen, nyckeln 0,55 em, 0,245 em till texten och 0,98 em mellan
+  posterna (linjediagram: en linje på 1,59 em); ritytans överkant 0,45 em under marginalen och högerkant
+  0,33 em innanför; kategorier på strecken (`midCat`) flyttar in ritytan så att första och sista etiketten får
+  plats; cirkelns diameter 92,5 % av ritytans minsta sida (3D: 88 % av det). Med `layoutTarget inner` gäller
+  den manuella rektangeln ritytan direkt.
+- **Skala:** som Excel: 0 med om det minsta värdet är under 5/6 av det största, största + 5 %, steg
+  1/2/5·10ⁿ — det minsta där etiketterna får plats: lodrät axel minst 1,5 em mellan strecken, vågrät minst
+  etikettens bredd + 2 em. Ger samma axlar som PowerPoint för alla tretton `p4`-diagrammen.
+- **Prov:** `chart_model`/`chart_fmt`/`chart_draw` har enhetsprov, `chart_tests.rs` ritar egna minimala
+  diagram genom hela ritvägen. `KLADD_CHART_REFS=…/docx4j-chart-render/src/test/resources/charts/render/office
+  cargo test chart_draw::tests::docx4j_referens -- --ignored --nocapture` jämför textens lägen med JSON-filerna
+  ur PowerPoints PDF (docx4j, Apache-2.0; filerna ligger inte i git): medelfel 1,8 pt vågrätt och 0,3 pt lodrätt
+  över 169 texter (Aptos ersätts med Liberation Sans). Datumetiketterna i `p4-area` skiljer sig: PDF:en är
+  gjord med ett annat språk (`m/d/yyyy` visas som `1/05/2002`).
+
+### EMF/WMF
+
+`emf/` är en uppspelare för den vanliga delmängden av MS-EMF och MS-WMF, med Apache POI:s `hemf`/`hwmf` som
+förebild för beteendet (se `emf/NOTICE.md`): `records.rs` (EMF), `wmf.rs` (WMF med och utan `Placeable`-huvud),
+`player.rs` (ritytans tillstånd och operationerna), `dib.rs` (bitmappar). `media::metafile` spelar upp filen i
+bildens ram med `a:srcRect` (negativa värden ger luft); ritar uppspelningen inget (bara EMF+) används den
+största bitmappen eller platshållaren som förut. Bildformens egen fyllning (`p:pic/p:spPr`, inte en ärvd från
+layoutens platshållare) ritas nu bakom bilden
+(`render.rs`, några rader) — metafilerna i `cppcon15-stl-algorithms-mac` är genomskinliga och har en ljus
+fyllning.
+
+- Koordinater: logiskt → världstransform → fönster/viewport och mappningsläge → enhetens bildpunkter →
+  0,01 mm (`szlMillimeters`, eller `szlMicrometers` om de finns) → `rclFrame` → bildens ram.
+- Banor (`BeginPath` … `FillPath`/`StrokePath`/`StrokeAndFillPath`/`SelectClipPath`), polygoner och
+  polylinjer (16 och 32 bitar), Bézier, rektanglar, ellipser, bågar, `SetPolyFillMode` (jämn/udda eller
+  vindning), stockobjekt (`NULL_PEN` m.fl.), pennor (bredd, streck, ändar, hörn; kosmetiska = 0,75 pt),
+  penslar (fyllda; streckade och mönster som blandfärg), `SaveDC`/`RestoreDC`, rektangel- och banklipp (som
+  balanserade `PushClip`/`PopClip`), `ExtTextOutW` (typsnitt ur `LOGFONT` via `FontBook`, glyfer på
+  `dx`-listans lägen, justering, vridning, understrykning), `StretchDIBits`/`BitBlt`/`StretchBlt`/
+  `SetDIBitsToDevice`/`AlphaBlend` (och `BitBlt` utan källa som fyllning).
+- Inte gjort: regionoperationer utöver snitt/ersätt, `ExcludeClipRect`, streckmönster i penslar, rasteroperationer
+  utöver de vanligaste, text som glyfnummer (`ETO_GLYPH_INDEX`), EMF+.
+
+### Resultat mot PowerPoint (diagram och EMF/WMF)
+
+Jämförelseprovet på alla 33 presentationer med PowerPoint-PDF (1 121 bilder) före och efter: ingen
+presentation fick lägre medel, ingen bild blev sämre och alla bilder med diagram eller EMF blev bättre, medel
+0,8717 → 0,8735.
+
+| Bild | Innehåll | Före | Efter |
+|---|---|---:|---:|
+| cppcon15-stl-algorithms-mac 50/55/61/63 | EMF (tabeller, pilar, text som banor) | 0,670–0,806 | 0,880–0,929 |
+| cppcon15-stl-algorithms-mac 79–88 | EMF (tusentals banor, klipp) | 0,673–0,880 | 0,726–0,935 |
+| cppcon16-iterator-haiku 46 | EMF med text (`ExtTextOutW`), `BitBlt` | 0,575 | 0,687 |
+| cppcon17-inherited-codebase-mac 33–36 | EMF med klippbanor och text | 0,802–0,957 | 0,892–0,984 |
+| cppcon17-inherited-codebase-mac 7 | 3D-cirkel med etikett | 0,830 | 0,943 |
+| msrc-eko19 5 | 100 % staplad yta | 0,688 | 0,773 |
+| msrc-eko19 6 | 100 % staplad yta med etiketter | 0,645 | 0,768 |
+| msrc-win32k 8 | 3D-cirkel, utskjuten sektor | 0,784 | 0,865 |
+
+Kvar: diagramytans radiella övertoning i `msrc-eko19` (banövertoningen ritas för ljus, `render.rs`), riktig
+3D (sidornas skuggning, väggar och golv), sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar- och
+yt-3D-diagram, `cx:` (chartex). Tid i debug för den tyngsta EMF-bilden (`cppcon15` bild 83, 22 000 element):
+visningslistan 60 ms, rastret 1,8 s (en bild utan EMF i samma presentation: 1,2 s), PDF 0,56 s.

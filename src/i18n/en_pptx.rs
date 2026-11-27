@@ -55,4 +55,6 @@ pub const EN: &[(&str, &str)] = &[
     ("{name} konverterades med LibreOffice. Originalet ändras inte.", "{name} was converted with LibreOffice. The original is not changed."),
     ("{n} av {total}", "{n} of {total}"),
     ("{total} träffar", "{total} matches"),
+    ("Serie", "Series"),
+    ("Diagramrubrik", "Chart Title"),
 ];
