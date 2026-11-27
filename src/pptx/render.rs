@@ -241,7 +241,9 @@ impl<'a> Builder<'a> {
         // Effekterna gäller formen; utan fyllning och linje gäller de texten.
         let geom_drawn = self.scene.items.len() > start;
         if geom_drawn {
-            self.wrap_effects(start, effects.clone());
+            // 3D (`sp3d`/`scene3d`): fasning, kontur och kamera gäller bara formen, inte texten.
+            let fx = super::bevel::with_3d(&self.sheets, effects.clone(), &chain, style, &f, &self.scene.items[start..]);
+            self.wrap_effects(start, fx);
         }
         let text_start = self.scene.items.len();
         if let Some(body) = body.filter(|_| has_text) {
@@ -581,6 +583,7 @@ impl<'a> Builder<'a> {
         // 11 och 17; osäkert om det gäller generellt).
         let transparent = effects.iter().any(|e| matches!(e, super::scene::Effect::OuterShadow { .. })) && self.scene.items[start..].iter().any(|it| matches!(it, Item::Image { image, .. } if image.rgba.chunks_exact(4).any(|p| p[3] < 250)));
         let effects: Vec<_> = effects.into_iter().filter(|e| !(transparent && matches!(e, super::scene::Effect::OuterShadow { .. }))).collect();
+        let effects = super::bevel::with_3d(&self.sheets, effects, &chain, style, &f, &self.scene.items[start..]);
         self.wrap_effects(start, effects);
     }
 

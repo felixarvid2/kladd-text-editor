@@ -378,6 +378,8 @@ En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öp
 | `Ctrl++` / `Ctrl+-` | Zooma in / ut |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` (eller `Ctrl+0`) | Verklig storlek / bildbredd / hel bild |
 
+**3D.** Diagram i 3D (cirkel, stapel, linje och yta) ritas med djup, sidor och belysning, och former med 3D-kant (fasning) får skuggade kanter som i PowerPoint. Former som är vridna i 3D (isometriska och perspektiviska kameror) visas förenklat: formen trycks ihop och djupet ritas som en enfärgad extrudering, men texten står kvar rakt framifrån.
+
 ## Kortkommandon
 
 På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.

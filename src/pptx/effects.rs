@@ -257,6 +257,8 @@ fn reach(effects: &[Effect], scale: f32) -> f32 {
         .map(|e| match e {
             Effect::OuterShadow { dx, dy, blur, .. } => (dx.abs().max(dy.abs()) + blur * 1.5) * scale + 2.0,
             Effect::Glow { radius, .. } => radius * 1.5 * scale + 2.0,
+            Effect::Contour { width, .. } => width * scale + 2.0,
+            Effect::Camera { extrude, .. } => extrude.0.abs().max(extrude.1.abs()) * scale + 2.0,
             _ => 0.0,
         })
         .fold(0.0f32, f32::max)
@@ -345,6 +347,26 @@ fn draw_under(pm: &mut sk::Pixmap, l: &sk::Pixmap, x0: i32, y0: i32, effects: &[
                 let Some(s) = a.colorize(color, 2.0) else { continue };
                 pm.draw_pixmap(x0 - m as i32, y0 - m as i32, s.as_ref(), &sk::PixmapPaint::default(), sk::Transform::identity(), mask);
             }
+            Effect::Contour { width, color } => {
+                let m = (width * scale).ceil() as i32 + 2;
+                if let Some(c) = super::bevel::contour(l, m as usize, width * scale, color) {
+                    pm.draw_pixmap(x0 - m, y0 - m, c.as_ref(), &sk::PixmapPaint::default(), sk::Transform::identity(), mask);
+                }
+            }
+            Effect::Camera { extrude, color, .. } => {
+                // Extruderingen: lagrets form i extruderingens färg, förskjuten bakåt steg för steg.
+                let (ex, ey) = (extrude.0 * scale, extrude.1 * scale);
+                let steps = ex.abs().max(ey.abs()).ceil().min(400.0) as usize;
+                if steps > 0 {
+                    let a = Alpha::from_layer(l, 0, 0.0);
+                    if let Some(sh) = a.colorize(color, 1.0) {
+                        for k in (1..=steps).rev() {
+                            let f = k as f32 / steps as f32;
+                            pm.draw_pixmap(0, 0, sh.as_ref(), &sk::PixmapPaint { quality: sk::FilterQuality::Bilinear, ..Default::default() }, sk::Transform::from_translate(x0 as f32 + ex * f, y0 as f32 + ey * f), mask);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -399,13 +421,23 @@ fn modify_layer(l: &mut sk::Pixmap, effects: &[Effect], scale: f32) {
                     }
                 }
             }
+            Effect::Bevel { width, height, kind, lighting } => super::bevel::shade_layer(l, width * scale, height * scale, kind, &lighting),
             _ => {}
         }
     }
 }
 
+/// Transformen för lagret: sidans, med en 3D-kameras förvrängning först.
+fn camera_page(effects: &[Effect], page: &Affine) -> Affine {
+    match effects.iter().find_map(|e| if let Effect::Camera { t, .. } = e { Some(*t) } else { None }) {
+        Some(t) => t.then(page),
+        None => *page,
+    }
+}
+
 /// Ritar `content` med `effects` på `pm` (anropas av `raster::draw`).
 pub(super) fn draw(pm: &mut sk::Pixmap, content: &[Item], effects: &[Effect], page: &Affine, mask: Option<&sk::Mask>) {
+    let page = &camera_page(effects, page);
     let Some((mut l, x0, y0)) = layer(pm.width(), pm.height(), content, effects, page) else { return };
     draw_under(pm, &l, x0, y0, effects, page, mask);
     modify_layer(&mut l, effects, page.scale_factor());
@@ -415,7 +447,7 @@ pub(super) fn draw(pm: &mut sk::Pixmap, content: &[Item], effects: &[Effect], pa
 /// Effekterna under innehållet som en egen bild (för PDF:en): (pixmap, transform pixmap → bild i punkter).
 /// `ppt` är upplösningen i bildpunkter per punkt.
 pub fn underlay(content: &[Item], effects: &[Effect], slide_w: f32, slide_h: f32, ppt: f32) -> Option<(sk::Pixmap, Affine)> {
-    if !effects.iter().any(|e| matches!(e, Effect::OuterShadow { .. } | Effect::Glow { .. } | Effect::Reflection { .. })) {
+    if !effects.iter().any(|e| matches!(e, Effect::OuterShadow { .. } | Effect::Glow { .. } | Effect::Reflection { .. } | Effect::Contour { .. })) {
         return None;
     }
     let page = Affine::scale(ppt, ppt);
@@ -428,6 +460,39 @@ pub fn underlay(content: &[Item], effects: &[Effect], slide_w: f32, slide_h: f32
     let shift = page.then(&Affine::translate(-ox as f32, -oy as f32));
     draw_under(&mut out, &l, x0 - ox, y0 - oy, effects, &shift, None);
     let t = Affine::translate(ox as f32, oy as f32).then(&Affine::scale(1.0 / ppt, 1.0 / ppt));
+    Some((out, t))
+}
+
+/// Fasningen ovanpå innehållet som en egen bild (för PDF:en): bara kantzonens bildpunkter, resten
+/// genomskinligt, så att det inre av formen förblir vektorer. (pixmap, transform pixmap → bild i punkter).
+pub fn overlay(content: &[Item], effects: &[Effect], slide_w: f32, slide_h: f32, ppt: f32) -> Option<(sk::Pixmap, Affine)> {
+    let Some(&Effect::Bevel { width, height, kind, lighting }) = effects.iter().find(|e| matches!(e, Effect::Bevel { .. })) else { return None };
+    let page = Affine::scale(ppt, ppt);
+    let (pw, ph) = ((slide_w * ppt).ceil().max(1.0) as u32, (slide_h * ppt).ceil().max(1.0) as u32);
+    let (mut l, x0, y0) = layer(pw, ph, content, effects, &page)?;
+    super::bevel::shade_layer_zone_only(&mut l, width * ppt, height * ppt, kind, &lighting);
+    let t = Affine::translate(x0 as f32, y0 as f32).then(&Affine::scale(1.0 / ppt, 1.0 / ppt));
+    Some((l, t))
+}
+
+/// Innehållet med alla effekter som en rasterbild (för PDF:en när en 3D-kamera förvränger formen):
+/// (pixmap, transform pixmap → bild i punkter).
+pub fn rasterized(content: &[Item], effects: &[Effect], slide_w: f32, slide_h: f32, ppt: f32) -> Option<(sk::Pixmap, Affine)> {
+    if !effects.iter().any(|e| matches!(e, Effect::Camera { .. })) {
+        return None;
+    }
+    let page = Affine::scale(ppt, ppt);
+    let cp = camera_page(effects, &page);
+    let (bx0, by0, bx1, by1) = bounds(content, &cp)?;
+    let m = reach(effects, ppt).ceil() + 4.0;
+    let (x0, y0) = ((bx0 - m).floor().max(-(slide_w * ppt)), (by0 - m).floor().max(-(slide_h * ppt)));
+    let (x1, y1) = ((bx1 + m).ceil().min(2.0 * slide_w * ppt), (by1 + m).ceil().min(2.0 * slide_h * ppt));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let mut out = sk::Pixmap::new((x1 - x0) as u32, (y1 - y0) as u32)?;
+    draw(&mut out, content, effects, &page.then(&Affine::translate(-x0, -y0)), None);
+    let t = Affine::translate(x0, y0).then(&Affine::scale(1.0 / ppt, 1.0 / ppt));
     Some((out, t))
 }
 

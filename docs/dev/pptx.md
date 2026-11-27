@@ -178,12 +178,14 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
   forminterpolering, föredragsvyns automatiska val av skärm (se *Bildspel* nedan), markering av text på bilden;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
-- **Diagram:** riktig 3D, sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, chartex (`cx:`).
+- **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
+  3D-diagrammen utan referensbilder (stapel/linje/yta) är inte kalibrerade (se *3D i diagram och former*).
 - **EMF/WMF:** `ExcludeClipRect`, fler regionoperationer, streckade/mönstrade penslar, `ETO_GLYPH_INDEX`, EMF+.
 - **Tabeller:** lodrät text i celler låter inte raden växa; några val är inte prövade mot referensbilder (se
   avsnittet).
 - **SmartArt:** layouter som PowerPoint lägger om (kugghjulen i `msrc-win32k` bild 4/22) kräver en layoutmotor.
-- **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
+- **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
+  `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
@@ -641,3 +643,87 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
 - **Kvar:** morph som forminterpolering, `p14`-övergångarnas egna utseenden (virvel, glitter …), riktiga färgbyten i
   betoningar (kräver omrendering), `iterate` (bokstav för bokstav), ljud och video, utlösare, val av skärm.
 
+## 3D i diagram och former (omgång 3)
+
+Nya moduler: `chart_3d.rs` (kamera, projektion, belysning, cirkelns och staplarnas ytor, målarordning; rena
+funktioner), `chart_3d_draw.rs` (undermodul till `chart_draw.rs`, delar `Draw`) och `bevel.rs` (`a:sp3d`/
+`a:scene3d` på former). `scene::Effect` har fått `Bevel`, `Contour` och `Camera` (sist i listan); kroken i
+`render.rs` är `bevel::with_3d` för former och bilder, och `pdf.rs` ritar fasningen som ett rasteröverlägg
+(`effects::overlay`, bara kantzonen) och former med en 3D-kamera helt som rasterbild (`effects::rasterized`).
+
+**Diagram.**
+
+- **Modellen:** `View3D` har `rotX`/`rotY` som `Option` (standardvärdena beror på typen: cirkel 30/0,
+  stapel/linje/yta 15/20), `depthPercent`, `hPercent`, `rAngAx`, `perspective`; `Chart::walls` (`c:floor`,
+  `c:sideWall`, `c:backWall`); `Plot::three_d`, `shape` (`c:shape`) och `gap_depth`.
+- **Kameran:** rätvinkliga axlar (`rAngAx`, standard) ger en sned parallellprojektion där framsidan är
+  oförvrängd och en enhet bakåt flyttar punkten (sin `rotY`, sin `rotX` · cos `rotY`); annars vrids världen
+  `rotY` och `rotX` och `perspective` ger synfältet `perspective / 2` grader. Ytornas skuggning räknas alltid
+  med den riktiga vridningen.
+- **Belysningen:** en riktad ljuskälla (40° till vänster om rakt upp, 36° ut från skärmen i kamerans
+  koordinater) och 35 % omgivningsljus, anpassat med minsta kvadrat till sidornas färger i de två 3D-cirklarna
+  i PowerPoints PDF-export (`msrc-win32k` bild 8, `rotX` 30: sidan rakt fram 55 % av toppens ljushet,
+  vänsterkanten 77 %, högerkanten 39 %; `cppcon17-inherited-codebase-mac` bild 7, `rotX` 50: 38 %).
+- **3D-cirkeln:** toppar, sidor (de delar av bågen som vetter mot betraktaren, med en vågrät övertoning i
+  ljusheten) och snittytor där en sektor är utskjuten; sidor och snittytor bakifrån och fram, topparna sist.
+  Tjockleken 0,30 r vid `hPercent` 100 och storleken 84 % av det största som får plats valdes mot de två
+  bilderna (uppmätt tjocklek 0,22–0,28 r; PowerPoints perspektiv i cirkeln görs inte).
+- **Stapel, linje och yta:** en låda med bakvägg, sidovägg och golv (deras `spPr`; utan fyllning som
+  standard), värdeaxelns rutnät på väggarna, serierna som föremål ritade bakifrån och fram (varje föremåls
+  ytor med baksidesgallring och ljushet relativt framsidan). Staplar: lådor, cylindrar (36 sidor), koner och
+  pyramider (`coneToMax`/`pyramidToMax` som stympade mot axelns största värde), grupperade, staplade, 100 %
+  och `standard` (serierna på djupet när diagrammet har en `serAx`). Linjer som band och ytor som skivor på
+  var sin rad på djupet (`gapDepth`), första serien närmast. Axeletiketterna längs lådans främre kanter,
+  seriernas namn till höger om djupet.
+- **Inte gjort:** `surface3DChart`, perspektiv i 3D-cirkeln, datatabeller i 3D, att räkna in etikettbredden i
+  lådans placering vid stor vridning. Stapel/linje/yta i 3D finns inte i referensmaterialet och är bara
+  prövade med egna fixturer (`chart_tests.rs`) och genom att titta på bilderna.
+
+**Former** (`bevel.rs`):
+
+- **Arv:** `a:scene3d` och `a:sp3d` var för sig ur första `spPr` i platshållarkedjan, annars ur temats
+  effektstil via `effectRef` (Office 2007-temans tredje effektstil har en fasning; `bevel::THEME_3D`).
+  `effectRef idx="3"` förekommer bara i `cppcon14-parallel-overview` (1), `cppcon17-inherited-codebase-mac`
+  (2) och `owasp-top10-2010-es` (101, SmartArt); med och utan temats 3D gav samma mått i de åtta
+  presentationerna med fasningar (cppcon14 ×2, msrc-eko19, owasp-2017 ×5), och owasp-2010-es blev bättre.
+- **Fasning** (`bevelT`; `bevelB` och `extrusionH` syns inte framifrån): avståndet till formens kant
+  (exakt euklidiskt avståndsfält, Felzenszwalb–Huttenlocher, ur lagrets täckning) → läget i profilen →
+  normalen (profilens lutning × `h` / bredden) → ljusheten (omgivning + Lambert + Blinn-glans, relativt en
+  plan yta) gånger färgen. De tolv profilerna är uppskattade ur PowerPoints galleri. `threePt` är anpassad
+  till kvadraterna i `cppcon14-parallel-overview` bild 14 (PowerPoint rastrerar fasningar i PDF:en i
+  200 dpi; fasetternas ljushet uppåt 1,04, nedåt 0,52, vänster 0,81, höger 0,57 → omgivning 0,29, ljuset 25°
+  vänster om rakt upp och 61° ut från planet). Ljuset vrids med formens och gruppens rotation men inte med
+  speglingar (kvadraterna sitter i en grupp vriden 90° med `flipV` och är ljusast åt höger). `rev` vrider
+  riggen (125° i SmartArt-pilarna på samma bild stämmer), utom för de jämna riggarna (`balanced` …).
+  Glansen efter materialet (`warmMatte` 0,77, `plastic`/`metal` 1, `flat`/`matte`/`dkEdge` 0), riggen
+  `flat` ger ingen skuggning. Den synliga zonen är halva `w` (`bevel::ZONE`): uppmätt 6–8 pt för `w` 13 pt,
+  och 0,5 gav bäst mått av 0,3–1,0.
+- **Kontur** (`contourW`, `contourClr`): ett band runt formen ur avståndsfältet utanför.
+- **Kameror** som inte tittar rakt framifrån (isometriska, perspektiv, egna `a:rot`): formen förvrängs
+  affint runt sin mitt (planet vridet `lon`/`lat`, parallellprojektion) och extruderas `extrusionH` längs
+  den projicerade djupaxeln i `extrusionClr` (annars 60 % av fyllningen); sneda kameror bara extruderar.
+  Texten förvrängs inte. Ingen form i materialet har en sådan kamera.
+- **Inte gjort:** 3D-text (`sp3d` på `a:bodyPr`), riktigt perspektiv, ljusare/mörkare extruderingssidor.
+
+**Prov:** `chart_3d.rs` (hörnens lägen vid rätvinklig vy, vridning och perspektiv, belysningen mot
+PowerPoints cirklar, cirkelns ytor och ritordning, framsidans vinkelintervall, lådans synliga sidor och
+ordning, utåtriktade normaler för alla former), `chart_tests.rs` (3D-stapel genom hela ritvägen med
+skuggade sidor, alla typer och former inom ramen, 3D-cirkel med övertonade sidor före topparna),
+`bevel.rs` (avståndsfältet, profilernas form, ljuset som i PowerPoint, ljuset vrids med formen men inte med
+speglingar, `orthographicFront` utan fasning ger samma visningslista som utan `scene3d`, fasning/kontur/
+kamera i rastret och PDF-överlägget, kamerornas förvrängning).
+
+**Resultat** (jämförelseprovet, alla 33 presentationer, 1 124 bilder; före = 2.11.0, `integ2`): medel
+0,88424 → 0,88441. Ingen presentation blev sämre; en bild sjönk 0,0009 (`owasp-top10-2017-ko` bild 15,
+fasningen på en liten ruta i hörnet), 136 bilder blev bättre.
+
+| Bild | Innehåll | Före | Efter |
+|---|---|---:|---:|
+| cppcon14-parallel-overview 14 | `coolSlant` på kvadrater och cirklar, SmartArt-pilar | 0,8813 | 0,8998 |
+| cppcon14-parallel-overview 33 | fasade former | 0,8145 | 0,8260 |
+| cppcon14-parallel-overview 10 / 4 | fasade former | 0,6420 / 0,8794 | 0,6492 / 0,8827 |
+| owasp-top10-2010-es 6 / 17 / 19 | fasade SmartArt-former | 0,8863 / 0,9213 / 0,8179 | 0,9003 / 0,9263 / 0,8223 |
+| owasp-top10-2017-* (alla fem) | `circle` på rubrikrutan på varje bild | | +0,0009–0,0010 per presentation |
+| cppcon14-decomposing 5 / 39 | `coolSlant`, `balanced` vriden 145° | 0,8773 / 0,8912 | 0,8788 / 0,8921 |
+| msrc-win32k 8 | 3D-cirkel, utskjuten | 0,8669 | 0,8695 |
+| cppcon17-inherited-codebase-mac 7 | 3D-cirkel, `rotX` 50 | 0,9454 | 0,9462 |

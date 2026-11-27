@@ -326,6 +326,14 @@ pub enum Effect {
     /// Tunnare text (syntetiskt tunt typsnitt, t.ex. Calibri Light): glyferna skrapas `width` punkter
     /// in från kanten.
     Thin { width: f32 },
+    /// 3D-fasning sedd framifrån (`a:sp3d/a:bevelT`, `bevel.rs`): en skuggad zon `width` punkter in från
+    /// kanten med profilen `kind` och höjden `height`.
+    Bevel { width: f32, height: f32, kind: super::bevel::BevelType, lighting: super::bevel::Lighting },
+    /// 3D-kontur (`a:sp3d/@contourW`): ett band runt formen.
+    Contour { width: f32, color: Rgba },
+    /// Kamera som inte tittar rakt framifrån (`a:scene3d/a:camera`): formen förvrängs med `t` (bildens
+    /// koordinater) och extruderas `extrude` punkter (förskjutning på skärmen) i färgen `color`.
+    Camera { t: Affine, extrude: (f32, f32), color: Rgba },
 }
 
 /// Ett element i visningslistan.

@@ -172,3 +172,135 @@ fn tid() {
         println!("{} element: scen {:?}, raster {:?}, pdf {:?} ({} kB)", scene.items.len(), t1, t2 - t1, t3 - t2, pdf.len() / 1024);
     }
 }
+
+// ---- 3D-diagram (w-p3d) ----
+
+/// Stapeldiagrammet `BAR` som 3D-typ (`c:bar3DChart` m.fl.) med en vy och golv/väggar.
+fn bar_3d(kind: &str, extra: &str, view: &str) -> String {
+    BAR.replace("<c:barChart>", &format!("<c:{kind}>{extra}"))
+        .replace("</c:barChart>", &format!("<c:shape val=\"box\"/></c:{kind}>"))
+        .replace("<c:autoTitleDeleted val=\"1\"/>", &format!("<c:autoTitleDeleted val=\"1\"/>{view}<c:backWall><c:spPr><a:solidFill><a:srgbClr val=\"F0F0F0\"/></a:solidFill></c:spPr></c:backWall>"))
+}
+
+fn render_png(scene: &super::scene::Scene) -> Vec<u8> {
+    let pm = super::raster::render(scene, 400, 300).unwrap();
+    super::raster::to_rgba(pm).2
+}
+
+#[test]
+fn stapeldiagram_i_3d_har_skuggade_sidor() {
+    let accent1 = Rgba::rgb8(0x44, 0x72, 0xC4);
+    let view = r#"<c:view3D><c:rotX val="15"/><c:rotY val="20"/><c:depthPercent val="100"/><c:rAngAx val="1"/></c:view3D>"#;
+    let xml = bar_3d("bar3DChart", "", view);
+    let bytes = deck(&chart_frame(), &[("charts/chart1.xml", "chart", xml.as_bytes())]);
+    let d = Deck::open(&bytes).unwrap();
+    let scene = render::slide_scene(&d, 0);
+    let t = texts(&scene.items);
+    assert!(!t.iter().any(|x| x == "Diagram"), "ingen platshållare: {t:?}");
+    for want in ["A", "B", "C", "4.0"] {
+        assert!(t.iter().any(|x| x == want), "saknar {want:?} i {t:?}");
+    }
+    let f = fills(&scene.items);
+    // Framsidorna i seriens färg, toppen ljusare och sidan mörkare (samma kulör).
+    let fronts = f.iter().filter(|(_, c)| *c == accent1).count();
+    assert_eq!(fronts, 4, "tre framsidor och förklaringens nyckel i accent1");
+    let lighter = f.iter().any(|(_, c)| c.b > accent1.b + 0.01 && c.r > accent1.r && (c.r - c.b).abs() < (accent1.b - accent1.r) + 0.01);
+    let darker = f.iter().any(|(_, c)| c.b < accent1.b - 0.05 && c.r < accent1.r && c.b > c.r);
+    assert!(lighter && darker, "{f:?}");
+    // Bakväggen fylls.
+    assert!(f.iter().any(|(_, c)| *c == Rgba::rgb8(0xF0, 0xF0, 0xF0)));
+    // Rastret och PDF:en klarar diagrammet.
+    assert!(render_png(&scene).len() == 400 * 300 * 4);
+    assert!(super::pdf::write(&d, &[0]).is_ok());
+}
+
+#[test]
+fn diagram_i_3d_alla_typer_och_former() {
+    let persp = r#"<c:view3D><c:rotX val="20"/><c:rotY val="30"/><c:depthPercent val="150"/><c:rAngAx val="0"/><c:perspective val="30"/></c:view3D>"#;
+    let cases = [
+        bar_3d("bar3DChart", "", persp).replace("<c:shape val=\"box\"/>", "<c:shape val=\"cylinder\"/>"),
+        bar_3d("bar3DChart", "", persp).replace("<c:shape val=\"box\"/>", "<c:shape val=\"coneToMax\"/>").replace("<c:barDir val=\"col\"/>", "<c:barDir val=\"bar\"/>"),
+        bar_3d("bar3DChart", "", persp).replace("<c:shape val=\"box\"/>", "<c:shape val=\"pyramid\"/>").replace("clustered", "stacked"),
+        bar_3d("line3DChart", "", persp).replace("<c:barDir val=\"col\"/>", ""),
+        bar_3d("area3DChart", "", persp).replace("<c:barDir val=\"col\"/>", "").replace("clustered", "standard"),
+    ];
+    for (n, xml) in cases.iter().enumerate() {
+        if let Some(dir) = std::env::var_os("KLADD_3D_PNG") {
+            let bytes = deck(&chart_frame(), &[("charts/chart1.xml", "chart", xml.as_bytes())]);
+            let scene = render::slide_scene(&Deck::open(&bytes).unwrap(), 0);
+            let pm = super::raster::render(&scene, 720, 540).unwrap();
+            let (w, h, rgba) = super::raster::to_rgba(pm);
+            image::RgbaImage::from_raw(w, h, rgba).unwrap().save(std::path::Path::new(&dir).join(format!("3d-{n}.png"))).unwrap();
+        }
+        let bytes = deck(&chart_frame(), &[("charts/chart1.xml", "chart", xml.as_bytes())]);
+        let d = Deck::open(&bytes).unwrap();
+        let scene = render::slide_scene(&d, 0);
+        let t = texts(&scene.items);
+        assert!(!t.iter().any(|x| x == "Diagram"), "ingen platshållare");
+        assert!(t.iter().any(|x| x == "B"), "kategorier: {t:?}");
+        // Allt hamnar inom diagramramen (72..472 × 72..372 pt).
+        for (b, _) in fills(&scene.items).into_iter().filter(|(b, _)| b.2 - b.0 < 700.0) {
+            assert!(b.0 >= 71.0 && b.2 <= 473.0 && b.1 >= 71.0 && b.3 <= 373.0, "{b:?} utanför ramen");
+        }
+        assert!(fills(&scene.items).len() > 4, "fall {n}: {}", fills(&scene.items).len());
+        render_png(&scene);
+    }
+}
+
+#[test]
+fn cirkel_i_3d_har_sidor_med_overtoning() {
+    let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<c:chart><c:autoTitleDeleted val="1"/><c:view3D><c:rotX val="30"/><c:rotY val="0"/><c:rAngAx val="0"/></c:view3D><c:plotArea><c:layout/>
+<c:pie3DChart><c:varyColors val="1"/><c:ser><c:idx val="0"/><c:order val="0"/><c:explosion val="10"/>
+<c:val><c:numLit><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>3</c:v></c:pt></c:numLit></c:val></c:ser></c:pie3DChart>
+</c:plotArea></c:chart></c:chartSpace>"#;
+    let bytes = deck(&chart_frame(), &[("charts/chart1.xml", "chart", xml.as_bytes())]);
+    let d = Deck::open(&bytes).unwrap();
+    let scene = render::slide_scene(&d, 0);
+    // Topparna i accent1/accent2 ritas sist; sidorna är vågräta övertoningar, mörkare än toppen.
+    let f = fills(&scene.items);
+    let tops: Vec<usize> = f.iter().enumerate().filter(|(_, (_, c))| *c == Rgba::rgb8(0x44, 0x72, 0xC4) || *c == Rgba::rgb8(0xED, 0x7D, 0x31)).map(|(i, _)| i).collect();
+    assert_eq!(tops.len(), 2);
+    let grads: Vec<&Item> = scene.items.iter().filter(|i| matches!(i, Item::Fill { paint: Paint::Linear { .. }, .. })).collect();
+    assert!(!grads.is_empty(), "sidor med övertoning");
+    let last_grad = scene.items.iter().rposition(|i| matches!(i, Item::Fill { paint: Paint::Linear { .. }, .. })).unwrap();
+    let first_top = scene.items.iter().position(|i| matches!(i, Item::Fill { paint: Paint::Solid(c), .. } if *c == Rgba::rgb8(0x44, 0x72, 0xC4) || *c == Rgba::rgb8(0xED, 0x7D, 0x31))).unwrap();
+    assert!(last_grad < first_top, "sidorna före topparna");
+    for g in grads {
+        if let Item::Fill { paint: Paint::Linear { stops, .. }, .. } = g {
+            assert!(stops.iter().all(|s| s.color.r < 0.95 && s.color.b < 0.8));
+        }
+    }
+}
+
+/// En fylld rektangel med `extra` i `spPr` (efter fyllningen).
+fn shape_3d(extra: &str) -> String {
+    format!(r#"<p:sp><p:nvSpPr><p:cNvPr id="3" name="Form"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1270000" y="1270000"/><a:ext cx="2540000" cy="1270000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>{extra}</p:spPr></p:sp>"#)
+}
+
+#[test]
+fn rakt_framifran_utan_fasning_ger_samma_bild() {
+    let plain = Deck::open(&deck(&shape_3d(""), &[])).unwrap();
+    let front = Deck::open(&deck(&shape_3d(r#"<a:scene3d><a:camera prst="orthographicFront"/><a:lightRig rig="threePt" dir="t"/></a:scene3d><a:sp3d/>"#), &[])).unwrap();
+    let a = super::raster::render(&render::slide_scene(&plain, 0), 480, 360).unwrap();
+    let b = super::raster::render(&render::slide_scene(&front, 0), 480, 360).unwrap();
+    assert!(a.data() == b.data(), "samma bildpunkter");
+    // Med en fasning blir det skillnad.
+    let bev = Deck::open(&deck(&shape_3d(r#"<a:scene3d><a:camera prst="orthographicFront"/><a:lightRig rig="threePt" dir="t"/></a:scene3d><a:sp3d><a:bevelT w="127000" h="76200"/></a:sp3d>"#), &[])).unwrap();
+    let c = super::raster::render(&render::slide_scene(&bev, 0), 480, 360).unwrap();
+    assert!(a.data() != c.data());
+}
+
+#[test]
+fn pdf_med_3d_effekter() {
+    let plain = super::pdf::write(&Deck::open(&deck(&shape_3d(""), &[])).unwrap(), &[0]).unwrap();
+    for extra in [
+        r#"<a:scene3d><a:camera prst="orthographicFront"/><a:lightRig rig="threePt" dir="t"/></a:scene3d><a:sp3d><a:bevelT w="127000" h="76200" prst="coolSlant"/></a:sp3d>"#,
+        r#"<a:sp3d contourW="25400"><a:contourClr><a:srgbClr val="FF0000"/></a:contourClr></a:sp3d>"#,
+        r#"<a:scene3d><a:camera prst="isometricOffAxis1Right"/><a:lightRig rig="threePt" dir="t"/></a:scene3d><a:sp3d extrusionH="127000"><a:bevelT/></a:sp3d>"#,
+    ] {
+        let d = Deck::open(&deck(&shape_3d(extra), &[])).unwrap();
+        let pdf = super::pdf::write(&d, &[0]).expect("PDF");
+        assert!(pdf.len() > plain.len() + 200, "3D-effekten som rasterbild i PDF:en: {} mot {}", pdf.len(), plain.len());
+    }
+}
