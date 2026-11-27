@@ -12,6 +12,8 @@ Håll den under ca 15 MB och föredra små filer.
   ändrar inget. Till sist läggs ett stycke sist; efter sparning och omläsning ska allt annat vara kvar.
 - `corpus_pdf`: `pdf_read::read` utan panik, `PdfEngine::open` ger samma sidantal, första sidan renderas i låg upplösning.
   Krypterade filer ska ge `NeedsPassword`.
+- `corpus_pptx_miniatyrer` (`src/pptx/tests.rs`): bild 1 i varje `pptx/*.pptx` jämförs med PowerPoints egen miniatyr
+  (`docProps/thumbnail.jpeg`); måttet i `pptx/manifest.toml` får inte sjunka mer än 0,03. Se `docs/dev/pptx.md`.
 - `corpus_soffice_docx`, `corpus_soffice_odt` (`#[ignore]`): de sparade filerna, orörda och ändrade, konverteras med
   `soffice --headless --convert-to pdf`. Kör med `KLADD_CORPUS_SOFFICE=1 cargo test corpus_soffice -- --ignored`;
   utan variabeln hoppas testet över om `soffice` saknas, med den är det ett fel. CI-jobbet *korpus i LibreOffice* gör detta.

@@ -32,6 +32,7 @@ mod en_misc;
 mod en_odtrev;
 mod en_para;
 mod en_pdf;
+mod en_pptx;
 mod en_review;
 mod en_tables2;
 mod en_templates;
@@ -122,7 +123,7 @@ static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
 });
 
 fn tables() -> &'static [&'static [(&'static str, &'static str)]] {
-    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN, en_menus::EN, en_git::EN, en_templates::EN, en_track2::EN, en_csv::EN, en_lsp::EN, en_vim::EN, en_math::EN, en_code::EN, en_styles2::EN, en_para::EN, en_tables2::EN, en_legacy::EN, en_epub::EN]
+    &[en_app::EN, en_word::EN, en_pdf::EN, en_doc::EN, en_misc::EN, en_review::EN, en_incr::EN, en_odtrev::EN, en_autocorrect::EN, en_annot2::EN, en_menus::EN, en_git::EN, en_templates::EN, en_track2::EN, en_csv::EN, en_lsp::EN, en_vim::EN, en_math::EN, en_code::EN, en_styles2::EN, en_para::EN, en_tables2::EN, en_legacy::EN, en_epub::EN, en_pptx::EN]
 }
 
 /// Översätter en svensk text. Saknas översättningen visas svenskan.

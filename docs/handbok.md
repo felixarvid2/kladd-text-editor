@@ -10,7 +10,7 @@ Den fullständiga beskrivningen av Kladds funktioner. En kort översikt finns i 
 - **Versionshistorik** – varje sparning lagrar en version (gallras automatiskt). *Arkiv → Versionshistorik…* jämför med aktuell text och kan återställa en version eller öppna den i en ny flik.
 - **Mallar** – *Ny från mall…* (`Ctrl+Shift+N`) visar ett galleri med brev, rapport, mötesprotokoll, dagordning, CV, faktura, uppsats, anteckningar, README och tomma sidor, på svenska eller engelska. `{{platshållare}}` som namn och datum fylls i i ett formulär. *Spara som mall…* gör det aktuella dokumentet till en egen mall (under *Mina mallar*, i datakatalogens `mallar/`), och en .docx eller .odt kan importeras som mall. De inbyggda ligger som filer i `assets/templates/`.
 - **Vim-läge** – *Vim-läge* i huvudmenyn ger Vim-tangentbindningar i textläget (av som standard; inte i dokumentläget eller PDF). Lägena normal, infoga, markera (tecken, rad, block), ersätt och kommandorad (`:`), med antal, operatorer (`d c y > < gu gU ~`) och rörelser, textobjekt (`iw aw ip ap i" a" i( a( i[ i{ it` m.fl.), register (`"a`–`"z`, `"+` för urklipp), markeringar, `.`, ångra/gör om, sökning (`/ ? n N * #`) och makron (`q`/`@`). Kommandoraden har `:w :q :wq :x :q! :e fil`, `:s` och `:%s` med Rusts reguljära uttryck, `:<rad>`, `:set nu/nonu/wrap/nowrap`, `:noh` och `:sp`/`:vs` (delad vy). Blockmarkör i normalläget, läget och väntande kommando visas i statusraden. Kladds Ctrl-genvägar fungerar som vanligt utom de Vim använder i normalläget (`Ctrl+d`, `u`, `r`, `v`, `o`). Flera markörer är avstängda medan Vim-läget är på.
-- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), många kodformat och PDF. PDF:er visas i en PDF-visare, se [PDF](#pdf). E-böcker (`.epub`) öppnas i ett läsläge, se [EPUB](#epub).
+- **Öppna och spara** `.txt`, `.md`, Word-dokument (`.docx`), OpenDocument-text (`.odt`), många kodformat och PDF. PDF:er visas i en PDF-visare, se [PDF](#pdf). E-böcker (`.epub`) öppnas i ett läsläge, se [EPUB](#epub). PowerPoint-presentationer visas med miniatyrer, bildspel och anteckningar, se [PowerPoint](#powerpoint).
 - **Utskrift** med `Ctrl+P` till CUPS-skrivare (kopior, sidintervall, dubbelsidigt) eller som PDF. PDF-filen följer dokumentets sidstorlek och marginaler och har sidnummer i sidhuvud och sidfot.
 - **Klistra in formaterad text** från Word, LibreOffice, Google Dokument och webbsidor. Ctrl+Shift+V klistrar in utan formatering.
 - **Förlustfri Word-sparning** – Word-filer sparas med alla sina delar kvar, se [Word-dokument](#word-dokument).
@@ -325,6 +325,38 @@ En `.epub` öppnas i ett läsläge för bara läsning, med ett gränssnitt som l
 
 Klick i marginalen utanför spalten går en skärm bakåt (vänster) eller framåt (höger).
 
+## PowerPoint
+
+En PowerPoint-presentation (`.pptx`, och även `.ppsx`, `.potx` och `.pptm`) öppnas i en presentationsvy för bara läsning. Bilderna ritas med Kladds egen ritmotor (former, bilder, text med PowerPoints radavstånd och autoanpassning, tabeller och SmartArt) i bakgrundstrådar, så att gränssnittet inte fryser. Makron i `.pptm` körs aldrig. Gamla `.ppt`-filer konverteras till `.pptx` med LibreOffice när de öppnas (som `.doc`), och utan LibreOffice säger Kladd det. Presentationen skrivs aldrig över: *Spara* visar ett meddelande.
+
+**Vyn.** Till vänster ligger miniatyrlisten (`F4`) med bildnummer; aktuell bild är markerad, ett klick hoppar dit, och dolda bilder är tonade med överstruket nummer. *Visa* i verktygsraden växlar mellan *Bild för bild* (en bild i taget, som PowerPoints normalvy) och *Rullande lista* (alla bilder under varandra). Zoomen har lägena *Hel bild* (hela bilden syns), *Bildbredd* och fasta procent. I läget bild för bild bläddrar mushjulet mellan bilderna när hela bilden syns. Talaranteckningarna visas i en panel under bilden när presentationen har anteckningar (av och på under *Visa*; dra i kanten för att ändra höjden). Statusraden visar *Bild 4 av 12*. Bilden du var på sparas per fil för de 100 senaste presentationerna.
+
+**Bildspel.** `F5` startar bildspelet i helskärm från början och `Skift+F5` från aktuell bild (eller knappen *Bildspel* och *Visa*-menyn). Dolda bilder hoppas över. Nästa bild förrenderas medan du visar den aktuella. Efter sista bilden visas en svart skärm med *Slut på bildspelet*; ett steg till avslutar.
+
+| Kommando | Funktion |
+|---|---|
+| `Höger` / `Ner` / `Mellanslag` / `Page Down` / `Enter` / `N` / klick / hjulet nedåt | Nästa bild |
+| `Vänster` / `Upp` / `Backsteg` / `Page Up` / `P` / högerklick / hjulet uppåt | Föregående bild |
+| `Home` / `End` | Första / sista bilden |
+| `B` eller `.` / `W` eller `,` | Svart / vit skärm (samma tangent igen, eller nästa, tar tillbaka bilden) |
+| `Esc` | Avsluta bildspelet |
+
+**Sök.** `Ctrl+F` söker i bildernas text och i anteckningarna. Träffarna markeras på bilden (gult, den aktuella orange) och i anteckningspanelen, fältet visar *träff av antal*, och `Enter`/`Skift+Enter` (eller `F3`/`Skift+F3`) går mellan träffarna; en träff i anteckningarna öppnar panelen. Texten tas ur samma ritning som visas, så det som syns på bilden är det som hittas.
+
+**Export och utskrift.** *Exportera som PDF…* (i *Visa*-menyn och Arkiv-menyn) gör en PDF med riktig, sökbar text av alla bilder som inte är dolda, med samma ritning som på skärmen. `Ctrl+P` skriver ut samma PDF.
+
+**Redigera en kopia** (knappen uppe till höger, eller Arkiv-menyn) öppnar presentationens text som ett nytt, osparat dokument i dokumentläget: en rubrik per bild (bildens titel, annars *Bild 3*), punktlistor med nivåer ur textplatshållarna, vanliga stycken ur textrutor, tabeller som tabeller, bilder (PNG, JPEG, GIF, SVG; inte EMF/WMF) och anteckningarna som citat. Presentationen själv ändras inte; kopian kan sparas som `.md`, `.docx` eller `.pdf`.
+
+| Kommando | Funktion |
+|---|---|
+| `F4` | Miniatyrer på/av |
+| `F5` / `Skift+F5` | Bildspel från början / från aktuell bild |
+| `Page Down` / `Page Up`, `Höger` / `Vänster` | Nästa / föregående bild (i bild för bild även `Mellanslag`, `Ner`/`Upp`) |
+| `Home` / `End` | Första / sista bilden |
+| `Ctrl+F`, `F3` / `Skift+F3` | Sök, nästa / föregående träff |
+| `Ctrl++` / `Ctrl+-` | Zooma in / ut |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` (eller `Ctrl+0`) | Verklig storlek / bildbredd / hel bild |
+
 ## Kortkommandon
 
 På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
@@ -361,6 +393,7 @@ På Mac används ⌘ i stället för Ctrl och ⌥ i stället för Alt.
 | `Alt+Z` | Radbrytning på/av |
 | `Ctrl+Shift+M` | Byt mellan läsläge och redigering för Markdown |
 | `Mellanslag`, `[` / `]`, `Alt+Vänster`, `Ctrl+I`, `Ctrl+D` m.fl. | Läsläget för e-böcker, se [EPUB](#epub) |
+| `F4`, `F5` / `Skift+F5`, `B` / `W` m.fl. | Presentationer och bildspel, se [PowerPoint](#powerpoint) |
 | `Ctrl+\` | Dela vyn i två rutor |
 | `Ctrl+Shift+\` | Dela vyn vågrätt |
 | `F6` | Byt aktiv ruta i delad vy |

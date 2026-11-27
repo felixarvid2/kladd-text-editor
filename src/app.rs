@@ -44,6 +44,9 @@ pub(crate) mod commands;
 // EPUB-läsläget i appen (flik, sidopanel, tangenter, lägesminne).
 #[path = "epub/glue.rs"]
 mod epub_glue;
+// Presentationer (.pptx) i en egen flikvy.
+#[path = "pptx/glue.rs"]
+mod pptx_glue;
 
 const SETTINGS_KEY: &str = "kladd-settings";
 const TOPBAR_H: f32 = 46.0;
@@ -100,6 +103,10 @@ pub struct Settings {
     pub epub: crate::epub::view::Prefs,
     /// Var man var (del och rullning) i senast öppnade böcker, nyast först.
     pub epub_memory: Vec<(String, crate::epub::view::Memory)>,
+    /// Presentationsvyn: miniatyrer, anteckningar, visningsläge och zoom (gäller alla presentationer).
+    pub pptx: crate::pptx::view::Prefs,
+    /// Senast visade bild i senast öppnade presentationer, nyast först.
+    pub pptx_memory: Vec<(String, crate::pptx::view::Memory)>,
     /// Sök efter nya versioner av Kladd (högst en gång per dygn).
     pub auto_update_check: bool,
     /// Senaste lyckade kontroll, sekunder sedan 1970.
@@ -154,6 +161,8 @@ impl Default for Settings {
             pdf_memory: Vec::new(),
             epub: Default::default(),
             epub_memory: Vec::new(),
+            pptx: Default::default(),
+            pptx_memory: Vec::new(),
             auto_update_check: true,
             update_last_check: 0,
             update_skip: None,
@@ -687,6 +696,7 @@ impl KladdApp {
     fn install_doc(&mut self, ctx: &egui::Context, mut doc: Document, canonical: &Path) {
         self.next_id += 1;
         self.epub_restore(&mut doc);
+        self.pptx_restore(&mut doc);
         if crate::mdread::opens_in_reading(&doc) {
             self.md_reading.insert(doc.id);
         }
@@ -806,7 +816,8 @@ impl KladdApp {
                 .add_filter(t("OpenDocument-text"), &["odt", "ott"])
                 .add_filter(t("Äldre dokument (via LibreOffice)"), crate::legacy::EXTENSIONS)
                 .add_filter("PDF", &["pdf"])
-                .add_filter(t("E-bok (.epub)"), &["epub"]);
+                .add_filter(t("E-bok (.epub)"), &["epub"])
+                .add_filter(t("PowerPoint (.pptx)"), crate::pptx::EXTENSIONS);
             if let Some(dir) = dir {
                 dlg = dlg.set_directory(dir);
             }
@@ -824,6 +835,10 @@ impl KladdApp {
         let Some(doc) = self.docs.get(idx) else { return };
         if doc.epub.is_some() {
             self.notify(ctx, t("Boken sparas inte. Använd Redigera en kopia för att ändra texten."), false);
+            return;
+        }
+        if doc.pptx.is_some() {
+            self.notify(ctx, t("Presentationen visas bara; den kan inte sparas från Kladd än."), false);
             return;
         }
         let (tx, rx) = channel();
@@ -869,7 +884,7 @@ impl KladdApp {
     }
 
     pub(crate) fn request_insert_image(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() || self.docs.is_empty() || self.pdf_mode() || self.epub_mode() {
+        if self.dialog.is_some() || self.docs.is_empty() || self.pdf_mode() || self.epub_mode() || self.pptx_mode() {
             return;
         }
         let doc_id = self.docs[self.active].id;
@@ -942,6 +957,10 @@ impl KladdApp {
         }
         if doc.epub.is_some() {
             self.notify(ctx, t("Boken sparas inte. Använd Redigera en kopia för att ändra texten."), false);
+            return;
+        }
+        if doc.pptx.is_some() {
+            self.notify(ctx, t("Presentationen visas bara; den kan inte sparas från Kladd än."), false);
             return;
         }
         let Some(path) = doc.path.clone().filter(|_| !doc.needs_save_as()) else {
@@ -1112,6 +1131,7 @@ impl KladdApp {
         }
         self.store_pdf_memory(idx);
         self.store_epub_memory(idx);
+        self.store_pptx_memory(idx);
         let doc = self.docs.remove(idx);
         self.autosave.forget(doc.id);
         self.recovery.forget(doc.id);
@@ -1148,6 +1168,10 @@ impl KladdApp {
         }
         if self.epub_mode() {
             self.epub_open_find();
+            return;
+        }
+        if self.pptx_mode() {
+            self.pptx_open_find();
             return;
         }
         // Sök fungerar i läsläget; ersätt kräver redigeraren.
@@ -1489,7 +1513,7 @@ impl KladdApp {
             }
             // En SVG-fil är också text (XML): den infogas bara i ett dokument med bilder, annars öppnas den.
             let svg_as_text = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) && !self.docs.get(self.active).is_some_and(|d| d.is_markdown());
-            if is_image_path(&p) && !svg_as_text && !self.docs.is_empty() && !self.pdf_mode() && !self.epub_mode() {
+            if is_image_path(&p) && !svg_as_text && !self.docs.is_empty() && !self.pdf_mode() && !self.epub_mode() && !self.pptx_mode() {
                 self.insert_image(ctx, &p);
             } else {
                 self.open_path(ctx, &p);
@@ -1499,7 +1523,7 @@ impl KladdApp {
 
     /// Vim-läget är på och gäller den aktiva fliken (inte dokumentläget eller PDF).
     fn vim_active(&self) -> bool {
-        self.settings.vim && !self.docs.is_empty() && !self.pdf_mode() && !self.epub_mode() && !self.word_mode()
+        self.settings.vim && !self.docs.is_empty() && !self.pdf_mode() && !self.epub_mode() && !self.pptx_mode() && !self.word_mode()
     }
 
     /// Vim-läget: tar tangenterna före resten och utför det Vim ber om.
@@ -1622,6 +1646,10 @@ impl KladdApp {
             self.pdf_shortcuts(ctx);
             return;
         }
+        if self.pptx_presenting() {
+            self.pptx_show_keys(ctx);
+            return;
+        }
         // Ctrl+Skift+P före Ctrl+P (skriv ut): `consume_shortcut` bryr sig inte om extra Skift.
         if hit(ctrl_shift, Key::P) {
             self.open_palette();
@@ -1699,6 +1727,17 @@ impl KladdApp {
         // EPUB-läsläget: bläddring, kapitel, sök och typografi; resten av genvägarna hör till redigeraren.
         if self.epub_mode() {
             self.epub_shortcuts(ctx);
+            if hit(ctrl_shift, Key::K) || hit(ctrl_shift, Key::L) {
+                self.toggle_theme(ctx);
+            }
+            if hit(ctrl, Key::Q) {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            return;
+        }
+        // Presentationer: bara visning; redigerarens genvägar gäller inte.
+        if self.pptx_mode() {
+            self.pptx_shortcuts(ctx);
             if hit(ctrl_shift, Key::K) || hit(ctrl_shift, Key::L) {
                 self.toggle_theme(ctx);
             }
@@ -2045,6 +2084,10 @@ impl KladdApp {
                         crate::epub::view::status(ui, p, &font, tab, &self.settings.epub);
                         return;
                     }
+                    if let Some(tab) = self.docs.get(self.active).and_then(|d| d.pptx.as_deref()) {
+                        crate::pptx::view::status(ui, p, &font, tab);
+                        return;
+                    }
                     self.lsp_status(ui, p, &font);
                     let Some(doc) = self.docs.get_mut(self.active) else { return };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2181,6 +2224,10 @@ impl KladdApp {
         }
         if self.epub_mode() {
             self.epub_page(ui, p);
+            return;
+        }
+        if self.pptx_mode() {
+            self.pptx_page(ui, p);
             return;
         }
         if self.word_mode() {
@@ -3993,6 +4040,7 @@ impl eframe::App for KladdApp {
         self.handle_drops(&ctx);
         self.handle_shortcuts(&ctx);
         self.pdf_sync_fullscreen(&ctx);
+        self.pptx_sync_fullscreen(&ctx);
         self.pdf_frame(&ctx);
 
         // Presentationsläget: bara sidan, inga fält eller paneler.
@@ -4000,10 +4048,15 @@ impl eframe::App for KladdApp {
             self.pdf_page(ui, &p);
             return;
         }
+        if self.pptx_presenting() {
+            self.pptx_show_page(ui);
+            return;
+        }
 
         self.top_bar(ui, &p);
         self.word_bar(ui, &p);
         self.pdf_bar(ui, &p);
+        self.pptx_bar(ui, &p);
         self.git_tick(&ctx);
         self.status_bar(ui, &p);
         self.lsp_panel(ui, &p);
@@ -4011,6 +4064,7 @@ impl eframe::App for KladdApp {
         self.find_files_panel(ui, &p);
         self.pdf_sidebar(ui, &p);
         self.epub_sidebar(ui, &p);
+        self.pptx_sidebar(ui, &p);
         self.workspace_panel(ui, &p);
         self.nav_pane(ui, &p);
         self.preview(ui, &p);
@@ -4024,6 +4078,7 @@ impl eframe::App for KladdApp {
         self.lsp_dialogs(&ctx, &p);
         self.pdf_overlays(&ctx, &p);
         self.epub_overlays(&ctx, &p);
+        self.pptx_overlays(&ctx, &p);
         self.autocorrect_dialog(&ctx);
         self.close_dialog(&ctx, &p);
         self.recovery_dialog(&ctx, &p);
@@ -4058,6 +4113,7 @@ impl eframe::App for KladdApp {
         for i in 0..self.docs.len() {
             self.store_pdf_memory(i);
             self.store_epub_memory(i);
+            self.store_pptx_memory(i);
         }
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
     }

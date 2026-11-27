@@ -1,5 +1,6 @@
 //! Gamla dokumentformat (.doc, .rtf, .wpd, .wps): konverteras till .docx med LibreOffice i en
-//! bakgrundstråd och öppnas sedan i dokumentläget. Utan LibreOffice ger Kladd ett tydligt fel;
+//! bakgrundstråd och öppnas sedan i dokumentläget. Gamla PowerPoint-filer (.ppt) konverteras på
+//! samma sätt till .pptx och öppnas i presentationsvyn. Utan LibreOffice ger Kladd ett tydligt fel;
 //! .rtf läses då med en enkel inbyggd läsare (text, fet, kursiv, stycken).
 
 use std::ffi::{OsStr, OsString};
@@ -15,7 +16,7 @@ use crate::theme::Palette;
 use crate::{i18n::t, tf};
 
 /// Filändelser som konverteras med LibreOffice.
-pub const EXTENSIONS: &[&str] = &["doc", "rtf", "wpd", "wps"];
+pub const EXTENSIONS: &[&str] = &["doc", "rtf", "wpd", "wps", "ppt"];
 
 /// Så länge får en konvertering ta innan den avbryts.
 pub const TIMEOUT: Duration = Duration::from_secs(120);
@@ -37,7 +38,7 @@ pub fn needs_conversion(path: &Path) -> bool {
 
 fn classify(ext: &str, head: &[u8]) -> bool {
     match ext {
-        "doc" => head.starts_with(&OLE_MAGIC),
+        "doc" | "ppt" => head.starts_with(&OLE_MAGIC),
         "rtf" => head.starts_with(b"{\\rtf"),
         "wpd" | "wps" => true,
         _ => false,
@@ -88,6 +89,12 @@ pub fn file_url(path: &Path) -> String {
     out
 }
 
+/// Formatet LibreOffice ska konvertera till: .pptx för presentationer, annars .docx.
+pub fn target_ext(input: &Path) -> &'static str {
+    let ext = input.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if ext == "ppt" { "pptx" } else { "docx" }
+}
+
 /// Argumenten till `soffice`. Eget användarprofil-bibliotek gör att en redan öppen LibreOffice inte
 /// tar över anropet (då skulle konverteringen aldrig köras).
 pub fn convert_args(profile: &Path, outdir: &Path, input: &Path) -> Vec<OsString> {
@@ -97,7 +104,7 @@ pub fn convert_args(profile: &Path, outdir: &Path, input: &Path) -> Vec<OsString
         "--norestore".into(),
         "--nolockcheck".into(),
         "--convert-to".into(),
-        "docx".into(),
+        target_ext(input).into(),
         "--outdir".into(),
         outdir.into(),
         input.into(),
@@ -122,7 +129,7 @@ impl Drop for TempDir {
     }
 }
 
-/// Konverterar `input` till .docx med `soffice` och ger filens innehåll. Avbryts efter `timeout`.
+/// Konverterar `input` till .docx (eller .pptx, se [`target_ext`]) med `soffice` och ger filens innehåll. Avbryts efter `timeout`.
 pub fn convert(soffice: &Path, input: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
     let tmp = TempDir::new().map_err(|e| tf!("Kunde inte skapa en temporär katalog: {e}", e = e))?;
     let out = tmp.0.join("ut");
@@ -148,19 +155,25 @@ pub fn convert(soffice: &Path, input: &Path, timeout: Duration) -> Result<Vec<u8
         }
     }
     let stem = input.file_stem().unwrap_or_default();
-    let result = out.join(Path::new(stem).with_extension("docx"));
+    let result = out.join(Path::new(stem).with_extension(target_ext(input)));
     std::fs::read(&result).map_err(|_| t("LibreOffice kunde inte konvertera filen.").to_owned())
 }
 
 /// Felet när LibreOffice saknas.
 pub fn missing_message(path: &Path) -> String {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if target_ext(path) == "pptx" {
+        return tf!("{name} kan bara öppnas med LibreOffice, som inte hittades. Installera det från libreoffice.org eller öppna filen i PowerPoint och spara som .pptx.", name = name);
+    }
     tf!("{name} kan bara öppnas med LibreOffice, som inte hittades. Installera det från libreoffice.org eller öppna filen i Word och spara som .docx.", name = name)
 }
 
 /// Notisen när en konverterad fil har öppnats.
 pub fn converted_note(path: &Path) -> String {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if target_ext(path) == "pptx" {
+        return tf!("{name} konverterades med LibreOffice. Originalet ändras inte.", name = name);
+    }
     tf!("{name} konverterades med LibreOffice. Originalet ändras inte: Spara som skapar en .docx.", name = name)
 }
 

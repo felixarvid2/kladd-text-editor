@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "kladd"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -2449,6 +2449,7 @@ dependencies = [
  "sys-locale",
  "trash",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-normalization",
  "ureq",
  "windows-sys 0.61.2",

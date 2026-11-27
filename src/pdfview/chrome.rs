@@ -35,7 +35,7 @@ pub const CHECK_EVERY: f64 = 1.0;
 /// Högsta antal filer vars visningsläge sparas.
 pub const MAX_MEMORY: usize = 100;
 
-const BAR_H: f32 = 40.0;
+pub(crate) const BAR_H: f32 = 40.0;
 const BTN: f32 = 30.0;
 
 /// Det raden och dialogerna ber appen göra.
@@ -412,7 +412,7 @@ pub fn current_section(outline: &[OutlineItem], page: usize) -> Option<Vec<usize
 // ------------------------------------------------------------ ikoner
 
 #[derive(Clone, Copy)]
-enum G {
+pub(crate) enum G {
     Std(Icon),
     Sidebar,
     Left,
@@ -478,7 +478,7 @@ fn paint_glyph(ui: &Ui, g: G, c: egui::Pos2, color: Color32, under: Color32) {
     }
 }
 
-fn tool_btn(ui: &mut Ui, p: &Palette, g: G, active: bool, enabled: bool, tip: &str) -> Response {
+pub(crate) fn tool_btn(ui: &mut Ui, p: &Palette, g: G, active: bool, enabled: bool, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), if enabled { Sense::click() } else { Sense::hover() });
     let resp = resp.on_hover_text(crate::keys::shortcut(tip));
     if ui.is_rect_visible(rect) {
@@ -506,7 +506,7 @@ fn tool_btn(ui: &mut Ui, p: &Palette, g: G, active: bool, enabled: bool, tip: &s
     resp
 }
 
-fn bar_divider(ui: &mut Ui, p: &Palette) {
+pub(crate) fn bar_divider(ui: &mut Ui, p: &Palette) {
     ui.add_space(3.0);
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line));
@@ -514,7 +514,7 @@ fn bar_divider(ui: &mut Ui, p: &Palette) {
 }
 
 /// Knapp med text och liten pil som öppnar en meny.
-fn menu_trigger(ui: &mut Ui, p: &Palette, label: &str) -> Response {
+pub(crate) fn menu_trigger(ui: &mut Ui, p: &Palette, label: &str) -> Response {
     let font = FontId::new(13.5, FontFamily::Proportional);
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, p.text);
     let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 32.0, BTN), Sense::click());
@@ -527,7 +527,7 @@ fn menu_trigger(ui: &mut Ui, p: &Palette, label: &str) -> Response {
     resp
 }
 
-fn menu_heading(ui: &mut Ui, p: &Palette, text: &str) {
+pub(crate) fn menu_heading(ui: &mut Ui, p: &Palette, text: &str) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(10.0);
@@ -807,7 +807,7 @@ pub fn sidebar(ui: &mut Ui, p: &Palette, tab: &mut PdfTab) -> Option<Action> {
     act
 }
 
-fn side_tab_button(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> Response {
+pub(crate) fn side_tab_button(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> Response {
     let font = FontId::new(13.0, if active { theme::medium() } else { FontFamily::Proportional });
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, if active { p.text } else { p.muted });
     let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 20.0, 26.0), Sense::click());
