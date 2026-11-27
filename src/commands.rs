@@ -58,6 +58,8 @@ pub enum Scope {
     Word,
     /// PDF-visaren.
     Pdf,
+    /// Presentationsvyn (.pptx).
+    Pptx,
 }
 
 /// Ögonblicksbild av det som `enabled` och `checked` behöver veta om appen. Byggs en gång per bild
@@ -87,6 +89,8 @@ pub struct Env<'a> {
     pub md_reading: bool,
     /// Den aktiva fliken är en bok (EPUB).
     pub epub: bool,
+    /// Den aktiva fliken är en presentation (.pptx).
+    pub pptx: bool,
 }
 
 impl<'a> Env<'a> {
@@ -112,6 +116,7 @@ impl<'a> Env<'a> {
             lsp_panel: app.lsp.ui.panel,
             md_reading: app.md_read_mode(),
             epub: app.epub_mode(),
+            pptx: app.pptx_mode(),
         }
     }
 
@@ -138,6 +143,7 @@ impl<'a> Env<'a> {
             lsp_panel: false,
             md_reading: false,
             epub: false,
+            pptx: false,
         }
     }
 }
@@ -210,6 +216,7 @@ impl Command {
             Scope::Any => true,
             Scope::Word => env.word,
             Scope::Pdf => env.pdf,
+            Scope::Pptx => env.pptx,
         }
     }
 
@@ -294,7 +301,13 @@ impl KladdApp {
     }
 
     fn cmd_zoom(&mut self, dir: f32) {
-        if self.word_mode() { self.word_zoom_step(dir) } else { self.zoom(dir) }
+        if self.pptx_mode() {
+            self.pptx_zoom(dir);
+        } else if self.word_mode() {
+            self.word_zoom_step(dir)
+        } else {
+            self.zoom(dir)
+        }
     }
 
     fn cmd_set_lang(&mut self, ctx: &egui::Context, l: i18n::LangSetting) {
@@ -336,14 +349,16 @@ pub static ALL: &[Command] = &[
     Command::new("file.new_template", "Ny från mall…", File, "Ctrl+Shift+N", always, |a, _| a.open_templates()),
     Command::new("file.open", "Öppna…", File, "Ctrl+O", always, |a, c| a.request_open(c)),
     Command::new("file.save", "Spara", File, "Ctrl+S", |e| e.has_doc, |a, c| a.cmd_save(c)),
-    Command::new("file.save_as", "Spara som…", File, "Ctrl+Shift+S", |e| e.has_doc && !e.pdf, |a, c| a.request_save_as(c, a.active, false, false)),
-    Command::new("file.save_template", "Spara som mall…", File, "", |e| e.has_doc && !e.pdf, |a, _| a.open_save_template()),
+    Command::new("file.save_as", "Spara som…", File, "Ctrl+Shift+S", |e| e.has_doc && !e.pdf && !e.pptx, |a, c| a.request_save_as(c, a.active, false, false)),
+    Command::new("file.save_template", "Spara som mall…", File, "", |e| e.has_doc && !e.pdf && !e.pptx, |a, _| a.open_save_template()),
     Command::new("file.save_copy", "Spara kopia…", File, "Ctrl+Shift+S", |e| e.pdf, |a, c| a.request_save_copy(c, a.active)),
     Command::new("file.export_html", "Exportera som webbsida…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "html")),
     Command::new("file.export_epub", "Exportera som e-bok…", File, "", |e| e.markdown && !e.pdf, |a, c| a.request_export(c, "epub")),
     Command::new("file.export_notes", "Exportera anteckningar…", File, "", |e| e.epub, |a, c| a.epub_export_notes(c)),
+    Command::new("file.pptx_export_pdf", "Exportera som PDF…", File, "", |e| e.pptx, |a, c| a.pptx_export_pdf(c)).scope(Scope::Pptx),
+    Command::new("file.pptx_edit_copy", "Redigera en kopia", File, "", |e| e.pptx, |a, c| a.pptx_action(c, crate::pptx::view::Action::EditCopy)).scope(Scope::Pptx),
     Command::new("file.print", "Skriv ut…", File, "Ctrl+P", |e| e.has_doc, |a, c| a.open_print(c)),
-    Command::new("file.history", "Versionshistorik…", File, "", |e| e.has_path && !e.pdf, |a, c| a.open_history(c)),
+    Command::new("file.history", "Versionshistorik…", File, "", |e| e.has_path && !e.pdf && !e.pptx, |a, c| a.open_history(c)),
     Command::new("file.open_folder", "Öppna mapp…", File, "", always, |a, c| a.request_folder(c)).sep(),
     Command::new("file.close_folder", "Stäng mapp", File, "", |e| e.settings.workspace.is_some(), |a, _| a.close_workspace()),
     Command::new("file.quick_open", "Snabböppna…", File, "Ctrl+E", always, |a, c| a.open_quick(c)),
@@ -355,7 +370,7 @@ pub static ALL: &[Command] = &[
     Command::new("edit.pdf_undo", "Ångra sidändring", Edit, "Ctrl+Z", |e| e.pdf, |a, c| a.pdf_organize(c, PdfOrgOp::Undo)).scope(Scope::Pdf),
     Command::new("edit.pdf_redo", "Gör om sidändring", Edit, "Ctrl+Shift+Z", |e| e.pdf, |a, c| a.pdf_organize(c, PdfOrgOp::Redo)).scope(Scope::Pdf),
     Command::new("edit.find", "Sök", Edit, "Ctrl+F", |e| e.has_doc, |a, c| a.open_find(c, false)).sep(),
-    Command::new("edit.replace", "Sök och ersätt", Edit, "Ctrl+H", |e| e.has_doc && !e.pdf, |a, c| a.open_find(c, true)),
+    Command::new("edit.replace", "Sök och ersätt", Edit, "Ctrl+H", |e| e.has_doc && !e.pdf && !e.pptx, |a, c| a.open_find(c, true)),
     Command::new("edit.find_next", "Nästa träff", Edit, "F3", |e| e.find_open && !e.pdf, |a, c| a.seek(c, Seek::Next)),
     Command::new("edit.find_prev", "Föregående träff", Edit, "Shift+F3", |e| e.find_open && !e.pdf, |a, c| a.seek(c, Seek::Prev)),
     Command::new("edit.find_files", "Sök i filer…", Edit, "Ctrl+Shift+F", always, |a, c| a.open_find_files(c)),
@@ -382,7 +397,13 @@ pub static ALL: &[Command] = &[
     Command::new("view.zoom_in", "Större text", View, "Ctrl++", always, |a, _| a.cmd_zoom(1.0)).sep(),
     Command::new("view.zoom_out", "Mindre text", View, "Ctrl+−", always, |a, _| a.cmd_zoom(-1.0)),
     Command::new("view.zoom_reset", "Normal textstorlek", View, "Ctrl+0", always, |a, _| {
-        if a.word_mode() { a.settings.word_zoom = 1.0 } else { a.settings.font_size = DEFAULT_FONT_SIZE }
+        if a.pptx_mode() {
+            a.pptx_zoom(0.0)
+        } else if a.word_mode() {
+            a.settings.word_zoom = 1.0
+        } else {
+            a.settings.font_size = DEFAULT_FONT_SIZE
+        }
     }),
     Command::new("view.pdf_sidebar", "Sidofält", View, "F4", |e| e.pdf, |a, _| {
         if let Some(t) = a.pdf_tab_mut() {
@@ -404,8 +425,16 @@ pub static ALL: &[Command] = &[
     })
     .scope(Scope::Pdf),
     Command::new("view.pdf_reload", "Läs om från disk", View, "", |e| e.pdf, |a, c| a.pdf_action(c, PdfAction::Reload)).scope(Scope::Pdf),
+    Command::new("view.pptx_thumbs", "Miniatyrer", View, "F4", |e| e.pptx, |a, _| a.settings.pptx.thumbs = !a.settings.pptx.thumbs).scope(Scope::Pptx).checked(|e| e.settings.pptx.thumbs).sep(),
+    Command::new("view.pptx_notes", "Anteckningar", View, "", |e| e.pptx, |a, _| a.settings.pptx.notes = !a.settings.pptx.notes).scope(Scope::Pptx).checked(|e| e.settings.pptx.notes),
+    Command::new("view.pptx_single", "Bild för bild", View, "", |e| e.pptx, |a, _| a.settings.pptx.scroll = false).scope(Scope::Pptx).checked(|e| !e.settings.pptx.scroll),
+    Command::new("view.pptx_scroll", "Rullande lista", View, "", |e| e.pptx, |a, _| a.settings.pptx.scroll = true).scope(Scope::Pptx).checked(|e| e.settings.pptx.scroll),
+    Command::new("view.pptx_fit_window", "Anpassa till fönstret", View, "Ctrl+3", |e| e.pptx, |a, _| a.settings.pptx.zoom = crate::pptx::view::Zoom::Window).scope(Scope::Pptx),
+    Command::new("view.pptx_fit_width", "Anpassa till bredden", View, "Ctrl+2", |e| e.pptx, |a, _| a.settings.pptx.zoom = crate::pptx::view::Zoom::Width).scope(Scope::Pptx),
+    Command::new("view.pptx_show", "Bildspel från början", View, "F5", |e| e.pptx, |a, c| a.pptx_start_show(c, false)).scope(Scope::Pptx).sep(),
+    Command::new("view.pptx_show_here", "Bildspel från aktuell bild", View, "Shift+F5", |e| e.pptx, |a, c| a.pptx_start_show(c, true)).scope(Scope::Pptx),
     // ---------------------------------------------------------------- Infoga
-    Command::new("insert.image", "Infoga bild…", Insert, "Ctrl+Shift+I", |e| e.has_doc && !e.pdf, |a, c| a.request_insert_image(c)),
+    Command::new("insert.image", "Infoga bild…", Insert, "Ctrl+Shift+I", |e| e.has_doc && !e.pdf && !e.pptx, |a, c| a.request_insert_image(c)),
     Command::new("insert.toc", "Infoga innehållsförteckning…", Insert, "", |e| e.markdown && !e.pdf, |a, c| a.insert_toc(c)),
     Command::new("insert.table", "Infoga tabell", Insert, "", |e| e.word, |a, c| a.word_edit(c, |t, s| markup::insert_table(t, s.end))).scope(Scope::Word),
     Command::new("insert.footnote", "Infoga fotnot", Insert, "Ctrl+Alt+F", |e| e.word, |a, c| a.word_footnote(c)).scope(Scope::Word),
@@ -448,7 +477,7 @@ pub static ALL: &[Command] = &[
     Command::new("tools.grammar", "Grammatikkontroll", Tools, "", always, |a, _| a.grammar_toggle()).checked(|e| e.settings.grammar),
     Command::new("tools.grammar_settings", "Grammatik och stil…", Tools, "", always, |a, _| a.open_grammar_dialog(false)),
     Command::new("tools.autocorrect", "Autokorrigering…", Tools, "", always, |a, _| a.open_autocorrect_dialog()),
-    Command::new("tools.lsp_panel", "Problem och referenser", Tools, "", |e| e.has_doc && !e.pdf, |a, _| a.lsp.ui.panel = !a.lsp.ui.panel).checked(|e| e.lsp_panel).sep(),
+    Command::new("tools.lsp_panel", "Problem och referenser", Tools, "", |e| e.has_doc && !e.pdf && !e.pptx, |a, _| a.lsp.ui.panel = !a.lsp.ui.panel).checked(|e| e.lsp_panel).sep(),
     Command::new("tools.lsp_settings", "Språkservrar…", Tools, "", always, |a, _| a.lsp.ui.settings_open = true),
     Command::new("git.compare", "Jämför med HEAD…", Tools, "", |e| e.git_doc, |a, c| a.git_compare_active(c)).sep(),
     Command::new("git.blame", "Visa blame", Tools, "", |e| e.git_doc, |a, _| a.git.blame_on = !a.git.blame_on).checked(|e| e.blame_on),
@@ -570,6 +599,16 @@ mod tests {
         assert!(!get("review.accept").available(&word), "inga ändringar att godkänna");
         let changes = Env { changes: 3, ..word };
         assert!(get("review.accept").available(&changes));
+
+        let pptx = Env { has_doc: true, pptx: true, ..Env::empty(&s) };
+        assert!(get("view.pptx_show").available(&pptx));
+        assert!(get("file.pptx_export_pdf").available(&pptx));
+        assert!(get("edit.find").available(&pptx));
+        assert!(!get("file.save_as").available(&pptx), "presentationen sparas inte");
+        assert!(!get("edit.replace").available(&pptx));
+        assert!(!get("insert.image").available(&pptx));
+        assert!(!get("view.pptx_show").available(&text));
+        assert!(menu_items(Category::View, &text).all(|c| !c.id.starts_with("view.pptx")), "presentationskommandon syns bara i presentationer");
     }
 
     #[test]

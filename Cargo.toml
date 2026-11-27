@@ -104,6 +104,8 @@ assets = [
     ["assets/fonts/OFL.txt", "usr/share/doc/kladd/FONT-LICENSE", "644"],
     ["assets/fonts/Carlito-OFL.txt", "usr/share/doc/kladd/CARLITO-FONT-LICENSE", "644"],
     ["assets/fonts/STIXTwo-OFL.txt", "usr/share/doc/kladd/STIXTWO-FONT-LICENSE", "644"],
+    ["src/pptx/geom/LICENSE-APACHE-POI.txt", "usr/share/doc/kladd/POI-LICENSE", "644"],
+    ["src/pptx/geom/NOTICE.md", "usr/share/doc/kladd/POI-NOTICE.md", "644"],
     ["README.md", "usr/share/doc/kladd/README.md", "644"],
 ]
 

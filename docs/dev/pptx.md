@@ -39,8 +39,8 @@ En ritväg för allt:
 | `render.rs` | `slide_scene(deck, i) -> Scene`; `Builder` med `tree`, `shape`, `picture`, `graphic_frame`, `paint`, `place_text`, `draw_blip`, `placeholder_box`, `rels(owner)` (används av hookarna). |
 | `tables.rs` / `smartart.rs` / `charts.rs` / `media.rs` | Hookar: `draw_table(b, tbl, frame, owner)`, `draw_diagram(..)`, `draw_chart(..)`, `metafile(b, part, frame)`. |
 | `raster.rs` | `render(&Scene, w, h) -> Pixmap`, `draw(pixmap, scene, transform)`, `to_rgba`, `glyph_path`. |
-| `pdf.rs` | `write(deck, &[slide]) -> Result<Vec<u8>, String>` (ännu inte i menyn). |
-| `view.rs` + `glue.rs` | `PptxTab` (flikvyn), `status`; `KladdApp::pptx_mode`/`pptx_page`. |
+| `pdf.rs` | `write(deck, &[slide]) -> Result<Vec<u8>, String>` (Exportera som PDF och utskrift, via `view::pdf_of`). |
+| `view.rs` + `glue.rs` | `PptxTab` (flikvyn), `status`; `KladdApp::pptx_mode`/`pptx_page`. Se *Visningen* nedan. |
 | `compare.rs` | Jämförelsemåttet och det ignorerade jämförelseprovet. |
 
 ## Det som stöds
@@ -188,5 +188,54 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
   Tunna vikter (Calibri Light, Segoe UI Light).
 - **Text:** full bidi (UAX #9), `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), vertikal östasiatisk text
   (`eaVert` roteras bara), bindestreck.
-- **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
-  anteckningar, `.ppt` via LibreOffice, handboken.
+- **Visning:** se *Visningen* nedan (kvar där).
+
+## Visningen
+
+Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger på. Förebilder: PDF-visaren
+(verktygsrad, sidopanel, presentationsläge, sökfält; `pdfview/chrome.rs` delar `tool_btn` m.fl.) och EPUB-vyn
+(lägesminne, *Redigera en kopia*).
+
+| Modul | Gränssnitt |
+|---|---|
+| `view.rs` | `PptxTab { deck, current, find, … }`: `toolbar`, `sidebar` (miniatyrer), `show` (bild för bild eller rullande lista, anteckningspanel), `find_bar`, `handle_keys`; bildspel `start_show`/`show_page`/`show_keys`/`stop_show`; `pdf_bytes`, `begin_export`/`poll_export`; `memory`/`restore`. `Prefs` (miniatyrer, anteckningar, läge, `Zoom`) och `Memory` ligger i inställningarna (`settings.pptx`, `settings.pptx_memory`). Rena hjälpare: `scale_for`, `zoom_step`, `parse_slide_input`, `pdf_of`. |
+| `glue.rs` | `KladdApp::pptx_*`: verktygsrad, sidopanel, sökfält, tangenter, helskärm (`pptx_sync_fullscreen`), PDF-export, lägesminne, *Redigera en kopia*. |
+| `slideshow.rs` | `Show::new(hidden, start)`, `screen()` (bild, svart/vit skärm, slutskärm), `next`/`prev`/`first`/`last`, `toggle_blank`, `upcoming` (förrendering). |
+| `find.rs` | `slide_text(&Scene) -> SlideText` (bildens text ur glyfkörningarna med tecknens lägen), `find_all`, `hits_for`, `hit_rects` (rektanglar i punkter). |
+| `notes.rs` | `notes(deck, i)`/`notes_text` (anteckningssidans brödtextplatshållare), `paragraphs(txBody)` (nivå, fet, kursiv), `shapes(tree)`. |
+| `copy_md.rs` | `deck_to_markdown(deck) -> (String, bilder)` för *Redigera en kopia*. |
+
+- **Rendering:** en pool med högst två samtidiga renderingar (`render_slide` i en egen tråd, panik ger en vit
+  bild). Varje bild önskar en textur av ett slag (bildspel, vy, miniatyr) i en viss bredd; i slutet av bildrutan
+  startas önskningarna i den ordningen. Miniatyrernas bredd avrundas uppåt till 32 bildpunkter så att en
+  storleksändring av panelen inte renderar om allt. Texturer långt från det synliga släpps.
+- **Bildspel:** helskärm via `ViewportCommand::Fullscreen`, som följer fliken (`fullscreen_sent`). Byts aktiv
+  flik under bildspelet (en fil öppnas utifrån) avslutas det, så att fönstret inte fastnar i helskärm. Medan
+  bildspelet pågår går alla tangenter till det (`handle_shortcuts`), och `ui()` ritar bara bilden.
+- **Sök:** registret byggs i en bakgrundstråd när sökfältet öppnas: varje bilds visningslista byggs
+  (`render::slide_scene`, utan raster) och glyfkörningarnas text och lägen sparas, plus anteckningarna. Träffarna
+  visas efter hand. Körningar på samma baslinje som fortsätter där den förra slutade fogas ihop utan mellanrum,
+  andra skiljs med ett blanksteg (så att en fras över en radbrytning hittas). Tecken och glyfer avbildas ett till
+  ett när antalen stämmer och glyferna går åt höger; annars (ligaturer, höger till vänster) markeras hela
+  körningen. **Önskemål till ritmotorn:** klusteroffset per glyf i `GlyphRun` (rustybuzz har dem) skulle ge
+  exakta träffrektanglar även för ligaturer och bidi.
+- **Redigera en kopia:** rubrik per bild ur titelplatshållaren (`title`/`ctrTitle`, annars "Bild N"); brödtext-
+  platshållare (`body`/`obj`/bara `idx`) ger punktlistor med nivåer (fyra blanksteg per nivå, som Word-importen),
+  `buAutoNum` numrerade listor och `buNone` vanliga stycken; textrutor ger stycken; tabeller blir Markdown-tabeller
+  (första raden rubrikrad, sammanslagna celler tomma, `<br>` för radbrytningar); bilder läggs in med
+  `bild:`-adresser (PNG/JPEG/GIF/BMP/WebP/SVG, inte EMF/WMF); SmartArt ger datamodellens text som punktlista;
+  sidfot, datum och bildnummer hoppas över; anteckningarna blir ett citat. Provet sparar kopian som .docx och
+  läser tillbaka den.
+- **Filformat:** `.ppsx`, `.potx`, `.pptm`, `.ppsm`, `.potm` öppnas som `.pptx` (`pptx::EXTENSIONS`; ingen
+  kontroll av huvuddelens innehållstyp, makron läses inte). `.ppt` går via `legacy.rs` (`target_ext` → `pptx`)
+  och `Document::from_converted` öppnar resultatet i presentationsvyn.
+- **Utskrift:** `print.rs` skriver ut `PptxTab::pdf_bytes()` (samma PDF som exporten, utan dolda bilder).
+- **Paketering:** `src/pptx/geom/LICENSE-APACHE-POI.txt` och `NOTICE.md` följer med som `POI-LICENSE` och
+  `POI-NOTICE.md` bredvid typsnittslicenserna (deb, flatpak, AppImage, Windows, macOS). Kladd har ingen
+  om-/licensdialog (*Om Kladd* är en notis), så de listas inte i appen.
+- **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
+  enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
+  `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
+- **Kvar:** bildövergångar och animeringar (bildspelet visar slutläget direkt), föredragsvy med nästa bild och
+  timer, länkar och åtgärdsknappar i bildspelet, video/ljud, hoppa till bildnummer med siffror + Enter i
+  bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).

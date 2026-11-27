@@ -75,7 +75,7 @@ pub struct Document {
 
 /// Filtyper som visas i öppna/spara-dialogerna.
 pub const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "docx", "odt", "pdf", "epub", "pptx", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
+    "txt", "md", "markdown", "docx", "odt", "pdf", "epub", "pptx", "ppsx", "potx", "pptm", "rs", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "toml", "yaml",
     "yml", "html", "htm", "css", "scss", "xml", "svg", "sh", "bash", "zsh", "c", "h", "cpp",
     "hpp", "cc", "java", "kt", "go", "rb", "php", "lua", "sql", "ini", "conf", "cfg", "env",
     "csv", "tsv", "log", "tex", "rst", "org", "srt", "desktop", "service",
@@ -346,7 +346,9 @@ impl Document {
     /// Ett .doc/.rtf/.wpd/.wps som LibreOffice har konverterat till .docx (`docx`). Fliken behåller
     /// originalets sökväg men kan bara sparas med Spara som (`needs_save_as`).
     pub fn from_converted(id: u64, path: &Path, docx: Vec<u8>) -> Result<Self, String> {
-        let mut doc = Self::load_bytes(id, path, docx, "docx")?;
+        // En .ppt blir en .pptx som öppnas i presentationsvyn.
+        let target = if ext_of(path) == "ppt" { "pptx" } else { "docx" };
+        let mut doc = Self::load_bytes(id, path, docx, target)?;
         let note = crate::legacy::converted_note(path);
         doc.open_note = Some(match doc.open_note.take() {
             Some(n) => format!("{note} {n}"),
@@ -397,7 +399,7 @@ impl Document {
     fn load_bytes(id: u64, path: &Path, bytes: Vec<u8>, ext: &str) -> Result<Self, String> {
         let ext = ext.to_owned();
         // En PowerPoint-presentation öppnas i presentationsvyn.
-        if ext == "pptx" {
+        if crate::pptx::is_ext(&ext) {
             let deck = crate::pptx::Deck::open(&bytes)?;
             return Ok(Self::pptx_tab(id, path, crate::pptx::view::PptxTab::new(deck)));
         }
@@ -464,7 +466,7 @@ impl Document {
                 rev: 0,
             });
         }
-        if ext == "doc" && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+        if matches!(ext.as_str(), "doc" | "ppt") && bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
             return Err(crate::legacy::missing_message(path));
         }
         let (mut text, encoding) = decode_owned(bytes)?;

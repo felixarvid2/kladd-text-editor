@@ -24,11 +24,27 @@ pub mod tables;
 pub mod text;
 pub mod view;
 pub mod xml;
+// Visningen (w-pview): anteckningar, sök, bildspel och Redigera en kopia.
+pub mod copy_md;
+pub mod find;
+pub mod notes;
+pub mod slideshow;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_tests;
 
 pub use model::Deck;
+
+/// Filändelser som öppnas i presentationsvyn: presentation, bildspel, mall och deras varianter med
+/// makron (makron körs aldrig, de läses inte ens).
+pub const EXTENSIONS: &[&str] = &["pptx", "ppsx", "potx", "pptm", "ppsm", "potm"];
+
+/// Öppnas filändelsen (gemener) i presentationsvyn?
+pub fn is_ext(ext: &str) -> bool {
+    EXTENSIONS.contains(&ext)
+}
 
 /// Renderar bild `i` till RGBA i `w`×`h` bildpunkter.
 #[allow(dead_code)]

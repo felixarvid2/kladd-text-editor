@@ -78,6 +78,8 @@ Source: "{#Root}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\assets\fonts\OFL.txt"; DestDir: "{app}\licenses"; DestName: "FONT-LICENSE.txt"; Flags: ignoreversion
 Source: "{#Root}\assets\fonts\Carlito-OFL.txt"; DestDir: "{app}\licenses"; DestName: "CARLITO-FONT-LICENSE.txt"; Flags: ignoreversion
 Source: "{#Root}\assets\fonts\STIXTwo-OFL.txt"; DestDir: "{app}\licenses"; DestName: "STIXTWO-FONT-LICENSE.txt"; Flags: ignoreversion
+Source: "{#Root}\src\pptx\geom\LICENSE-APACHE-POI.txt"; DestDir: "{app}\licenses"; DestName: "POI-LICENSE.txt"; Flags: ignoreversion
+Source: "{#Root}\src\pptx\geom\NOTICE.md"; DestDir: "{app}\licenses"; DestName: "POI-NOTICE.md"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

@@ -216,6 +216,8 @@ fn render_pdf(doc: &Document) -> Result<PathBuf, String> {
                 None => base,
             }
         }
+        // En presentation skrivs ut som sin PDF (samma ritning som på skärmen, utan dolda bilder).
+        None if doc.pptx.is_some() => doc.pptx.as_deref().map(|t| t.pdf_bytes()).unwrap_or_else(|| Err(String::new()))?,
         None => {
             let base = doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
             let images = &doc.images;
@@ -261,10 +263,6 @@ impl KladdApp {
         // En bok har ingen text att skriva ut; kopian gör det.
         if self.epub_mode() {
             self.notify(ctx, crate::i18n::t("Boken kan inte skrivas ut. Använd Redigera en kopia."), false);
-            return;
-        }
-        if self.pptx_mode() {
-            self.notify(ctx, crate::i18n::t("Presentationer kan inte skrivas ut än."), false);
             return;
         }
         self.print.dialog = Some(PrintDialog::new(ctx));

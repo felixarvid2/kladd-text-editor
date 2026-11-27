@@ -177,6 +177,8 @@ jobs:
           cp assets/fonts/OFL.txt "dist/$name/licenses/FONT-LICENSE.txt"
           cp assets/fonts/Carlito-OFL.txt "dist/$name/licenses/CARLITO-FONT-LICENSE.txt"
           cp assets/fonts/STIXTwo-OFL.txt "dist/$name/licenses/STIXTWO-FONT-LICENSE.txt"
+          cp src/pptx/geom/LICENSE-APACHE-POI.txt "dist/$name/licenses/POI-LICENSE.txt"
+          cp src/pptx/geom/NOTICE.md "dist/$name/licenses/POI-NOTICE.md"
           powershell -NoProfile -Command "Compress-Archive -Path 'dist/$name' -DestinationPath 'dist/$name.zip'"
           rm -rf "dist/$name"
 
@@ -247,6 +249,8 @@ jobs:
           cp assets/fonts/OFL.txt "$app/Contents/Resources/licenses/FONT-LICENSE.txt"
           cp assets/fonts/Carlito-OFL.txt "$app/Contents/Resources/licenses/CARLITO-FONT-LICENSE.txt"
           cp assets/fonts/STIXTwo-OFL.txt "$app/Contents/Resources/licenses/STIXTWO-FONT-LICENSE.txt"
+          cp src/pptx/geom/LICENSE-APACHE-POI.txt "$app/Contents/Resources/licenses/POI-LICENSE.txt"
+          cp src/pptx/geom/NOTICE.md "$app/Contents/Resources/licenses/POI-NOTICE.md"
 
       - name: Importera certifikat
         # Läggs i en tillfällig nyckelring som tas bort sist i jobbet.
