@@ -2489,10 +2489,11 @@ dependencies = [
 
 [[package]]
 name = "kladd"
-version = "2.15.0"
+version = "2.16.0"
 dependencies = [
  "arboard",
  "chrono",
+ "core-graphics",
  "cpal",
  "dirs",
  "eframe",
@@ -2534,6 +2535,7 @@ dependencies = [
  "ureq",
  "windows-sys 0.61.2",
  "winresource",
+ "x11rb",
  "zip",
 ]
 

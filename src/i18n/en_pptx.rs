@@ -141,4 +141,9 @@ pub const EN: &[(&str, &str)] = &[
     // Typsnitt, radavstånd och numrerad lista i formatraden (w-pedit4).
     ("Rubrik ({font})", "Heading ({font})"),
     ("Brödtext ({font})", "Body ({font})"),
+    // Föredragsvyn väljer skärm (w-pshow3).
+    ("Byt skärm", "Swap displays"),
+    ("Flyttar publikens bild till nästa skärm (Alt+S)", "Moves the audience view to the next display (Alt+S)"),
+    ("Publikens skärm: automatiskt", "Audience display: automatic"),
+    ("Publikens skärm: skärm {n} ({w}×{h})", "Audience display: display {n} ({w}×{h})"),
 ];

@@ -96,8 +96,7 @@ pub struct RunStyle {
     pub latin: String,
     pub ea: String,
     pub cs: String,
-    /// `a:sym`: typsnitt för symboltecken (används inte än).
-    #[allow(dead_code)]
+    /// `a:sym`: typsnitt för privata symboltecken (U+F020–F0FF).
     pub sym: Option<String>,
     /// Storlek i punkter (med `fontScale`).
     pub size: f32,
@@ -414,23 +413,39 @@ fn shape_run(run: &Run, book: &FontBook, segs: &mut Vec<Seg>, cls: &mut Vec<Cl>,
     for (i, &c0) in chars.iter().enumerate() {
         let level = levels.get(i).copied().unwrap_or(0);
         let class = script_class(c0);
-        let res = book.resolve(fam(class), style.bold, style.italic);
-        let c = match res.symbol_map {
-            Some(sym) => fonts::symbol_to_unicode(sym, c0),
-            None => c0,
-        };
-        let mut face = res.face.clone();
-        let mut c_out = c;
-        if !c.is_whitespace() && !c.is_control() {
-            let has = face.face().is_some_and(|f| f.glyph_index(c).is_some());
-            if !has {
-                // Symboltypsnitt som finns installerat: tecknet kan ligga i U+F0xx.
-                let sym = char::from_u32(0xF000 + (c as u32 & 0xFF));
-                if face.symbol_cmap && (c as u32) < 0x100 && sym.is_some_and(|s| face.face().is_some_and(|f| f.glyph_index(s).is_some())) {
-                    c_out = sym.unwrap_or(c);
-                } else if let Some(fb) = book.fallback(c, &face) {
-                    face = fb;
+        // Löser tecknets typsnitt; `ok` = tecknet finns i det slutliga typsnittet.
+        let pick = |family: &str| {
+            let res = book.resolve(family, style.bold, style.italic);
+            let c = match res.symbol_map {
+                Some(sym) => fonts::symbol_to_unicode(sym, c0),
+                None => c0,
+            };
+            let mut face = res.face.clone();
+            let mut c_out = c;
+            if !c.is_whitespace() && !c.is_control() {
+                let has = face.face().is_some_and(|f| f.glyph_index(c).is_some());
+                if !has {
+                    // Symboltypsnitt som finns installerat: tecknet kan ligga i U+F0xx.
+                    let sym = char::from_u32(0xF000 + (c as u32 & 0xFF));
+                    if face.symbol_cmap && (c as u32) < 0x100 && sym.is_some_and(|s| face.face().is_some_and(|f| f.glyph_index(s).is_some())) {
+                        c_out = sym.unwrap_or(c);
+                    } else if let Some(fb) = book.fallback(c, &face) {
+                        face = fb;
+                    }
                 }
+            }
+            let ok = c_out.is_whitespace() || c_out.is_control() || (!face.family.contains("Unifont") && face.face().is_some_and(|f| f.glyph_index(c_out).is_some()));
+            (res, face, c_out, ok)
+        };
+        let (mut res, mut face, mut c_out, ok) = pick(fam(class));
+        // Ett privat tecken (U+F020–F0FF) som ingen reserv kan rita ritas i `a:sym`-typsnittet (Wingdings-pilen i
+        // `cppcon20-stl-features` bild 33 blev en tom ruta). Tecken som redan ritas som förut lämnas (msrc-identity 33).
+        if let Some(sym) = style.sym.as_deref().filter(|_| !ok && (0xF020..=0xF0FF).contains(&(c0 as u32))) {
+            (res, face, c_out, _) = pick(sym);
+            // Wingdings smileys är ca 15 % smalare än DejaVus (mätt mot PowerPoints PDF, msrc-identity 33); pilarna
+            // har samma bredd (cppcon20-stl-features 22 blev sämre med skalning).
+            if matches!(c_out, '\u{263A}' | '\u{2639}' | '\u{1F610}') {
+                res.x_scale *= 0.85;
             }
         }
         // Byt bit när bidinivån byter (UAX #9).
@@ -1225,6 +1240,22 @@ mod tests {
         let (bx, tx) = (x_of(&c, "•"), x_of(&c, "Mitten"));
         assert!(((tx - bx) - 20.0).abs() < 1.0, "{c:?}");
         assert!(bx > 100.0, "punkten stod kvar vid vänstermarginalen: {c:?}");
+    }
+
+    #[test]
+    fn privat_tecken_ritas_i_sym_typsnittet() {
+        let book = FontBook::default();
+        let mut p = para("a\u{F0E8}b", false);
+        p.runs[0].style.sym = Some("Wingdings".into());
+        let r = runs(&layout(&frame(vec![p]), 300.0, 100.0, &book));
+        if book.resolve("Wingdings", false, false).face.family.contains("Wingdings") {
+            // Riktig Wingdings finns (Windows/macOS i CI): tecknet ritas med den som det är.
+            assert!(r.iter().any(|g| g.0.contains('\u{F0E8}')), "{r:?}");
+        } else {
+            // Wingdings-pilen blir ett riktigt Unicode-tecken i stället för en tom ruta.
+            assert!(r.iter().any(|g| g.0.contains('\u{2794}')), "{r:?}");
+            assert!(!r.iter().any(|g| g.0.contains('\u{F0E8}')), "{r:?}");
+        }
     }
 
     #[test]

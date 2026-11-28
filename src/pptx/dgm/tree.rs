@@ -69,6 +69,13 @@ pub struct Tree<'a> {
     pub paths: HashMap<usize, Vec<(f64, f64)>>,
     /// Böjda kopplingar som ritas som cirkelbågspilar.
     pub arcs: std::collections::HashSet<usize>,
+    /// Faktor för teckenstorlekarna i villkoren (`primFontSz`/`secFontSz` med `val`): rutor som växer med
+    /// texten (`rule type="h" val="INF"`) läggs ut för en gemensam storlek i taget.
+    pub font_k: f64,
+    /// Lägsta höjd per nod (rutor som vuxit med texten).
+    pub grow: HashMap<usize, f64>,
+    /// Krymp inte för att få plats (`lin` och helheten): storleken väljs i stället med `font_k`.
+    pub no_shrink: bool,
 }
 
 fn alg_type<'a>(n: &LNode<'a>) -> &'a str {
@@ -96,7 +103,7 @@ impl<'a> Tree<'a> {
     pub fn build(m: &'a Model<'a>, def: &'a Node) -> Option<Tree<'a>> {
         let root_def = def.child("dgm:layoutNode")?;
         let root_pt = m.root?;
-        let mut t = Tree { nodes: Vec::new(), m, def, seen: HashMap::new(), paths: HashMap::new(), arcs: Default::default() };
+        let mut t = Tree { nodes: Vec::new(), m, def, seen: HashMap::new(), paths: HashMap::new(), arcs: Default::default(), font_k: 1.0, grow: HashMap::new(), no_shrink: false };
         let id = t.new_node(root_def, root_pt, None);
         t.process(id, &root_def.children, root_pt, 1, 1, 0);
         Some(t)
@@ -336,20 +343,35 @@ impl<'a> Tree<'a> {
             let value = match ref_type {
                 "none" => {
                     let v = c.attr_f64("val").unwrap_or(0.0);
-                    if is_length(ty) { v * MM } else { v }
+                    if is_length(ty) {
+                        v * MM
+                    } else if ty.ends_with("FontSz") {
+                        v * self.font_k
+                    } else {
+                        v
+                    }
                 }
                 rt => {
                     let rel = c.attr("refFor").unwrap_or("self");
                     let refs = self.targets(id, rel, c.attr("refForName"), c.attr("refPtType"));
                     let Some(v) = refs.first().and_then(|r| self.value(*r, rt)) else { continue };
-                    // En längd ur en teckenstorlek: storleken räknas som millimeter.
-                    if is_length(ty) && rt.ends_with("FontSz") { v * fact * MM } else { v * fact }
+                    // En längd ur en teckenstorlek: storleken räknas som millimeter. En marginal ur en
+                    // längd: längden räknas i millimeter och marginalen i punkter (`vList2`:s
+                    // `lMarg = 0,09 w` ger 16,3 pt för en ram på 513 pt, som PowerPoint).
+                    if is_length(ty) && rt.ends_with("FontSz") {
+                        v * fact * MM
+                    } else if ty.ends_with("Marg") && is_length(rt) {
+                        v / MM * fact
+                    } else {
+                        v * fact
+                    }
                 }
             };
             let op = c.attr("op").unwrap_or("none");
             // `op="equ"` utan värde gör bara värdena lika (grupp), sätter inget.
             if op != "none" && ref_type == "none" && c.attr("val").is_none() {
-                if ty.ends_with("FontSz") {
+                // Teckenstorlekar och höjder/bredder (rutor som växer med texten blir lika stora).
+                if ty.ends_with("FontSz") || ty == "h" || ty == "w" {
                     for t in &targets {
                         self.nodes[*t].font_groups.insert(ty.to_owned(), (id, ci));
                     }
@@ -467,6 +489,10 @@ impl<'a> Tree<'a> {
         if let Some(sy) = self.cust(id, "custScaleY").filter(|v| *v > 0.0) {
             r.y += r.h * (1.0 - sy) / 2.0;
             r.h *= sy;
+        }
+        // En ruta som vuxit med sin text växer nedåt.
+        if let Some(g) = self.grow.get(&id) {
+            r.h = r.h.max(*g);
         }
         let alg = alg_type(&self.nodes[id]);
         if alg == "composite" {
@@ -595,7 +621,7 @@ impl<'a> Tree<'a> {
         let total: f64 = ext.iter().map(along).sum();
         let cross = ext.iter().map(across).fold(0.0, f64::max);
         let mut s = 1.0f64;
-        if total > avail_p && total > 0.0 {
+        if total > avail_p && total > 0.0 && !self.no_shrink {
             s = s.min(avail_p / total);
         }
         let _ = cross;
@@ -1025,7 +1051,7 @@ impl<'a> Tree<'a> {
         self.connect();
         let e = self.shapes_extent();
         if let Some(e) = e {
-            if e.w > w + 0.5 || e.h > h + 0.5 {
+            if (e.w > w + 0.5 || e.h > h + 0.5) && !self.no_shrink {
                 let s = (w / e.w).min(h / e.h);
                 for n in &mut self.nodes {
                     n.rect = Rect { x: (n.rect.x - e.x) * s, y: (n.rect.y - e.y) * s, w: n.rect.w * s, h: n.rect.h * s };
@@ -1043,6 +1069,16 @@ impl<'a> Tree<'a> {
                 }
             }
         }
+    }
+
+    /// Växer nodens ruta med texten (en regel `type="h" val="INF"` på en textnod)?
+    pub fn grows_with_text(&self, id: usize) -> bool {
+        alg_type(&self.nodes[id]) == "tx" && self.rules_for(id).iter().any(|r| r.attr("type") == Some("h") && r.attr("val") == Some("INF"))
+    }
+
+    /// Ryms formerna i ramen `w`×`h`?
+    pub fn fits_frame(&self, w: f64, h: f64) -> bool {
+        self.shapes_extent().is_none_or(|e| e.x >= -0.5 && e.y >= -0.5 && e.x + e.w <= w + 0.5 && e.y + e.h <= h + 0.5)
     }
 
     /// Utbredningen av formerna som ritas.

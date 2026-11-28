@@ -1,6 +1,6 @@
 [package]
 name = "kladd"
-version = "2.15.0"
+version = "2.16.0"
 edition = "2024"
 description = "Kladd – en lugn och snygg texteditor för txt, Markdown och kod"
 authors = ["Felix"]
@@ -77,16 +77,22 @@ strip = true
 [dev-dependencies]
 egui_kittest = { version = "0.37", default-features = false, features = ["eframe"] }
 
+# Skärmlistan för bildspelet (src/pptx/show_screens.rs): RandR via ren Rust, samma version och funktioner som winit drar in.
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+x11rb = { version = "0.13.2", default-features = false, features = ["randr"] }
+
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Skärmlistan för bildspelet (src/pptx/show_screens.rs): samma version som winit använder.
+core-graphics = "0.23.1"
 # Apple-händelsen "öppna dokument" från Finder (src/macopen.rs). Samma versioner som winit/eframe drar in.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [package.metadata.deb]
 maintainer = "Felix <felix@localhost>"

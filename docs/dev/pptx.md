@@ -170,15 +170,15 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 7 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
   text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
   autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
   automatisk sparning).
-- **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
-  markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
+- **Visning:** föredragsvyns skärmval saknar skärmlista på Wayland utan XWayland och är inte prövat med två
+  riktiga skärmar (se *Föredragsvyn väljer skärm (omgång 7, w-pshow3)*); markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
 - **Diagram:** yt-3D (`surface3DChart`), chartex (`cx:`), sekundär x-axel i punktdiagram, datumaxelns
@@ -192,14 +192,18 @@ Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
 - **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
 - **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)* och *SmartArt: hierarkier och böjda kopplingar
-  (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: text som får rutan att växa
-  (`rule type="h" val="INF"`, `vList2`), egna förskjutningar i `composite` (kugghjul med ett och två hjul),
+  (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: rutor som växer med texten när texten
+  och den synliga formen är olika noder (`list1` i ReportProg: texten kan sticka ut nedtill), `rule type="w"
+  val="INF"`, egna förskjutningar i `composite` (kugghjul med ett och två hjul),
   hierarkins `hang` i två spalter (`secLinDir`), nivåetiketterna i `hierarchy5` (bakgrundskolumnerna i
   `bgShapesFlow` följer inte hierarkin när den krymps; ett försök att krympa `hierFlow` till sin ruta gjorde
   släktträdet sämre och togs bort) och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum` m.fl. (`duotone` gjordes i omgång 5)
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
+- **Typsnitt:** utan Microsofts typsnitt ligger Verdana-presentationerna ~0,05 lägre i jämförelsen (mätt i omgång 7);
+  PowerPoints extra krympning utöver filens `fontScale` (cppcon20 bild 33) är oförklarad (se *Textkrympning och
+  typsnittsmått (omgång 7, w-pfid3)*).
 - **Minne:** avkodade bilder hålls i en cache på högst 256 MB per presentation och skalas ner till högst
   2560 bildpunkter.
 
@@ -986,7 +990,7 @@ gjorda med ffmpeg `sine`/`testsrc`).
 - **Prov:** `show_links_tests.rs` (länkdäck byggt i provet; åtgärder, textlänkens träffyta, klick, senast visade, siffror +
   Enter), `media_model::tests`, `media_tests`. Ignorerade `skriv_provfil` (`KLADD_PLINK_OUT`, `KLADD_PMEDIA_OUT`) skriver
   provpresentationer att titta på för hand.
-- **Kvar:** föredragsvyns val av skärm (winit ger ingen skärmlista via egui här: inte gjort); länkar på gruppbarn och i
+- **Kvar:** länkar på gruppbarn och i
   SmartArt; `hlinkfile`/`hlinkpres`; markering av länkar vid tangentbordsnavigering (Tab); `p:quickTimeFile` som video utan
   `rect_pt` i grupper; videoformer med andra geometrier än rektangel, rundad rektangel och ellips beskärs som rektangel.
 - **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
@@ -1221,3 +1225,78 @@ Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastade
 - **`lnSpcReduction` på radavståndet:** att dra av bara en del (0,5 eller 0,75 av värdet) i stället för hela gjorde
   `cppcon15`/`cppcon19`/`cppcon20` 0,02–0,06 sämre; den nuvarande avdragsregeln (hela värdet av procenttalet) är rätt.
   `cppcon15-stl-algorithms-mac` bild 9 (110 % radavstånd, 77,5 %/20 %) har ändå ~6 % för tät text; orsaken är inte klarlagd.
+
+## Föredragsvyn väljer skärm (omgång 7, w-pshow3)
+
+- **Vad egui/winit ger:** `ViewportCommand::SetMonitor(n)` (och `ViewportBuilder::with_monitor`) sätter fönstret i kantlös helskärm på
+  skärm nummer n i winits `available_monitors()`-ordning, men varken egui eller eframe ger skärmlistan eller numret på den skärm
+  fönstret ligger på (`ViewportInfo` har bara `monitor_size` och `outer_rect`).
+- **`show_screens.rs`:** skärmlistan läses i samma ordning som winits `available_monitors()`:
+  - Linux/X11: RandR via `x11rb` (direkt beroende, ren Rust, bara `randr`): kretsarna från `get_screen_resources_current` med storlek
+    och utgång, samma urval som winit (`x11/monitor.rs`).
+  - Windows: `EnumDisplayMonitors(0, null, …)` + `GetMonitorInfoW` (`windows-sys`, funktionen `Win32_Graphics_Gdi` tillagd); winit
+    (`windows/monitor.rs`) lägger monitorerna i uppräkningens ordning, och det gör vi också (`rcMonitor`, bildpunkter).
+  - macOS: `CGDisplay::active_displays()` + `bounds()` (`core-graphics` 0.23, samma som winit; `macos/monitor.rs` använder samma
+    lista i samma ordning). Enheten är punkter, inte bildpunkter (`units_per_point`).
+  - Wayland utan XWayland: tom lista = som förut (inget *Byt skärm*, inget skärmval).
+  `KLADD_SCREENS="x,y,b,h;x,y,b,h"` ersätter listan för prov. Valet är rent och provat (`audience`, `presenter`). Windows- och
+  macOS-grenarna är kontrollerade med `cargo check --target x86_64-pc-windows-msvc`/`aarch64-apple-darwin` på en liten provkrate
+  med modulen (hela kladd går inte att korskontrollera här: ring/cc-rs saknar `lib.exe` respektive Apple-verktyg), men inte körda.
+- **Beteende:** vid start läses Kladd-fönstrets `outer_rect` (mitten) → `home`. Med föredragsvy går publiken till nästa skärm
+  (`(home+1)%n`), utan föredragsvy stannar den (om inte *Visa*-menyns val `Prefs::audience_screen` är satt, som gäller alltid).
+  `glue.rs::pptx_sync_fullscreen` skickar `SetMonitor(n)` i stället för `Fullscreen(true)` och återställer fönstrets läge när
+  bildspelet slutar. Föredragsvyns fönster får `with_position` på sin skärm och flyttas med `OuterPosition` när *Byt skärm*
+  (knappen i föredragsvyn eller `Alt+S`, `ShowView::swap_screens`) byter.
+- **Prövat:** bara i Xvfb med en skärm (RandR-listan = 1; med `KLADD_SCREENS` visades menyn och föredragsvyns fönster flyttades
+  mellan de två rektanglarna med `Alt+S`). Själva `SetMonitor` mellan verkliga skärmar är inte prövad här (Xvfb har bara en
+  RandR-krets), och inte heller Windows/macOS (bara kompilerade).
+
+## SmartArt: rutor som växer med texten (omgång 7)
+
+Textnoder med regeln `rule type="h" val="INF"` (`vList2`, `list1`, `process1`/`process4`, rutorna i
+organisationsscheman) växer med sin text i stället för att texten krymps, och den gemensamma storleken väljs så
+att hela diagrammet ryms (`dgm/mod.rs`, `grow_and_shrink`):
+
+1. För en storlek *f* (villkorens `primFontSz`/`secFontSz` med `val` gånger `Tree::font_k` = *f* / utgångsstorleken)
+   läggs diagrammet ut utan krympning (`Tree::no_shrink`: varken `lin` eller helheten krymps). Höjder ur
+   teckenstorleken (`h = 0,52 × primFontSz` i `vList2`) följer med.
+2. Utskriften i växläge (`Emitter::grow_mode`) behåller storleken för de växande rutorna och sparar höjden texten
+   behöver (Kladds textmotor, med insättningar, plus formens textrektangels marginal) i `needs`. Rutor vars höjd
+   ska vara lika (`h` med `op="equ"`) får den största i gruppen.
+3. Diagrammet läggs ut igen med de höjderna som lägsta höjd (`Tree::grow`) och ska rymmas i ramen.
+4. Den största storleken i halva punkter (från utgångsstorleken ned till regelns minsta eller 5 pt) som ryms väljs
+   med binärsökning. Ryms ingen (organisationsscheman, vars rutor inte beror på teckenstorleken) läggs diagrammet
+   ut som förut.
+
+Samtidigt, uppmätt mot PowerPoints ritdelar för `vList2` i msrc-identity:
+- Text på nivå 1 och nedåt är 78 % av den primära storleken när `secFontSz` saknas (31 → 24, 22 → 17 pt).
+- `lnSpAfParP`/`lnSpAfChP` ger avståndet efter stycken (standard 35 % och 15 %).
+- En marginal ur en längd (`lMarg refType="w" fact="0.09"`) räknar längden i millimeter och marginalen i punkter
+  (16,3 pt för en ruta på 513 pt, som i PowerPoints ritdel); en saknad sidomarginal hos en nod med andra
+  marginaler blir 0,56 × storleken; punktindraget 0,77 × storleken.
+- Avståndet efter det sista stycket räknas inte in i höjden (med det blev medlet sämre: 0,837 → 0,819).
+
+**Jämförelse mot ritdelarna** (`oracle`): `vList2` 0,50/0,64/0,74 → 0,59/0,96/0,96, `list1` 0,40 → 0,62, medel
+0,662 → 0,677; övriga layouter oförändrade. Prov: `rutor_vaxer_med_texten_och_storleken_krymps_tills_allt_ryms`.
+
+## Textkrympning och typsnittsmått (omgång 7, w-pfid3)
+
+Mätt med Microsofts Core Fonts (Verdana, Arial, Georgia, Trebuchet, Courier New, Comic Sans, Impact; Calibri, Segoe UI
+och Aptos ingår inte) installerade tillfälligt i behållaren, aldrig i repot, och borttagna efteråt.
+
+- **Typsnittens del av felet:** jämförelsen mot PowerPoint med typsnitten installerade ger totalmedel 0,8895 → 0,8988.
+  `cppcon15-functional` 0,854 → 0,908, `cppcon19-charconv` 0,849 → 0,895, `cppcon20-stl-features` 0,857 → 0,902,
+  `owasp-top10-2017-he` 0,712 → 0,725, covid-bilderna +0,003–0,005, övriga oförändrade. Det som återstår i dessa
+  presentationer beror alltså inte på Verdana/Arial.
+- **Krympregeln finns inte:** även med riktiga typsnitt gör varje villkor för att räkna om `normAutofit` vid ritning
+  (ingen `fontScale` men texten ryms inte; med eller utan krav på `lnSpcReduction`) bilder 0,3–0,4 sämre
+  (`cppcon20-stl-features` 19/41, `cppcon19-charconv` 20/51; presentationsmedel −0,02 till −0,04). Bild 41 överskrider
+  rutan med 88 pt men ritas av PowerPoint utan krympning, medan bild 33 (överskott 20 pt) krymps; PDF-exporten räknar
+  alltså inte om. Det sparade värdet gäller. Bild 33 förblir oförklarad (0,49).
+- **Fynd:** `a:sym typeface="Wingdings"` på privata tecken (U+F020–F0FF) ignorerades; tecknet blev en tom ruta
+  (cppcon20 bild 33, "→"; reserven var Unifont, som ritar en hex-ruta). Nu ritas sådana tecken, när ingen annan reserv än Unifont finns, i `a:sym`-typsnittet (Wingdings-pilen blir ➔ ur DejaVu Sans), smileyn 15 % smalare eftersom Wingdings-smileyn är mindre (`msrc-identity` 33: 0,953 → 0,963; med full storlek blev bilden sämre än rutan), pilen oskalad (`cppcon20-stl-features` 22 blev sämre med skalning).
+- **Ersättare:** Verdana → DejaVu Sans har redan rätt bredd (mätt 71,54 mot 71,27 em per provtext, skalning 1,004;
+  bold 0,998), så uppgiften om att DejaVu är ~6 % bredare stämmer inte. Arial/Courier New/Times/Calibri har
+  metrikkompatibla ersättare, Trebuchet ≈ Liberation Sans (1,005). Nytt i `substitutes`: Georgia → Liberation
+  Serif ×1,085 (fet ×1,204) och Comic Sans → Liberation Sans ×1,038 (fet ×1,011). Inget sådant typsnitt finns i
+  referensmaterialet, så skalningen är mätt men inte prövad mot någon bild.

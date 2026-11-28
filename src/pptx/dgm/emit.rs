@@ -86,6 +86,10 @@ pub struct Emitter<'t, 'a, 's, 'x> {
     pub tree: &'t Tree<'a>,
     pub sheets: &'s Sheets<'s>,
     pub styles: Styles<'x>,
+    /// Rutor som växer med texten (`Tree::grows_with_text`) behåller teckenstorleken (den väljs med
+    /// `Tree::font_k`), och den höjd deras text behöver sparas i `needs`.
+    pub grow_mode: bool,
+    pub needs: std::cell::RefCell<HashMap<usize, f64>>,
 }
 
 /// Teckenstorlekar för en textform.
@@ -223,6 +227,11 @@ impl Emitter<'_, '_, '_, '_> {
             "b" => "b",
             _ => "ctr",
         };
+        // Avstånd efter stycken i procent av radhöjden: `lnSpAfParP`/`lnSpAfChP` (standard 35 och 15).
+        let spc_aft = |bullet: bool| -> i64 {
+            let (name, def) = if bullet { ("lnSpAfChP", 15.0) } else { ("lnSpAfParP", 35.0) };
+            (param(node, name).and_then(|v| v.parse::<f64>().ok()).unwrap_or(def) * 1000.0).round() as i64
+        };
         let min_lvl = pts.iter().map(|p| p.1).min().unwrap_or(0);
         let mut paras = Vec::new();
         for (pt, lvl) in pts {
@@ -242,10 +251,10 @@ impl Emitter<'_, '_, '_, '_> {
                 let mut kids = vec![
                     el("a:lnSpc", &[], vec![el("a:spcPct", &[("val", "90000".into())], Vec::new())]),
                     el("a:spcBef", &[], vec![el("a:spcPct", &[("val", "0".into())], Vec::new())]),
-                    el("a:spcAft", &[], vec![el("a:spcPct", &[("val", (if bullet { "15000" } else { "35000" }).into())], Vec::new())]),
+                    el("a:spcAft", &[], vec![el("a:spcPct", &[("val", spc_aft(bullet).to_string())], Vec::new())]),
                 ];
                 if bullet {
-                    let ind = size * 0.7 * EMU;
+                    let ind = size * 0.77 * EMU;
                     let depth = (lvl + 1 - st_bullet) as f64;
                     set_attr(&mut ppr, "marL", ((ind * depth).round() as i64).to_string());
                     set_attr(&mut ppr, "indent", ((-ind).round() as i64).to_string());
@@ -334,8 +343,27 @@ impl Emitter<'_, '_, '_, '_> {
                 None => n.vals.get(k).copied().unwrap_or(def),
             }
         };
-        let (dw, dh) = ((n.rect.w * 0.1).min(7.2), (n.rect.h * 0.1).min(3.6));
+        let (mut dw, dh) = ((n.rect.w * 0.1).min(7.2), (n.rect.h * 0.1).min(3.6));
+        // Har noden andra marginaler men saknar en sidomarginal blir den 0,56 × teckenstorleken
+        // (`vList2`:s `childText` har bara `lMarg`, `tMarg` och `bMarg`; PowerPoint ger rIns 0,56 × storleken).
+        if ["lMarg", "rMarg", "tMarg", "bMarg"].iter().any(|k| n.vals.contains_key(*k) || n.vals.contains_key(&format!("{k}%"))) {
+            dw = (size * 0.56).min(n.rect.w * 0.1).max(0.0);
+        }
         (m("lMarg", dw), m("tMarg", dh), m("rMarg", dw), m("bMarg", dh))
+    }
+
+    /// Textens höjd med insättningarna när den läggs ut i bredden `w`.
+    fn text_height(&self, sp: &Node, body: &Node, w: f64) -> f64 {
+        let bodies: Vec<&Node> = body.child("a:bodyPr").into_iter().collect();
+        let bp = richtext::body_props(&bodies);
+        let chain = [sp];
+        let lists = inherit::list_styles(self.sheets, &chain, inherit::tx_kind(sp));
+        let (font_ref, font_color) = inherit::style_font(self.sheets, sp.child("p:style"));
+        let env = TextEnv { sheets: self.sheets, lists, font_ref, font_color, font_scale: bp.font_scale, slide_no: 1 };
+        let fr = richtext::frame(&env, body, &bp);
+        // Textens höjd i Kladds textmotor (samma som när den ritas). Avståndet efter det sista stycket
+        // räknas inte: med det blev jämförelsen mot PowerPoints ritdelar sämre i medel (se docs).
+        (text::layout(&fr, w as f32, 1.0e6, &self.sheets.deck.fonts).height + bp.insets.1 + bp.insets.3) as f64
     }
 
     /// Ryms texten i rutan?
@@ -598,9 +626,16 @@ impl Emitter<'_, '_, '_, '_> {
             };
             let text_rect = Rect { x: r.x + tr.0, y: r.y + tr.1, w: (tr.2 - tr.0).max(1.0), h: (tr.3 - tr.1).max(1.0) };
             let prim = t.bounded(id, "primFontSz").unwrap_or(65.0);
-            let sec = t.bounded(id, "secFontSz").unwrap_or(prim);
+            // Utan `secFontSz` är texten på nivå 1 och nedåt 78 % av den primära (som PowerPoint, `vList2`).
+            let sec = t.bounded(id, "secFontSz").unwrap_or(prim * 0.78);
             let min = t.rules_for(id).iter().filter(|r| r.attr("type").is_some_and(|t| t.ends_with("FontSz"))).filter_map(|r| r.attr_f64("val")).fold(f64::INFINITY, f64::min);
-            let (start, min) = if min.is_finite() { (Fonts { prim, sec }, min) } else { (Fonts { prim: prim.min(18.0), sec: sec.min(18.0) }, prim.min(18.0)) };
+            // Utan regel krymps texten inte: storleken ur villkoren när rutorna växer med texten (då är
+            // storleken redan vald med `Tree::font_k`), annars högst 18 pt.
+            let (start, min) = match (min.is_finite(), self.grow_mode && t.nodes[id].vals.contains_key("primFontSz")) {
+                (true, _) => (Fonts { prim, sec }, min),
+                (false, true) => (Fonts { prim, sec }, prim),
+                (false, false) => (Fonts { prim: prim.min(18.0), sec: sec.min(18.0) }, prim.min(18.0)),
+            };
             let fixed = t.text_points(id).iter().all(|(p, _)| t.m.custom_text(*p));
             let mut txx = el(
                 "p:txXfrm",
@@ -618,7 +653,16 @@ impl Emitter<'_, '_, '_, '_> {
         }
         // Teckenstorlek per form, sedan den minsta i varje grupp med `op="equ"`.
         for p in &mut pending {
-            p.font = self.fit(p);
+            if self.grow_mode && t.grows_with_text(p.id) {
+                // Rutan växer i stället för att texten krymps: spara höjden texten behöver.
+                let need = self.body(p.id, p.start, self.insets(p.id, p.start)).map(|b| self.text_height(&p.sp, &b, p.text_box.0)).unwrap_or(0.0);
+                let r = t.nodes[p.id].rect;
+                self.needs.borrow_mut().insert(p.id, need + (r.h - p.text_box.1).max(0.0));
+                p.font = p.start;
+                p.fixed = true;
+            } else {
+                p.font = self.fit(p);
+            }
         }
         let mut group_min: HashMap<(usize, usize), f64> = HashMap::new();
         for p in &pending {
