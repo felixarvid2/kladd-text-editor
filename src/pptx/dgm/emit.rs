@@ -123,7 +123,9 @@ impl Emitter<'_, '_, '_, '_> {
             }
             cur = t.nodes[i].parent;
         }
-        None
+        // En nod utan presentationspunkt (t.ex. nyss tillagd i redigeringen) får stilen som noderna med
+        // samma namn har.
+        t.nodes.iter().filter(|n| n.name == t.nodes[id].name).find_map(|n| n.pres.and_then(|p| t.m.prset(p)).and_then(|s| s.attr("presStyleLbl")).map(str::to_owned))
     }
 
     fn style_refs(&self, drawn: &[usize]) -> HashMap<usize, StyleRef> {
@@ -602,11 +604,15 @@ impl Emitter<'_, '_, '_, '_> {
                 }
             }
             let model_id = n.pres.map(|p| t.m.pts[p].id.to_owned()).unwrap_or_default();
-            let sp = el(
+            let mut sp = el(
                 "p:sp",
                 &[("modelId", model_id)],
                 vec![el("p:nvSpPr", &[], vec![el("p:cNvPr", &[("id", "0".into()), ("name", String::new())], Vec::new()), el("p:cNvSpPr", &[], Vec::new())]), sppr, self.style(sr)],
             );
+            // Datapunkten formen visar (för redigeringen, `edit_smartart.rs`; skrivs aldrig till filen).
+            if let Some(p) = t.own_point(id) {
+                sp.attrs.push(("kladdPt".into(), t.m.pts[p].id.to_owned()));
+            }
             // Platshållare för en bild (`blipPhldr`): PowerPoints bildsymbol mitt i formen.
             let picture = prst.is_some() && shape.is_some_and(|s| s.attr_bool("blipPhldr").unwrap_or(false));
             if t.text_points(id).is_empty() {

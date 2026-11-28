@@ -288,3 +288,118 @@ impl KladdApp {
         self.notify(ctx, t("Kopian av presentationen är ett nytt dokument. Presentationen själv ändras inte."), false);
     }
 }
+
+// ---------------------------------------------------------------- ny presentation
+
+impl KladdApp {
+    /// *Arkiv → Ny presentation…*: öppnar dialogen med färgvarianter.
+    pub(crate) fn pptx_open_new_dialog(&mut self) {
+        self.new_pres = Some(crate::pptx::new_deck::Variant::Kladd);
+    }
+
+    /// Lägger en ny, namnlös presentation i en ny flik (ingen sökväg förrän man sparar).
+    fn pptx_install_new(&mut self, ctx: &egui::Context, bytes: Vec<u8>) {
+        match crate::pptx::Deck::open(&bytes) {
+            Ok(deck) => {
+                self.untitled_counter += 1;
+                let tab = PptxTab::with_source(deck, bytes);
+                let doc = crate::doc::Document::pptx_untitled(self.next_id, self.untitled_counter, tab);
+                self.next_id += 1;
+                self.docs.push(doc);
+                self.active = self.docs.len() - 1;
+                // Börja i redigeringsläget: en ny presentation är till för att fyllas.
+                if let Some(tab) = self.pptx_tab_mut() {
+                    tab.toggle_edit();
+                }
+            }
+            Err(e) => self.notify(ctx, e, true),
+        }
+    }
+
+    /// Dialogen *Ny presentation*: välj färgvariant.
+    pub(crate) fn pptx_new_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        use crate::pptx::new_deck::Variant;
+        let Some(mut sel) = self.new_pres else { return };
+        let mut create = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("kladd-pptx-new"))
+            .backdrop_color(egui::Color32::from_black_alpha(if p.dark { 140 } else { 70 }))
+            .frame(Frame::NONE.fill(p.surface).stroke(egui::Stroke::new(1.0, p.line)).corner_radius(14).inner_margin(egui::Margin::same(24)).shadow(ctx.global_style().visuals.window_shadow))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(egui::RichText::new(t("Ny presentation")).font(egui::FontId::new(17.0, crate::theme::semibold())).color(p.text));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(t("Välj färgtema. Bilden får Kladds egna bildmall med sju layouter.")).color(p.muted));
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    for v in Variant::ALL {
+                        let name = match v {
+                            Variant::Kladd => t("Kladd"),
+                            Variant::Skog => t("Skog"),
+                            Variant::Skymning => t("Skymning"),
+                        };
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(126.0, 84.0), egui::Sense::click());
+                        let on = sel == v;
+                        ui.painter().rect_filled(r, 8.0, p.chrome);
+                        ui.painter().rect_stroke(r, 8.0, egui::Stroke::new(if on { 2.0 } else { 1.0 }, if on { p.accent } else { p.line }), egui::StrokeKind::Inside);
+                        for (i, c) in v.swatches().iter().enumerate() {
+                            let sw = egui::Rect::from_min_size(r.min + egui::vec2(12.0 + i as f32 * 36.0, 14.0), egui::vec2(30.0, 30.0));
+                            ui.painter().rect_filled(sw, 5.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                        }
+                        ui.painter().text(r.min + egui::vec2(12.0, 62.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.5), p.text);
+                        if resp.clicked() {
+                            sel = v;
+                        }
+                    }
+                });
+                ui.add_space(20.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let ok = egui::Button::new(egui::RichText::new(t("Skapa")).font(egui::FontId::new(13.5, crate::theme::medium())).color(p.on_accent)).fill(p.accent).stroke(egui::Stroke::NONE).corner_radius(8).min_size(egui::vec2(88.0, 30.0));
+                    if ui.add(ok).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        create = true;
+                    }
+                    if ui.add(crate::app::quiet_button(t("Avbryt"), p)).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            });
+        if create {
+            self.new_pres = None;
+            self.pptx_install_new(ctx, crate::pptx::new_deck::build(sel));
+        } else if cancel {
+            self.new_pres = None;
+        } else {
+            self.new_pres = Some(sel);
+        }
+    }
+
+    /// *Ny presentation från mall…*: välj en `.potx` (eller en annan presentation).
+    pub(crate) fn pptx_request_new_from_file(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() {
+            self.notify(ctx, t("Stäng den öppna fildialogen först."), true);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dialog = Some(rx);
+        let ctx = ctx.clone();
+        let dir = self.start_dir();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().set_title(t("Ny presentation från mall")).add_filter(t("PowerPoint-mallar och presentationer"), &["potx", "potm", "pptx", "pptm", "ppsx"]);
+            if let Some(dir) = dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let _ = tx.send(super::DialogResult::NewFromPptx(dlg.pick_file()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Öppnar filen som en ny, namnlös presentation: ingen sökväg, innehållstypen blir en presentation
+    /// när den sparas.
+    pub(crate) fn pptx_new_from_file(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => self.pptx_install_new(ctx, bytes),
+            Err(e) => self.notify(ctx, tf!("Kunde inte läsa {name}: {e}", name = path.display(), e = e), true),
+        }
+    }
+}

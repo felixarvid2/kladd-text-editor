@@ -9,7 +9,7 @@ use super::{raster, render, smartart, Deck};
 
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const NS: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#;
-const DGM: &str = r#"xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+pub(super) const DGM: &str = r#"xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 
 const THEME: &str = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Prov"><a:themeElements>
 <a:clrScheme name="Prov"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="1F497D"/></a:dk2><a:lt2><a:srgbClr val="EEECE1"/></a:lt2>
@@ -28,7 +28,7 @@ const QUICK: &str = r#"<dgm:styleDef xmlns:dgm="http://schemas.openxmlformats.or
 
 /// En .pptx (720 × 540 pt) med `slide_inner` på bilden och SmartArt-delarna `parts`
 /// (`ppt/diagrams/…`); bildens relationer rIdD/rIdL/rIdQ/rIdC (och rIdW om `drawing`).
-fn pptx(slide_inner: &str, data: &str, layout: &str, drawing: Option<&str>) -> Vec<u8> {
+pub(super) fn pptx(slide_inner: &str, data: &str, layout: &str, drawing: Option<&str>) -> Vec<u8> {
     let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opt = zip::write::SimpleFileOptions::default();
     let mut put = |name: &str, data: &str| {
@@ -64,7 +64,7 @@ fn pptx(slide_inner: &str, data: &str, layout: &str, drawing: Option<&str>) -> V
 }
 
 /// SmartArt-ramen: (x, y, b, h) i punkter.
-fn frame(x: f64, y: f64, w: f64, h: f64) -> String {
+pub(super) fn frame(x: f64, y: f64, w: f64, h: f64) -> String {
     let e = |v: f64| (v * 12_700.0) as i64;
     format!(
         r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="5" name="SmartArt"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="{}" y="{}"/><a:ext cx="{}" cy="{}"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rIdD" r:lo="rIdL" r:qs="rIdQ" r:cs="rIdC"/></a:graphicData></a:graphic></p:graphicFrame>"#,
@@ -98,7 +98,7 @@ fn data(nodes: &[(&str, &str, &[(&str, &str)])], pres: &str, ext: &str) -> Strin
     format!(r#"<dgm:dataModel {DGM}><dgm:ptLst>{pts}{pres}</dgm:ptLst><dgm:cxnLst>{cxns}</dgm:cxnLst>{ext}</dgm:dataModel>"#)
 }
 
-fn layout(inner: &str) -> String {
+pub(super) fn layout(inner: &str) -> String {
     format!(r#"<dgm:layoutDef {DGM} uniqueId="urn:prov/layout">{inner}</dgm:layoutDef>"#)
 }
 
@@ -273,7 +273,7 @@ fn rita_layoutmotorns_bilder() {
 }
 
 /// En lista uppifrån (`lin`, `fromT`) med mellanrum (`sp`) efter varje nod utom den sista.
-const LIN_T: &str = r#"<dgm:layoutNode name="root"><dgm:alg type="lin"><dgm:param type="linDir" val="fromT"/></dgm:alg><dgm:shape/><dgm:presOf/>
+pub(super) const LIN_T: &str = r#"<dgm:layoutNode name="root"><dgm:alg type="lin"><dgm:param type="linDir" val="fromT"/></dgm:alg><dgm:shape/><dgm:presOf/>
 <dgm:constrLst><dgm:constr type="w" for="ch" forName="node" refType="w"/><dgm:constr type="h" for="ch" forName="node" refType="h"/><dgm:constr type="h" for="ch" forName="space" refType="h" fact="0.1"/><dgm:constr type="primFontSz" for="ch" forName="node" op="equ" val="65"/></dgm:constrLst>
 <dgm:ruleLst><dgm:rule type="primFontSz" for="ch" forName="node" val="5"/></dgm:ruleLst>
 <dgm:forEach name="f" axis="ch" ptType="node"><dgm:layoutNode name="node" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="roundRect"/><dgm:presOf axis="self"/></dgm:layoutNode>

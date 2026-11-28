@@ -289,7 +289,7 @@ pub fn slide_part(deck: &Deck, slide: usize) -> Result<String, String> {
 }
 
 /// Prefixet för en namnrymd i dokumentet (läggs till på roten om det saknas).
-fn pfx(doc: &mut XDoc, uri: &str, want: &str) -> String {
+pub(super) fn pfx(doc: &mut XDoc, uri: &str, want: &str) -> String {
     doc.ensure_prefix(uri, want)
 }
 
@@ -431,7 +431,7 @@ fn remove_timing_refs(root: &mut XElem, ids: &HashSet<String>) {
 }
 
 /// Största `p:cNvPr/@id` i dokumentet.
-fn max_id(root: &XElem) -> i64 {
+pub(super) fn max_id(root: &XElem) -> i64 {
     let mut m = 0;
     root.walk(&mut |e| {
         if e.name == "p:cNvPr" {
@@ -493,8 +493,8 @@ pub fn duplicate_shape(txn: &mut Txn, slide: usize, index: usize, id: u32) -> Re
         };
         if let Some(off) = xfrm.and_then(|x| x.child_mut("a:off")) {
             let (x, y) = (off.attr_i64("x").unwrap_or(0), off.attr_i64("y").unwrap_or(0));
-            off.set_attr("x", &(x + STEP).to_string());
-            off.set_attr("y", &(y + STEP).to_string());
+            off.set_attr("x", &x.saturating_add(STEP).to_string());
+            off.set_attr("y", &y.saturating_add(STEP).to_string());
         }
     };
     if is_ac(&copy) {
@@ -582,7 +582,7 @@ pub fn insert_textbox(txn: &mut Txn, slide: usize, xf: Xf) -> Result<usize, Stri
 }
 
 /// Lägger formen sist i formträdet (före `extLst`) och ger dess läge i ritmodellen.
-fn append_shape(doc: &mut XDoc, xml: &str) -> Result<usize, String> {
+pub(super) fn append_shape(doc: &mut XDoc, xml: &str) -> Result<usize, String> {
     let el = doc_fragment(doc, xml)?;
     let scope = doc.root_scope();
     let tree = tree_mut(doc)?;

@@ -194,6 +194,8 @@ enum DialogResult {
     PdfInsert { doc_id: u64, path: Option<PathBuf>, at: usize },
     /// "Importera .docx/.odt…" i mallgalleriet.
     TemplateImport(Option<PathBuf>),
+    /// *Ny presentation från mall…*: vald fil.
+    NewFromPptx(Option<PathBuf>),
 }
 
 struct PendingPassword {
@@ -283,6 +285,8 @@ pub struct KladdApp {
     autosave: crate::autosave::Autosave,
     history: Option<crate::history_ui::Dialog>,
     templates: Option<crate::templates_ui::Dialog>,
+    /// Dialogen *Ny presentation* (vald färgvariant).
+    new_pres: Option<crate::pptx::new_deck::Variant>,
     pending_password: Option<PendingPassword>,
     allow_exit: bool,
     toast: Option<Toast>,
@@ -456,6 +460,7 @@ impl KladdApp {
             autosave: Default::default(),
             history: None,
             templates: None,
+            new_pres: None,
             pending_password: None,
             allow_exit: false,
             toast: None,
@@ -978,9 +983,12 @@ impl KladdApp {
     /// Efter varje lyckad sparning av flikens egen fil: minns filens stämpel och lagrar en version.
     fn after_save(&mut self, idx: usize, path: &Path) {
         let Some(doc) = self.docs.get(idx) else { return };
-        self.autosave.record_stamp(doc.id, path);
+        // Filen läses om en gång: bytes går både till historiken och till kontrollsumman mot extern ändring.
+        // Gäller också presentationer (`save_to` skriver zip-filen, som läses här).
+        let bytes = std::fs::read(path).ok();
+        self.autosave.record_stamp_with(doc.id, path, bytes.as_deref());
         self.git.bump();
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Some(bytes) = bytes {
             let _ = crate::history::record(&crate::history::root(), path, &bytes, crate::history::now_ms(), &Default::default());
         }
     }
@@ -1437,6 +1445,11 @@ impl KladdApp {
             DialogResult::Open(files) => {
                 for f in files {
                     self.open_path(ctx, &f);
+                }
+            }
+            DialogResult::NewFromPptx(path) => {
+                if let Some(path) = path {
+                    self.pptx_new_from_file(ctx, &path);
                 }
             }
             DialogResult::TemplateImport(path) => {
@@ -2688,6 +2701,9 @@ impl KladdApp {
             }
             if welcome_row(ui, p, t("Öppna fil…"), "Ctrl+O", None) {
                 self.request_open(&ctx);
+            }
+            if welcome_row(ui, p, t("Ny presentation…"), "", None) {
+                self.pptx_open_new_dialog();
             }
         });
 
@@ -4087,6 +4103,7 @@ impl eframe::App for KladdApp {
         self.docx_dialog(&ctx, &p);
         self.history_dialog(&ctx, &p);
         self.templates_dialog(&ctx, &p);
+        self.pptx_new_dialog(&ctx, &p);
         self.password_dialog(&ctx, &p);
         self.print_dialog(&ctx, &p);
         self.page_dialog(&ctx, &p);

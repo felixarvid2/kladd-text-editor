@@ -289,14 +289,17 @@ fn draw_scene(s: &mut krilla::surface::Surface<'_>, scene: &Scene) {
 /// Skriver bilderna `slides` (index) som en PDF.
 pub fn write(deck: &Deck, slides: &[usize]) -> Result<Vec<u8>, String> {
     let mut doc = Document::new();
-    for &i in slides {
-        let scene = super::render::slide_scene(deck, i);
-        let settings = PageSettings::from_wh(scene.width, scene.height).ok_or_else(|| crate::i18n::t("Ogiltig bildstorlek.").to_owned())?;
-        let mut page = doc.start_page_with(settings);
-        let mut s = page.surface();
-        draw_scene(&mut s, &scene);
-        s.finish();
-        page.finish();
+    // Visningslistorna byggs parallellt (några bilder i taget, så att minnet hålls nere); sidorna skrivs i ordning.
+    for chunk in slides.chunks(super::par::workers() * 2) {
+        let scenes = super::par::map(chunk, |&i| super::render::slide_scene(deck, i));
+        for scene in scenes {
+            let settings = PageSettings::from_wh(scene.width, scene.height).ok_or_else(|| crate::i18n::t("Ogiltig bildstorlek.").to_owned())?;
+            let mut page = doc.start_page_with(settings);
+            let mut s = page.surface();
+            draw_scene(&mut s, &scene);
+            s.finish();
+            page.finish();
+        }
     }
     doc.finish().map_err(|e| crate::tf!("PDF:en kunde inte skapas: {e}", e = format!("{e:?}")))
 }

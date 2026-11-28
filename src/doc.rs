@@ -396,6 +396,13 @@ impl Document {
         d
     }
 
+    /// En ny, namnlös presentation (ingen sökväg förrän den sparas).
+    pub fn pptx_untitled(id: u64, untitled_index: usize, tab: crate::pptx::view::PptxTab) -> Self {
+        let mut d = Self::new_untitled(id, untitled_index);
+        d.pptx = Some(Box::new(tab));
+        d
+    }
+
     fn load_bytes(id: u64, path: &Path, bytes: Vec<u8>, ext: &str) -> Result<Self, String> {
         let ext = ext.to_owned();
         // En PowerPoint-presentation öppnas i presentationsvyn.

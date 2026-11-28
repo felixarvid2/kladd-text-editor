@@ -347,6 +347,8 @@ pub static ALL: &[Command] = &[
     // ---------------------------------------------------------------- Arkiv
     Command::new("file.new", "Ny flik", File, "Ctrl+T", always, |a, _| a.new_tab()),
     Command::new("file.new_template", "Ny från mall…", File, "Ctrl+Shift+N", always, |a, _| a.open_templates()),
+    Command::new("file.new_presentation", "Ny presentation…", File, "", always, |a, _| a.pptx_open_new_dialog()),
+    Command::new("file.new_presentation_template", "Ny presentation från mall…", File, "", always, |a, c| a.pptx_request_new_from_file(c)),
     Command::new("file.open", "Öppna…", File, "Ctrl+O", always, |a, c| a.request_open(c)),
     Command::new("file.save", "Spara", File, "Ctrl+S", |e| e.has_doc, |a, c| a.cmd_save(c)),
     Command::new("file.save_as", "Spara som…", File, "Ctrl+Shift+S", |e| e.has_doc && !e.pdf, |a, c| a.request_save_as(c, a.active, false, false)),

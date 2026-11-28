@@ -173,10 +173,11 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 Sammanställt efter omgång 7 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
-  text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
+  text i SmartArt-former som visar flera noder (se *Redigera SmartArt-text*) och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
+  diagramdata: flernivåkategorier skrivs som en nivå, bubbelstorlekar och diagramtypen ändras inte (se
+  *Redigera diagramdata*);
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
-  autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
-  automatisk sparning).
+  autoanpassning efter storleksändring av flera former eller en grupp; (återställning efter krasch gjordes i omgång 8).
 - **Visning:** föredragsvyns skärmval saknar skärmlista på Wayland utan XWayland och är inte prövat med två
   riktiga skärmar (se *Föredragsvyn väljer skärm (omgång 7, w-pshow3)*); markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
@@ -575,8 +576,7 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   innehållstyperna) tas bort vid första ändringen. En `.ppt` som konverterats kräver *Spara som* (`needs_save_as`).
   Automatisk sparning går genom `save_to`; `autosave.rs` mäter tystnad med textens kontrollsumma, som för en
   presentation alltid är tom, så den sparar ~3 s efter att fliken blivit ändrad (också mitt i skrivandet; man kan
-  fortsätta skriva, sparningen avslutar bara ångra-sammanslagningen). Återställning efter krasch (`recovery.rs`)
-  sparar text och hoppar över presentationer.
+  fortsätta skriva, sparningen avslutar bara ångra-sammanslagningen). Återställning efter krasch: se *Återställning och stora presentationer (omgång 8)*.
 - **Markören:** `text::layout_carets` är samma utläggning som `text::layout` och ger dessutom markörlägen (klustrens
   början, radbrytningar och styckenas slut; `Seg` vet vilken körning och vilket tecken det börjar i).
   `TextModel::carets` bygger textramen som `render::Builder::text_body`/`place_text` (arv, `bodyPr`, geometrins
@@ -1300,3 +1300,168 @@ och Aptos ingår inte) installerade tillfälligt i behållaren, aldrig i repot, 
   metrikkompatibla ersättare, Trebuchet ≈ Liberation Sans (1,005). Nytt i `substitutes`: Georgia → Liberation
   Serif ×1,085 (fet ×1,204) och Comic Sans → Liberation Sans ×1,038 (fet ×1,011). Inget sådant typsnitt finns i
   referensmaterialet, så skalningen är mätt men inte prövad mot någon bild.
+
+## Ny presentation och former att rita (omgång 8)
+
+- **`new_deck.rs`:** `build(Variant) -> Vec<u8>` skriver en hel `.pptx` (zip i minnet) med eget tema (`Kladd`: färgschema ur
+  tre paletter `Kladd`/`Skog`/`Skymning`, typsnitten Calibri Light/Calibri, egen `a:fmtScheme` med tre fyllningar, linjer,
+  effekter och bakgrunder), en bildmall (rubrik, text, datum, sidfot, bildnummer, `p:txStyles` med nio nivåer), sju layouter
+  (`title`, `obj`, `secHead`, `twoObj`, `twoTxTwoObj`, `titleOnly`, `blank`, med svenska namn), en första bild i
+  Rubrikbild med tomma platshållare, anteckningsmall med eget tema (`theme2.xml`), `docProps`, `presProps`, `viewProps`,
+  `tableStyles` (bara standardformatets id). Måtten är våra egna (inte Microsofts); ingen del är kopierad. Provet
+  `ny_presentation_egen_inte_microsofts` kontrollerar temanamnet.
+- **Flöde:** `glue.rs` (`pptx_open_new_dialog`, `pptx_new_dialog`, `pptx_install_new`, `pptx_request_new_from_file`,
+  `pptx_new_from_file`), `Document::pptx_untitled` (ingen sökväg; *Spara* går till *Spara som*, `from_ext` är tom så
+  innehållstypen byts till `.pptx` när en mall sparas) och två kommandon (`file.new_presentation`,
+  `file.new_presentation_template`) plus en rad i startvyn. Fliken startar i redigeringsläget.
+- **Former** (`edit_new.rs`): `insert_shape(txn, bild, ShapeKind, Xf)` skriver `p:sp` (ordningen `nvSpPr`, `spPr`, `style`,
+  `txBody`) eller `p:cxnSp` för linjen (riktningen som `flipH`/`flipV`), med `p:style` ur temat (form: `lnRef` 2 med
+  `shade`, `fillRef` 1, `effectRef` 0, `fontRef minor` i `lt1`; linje: `lnRef` 1, `fillRef` 0). Gränssnittet:
+  `Editor::tool`/`new_drag`, `PptxTab::shape_tool` (dra en ruta, ett klick ger 144 × 86,4 pt, `Esc` avbryter), och i
+  `edit_view.rs` bara en anropsgren plus `!tool_on &&` på musblocken. Textrutan använder `insert_textbox` och börjar skriva.
+- **Prov** (`new_deck_tests.rs`): alla varianter går genom `validate`, öppnas, ritas; en ny bild per layout, text i rubriken,
+  sparning och återöppning; python-pptx öppnar filen och LibreOffice konverterar den till PDF när de finns; alla formtyper
+  ritas och får temats stil.
+- **Kvar:** fler färgteman (och typsnittsval i dialogen), en bildmallsvy, fler grundformer (stjärna, hjärta, pilar åt
+  andra håll) och dra-för-att-rita med `Skift` (proportionellt).
+
+## Redigera diagramdata (omgång 8)
+
+Dubbelklick på ett diagram i redigeringsläget öppnar *Diagramdata* (`edit_chart_ui.rs`): kategorier × serier,
+seriernas namn, lägg till/ta bort kategorier och serier, diagrammets rubrik och axelrubrikerna. *OK* skriver allt
+i ett ångringssteg; oförändrad tabell ger inget steg. Kroken i `edit_view.rs` är några rader: dubbelklicket (båda
+grenarna), fönstret ritas i `edit_overlay`, tangenterna går inte till redigeringen medan fönstret är öppet, och
+`set_deck` renderar om bilder vars diagramdel ändrats (diagrammet är en egen del, så bildens del är orörd; gäller
+också ångra/gör om).
+
+- **Diagramdelen** (`edit_chart.rs`, förlustfritt med `edit_xml.rs`): läsning ur seriernas `c:tx`, `c:cat`/
+  `c:xVal` och `c:val`/`c:yVal` (cache eller literal; kategorierna ur första serien som har några, tal- och
+  datumkategorier visas formaterade men behåller talet om texten inte ändras). Skrivning: cacharna skrivs om
+  (`ptCount`, `formatCode` och cachens `extLst` kvar), `c:f` får nytt slut när antalet kategorier ändras (lodräta
+  och vågräta områden), en ändrad kategori som inte är ett tal gör kategorierna till `strRef`/`strCache`. En ny
+  serie är en kopia av sista seriens `c:ser` med nytt `idx`/`order`, utan `c:spPr`/`c:dPt`/trendlinjer/
+  felstaplar/`extLst` (diagrammets stil ger färgen) och med `c:f` för namn och värden en kolumn (rad) längre bort
+  per ny serie. Borttagna serier tas bort ur sin plott; serierna står i tabellens ordning per plott. Rubriker:
+  `c:tx/c:rich` med första styckets `a:pPr` och körningens `a:rPr` kvar (rad = stycke); tom rubrik tar bort
+  `c:title` (diagrammets: `autoTitleDeleted` = 1), en ny skapas med `overlay` 0 på rätt plats i schemat.
+- **Arbetsboken** (`edit_chart_xlsx.rs`; `c:externalData` → relation `package` till `ppt/embeddings/*.xlsx`):
+  cellerna som `c:f` pekar på skrivs i bladet med det namnet (namn och kategorier som delade strängar sist i
+  `sharedStrings.xml`, eller `inlineStr` utan den delen; tal som `v`; tomma värden tar bort värdet men behåller
+  cellens format `s`). Rader skapas i ordning och celler i kolumnordning, `spans` tas bort på ändrade rader,
+  `dimension` växer. Tabeller (`xl/tables`) som cellerna ligger intill växer (`ref`, `autoFilter`, nya
+  `tableColumn` med rubrikcellens text som namn) och kolumnnamnen följer ändrade rubrikceller (Excel kräver att de
+  stämmer). En formel som skrivs över gör `xl/calcChain.xml` inaktuell: delen tas bort med relation och
+  innehållstyp. Celler för borttagna serier/kategorier lämnas kvar (utanför diagrammets område), så att tabeller
+  förblir giltiga. Övriga poster kopieras komprimerade som de är. Länkad arbetsbok (`TargetMode="External"`):
+  bara cachen, och en notis.
+- **Prov** (`edit_chart_tests.rs`, egen presentation och arbetsbok byggda i provet): referenserna, läsning, tur
+  och retur med alla ändringar (validate, diagramdelen läses tillbaka, referenser, källans `extLst` och rubrikens
+  formatering kvar, arbetsbokens celler/tabell/strängar, openpyxl om det finns, ritningen visar de nya
+  kategorierna, ångra), formel som skrivs över (calcChain borta, ny rad i ordning, oförändrade poster byte för
+  byte, openpyxl), länkad arbetsbok, rubrik bort och tillbaka. Det ignorerade `redigera_alla_diagram`
+  (`KLADD_PPTX_SWEEP=mapp`, `KLADD_CHART_XLSX_OUT=mapp` sparar arbetsböckerna) ändrar ett värde och lägger till en
+  kategori och en serie i varje diagram i materialet: 270 diagram (202 med inbäddad arbetsbok), alla giltiga,
+  läses tillbaka med rätt antal och ritas; de 97 sparade arbetsböckerna öppnas alla av openpyxl.
+- **Inte gjort:** flernivåkategorier (`multiLvlStrRef`) skrivs som en nivå; bubbelstorlekar (`c:bubbleSize`);
+  byta diagramtyp; datum som kategorier skrivs som text om de ändras; nya serier i ett punktdiagram får samma
+  x-värden som tabellens kategorier.
+
+## Återställning och stora presentationer (omgång 8, w-precov)
+
+- **Säkerhetskopia (`recovery.rs`, `recover.rs`):** `Recovery::sync` tar nu med presentationsflikar som är ändrade. Kopian är en
+  fullständig `.pptx` (`Session::recovery_bytes` = `save::write_zip(base, pkg, touched)`, samma källbevarande skrivning som
+  *Spara* men utan att röra sessionen) i `återställning/<pid>-<flik>.pptx` bredvid `…json` (`Snapshot::pptx`, texten tom). Den
+  skrivs av skrivtråden via `write_atomic` (tmp + rename), `.pptx` före `.json`, så `.json` är det som visar att en kopia
+  finns. Den skrivs bara när `Session::rev()` ändrats sedan sist. `find_orphans` är oförändrad (bara `.json`, halva
+  `.tmp`-filer räknas inte). `Found::into_document` öppnar kopian (`Deck::open`), `PptxTab::mark_recovered` räknar den som
+  ändrad (`Session::mark_dirty`) och dokumentets sökväg är originalets; Spara skriver dit. Ångra-historiken återställs inte.
+  Kopian rensas som för text (sparad, stängd eller ren flik).
+- **Stora presentationer (`big_tests.rs`, ignorerat):** `KLADD_PBIG=600 cargo test stora_presentationer -- --ignored --nocapture`
+  bygger en syntetisk presentation (rubrik och sex punkter på varje bild, bild på var annan, tabell på var femte) och mäter
+  öppning, första bild, miniatyrer, sökregister, PDF, en redigering, säkerhetskopian och `VmHWM`. Mått i debugbygge (inget
+  `--release`), 4 kärnor delade med andra körningar, 600 bilder, före → efter: öppna 345 → 156 ms, redigering 270 → 51 ms,
+  minnestopp 154 MB (oförändrat). Per bild kostar visningslistan ca 25–50 ms och rastreringen av en miniatyr ca 30–45 ms
+  (debug), jämnt fördelat: ingen enskild flaskhals, så vinsterna kommer av att fördela bilderna på trådar (200 bilder, samma
+  körning: sökregister 6,1 s med en tråd → 1,9 s med tre, miniatyrer 6,4 s med två trådar → 4,0 s med tre; PDF 28 → 22 s
+  vid 600 bilder, eftersom krilla-skrivningen av sidorna är i följd och ca 40 % av tiden).
+- **Gjort för stora presentationer:** `par.rs` (`workers()` = kärnor − 1, högst 6; `map` ger resultat i ordning);
+  `Deck::from_package` tolkar bilderna parallellt och tar över en bild ur `reuse` när både bildens del och dess relationsdel
+  är samma `Arc` (en redigering rör en eller två bilder); sökregistret byggs av `workers()` trådar; `max_jobs()` (miniatyrer)
+  är `workers().max(2)`; `pdf::write` bygger visningslistorna parallellt i omgångar om `2 × workers()`.
+- **Kvar:** PDF-skrivningen av sidorna är i följd (krilla); en redigering bygger fortfarande om bilderna som ändrats och
+  klonar övriga (`Node::clone`); första bildens första rendering laddar typsnitt (ca 0,4 s i debug); avkodade bilder i
+  cachen delas redan mellan ombyggnader.
+
+## Redigera SmartArt-text (omgång 8)
+
+`edit_smartart.rs`, med några rader krokar i `edit_view.rs` (`TextState::smart`, dubbelklick, `commit_text`,
+markörlägena i `set_deck`, tangenterna i `text_keys`).
+
+- **Hitta noden:** dubbelklick i redigeringsläget på en form i ett SmartArt-diagram (en toppnivåram). Formen tas ur
+  ritdelen som ritas: PowerPoints sparade (`dsp:`), annars Kladds motors (`Deck::drawings` med `#kladd`). Träffprovet
+  använder formens textruta (`dsp:txXfrm` med formens vridning) i ritdelens koordinater (`drawing_transform`). Noden
+  är den enda punkt (`node`/`asst`) som en `presOf`-koppling till formens presentationspunkt (`modelId`) kommer
+  från; i motorns ritdel står den i attributet `kladdPt` (bara i minnet, skrivs aldrig). Former som visar flera
+  noder (t.ex. `vList5`:s underpunkter) redigeras inte.
+- **Text:** samma textmodell, markör och formatrad som former. Modellen läses ur ritdelens `dsp:txBody` (det som
+  ritas, med storlekarna), annars ur datamodellens `dgm:t` (markörlägena räknas då med storleken motorn ritar med).
+  Skrivningen går till BÅDA: `dsp:sp/dsp:txBody` (hela modellen) och `dgm:pt/dgm:t` (bara texten, stycke för
+  stycke, med nodens egna stycke- och körningsformat, så att datamodellen inte får ritdelens anpassade storlekar).
+  Utan sparad ritdel skrivs datamodellen med hela modellen och motorn lägger ut diagrammet igen när presentationen
+  byggs om (`Deck::from_package` → `lay_out_missing`).
+- **Noder:** `Enter` sist i en nod ger ett syskon efter den (ny `dgm:pt` med nodens `dgm:t`-inställningar utan
+  text, `parTrans`/`sibTrans`-punkter och en `parOf`-koppling; nya `modelId` som GUID; följande syskons `srcOrd` +1),
+  `Tab` gör noden till sista barn till syskonet före, `Skift+Tab` flyttar den till syskon efter föräldern, och
+  `Backsteg`/`Delete` i en tom nod utan barn tar bort den (punkten, övergångarna, kopplingen, dess
+  presentationspunkter och deras kopplingar). Därefter **tas den sparade ritdelen bort**: `dsp:dataModelExt` i
+  datamodellen, bladets `diagramDrawing`-relation och delen (om inget annat blad pekar på den). Kladds motor lägger ut
+  diagrammet, och PowerPoint lägger ut det igen ur datamodellen när filen öppnas (det gör PowerPoint alltid när
+  ritdelen saknas). Presentationspunkterna för de nya noderna saknas; PowerPoint skapar dem.
+- **Prov** (`edit_smartart_tests.rs`): text i en nod med ritdel (datamodellen och ritdelen har samma text,
+  formateringen behålls i båda, övriga delar orörda, `validate`, öppnas igen), ny nod (ritdelen, relationen och
+  hänvisningen borta; den nya noden syns i rätt ordning efter omläggningen och går att skriva i), ned/upp/ta bort
+  och tangenterna. Det ignorerade `smartart_alla` (`KLADD_PPTX_SWEEP`) redigerar en nod och lägger till en nod i
+  varje diagram i materialet, sparar, validerar och öppnar igen: 54 diagram, inga fel.
+- **Kvar:** SmartArt-text där en form visar flera noder (t.ex. `vList5`:s underpunkter); presentationspunkter och
+  egen skala (`custScaleX`/`custScaleY`) för nya noder; SmartArt i grupper.
+
+## Slumpprov (omgång 8, w-pfuzz)
+
+`src/pptx/fuzz_tests.rs`: en egen seedad mutator (xorshift, stabil Rust) som förstör korpusfiler på tre nivåer —
+zip (ta bort och byta namn på poster, trunkera, byta byte), XML (ta bort/duplicera/byta element, ta bort attribut,
+extrema och negativa tal, tomma texter, ogiltig UTF-8, okända namnrymder, upprepade öppningstaggar) och relationer
+(mål på sig själv, på en annan del eller på en del som saknas). Varje fall körs i en egen tråd med `catch_unwind` och
+40 s tidsgräns: öppna, rita/rastrera de första bilderna, sök, PDF, tidslinje och bildspelets tider, sedan redigering
+(flytta med extrema mått, duplicera/ta bort form, text och format, tabellcell, textruta, anteckningar, duplicera/
+flytta/dölj/ny/ta bort bild), spara, `validate` av den sparade filen (när originalet godkänns) och öppna igen.
+Kör `KLADD_PPTX_FUZZ=<antal> KLADD_PPTX_FUZZ_SEED=<n> KLADD_PPTX_REFS=<mapp> [KLADD_PPTX_FUZZ_OUT=<mapp>]
+cargo test slumpprov_av -- --ignored --nocapture` (helst under `ulimit -v` så att en minnesbomb avbryter i stället för
+att fälla maskinen; loggraden `fall N seed S fil` skrivs före varje fall). `slumpprov_ett_fall` kör en fil och tar
+tid på stegen. Minnet mäts som ökning av `VmHWM` per fall (störst sett: ~230 MB).
+
+Resultat (≈3 000 fall, 522 korpusfiler under 3 MB): två klasser av paniker, båda aritmetiska overflow (bara i
+debugbygge; i release hade de gett tysta felvärden): (1) `p:notesSz` med orimliga mått gav overflow när
+anteckningsmallen skapades (`create_notes_master`), rättat vid roten genom att läsa in måtten med samma gränser som
+`p:sldSz`; (2) `duplicate_shape` lade till 228 600 på en position nära `i64::MAX`, nu `saturating_add`. Ingen hängning,
+ingen minnesbomb och ingen sparad fil som `validate` underkänner när originalet godkänns. En tidig "hängning" var
+mutatorn själv (en tagg upprepad 400 gånger i `presentation.xml` gav 757 bilder, och redigering av så många bilder tar
+~150 s i debugbygge); upprepningen är nu begränsad. Provets egen `validate` (`edit_tests.rs`) packar upp med `unwrap`
+och paniker på trasig zip; det är ett fel i provhjälpen, inte i produkten, och fuzzprovet räknar trasig zip som
+underkänd. Före/efter: seed 2 (400 fall) 1 klass → 0; seed 3/4 (500 vardera) 0 produktklasser; efter rättelserna seed
+2/5/6 (500 vardera) 0 klasser.
+
+### Slumpprov, andra passet: redigering av diagram, SmartArt, nya presentationer och säkerhetskopia
+
+Provet (`fuzz_tests.rs`) kör nu också: diagramdata (värde, namn, kategori, ny/borttagen serie och kategori, rubriker,
+orimliga tal, tomma tabeller) via `edit_chart::write` på förvrängda diagram, de inbäddade arbetsböckerna direkt
+(`edit_chart_xlsx::edit` med orimliga celler, även `u32::MAX`, och blad som saknas), SmartArt-text och nodoperationer
+(`edit_smartart`), nya presentationer (`new_deck::build`, alla varianter) och diagramfixturen som utgångsfiler, och
+`recovery_bytes` efter redigeringarna (måste godkännas av `validate` när originalet gör det). Förvrängningarna går nu
+också in i arbetsböckernas zip (blad, delade strängar, tabeller, beräkningskedja) och riktas hälften av gångerna mot
+`charts/` och `diagrams/`. 89 av korpusfilerna har diagram eller SmartArt.
+
+Resultat (1 500 fall före rättelsen, seed 11–13; 1 500 efter, seed 11/14/15): en klass, ett fall: en relationsfil med
+ogiltig UTF-8 lästes av ritningen (mild tolk) men inte av redigeringens källbevarande tolk, så `copy_part` (duplicera
+bild) kopierade ett diagram utan relationer och `r:id` pekade på ingenting. `Txn::raw_rels` faller nu tillbaka på den
+milda tolken. Diagram-, arbetsboks-, SmartArt- och säkerhetskopieringsstegen gav inga paniker, hängningar eller ogiltiga
+filer. Provets `validate` returnerar nu ett fel för en trasig zip-post i stället för att panika.

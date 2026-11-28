@@ -20,6 +20,27 @@ pub fn stamp_of(path: &Path) -> Option<Stamp> {
     Some((m.modified().ok()?, m.len()))
 }
 
+/// Filer upp till så här stora läses om och jämförs på innehåll innan en automatisk sparning skriver över dem.
+/// Större filer jämförs bara på stämpel (ändringstid och storlek): en ändring av samma storlek inom
+/// tidsstämpelns upplösning kan då missas, men att läsa om hundratals MiB vid varje sparning vore dyrare.
+pub const FINGERPRINT_MAX: u64 = 16 * 1024 * 1024;
+
+/// Kontrollsumma av filens bytes (std:s `DefaultHasher`; ingen snabbare hash finns bland beroendena).
+pub fn fingerprint_of(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Kontrollsumman av filen på disk, om den är högst `limit` byte och går att läsa.
+fn fingerprint_file(path: &Path, limit: u64) -> Option<u64> {
+    if std::fs::metadata(path).ok()?.len() > limit {
+        return None;
+    }
+    std::fs::read(path).ok().map(|b| fingerprint_of(&b))
+}
+
 /// Det som avgör om en flik får sparas automatiskt.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Facts {
@@ -70,6 +91,21 @@ pub fn check_disk(recorded: Option<Stamp>, current: Option<Stamp>) -> Disk {
     }
 }
 
+/// Som `check_disk`, men en fil vars stämpel ser oförändrad ut läses om (högst `limit` byte) och
+/// jämförs mot kontrollsumman av det Kladd senast läste eller skrev. Saknas kontrollsumma, eller är
+/// filen större än `limit`, gäller bara stämpeln.
+pub fn check_disk_content(path: &Path, recorded: Option<Stamp>, fingerprint: Option<u64>, limit: u64) -> Disk {
+    let state = check_disk(recorded, stamp_of(path));
+    match (state, recorded, fingerprint) {
+        (Disk::Unchanged, Some((_, len)), Some(fp)) if len <= limit => match fingerprint_file(path, limit) {
+            Some(now) if now == fp => Disk::Unchanged,
+            // Annat innehåll, eller filen gick inte att läsa: spara inte i blindo.
+            _ => Disk::Changed,
+        },
+        _ => state,
+    }
+}
+
 /// Sant när tystnaden efter senaste ändringen räckt.
 pub fn due(last_change: f64, now: f64) -> bool {
     now - last_change >= DELAY_SECS
@@ -79,6 +115,8 @@ pub fn due(last_change: f64, now: f64) -> bool {
 #[derive(Default)]
 pub struct Autosave {
     stamps: HashMap<u64, Stamp>,
+    /// Kontrollsumma av filens bytes när Kladd senast läste eller skrev den (saknas för stora filer).
+    fingerprints: HashMap<u64, u64>,
     /// Senast sedda textens hash och tidpunkten den ändrades, för den aktiva fliken.
     seen: HashMap<u64, (u64, f64)>,
     /// Flikar där en notis om ändring på disk redan visats (med stämpeln den gällde).
@@ -107,6 +145,24 @@ fn hash(text: &str) -> u64 {
 impl Autosave {
     /// Minns filens stämpel (vid öppning och efter varje sparning).
     pub fn record_stamp(&mut self, doc_id: u64, path: &Path) {
+        self.record_stamp_with(doc_id, path, None);
+    }
+
+    /// Som `record_stamp`; `bytes` är filens innehåll om anroparen redan har läst det (annars läses den här).
+    pub fn record_stamp_with(&mut self, doc_id: u64, path: &Path, bytes: Option<&[u8]>) {
+        let fp = match bytes {
+            Some(b) if b.len() as u64 <= FINGERPRINT_MAX => Some(fingerprint_of(b)),
+            Some(_) => None,
+            None => fingerprint_file(path, FINGERPRINT_MAX),
+        };
+        match fp {
+            Some(f) => {
+                self.fingerprints.insert(doc_id, f);
+            }
+            None => {
+                self.fingerprints.remove(&doc_id);
+            }
+        }
         match stamp_of(path) {
             Some(s) => {
                 self.stamps.insert(doc_id, s);
@@ -129,6 +185,7 @@ impl Autosave {
         self.big_hash.remove(&doc_id);
         self.failed.remove(&doc_id);
         self.stamps.remove(&doc_id);
+        self.fingerprints.remove(&doc_id);
         self.seen.remove(&doc_id);
         self.warned.remove(&doc_id);
     }
@@ -138,7 +195,7 @@ impl Autosave {
         match self.stamps.get(&doc_id) {
             // Okänd stämpel (borde inte hända): spara inte i blindo.
             None if stamp_of(path).is_some() => Disk::Changed,
-            recorded => check_disk(recorded.copied(), stamp_of(path)),
+            recorded => check_disk_content(path, recorded.copied(), self.fingerprints.get(&doc_id).copied(), FINGERPRINT_MAX),
         }
     }
 
@@ -278,6 +335,86 @@ mod tests {
         assert_eq!(check_disk(Some(stamp(5, 10)), None), Disk::Missing);
         assert_eq!(check_disk(None, None), Disk::Unchanged);
         assert_eq!(check_disk(None, Some(stamp(5, 10))), Disk::Changed);
+    }
+
+    fn disk_file(name: &str, content: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kladd-fp-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, content).unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn same_size_external_change_is_caught_by_fingerprint() {
+        let (dir, file) = disk_file("same", b"abcd");
+        let stamp = stamp_of(&file);
+        let fp = Some(fingerprint_of(b"abcd"));
+        // Samma längd och, med tvingad stämpel, samma ändringstid: bara innehållet skiljer.
+        std::fs::write(&file, b"abce").unwrap();
+        let mtime = stamp.unwrap().0;
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(stamp_of(&file), stamp, "förutsättning: stämpeln är densamma");
+        assert_eq!(check_disk_content(&file, stamp, None, FINGERPRINT_MAX), Disk::Unchanged, "stämpeln ensam missar det");
+        assert_eq!(check_disk_content(&file, stamp, fp, FINGERPRINT_MAX), Disk::Changed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn different_size_is_detected() {
+        let (dir, file) = disk_file("size", b"abcd");
+        let (stamp, fp) = (stamp_of(&file), Some(fingerprint_of(b"abcd")));
+        std::fs::write(&file, b"abcdef").unwrap();
+        assert_eq!(check_disk_content(&file, stamp, fp, FINGERPRINT_MAX), Disk::Changed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_file_passes() {
+        let (dir, file) = disk_file("same-ok", b"abcd");
+        let (stamp, fp) = (stamp_of(&file), Some(fingerprint_of(b"abcd")));
+        assert_eq!(check_disk_content(&file, stamp, fp, FINGERPRINT_MAX), Disk::Unchanged);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_over_limit_falls_back_to_metadata() {
+        let (dir, file) = disk_file("big", b"abcd");
+        let stamp = stamp_of(&file);
+        let fp = Some(fingerprint_of(b"abcd"));
+        std::fs::write(&file, b"abce").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(stamp.unwrap().0).unwrap();
+        // Gränsen under filens storlek: ingen omläsning, alltså missas ändringen med samma stämpel.
+        assert_eq!(check_disk_content(&file, stamp, fp, 3), Disk::Unchanged);
+        // Men en ändrad storlek fångas fortfarande av stämpeln.
+        std::fs::write(&file, b"abcdef").unwrap();
+        assert_eq!(check_disk_content(&file, stamp, fp, 3), Disk::Changed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_file_is_missing() {
+        let (dir, file) = disk_file("gone", b"abcd");
+        let (stamp, fp) = (stamp_of(&file), Some(fingerprint_of(b"abcd")));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(check_disk_content(&file, stamp, fp, FINGERPRINT_MAX), Disk::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_stamp_remembers_content_for_disk_state() {
+        let (dir, file) = disk_file("rec", b"abcd");
+        let mut a = Autosave::default();
+        a.record_stamp(1, &file);
+        assert_eq!(a.disk_state(1, &file), Disk::Unchanged);
+        let stamp = stamp_of(&file).unwrap();
+        std::fs::write(&file, b"abce").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(stamp.0).unwrap();
+        assert_eq!(a.disk_state(1, &file), Disk::Changed);
+        // Kladd skriver själv: nya bytes blir den nya utgångspunkten.
+        a.record_stamp_with(1, &file, Some(b"abce"));
+        assert_eq!(a.disk_state(1, &file), Disk::Unchanged);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

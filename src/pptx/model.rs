@@ -160,6 +160,8 @@ impl Deck {
         let size_emu = (size_emu.0.clamp(12_700, 51_206_400), size_emu.1.clamp(12_700, 51_206_400));
         let notes_size_emu =
             pres.child("p:notesSz").map(|s| (s.attr_i64("cx").unwrap_or(6_858_000), s.attr_i64("cy").unwrap_or(9_144_000))).unwrap_or((6_858_000, 9_144_000));
+        // Som bildstorleken: orimliga mått (negativa, enorma) ger overflow i anteckningsmallens uträkningar.
+        let notes_size_emu = (notes_size_emu.0.clamp(12_700, 51_206_400), notes_size_emu.1.clamp(12_700, 51_206_400));
         let first_slide_num = pres.attr_i64("firstSlideNum").unwrap_or(1);
         let default_text_style = pres.child("p:defaultTextStyle").cloned();
 
@@ -202,11 +204,30 @@ impl Deck {
             .child("p:sldIdLst")
             .map(|l| l.children.iter().filter_map(|c| c.attr("r:id").map(str::to_owned)).collect())
             .unwrap_or_default();
-        for id in slide_ids {
-            let Some(r) = package::rel(&pres_rels, &id) else { continue };
-            let part = r.target.clone();
-            let Some(root) = deck.pkg.xml(&part).filter(|n| n.name == "p:sld") else { continue };
-            let rels = deck.pkg.rels(&part);
+        // Bildernas XML tolkas parallellt (stora presentationer); en bild som en redigering inte rört (samma
+        // delar som i `reuse`) tas över ur den gamla presentationen i stället för att tolkas om.
+        let parts: Vec<String> = slide_ids.iter().filter_map(|id| package::rel(&pres_rels, id)).map(|r| r.target.clone()).collect();
+        let parsed: Vec<Option<(Node, Vec<Rel>)>> = {
+            let pkg = &deck.pkg;
+            super::par::map(&parts, |part| {
+                if let Some(old) = reuse.and_then(|d| d.slides.iter().find(|s| s.part == *part)) {
+                    let (o, n) = (reuse.map(|d| &d.pkg)?, pkg);
+                    let rels = crate::pptx::edit::rels_name(part);
+                    let same = |name: &str| match (o.parts.get(name), n.parts.get(name)) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if same(part) && same(&rels) {
+                        return Some((old.root.clone(), old.rels.clone()));
+                    }
+                }
+                let root = pkg.xml(part).filter(|n| n.name == "p:sld")?;
+                Some((root, pkg.rels(part)))
+            })
+        };
+        for (part, parsed) in parts.into_iter().zip(parsed) {
+            let Some((root, rels)) = parsed else { continue };
             let layout = match rel_target(&rels, "slideLayout") {
                 Some(lp) => match layout_index.get(lp) {
                     Some(&i) => Some(i),

@@ -198,7 +198,18 @@ impl<'a> Txn<'a> {
     /// Relationerna som de står (id, typ, mål som det står, extern).
     pub fn raw_rels(&self, owner: &str) -> Vec<(String, String, String, bool)> {
         let Some(bytes) = self.read(&rels_name(owner)) else { return Vec::new() };
-        let Some(d) = edit_xml::parse(&bytes) else { return Vec::new() };
+        let Some(d) = edit_xml::parse(&bytes) else {
+            // Den källbevarande tolken vägrar t.ex. ogiltig UTF-8, men läsningen (som ritar bilden) är mildare:
+            // en relationsfil som den förra läser ska inte tappa sina relationer vid kopiering (slumpprov: en
+            // kopierad diagramdel utan relationer, med `r:id` som pekar på ingenting).
+            let Some(root) = super::xml::parse(&bytes) else { return Vec::new() };
+            return root
+                .children
+                .iter()
+                .filter(|e| e.local() == "Relationship")
+                .filter_map(|e| Some((e.attr("Id")?.to_owned(), e.attr("Type").unwrap_or_default().to_owned(), e.attr("Target")?.to_owned(), e.attr("TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External")))))
+                .collect();
+        };
         d.root
             .elems()
             .filter(|e| e.local() == "Relationship")
@@ -503,6 +514,23 @@ impl Session {
         };
         let bytes = super::save::write_zip(&self.base, &rebuilt.as_ref().unwrap_or(deck).pkg, &self.touched)?;
         Ok((bytes, rebuilt))
+    }
+
+    /// Ändringsräknaren: ändras vid varje ändring, ångra och gör om (för säkerhetskopian).
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// Filens innehåll som det ser ut nu, utan att röra sessionen: en fullständig zip byggd med samma
+    /// källbevarande skrivning som sparningen (`recovery.rs` skriver den som säkerhetskopia).
+    pub fn recovery_bytes(&self, deck: &Deck) -> Result<Vec<u8>, String> {
+        super::save::write_zip(&self.base, &deck.pkg, &self.touched)
+    }
+
+    /// Räknar presentationen som ändrad (en återställd säkerhetskopia ska sparas över originalet).
+    pub fn mark_dirty(&mut self) {
+        self.rev = self.next_rev;
+        self.next_rev += 1;
     }
 
     /// Efter en lyckad sparning: det sparade blir utgångsläget.

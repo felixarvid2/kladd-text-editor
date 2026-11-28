@@ -44,16 +44,20 @@ pub mod fills;
 pub mod mtx;
 // Redigering och sparande (w-pedit).
 pub mod edit;
+pub mod new_deck;
 pub mod edit_bar;
 pub mod edit_fit;
 pub mod edit_group;
 pub mod edit_format;
+pub mod edit_new;
 pub mod edit_ops;
 pub mod edit_table;
 pub mod edit_text;
 pub mod edit_view;
 pub mod edit_xml;
 pub mod save;
+pub mod recover;
+pub mod par;
 // Omgång 3, bildspelet (w-panim): övergångar, animeringar och föredragsvy.
 pub mod anim;
 pub mod anim_expr;
@@ -81,6 +85,8 @@ mod chart_tests;
 #[cfg(test)]
 mod edit_tests;
 #[cfg(test)]
+mod new_deck_tests;
+#[cfg(test)]
 mod smartart_tests;
 // Omgång 4, utlösare och bokstav för bokstav (w-ptrig).
 #[cfg(test)]
@@ -88,6 +94,23 @@ mod anim_pieces_tests;
 // Omgång 5, länkar och video i bildspelet (w-pshow2).
 #[cfg(test)]
 mod show_links_tests;
+// Omgång 8, redigera diagramdata (w-pchartedit).
+pub mod edit_chart;
+pub mod edit_chart_ui;
+pub mod edit_chart_xlsx;
+#[cfg(test)]
+mod edit_chart_tests;
+// Omgång 8, stora presentationer (w-precov).
+#[cfg(test)]
+mod big_tests;
+// Omgång 8, redigera SmartArt-text (w-psmartedit).
+pub mod edit_smartart;
+#[cfg(test)]
+mod edit_smartart_tests;
+
+// Omgång 8, slumpprov (w-pfuzz).
+#[cfg(test)]
+mod fuzz_tests;
 
 pub use model::Deck;
 

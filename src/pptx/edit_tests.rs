@@ -166,7 +166,14 @@ pub fn validate(bytes: &[u8]) -> Vec<String> {
     let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else { return vec!["zip går inte att läsa".into()] };
     let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
     for i in 0..z.len() {
-        let mut f = z.by_index(i).unwrap();
+        // En trasig post (ogiltigt huvud, metod som inte stöds) är ett fel i filen, inte en panik i provet.
+        let mut f = match z.by_index(i) {
+            Ok(f) => f,
+            Err(e) => {
+                errs.push(format!("post {i} går inte att öppna: {e}"));
+                continue;
+            }
+        };
         let mut b = Vec::new();
         if f.read_to_end(&mut b).is_err() {
             errs.push(format!("{} går inte att packa upp", f.name()));

@@ -4,6 +4,21 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.17.0] – 2026-11-28
+
+### Nytt
+
+- **PowerPoint: ny presentation, ny från mall och former att rita.** *Arkiv → Ny presentation…* (och i startvyn) skapar en tom 16:9-presentation med Kladds egna tema (färg- och typsnittsschema och formatmatris skrivna för Kladd), egen bildmall och sju layouter, i tre färgteman; den har ingen sökväg förrän man sparar. *Ny presentation från mall…* öppnar en `.potx` (eller annan presentation) som en ny, namnlös presentation som sparas som `.pptx`. *Infoga* i redigeringsläget har rektangel, rundad rektangel, ellips, triangel, pil och linje som ritas genom att dra, med temats stil (`p:style` med `lnRef`, `fillRef`, `effectRef`, `fontRef`). Se `docs/dev/pptx.md`.
+- **PowerPoint: redigera diagramdata.** Dubbelklicka på ett diagram i redigeringsläget för att ändra värden, kategorier och serier (lägga till, ta bort, byta namn) och diagrammets rubrik och axelrubriker i en tabell. Diagrammet ändras källbevarande (cacharna och referenserna i diagramdelen) och den inbäddade Excel-arbetsboken uppdateras så att PowerPoints *Redigera data* visar samma värden; länkade arbetsböcker lämnas orörda. Se `docs/dev/pptx.md`.
+- **PowerPoint: text i SmartArt kan redigeras.** Dubbelklicka på en form i ett SmartArt-diagram i redigeringsläget för att skriva i nodens text; ändringen sparas både i diagrammets data och i PowerPoints sparade ritning. `Enter` sist i en nod lägger till en nod efter den, `Tab`/`Skift+Tab` flyttar noden en nivå ned/upp och `Backsteg` i en tom nod tar bort den; då lägger Kladd ut diagrammet på nytt (och PowerPoint gör det när filen öppnas). Se `docs/handbok.md`.
+- **PowerPoint: återställning efter krasch och snabbare stora presentationer.** Osparade ändringar i en presentation säkerhetskopieras regelbundet som en fullständig `.pptx` (samma källbevarande skrivning som *Spara*, atomiskt, aldrig över originalet); efter en krasch erbjuds kopian vid nästa start och öppnas som ändrad med originalets sökväg, så att *Spara* skriver dit (ångra-historiken följer inte med). Stora presentationer öppnas och redigeras snabbare: bildernas XML tolkas parallellt, oförändrade bilder tas över vid redigering, sökregistret och miniatyrerna byggs av flera trådar och PDF-exporten bygger visningslistorna parallellt (600 bilder i debugbygge: öppna 0,35 → 0,16 s, en redigering 0,27 → 0,05 s, PDF 28 → 22 s; bilderna ritas exakt som förut).
+
+### Rättat
+
+- **PowerPoint: tåligare mot trasiga filer.** Slumpprov (≈3 000 förvrängda presentationer) hittade två overflow-fel, nu rättade: orimliga anteckningsmått och duplicering av en form nära talområdets kant. Se `docs/dev/pptx.md`.
+- **PowerPoint: kopierade diagram behåller sina relationer** även när relationsfilen har ogiltiga tecken som ritningen tolererar (andra slumpprovet: redigering av diagram, arbetsböcker, SmartArt och säkerhetskopia).
+- **Återställning, enkelinstans och automatisk sparning är tåligare.** En misslyckad skrivning av säkerhetskopian (full disk, saknad behörighet) bokförs inte längre som gjord utan försöks igen nästa varv, och felet loggas en gång per flik. Meddelanden mellan Kladd-fönster är begränsade till 1 MiB och trasiga kastas. Automatisk sparning jämför dessutom en kontrollsumma av filens innehåll (filer upp till 16 MiB) och inte bara ändringstid och storlek, så en extern ändring med samma storlek och tidsstämpel inte skrivs över. Se `docs/handbok.md`.
+
 ## [2.16.0] – 2026-11-28
 
 ### Nytt

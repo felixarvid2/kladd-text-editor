@@ -20,7 +20,7 @@ use super::text;
 use super::xml::Node;
 
 /// Datamodellens del för ett SmartArt-objekt (`dgm:relIds@r:dm`).
-fn data_part(rels: &[package::Rel], gd: &Node) -> Option<String> {
+pub(crate) fn data_part(rels: &[package::Rel], gd: &Node) -> Option<String> {
     gd.child("dgm:relIds")?.attr("r:dm").and_then(|id| package::rel(rels, id)).map(|r| r.target.clone())
 }
 
@@ -30,17 +30,17 @@ fn data_model<'a>(b: &Builder<'a>, gd: &Node, owner: Owner) -> Option<Node> {
 }
 
 /// Nyckeln för en ritdel som layoutmotorn gjort (efter datamodellens del).
-fn laid_out_key(data_part: &str) -> String {
+pub(crate) fn laid_out_key(data_part: &str) -> String {
     format!("{data_part}#kladd")
 }
 
 /// Har ritdelen några former? PowerPoint sparar ibland en tom `dsp:spTree`.
-fn usable(d: &Drawing) -> bool {
+pub(crate) fn usable(d: &Drawing) -> bool {
     d.root.child("p:spTree").is_some_and(|t| t.children.iter().any(|c| matches!(c.name.as_str(), "p:sp" | "p:grpSp" | "p:cxnSp" | "p:pic")))
 }
 
 /// Ritdelens namn för diagrammet ur datamodellens `dsp:dataModelExt@relId` (eller den enda på bladet).
-fn drawing_part_of(rels: &[package::Rel], data: Option<&Node>) -> Option<String> {
+pub(crate) fn drawing_part_of(rels: &[package::Rel], data: Option<&Node>) -> Option<String> {
     let mut rel_id = None;
     if let Some(dm_xml) = data {
         dm_xml.walk(&mut |n| {
