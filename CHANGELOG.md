@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Rättat
+
+- **Enkelinstans och automatisk sparning: tystnande klienter och identiska stämplar.** En klient som ansluter till Kladds uttag men inte skickar något släpps efter 5 sekunder i stället för att hålla en tråd för alltid. Notisen om att en fil ändrats på disk nycklas nu också på innehållets kontrollsumma, så två olika externa ändringar med samma ändringstid och storlek ger varsin notis.
+
 ## [2.17.0] – 2026-11-28
 
 ### Nytt

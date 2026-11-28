@@ -120,13 +120,21 @@ pub struct Autosave {
     /// Senast sedda textens hash och tidpunkten den ändrades, för den aktiva fliken.
     seen: HashMap<u64, (u64, f64)>,
     /// Flikar där en notis om ändring på disk redan visats (med stämpeln den gällde).
-    warned: HashMap<u64, Option<Stamp>>,
+    warned: HashMap<u64, NoticeKey>,
     /// Flikar vars senaste automatiska sparning misslyckades, med textens hash (så att felet inte upprepas).
     failed: HashMap<u64, u64>,
     last_active: Option<u64>,
     had_focus: bool,
     /// Stora texter: senast beräknade hash och när (hashas högst två gånger i sekunden).
     big_hash: HashMap<u64, (f64, u64)>,
+}
+
+/// Vad en notis om ändring på disk gällde: stämpeln och, när filen gick att läsa, kontrollsumman av innehållet.
+/// Två olika externa ändringar med samma stämpel ger då två notiser.
+type NoticeKey = (Option<Stamp>, Option<u64>);
+
+fn notice_key(path: &Path) -> NoticeKey {
+    (stamp_of(path), fingerprint_file(path, FINGERPRINT_MAX))
 }
 
 /// Något som appen ska göra efter en genomgång.
@@ -251,7 +259,7 @@ impl Autosave {
             match self.disk_state(id, path) {
                 Disk::Unchanged => steps.push(Step::Save(id)),
                 state => {
-                    let current = stamp_of(path);
+                    let current = notice_key(path);
                     // Visa notisen en gång per ändring, inte varannan sekund.
                     if self.warned.get(&id) != Some(&current) {
                         self.warned.insert(id, current);
@@ -414,6 +422,19 @@ mod tests {
         // Kladd skriver själv: nya bytes blir den nya utgångspunkten.
         a.record_stamp_with(1, &file, Some(b"abce"));
         assert_eq!(a.disk_state(1, &file), Disk::Unchanged);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notice_key_tells_same_stamp_changes_apart() {
+        let (dir, file) = disk_file("notice", b"abcd");
+        let stamp = stamp_of(&file).unwrap();
+        let first = notice_key(&file);
+        std::fs::write(&file, b"abce").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(stamp.0).unwrap();
+        let second = notice_key(&file);
+        assert_eq!(first.0, second.0, "samma stämpel");
+        assert_ne!(first, second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

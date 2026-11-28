@@ -4,9 +4,10 @@
 //! Transporten är `interprocess`-lokala uttag: Unix-socket i en fil på Linux/macOS och
 //! namngiven pipe på Windows. Namnet är per användare.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{Listener, ListenerOptions, Name, Stream, prelude::*};
 
@@ -58,11 +59,40 @@ fn encode(files: &[PathBuf]) -> Vec<u8> {
 /// Största meddelande vi tar emot (en lista sökvägar; 1 MiB räcker för tusentals filer).
 const MAX_MESSAGE: u64 = 1 << 20;
 
-/// Läser ett meddelande, högst `MAX_MESSAGE` byte. `None` om det är för stort, trasigt eller inte går att läsa.
-fn read_message(r: impl Read) -> Option<Vec<PathBuf>> {
+/// Så länge en klient får hålla en anslutning öppen utan att ha skickat klart.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Läser ett meddelande, högst `MAX_MESSAGE` byte, färdigt inom `READ_TIMEOUT`. `None` om det är för stort,
+/// trasigt, går för långsamt eller inte går att läsa. Strömmen ska vara icke-blockerande (`WouldBlock` väntas
+/// in med korta pauser): `interprocess` saknar mottagningstidsgräns för namngivna pipes på Windows, så en
+/// gemensam frist i stället för `set_recv_timeout` ger samma beteende överallt, och tråden slutar alltid.
+fn read_message_within(mut r: impl Read, timeout: Duration) -> Option<Vec<PathBuf>> {
+    let deadline = Instant::now() + timeout;
     let mut buf = Vec::new();
-    r.take(MAX_MESSAGE + 1).read_to_end(&mut buf).ok()?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() as u64 > MAX_MESSAGE {
+                    return None;
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
     parse(&buf)
+}
+
+fn read_message(r: impl Read) -> Option<Vec<PathBuf>> {
+    read_message_within(r, READ_TIMEOUT)
 }
 
 /// Tomt meddelande = bara visa fönstret. Annars måste varje sökväg avslutas med NUL (som `encode` gör);
@@ -131,6 +161,10 @@ pub fn listen(tx: Sender<Incoming>, ctx: egui::Context) -> bool {
             // En tråd per anslutning, så att en hängande klient inte blockerar nästa.
             let (tx, ctx) = (tx.clone(), ctx.clone());
             std::thread::spawn(move || {
+                // Icke-blockerande + frist: en klient som tiger släpps efter `READ_TIMEOUT`.
+                if stream.set_nonblocking(true).is_err() {
+                    return;
+                }
                 if let Some(files) = read_message(stream) {
                     if tx.send(Incoming::Open(files)).is_ok() {
                         ctx.request_repaint();
@@ -175,6 +209,25 @@ mod tests {
         let files = read_message(&msg[..]).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("a.txt"));
+    }
+
+    /// En klient som anslutit men inte skickar något: alltid `WouldBlock`.
+    struct Silent;
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::WouldBlock.into())
+        }
+    }
+
+    #[test]
+    fn silent_client_times_out_and_does_not_block_others() {
+        let t = Instant::now();
+        let silent = std::thread::spawn(|| read_message_within(Silent, Duration::from_millis(150)));
+        // Ett andra, giltigt meddelande hanteras medan det första väntar.
+        let msg = encode(&[std::env::temp_dir().join("b.txt")]);
+        assert_eq!(read_message_within(&msg[..], Duration::from_millis(150)).map(|f| f.len()), Some(1));
+        assert!(t.elapsed() < Duration::from_millis(140), "giltig klient ska inte vänta på den tysta");
+        assert_eq!(silent.join().unwrap(), None);
     }
 
     #[test]
