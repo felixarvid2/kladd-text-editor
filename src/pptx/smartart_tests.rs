@@ -570,3 +570,20 @@ fn langt_ord_krymps_inom_rutan_och_gruppen_far_samma_storlek() {
         }
     }
 }
+
+#[test]
+fn bildplatshallare_far_en_bildsymbol() {
+    // En tom bildplatshållare (`blipPhldr`) ritas med PowerPoints bildsymbol i mitten.
+    let l = layout(
+        r#"<dgm:layoutNode name="root"><dgm:alg type="lin"/><dgm:shape/><dgm:presOf/><dgm:constrLst><dgm:constr type="w" for="ch" refType="w" fact="0.5"/><dgm:constr type="h" for="ch" refType="h"/></dgm:constrLst>
+<dgm:forEach name="f" axis="ch" ptType="node" cnt="1"><dgm:layoutNode name="img" styleLbl="node1"><dgm:alg type="sp"/><dgm:shape type="roundRect" blipPhldr="1"/><dgm:presOf/></dgm:layoutNode>
+<dgm:layoutNode name="txt" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="rect"/><dgm:presOf axis="self"/></dgm:layoutNode></dgm:forEach></dgm:layoutNode>"#,
+    );
+    let deck = Deck::open(&pptx(&frame(0.0, 0.0, 200.0, 100.0), &data(&[("a", "A", &[])], "", ""), &l, None)).unwrap();
+    let s = laid_out(&deck);
+    assert_eq!(s.len(), 3, "{s:?}");
+    assert_eq!(s[0].2, "roundRect");
+    // Symbolen: en kvadrat på 40 % av den kortaste sidan (100 → 40) mitt i formen (0–100 × 0–100).
+    let g = s[1].1;
+    assert!(s[1].2.is_empty() && close(g.2, 40.0) && close(g.3, 40.0) && close(g.0, 30.0) && close(g.1, 30.0), "{g:?}");
+}

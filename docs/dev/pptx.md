@@ -193,9 +193,10 @@ Sammanställt efter omgång 5 (detaljer i respektive avsnitt nedan):
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
 - **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)* och *SmartArt: hierarkier och böjda kopplingar
   (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: text som får rutan att växa
-  (`rule type="h" val="INF"`, `vList2`), ikoner i platshållare (`blipPhldr` ritas som en tom form), egna
-  förskjutningar i `composite` (kugghjul med ett och två hjul), hierarkins `hang` i två spalter (`secLinDir`),
-  nivåetiketterna i `hierarchy5` och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
+  (`rule type="h" val="INF"`, `vList2`), egna förskjutningar i `composite` (kugghjul med ett och två hjul),
+  hierarkins `hang` i två spalter (`secLinDir`), nivåetiketterna i `hierarchy5` (bakgrundskolumnerna i
+  `bgShapesFlow` följer inte hierarkin när den krymps; ett försök att krympa `hierFlow` till sin ruta gjorde
+  släktträdet sämre och togs bort) och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum` m.fl. (`duotone` gjordes i omgång 5)
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
@@ -1193,3 +1194,11 @@ presentationernas medel) sågs sida vid sida med PowerPoints PDF och grupperades
   (sorterade, lästa en gång per flik). Numrerad lista skiljs från punkt på om punkttexten börjar med en bokstav eller siffra.
 - Kvar: radavstånd i punkter (`spcPts`) visas inte i menyn, avstånd före/efter, `buAutoNum` med andra scheman
   (romerska, bokstäver) och startnummer, sökruta i typsnittsmenyn.
+
+## SmartArt: bildplatshållare (omgång 6)
+
+Tomma bildplatshållare i SmartArt (`dgm:shape blipPhldr="1"`, t.ex. `vList4`, `pList1`, `vList3` i
+mallarna i provsamlingarna) ritas som formen med PowerPoints bildsymbol i mitten (`emit.rs`, `picture_glyph`):
+en grå ram med berg och sol, en kvadrat på 40 % av formens kortaste sida, som en egen form ovanpå
+(`a:custGeom` med tre banor). Prov: `bildplatshallare_far_en_bildsymbol`. Text som får rutan att växa och
+nivåetiketterna i `hierarchy5` hanns inte med (se *Kvar*).
