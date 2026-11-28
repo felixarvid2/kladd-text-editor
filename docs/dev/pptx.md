@@ -174,7 +174,8 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
   SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
-  understruken, storlek, färg, justering och punkter (omgång 5, se *Textformat och autoanpassning (omgång 5)*:
+  understruken, storlek, färg, justering och punkter (omgång 5, se *Textformat och autoanpassning (omgång 5)*;
+  tabellceller och flervalsmarkering också gjorda där, text i former i grupper saknas:
   teckensnitt, marginaler, radavstånd, numrerade listor och markeringsfärg saknas); återställning efter krasch
   (bara automatisk sparning).
 - **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
@@ -1084,7 +1085,22 @@ Moduler: `edit_format.rs` (modellens formatfunktioner), `edit_fit.rs` (autoanpas
   inte, monotont, tillbaka till 100 %, behåll värde som ryms), `spautofit_*`, `textformat_tur_och_retur_*`
   (sparad fil går genom `validate`, öppnas igen och ritas med nya storlek, färg, justering och punkter);
   `redigera_alla` gör också ett textformatssteg med autoanpassning.
-- **Kvar:** text i tabellceller, flervalsmarkering och text i former i grupper (omgång 5 hann bara textformat och
-  autoanpassning); teckensnitt, radavstånd, nivåspecifika punkttecken och numrerade listor i formatraden; format på
+- **Tabellceller** (`edit_table.rs`): `geometry` räknar om rutnätet ur `a:tblGrid`, `a:tr/@h` och cellernas text
+  (raden växer som i `tables.rs`, men utan tabellformatets textstil: bara presentationens grundstilar och cellens
+  `a:lstStyle`, så markören kan stå någon punkt fel i en rubrikrad med fetstil ur formatet); `cell_at` ger cellen
+  under en punkt, `next_cell` läsordningen, `TextModel::cell_carets` markörlägena (delar `carets_core` med
+  formerna) och `set_cell_text` skriver `a:txBody` i `a:tc` (`write_cell_body`, skapas före `a:tcPr`). `TextState::cell`
+  pekar ut cellen; `commit_text` väljer `set_cell_text` och hoppar över autoanpassningen. Dubbelklick, klick på en
+  markerad tabell, `Enter` (cell 0,0) och klick i en annan cell börjar redigera; `Tab`/`Skift+Tab` går mellan celler
+  (efter sista cellen läggs ingen rad till). Tabeller som är vridna, speglade, höger-till-vänster eller har lodrät
+  celltext redigeras inte. Prov: `text_i_tabellcell_tur_och_retur`.
+- **Flera former** (`Editor::more` utöver `sel`, `selection()`): Skift/Ctrl+klick växlar, dragruta (`band`) markerar
+  det den rör, `Ctrl+A` allt. Dra en markerad form flyttar alla (`Drag::others`, ett steg); pilarna, `Delete`
+  (bakifrån), `Ctrl+D` (bakifrån, dubbletterna markeras via nya id) och ordna (en form i taget med återslagning ur id,
+  sammanslagna till ett ångra-steg) gäller alla. Storlek och vridning bara för en form (handtagen visas inte).
+  Formatraden gäller alla markerade former med text och står kvar hela redigeringsläget. Prov:
+  `flera_former_flyttas_dupliceras_och_tas_bort_i_ett_steg`.
+- **Kvar:** text i former i grupper; ny rad med `Tab` i sista cellen; tabellformatets textstil i cellmarkören;
+  teckensnitt, radavstånd, nivåspecifika punkttecken och numrerade listor i formatraden; format på
   markeringen som visas blandat (raden visar värdet i körningen vid markören); autoanpassning efter att en form
-  ändrar storlek med handtagen (PowerPoint räknar då om).
+  ändrar storlek med handtagen (PowerPoint räknar då om); markering och redigering av flera tabellceller.

@@ -48,6 +48,7 @@ pub mod edit_bar;
 pub mod edit_fit;
 pub mod edit_format;
 pub mod edit_ops;
+pub mod edit_table;
 pub mod edit_text;
 pub mod edit_view;
 pub mod edit_xml;

@@ -80,24 +80,31 @@ impl PptxTab {
                 self.commit_text();
             }
             self.edit.session.break_merge();
-        } else if let Some(sel) = self.edit.sel.filter(|s| s.slide == self.current) {
-            self.begin_text(sel, None);
-            let Some(ts) = &mut self.edit.text else { return };
-            let fmts = ts.carets.as_ref().map(|c| c.paras.clone()).unwrap_or_default();
-            let end = ts.model.end();
-            if f(&mut ts.model, Pos::default(), end, &fmts) {
-                self.commit_text();
+        } else {
+            // Alla markerade former med text (en eller flera).
+            for sel in self.selection() {
+                self.begin_text(sel, None);
+                let Some(ts) = &mut self.edit.text else { continue };
+                let fmts = ts.carets.as_ref().map(|c| c.paras.clone()).unwrap_or_default();
+                let end = ts.model.end();
+                if f(&mut ts.model, Pos::default(), end, &fmts) {
+                    self.commit_text();
+                }
+                self.end_text();
             }
-            self.end_text();
         }
     }
 
     /// Formatet som raden visar.
     fn format_now(&mut self) -> Option<Format> {
+        let ok = |me: &mut Self, sel: Sel| me.shapes_on(me.current).iter().any(|s| s.index == sel.index && s.id == sel.id && s.kind == Kind::Shape && !s.alternate);
         if let Some(ts) = &self.edit.text {
             return ts.carets.as_ref().and_then(|c| Format::at(c, ts.caret));
         }
         let sel = self.edit.sel.filter(|s| s.slide == self.current)?;
+        if !ok(self, sel) || !self.edit.more.is_empty() {
+            return None;
+        }
         let key = std::sync::Arc::as_ptr(&self.deck) as usize;
         if let Some((k, s, f)) = &self.edit.fmt.cache {
             if *k == key && *s == sel {
@@ -151,13 +158,10 @@ impl PptxTab {
         self.format_text(&mut |m, a, b, _| m.set_color(a, b, c));
     }
 
-    /// Formatraden under verktygsraden (när en form med text är markerad).
+    /// Formatraden under verktygsraden. Den står kvar hela redigeringsläget (så att bilden inte hoppar när
+    /// markeringen ändras) och visar formatet när en form med text är markerad.
     pub(super) fn format_bar(&mut self, ui: &mut Ui, p: &Palette) {
         if !self.editing() {
-            return;
-        }
-        let Some(sel) = self.edit.text.as_ref().map(|t| t.sel).or(self.edit.sel).filter(|s| s.slide == self.current) else { return };
-        if !self.shapes_on(self.current).iter().any(|s| s.index == sel.index && s.id == sel.id && s.kind == Kind::Shape && !s.alternate) {
             return;
         }
         let fmt = self.format_now();

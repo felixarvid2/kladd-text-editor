@@ -515,6 +515,24 @@ impl TextModel {
         out
     }
 
+    /// Skriver styckena in i cellens `a:txBody` (skapas före `a:tcPr`/`a:extLst` om den saknas).
+    pub fn write_cell_body(&self, tc: &mut XElem) {
+        if tc.child("a:txBody").is_none() {
+            let a = &self.a;
+            let tag = q(a, "txBody");
+            let Some(body) = self.frag(&format!("<{tag}><{}/><{}/></{tag}>", q(a, "bodyPr"), q(a, "lstStyle"))) else { return };
+            tc.insert_before(body, &["a:tcPr", "a:extLst"]);
+        }
+        let paras = self.paras_xml();
+        let Some(body) = tc.child_mut("a:txBody") else { return };
+        let at = body.index_of("a:p").unwrap_or(body.children.len());
+        body.remove_children("a:p");
+        let at = at.min(body.children.len());
+        for (k, p) in paras.into_iter().enumerate() {
+            body.children.insert(at + k, XNode::Elem(p));
+        }
+    }
+
     /// Skriver styckena in i formens `p:txBody` (skapas om den saknas; `bodyPr` och `lstStyle` behålls).
     pub fn write_into(&self, sp: &mut XElem, p_prefix: &str) {
         if sp.child("p:txBody").is_none() {
@@ -643,6 +661,12 @@ impl TextModel {
         let lists = inherit::list_styles(&sheets, &chain, inherit::tx_kind(sp));
         let (font_ref, font_color) = inherit::style_font(&sheets, style);
         let env = TextEnv { sheets: &sheets, lists, font_ref, font_color, font_scale: bp.font_scale, slide_no: deck.slide_number(slide) };
+        self.carets_core(deck, &env, &bp, rect, &f, autofit)
+    }
+
+    /// Utläggningen och markörlägena för texten i en ruta `rect` (l, t, r, b) i en placering `f`;
+    /// delas av former och tabellceller.
+    pub(super) fn carets_core(&self, deck: &Deck, env: &TextEnv<'_, '_>, bp: &richtext::BodyProps, rect: (f32, f32, f32, f32), f: &super::render::Frame, autofit: AutoFit) -> Option<Carets> {
         // Styckena ur modellen (samma XML som skrivs in i bilden), en körning per item.
         let mut body_xml = String::from("<a:txBody>");
         let mut run_map: Vec<Vec<(usize, usize)>> = Vec::new();
@@ -655,7 +679,7 @@ impl TextModel {
             &edit_xml::fragment_in(&self.scope, &body_xml.replace("<a:txBody>", &format!("<{}>", q(&self.a, "txBody"))).replace("</a:txBody>", &format!("</{}>", q(&self.a, "txBody")))).into_iter().next()?,
             &self.scope,
         )?;
-        let mut fr = richtext::frame(&env, &body, &bp);
+        let mut fr = richtext::frame(env, &body, bp);
         for (pi, para) in fr.paras.iter_mut().enumerate() {
             let Some(tp) = self.paras.get(pi) else { break };
             let lvl = tp.level().clamp(0, 8) as usize;

@@ -816,6 +816,26 @@ fn redigera_alla() {
                     step(&mut s, &mut deck, "textformat", &|t| super::edit_fit::set_text_fit(t, 0, sh.index, sh.id, &m, fit, sh.xf))?;
                 }
             }
+            // Text i första tabellcellen (första tabellen på bild 1) och flera former flyttas i ett steg.
+            if let Some(sh) = edit_ops::shapes(&deck, 0).into_iter().find(|s| super::edit_table::is_editable_table(&deck, 0, s.index)) {
+                let part0 = deck.slides[0].part.clone();
+                let doc = edit_xml::parse(deck.pkg.read(&part0).unwrap_or_default()).ok_or("bild 1 kan inte tolkas")?;
+                let a = doc.prefix_for(edit::NS_A).unwrap_or_else(|| "a".into());
+                if let Some(mut m) = super::edit_table::cell_model(&doc, sh.index, (0, 0), &a) {
+                    let end = m.end();
+                    m.insert(end, " ändrad");
+                    step(&mut s, &mut deck, "tabellcell", &|t| super::edit_table::set_cell_text(t, 0, sh.index, sh.id, (0, 0), &m))?;
+                }
+            }
+            let many: Vec<_> = edit_ops::shapes(&deck, 0).into_iter().take(3).collect();
+            if many.len() > 1 {
+                step(&mut s, &mut deck, "flytta flera", &|t| {
+                    for sh in &many {
+                        edit_ops::set_xf(t, 0, sh.index, sh.id, Xf { y: sh.xf.y + 12_700, ..sh.xf })?;
+                    }
+                    Ok(())
+                })?;
+            }
             let layout = deck.slides.first().and_then(|s| s.layout).unwrap_or(0);
             if !deck.layouts.is_empty() {
                 let after = (n > 0).then_some(0);
@@ -1082,4 +1102,108 @@ fn autoanpassning_mot_materialet() {
         }
     }
     println!("{n} former med lagrad autoanpassning: samma steg {same}, vårt mildare {milder}, vårt hårdare {harder}; lagrat steg ryms hos oss i {stored_fits}");
+}
+
+// ------------------------------------------------------------------ tabellceller
+
+/// Bild 1 med en tabell (2 rader × 2 kolumner, cell (0,0) med text) längst fram.
+fn table_fixture() -> (Ed, edit_ops::ShapeInfo) {
+    let mut ed = Ed::new(fixture(true));
+    let part0 = ed.deck.slides[0].part.clone();
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let cell = |txt: &str| format!(r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p>{}</a:p></a:txBody><a:tcPr/></a:tc>"#, if txt.is_empty() { String::new() } else { format!(r#"<a:r><a:rPr lang="sv-SE"/><a:t>{txt}</a:t></a:r>"#) });
+        let xml = format!(
+            r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="40" name="Tabell"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="1000000" y="1000000"/><a:ext cx="4000000" cy="800000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr/><a:tblGrid><a:gridCol w="2000000"/><a:gridCol w="2000000"/></a:tblGrid><a:tr h="400000">{}{}</a:tr><a:tr h="400000">{}{}</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#,
+            cell("Hej"),
+            cell(""),
+            cell(""),
+            cell("")
+        );
+        let el = doc.fragment(&xml).into_iter().next().unwrap();
+        let tree = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap();
+        let at = tree.index_of("p:extLst").unwrap_or(tree.children.len());
+        tree.children.insert(at, edit_xml::XNode::Elem(el));
+        Ok(())
+    });
+    let sh = ed.shape(0, "Tabell");
+    (ed, sh)
+}
+
+#[test]
+fn text_i_tabellcell_tur_och_retur() {
+    use super::edit_table::{cell_at, cell_model, next_cell, set_cell_text};
+    let (mut ed, sh) = table_fixture();
+    // Träff: punkterna i bildens punkter (EMU / 12700).
+    let (x0, y0) = (1_000_000.0 / 12_700.0, 1_000_000.0 / 12_700.0);
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 + 10.0, y0 + 10.0), Some((0, 0)));
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 + 200.0, y0 + 10.0), Some((0, 1)));
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 + 10.0, y0 + 40.0), Some((1, 0)));
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 - 5.0, y0 + 10.0), None);
+    assert_eq!(next_cell(&ed.deck, 0, sh.index, (0, 1), false), Some((1, 0)));
+    assert_eq!(next_cell(&ed.deck, 0, sh.index, (1, 1), false), None);
+    assert_eq!(next_cell(&ed.deck, 0, sh.index, (0, 0), true), None);
+    // Cell (1,1): skriv text; markören står i cellen.
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let mut m = cell_model(&doc, sh.index, (1, 1), "a").unwrap();
+    m.insert(Pos::default(), "Cell text");
+    let c = m.cell_carets(&ed.deck, 0, sh.index, (1, 1)).unwrap();
+    let (a, b) = c.caret(m.end()).unwrap();
+    assert!(a.0 > x0 + 157.0 && a.0 < x0 + 315.0 && a.1 > y0 + 31.5 && b.1 < y0 + 63.0, "markör {a:?} {b:?}");
+    ed.apply(|t| set_cell_text(t, 0, sh.index, sh.id, (1, 1), &m));
+    assert!(ed.text(0).contains("Cell text"));
+    // Cell (0,0) orörd; filen giltig och oförändrad utanför tabellen.
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert!(x.contains(r#"<a:t>Hej</a:t></a:r></a:p></a:txBody><a:tcPr/>"#) && x.contains("<a:t>Cell text</a:t>"), "{x}");
+    // Texten ger raden mer höjd när den bryts: cellens markör följer den nya geometrin.
+    let mut m2 = m.clone();
+    let end = m2.end();
+    m2.insert(end, " som är så lång att den måste brytas över flera rader i cellen");
+    ed.apply(|t| set_cell_text(t, 0, sh.index, sh.id, (1, 1), &m2));
+    let c2 = m2.cell_carets(&ed.deck, 0, sh.index, (1, 1)).unwrap();
+    assert!(c2.text_h > c.text_h + 5.0, "{} > {}", c2.text_h, c.text_h);
+    assert_valid(&ed.save());
+}
+
+// ------------------------------------------------------------------ flera former
+
+#[test]
+fn flera_former_flyttas_dupliceras_och_tas_bort_i_ett_steg() {
+    let mut ed = Ed::new(fixture(true));
+    let before = edit_ops::shapes(&ed.deck, 0);
+    let pick: Vec<_> = ["Ruta", "Bild"].iter().map(|n| ed.shape(0, n)).collect();
+    // Flytta båda i en transaktion.
+    ed.apply(|t| {
+        for s in &pick {
+            edit_ops::set_xf(t, 0, s.index, s.id, Xf { x: s.xf.x + 254_000, y: s.xf.y + 127_000, ..s.xf })?;
+        }
+        Ok(())
+    });
+    for s in &pick {
+        let now = ed.shape(0, &s.name);
+        assert_eq!((now.xf.x, now.xf.y), (s.xf.x + 254_000, s.xf.y + 127_000));
+    }
+    // Duplicera bakifrån: båda får nya id, lägena före står kvar.
+    let pick: Vec<_> = ["Ruta", "Bild"].iter().map(|n| ed.shape(0, n)).collect();
+    ed.apply(|t| {
+        for s in pick.iter().rev() {
+            edit_ops::duplicate_shape(t, 0, s.index, s.id)?;
+        }
+        Ok(())
+    });
+    assert_eq!(edit_ops::shapes(&ed.deck, 0).len(), before.len() + 2);
+    assert_valid(&ed.save());
+    // Ta bort alla fyra (originalen och dubbletterna) bakifrån i ett steg.
+    let all: Vec<_> = edit_ops::shapes(&ed.deck, 0).into_iter().filter(|s| s.name == "Ruta" || s.name == "Bild" || s.name.starts_with("Ruta ") || s.name.starts_with("Bild ")).collect();
+    assert!(all.len() >= 4, "{:?}", all.iter().map(|s| &s.name).collect::<Vec<_>>());
+    ed.apply(|t| {
+        for s in all.iter().rev() {
+            edit_ops::delete_shape(t, 0, s.index, s.id)?;
+        }
+        Ok(())
+    });
+    assert_eq!(edit_ops::shapes(&ed.deck, 0).len(), before.len() - 2);
+    assert_valid(&ed.save());
 }
