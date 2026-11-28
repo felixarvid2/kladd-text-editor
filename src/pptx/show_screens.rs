@@ -1,9 +1,12 @@
 //! Skärmarna för bildspelet: var publikens helskärm och föredragsvyn hamnar när det finns flera skärmar.
 //!
 //! egui/winit kan sätta ett fönster i helskärm på skärm nummer N (`ViewportCommand::SetMonitor`) men ger
-//! ingen skärmlista. På Linux/X11 läses därför skärmarna med RandR (x11rb, ren Rust) i samma ordning som winit
-//! räknar dem (kretsarna med en utgång och en storlek). På andra system saknas listan (tom): bildspelet
-//! beter sig då som förut, och *Byt skärm* och skärmvalet visas inte. Rent val av skärm provas här.
+//! ingen skärmlista. Skärmarna läses därför här, i samma ordning som winits `available_monitors()`:
+//! - Linux/X11: RandR (x11rb, ren Rust), kretsarna med en utgång och en storlek.
+//! - Windows: `EnumDisplayMonitors` + `GetMonitorInfoW` (windows-sys), i uppräkningens ordning.
+//! - macOS: `CGGetActiveDisplayList` + `CGDisplayBounds` (core-graphics), i listans ordning.
+//! Annars (Wayland utan X) är listan tom: bildspelet beter sig då som förut, och *Byt skärm* och skärmvalet
+//! visas inte. Rent val av skärm provas här.
 //!
 //! `KLADD_SCREENS="x,y,b,h;x,y,b,h"` ersätter listan (för att pröva menyn och placeringen utan flera skärmar).
 
@@ -56,9 +59,50 @@ fn platform() -> Vec<Screen> {
     read().unwrap_or_default()
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"))))]
+#[cfg(windows)]
+fn platform() -> Vec<Screen> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+    unsafe extern "system" fn each(hm: HMONITOR, _dc: HDC, _r: *mut RECT, data: LPARAM) -> i32 {
+        // SAFETY: `data` är pekaren till vektorn nedan, som lever under hela uppräkningen.
+        let out = unsafe { &mut *(data as *mut Vec<Screen>) };
+        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if unsafe { GetMonitorInfoW(hm, &mut info) } != 0 {
+            let r = info.rcMonitor;
+            out.push(Screen { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top });
+        }
+        1
+    }
+    let mut out: Vec<Screen> = Vec::new();
+    // SAFETY: återanropet följer `MONITORENUMPROC` och pekaren gäller bara under anropet.
+    unsafe { EnumDisplayMonitors(ptr::null_mut(), ptr::null(), Some(each), &mut out as *mut _ as LPARAM) };
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn platform() -> Vec<Screen> {
+    use core_graphics::display::CGDisplay;
+    // Punkter (inte bildpunkter) i CoreGraphics koordinater, som winit.
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            Screen { x: b.origin.x as i32, y: b.origin.y as i32, w: b.size.width as i32, h: b.size.height as i32 }
+        })
+        .collect()
+}
+
+#[cfg(not(any(windows, target_os = "macos", all(unix, not(target_os = "android")))))]
 fn platform() -> Vec<Screen> {
     Vec::new()
+}
+
+/// Skärmlistans enhet per egui-punkt: bildpunkter på Linux och Windows, men punkter på macOS.
+pub fn units_per_point(pixels_per_point: f32) -> f32 {
+    if cfg!(target_os = "macos") { 1.0 } else { pixels_per_point }
 }
 
 /// Skärmen som innehåller punkten.

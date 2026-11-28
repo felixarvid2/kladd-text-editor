@@ -215,7 +215,7 @@ impl KladdApp {
                 let outer = ctx.input(|i| i.viewport().outer_rect);
                 tab.restore_pos = outer.map(|r| r.min);
                 if let (Some(r), Some(show)) = (outer, tab.show_mut()) {
-                    let ppp = ctx.pixels_per_point();
+                    let ppp = crate::pptx::show_screens::units_per_point(ctx.pixels_per_point());
                     show.set_home_at(r.center() * ppp);
                 }
             }

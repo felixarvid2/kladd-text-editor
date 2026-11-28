@@ -530,7 +530,7 @@ impl ShowView {
             // Med flera skärmar: föredragsvyn på sin skärm (och flyttas med när *Byt skärm* byter).
             let place = self.audience_screen().map(|a| show_screens::presenter(self.screens.len(), self.home, a));
             let origin = |i: usize| {
-                let (s, ppp) = (self.screens[i], ctx.pixels_per_point());
+                let (s, ppp) = (self.screens[i], show_screens::units_per_point(ctx.pixels_per_point()));
                 pos2(s.x as f32 / ppp + 40.0, s.y as f32 / ppp + 40.0)
             };
             if let Some(i) = place {

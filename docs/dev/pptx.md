@@ -1227,11 +1227,17 @@ Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastade
 - **Vad egui/winit ger:** `ViewportCommand::SetMonitor(n)` (och `ViewportBuilder::with_monitor`) sätter fönstret i kantlös helskärm på
   skärm nummer n i winits `available_monitors()`-ordning, men varken egui eller eframe ger skärmlistan eller numret på den skärm
   fönstret ligger på (`ViewportInfo` har bara `monitor_size` och `outer_rect`).
-- **`show_screens.rs`:** skärmlistan läses på Linux/X11 med RandR via `x11rb` (direkt beroende, ren Rust, bara funktionen
-  `randr`; samma version som winit redan drar in): kretsarna från `get_screen_resources_current` med storlek och utgång, i samma
-  ordning och med samma urval som winit (`x11/monitor.rs`), så att index n är densamma skärm i båda. Windows, macOS och Wayland
-  utan XWayland ger tom lista = som förut (inget *Byt skärm*, inget skärmval); `EnumDisplayMonitors`/`NSScreen` är det som
-  saknas där. `KLADD_SCREENS="x,y,b,h;x,y,b,h"` ersätter listan för prov. Valet är rent och provat (`audience`, `presenter`).
+- **`show_screens.rs`:** skärmlistan läses i samma ordning som winits `available_monitors()`:
+  - Linux/X11: RandR via `x11rb` (direkt beroende, ren Rust, bara `randr`): kretsarna från `get_screen_resources_current` med storlek
+    och utgång, samma urval som winit (`x11/monitor.rs`).
+  - Windows: `EnumDisplayMonitors(0, null, …)` + `GetMonitorInfoW` (`windows-sys`, funktionen `Win32_Graphics_Gdi` tillagd); winit
+    (`windows/monitor.rs`) lägger monitorerna i uppräkningens ordning, och det gör vi också (`rcMonitor`, bildpunkter).
+  - macOS: `CGDisplay::active_displays()` + `bounds()` (`core-graphics` 0.23, samma som winit; `macos/monitor.rs` använder samma
+    lista i samma ordning). Enheten är punkter, inte bildpunkter (`units_per_point`).
+  - Wayland utan XWayland: tom lista = som förut (inget *Byt skärm*, inget skärmval).
+  `KLADD_SCREENS="x,y,b,h;x,y,b,h"` ersätter listan för prov. Valet är rent och provat (`audience`, `presenter`). Windows- och
+  macOS-grenarna är kontrollerade med `cargo check --target x86_64-pc-windows-msvc`/`aarch64-apple-darwin` på en liten provkrate
+  med modulen (hela kladd går inte att korskontrollera här: ring/cc-rs saknar `lib.exe` respektive Apple-verktyg), men inte körda.
 - **Beteende:** vid start läses Kladd-fönstrets `outer_rect` (mitten) → `home`. Med föredragsvy går publiken till nästa skärm
   (`(home+1)%n`), utan föredragsvy stannar den (om inte *Visa*-menyns val `Prefs::audience_screen` är satt, som gäller alltid).
   `glue.rs::pptx_sync_fullscreen` skickar `SetMonitor(n)` i stället för `Fullscreen(true)` och återställer fönstrets läge när
@@ -1239,4 +1245,4 @@ Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastade
   (knappen i föredragsvyn eller `Alt+S`, `ShowView::swap_screens`) byter.
 - **Prövat:** bara i Xvfb med en skärm (RandR-listan = 1; med `KLADD_SCREENS` visades menyn och föredragsvyns fönster flyttades
   mellan de två rektanglarna med `Alt+S`). Själva `SetMonitor` mellan verkliga skärmar är inte prövad här (Xvfb har bara en
-  RandR-krets), och inte heller Windows/macOS.
+  RandR-krets), och inte heller Windows/macOS (bara kompilerade).

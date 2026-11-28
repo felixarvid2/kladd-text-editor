@@ -2493,6 +2493,7 @@ version = "2.15.0"
 dependencies = [
  "arboard",
  "chrono",
+ "core-graphics",
  "cpal",
  "dirs",
  "eframe",
