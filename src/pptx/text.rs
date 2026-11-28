@@ -1248,9 +1248,14 @@ mod tests {
         let mut p = para("a\u{F0E8}b", false);
         p.runs[0].style.sym = Some("Wingdings".into());
         let r = runs(&layout(&frame(vec![p]), 300.0, 100.0, &book));
-        // Wingdings-pilen blir ett riktigt Unicode-tecken i stället för en tom ruta.
-        assert!(r.iter().any(|g| g.0.contains('\u{2794}')), "{r:?}");
-        assert!(!r.iter().any(|g| g.0.contains('\u{F0E8}')), "{r:?}");
+        if book.resolve("Wingdings", false, false).face.family.contains("Wingdings") {
+            // Riktig Wingdings finns (Windows/macOS i CI): tecknet ritas med den som det är.
+            assert!(r.iter().any(|g| g.0.contains('\u{F0E8}')), "{r:?}");
+        } else {
+            // Wingdings-pilen blir ett riktigt Unicode-tecken i stället för en tom ruta.
+            assert!(r.iter().any(|g| g.0.contains('\u{2794}')), "{r:?}");
+            assert!(!r.iter().any(|g| g.0.contains('\u{F0E8}')), "{r:?}");
+        }
     }
 
     #[test]
