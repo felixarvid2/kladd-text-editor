@@ -4,6 +4,8 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.17.0] – 2026-11-28
+
 ### Nytt
 
 - **PowerPoint: ny presentation, ny från mall och former att rita.** *Arkiv → Ny presentation…* (och i startvyn) skapar en tom 16:9-presentation med Kladds egna tema (färg- och typsnittsschema och formatmatris skrivna för Kladd), egen bildmall och sju layouter, i tre färgteman; den har ingen sökväg förrän man sparar. *Ny presentation från mall…* öppnar en `.potx` (eller annan presentation) som en ny, namnlös presentation som sparas som `.pptx`. *Infoga* i redigeringsläget har rektangel, rundad rektangel, ellips, triangel, pil och linje som ritas genom att dra, med temats stil (`p:style` med `lnRef`, `fillRef`, `effectRef`, `fontRef`). Se `docs/dev/pptx.md`.
