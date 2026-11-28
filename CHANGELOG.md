@@ -7,6 +7,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Rättat
 
 - **Enkelinstans och automatisk sparning: tystnande klienter och identiska stämplar.** En klient som ansluter till Kladds uttag men inte skickar något släpps efter 5 sekunder i stället för att hålla en tråd för alltid. Notisen om att en fil ändrats på disk nycklas nu också på innehållets kontrollsumma, så två olika externa ändringar med samma ändringstid och storlek ger varsin notis.
+- **PowerPoint: trasiga inbäddade typsnitt och SmartArt-urval kan inte längre krascha.** En komprimerad (MTX) glyf med negativt konturantal avvisas nu i stället för att ge en panik, glyfer med fler än 65 536 punkter avvisas i stället för att trunkeras tyst, och ett SmartArt-urval med `st` lika med det minsta heltalet panikar inte längre i debugbygget.
 
 ## [2.17.0] – 2026-11-28
 

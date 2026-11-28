@@ -476,6 +476,8 @@ fn datamodellens_axlar_och_urval() {
     assert_eq!(sel(r#"axis="ch" ptType="node" st="2" cnt="1""#), ["b"]);
     assert_eq!(sel(r#"axis="ch" ptType="node" step="2""#), ["a", "c"]);
     assert_eq!(sel(r#"axis="des" ptType="node""#), ["a", "a1", "b", "c"]);
+    // `st` som är i64::MIN: `-st` fick tidigare debugbygget att panika på överflöd.
+    assert_eq!(sel(r#"axis="ch" ptType="node" st="-9223372036854775808" cnt="1""#), ["a"]);
     assert_eq!(sel(r#"axis="ch ch" ptType="node node""#), ["a1"]);
     let a = m.pts.iter().position(|p| p.id == "a").unwrap();
     let n = super::xml::parse(br#"<dgm:forEach xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" axis="followSib" ptType="sibTrans" cnt="1"/>"#).unwrap();
