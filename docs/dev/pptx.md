@@ -1300,3 +1300,27 @@ och Aptos ingår inte) installerade tillfälligt i behållaren, aldrig i repot, 
   metrikkompatibla ersättare, Trebuchet ≈ Liberation Sans (1,005). Nytt i `substitutes`: Georgia → Liberation
   Serif ×1,085 (fet ×1,204) och Comic Sans → Liberation Sans ×1,038 (fet ×1,011). Inget sådant typsnitt finns i
   referensmaterialet, så skalningen är mätt men inte prövad mot någon bild.
+
+## Ny presentation och former att rita (omgång 8)
+
+- **`new_deck.rs`:** `build(Variant) -> Vec<u8>` skriver en hel `.pptx` (zip i minnet) med eget tema (`Kladd`: färgschema ur
+  tre paletter `Kladd`/`Skog`/`Skymning`, typsnitten Calibri Light/Calibri, egen `a:fmtScheme` med tre fyllningar, linjer,
+  effekter och bakgrunder), en bildmall (rubrik, text, datum, sidfot, bildnummer, `p:txStyles` med nio nivåer), sju layouter
+  (`title`, `obj`, `secHead`, `twoObj`, `twoTxTwoObj`, `titleOnly`, `blank`, med svenska namn), en första bild i
+  Rubrikbild med tomma platshållare, anteckningsmall med eget tema (`theme2.xml`), `docProps`, `presProps`, `viewProps`,
+  `tableStyles` (bara standardformatets id). Måtten är våra egna (inte Microsofts); ingen del är kopierad. Provet
+  `ny_presentation_egen_inte_microsofts` kontrollerar temanamnet.
+- **Flöde:** `glue.rs` (`pptx_open_new_dialog`, `pptx_new_dialog`, `pptx_install_new`, `pptx_request_new_from_file`,
+  `pptx_new_from_file`), `Document::pptx_untitled` (ingen sökväg; *Spara* går till *Spara som*, `from_ext` är tom så
+  innehållstypen byts till `.pptx` när en mall sparas) och två kommandon (`file.new_presentation`,
+  `file.new_presentation_template`) plus en rad i startvyn. Fliken startar i redigeringsläget.
+- **Former** (`edit_new.rs`): `insert_shape(txn, bild, ShapeKind, Xf)` skriver `p:sp` (ordningen `nvSpPr`, `spPr`, `style`,
+  `txBody`) eller `p:cxnSp` för linjen (riktningen som `flipH`/`flipV`), med `p:style` ur temat (form: `lnRef` 2 med
+  `shade`, `fillRef` 1, `effectRef` 0, `fontRef minor` i `lt1`; linje: `lnRef` 1, `fillRef` 0). Gränssnittet:
+  `Editor::tool`/`new_drag`, `PptxTab::shape_tool` (dra en ruta, ett klick ger 144 × 86,4 pt, `Esc` avbryter), och i
+  `edit_view.rs` bara en anropsgren plus `!tool_on &&` på musblocken. Textrutan använder `insert_textbox` och börjar skriva.
+- **Prov** (`new_deck_tests.rs`): alla varianter går genom `validate`, öppnas, ritas; en ny bild per layout, text i rubriken,
+  sparning och återöppning; python-pptx öppnar filen och LibreOffice konverterar den till PDF när de finns; alla formtyper
+  ritas och får temats stil.
+- **Kvar:** fler färgteman (och typsnittsval i dialogen), en bildmallsvy, fler grundformer (stjärna, hjärta, pilar åt
+  andra håll) och dra-för-att-rita med `Skift` (proportionellt).

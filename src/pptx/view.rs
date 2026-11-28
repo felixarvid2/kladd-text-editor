@@ -1106,6 +1106,13 @@ impl PptxTab {
                             if crate::app::menu_item(ui, p, t("Textruta"), "", None, n > 0) {
                                 self.insert_textbox();
                             }
+                            // Former som ritas genom att dra på bilden.
+                            for kind in super::edit_new::ShapeKind::ALL.into_iter().filter(|k| *k != super::edit_new::ShapeKind::TextBox) {
+                                if crate::app::menu_item(ui, p, kind.label(), "", Some(self.edit.tool == Some(kind)), n > 0) {
+                                    self.set_shape_tool(Some(kind));
+                                    ui.close();
+                                }
+                            }
                             if crate::app::menu_item(ui, p, t("Bild…"), "Ctrl+Shift+I", None, n > 0) {
                                 act = Some(Action::InsertPicture);
                             }

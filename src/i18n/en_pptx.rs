@@ -146,4 +146,23 @@ pub const EN: &[(&str, &str)] = &[
     ("Flyttar publikens bild till nästa skärm (Alt+S)", "Moves the audience view to the next display (Alt+S)"),
     ("Publikens skärm: automatiskt", "Audience display: automatic"),
     ("Publikens skärm: skärm {n} ({w}×{h})", "Audience display: display {n} ({w}×{h})"),
+    // Ny presentation (w-pnew).
+    ("Ny presentation…", "New Presentation…"),
+    ("Ny presentation från mall…", "New Presentation from Template…"),
+    ("Ny presentation", "New presentation"),
+    ("Välj färgtema. Bilden får Kladds egna bildmall med sju layouter.", "Choose a colour theme. The slide uses Kladd's own slide master with seven layouts."),
+    ("Kladd", "Kladd"),
+    ("Skog", "Forest"),
+    ("Skymning", "Dusk"),
+    ("Skapa", "Create"),
+    ("Ny presentation från mall", "New presentation from template"),
+    ("PowerPoint-mallar och presentationer", "PowerPoint templates and presentations"),
+    // Former att rita (w-pnew).
+    ("Rektangel", "Rectangle"),
+    ("Rundad rektangel", "Rounded rectangle"),
+    ("Ellips", "Ellipse"),
+    ("Triangel", "Triangle"),
+    ("Pil", "Arrow"),
+    ("Linje", "Line"),
+    ("{form} {n}", "{form} {n}"),
 ];

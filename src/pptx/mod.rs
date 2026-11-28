@@ -44,10 +44,12 @@ pub mod fills;
 pub mod mtx;
 // Redigering och sparande (w-pedit).
 pub mod edit;
+pub mod new_deck;
 pub mod edit_bar;
 pub mod edit_fit;
 pub mod edit_group;
 pub mod edit_format;
+pub mod edit_new;
 pub mod edit_ops;
 pub mod edit_table;
 pub mod edit_text;
@@ -80,6 +82,8 @@ mod view_tests;
 mod chart_tests;
 #[cfg(test)]
 mod edit_tests;
+#[cfg(test)]
+mod new_deck_tests;
 #[cfg(test)]
 mod smartart_tests;
 // Omgång 4, utlösare och bokstav för bokstav (w-ptrig).

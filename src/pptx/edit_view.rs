@@ -72,6 +72,9 @@ pub struct Editor {
     pub text: Option<TextState>,
     /// Fler markerade former förutom `sel` (flervalsmarkering).
     pub more: Vec<Sel>,
+    /// Formen som ritas med nästa drag (`Infoga → Former`) och dragrutan under dragningen.
+    pub tool: Option<super::edit_new::ShapeKind>,
+    pub new_drag: Option<((f32, f32), (f32, f32))>,
     /// Dragrutan som markerar former: (start, nu) i bildens punkter.
     band: Option<((f32, f32), (f32, f32))>,
     /// Anteckningarna under redigering (bild, text).
@@ -92,7 +95,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(source: Vec<u8>, deck: &Deck) -> Editor {
-        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, more: Vec::new(), band: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None, fmt: Default::default() }
+        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, more: Vec::new(), tool: None, new_drag: None, band: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None, fmt: Default::default() }
     }
 }
 
@@ -959,8 +962,13 @@ impl PptxTab {
             }
         }
 
+        // Formverktyget (Infoga → Former) tar musen medan en form ska ritas.
+        let tool_on = self.shape_tool_active();
+        if tool_on {
+            self.shape_tool(ui, &resp, rect, slide, p.accent);
+        }
         // Musen.
-        if resp.drag_started_by(PointerButton::Primary) {
+        if !tool_on && resp.drag_started_by(PointerButton::Primary) {
             if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
                 let start = to_slide(origin);
                 let in_text = text_sel.and_then(|ts| shapes.iter().find(|s| s.index == ts.index)).is_some_and(|s| s.hit(start.0, start.1, 0.0));
@@ -1009,7 +1017,7 @@ impl PptxTab {
                 }
             }
         }
-        if resp.dragged_by(PointerButton::Primary) {
+        if !tool_on && resp.dragged_by(PointerButton::Primary) {
             if let Some(pt) = ui.input(|i| i.pointer.interact_pos()) {
                 let (x, y) = to_slide(pt);
                 let shift = ui.input(|i| i.modifiers.shift);
@@ -1024,7 +1032,7 @@ impl PptxTab {
                 }
             }
         }
-        if resp.drag_stopped() {
+        if !tool_on && resp.drag_stopped() {
             if let Some(ts) = &mut self.edit.text {
                 ts.selecting = false;
             }
@@ -1071,7 +1079,7 @@ impl PptxTab {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) {
+        if !tool_on && resp.clicked_by(PointerButton::Primary) {
             if let Some(pt) = resp.interact_pointer_pos() {
                 let (x, y) = to_slide(pt);
                 let shift = ui.input(|i| i.modifiers.shift);
@@ -1127,7 +1135,7 @@ impl PptxTab {
                 }
             }
         }
-        if resp.double_clicked() {
+        if !tool_on && resp.double_clicked() {
             if let Some(pt) = resp.interact_pointer_pos() {
                 let (x, y) = to_slide(pt);
                 let table = |me: &Self, s: &ShapeInfo| s.kind == Kind::Frame && super::edit_table::is_editable_table(&me.deck, slide, s.index) || s.kind == Kind::Group && !s.alternate && super::edit_group::is_group(&me.deck, slide, s.index);
