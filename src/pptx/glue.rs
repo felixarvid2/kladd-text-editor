@@ -190,9 +190,11 @@ impl KladdApp {
 
     pub(crate) fn pptx_start_show(&mut self, ctx: &egui::Context, from_current: bool) {
         let animate = self.settings.pptx.animate;
+        let pref = self.settings.pptx.audience_screen;
         let dir = self.docs.get(self.active).and_then(|d| d.path.as_ref()).and_then(|p| p.parent()).map(std::path::Path::to_path_buf);
         let Some(tab) = self.pptx_tab_mut() else { return };
         tab.media_dir = dir;
+        tab.audience_pref = pref;
         if !tab.start_show(from_current, animate) {
             self.notify(ctx, t("Presentationen har inga bilder att visa (alla är dolda)."), false);
         }
@@ -208,9 +210,29 @@ impl KladdApp {
                 tab.stop_show();
             }
             let want = tab.presenting();
-            if want != tab.fullscreen_sent {
+            if want && !tab.fullscreen_sent {
+                // Bildspelet startar: skärmen Kladd-fönstret ligger på blir föredragsvyns.
+                let outer = ctx.input(|i| i.viewport().outer_rect);
+                tab.restore_pos = outer.map(|r| r.min);
+                if let (Some(r), Some(show)) = (outer, tab.show_mut()) {
+                    let ppp = ctx.pixels_per_point();
+                    show.set_home_at(r.center() * ppp);
+                }
+            }
+            // Med flera skärmar går publikens helskärm till sin skärm (`show_screens.rs`), annars aktuell.
+            let monitor = if want { tab.show_mut().and_then(|s| s.audience_screen()) } else { None };
+            if want != tab.fullscreen_sent || (want && monitor != tab.monitor_sent) {
                 tab.fullscreen_sent = want;
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(want));
+                tab.monitor_sent = monitor;
+                match (want, monitor) {
+                    (true, Some(i)) => ctx.send_viewport_cmd(ViewportCommand::SetMonitor(i)),
+                    (w, _) => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(w)),
+                }
+                if !want {
+                    if let Some(p) = tab.restore_pos.take() {
+                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(p));
+                    }
+                }
             }
         }
     }

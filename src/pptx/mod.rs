@@ -61,6 +61,7 @@ pub mod anim_layers;
 pub mod morph;
 pub mod presenter;
 pub mod show_links;
+pub mod show_screens;
 pub mod transition;
 // Omgång 3, 3D i diagram och former (w-p3d).
 pub mod bevel;

@@ -177,7 +177,7 @@ Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
   autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
   automatisk sparning).
-- **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
+- **Visning:** (föredragsvyns val av skärm gjordes i omgång 7),
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
@@ -986,7 +986,7 @@ gjorda med ffmpeg `sine`/`testsrc`).
 - **Prov:** `show_links_tests.rs` (länkdäck byggt i provet; åtgärder, textlänkens träffyta, klick, senast visade, siffror +
   Enter), `media_model::tests`, `media_tests`. Ignorerade `skriv_provfil` (`KLADD_PLINK_OUT`, `KLADD_PMEDIA_OUT`) skriver
   provpresentationer att titta på för hand.
-- **Kvar:** föredragsvyns val av skärm (winit ger ingen skärmlista via egui här: inte gjort); länkar på gruppbarn och i
+- **Kvar:** länkar på gruppbarn och i
   SmartArt; `hlinkfile`/`hlinkpres`; markering av länkar vid tangentbordsnavigering (Tab); `p:quickTimeFile` som video utan
   `rect_pt` i grupper; videoformer med andra geometrier än rektangel, rundad rektangel och ellips beskärs som rektangel.
 - **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
@@ -1221,3 +1221,22 @@ Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastade
 - **`lnSpcReduction` på radavståndet:** att dra av bara en del (0,5 eller 0,75 av värdet) i stället för hela gjorde
   `cppcon15`/`cppcon19`/`cppcon20` 0,02–0,06 sämre; den nuvarande avdragsregeln (hela värdet av procenttalet) är rätt.
   `cppcon15-stl-algorithms-mac` bild 9 (110 % radavstånd, 77,5 %/20 %) har ändå ~6 % för tät text; orsaken är inte klarlagd.
+
+## Föredragsvyn väljer skärm (omgång 7, w-pshow3)
+
+- **Vad egui/winit ger:** `ViewportCommand::SetMonitor(n)` (och `ViewportBuilder::with_monitor`) sätter fönstret i kantlös helskärm på
+  skärm nummer n i winits `available_monitors()`-ordning, men varken egui eller eframe ger skärmlistan eller numret på den skärm
+  fönstret ligger på (`ViewportInfo` har bara `monitor_size` och `outer_rect`).
+- **`show_screens.rs`:** skärmlistan läses på Linux/X11 med RandR via `x11rb` (direkt beroende, ren Rust, bara funktionen
+  `randr`; samma version som winit redan drar in): kretsarna från `get_screen_resources_current` med storlek och utgång, i samma
+  ordning och med samma urval som winit (`x11/monitor.rs`), så att index n är densamma skärm i båda. Windows, macOS och Wayland
+  utan XWayland ger tom lista = som förut (inget *Byt skärm*, inget skärmval); `EnumDisplayMonitors`/`NSScreen` är det som
+  saknas där. `KLADD_SCREENS="x,y,b,h;x,y,b,h"` ersätter listan för prov. Valet är rent och provat (`audience`, `presenter`).
+- **Beteende:** vid start läses Kladd-fönstrets `outer_rect` (mitten) → `home`. Med föredragsvy går publiken till nästa skärm
+  (`(home+1)%n`), utan föredragsvy stannar den (om inte *Visa*-menyns val `Prefs::audience_screen` är satt, som gäller alltid).
+  `glue.rs::pptx_sync_fullscreen` skickar `SetMonitor(n)` i stället för `Fullscreen(true)` och återställer fönstrets läge när
+  bildspelet slutar. Föredragsvyns fönster får `with_position` på sin skärm och flyttas med `OuterPosition` när *Byt skärm*
+  (knappen i föredragsvyn eller `Alt+S`, `ShowView::swap_screens`) byter.
+- **Prövat:** bara i Xvfb med en skärm (RandR-listan = 1; med `KLADD_SCREENS` visades menyn och föredragsvyns fönster flyttades
+  mellan de två rektanglarna med `Alt+S`). Själva `SetMonitor` mellan verkliga skärmar är inte prövad här (Xvfb har bara en
+  RandR-krets), och inte heller Windows/macOS.

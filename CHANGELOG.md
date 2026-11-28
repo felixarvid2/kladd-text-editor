@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **PowerPoint: föredragsvyn väljer skärm.** Med flera skärmar (Linux/X11, skärmlistan läses med RandR) går publikens helskärm till en annan skärm än Kladd-fönstrets och föredragsvyn öppnas på fönstrets egen. *Byt skärm* i föredragsvyn (`Alt+S`) byter plats på dem, och *Visa*-menyn har ett val för vilken skärm publiken visas på. Med en skärm eller utan skärmlista är allt som förut. Se `docs/dev/pptx.md`.
+
 ## [2.15.0] – 2026-11-28
 
 ### Nytt

@@ -62,11 +62,13 @@ pub struct Prefs {
     pub zoom: Zoom,
     /// Bildspelet spelar upp övergångar och animeringar.
     pub animate: bool,
+    /// Skärmen publikens helskärm ligger på (`None` = automatiskt), när Kladd känner till flera skärmar.
+    pub audience_screen: Option<usize>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { thumbs: true, notes: true, scroll: false, zoom: Zoom::Window, animate: true }
+        Prefs { thumbs: true, notes: true, scroll: false, zoom: Zoom::Window, animate: true, audience_screen: None }
     }
 }
 
@@ -324,6 +326,12 @@ pub struct PptxTab {
     presenter_on_start: bool,
     /// Presentationens katalog (länkade mediafiler med relativ sökväg läses därifrån); sätts av appen.
     pub media_dir: Option<PathBuf>,
+    /// Valet av publikens skärm (ur inställningarna, sätts av appen vid start).
+    pub audience_pref: Option<usize>,
+    /// Skärmen bildspelets helskärm senast sattes på (`glue.rs`).
+    pub monitor_sent: Option<usize>,
+    /// Fönstrets läge före bildspelet (återställs när det slutar om det flyttats till en annan skärm).
+    pub restore_pos: Option<egui::Pos2>,
     wheel: f32,
     /// Skalan i senaste bilden (för zoomstegen).
     last_k: f32,
@@ -357,6 +365,9 @@ impl PptxTab {
             fullscreen_sent: false,
             presenter_on_start: false,
             media_dir: None,
+            audience_pref: None,
+            monitor_sent: None,
+            restore_pos: None,
             wheel: 0.0,
             last_k: 1.0,
             page_text: String::new(),
@@ -447,7 +458,7 @@ impl PptxTab {
         let hidden: Vec<bool> = self.deck.slides.iter().map(|s| s.hidden).collect();
         let show = if from_current { Show::new(&hidden, self.current) } else { Show::from_beginning(&hidden) };
         let presenter = std::mem::take(&mut self.presenter_on_start);
-        self.show = show.map(|s| super::presenter::ShowView::new(self.deck.clone(), s, animate).with_presenter(presenter).with_media_dir(self.media_dir.clone()));
+        self.show = show.map(|s| super::presenter::ShowView::new(self.deck.clone(), s, animate).with_presenter(presenter).with_media_dir(self.media_dir.clone()).with_audience_pref(self.audience_pref));
         self.show.is_some()
     }
 
@@ -463,6 +474,11 @@ impl PptxTab {
         if self.show.as_mut().is_some_and(|s| !s.keys(ctx)) {
             self.stop_show();
         }
+    }
+
+    /// Bildspelet, om det pågår (för skärmvalet i `glue.rs`).
+    pub fn show_mut(&mut self) -> Option<&mut super::presenter::ShowView> {
+        self.show.as_mut()
     }
 
     /// Bildspelet (och föredragsvyn), se `presenter.rs`.
@@ -1033,6 +1049,20 @@ impl PptxTab {
                         }
                         if crate::app::menu_item(ui, p, t("Spela upp övergångar och animeringar"), "", Some(prefs.animate), true) {
                             prefs.animate = !prefs.animate;
+                        }
+                        // Publikens skärm när det finns flera (bara om Kladd kan läsa skärmlistan).
+                        let screens = super::show_screens::list();
+                        if screens.len() >= 2 {
+                            crate::app::menu_divider(ui, p);
+                            if crate::app::menu_item(ui, p, t("Publikens skärm: automatiskt"), "", Some(prefs.audience_screen.is_none()), true) {
+                                prefs.audience_screen = None;
+                            }
+                            for (i, s) in screens.iter().enumerate() {
+                                let label = tf!("Publikens skärm: skärm {n} ({w}×{h})", n = i + 1, w = s.w, h = s.h);
+                                if crate::app::menu_item(ui, p, &label, "", Some(prefs.audience_screen == Some(i)), true) {
+                                    prefs.audience_screen = Some(i);
+                                }
+                            }
                         }
                         crate::app::menu_divider(ui, p);
                         if crate::app::menu_item(ui, p, t("Exportera som PDF…"), "", None, true) {

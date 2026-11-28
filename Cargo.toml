@@ -77,6 +77,10 @@ strip = true
 [dev-dependencies]
 egui_kittest = { version = "0.37", default-features = false, features = ["eframe"] }
 
+# Skärmlistan för bildspelet (src/pptx/show_screens.rs): RandR via ren Rust, samma version och funktioner som winit drar in.
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+x11rb = { version = "0.13.2", default-features = false, features = ["randr"] }
+
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 

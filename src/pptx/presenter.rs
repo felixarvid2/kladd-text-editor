@@ -28,6 +28,7 @@ use super::scene::Affine;
 use super::edit_ops::{self, ShapeInfo};
 use super::morph;
 use super::show_links::{self, Action, SlideLinks};
+use super::show_screens::{self, Screen as DeskScreen};
 use super::slideshow::{Blank, Frame, Playback, Screen, Show, SlideState, SlideTiming, Timer, TriggerTiming, clock_text};
 use super::transition::{self, Kind, Layer, Transition};
 use super::Deck;
@@ -135,6 +136,14 @@ pub struct ShowView {
     last_real: f64,
     /// Ljud och video (`media_play.rs`).
     hub: MediaHub,
+    /// Skärmarna (tom = okänt), skärmen Kladd-fönstret låg på när bildspelet startade, valet i *Visa*-menyn och
+    /// skärmen som *Byt skärm* valt (`show_screens.rs`).
+    screens: Vec<DeskScreen>,
+    home: usize,
+    pref: Option<usize>,
+    swap: Option<usize>,
+    /// Skärmen föredragsvyns fönster senast placerades på.
+    presenter_at: Option<usize>,
     /// Länkar och åtgärdsknappar per bild (byggs första gången bilden klickas eller hålls över).
     links: HashMap<usize, Arc<SlideLinks>>,
     /// Länkområdet som pekaren är över (bild, område), så att `hlinkHover` bara utförs när pekaren kommer in.
@@ -198,6 +207,11 @@ impl ShowView {
             wheel: 0.0,
             stalled: 0.0,
             last_real: 0.0,
+            screens: show_screens::list(),
+            home: 0,
+            pref: None,
+            swap: None,
+            presenter_at: None,
             links: HashMap::new(),
             hover_link: None,
             hover_hold: false,
@@ -210,6 +224,30 @@ impl ShowView {
     pub fn with_presenter(mut self, on: bool) -> ShowView {
         self.presenter = on;
         self
+    }
+
+    /// Valet av publikens skärm i *Visa*-menyn (`None` = automatiskt).
+    pub fn with_audience_pref(mut self, pref: Option<usize>) -> ShowView {
+        self.pref = pref;
+        self
+    }
+
+    /// Kladd-fönstret ligger vid `pos` (skrivbordets bildpunkter) när bildspelet startar: där hamnar föredragsvyn.
+    pub fn set_home_at(&mut self, pos: Pos2) {
+        self.home = show_screens::index_at(&self.screens, pos.x, pos.y).unwrap_or(0);
+    }
+
+    /// Skärmen publikens helskärm ska ligga på (`None` = där fönstret är).
+    pub fn audience_screen(&self) -> Option<usize> {
+        show_screens::audience(self.screens.len(), self.home, self.pref, self.swap, self.presenter)
+    }
+
+    /// *Byt skärm*: publiken flyttas till nästa skärm och föredragsvyn till skärmen publiken lämnade.
+    pub fn swap_screens(&mut self) {
+        let n = self.screens.len();
+        if n >= 2 {
+            self.swap = Some((self.audience_screen().unwrap_or(self.home) + 1) % n);
+        }
     }
 
     /// Presentationens katalog: länkade mediafiler med relativ sökväg läses därifrån.
@@ -381,6 +419,9 @@ impl ShowView {
         if key(Modifiers::ALT, Key::F5) {
             self.presenter = !self.presenter;
         }
+        if key(Modifiers::ALT, Key::S) {
+            self.swap_screens();
+        }
         // Siffror + Enter hoppar till bildnumret (som PowerPoint); en gammal inmatning glöms efter några sekunder.
         if !self.digits.is_empty() && self.digits_at.elapsed() > DIGITS_TIMEOUT {
             self.digits.clear();
@@ -485,7 +526,21 @@ impl ShowView {
         }
         if self.presenter && !embedded {
             let id = egui::ViewportId::from_hash_of("kladd-pptx-presenter");
-            let builder = egui::ViewportBuilder::default().with_title(t("Föredragsvy")).with_inner_size([1100.0, 720.0]);
+            let mut builder = egui::ViewportBuilder::default().with_title(t("Föredragsvy")).with_inner_size([1100.0, 720.0]);
+            // Med flera skärmar: föredragsvyn på sin skärm (och flyttas med när *Byt skärm* byter).
+            let place = self.audience_screen().map(|a| show_screens::presenter(self.screens.len(), self.home, a));
+            let origin = |i: usize| {
+                let (s, ppp) = (self.screens[i], ctx.pixels_per_point());
+                pos2(s.x as f32 / ppp + 40.0, s.y as f32 / ppp + 40.0)
+            };
+            if let Some(i) = place {
+                if self.presenter_at.is_none() {
+                    builder = builder.with_position(origin(i));
+                } else if self.presenter_at != place {
+                    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::OuterPosition(origin(i)));
+                }
+                self.presenter_at = place;
+            }
             ctx.show_viewport_immediate(id, builder, |ui, _| {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     // Att stänga talarens fönster stänger bara föredragsvyn.
@@ -850,6 +905,9 @@ impl ShowView {
                 let black = matches!(self.play.show.screen(), Screen::Blank(Blank::Black));
                 if ui.selectable_label(black, t("Svart skärm")).clicked() {
                     self.play.jump(now, |s| s.toggle_blank(Blank::Black));
+                }
+                if self.screens.len() >= 2 && ui.button(t("Byt skärm")).on_hover_text(t("Flyttar publikens bild till nästa skärm (Alt+S)")).clicked() {
+                    self.swap_screens();
                 }
                 if ui.button(t("Avsluta bildspelet")).clicked() {
                     keep = false;
