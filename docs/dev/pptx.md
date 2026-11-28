@@ -170,14 +170,13 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 5 (detaljer i respektive avsnitt nedan):
 
-- **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
-  SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
-  understruken, storlek, färg, justering och punkter (omgång 5, se *Textformat och autoanpassning (omgång 5)*;
-  tabellceller och flervalsmarkering också gjorda där, text i former i grupper saknas:
-  teckensnitt, marginaler, radavstånd, numrerade listor och markeringsfärg saknas); återställning efter krasch
-  (bara automatisk sparning).
+- **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
+  text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
+  teckensnitt, marginaler, radavstånd och numrerade listor i formatraden; markering över flera tabellceller;
+  autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
+  automatisk sparning).
 - **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
@@ -197,9 +196,8 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
   (`rule type="h" val="INF"`, `vList2`), ikoner i platshållare (`blipPhldr` ritas som en tom form), egna
   förskjutningar i `composite` (kugghjul med ett och två hjul), hierarkins `hang` i två spalter (`secLinDir`),
   nivåetiketterna i `hierarchy5` och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
-- **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
-  (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
+  (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum` m.fl. (`duotone` gjordes i omgång 5)
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
 - **Minne:** avkodade bilder hålls i en cache på högst 256 MB per presentation och skalas ner till högst
   2560 bildpunkter.
