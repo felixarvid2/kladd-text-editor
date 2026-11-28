@@ -1126,6 +1126,20 @@ impl<'a> Tree<'a> {
     }
 
     /// Datapunkterna vars text noden visar (`presOf`), med nivå (0 = punkten själv).
+    /// Datapunkten en textnod visar när den visar exakt en nod (`presOf` på sig själv eller ingen
+    /// `presOf`), också utan text: den nod som redigeras i formen (`edit_smartart.rs`).
+    pub fn own_point(&self, id: usize) -> Option<usize> {
+        let n = &self.nodes[id];
+        if alg_type(n) != "tx" || !self.m.is_type(n.pt, "node") {
+            return None;
+        }
+        match n.pres_of {
+            None => Some(n.pt),
+            Some(po) if po.attr("axis").is_some_and(|a| a.split_whitespace().all(|x| x == "self")) => Some(n.pt),
+            _ => None,
+        }
+    }
+
     pub fn text_points(&self, id: usize) -> Vec<(usize, usize)> {
         let n = &self.nodes[id];
         // Bara textalgoritmen ritar text; `presOf` på andra noder kopplar bara formen till punkten.

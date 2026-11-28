@@ -103,6 +103,10 @@ mod edit_chart_tests;
 // Omgång 8, stora presentationer (w-precov).
 #[cfg(test)]
 mod big_tests;
+// Omgång 8, redigera SmartArt-text (w-psmartedit).
+pub mod edit_smartart;
+#[cfg(test)]
+mod edit_smartart_tests;
 
 pub use model::Deck;
 

@@ -9,6 +9,10 @@ Den fullständiga beskrivningen av Kladds funktioner. En kort översikt finns i 
 - **PowerPoint: ny presentation, ny från mall och former att rita.** *Arkiv → Ny presentation…* (och i startvyn) skapar en tom 16:9-presentation med Kladds egna tema (färg- och typsnittsschema och formatmatris skrivna för Kladd), egen bildmall och sju layouter, i tre färgteman; den har ingen sökväg förrän man sparar. *Ny presentation från mall…* öppnar en `.potx` (eller annan presentation) som en ny, namnlös presentation som sparas som `.pptx`. *Infoga* i redigeringsläget har rektangel, rundad rektangel, ellips, triangel, pil och linje som ritas genom att dra, med temats stil (`p:style` med `lnRef`, `fillRef`, `effectRef`, `fontRef`). Se `docs/dev/pptx.md`.
 - **PowerPoint: redigera diagramdata.** Dubbelklicka på ett diagram i redigeringsläget för att ändra värden, kategorier och serier (lägga till, ta bort, byta namn) och diagrammets rubrik och axelrubriker i en tabell. Diagrammet ändras källbevarande (cacharna och referenserna i diagramdelen) och den inbäddade Excel-arbetsboken uppdateras så att PowerPoints *Redigera data* visar samma värden; länkade arbetsböcker lämnas orörda. Se `docs/dev/pptx.md`.
 
+### Nytt
+
+- **PowerPoint: text i SmartArt kan redigeras.** Dubbelklicka på en form i ett SmartArt-diagram i redigeringsläget för att skriva i nodens text; ändringen sparas både i diagrammets data och i PowerPoints sparade ritning. `Enter` sist i en nod lägger till en nod efter den, `Tab`/`Skift+Tab` flyttar noden en nivå ned/upp och `Backsteg` i en tom nod tar bort den; då lägger Kladd ut diagrammet på nytt (och PowerPoint gör det när filen öppnas). Se `docs/handbok.md`.
+
 ## [2.16.0] – 2026-11-28
 
 ### Nytt

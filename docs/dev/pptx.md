@@ -173,7 +173,7 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 Sammanställt efter omgång 7 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
-  text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
+  text i SmartArt-former som visar flera noder (se *Redigera SmartArt-text*) och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
   diagramdata: flernivåkategorier skrivs som en nivå, bubbelstorlekar och diagramtypen ändras inte (se
   *Redigera diagramdata*);
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
@@ -1391,3 +1391,36 @@ också ångra/gör om).
 - **Kvar:** PDF-skrivningen av sidorna är i följd (krilla); en redigering bygger fortfarande om bilderna som ändrats och
   klonar övriga (`Node::clone`); första bildens första rendering laddar typsnitt (ca 0,4 s i debug); avkodade bilder i
   cachen delas redan mellan ombyggnader.
+
+## Redigera SmartArt-text (omgång 8)
+
+`edit_smartart.rs`, med några rader krokar i `edit_view.rs` (`TextState::smart`, dubbelklick, `commit_text`,
+markörlägena i `set_deck`, tangenterna i `text_keys`).
+
+- **Hitta noden:** dubbelklick i redigeringsläget på en form i ett SmartArt-diagram (en toppnivåram). Formen tas ur
+  ritdelen som ritas: PowerPoints sparade (`dsp:`), annars Kladds motors (`Deck::drawings` med `#kladd`). Träffprovet
+  använder formens textruta (`dsp:txXfrm` med formens vridning) i ritdelens koordinater (`drawing_transform`). Noden
+  är den enda punkt (`node`/`asst`) som en `presOf`-koppling till formens presentationspunkt (`modelId`) kommer
+  från; i motorns ritdel står den i attributet `kladdPt` (bara i minnet, skrivs aldrig). Former som visar flera
+  noder (t.ex. `vList5`:s underpunkter) redigeras inte.
+- **Text:** samma textmodell, markör och formatrad som former. Modellen läses ur ritdelens `dsp:txBody` (det som
+  ritas, med storlekarna), annars ur datamodellens `dgm:t` (markörlägena räknas då med storleken motorn ritar med).
+  Skrivningen går till BÅDA: `dsp:sp/dsp:txBody` (hela modellen) och `dgm:pt/dgm:t` (bara texten, stycke för
+  stycke, med nodens egna stycke- och körningsformat, så att datamodellen inte får ritdelens anpassade storlekar).
+  Utan sparad ritdel skrivs datamodellen med hela modellen och motorn lägger ut diagrammet igen när presentationen
+  byggs om (`Deck::from_package` → `lay_out_missing`).
+- **Noder:** `Enter` sist i en nod ger ett syskon efter den (ny `dgm:pt` med nodens `dgm:t`-inställningar utan
+  text, `parTrans`/`sibTrans`-punkter och en `parOf`-koppling; nya `modelId` som GUID; följande syskons `srcOrd` +1),
+  `Tab` gör noden till sista barn till syskonet före, `Skift+Tab` flyttar den till syskon efter föräldern, och
+  `Backsteg`/`Delete` i en tom nod utan barn tar bort den (punkten, övergångarna, kopplingen, dess
+  presentationspunkter och deras kopplingar). Därefter **tas den sparade ritdelen bort**: `dsp:dataModelExt` i
+  datamodellen, bladets `diagramDrawing`-relation och delen (om inget annat blad pekar på den). Kladds motor lägger ut
+  diagrammet, och PowerPoint lägger ut det igen ur datamodellen när filen öppnas (det gör PowerPoint alltid när
+  ritdelen saknas). Presentationspunkterna för de nya noderna saknas; PowerPoint skapar dem.
+- **Prov** (`edit_smartart_tests.rs`): text i en nod med ritdel (datamodellen och ritdelen har samma text,
+  formateringen behålls i båda, övriga delar orörda, `validate`, öppnas igen), ny nod (ritdelen, relationen och
+  hänvisningen borta; den nya noden syns i rätt ordning efter omläggningen och går att skriva i), ned/upp/ta bort
+  och tangenterna. Det ignorerade `smartart_alla` (`KLADD_PPTX_SWEEP`) redigerar en nod och lägger till en nod i
+  varje diagram i materialet, sparar, validerar och öppnar igen: 54 diagram, inga fel.
+- **Kvar:** SmartArt-text där en form visar flera noder (t.ex. `vList5`:s underpunkter); presentationspunkter och
+  egen skala (`custScaleX`/`custScaleY`) för nya noder; SmartArt i grupper.

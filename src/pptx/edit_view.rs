@@ -60,6 +60,14 @@ pub struct TextState {
     pub child: Option<u32>,
     /// Dras en markering med musen?
     selecting: bool,
+    /// Noden i ett SmartArt-diagram när texten är en nods (`edit_smartart.rs`).
+    pub smart: Option<super::edit_smartart::Target>,
+}
+
+impl TextState {
+    pub(super) fn for_smart(sel: Sel, model: TextModel, caret: Pos, carets: Option<Carets>, t: super::edit_smartart::Target) -> TextState {
+        TextState { sel, model, caret, anchor: caret, carets, cell: None, child: None, selecting: false, smart: Some(t) }
+    }
 }
 
 /// Redigeringstillståndet i en presentationsflik.
@@ -196,10 +204,13 @@ impl PptxTab {
             (0..deck.slides.len())
                 .filter(|&i| {
                     let p = &deck.slides[i].part;
-                    match (old.pkg.parts.get(p), deck.pkg.parts.get(p)) {
+                    let differs = |p: &str| match (old.pkg.parts.get(p), deck.pkg.parts.get(p)) {
                         (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                        (None, None) => false,
                         _ => true,
-                    }
+                    };
+                    // Också delar bilden pekar på (SmartArt-data och -ritdel, diagram).
+                    differs(p) || old.slides[i].rels.iter().chain(&deck.slides[i].rels).any(|r| !r.external && differs(&r.target))
                 })
                 .collect()
         } else {
@@ -224,6 +235,7 @@ impl PptxTab {
         // Markörlägena gäller den nya presentationen.
         if let Some(ts) = &mut self.edit.text {
             ts.carets = match (ts.cell, ts.child) {
+                _ if ts.smart.is_some() => ts.smart.as_ref().and_then(|t| super::edit_smartart::carets(&self.deck, t, &ts.model)),
                 (_, Some(child)) => Self::child_carets(&self.deck, ts.sel, child, &ts.model),
                 (Some(addr), _) => ts.model.cell_carets(&self.deck, ts.sel.slide, ts.sel.index, addr),
                 _ => edit_ops::node(&self.deck, ts.sel.slide, ts.sel.index).and_then(|node| ts.model.carets(&self.deck, ts.sel.slide, node)),
@@ -298,7 +310,7 @@ impl PptxTab {
             }
         }
         self.edit.sel = Some(sel);
-        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: None });
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: None, smart: None });
     }
 
     /// Börjar skriva i en form i en grupp (`child` = formens `p:cNvPr/@id`).
@@ -316,7 +328,7 @@ impl PptxTab {
             }
         }
         self.edit.sel = Some(sel);
-        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: Some(child) });
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: Some(child), smart: None });
     }
 
     fn child_carets(deck: &Deck, sel: Sel, child: u32, model: &TextModel) -> Option<Carets> {
@@ -343,7 +355,7 @@ impl PptxTab {
             }
         }
         self.edit.sel = Some(sel);
-        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: Some(addr), child: None });
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: Some(addr), child: None, smart: None });
     }
 
     /// Räknar om `normAutofit`/`spAutoFit` för formen efter att den fått ny storlek (`xf`); skrivs med
@@ -391,6 +403,10 @@ impl PptxTab {
     pub(super) fn commit_text(&mut self) {
         let Some(ts) = &self.edit.text else { return };
         let (sel, model, before) = (ts.sel, ts.model.clone(), ts.carets.as_ref().map(|c| c.text_h));
+        if let Some(t) = ts.smart.clone() {
+            self.apply(Some(format!("text:{}:{}:s{}", sel.slide, sel.id, t.pt)), |txn| super::edit_smartart::set_text(txn, &t, &model));
+            return;
+        }
         if let Some(addr) = ts.cell {
             self.apply(Some(format!("text:{}:{}:{}:{}", sel.slide, sel.id, addr.0, addr.1)), |txn| super::edit_table::set_cell_text(txn, sel.slide, sel.index, sel.id, addr, &model));
             return;
@@ -418,6 +434,7 @@ impl PptxTab {
         let events = ctx.input(|i| i.events.clone());
         let mut handled = Vec::new();
         let mut tab_cell = None;
+        let mut smart_op = None;
         for (k, ev) in events.iter().enumerate() {
             let Some(ts) = &mut self.edit.text else { break };
             let mut changed = false;
@@ -460,6 +477,12 @@ impl PptxTab {
                             ts.anchor = p;
                         }
                     };
+                    // SmartArt: Enter sist i noden, Tab och Delete/Backsteg i en tom nod ändrar noderna.
+                    if let Some(op) = ts.smart.as_ref().and_then(|_| super::edit_smartart::key_op(*key, shift, m.command, ts.caret == ts.model.end(), ts.model.text().is_empty())) {
+                        smart_op = ts.smart.clone().map(|t| (t, op));
+                        handled.push(k);
+                        continue;
+                    }
                     match key {
                         Key::ArrowLeft | Key::ArrowRight => {
                             let fwd = *key == Key::ArrowRight;
@@ -579,6 +602,9 @@ impl PptxTab {
                     keep
                 });
             });
+        }
+        if let Some((t, op)) = smart_op {
+            self.smart_op(t, op);
         }
         if let Some((sel, from, back)) = tab_cell {
             if let Some(next) = super::edit_table::next_cell(&self.deck, sel.slide, sel.index, from, back) {
@@ -1149,7 +1175,9 @@ impl PptxTab {
             if let Some(pt) = resp.interact_pointer_pos() {
                 let (x, y) = to_slide(pt);
                 let table = |me: &Self, s: &ShapeInfo| s.kind == Kind::Frame && super::edit_table::is_editable_table(&me.deck, slide, s.index) || s.kind == Kind::Group && !s.alternate && super::edit_group::is_group(&me.deck, slide, s.index);
-                if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Frame && super::edit_chart::is_chart(&self.deck, slide, s.index)) {
+                if self.begin_smart_at(slide, x, y) {
+                    // En nod i ett SmartArt-diagram (`edit_smartart.rs`).
+                } else if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Frame && super::edit_chart::is_chart(&self.deck, slide, s.index)) {
                     self.end_text();
                     self.open_chart(Sel { slide, index: s.index, id: s.id });
                 } else if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate || table(self, s)) {
