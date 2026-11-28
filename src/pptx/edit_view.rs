@@ -56,6 +56,8 @@ pub struct TextState {
     pub(super) carets: Option<Carets>,
     /// Cellen i en tabell när texten är en cells.
     pub cell: Option<super::edit_table::CellAddr>,
+    /// Formen i gruppen (`p:cNvPr/@id`) när texten är en gruppforms; `sel` är då gruppen.
+    pub child: Option<u32>,
     /// Dras en markering med musen?
     selecting: bool,
 }
@@ -211,9 +213,10 @@ impl PptxTab {
         }
         // Markörlägena gäller den nya presentationen.
         if let Some(ts) = &mut self.edit.text {
-            ts.carets = match ts.cell {
-                Some(addr) => ts.model.cell_carets(&self.deck, ts.sel.slide, ts.sel.index, addr),
-                None => edit_ops::node(&self.deck, ts.sel.slide, ts.sel.index).and_then(|node| ts.model.carets(&self.deck, ts.sel.slide, node)),
+            ts.carets = match (ts.cell, ts.child) {
+                (_, Some(child)) => Self::child_carets(&self.deck, ts.sel, child, &ts.model),
+                (Some(addr), _) => ts.model.cell_carets(&self.deck, ts.sel.slide, ts.sel.index, addr),
+                _ => edit_ops::node(&self.deck, ts.sel.slide, ts.sel.index).and_then(|node| ts.model.carets(&self.deck, ts.sel.slide, node)),
             };
         }
     }
@@ -285,7 +288,30 @@ impl PptxTab {
             }
         }
         self.edit.sel = Some(sel);
-        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None });
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: None });
+    }
+
+    /// Börjar skriva i en form i en grupp (`child` = formens `p:cNvPr/@id`).
+    pub fn begin_child(&mut self, sel: Sel, child: u32, at: Option<(f32, f32)>) {
+        let Some(bytes) = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec) else { return };
+        let Some(doc) = edit_xml::parse(&bytes) else { return };
+        let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
+        let Some(model) = super::edit_group::child_model(&self.deck, &doc, sel.slide, sel.index, child, &a) else { return };
+        let carets = Self::child_carets(&self.deck, sel, child, &model);
+        self.end_text();
+        let mut caret = model.end();
+        if let (Some(c), Some((x, y))) = (&carets, at) {
+            if let Some(p) = c.hit(x, y) {
+                caret = p;
+            }
+        }
+        self.edit.sel = Some(sel);
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: Some(child) });
+    }
+
+    fn child_carets(deck: &Deck, sel: Sel, child: u32, model: &TextModel) -> Option<Carets> {
+        let (node, parent) = super::edit_group::find_child(deck, sel.slide, sel.index, child)?;
+        model.clone().in_parent(parent).carets(deck, sel.slide, node)
     }
 
     /// Börjar skriva i en tabellcell (markören vid punkten, annars sist).
@@ -307,13 +333,34 @@ impl PptxTab {
             }
         }
         self.edit.sel = Some(sel);
-        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: Some(addr) });
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: Some(addr), child: None });
+    }
+
+    /// Räknar om `normAutofit`/`spAutoFit` för formen efter att den fått ny storlek (`xf`); skrivs med
+    /// samma sammanslagningsnyckel som storleksändringen så att det blir ett ångra-steg.
+    fn refit_after_resize(&mut self, slide: usize, index: usize, id: u32, xf: Xf, key: String) {
+        let Some((model, _)) = self.text_of(Sel { slide, index, id }) else { return };
+        let Some(node) = edit_ops::node(&self.deck, slide, index) else { return };
+        // `f32::MAX` som tidigare höjd: en `spAutoFit`-form får exakt textens höjd (också när den blev för hög).
+        let Some(fit) = model.autofit(&self.deck, slide, node, xf, Some(f32::MAX)) else { return };
+        self.apply(Some(key), |txn| super::edit_fit::set_fit_only(txn, slide, index, id, fit, xf));
+        self.edit.session.break_merge();
     }
 
     /// Står man i en tabellcell och klickar i en annan i samma tabell börjar den cellen redigeras.
     fn switch_cell(&mut self, x: f32, y: f32) -> bool {
         let Some(ts) = &self.edit.text else { return false };
-        let (Some(cur), sel) = (ts.cell, ts.sel) else { return false };
+        let sel = ts.sel;
+        if let Some(cur) = ts.child {
+            return match super::edit_group::child_at(&self.deck, sel.slide, sel.index, x, y) {
+                Some(c) if c != cur => {
+                    self.begin_child(sel, c, Some((x, y)));
+                    true
+                }
+                _ => false,
+            };
+        }
+        let Some(cur) = ts.cell else { return false };
         match super::edit_table::cell_at(&self.deck, sel.slide, sel.index, x, y) {
             Some(a) if a != cur => {
                 self.begin_cell(sel, a, Some((x, y)));
@@ -336,6 +383,18 @@ impl PptxTab {
         let (sel, model, before) = (ts.sel, ts.model.clone(), ts.carets.as_ref().map(|c| c.text_h));
         if let Some(addr) = ts.cell {
             self.apply(Some(format!("text:{}:{}:{}:{}", sel.slide, sel.id, addr.0, addr.1)), |txn| super::edit_table::set_cell_text(txn, sel.slide, sel.index, sel.id, addr, &model));
+            return;
+        }
+        if let Some(child) = ts.child {
+            // Autoanpassning (bara `a:normAutofit`) räknas om som för vanliga former.
+            let fit = super::edit_group::find_child(&self.deck, sel.slide, sel.index, child).and_then(|(n, parent)| {
+                let xf = edit_ops::shapes(&self.deck, sel.slide).into_iter().find(|s| s.index == sel.index).map(|s| s.xf)?;
+                match model.clone().in_parent(parent).autofit(&self.deck, sel.slide, n, xf, before) {
+                    Some(f @ super::edit_fit::Fit::Norm { .. }) => Some(f),
+                    _ => None,
+                }
+            });
+            self.apply(Some(format!("text:{}:{}:g{child}", sel.slide, sel.id)), |txn| super::edit_group::set_child_text(txn, sel.slide, sel.index, sel.id, child, &model, fit));
             return;
         }
         let Some(info) = self.shape_of(sel) else { return };
@@ -514,6 +573,18 @@ impl PptxTab {
         if let Some((sel, from, back)) = tab_cell {
             if let Some(next) = super::edit_table::next_cell(&self.deck, sel.slide, sel.index, from, back) {
                 self.begin_cell(sel, next, None);
+            } else if !back && super::edit_table::is_last_cell(&self.deck, sel.slide, sel.index, from) {
+                // Tab i sista cellen lägger till en rad (som i PowerPoint) och går till dess första cell.
+                self.end_text();
+                let mut row = None;
+                if self.apply(None, |txn| {
+                    row = Some(super::edit_table::add_row(txn, sel.slide, sel.index, sel.id)?);
+                    Ok(())
+                }) {
+                    if let Some(r) = row {
+                        self.begin_cell(sel, (r, 0), None);
+                    }
+                }
             }
         }
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
@@ -829,6 +900,8 @@ impl PptxTab {
                             self.begin_text(sel, Some((x, y)));
                         } else if let Some(addr) = super::edit_table::cell_at(&self.deck, slide, s.index, x, y) {
                             self.begin_cell(sel, addr, Some((x, y)));
+                        } else if let Some(c) = super::edit_group::child_at(&self.deck, slide, s.index, x, y) {
+                            self.begin_child(sel, c, Some((x, y)));
                         }
                     }
                 }
@@ -960,13 +1033,19 @@ impl PptxTab {
                     let (index, id, xf) = (d.shape.index, d.shape.id, d.cur);
                     let (dx, dy) = (xf.x - d.shape.xf.x, xf.y - d.shape.xf.y);
                     let others = d.others;
-                    self.apply(None, |txn| {
+                    let resize = matches!(d.grip, Grip::Handle(_)) && d.shape.kind == Kind::Shape && !d.shape.alternate && d.shape.text;
+                    let key = resize.then(|| format!("resize:{slide}:{id}"));
+                    self.apply(key.clone(), |txn| {
                         edit_ops::set_xf(txn, slide, index, id, xf)?;
                         for o in &others {
                             edit_ops::set_xf(txn, slide, o.index, o.id, Xf { x: o.xf.x + dx, y: o.xf.y + dy, ..o.xf })?;
                         }
                         Ok(())
                     });
+                    // Textens autoanpassning räknas om för den nya storleken, i samma ångra-steg.
+                    if let Some(key) = key {
+                        self.refit_after_resize(slide, index, id, xf, key);
+                    }
                 }
             }
             if let Some(((ax, ay), (bx, by))) = self.edit.band.take() {
@@ -1051,13 +1130,17 @@ impl PptxTab {
         if resp.double_clicked() {
             if let Some(pt) = resp.interact_pointer_pos() {
                 let (x, y) = to_slide(pt);
-                let table = |me: &Self, s: &ShapeInfo| s.kind == Kind::Frame && super::edit_table::is_editable_table(&me.deck, slide, s.index);
+                let table = |me: &Self, s: &ShapeInfo| s.kind == Kind::Frame && super::edit_table::is_editable_table(&me.deck, slide, s.index) || s.kind == Kind::Group && !s.alternate && super::edit_group::is_group(&me.deck, slide, s.index);
                 if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate || table(self, s)) {
                     let sel = Sel { slide, index: s.index, id: s.id };
                     if text_sel != Some(sel) {
                         if s.kind == Kind::Frame {
                             if let Some(addr) = super::edit_table::cell_at(&self.deck, slide, s.index, x, y) {
                                 self.begin_cell(sel, addr, Some((x, y)));
+                            }
+                        } else if s.kind == Kind::Group {
+                            if let Some(c) = super::edit_group::child_at(&self.deck, slide, s.index, x, y) {
+                                self.begin_child(sel, c, Some((x, y)));
                             }
                         } else {
                             self.begin_text(sel, Some((x, y)));

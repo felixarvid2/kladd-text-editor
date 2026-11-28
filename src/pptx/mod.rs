@@ -46,6 +46,7 @@ pub mod mtx;
 pub mod edit;
 pub mod edit_bar;
 pub mod edit_fit;
+pub mod edit_group;
 pub mod edit_format;
 pub mod edit_ops;
 pub mod edit_table;

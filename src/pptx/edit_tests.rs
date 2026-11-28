@@ -1207,3 +1207,134 @@ fn flera_former_flyttas_dupliceras_och_tas_bort_i_ett_steg() {
     assert_eq!(edit_ops::shapes(&ed.deck, 0).len(), before.len() - 2);
     assert_valid(&ed.save());
 }
+
+// ------------------------------------------------------------------ grupper, ny tabellrad, tabellformat, storleksändring
+
+/// Ändrar gruppens `a:ext` så att barnen skalas (provar gruppens `chOff`/`chExt`).
+fn scale_group(ed: &mut Ed, cx: i64, cy: i64) {
+    let part0 = ed.deck.slides[0].part.clone();
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let g = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap().elems_mut().find(|e| e.name == "p:grpSp").unwrap();
+        let ext = g.path_mut(&["p:grpSpPr", "a:xfrm", "a:ext"]).unwrap();
+        ext.set_attr("cx", &cx.to_string());
+        ext.set_attr("cy", &cy.to_string());
+        Ok(())
+    });
+}
+
+#[test]
+fn text_i_form_i_grupp_med_skalning() {
+    use super::edit_group::{child_at, child_model, find_child, set_child_text};
+    let mut ed = Ed::new(fixture(true));
+    scale_group(&mut ed, 2_000_000, 1_000_000); // barnen skalas 2 × 1
+    let g = ed.shape(0, "Grupp");
+    let (gx, gy) = (5_000_000.0 / 12_700.0, 4_000_000.0 / 12_700.0);
+    // Barnet "Inre" (id 6) ligger i barnkoordinaterna 0..500000: på bilden 0..1000000 × 0..500000 från gruppens hörn.
+    assert_eq!(child_at(&ed.deck, 0, g.index, gx + 20.0, gy + 10.0), Some(6));
+    assert_eq!(child_at(&ed.deck, 0, g.index, gx + 500_000.0 * 2.0 / 12_700.0 + 20.0, gy + 10.0), None);
+    let (_, parent) = find_child(&ed.deck, 0, g.index, 6).unwrap();
+    let (px, _) = parent.apply(500_000.0 / 12_700.0, 0.0);
+    assert!((px - (gx + 2.0 * 500_000.0 / 12_700.0)).abs() < 0.01, "{px}");
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let mut m = child_model(&ed.deck, &doc, 0, g.index, 6, "a").unwrap();
+    m.insert(Pos::default(), "Gruppens text");
+    let (node, _) = find_child(&ed.deck, 0, g.index, 6).unwrap();
+    let c = m.carets(&ed.deck, 0, node).unwrap();
+    let (a, b) = c.caret(Pos::default()).unwrap();
+    // Markören står i barnets ruta på bilden (x 393,7–472,4 pt, y 314,96–354,3 pt).
+    assert!(a.0 > gx && a.0 < gx + 79.0 && a.1 >= gy - 0.5 && b.1 <= gy + 40.0, "{a:?} {b:?}");
+    ed.apply(|t| set_child_text(t, 0, g.index, g.id, 6, &m, None));
+    // Ellipsens textruta är smal, så texten bryts (tecken för tecken).
+    assert!(ed.text(0).replace(' ', "").contains("Gruppenstext"), "{}", ed.text(0));
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert!(x.contains("<a:t>Gruppens text</a:t>"), "{x}");
+    // Allt utanför barnets text är orört: gruppens xfrm har bara den ändring provet gjorde.
+    assert!(x.contains(r#"<a:ext cx="2000000" cy="1000000"/><a:chOff x="0" y="0"/><a:chExt cx="1000000" cy="1000000"/>"#), "{x}");
+}
+
+#[test]
+fn ny_tabellrad_kopierar_sista_raden_tom() {
+    use super::edit_table::{add_row, cell_model, is_last_cell};
+    let (mut ed, sh) = table_fixture();
+    assert!(is_last_cell(&ed.deck, 0, sh.index, (1, 1)) && !is_last_cell(&ed.deck, 0, sh.index, (0, 1)));
+    let mut row = 0;
+    ed.apply(|t| {
+        row = add_row(t, 0, sh.index, sh.id)?;
+        Ok(())
+    });
+    assert_eq!(row, 2);
+    assert!(is_last_cell(&ed.deck, 0, sh.index, (2, 1)));
+    let now = ed.shape(0, "Tabell");
+    assert_eq!(now.xf.cy, sh.xf.cy + 400_000);
+    let doc = edit_xml::parse(ed.deck.pkg.read(&ed.deck.slides[0].part).unwrap()).unwrap();
+    assert_eq!(cell_model(&doc, sh.index, (2, 0), "a").unwrap().text(), "");
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert_eq!(x.matches("<a:tr ").count(), 3, "{x}");
+    assert!(x.contains(r#"<a:tr h="400000"><a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>"#), "{x}");
+}
+
+#[test]
+fn tabellformatets_fetstil_ger_markor_som_texten() {
+    use super::edit_table::cell_model;
+    let (mut ed, sh) = table_fixture();
+    let part0 = ed.deck.slides[0].part.clone();
+    let caret_end = |ed: &Ed| {
+        let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+        let m = cell_model(&doc, sh.index, (0, 0), "a").unwrap();
+        let c = m.cell_carets(&ed.deck, 0, sh.index, (0, 0)).unwrap();
+        c.caret(m.end()).unwrap().0 .0
+    };
+    let plain = caret_end(&ed);
+    // Formatet "Medium Style 2 – Accent 1" med rubrikrad: fetstil i första raden.
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let pr = doc.fragment(r#"<a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr>"#).into_iter().next().unwrap();
+        let tbl = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap().elems_mut().find(|e| e.name == "p:graphicFrame").unwrap().path_mut(&["a:graphic", "a:graphicData", "a:tbl"]).unwrap();
+        tbl.remove_children("a:tblPr");
+        tbl.children.insert(0, edit_xml::XNode::Elem(pr));
+        Ok(())
+    });
+    let bold = caret_end(&ed);
+    assert!(bold > plain + 0.5, "fetstil är bredare: {bold} > {plain}");
+    // Markören stämmer med den ritade texten: glyfkörningens slut.
+    let scene = super::render::slide_scene(&ed.deck, 0);
+    let run = scene.items.iter().find_map(|i| if let super::scene::Item::Glyphs(g) = i { (g.text == "Hej").then_some(g) } else { None }).expect("glyfkörning");
+    let last = run.glyphs.last().unwrap();
+    let (gx, _) = run.t.apply(last.x, 0.0);
+    assert!((bold - gx).abs() < 14.0, "markör {bold}, sista glyfens start {gx}");
+}
+
+#[test]
+fn autoanpassning_efter_storleksandring() {
+    use super::edit_fit::Fit;
+    // spAutoFit: en uttänjd ruta får tillbaka textens höjd.
+    let mut ed = Ed::new(fixture(true));
+    let xf = Xf { x: 914_400, y: 914_400, cx: 3_000_000, cy: 400_000, rot: 0, flip_h: false, flip_v: false };
+    ed.apply(|t| edit_ops::insert_textbox(t, 0, xf).map(|_| ()));
+    let sh = edit_ops::shapes(&ed.deck, 0).into_iter().find(|s| s.name.starts_with("Textruta")).unwrap();
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let mut m = TextModel::from_body(edit_ops::raw_shape(&doc, sh.index).unwrap().child("p:txBody"), &doc.root_scope(), "a");
+    m.insert(Pos::default(), "En rad");
+    let big = Xf { cy: 3_000_000, ..sh.xf };
+    ed.apply(|t| edit_ops::set_xf(t, 0, sh.index, sh.id, big));
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let Some(Fit::Shape { cy, .. }) = m.autofit(&ed.deck, 0, node, big, Some(f32::MAX)) else { panic!("ska krympa") };
+    assert!(cy < 1_000_000, "{cy}");
+    // normAutofit: en smalare ruta ger ett kraftigare steg.
+    let (mut ed, mut m, sh) = autofit_fixture(4);
+    let end = m.end();
+    m.insert(end, "\nEtt ganska långt stycke med mycket text i en enda rad");
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let wide = m.autofit(&ed.deck, 0, node, sh.xf, None);
+    let narrow = Xf { cx: sh.xf.cx / 4, ..sh.xf };
+    ed.apply(|t| edit_ops::set_xf(t, 0, sh.index, sh.id, narrow));
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let Some(Fit::Norm { scale: s_narrow, .. }) = m.autofit(&ed.deck, 0, node, narrow, None) else { panic!("smal ruta ska krympa texten") };
+    let s_wide = if let Some(Fit::Norm { scale, .. }) = wide { scale } else { 1.0 };
+    assert!(s_narrow < s_wide, "{s_narrow} < {s_wide}");
+}

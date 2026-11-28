@@ -1103,72 +1103,24 @@ Moduler: `edit_format.rs` (modellens formatfunktioner), `edit_fit.rs` (autoanpas
   sammanslagna till ett ångra-steg) gäller alla. Storlek och vridning bara för en form (handtagen visas inte).
   Formatraden gäller alla markerade former med text och står kvar hela redigeringsläget. Prov:
   `flera_former_flyttas_dupliceras_och_tas_bort_i_ett_steg`.
-- **Kvar:** text i former i grupper; ny rad med `Tab` i sista cellen; tabellformatets textstil i cellmarkören;
-  teckensnitt, radavstånd, nivåspecifika punkttecken och numrerade listor i formatraden; format på
-  markeringen som visas blandat (raden visar värdet i körningen vid markören); autoanpassning efter att en form
-  ändrar storlek med handtagen (PowerPoint räknar då om); markering och redigering av flera tabellceller.
-
-## Sekundäraxlar, trendlinjer, felstaplar, radar och datatabeller (omgång 5)
-
-`chart_draw.rs` (sekundäraxeln) och tre nya undermoduler som delar `Draw`: `chart_analysis.rs` (trendlinjer och
-felstaplar, matematiken som rena funktioner), `chart_radar.rs` och `chart_table.rs`. Modellen (`chart_model.rs`) har fått
-`Series::trendlines`/`err_bars` (`Trendline`, `TrendKind`, `ErrBars`) och `Kind::Radar { filled }`.
-
-- **Sekundär värdeaxel:** en senare plotts värdeaxel som inte är den första plottens (som Excel skriver en
-  kombination: andra plotten har en egen `catAx` (ofta `delete`) och en `valAx` med `crosses max`, `axPos r`).
-  Plottarna på den får en egen skala (samma regler, värdeområdet ur bara de plottarna), axeln ritas vid ritytans
-  högerkant (överst för liggande staplar) med etiketterna utanför och rubriken vriden; ritytan krymper med
-  etiketternas bredd. Inte för punktdiagram (de har två värdeaxlar redan).
-- **Trendlinjer** (`c:trendline`): x är kategorins nummer (1, 2 …; vid grupperade staplar genom stapelns mitt)
-  eller punktens x-värde. Linjär och polynom (grad 2–6, minsta kvadrat med Gauss), exponentiell (ln y linjärt),
-  logaritmisk, potens (ln–ln), glidande medel (`period`). `forward`/`backward`, `intercept`, linjen klipps till
-  ritytan. `dispEq`/`dispRSqr` ger ekvationen (koefficienter med fyra decimaler, exponenter upphöjda) och R²
-  (i den linjäriserade formen, som Excel) vid linjens slut. Standardlinje: seriens färg, 2,25 pt, punktstreckad.
-  Jämfört mot PowerPoints PDF för ett glidande medel över 7 punkter (`cand/uzis-souhrn` bild 28, inte i
-  jämförelseprovets urval): kurvan följer PowerPoints.
-- **Felstaplar** (`c:errBars`): fast värde, procent, standardavvikelse (kring seriens medelvärde, som Excel),
-  standardfel, egna värden (`c:plus`/`c:minus`), `both`/`plus`/`minus`, `noEndCap`, i värdeled för stapel/linje/
-  yta (även liggande staplar och staplade värden) och i båda leden för punktdiagram. Felstaplarna räknas in i
-  axelns skala (grupperade serier). Standardlinje: textfärgen med 65 %, 0,75 pt.
-- **Radar** (`c:radarChart`): ekrar medurs från klockan tolv, värdeaxeln längs den första ekern med etiketterna
-  till vänster, månghörningar för värdeaxelns `majorGridlines` och ekrar för kategoriaxelns, kategorietiketter
-  utanför ekrarna; `radarStyle` `standard` (linjer), `marker` (linjer med markörer), `filled` (ytor).
-- **Datatabell** (`c:dTable`, `Chart::dtable`) i stående kategoridiagram: rubrikraden med kategorierna i
-  kategoriernas band (ersätter kategorietiketterna), en rad per serie med namnet och förklaringsnyckeln
-  (`showKeys`) i en kolumn till vänster om ritytan och värdena i seriens talformat; kantlinjer efter
-  `showHorzBorder`/`showVertBorder`/`showOutline` (temats rutnätsfärg, eller tabellens `spPr`). Ritytan krymper
-  med tabellen. Inte för liggande staplar eller punktdiagram.
-- **Inte gjort:** trendlinjeetikettens `manualLayout` och talformat, felstaplar för
-  staplade linjer/ytor i skalan, sekundär x-axel. Inget av de 33 referensdeckens diagram använder funktionerna,
-  så jämförelseprovet ändras inte; proven i `chart_tests.rs` ritar egna fixturer (`KLADD_CHART_PNG=mapp` sparar
-  bilderna).
-
-**Prov:** `chart_analysis.rs` (linjär, låst skärning, polynom, exponentiell, logaritmisk, potens, R², glidande
-medel, ekvationerna, felstaplarnas belopp), `chart_radar.rs` (ekrarnas lägen), `chart_tests.rs` (sekundäraxel
-med egen skala till höger, trendlinje med ekvation och R² som Excel, polynom och glidande medel, felstaplar på
-staplar, radar med markörer och fylld radar, datatabell med kantlinjer och nycklar, alla även till PDF).
-
-### Datumaxlar, vridna kategorietiketter och trendlinjens etikett (omgång 5, uppföljning)
-
-- **Datumaxel** (`c:dateAx`, `chart_dates.rs`): axeln är en tidsskala från det tidigaste till det senaste
-  datumet i `baseTimeUnit` (dagar, månader, år), en plats per enhet; punkterna hamnar på sina datum, dagar
-  utan värde blir tomma platser som linjen går över, och cachens `ptCount` (PowerPoint-sparade filer har
-  tomma rader: `uzis-souhrn` bild 28 har 493 men 315 punkter) räknas inte. Etiketterna står på var
-  `majorUnit`:e plats (i `majorTimeUnit`, omräknat till basenheten). Diagrammet görs om till ett vanligt
-  kategoridiagram (`dates::remap`), så staplar, linjer, etiketter och trendlinjer ritas som förut. En
-  `c:catAx` med datum är en textaxel (Office skriver `dateAx` när axeln är en datumaxel).
-- **Excels korta datum** (`m/d/yyyy`, format 14) visas i diagrammets språk (`c:lang`; `cs-CZ` →
-  `dd.mm.yyyy`, `sv` → `yyyy-mm-dd`, `en-GB` → `dd/mm/yyyy` …, `chart_fmt::localized_short_date`), som i
-  PowerPoints PDF-export; gäller både datumaxlar och kategorier med datumformat.
-- **Vridna kategorietiketter** (`c:txPr/a:bodyPr/@rot`; 0 och PowerPoints "automatiskt" −60 000 000 vrider
-  inte): etikettens slut vid strecket och texten nedåt längs vinkeln (moturs, som −45° och −90°), höjden
-  under ritytan efter den vridna etikettens storlek, steget efter radhöjden / sin(vinkeln). `tickLblSkip`
-  anger steget.
-- **`dispBlanksAs span`** gäller nu också 2D-linjer (linjen går över tomma celler); inget av
-  referensdiagrammen har `span`.
-- **Trendlinjens etikett** står vid linjens slut men inåt: till vänster om slutet, ovanför en stigande linje
-  och under en fallande, helt inom ritytan; får den inte plats flyttas den åt vänster tills linjen gått undan.
-- **Resultat:** jämförelseprovets 33 presentationer är oförändrade (ingen av dem har datumaxlar eller vridna
-  kategorietiketter). `cand/uzis-souhrn` (utanför urvalet; PowerPoints utskrift till A4 beskuren och skalad
-  till bildens storlek för mätningen) 0,843 → 0,857: bild 26–29 med datumaxlar 0,64–0,80 → 0,83–0,88, bild
-  3–5 och 23 (−45° vridna etiketter) 0,001–0,012 sämre trots att etiketterna står som i PowerPoint.
+- **Grupper** (`edit_group.rs`): ett barn adresseras med gruppens toppnivåläge och barnets `p:cNvPr/@id`
+  (`TextState::child`). `find_child` ger barnets nod och föräldratransformen (`child_transform` är samma uträkning som
+  `render::group`: `chOff`/`chExt` mot `off`/`ext`, också för undergrupper), som `TextModel::in_parent` ger
+  `carets_fit`; `child_at` träffar översta formen under en punkt; `set_child_text` skriver `p:txBody` (och
+  `a:normAutofit`) i barnet i XML:en (söks utan att gå in i `mc:AlternateContent`). Klick markerar gruppen som förut,
+  dubbelklick går in i barnet och ett klick på ett annat barn byter. `spAutoFit` räknas inte om för grupper.
+- **Ny tabellrad:** `Tab` i sista cellen (`is_last_cell`) anropar `edit_table::add_row`: en kopia av sista raden med
+  `a:tcPr` och `a:endParaRPr` kvar, tom text, utan `a:extLst` (`a16:rowId`) och `rowSpan`/`vMerge`; formens höjd växer
+  med radens `h`. Markören går till den nya radens första cell.
+- **Tabellformatets textstil:** `tables::cell_style_list` (enda ändringen i `tables.rs`: en funktion på slutet) ger
+  formatets textstil för en cell som nivålista; `edit_table` lägger den mellan cellens `a:lstStyle` och grundstilarna,
+  som `draw_table`, både för radhöjderna och markören.
+- **Autoanpassning efter storleksändring:** `refit_after_resize` (efter en handtagsdragning av en textform): ny
+  autoanpassning ur den nya storleken (`spAutoFit`: exakt textens höjd, `f32::MAX` som tidigare höjd; `normAutofit`:
+  stegen) skrivs med `set_fit_only` och samma sammanslagningsnyckel som storleksändringen, så ett ångra-steg.
+- **Prov:** `text_i_form_i_grupp_med_skalning`, `ny_tabellrad_kopierar_sista_raden_tom`,
+  `tabellformatets_fetstil_ger_markor_som_texten`, `autoanpassning_efter_storleksandring`.
+- **Kvar:** `spAutoFit` i grupper; text i tabeller i grupper; teckensnitt, radavstånd, nivåspecifika punkttecken och
+  numrerade listor i formatraden; format på markeringen som visas blandat (raden visar värdet i körningen vid
+  markören); redigering och markering över flera tabellceller; autoanpassning efter storleksändring av flera former
+  eller en grupp.

@@ -550,3 +550,20 @@ pub fn draw_table<'a>(b: &mut Builder<'a>, tbl: &'a Node, f: &Frame, owner: Owne
 #[cfg(test)]
 #[path = "table_tests.rs"]
 mod tests;
+
+/// Tabellformatets textstil för cellen med området `(r0, r1, c0, c1)` som nivålista (för
+/// redigeringen, som lägger ut cellens text som `draw_table` gör).
+pub(super) fn cell_style_list(deck: &super::Deck, tbl: &Node, (r0, r1, c0, c1): (usize, usize, usize, usize)) -> Node {
+    let tbl_pr = tbl.child("a:tblPr");
+    let style = tbl_pr.and_then(|p| p.child("a:tableStyleId")).and_then(|s| {
+        let id = s.text.trim();
+        deck.table_styles
+            .as_ref()
+            .and_then(|ts| ts.children.iter().find(|st| st.attr("styleId").is_some_and(|v| v.trim().eq_ignore_ascii_case(id))))
+            .or_else(|| super::table_builtin::style(id))
+    });
+    let rows = tbl.children_named("a:tr").count();
+    let cols = tbl.child("a:tblGrid").map_or(0, |g| g.children_named("a:gridCol").count());
+    let parts = style_parts(style, Flags::of(tbl_pr), Area { r0, r1, c0, c1 }, rows, cols);
+    text_list(&text_style(&parts))
+}

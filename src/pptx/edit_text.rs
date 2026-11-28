@@ -87,6 +87,8 @@ pub struct TextModel {
     /// Prefixet för DrawingML (`a`) i bildens XML och rotens namnrymder (för nya element).
     a: String,
     scope: Vec<(String, String)>,
+    /// Transformen från formens förälder (gruppens barnkoordinater) till bilden; enhet för toppnivåformer.
+    parent: Affine,
 }
 
 fn q(a: &str, l: &str) -> String {
@@ -120,7 +122,13 @@ impl TextModel {
         if paras.is_empty() {
             paras.push(TPara { ppr: None, items: Vec::new(), end: None, orig: None });
         }
-        TextModel { paras, a: a.to_owned(), scope: scope.to_vec() }
+        TextModel { paras, a: a.to_owned(), scope: scope.to_vec(), parent: Affine::IDENTITY }
+    }
+
+    /// Sätter transformen för en form i en grupp (se `edit_group.rs`).
+    pub fn in_parent(mut self, parent: Affine) -> TextModel {
+        self.parent = parent;
+        self
     }
 
     pub(super) fn frag(&self, xml: &str) -> Option<XElem> {
@@ -639,7 +647,7 @@ impl TextModel {
         let sheets = Sheets::for_slide(deck, slide);
         let chain = inherit::shape_chain(&sheets, sp, Owner::Slide);
         let xfrm = chain.iter().find_map(|s| s.path(&["p:spPr", "a:xfrm"]))?;
-        let f = frame_of(xfrm, &Affine::IDENTITY)?;
+        let f = frame_of(xfrm, &self.parent)?;
         let geom = match chain.iter().find_map(|s| s.child("p:spPr").and_then(|p| p.children.iter().find(|c| c.name == "a:prstGeom" || c.name == "a:custGeom"))) {
             Some(n) if n.name == "a:prstGeom" => geom::preset(n.attr("prst").unwrap_or("rect"), n.child("a:avLst"), f.w as f64, f.h as f64),
             Some(n) => Some(geom::evaluate(n, None, f.w as f64, f.h as f64)),

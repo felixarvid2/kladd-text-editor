@@ -122,7 +122,7 @@ pub fn set_text_fit(txn: &mut Txn, slide: usize, index: usize, id: u32, model: &
 
 /// Sätter `fontScale`/`lnSpcReduction` på formens egen `a:normAutofit` (skapas efter `a:prstTxWarp`
 /// och före `a:scene3d` om formen ärvde den).
-fn write_norm(e: &mut XElem, doc: &super::edit_xml::XDoc, scale: f32, red: f32) -> Result<(), String> {
+pub(super) fn write_norm(e: &mut XElem, doc: &super::edit_xml::XDoc, scale: f32, red: f32) -> Result<(), String> {
     let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
     let tag = if a.is_empty() { "normAutofit".to_owned() } else { format!("{a}:normAutofit") };
     let body = e.child_mut("p:txBody").and_then(|b| b.child_mut("a:bodyPr")).ok_or("bodyPr")?;
@@ -145,4 +145,12 @@ fn write_norm(e: &mut XElem, doc: &super::edit_xml::XDoc, scale: f32, red: f32) 
         fit.remove_attr("lnSpcReduction");
     }
     Ok(())
+}
+
+/// Skriver bara autoanpassningen (efter att formen ändrat storlek med handtagen).
+pub fn set_fit_only(txn: &mut Txn, slide: usize, index: usize, id: u32, fit: Fit, xf: Xf) -> Result<(), String> {
+    edit_ops::with_shape(txn, slide, index, id, &mut |e, doc| match fit {
+        Fit::Norm { scale, red } => write_norm(e, doc, scale, red),
+        Fit::Shape { y, cy } => edit_ops::write_xf(e, doc, Xf { y, cy, ..xf }),
+    })
 }

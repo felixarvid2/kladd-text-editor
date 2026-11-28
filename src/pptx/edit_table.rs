@@ -2,10 +2,9 @@
 //! texten som i `tables.rs`), träff på en cell, markörlägen för cellens text och skrivning av
 //! cellens `a:txBody`. Samma textmodell som former (`TextModel`).
 //!
-//! Avgränsningar: texten läggs ut med presentationens grundstilar och cellens egna `a:lstStyle`
-//! inte tabellformatets textstil (fetstil i rubrikraden, färger) och tabeller som är vridna,
-//! höger-till-vänster eller har lodrät text i cellen redigeras inte. Markören kan därför stå någon
-//! punkt fel i en rubrikrad med fetstil från tabellformatet.
+//! Texten läggs ut som `tables.rs` ritar den: cellens `a:lstStyle`, tabellformatets textstil
+//! (fetstil i rubrikraden, färger) och presentationens grundstilar. Tabeller som är vridna,
+//! höger-till-vänster eller har lodrät text i cellen redigeras inte.
 
 use super::edit::Txn;
 use super::edit_ops;
@@ -103,8 +102,10 @@ fn geometry(deck: &Deck, slide: usize, tbl: &Node) -> Option<Geo> {
                 }
             }
             let bp = cell_props(tc);
+            let tx = super::tables::cell_style_list(deck, tbl, (ri, ri + sr, ci, ci + sc));
             let fr = tc.child("a:txBody").map(|body| {
                 let mut lists: Vec<&Node> = body.child("a:lstStyle").into_iter().collect();
+                lists.push(&tx);
                 lists.extend(base.iter().copied());
                 let env = TextEnv { sheets: &sheets, lists, font_ref: None, font_color: None, font_scale: 1.0, slide_no: deck.slide_number(slide) };
                 (richtext::frame(&env, body, &bp), bp.vert != "horz")
@@ -167,6 +168,13 @@ pub fn next_cell(deck: &Deck, slide: usize, index: usize, from: CellAddr, back: 
     if back { at.checked_sub(1).map(|i| order[i]) } else { order.get(at + 1).copied() }
 }
 
+/// Är `addr` tabellens sista cell i läsordning?
+pub fn is_last_cell(deck: &Deck, slide: usize, index: usize, addr: CellAddr) -> bool {
+    let Some((tbl, _)) = table_of(deck, slide, index) else { return false };
+    let Some(g) = geometry(deck, slide, tbl) else { return false };
+    g.cells.iter().map(|c| c.addr).max() == Some(addr)
+}
+
 /// Cellens text som modell (`a:txBody` i `a:tc`) ur XML:en i `doc`.
 pub fn cell_model(doc: &super::edit_xml::XDoc, index: usize, addr: CellAddr, a: &str) -> Option<TextModel> {
     let tc = tc_of(edit_ops::raw_shape(doc, index)?, addr)?;
@@ -196,7 +204,9 @@ impl TextModel {
         }
         let sheets = Sheets::for_slide(deck, slide);
         let base = inherit::list_styles(&sheets, &[], TxKind::Other);
+        let tx = super::tables::cell_style_list(deck, tbl, (cell.r0, cell.r1, cell.c0, cell.c1));
         let mut lists: Vec<&Node> = tc.child("a:txBody").and_then(|b| b.child("a:lstStyle")).into_iter().collect();
+        lists.push(&tx);
         lists.extend(base.iter().copied());
         let env = TextEnv { sheets: &sheets, lists, font_ref: None, font_color: None, font_scale: 1.0, slide_no: deck.slide_number(slide) };
         let (x0, y0, x1, y1) = g.rect(cell);
@@ -219,3 +229,43 @@ pub fn set_cell_text(txn: &mut Txn, slide: usize, index: usize, id: u32, addr: C
     })
 }
 
+
+/// Lägger en ny rad sist i tabellen: en kopia av sista raden med tom text och samma cellegenskaper
+/// (`a:tcPr`, styckeformat i `a:endParaRPr`). Formens höjd växer med radens. Ger den nya radens index.
+pub fn add_row(txn: &mut Txn, slide: usize, index: usize, id: u32) -> Result<usize, String> {
+    let mut new_row = 0;
+    edit_ops::with_shape(txn, slide, index, id, &mut |e, doc| {
+        let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
+        let q = |l: &str| if a.is_empty() { l.to_owned() } else { format!("{a}:{l}") };
+        let tbl = e.path_mut(&["a:graphic", "a:graphicData", "a:tbl"]).ok_or("tabellen finns inte längre")?;
+        let last = tbl.elems().filter(|r| r.name == "a:tr").last().ok_or("tabellen saknar rader")?.clone();
+        let h = last.attr_i64("h").unwrap_or(370_840);
+        let mut row = last;
+        // Ett unikt rad-id (a16:rowId) får inte kopieras; sammanslagning nedåt gäller inte den nya raden.
+        row.remove_children("a:extLst");
+        for tc in row.elems_mut().filter(|c| c.name == "a:tc") {
+            tc.remove_attr("rowSpan");
+            tc.remove_attr("vMerge");
+            let end = tc.child("a:txBody").and_then(|b| b.elems().filter(|p| p.name == "a:p").last()).and_then(|p| p.child("a:endParaRPr").cloned());
+            let mut para = doc.fragment(&format!("<{}/>", q("p"))).into_iter().next().ok_or("p")?;
+            if let Some(mut en) = end {
+                en.remove_attr("dirty");
+                para.children.push(super::edit_xml::XNode::Elem(en));
+            }
+            if let Some(body) = tc.child_mut("a:txBody") {
+                body.remove_children("a:p");
+                body.children.push(super::edit_xml::XNode::Elem(para));
+            }
+        }
+        let at = tbl.children.iter().rposition(|c| matches!(c, super::edit_xml::XNode::Elem(x) if x.name == "a:tr")).map_or(tbl.children.len(), |i| i + 1);
+        new_row = tbl.elems().filter(|r| r.name == "a:tr").count();
+        tbl.children.insert(at, super::edit_xml::XNode::Elem(row));
+        // Formens höjd.
+        if let Some(ext) = e.child_mut("p:xfrm").and_then(|x| x.child_mut("a:ext")) {
+            let cy = ext.attr_i64("cy").unwrap_or(0) + h;
+            ext.set_attr("cy", &cy.to_string());
+        }
+        Ok(())
+    })?;
+    Ok(new_row)
+}
