@@ -1018,11 +1018,11 @@ dropped = []
 headings = 0
 
 ["odt/lo-export-fillbitmap3.odt"]
-dropped = ["diagram och former"]
+dropped = ["diagram och former", "bakgrundsbilder"]
 headings = 0
 
 ["odt/lo-export-framebackgrounds.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 
 ["odt/lo-export-gerrit13858.odt"]
@@ -1055,17 +1055,17 @@ dropped = ["diagram och former"]
 headings = 0
 
 ["odt/lo-export-pagestyle_background_lo64.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
 
 ["odt/lo-export-pagestyle_background_lo70.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
 
 ["odt/lo-export-pagestyle_background_ooo33.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 skip_idempotent = "dokument med bara tomma avsnitt blir tomt"
 
@@ -1339,7 +1339,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-PageBackground.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 skip_idempotent = "textfärg från sidmall tappas"
 
@@ -1467,7 +1467,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-fill-image-name-missing-definition.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 
 ["odt/lo-import-hello.odt"]
@@ -1587,7 +1587,7 @@ dropped = []
 headings = 0
 
 ["odt/lo-import-tdf92586.odt"]
-dropped = []
+dropped = ["bakgrundsbilder"]
 headings = 0
 
 ["odt/lo-import-tdf94882.odt"]
