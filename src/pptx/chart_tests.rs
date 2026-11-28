@@ -426,14 +426,15 @@ fn sekundar_axel_har_egen_skala_till_hoger() {
 #[test]
 fn trendlinjer_med_ekvation_och_r2() {
     let trend = |t: &str, extra: &str| format!(r#"<c:trendline><c:spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill><a:prstDash val="sysDash"/></a:ln></c:spPr><c:trendlineType val="{t}"/>{extra}<c:dispRSqr val="1"/><c:dispEq val="1"/></c:trendline>"#);
+    let punkter = format!(
+        r#"<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>Mätning</c:v></c:tx><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>{}<c:xVal>{}</c:xVal><c:yVal>{}</c:yVal></c:ser>"#,
+        trend("linear", r#"<c:forward val="1"/>"#),
+        num_lit(&[1.0, 2.0, 3.0, 4.0, 5.0]),
+        num_lit(&[1.0, 3.0, 2.0, 5.0, 4.0])
+    );
     let plot = format!(
         r#"<c:scatterChart><c:scatterStyle val="lineMarker"/>{}<c:axId val="1"/><c:axId val="2"/></c:scatterChart><c:valAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="2"/></c:valAx><c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:crossAx val="1"/></c:valAx>"#,
-        format!(
-            r#"<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>Mätning</c:v></c:tx><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>{}<c:xVal>{}</c:xVal><c:yVal>{}</c:yVal></c:ser>"#,
-            trend("linear", r#"<c:forward val="1"/>"#),
-            num_lit(&[1.0, 2.0, 3.0, 4.0, 5.0]),
-            num_lit(&[1.0, 3.0, 2.0, 5.0, 4.0])
-        )
+        punkter
     );
     let scene = render_chart(&chart_xml(&plot), "trendlinje");
     let t: String = texts(&scene.items).join(" ");

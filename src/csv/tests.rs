@@ -235,7 +235,11 @@ fn parses_numbers_in_both_styles() {
     assert_eq!(parse_number("-12,5"), Some(-12.5));
     assert_eq!(parse_number("\u{2212}3"), Some(-3.0));
     assert_eq!(parse_number("42"), Some(42.0));
-    assert_eq!(parse_number("3.14"), Some(3.14));
+    // 3,14 är ett testvärde, inte π.
+    #[allow(clippy::approx_constant)]
+    {
+        assert_eq!(parse_number("3.14"), Some(3.14));
+    }
     assert_eq!(parse_number("1,5e3"), Some(1500.0));
     assert_eq!(parse_number(",5"), Some(0.5));
     assert_eq!(parse_number("1 234 567"), Some(1_234_567.0));

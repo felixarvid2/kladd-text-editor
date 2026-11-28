@@ -961,7 +961,7 @@ fn relayout(
     let reused = prep.is_some();
     #[cfg(test)]
     {
-        st.stats.memo_why = memo::WHY.with(|w| w.borrow_mut().drain(..).last().unwrap_or(0));
+        st.stats.memo_why = memo::WHY.with(|w| w.borrow_mut().drain(..).next_back().unwrap_or(0));
     }
     let prep = prep.unwrap_or_else(|| memo::fresh(text, &a, p, pages.is_some(), &grid, &cb));
     st.stats.plan_ms += t0.elapsed().as_secs_f64() * 1000.0;

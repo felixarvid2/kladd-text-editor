@@ -406,7 +406,6 @@ fn tid_per_bild() {
         all.extend(total.iter().copied());
         println!("| {} | {open_ms:.0} | {:.0} | {worst:.0} | {:.0} |", dir.file_name().unwrap().to_string_lossy(), med(&mut total), med(&mut scene_t));
     }
-    let mut all = all;
     all.sort_by(|a, b| a.total_cmp(b));
     println!("alla bilder: median {:.0} ms, 95:e percentilen {:.0} ms", all.get(all.len() / 2).unwrap_or(&0.0), all.get(all.len() * 95 / 100).unwrap_or(&0.0));
 }

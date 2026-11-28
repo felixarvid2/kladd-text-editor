@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(std::fs::read(&c).unwrap(), b"foo\0bin");
         // Reguljära uttryck med fångstgrupper.
         let re = Spec { regex: true, ..spec("(b)(a)(z)") };
-        let r = replace_in_files(&[a.clone()], &re, "$3$2$1");
+        let r = replace_in_files(std::slice::from_ref(&a), &re, "$3$2$1");
         assert_eq!(r[0].1, Ok(3));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "zab och zab\r\nzab");
         let _ = std::fs::remove_dir_all(&d);

@@ -358,6 +358,10 @@ fn glyph(r: &mut Reader<'_>) -> Option<Vec<u8>> {
     if n == 0x7FFF {
         n = r.i16()?;
         bbox = Some([r.i16()?, r.i16()?, r.i16()?, r.i16()?]);
+        // Ett negativt antal blir `as usize` ≈ 2^64 och får `with_capacity` att panika.
+        if n < 0 {
+            return None;
+        }
     }
     let n = n as usize;
     let mut ends = Vec::with_capacity(n);
@@ -365,7 +369,8 @@ fn glyph(r: &mut Reader<'_>) -> Option<Vec<u8>> {
     for i in 0..n {
         let v = r.u255()? as usize;
         total = if i == 0 { v + 1 } else { total + v };
-        ends.push(total.checked_sub(1)?);
+        // Slutindexen skrivs som u16; fler punkter får inte trunkeras tyst till en trasig glyf.
+        ends.push(u16::try_from(total.checked_sub(1)?).ok()?);
     }
     let flags = r.bytes(total)?.to_vec();
     let (mut x, mut y) = (0i32, 0i32);
@@ -396,7 +401,7 @@ fn glyph(r: &mut Reader<'_>) -> Option<Vec<u8>> {
         put16(&mut out, v as u16);
     }
     for e in &ends {
-        put16(&mut out, *e as u16);
+        put16(&mut out, *e);
     }
     put16(&mut out, 0);
     // Flaggor: bara på-kurvan-biten; koordinaterna som 16-bitars förskjutningar.
@@ -669,6 +674,16 @@ mod tests {
         write_copy(&mut w, &mut sym, &mut len, &mut dist, 6, 3);
         write_copy(&mut w, &mut sym, &mut len, &mut dist, 10, 611);
         assert_eq!(lzcomp(&w.finish(), 3).as_deref(), Some(&data[..]));
+    }
+
+    #[test]
+    fn glyf_med_negativt_konturantal_ger_none() {
+        // 0x7FFF följt av ett negativt antal fick `n as usize` att bli enormt (with_capacity-panik).
+        let mut g = Vec::new();
+        g.extend_from_slice(&0x7FFFi16.to_be_bytes());
+        g.extend_from_slice(&(-1i16).to_be_bytes());
+        g.extend_from_slice(&[0; 8]); // begränsningsrutan
+        assert!(glyph(&mut Reader { d: &g, p: 0 }).is_none());
     }
 
     #[test]

@@ -2006,7 +2006,7 @@ fn is_toc_xml(xml: &str) -> bool {
         let body = &after[gt + 1..];
         let end = body.find('<').unwrap_or(body.len());
         let instr = body[..end].trim_start();
-        if instr.len() >= 3 && instr[..3].eq_ignore_ascii_case("TOC") && !instr[3..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        if instr.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("TOC")) && !instr.get(3..).is_some_and(|r| r.starts_with(|c: char| c.is_ascii_alphanumeric())) {
             return true;
         }
         rest = &body[end..];
@@ -2023,7 +2023,7 @@ fn toc_instr(xml: &str) -> Option<String> {
         let body = &after[gt + 1..];
         let end = body.find('<').unwrap_or(body.len());
         let instr = body[..end].trim_start();
-        if instr.len() >= 3 && instr[..3].eq_ignore_ascii_case("TOC") && !instr[3..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        if instr.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("TOC")) && !instr.get(3..).is_some_and(|r| r.starts_with(|c: char| c.is_ascii_alphanumeric())) {
             return Some(instr[3..].replace("&quot;", "\"").replace("&amp;", "&"));
         }
         rest = &body[end..];
@@ -3270,6 +3270,7 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
     let mut units: Vec<MdUnit> = Vec::new();
     let mut out = String::new();
     let mut prev_list = false;
+    let mut list_eff: Option<usize> = None;
     // numId för den yttersta listan: en ny lista på nivå 0 får en tom rad före sig.
     let mut top_num: Option<String> = None;
     // Räknare per (numId, nivå); fortsätter när samma lista återupptas efter ett avbrott.
@@ -3349,6 +3350,9 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                     top_num = None;
                 }
                 prev_list = is_list;
+                if !is_list {
+                    list_eff = None;
+                }
                 match (p.kind, &p.list) {
                     (ParaKind::Heading(n), _) => {
                         let one_line = text.replace('\n', " ");
@@ -3357,13 +3361,20 @@ fn to_markdown_units(blocks: &[Block], numbering: &Numbering, text_w: Option<f64
                         out.push_str(&h);
                     }
                     (_, Some((num, lvl))) => {
-                        let l = *lvl as usize;
-                        let ordered = numbering.ordered.get(num).map(|v| v[l]).unwrap_or(false);
+                        let raw = *lvl as usize;
+                        // Markdown kan bara nästla ett steg i taget: en hoppad nivå (ilvl 0 följt av 2) ger annars
+                        // ett kodblock vid sparning och stycket skrivs om som kod med läckta markörer.
+                        let l = match list_eff {
+                            None => 0,
+                            Some(prev) => raw.min(prev + 1),
+                        };
+                        list_eff = Some(l);
+                        let ordered = numbering.ordered.get(num).map(|v| v[raw]).unwrap_or(false);
                         let indent = "    ".repeat(l);
                         let marker = if ordered {
                             // Ett objekt nollställer räknarna för djupare nivåer i samma lista.
                             counters.retain(|(n, d), _| n != num || *d <= l);
-                            let start = numbering.starts.get(num).map(|v| v[l]).unwrap_or(1);
+                            let start = numbering.starts.get(num).map(|v| v[raw]).unwrap_or(1);
                             let c = counters.entry((num.clone(), l)).and_modify(|c| *c += 1).or_insert(start);
                             format!("{c}. ")
                         } else {
@@ -4945,6 +4956,48 @@ fn mermaid_code(alt: &str) -> Option<&str> {
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="svg" ContentType="image/svg+xml"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#;
 
+/// Innehållstyper för ett paket som saknar `[Content_Types].xml`: standardtyperna och en `Override` per del som
+/// Kladd känner igen på namnet (huvuddokumentet, formatmallar, numrering, fotnoter, sidhuvuden …).
+fn synth_content_types(main: &str, names: &[&str]) -> String {
+    const WP: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml";
+    let mut x = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="svg" ContentType="image/svg+xml"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/>"#);
+    let main = main.trim_start_matches('/');
+    x.push_str(&format!("<Override PartName=\"/{main}\" ContentType=\"{WP}.document.main+xml\"/>"));
+    for n in names {
+        let name = n.trim_start_matches('/');
+        let lower = name.to_lowercase();
+        if name == main || !lower.ends_with(".xml") {
+            continue;
+        }
+        let file = lower.rsplit('/').next().unwrap_or("");
+        let ty = if lower.starts_with("word/") && !lower[5..].contains('/') {
+            match file.trim_end_matches(".xml").trim_end_matches(|c: char| c.is_ascii_digit()) {
+                "styles" => format!("{WP}.styles+xml"),
+                "numbering" => format!("{WP}.numbering+xml"),
+                "settings" => format!("{WP}.settings+xml"),
+                "footnotes" => format!("{WP}.footnotes+xml"),
+                "endnotes" => format!("{WP}.endnotes+xml"),
+                "comments" => format!("{WP}.comments+xml"),
+                "header" => format!("{WP}.header+xml"),
+                "footer" => format!("{WP}.footer+xml"),
+                "fonttable" => format!("{WP}.fontTable+xml"),
+                _ => continue,
+            }
+        } else if lower == "docprops/core.xml" {
+            "application/vnd.openxmlformats-package.core-properties+xml".to_owned()
+        } else if lower == "docprops/app.xml" {
+            "application/vnd.openxmlformats-officedocument.extended-properties+xml".to_owned()
+        } else if lower.starts_with("word/theme/") {
+            "application/vnd.openxmlformats-officedocument.theme+xml".to_owned()
+        } else {
+            continue;
+        };
+        x.push_str(&format!("<Override PartName=\"/{name}\" ContentType=\"{ty}\"/>"));
+    }
+    x.push_str("</Types>");
+    x
+}
+
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#;
 
@@ -5451,14 +5504,22 @@ fn cols_xml(sec: &sections::Section) -> String {
 /// Sätter sida, marginaler, spalter och avsnittstyp i en `w:sectPr` efter avsnittet `sec`. Är allt
 /// redan lika lämnas XML:en orörd (förlustfri sparning). `refs` = sidhuvud- och sidfotsreferenser att
 /// lägga först om `x` saknar egna (första avsnittet när brödtextens sectPr bär dem).
+#[cfg(test)]
 fn apply_section(orig: &str, sec: &sections::Section, refs: Option<&str>) -> String {
+    apply_section_at(orig, sec, refs, false)
+}
+
+/// Som `apply_section`; `first` = det första avsnittet i dokumentet (dess typ har ingen verkan).
+fn apply_section_at(orig: &str, sec: &sections::Section, refs: Option<&str>, first: bool) -> String {
     let raw = read_sect(orig);
     let (w, h) = sec.page;
     let size_ok = raw.size.is_some_and(|(rw, rh)| same_pt(rw, w, 1.0) && same_pt(rh, h, 1.0));
     let mar_ok = raw.margin.is_some_and(|m| m.iter().zip(sec.margin).all(|(a, b)| same_pt(*a, b, 0.6)));
     let cols_ok = raw.cols == sec.columns
         && (sec.columns == 1 || (raw.gap.is_some_and(|g| same_pt(g, sec.gap, 1.0)) && raw.rule == sec.rule && same_widths(&raw.widths, &sec.col_widths)));
-    let type_ok = raw.continuous == sec.continuous;
+    // Det första avsnittets typ har ingen verkan (inget föregår det) och läses därför alltid som "ny sida": en
+    // `w:type continuous` där ska stå kvar orörd (annars tappas den tyst vid en oförändrad sparning).
+    let type_ok = first || raw.continuous == sec.continuous;
     let refs_add = refs.filter(|r| !r.is_empty() && !orig.contains("headerReference") && !orig.contains("footerReference"));
     if size_ok && mar_ok && cols_ok && type_ok && refs_add.is_none() {
         return orig.to_owned();
@@ -5593,7 +5654,7 @@ fn fix_sections(body: &str, secs: &[sections::Section], refs: &str, replace_refs
             None => one,
         };
         match secs.get(k).filter(|_| k + 1 < secs.len()) {
-            Some(sec) => out.push_str(&apply_section(one, sec, (k == 0).then_some(refs))),
+            Some(sec) => out.push_str(&apply_section_at(one, sec, (k == 0).then_some(refs), k == 0)),
             None => out.push_str(one),
         }
         rest = &rest[end..];
@@ -5892,7 +5953,7 @@ fn write_fresh(defaults: DocDefaults, markdown: &str, new_boxes: &[docx_tbox::Fo
     }
     let body = fix_sections(&body, &secs, &header_refs(&sect), false, &edits, &[]);
     // Sidhuvud och sidfot hör till första avsnittet (de senare ärver); annorlunda första sida gäller bara det.
-    let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
+    let sect = secs.last().map_or(sect.clone(), |s| apply_section_at(&sect, s, None, secs.len() == 1));
     let sect = if secs.len() > 1 { remove_title_pg(&sect) } else { sect };
     let sect = if last_edit.is_empty() { sect } else { patch_sect(&sect, &defaults, false, &last_edit) };
     let document = format!(
@@ -6044,7 +6105,9 @@ fn section_hf_edit(
     if nt != ot {
         e.title_pg = Some(nt);
     }
-    if (new.page_start, new.page_fmt) != (old.page_start, old.page_fmt) {
+    // Decimal är standard: `w:pgNumType w:fmt="decimal"` i originalet ska inte skrivas om till "inget" (tappas tyst).
+    let plain = |f: Option<crate::hf::NumFmt>| f.filter(|f| *f != crate::hf::NumFmt::Decimal);
+    if (new.page_start, plain(new.page_fmt)) != (old.page_start, plain(old.page_fmt)) {
         e.pg_num = Some((new.page_start, new.page_fmt));
     }
     e
@@ -6175,6 +6238,24 @@ fn with_orig_ppr(made: &str, orig: &str) -> Option<String> {
     let rest = made.strip_prefix("<w:p>")?;
     let rest = if rest.starts_with("<w:pPr>") { &rest[rest.find("</w:pPr>")? + 8..] } else { rest };
     Some(format!("<w:p>{ppr}{rest}"))
+}
+
+/// Ett ändrat stycke som parats med en innehållskontroll (`w:sdt`) med ett enda stycke: kontrollens `w:sdtPr`
+/// (tagg, titel, platshållare) behålls och det nya stycket läggs i dess `w:sdtContent`. Annars `None` (stycket
+/// skrivs då som ett vanligt stycke som förut).
+fn with_orig_sdt(made: &str, orig: &str) -> Option<String> {
+    let orig = orig.trim();
+    if !orig.starts_with("<w:sdt>") || !orig.ends_with("</w:sdt>") || orig.matches("<w:sdt>").count() != 1 {
+        return None;
+    }
+    let open = orig.find("<w:sdtContent>")? + "<w:sdtContent>".len();
+    let close = orig.rfind("</w:sdtContent>")?;
+    let inner = orig.get(open..close)?;
+    if close < open || count_paras(inner) != 1 || inner.contains("<w:tbl") || inner.contains("<w:sdt") {
+        return None;
+    }
+    let made = with_orig_ppr(made, inner.trim()).unwrap_or_else(|| made.to_owned());
+    Some(format!("{}{made}{}", &orig[..open], &orig[close..]))
 }
 
 /// Platshållarens index för varje fotnotsreferens i `xml`, i ordning.
@@ -6672,7 +6753,8 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
             Slot::Skip => {}
             Slot::Paired(e) => {
                 let made = &w.body[u.range.clone()];
-                segs.push((false, with_orig_ppr(made, &src.elems[e].xml).unwrap_or_else(|| made.to_owned())));
+                let orig = &src.elems[e].xml;
+                segs.push((false, with_orig_sdt(made, orig).or_else(|| with_orig_ppr(made, orig)).unwrap_or_else(|| made.to_owned())));
             }
             Slot::Gen => segs.push((false, w.body[u.range.clone()].to_owned())),
         }
@@ -6747,7 +6829,7 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
         }
     };
     let body = fix_sections(&body, &secs, "", false, &edits, &src.sect_prs);
-    let sect = secs.last().map_or(sect.clone(), |s| apply_section(&sect, s, None));
+    let sect = secs.last().map_or(sect.clone(), |s| apply_section_at(&sect, s, None, secs.len() == 1));
     let document = format!("{}{body}{sect}{}", fix_head(&src.head), src.tail);
     let document = crate::docx_notes::patch_sects(&document, &src.page.notes, &defaults.notes);
 
@@ -6761,7 +6843,6 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
     doc_rel_add.push_str(&extras.rels);
     let mut type_add = std::mem::take(&mut extras.types);
     let mut new_parts = std::mem::take(&mut extras.parts);
-    let mut ids = ids;
     let mut fresh_part = |name: &str, kind: &str, mime: &str, xml: String, doc_rel_add: &mut String, type_add: &mut String| {
         let mut n = 0;
         let part = loop {
@@ -6975,8 +7056,17 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
     exts.extend(extras.exts.iter().map(String::as_str));
     exts.sort_unstable();
     exts.dedup();
-    if let Some(ct) = src.part("[Content_Types].xml") {
-        replaced.insert("[content_types].xml".into(), fix_decl(&patch_content_types(&decode_xml(ct), &exts, &type_add)).into_bytes());
+    match src.part("[Content_Types].xml") {
+        Some(ct) => {
+            replaced.insert("[content_types].xml".into(), fix_decl(&patch_content_types(&decode_xml(ct), &exts, &type_add)).into_bytes());
+        }
+        // Originalet saknar innehållstyper (ett trasigt paket som ändå gick att läsa): en fil utan dem öppnas inte i
+        // Word, så de byggs av delarna som finns.
+        None => {
+            let names: Vec<&str> = src.parts.iter().map(|(n, _)| n.as_str()).collect();
+            let ct = synth_content_types(&src.main, &names);
+            replaced.insert("[content_types].xml".into(), fix_decl(&patch_content_types(&ct, &exts, &type_add)).into_bytes());
+        }
     }
 
     // ---- paketet: alla originaldelar, de ändrade utbytta
@@ -6997,6 +7087,11 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
     if !have_rels {
         if let Some(new) = replaced.get(&rels_name.to_lowercase()) {
             parts.push((rels_name.clone(), new.clone()));
+        }
+    }
+    if src.part("[Content_Types].xml").is_none() {
+        if let Some(new) = replaced.get("[content_types].xml") {
+            parts.push(("[Content_Types].xml".into(), new.clone()));
         }
     }
     parts.extend(new_parts);
@@ -7685,6 +7780,19 @@ Marginal
         let doc = part_text(&out, "word/document.xml");
         assert!(doc.contains("Ändrat innehåll") && !doc.contains("Innehåll i kontroll"));
         assert!(doc.contains(P_LAST) && doc.contains(P_FIELD));
+    }
+
+    #[test]
+    fn edited_content_control_keeps_its_wrapper() {
+        let docx = rich_docx();
+        let l = read(&docx).unwrap();
+        let md = l.markdown.replace("Innehåll i kontroll", "Ändrat innehåll");
+        let out = write(&md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;
+        let doc = part_text(&out, "word/document.xml");
+        // Kontrollens egenskaper (titel) står kvar och det nya innehållet ligger i kontrollen.
+        assert!(doc.contains(r#"<w:sdt><w:sdtPr><w:alias w:val="Kontroll"/></w:sdtPr><w:sdtContent><w:p>"#), "{doc}");
+        assert!(doc.contains("Ändrat innehåll</w:t></w:r></w:p></w:sdtContent></w:sdt>"), "{doc}");
+        assert_eq!(doc.matches("<w:sdt>").count(), 1);
     }
 
     #[test]

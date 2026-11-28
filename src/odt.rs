@@ -999,6 +999,8 @@ struct Dropped {
     comments: bool,
     /// Spårade formatändringar (`text:format-change`) som inte kan visas.
     format_changes: bool,
+    /// Bakgrundsbilder (sida, ram, stycke: `style:background-image`): ritas inte och skrivs inte tillbaka.
+    backgrounds: bool,
 }
 
 impl Dropped {
@@ -1018,6 +1020,9 @@ impl Dropped {
         }
         if self.format_changes {
             v.push(crate::i18n::t("spårade formatändringar"));
+        }
+        if self.backgrounds {
+            v.push(crate::i18n::t("bakgrundsbilder"));
         }
         v
     }
@@ -2429,6 +2434,11 @@ pub fn read(bytes: &[u8]) -> Result<Loaded, String> {
     };
     crate::timing::lap("odt: formatmallar, sidor");
     read_regions(body, &mut rd.review, &mut rd.dropped);
+    // Bakgrundsbilder ligger i stilarna (sidmallar, ramar, stycken) och följer inte med vid sparning.
+    fn has_bg_image(n: &Node) -> bool {
+        (n.name == "style:background-image" && n.attr("xlink:href").is_some_and(|h| !h.trim().is_empty())) || n.els().any(has_bg_image)
+    }
+    rd.dropped.backgrounds = has_bg_image(&croot) || sroot.as_ref().is_some_and(has_bg_image);
     for c in body.els() {
         rd.walk(c);
     }
@@ -3710,7 +3720,7 @@ impl<'a> W<'a> {
             self.underline += 1;
         } else if t.eq_ignore_ascii_case("</u>") {
             self.underline = self.underline.saturating_sub(1);
-        } else if t.len() > 4 && t[..4].eq_ignore_ascii_case("<img") && t[4..].starts_with(char::is_whitespace) {
+        } else if t.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("<img")) && t.get(4..).is_some_and(|r| r.starts_with(char::is_whitespace)) {
             let Some(end) = t.find('>') else {
                 self.run(s.trim_end_matches('\n'), false);
                 return;

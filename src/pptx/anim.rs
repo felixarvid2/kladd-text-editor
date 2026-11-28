@@ -1306,7 +1306,7 @@ pub(crate) mod tests {
         // Formen själv animeras inte: den syns hela tiden.
         assert!(vis(&t, Target { shape: 3, para: None }, 0));
         // Ett intervall av stycken blir ett mål per stycke.
-        let xml = click(false, &[(0, effect("entr", 1, "clickEffect", 0, &r#"<p:set><p:cBhvr><p:cTn dur="1" fill="hold"/><p:tgtEl><p:spTgt spid="3"><p:txEl><p:pRg st="1" end="3"/></p:txEl></p:spTgt></p:tgtEl><p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst></p:cBhvr><p:to><p:strVal val="visible"/></p:to></p:set>"#.to_string()))]);
+        let xml = click(false, &[(0, effect("entr", 1, "clickEffect", 0, r#"<p:set><p:cBhvr><p:cTn dur="1" fill="hold"/><p:tgtEl><p:spTgt spid="3"><p:txEl><p:pRg st="1" end="3"/></p:txEl></p:spTgt></p:tgtEl><p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst></p:cBhvr><p:to><p:strVal val="visible"/></p:to></p:set>"#))]);
         assert_eq!(Timeline::of_slide(&timing(&xml)).targets(), vec![p(1), p(2), p(3)]);
     }
 

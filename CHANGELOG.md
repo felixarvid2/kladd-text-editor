@@ -4,6 +4,14 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+## [2.18.0] – 2026-11-28
+
+### Rättat
+
+- **Enkelinstans och automatisk sparning: tystnande klienter och identiska stämplar.** En klient som ansluter till Kladds uttag men inte skickar något släpps efter 5 sekunder i stället för att hålla en tråd för alltid. Notisen om att en fil ändrats på disk nycklas nu också på innehållets kontrollsumma, så två olika externa ändringar med samma ändringstid och storlek ger varsin notis.
+- **PowerPoint: trasiga inbäddade typsnitt och SmartArt-urval kan inte längre krascha.** En komprimerad (MTX) glyf med negativt konturantal avvisas nu i stället för att ge en panik, glyfer med fler än 65 536 punkter avvisas i stället för att trunkeras tyst, och ett SmartArt-urval med `st` lika med det minsta heltalet panikar inte längre i debugbygget.
+- **Word och ODT: tåligare mot trasiga filer och mindre som tappas tyst.** Slumpprov av öppna, visa, redigera, spara och öppna igen (≈8 000 förvrängda dokument) hittade tre fel som är rättade: en .docx utan `[Content_Types].xml` sparades utan den (Word öppnar inte en sådan fil), en text på en HTML-rad som började med ett flerbytetecken fick ODT-skrivaren att krascha, och detsamma gällde en fältinstruktion som började med ett flerbytetecken i .docx. Bevarandekontrollen av korpusen rättade dessutom tre tysta förluster vid en oförändrad sparning (listor som hoppar över en nivå blev kodblock med läckta markörer, första avsnittets `w:type continuous` och `w:pgNumType w:fmt="decimal"` försvann) och en vid ändring (en ändrad innehållskontroll behåller nu sin tagg, titel och platshållare). ODT-filer med bakgrundsbilder (sida, ram, stycke) varnar nu om att de inte följer med. Se `docs/dev/korpus.md`.
+
 ## [2.17.0] – 2026-11-28
 
 ### Nytt

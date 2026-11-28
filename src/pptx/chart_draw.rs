@@ -682,7 +682,7 @@ impl<'b, 'a> Draw<'b, 'a> {
         } else {
             c.plots.iter().skip(1).flat_map(|p| p.ax_ids.iter().filter_map(|id| find(id))).find(|a| a.kind == "valAx" && val_ax.is_none_or(|v| v.id != a.id) && cat_ax.is_none_or(|cx| cx.id != a.id))
         };
-        let on_sec = |p: &Plot<'_>| sec_ax.is_some_and(|s| p.ax_ids.iter().any(|id| *id == s.id));
+        let on_sec = |p: &Plot<'_>| sec_ax.is_some_and(|s| p.ax_ids.contains(&s.id));
         let (lo2, hi2, percent2) = value_range(c.plots.iter().filter(|p| on_sec(p)), ncat);
 
         // Värdeområdet.

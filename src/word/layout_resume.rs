@@ -1647,6 +1647,8 @@ pub(super) fn finish_fast(
     // Raderna däremellan ersätter de gamla (`windows`: gamla rader, nya rader).
     let mut windows: Vec<(Range<usize>, Range<usize>, Vec<PlacedRow>, Vec<PSnap>)> = Vec::new();
     let mut pout: Vec<PageNotes> = op.pout;
+    // Tomt intervall som startvärde: första ändringen vidgar det.
+    #[allow(clippy::reversed_empty_ranges)]
     let mut touched: Range<usize> = usize::MAX..0;
     let mut pager = Pager::new(geom, ppp, &out.anchors, &out.row_groups, &out.page_breaks, &spec);
     let mut flat = FlatRows {
@@ -1966,10 +1968,7 @@ mod tests {
     /// En ändring som när man skriver: oftast ett tecken i ett ord, ibland en radbrytning, ett nytt stycke eller en
     /// borttagning, i två fall av fem i fotnotsdefinitionerna. Ger var markören står efteråt.
     fn edit(r: &mut Rng, text: &mut String) -> usize {
-        let from = match text.find("\n[^1]:").filter(|_| r.below(5) < 2) {
-            Some(f) => f,
-            None => 0,
-        };
+        let from = text.find("\n[^1]:").filter(|_| r.below(5) < 2).unwrap_or_default();
         let mut at = from + r.below(text.len() - from);
         while !text.is_char_boundary(at) {
             at += 1;

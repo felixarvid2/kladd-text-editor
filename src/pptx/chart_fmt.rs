@@ -306,7 +306,7 @@ fn date(v: f64, sec: &str) -> String {
                 3 => DAYS[(v.floor() as i64).rem_euclid(7) as usize][..3].to_owned(),
                 _ => DAYS[(v.floor() as i64).rem_euclid(7) as usize].to_owned(),
             }),
-            'm' if last_was_hour || cs[i + run..].iter().find(|x| x.is_ascii_alphabetic()).is_some_and(|x| x.to_ascii_lowercase() == 's') && run <= 2 => {
+            'm' if last_was_hour || cs[i + run..].iter().find(|x| x.is_ascii_alphabetic()).is_some_and(|x| x.eq_ignore_ascii_case(&'s')) && run <= 2 => {
                 out.push_str(&if run == 1 { mi.to_string() } else { format!("{mi:02}") })
             }
             'm' => out.push_str(&match run {

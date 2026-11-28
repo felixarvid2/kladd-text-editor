@@ -77,6 +77,8 @@ mod code_export_tests;
 #[cfg(test)]
 mod corpus_tests;
 #[cfg(test)]
+mod word_fuzz_tests;
+#[cfg(test)]
 mod brk_tests;
 #[cfg(test)]
 mod svg_tests;

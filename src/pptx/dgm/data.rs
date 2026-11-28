@@ -249,7 +249,7 @@ impl<'a> Model<'a> {
             let st = st.get(i).copied().unwrap_or(1);
             let cnt = cnt.get(i).copied().unwrap_or(0);
             let step = step.get(i).copied().unwrap_or(1);
-            let start = if st > 0 { (st - 1) as usize } else { next.len().saturating_sub((-st) as usize) };
+            let start = if st > 0 { (st - 1) as usize } else { next.len().saturating_sub(st.unsigned_abs() as usize) };
             let mut v = Vec::new();
             if step > 0 {
                 let mut j = start;

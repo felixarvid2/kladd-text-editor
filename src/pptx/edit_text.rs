@@ -217,7 +217,7 @@ impl TextModel {
             if i > 0 {
                 p = self.split_para(p);
             }
-            let line = line.replace('\r', "").replace('\u{b}', "");
+            let line = line.replace(['\r', '\u{b}'], "");
             if line.is_empty() {
                 continue;
             }

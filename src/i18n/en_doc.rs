@@ -48,4 +48,5 @@ pub const EN: &[(&str, &str)] = &[
     ("Konfiguration", "Configuration"),
     ("Logg", "Log"),
     ("Undertexter", "Subtitles"),
+    ("bakgrundsbilder", "background images"),
 ];

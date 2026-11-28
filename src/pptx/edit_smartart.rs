@@ -423,7 +423,7 @@ pub fn restructure(txn: &mut Txn, t: &Target, op: Op) -> Result<Option<String>, 
         }
         Op::Demote => {
             let sibs = children_of(doc, &parent);
-            let Some(prev) = sibs.iter().filter(|s| s.1 < ord).last().map(|s| s.0.clone()) else { return Ok(None) };
+            let Some(prev) = sibs.iter().filter(|s| s.1 < ord).next_back().map(|s| s.0.clone()) else { return Ok(None) };
             let n = children_of(doc, &prev).last().map_or(0, |c| c.1 + 1);
             move_node(doc, &t.pt, &prev, n)?;
             shift_after(doc, &parent, ord, -1)?;
@@ -441,7 +441,7 @@ pub fn restructure(txn: &mut Txn, t: &Target, op: Op) -> Result<Option<String>, 
                 return Ok(None);
             }
             let sibs = children_of(doc, &parent);
-            let before = sibs.iter().filter(|s| s.1 < ord).last().map(|s| s.0.clone()).or_else(|| sibs.iter().find(|s| s.1 > ord).map(|s| s.0.clone()));
+            let before = sibs.iter().filter(|s| s.1 < ord).next_back().map(|s| s.0.clone()).or_else(|| sibs.iter().find(|s| s.1 > ord).map(|s| s.0.clone()));
             // Kopplingen, övergångarna, punkten och dess presentationspunkter.
             let cx = cxn_list(doc)?.elems().find(|c| is_par_of(c) && c.attr("destId").as_deref() == Some(t.pt.as_str())).cloned();
             let mut gone: Vec<String> = vec![t.pt.clone()];

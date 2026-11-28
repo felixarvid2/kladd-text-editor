@@ -97,7 +97,7 @@ fn footers(first_id: u32, own: bool) -> String {
     let (l, m, r) = if own { (small, mid.as_str(), right.as_str()) } else { ("", "", "") };
     format!(
         "{}{}{}",
-        ph(first_id, "Datum", r#"type="dt" sz="half" idx="10""#, pos(DATE), r#" vert="horz" lIns="91440" tIns="45720" rIns="91440" bIns="45720" rtlCol="0" anchor="ctr""#, l, "").replace(r#"<a:p><a:endParaRPr lang="sv-SE"/></a:p>"#, r#"<a:p><a:endParaRPr lang="sv-SE"/></a:p>"#),
+        ph(first_id, "Datum", r#"type="dt" sz="half" idx="10""#, pos(DATE), r#" vert="horz" lIns="91440" tIns="45720" rIns="91440" bIns="45720" rtlCol="0" anchor="ctr""#, l, ""),
         ph(first_id + 1, "Sidfot", r#"type="ftr" sz="quarter" idx="11""#, pos(FOOT), r#" vert="horz" lIns="91440" tIns="45720" rIns="91440" bIns="45720" rtlCol="0" anchor="ctr""#, m, ""),
         sldnum(first_id + 2, pos(NUM), r),
     )
@@ -122,7 +122,7 @@ fn master(v: Variant) -> String {
     let other_lvls: String = (1..=9).map(|l| format!(r#"<a:lvl{l}pPr marL="{}" algn="l" defTabSz="914400" rtl="0" eaLnBrk="1" latinLnBrk="0" hangingPunct="1"><a:defRPr sz="1800" kern="1200"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill><a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/></a:defRPr></a:lvl{l}pPr>"#, 457_200 * (l - 1))).collect();
     let shapes = format!(
         "{}{}{}",
-        ph(2, "Rubrik", r#"type="title""#, Some(TITLE), r#" vert="horz" lIns="91440" tIns="45720" rIns="91440" bIns="45720" rtlCol="0" anchor="ctr""#, "", "Klicka för att ändra rubrik").replace("<a:bodyPr", "<a:bodyPr").replace("anchor=\"ctr\"/>", "anchor=\"ctr\"><a:normAutofit/></a:bodyPr>").replace("<a:bodyPr vert=\"horz\" lIns=\"91440\" tIns=\"45720\" rIns=\"91440\" bIns=\"45720\" rtlCol=\"0\" anchor=\"ctr\"><a:normAutofit/></a:bodyPr>", "<a:bodyPr vert=\"horz\" lIns=\"91440\" tIns=\"45720\" rIns=\"91440\" bIns=\"45720\" rtlCol=\"0\" anchor=\"ctr\"><a:normAutofit/></a:bodyPr>"),
+        ph(2, "Rubrik", r#"type="title""#, Some(TITLE), r#" vert="horz" lIns="91440" tIns="45720" rIns="91440" bIns="45720" rtlCol="0" anchor="ctr""#, "", "Klicka för att ändra rubrik").replace("anchor=\"ctr\"/>", "anchor=\"ctr\"><a:normAutofit/></a:bodyPr>"),
         ph(3, "Innehåll", r#"type="body" idx="1""#, Some(BODY), r#" vert="horz" lIns="91440" tIns="45720" rIns="91440" bIns="45720" rtlCol="0""#, "", "Klicka för att ändra text").replace("rtlCol=\"0\"/>", "rtlCol=\"0\"><a:normAutofit/></a:bodyPr>"),
         footers(4, true),
     );

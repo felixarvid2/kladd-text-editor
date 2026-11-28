@@ -5,6 +5,8 @@ simulerade tangenter och klick, knappar hittas via etikett i AccessKit-trädet, 
 GPU och inget nätverk behövs. De körs av vanliga `cargo test` (och därmed i CI-jobbet `test` på Linux,
 Windows och macOS). Hela mappen tar några sekunder.
 
+CI-jobbet *statisk analys (clippy)* (Linux) kör `cargo clippy --all-targets --locked -- -A clippy::all -D clippy::correctness -D clippy::suspicious -D clippy::perf`: bara grupperna som hittar fel, inte stil. Ett fynd som är avsiktligt får ett lokalt `#[allow(...)]` med en kommentar om varför; aldrig crate-omfattande.
+
 ```
 cargo test ui_tests            # bara gränssnittstesterna
 cargo test ui_tests::word -- --nocapture
