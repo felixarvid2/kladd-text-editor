@@ -170,11 +170,11 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 5 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
   text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
-  teckensnitt, marginaler, radavstånd och numrerade listor i formatraden; markering över flera tabellceller;
+  marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
   autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
   automatisk sparning).
 - **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
