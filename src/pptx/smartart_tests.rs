@@ -587,3 +587,29 @@ fn bildplatshallare_far_en_bildsymbol() {
     let g = s[1].1;
     assert!(s[1].2.is_empty() && close(g.2, 40.0) && close(g.3, 40.0) && close(g.0, 30.0) && close(g.1, 30.0), "{g:?}");
 }
+
+#[test]
+fn rutor_vaxer_med_texten_och_storleken_krymps_tills_allt_ryms() {
+    // Som `vList2`: rutans höjd ur teckenstorleken, regeln `h INF` låter rutan växa med texten och
+    // den gemensamma storleken krymps tills hela listan ryms i ramen.
+    let l = layout(
+        r#"<dgm:layoutNode name="root"><dgm:alg type="lin"><dgm:param type="linDir" val="fromT"/></dgm:alg><dgm:shape/><dgm:presOf/>
+<dgm:constrLst><dgm:constr type="w" for="ch" forName="node" refType="w"/><dgm:constr type="h" for="ch" forName="node" refType="primFontSz" refFor="ch" refForName="node" fact="0.5"/><dgm:constr type="primFontSz" for="ch" forName="node" op="equ" val="65"/><dgm:constr type="tMarg" for="ch" forName="node" refType="primFontSz" refFor="ch" refForName="node" fact="0.2"/><dgm:constr type="bMarg" for="ch" forName="node" refType="primFontSz" refFor="ch" refForName="node" fact="0.2"/></dgm:constrLst>
+<dgm:ruleLst><dgm:rule type="primFontSz" for="ch" forName="node" val="5"/></dgm:ruleLst>
+<dgm:forEach name="f" axis="ch" ptType="node"><dgm:layoutNode name="node" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="rect"/><dgm:presOf axis="self"/><dgm:ruleLst><dgm:rule type="h" val="INF"/></dgm:ruleLst></dgm:layoutNode></dgm:forEach></dgm:layoutNode>"#,
+    );
+    let long = "En lång text som behöver flera rader i rutan och därför får den att växa";
+    let d = data(&[("a", "Kort", &[]), ("b", long, &[]), ("c", "Kort", &[])], "", "");
+    let deck = Deck::open(&pptx(&frame(0.0, 0.0, 300.0, 300.0), &d, &l, None)).unwrap();
+    let s = laid_out(&deck);
+    assert_eq!(s.len(), 3, "{s:?}");
+    let sizes: Vec<i64> = s.iter().filter_map(|x| x.4).collect();
+    assert!(sizes.iter().all(|z| *z == sizes[0]) && sizes[0] < 6500, "{sizes:?}");
+    let (a, b, c) = (s[0].1, s[1].1, s[2].1);
+    // Den långa texten har en högre ruta; de korta minst villkorets höjd (0,5 × storleken i mm).
+    assert!(b.3 > a.3 * 1.5 && close(a.3, c.3), "{a:?} {b:?} {c:?}");
+    let f = sizes[0] as f64 / 100.0;
+    assert!(a.3 >= 0.5 * f * 72.0 / 25.4 - 0.5, "{a:?} {f}");
+    // Rutorna efter varandra, inom ramen.
+    assert!(close(b.1, a.1 + a.3) && close(c.1, b.1 + b.3) && a.1 >= -0.5 && c.1 + c.3 <= 300.5, "{a:?} {b:?} {c:?}");
+}

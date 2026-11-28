@@ -192,8 +192,9 @@ Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
 - **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
 - **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)* och *SmartArt: hierarkier och böjda kopplingar
-  (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: text som får rutan att växa
-  (`rule type="h" val="INF"`, `vList2`), egna förskjutningar i `composite` (kugghjul med ett och två hjul),
+  (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: rutor som växer med texten när texten
+  och den synliga formen är olika noder (`list1` i ReportProg: texten kan sticka ut nedtill), `rule type="w"
+  val="INF"`, egna förskjutningar i `composite` (kugghjul med ett och två hjul),
   hierarkins `hang` i två spalter (`secLinDir`), nivåetiketterna i `hierarchy5` (bakgrundskolumnerna i
   `bgShapesFlow` följer inte hierarkin när den krymps; ett försök att krympa `hierFlow` till sin ruta gjorde
   släktträdet sämre och togs bort) och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
@@ -1246,3 +1247,31 @@ Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastade
 - **Prövat:** bara i Xvfb med en skärm (RandR-listan = 1; med `KLADD_SCREENS` visades menyn och föredragsvyns fönster flyttades
   mellan de två rektanglarna med `Alt+S`). Själva `SetMonitor` mellan verkliga skärmar är inte prövad här (Xvfb har bara en
   RandR-krets), och inte heller Windows/macOS (bara kompilerade).
+
+## SmartArt: rutor som växer med texten (omgång 7)
+
+Textnoder med regeln `rule type="h" val="INF"` (`vList2`, `list1`, `process1`/`process4`, rutorna i
+organisationsscheman) växer med sin text i stället för att texten krymps, och den gemensamma storleken väljs så
+att hela diagrammet ryms (`dgm/mod.rs`, `grow_and_shrink`):
+
+1. För en storlek *f* (villkorens `primFontSz`/`secFontSz` med `val` gånger `Tree::font_k` = *f* / utgångsstorleken)
+   läggs diagrammet ut utan krympning (`Tree::no_shrink`: varken `lin` eller helheten krymps). Höjder ur
+   teckenstorleken (`h = 0,52 × primFontSz` i `vList2`) följer med.
+2. Utskriften i växläge (`Emitter::grow_mode`) behåller storleken för de växande rutorna och sparar höjden texten
+   behöver (Kladds textmotor, med insättningar, plus formens textrektangels marginal) i `needs`. Rutor vars höjd
+   ska vara lika (`h` med `op="equ"`) får den största i gruppen.
+3. Diagrammet läggs ut igen med de höjderna som lägsta höjd (`Tree::grow`) och ska rymmas i ramen.
+4. Den största storleken i halva punkter (från utgångsstorleken ned till regelns minsta eller 5 pt) som ryms väljs
+   med binärsökning. Ryms ingen (organisationsscheman, vars rutor inte beror på teckenstorleken) läggs diagrammet
+   ut som förut.
+
+Samtidigt, uppmätt mot PowerPoints ritdelar för `vList2` i msrc-identity:
+- Text på nivå 1 och nedåt är 78 % av den primära storleken när `secFontSz` saknas (31 → 24, 22 → 17 pt).
+- `lnSpAfParP`/`lnSpAfChP` ger avståndet efter stycken (standard 35 % och 15 %).
+- En marginal ur en längd (`lMarg refType="w" fact="0.09"`) räknar längden i millimeter och marginalen i punkter
+  (16,3 pt för en ruta på 513 pt, som i PowerPoints ritdel); en saknad sidomarginal hos en nod med andra
+  marginaler blir 0,56 × storleken; punktindraget 0,77 × storleken.
+- Avståndet efter det sista stycket räknas inte in i höjden (med det blev medlet sämre: 0,837 → 0,819).
+
+**Jämförelse mot ritdelarna** (`oracle`): `vList2` 0,50/0,64/0,74 → 0,59/0,96/0,96, `list1` 0,40 → 0,62, medel
+0,662 → 0,677; övriga layouter oförändrade. Prov: `rutor_vaxer_med_texten_och_storleken_krymps_tills_allt_ryms`.

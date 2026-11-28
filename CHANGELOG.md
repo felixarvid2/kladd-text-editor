@@ -7,6 +7,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Nytt
 
 - **PowerPoint: föredragsvyn väljer skärm.** Med flera skärmar (Windows, macOS och Linux/X11) går publikens helskärm till en annan skärm än Kladd-fönstrets och föredragsvyn öppnas på fönstrets egen. *Byt skärm* i föredragsvyn (`Alt+S`) byter plats på dem, och *Visa*-menyn har ett val för vilken skärm publiken visas på. Med en skärm eller utan skärmlista är allt som förut. Se `docs/dev/pptx.md`.
+- **PowerPoint: SmartArt-rutor växer med texten.** I SmartArt-diagram som läggs ut av Kladd (utan sparad ritning) blir rutor med mycket text högre i stället för att all text krymps, och den gemensamma teckenstorleken väljs så att hela diagrammet ryms – som PowerPoint gör i till exempel listor med rubrik och underpunkter. Underpunkter blir mindre än rubrikerna och avstånd och marginaler följer PowerPoint. Se `docs/dev/pptx.md`.
 
 ## [2.15.0] – 2026-11-28
 
