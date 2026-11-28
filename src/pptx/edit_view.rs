@@ -91,11 +91,13 @@ pub struct Editor {
     overlay: Option<Id>,
     /// Formatraden (storleksfält, senast använd färg, formatet för markerad form).
     pub(super) fmt: super::edit_bar::FormatBar,
+    /// Fönstret för diagramdata (`edit_chart_ui.rs`).
+    pub chart: Option<super::edit_chart_ui::ChartDialog>,
 }
 
 impl Editor {
     pub fn new(source: Vec<u8>, deck: &Deck) -> Editor {
-        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, more: Vec::new(), tool: None, new_drag: None, band: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None, fmt: Default::default() }
+        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, more: Vec::new(), tool: None, new_drag: None, band: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None, fmt: Default::default(), chart: None }
     }
 }
 
@@ -134,6 +136,7 @@ impl PptxTab {
             self.edit.sel = None;
             self.edit.more.clear();
             self.edit.drag = None;
+            self.edit.chart = None;
         }
     }
 
@@ -189,7 +192,7 @@ impl PptxTab {
     pub(super) fn set_deck(&mut self, deck: Deck) {
         let old = self.deck.clone();
         let same_layout = old.slides.len() == deck.slides.len() && old.slides.iter().zip(&deck.slides).all(|(a, b)| a.part == b.part);
-        let changed: Vec<usize> = if same_layout {
+        let mut changed: Vec<usize> = if same_layout {
             (0..deck.slides.len())
                 .filter(|&i| {
                     let p = &deck.slides[i].part;
@@ -202,6 +205,10 @@ impl PptxTab {
         } else {
             (0..deck.slides.len()).collect()
         };
+        // Bilder vars diagram ändrats (diagramdelen är en egen del).
+        if same_layout {
+            changed.extend(super::edit_chart::slides_with_changed_parts(&old, &deck).into_iter().filter(|i| !changed.contains(i)).collect::<Vec<_>>());
+        }
         self.deck = Arc::new(deck);
         self.invalidate(&changed, !same_layout);
         self.notes_changed();
@@ -608,7 +615,7 @@ impl PptxTab {
             return;
         }
         let overlay = self.edit.overlay;
-        if !self.edit.on || ctx.memory(|m| m.focused().is_some_and(|f| Some(f) != overlay)) {
+        if !self.edit.on || self.edit.chart.is_some() || ctx.memory(|m| m.focused().is_some_and(|f| Some(f) != overlay)) {
             return;
         }
         // Ctrl+Skift+Z före Ctrl+Z: `consume_key` bryr sig inte om extra Skift.
@@ -887,6 +894,7 @@ impl PptxTab {
 
     /// Redigeringslagret över bilden `slide` i `rect` (skärmkoordinater).
     pub(super) fn edit_overlay(&mut self, ui: &mut Ui, rect: Rect, slide: usize, p: &Palette) {
+        self.chart_dialog(ui.ctx());
         if !self.edit.on {
             // Dubbelklick på en form startar redigeringen.
             let resp = ui.interact(rect, Id::unique(("kladd-pptx-view", slide)), Sense::click());
@@ -899,7 +907,9 @@ impl PptxTab {
                     if let Some(s) = self.shapes_on(slide).into_iter().rev().find(|s| s.hit(x, y, 2.0)) {
                         let sel = Sel { slide, index: s.index, id: s.id };
                         self.edit.sel = Some(sel);
-                        if s.kind == Kind::Shape && !s.alternate {
+                        if s.kind == Kind::Frame && super::edit_chart::is_chart(&self.deck, slide, s.index) {
+                            self.open_chart(sel);
+                        } else if s.kind == Kind::Shape && !s.alternate {
                             self.begin_text(sel, Some((x, y)));
                         } else if let Some(addr) = super::edit_table::cell_at(&self.deck, slide, s.index, x, y) {
                             self.begin_cell(sel, addr, Some((x, y)));
@@ -1139,7 +1149,10 @@ impl PptxTab {
             if let Some(pt) = resp.interact_pointer_pos() {
                 let (x, y) = to_slide(pt);
                 let table = |me: &Self, s: &ShapeInfo| s.kind == Kind::Frame && super::edit_table::is_editable_table(&me.deck, slide, s.index) || s.kind == Kind::Group && !s.alternate && super::edit_group::is_group(&me.deck, slide, s.index);
-                if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate || table(self, s)) {
+                if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Frame && super::edit_chart::is_chart(&self.deck, slide, s.index)) {
+                    self.end_text();
+                    self.open_chart(Sel { slide, index: s.index, id: s.id });
+                } else if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate || table(self, s)) {
                     let sel = Sel { slide, index: s.index, id: s.id };
                     if text_sel != Some(sel) {
                         if s.kind == Kind::Frame {

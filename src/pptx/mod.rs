@@ -92,6 +92,12 @@ mod anim_pieces_tests;
 // Omgång 5, länkar och video i bildspelet (w-pshow2).
 #[cfg(test)]
 mod show_links_tests;
+// Omgång 8, redigera diagramdata (w-pchartedit).
+pub mod edit_chart;
+pub mod edit_chart_ui;
+pub mod edit_chart_xlsx;
+#[cfg(test)]
+mod edit_chart_tests;
 
 pub use model::Deck;
 

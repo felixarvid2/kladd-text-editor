@@ -174,6 +174,8 @@ Sammanställt efter omgång 7 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
   text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
+  diagramdata: flernivåkategorier skrivs som en nivå, bubbelstorlekar och diagramtypen ändras inte (se
+  *Redigera diagramdata*);
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
   autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
   automatisk sparning).
@@ -1324,3 +1326,44 @@ och Aptos ingår inte) installerade tillfälligt i behållaren, aldrig i repot, 
   ritas och får temats stil.
 - **Kvar:** fler färgteman (och typsnittsval i dialogen), en bildmallsvy, fler grundformer (stjärna, hjärta, pilar åt
   andra håll) och dra-för-att-rita med `Skift` (proportionellt).
+
+## Redigera diagramdata (omgång 8)
+
+Dubbelklick på ett diagram i redigeringsläget öppnar *Diagramdata* (`edit_chart_ui.rs`): kategorier × serier,
+seriernas namn, lägg till/ta bort kategorier och serier, diagrammets rubrik och axelrubrikerna. *OK* skriver allt
+i ett ångringssteg; oförändrad tabell ger inget steg. Kroken i `edit_view.rs` är några rader: dubbelklicket (båda
+grenarna), fönstret ritas i `edit_overlay`, tangenterna går inte till redigeringen medan fönstret är öppet, och
+`set_deck` renderar om bilder vars diagramdel ändrats (diagrammet är en egen del, så bildens del är orörd; gäller
+också ångra/gör om).
+
+- **Diagramdelen** (`edit_chart.rs`, förlustfritt med `edit_xml.rs`): läsning ur seriernas `c:tx`, `c:cat`/
+  `c:xVal` och `c:val`/`c:yVal` (cache eller literal; kategorierna ur första serien som har några, tal- och
+  datumkategorier visas formaterade men behåller talet om texten inte ändras). Skrivning: cacharna skrivs om
+  (`ptCount`, `formatCode` och cachens `extLst` kvar), `c:f` får nytt slut när antalet kategorier ändras (lodräta
+  och vågräta områden), en ändrad kategori som inte är ett tal gör kategorierna till `strRef`/`strCache`. En ny
+  serie är en kopia av sista seriens `c:ser` med nytt `idx`/`order`, utan `c:spPr`/`c:dPt`/trendlinjer/
+  felstaplar/`extLst` (diagrammets stil ger färgen) och med `c:f` för namn och värden en kolumn (rad) längre bort
+  per ny serie. Borttagna serier tas bort ur sin plott; serierna står i tabellens ordning per plott. Rubriker:
+  `c:tx/c:rich` med första styckets `a:pPr` och körningens `a:rPr` kvar (rad = stycke); tom rubrik tar bort
+  `c:title` (diagrammets: `autoTitleDeleted` = 1), en ny skapas med `overlay` 0 på rätt plats i schemat.
+- **Arbetsboken** (`edit_chart_xlsx.rs`; `c:externalData` → relation `package` till `ppt/embeddings/*.xlsx`):
+  cellerna som `c:f` pekar på skrivs i bladet med det namnet (namn och kategorier som delade strängar sist i
+  `sharedStrings.xml`, eller `inlineStr` utan den delen; tal som `v`; tomma värden tar bort värdet men behåller
+  cellens format `s`). Rader skapas i ordning och celler i kolumnordning, `spans` tas bort på ändrade rader,
+  `dimension` växer. Tabeller (`xl/tables`) som cellerna ligger intill växer (`ref`, `autoFilter`, nya
+  `tableColumn` med rubrikcellens text som namn) och kolumnnamnen följer ändrade rubrikceller (Excel kräver att de
+  stämmer). En formel som skrivs över gör `xl/calcChain.xml` inaktuell: delen tas bort med relation och
+  innehållstyp. Celler för borttagna serier/kategorier lämnas kvar (utanför diagrammets område), så att tabeller
+  förblir giltiga. Övriga poster kopieras komprimerade som de är. Länkad arbetsbok (`TargetMode="External"`):
+  bara cachen, och en notis.
+- **Prov** (`edit_chart_tests.rs`, egen presentation och arbetsbok byggda i provet): referenserna, läsning, tur
+  och retur med alla ändringar (validate, diagramdelen läses tillbaka, referenser, källans `extLst` och rubrikens
+  formatering kvar, arbetsbokens celler/tabell/strängar, openpyxl om det finns, ritningen visar de nya
+  kategorierna, ångra), formel som skrivs över (calcChain borta, ny rad i ordning, oförändrade poster byte för
+  byte, openpyxl), länkad arbetsbok, rubrik bort och tillbaka. Det ignorerade `redigera_alla_diagram`
+  (`KLADD_PPTX_SWEEP=mapp`, `KLADD_CHART_XLSX_OUT=mapp` sparar arbetsböckerna) ändrar ett värde och lägger till en
+  kategori och en serie i varje diagram i materialet: 270 diagram (202 med inbäddad arbetsbok), alla giltiga,
+  läses tillbaka med rätt antal och ritas; de 97 sparade arbetsböckerna öppnas alla av openpyxl.
+- **Inte gjort:** flernivåkategorier (`multiLvlStrRef`) skrivs som en nivå; bubbelstorlekar (`c:bubbleSize`);
+  byta diagramtyp; datum som kategorier skrivs som text om de ändras; nya serier i ett punktdiagram får samma
+  x-värden som tabellens kategorier.
