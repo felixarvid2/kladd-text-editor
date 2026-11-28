@@ -7,13 +7,13 @@
 //! Ögonblicksbilden tas bort när fliken sparas, stängs eller blir ren igen. Vid nästa start erbjuds
 //! bilder vars process inte längre lever (`/proc/<pid>`) som återställning.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, FontId, Frame, Id, Key, Layout, Margin, RichText, Stroke, vec2};
@@ -179,9 +179,13 @@ fn delete_files(json: &Path) {
 }
 
 enum Job {
-    Write(Box<Snapshot>, Vec<Vec<u8>>, Option<Vec<u8>>),
+    /// Ögonblicksbild, bilder, presentation och hashen för det som skrivs.
+    Write(Box<Snapshot>, Vec<Vec<u8>>, Option<Vec<u8>>, u64),
     Delete(u64),
 }
+
+/// Skrivtrådens besked när ett skrivjobb är klart: flik-id, hashen som skrevs och utfallet.
+type Done = (u64, u64, std::io::Result<()>);
 
 pub struct Recovery {
     dir: PathBuf,
@@ -190,8 +194,15 @@ pub struct Recovery {
     handle: Option<std::thread::JoinHandle<()>>,
     /// Antal skrivjobb som ännu inte är klara.
     busy: Arc<AtomicUsize>,
-    /// Flik-id → hash för det som senast skickades till skrivtråden.
+    /// Flik-id → hash för det som skrivtråden bekräftat att den skrivit (inte bara skickat).
     written: HashMap<u64, u64>,
+    /// Flik-id → hash för skrivjobb som skickats men ännu inte rapporterats klara.
+    inflight: HashMap<u64, u64>,
+    /// Flikar som har eller kan ha filer på disk (skickat skrivjobb, lyckat eller ej) och inte glömts än.
+    touched: HashSet<u64>,
+    /// Redan loggade fel (flik, felslag), så att samma fel inte loggas varje varv.
+    reported: HashSet<(u64, std::io::ErrorKind)>,
+    done_rx: Receiver<Done>,
     next_at: Instant,
     was_focused: bool,
 }
@@ -204,15 +215,17 @@ impl Recovery {
     pub fn with_dir(dir: PathBuf) -> Self {
         let pid = std::process::id();
         let (tx, rx) = channel::<Job>();
+        let (done_tx, done_rx) = channel::<Done>();
         let busy = Arc::new(AtomicUsize::new(0));
         let handle = {
             let (dir, busy) = (dir.clone(), busy.clone());
             std::thread::spawn(move || {
                 while let Ok(job) = rx.recv() {
                     match job {
-                        Job::Write(snap, images, deck) => {
-                            // Ett misslyckat försök är inte värt att störa användaren med; nästa varv försöker igen.
-                            let _ = write_snapshot(&dir, &snap, &images, deck.as_deref());
+                        Job::Write(snap, images, deck, hash) => {
+                            let result = write_snapshot(&dir, &snap, &images, deck.as_deref());
+                            // Beskedet först, sedan `busy`: ser UI-tråden `busy == 0` ligger beskedet redan i kön.
+                            let _ = done_tx.send((snap.id, hash, result));
                             busy.fetch_sub(1, Ordering::SeqCst);
                         }
                         Job::Delete(id) => delete_files(&json_path(&dir, pid, id)),
@@ -227,6 +240,10 @@ impl Recovery {
             handle: Some(handle),
             busy,
             written: HashMap::new(),
+            inflight: HashMap::new(),
+            touched: HashSet::new(),
+            reported: HashSet::new(),
+            done_rx,
             next_at: Instant::now() + INTERVAL,
             was_focused: true,
         }
@@ -259,9 +276,10 @@ impl Recovery {
     /// Tar bort ögonblicksbilder för stängda och rena flikar och, om `write`, skriver ändrade osparade flikar.
     /// Returnerar sant om en skrivomgång gjordes.
     pub fn sync(&mut self, docs: &[Document], write: bool) -> bool {
+        self.drain();
         let stale: Vec<u64> = self
-            .written
-            .keys()
+            .touched
+            .iter()
             .copied()
             .filter(|id| !docs.iter().any(|d| d.id == *id && d.dirty && d.pdfv.is_none()))
             .collect();
@@ -284,6 +302,7 @@ impl Recovery {
             if self.written.get(&doc.id) == Some(&hash) {
                 continue;
             }
+            // Ett pågående jobb för samma innehåll väntar vi in (`busy` hindrar det ändå); ett misslyckat skrivs om.
             let (snap, images) = Snapshot::from_doc(doc, self.pid, saved_at);
             let deck = match &doc.pptx {
                 Some(tab) => match tab.recovery_bytes() {
@@ -295,14 +314,46 @@ impl Recovery {
             };
             self.busy.fetch_add(1, Ordering::SeqCst);
             if let Some(tx) = &self.tx {
-                if tx.send(Job::Write(Box::new(snap), images, deck)).is_err() {
+                if tx.send(Job::Write(Box::new(snap), images, deck, hash)).is_err() {
                     self.busy.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
             }
-            self.written.insert(doc.id, hash);
+            // `written` uppdateras först när skrivtråden rapporterat lyckat resultat.
+            self.inflight.insert(doc.id, hash);
+            self.touched.insert(doc.id);
         }
         true
+    }
+
+    /// Tar emot skrivtrådens färdigrapporter.
+    fn drain(&mut self) {
+        while let Ok(done) = self.done_rx.try_recv() {
+            self.apply(done);
+        }
+    }
+
+    fn apply(&mut self, (id, hash, result): Done) {
+        if self.inflight.get(&id) == Some(&hash) {
+            self.inflight.remove(&id);
+        }
+        // Glömd flik (sparad, stängd eller släng): Delete ligger efter skrivjobbet i kön och städar filerna.
+        if !self.touched.contains(&id) {
+            return;
+        }
+        match result {
+            // Det som faktiskt skrevs; ett äldre resultat kan aldrig markera en nyare version som skriven.
+            Ok(()) => {
+                self.written.insert(id, hash);
+                self.reported.retain(|(i, _)| *i != id);
+            }
+            // Fliken förblir ej skriven och försöks igen nästa varv; felet loggas en gång per flik och felslag.
+            Err(e) => {
+                if self.reported.insert((id, e.kind())) {
+                    eprintln!("kladd: kan inte skriva återställningsfil för flik {id}: {e}");
+                }
+            }
+        }
     }
 
     /// Nästa varv skriver direkt (t.ex. efter en återställning).
@@ -313,13 +364,16 @@ impl Recovery {
     /// Tar bort fliken id:s ögonblicksbild (sparad, stängd eller släng).
     pub fn forget(&mut self, id: u64) {
         self.written.remove(&id);
+        self.inflight.remove(&id);
+        self.touched.remove(&id);
+        self.reported.retain(|(i, _)| *i != id);
         if let Some(tx) = &self.tx {
             let _ = tx.send(Job::Delete(id));
         }
     }
 
     fn forget_all(&mut self) {
-        let ids: Vec<u64> = self.written.keys().copied().collect();
+        let ids: Vec<u64> = self.touched.iter().copied().collect();
         for id in ids {
             self.forget(id);
         }
@@ -676,6 +730,89 @@ mod tests {
         r.forget(5);
         r.shutdown(&[]);
         assert!(files(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_write_is_not_recorded_and_is_retried() {
+        let dir = tmp("failwrite");
+        // Mappen är en fil: create_dir_all går inte att lyckas med, inte ens som root.
+        let target = dir.join("blockerad");
+        std::fs::write(&target, b"fil").unwrap();
+        let mut r = Recovery::with_dir(target.clone());
+        let docs = vec![dirty_doc(1, "ett")];
+        assert!(r.sync(&docs, true));
+        wait_idle(&r);
+        r.drain();
+        assert!(r.written.is_empty(), "misslyckad skrivning får inte bokföras");
+        assert!(r.inflight.is_empty());
+        // Hindret försvinner: nästa varv skriver igen utan att texten ändrats.
+        std::fs::remove_file(&target).unwrap();
+        assert!(r.sync(&docs, true));
+        wait_idle(&r);
+        r.drain();
+        assert_eq!(r.written.len(), 1);
+        assert_eq!(files(&target), vec![format!("{}-1.json", std::process::id())]);
+        r.shutdown(&[]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn successful_write_prevents_duplicate_write() {
+        let dir = tmp("nodup");
+        let mut r = Recovery::with_dir(dir.clone());
+        let docs = vec![dirty_doc(1, "ett")];
+        r.sync(&docs, true);
+        wait_idle(&r);
+        r.drain();
+        assert_eq!(r.written.len(), 1);
+        r.sync(&docs, true);
+        assert!(r.inflight.is_empty(), "inget nytt skrivjobb för oförändrad text");
+        assert_eq!(r.busy.load(Ordering::SeqCst), 0);
+        r.shutdown(&[]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_completion_does_not_mark_newer_revision_written() {
+        let dir = tmp("stale");
+        let mut r = Recovery::with_dir(dir.clone());
+        let mut docs = vec![dirty_doc(1, "ett")];
+        let old = content_hash(&docs[0]);
+        r.sync(&docs, true);
+        wait_idle(&r);
+        r.drain();
+        docs[0].text = "ett och mer".into();
+        docs[0].on_edited();
+        let new = content_hash(&docs[0]);
+        assert_ne!(old, new);
+        // Ett försenat besked om den gamla versionen.
+        r.apply((1, old, Ok(())));
+        assert_eq!(r.written.get(&1), Some(&old));
+        r.sync(&docs, true);
+        wait_idle(&r);
+        r.drain();
+        assert_eq!(r.written.get(&1), Some(&new));
+        assert!(find_orphans(&dir, &|_| false).iter().any(|f| f.snap.text == "ett och mer"));
+        r.shutdown(&[]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forget_during_inflight_write_leaves_nothing() {
+        let dir = tmp("race");
+        let mut r = Recovery::with_dir(dir.clone());
+        let docs = vec![dirty_doc(1, "ett")];
+        r.sync(&docs, true);
+        // Fliken sparas/stängs medan skrivjobbet kan vara på väg.
+        r.sync(&[], false);
+        r.drain();
+        assert!(r.touched.is_empty());
+        // Ett sent besked om den glömda fliken bokförs inte.
+        r.apply((1, content_hash(&docs[0]), Ok(())));
+        assert!(r.written.is_empty());
+        r.shutdown(&[]);
+        assert!(files(&dir).is_empty(), "{:?}", files(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

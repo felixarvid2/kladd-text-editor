@@ -983,9 +983,12 @@ impl KladdApp {
     /// Efter varje lyckad sparning av flikens egen fil: minns filens stämpel och lagrar en version.
     fn after_save(&mut self, idx: usize, path: &Path) {
         let Some(doc) = self.docs.get(idx) else { return };
-        self.autosave.record_stamp(doc.id, path);
+        // Filen läses om en gång: bytes går både till historiken och till kontrollsumman mot extern ändring.
+        // Gäller också presentationer (`save_to` skriver zip-filen, som läses här).
+        let bytes = std::fs::read(path).ok();
+        self.autosave.record_stamp_with(doc.id, path, bytes.as_deref());
         self.git.bump();
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Some(bytes) = bytes {
             let _ = crate::history::record(&crate::history::root(), path, &bytes, crate::history::now_ms(), &Default::default());
         }
     }

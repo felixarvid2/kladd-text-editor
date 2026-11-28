@@ -15,6 +15,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 - **PowerPoint: tåligare mot trasiga filer.** Slumpprov (≈3 000 förvrängda presentationer) hittade två overflow-fel, nu rättade: orimliga anteckningsmått och duplicering av en form nära talområdets kant. Se `docs/dev/pptx.md`.
 - **PowerPoint: kopierade diagram behåller sina relationer** även när relationsfilen har ogiltiga tecken som ritningen tolererar (andra slumpprovet: redigering av diagram, arbetsböcker, SmartArt och säkerhetskopia).
+- **Återställning, enkelinstans och automatisk sparning är tåligare.** En misslyckad skrivning av säkerhetskopian (full disk, saknad behörighet) bokförs inte längre som gjord utan försöks igen nästa varv, och felet loggas en gång per flik. Meddelanden mellan Kladd-fönster är begränsade till 1 MiB och trasiga kastas. Automatisk sparning jämför dessutom en kontrollsumma av filens innehåll (filer upp till 16 MiB) och inte bara ändringstid och storlek, så en extern ändring med samma storlek och tidsstämpel inte skrivs över. Se `docs/handbok.md`.
 
 ## [2.16.0] – 2026-11-28
 
