@@ -50,6 +50,9 @@ pub struct Snapshot {
     pub odt: bool,
     pub pdf: bool,
     pub word_view: bool,
+    /// En presentation: hela .pptx-filen ligger bredvid som `<pid>-<flik>.pptx` (texten är tom).
+    #[serde(default)]
+    pub pptx: bool,
     /// Sekunder sedan 1970.
     pub saved_at: u64,
     pub images: Vec<ImageRef>,
@@ -86,6 +89,7 @@ impl Snapshot {
             odt: doc.docx && doc.extension() == "odt",
             pdf: doc.pdf,
             word_view: doc.word_view,
+            pptx: doc.pptx.is_some(),
             saved_at,
             images,
         };
@@ -111,6 +115,11 @@ fn json_path(dir: &Path, pid: u32, id: u64) -> PathBuf {
     dir.join(format!("{pid}-{id}.json"))
 }
 
+/// Presentationens säkerhetskopia (en fullständig .pptx).
+fn deck_path(json: &Path) -> PathBuf {
+    json.with_extension("pptx")
+}
+
 fn side_dir(json: &Path) -> PathBuf {
     json.with_extension("bilder")
 }
@@ -132,9 +141,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
-fn write_snapshot(dir: &Path, snap: &Snapshot, images: &[Vec<u8>]) -> std::io::Result<()> {
+fn write_snapshot(dir: &Path, snap: &Snapshot, images: &[Vec<u8>], deck: Option<&[u8]>) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let json = json_path(dir, snap.pid, snap.id);
+    // Presentationen först: json-filen är det som visar att en säkerhetskopia finns, och den skrivs sist.
+    match deck {
+        Some(bytes) => write_atomic(&deck_path(&json), bytes)?,
+        None => {
+            let _ = std::fs::remove_file(deck_path(&json));
+        }
+    }
     let side = side_dir(&json);
     if images.is_empty() {
         let _ = std::fs::remove_dir_all(&side);
@@ -158,11 +174,12 @@ fn write_snapshot(dir: &Path, snap: &Snapshot, images: &[Vec<u8>]) -> std::io::R
 
 fn delete_files(json: &Path) {
     let _ = std::fs::remove_file(json);
+    let _ = std::fs::remove_file(deck_path(json));
     let _ = std::fs::remove_dir_all(side_dir(json));
 }
 
 enum Job {
-    Write(Box<Snapshot>, Vec<Vec<u8>>),
+    Write(Box<Snapshot>, Vec<Vec<u8>>, Option<Vec<u8>>),
     Delete(u64),
 }
 
@@ -193,9 +210,9 @@ impl Recovery {
             std::thread::spawn(move || {
                 while let Ok(job) = rx.recv() {
                     match job {
-                        Job::Write(snap, images) => {
+                        Job::Write(snap, images, deck) => {
                             // Ett misslyckat försök är inte värt att störa användaren med; nästa varv försöker igen.
-                            let _ = write_snapshot(&dir, &snap, &images);
+                            let _ = write_snapshot(&dir, &snap, &images, deck.as_deref());
                             busy.fetch_sub(1, Ordering::SeqCst);
                         }
                         Job::Delete(id) => delete_files(&json_path(&dir, pid, id)),
@@ -246,7 +263,7 @@ impl Recovery {
             .written
             .keys()
             .copied()
-            .filter(|id| !docs.iter().any(|d| d.id == *id && d.dirty && d.pdfv.is_none() && d.pptx.is_none()))
+            .filter(|id| !docs.iter().any(|d| d.id == *id && d.dirty && d.pdfv.is_none()))
             .collect();
         for id in stale {
             self.forget(id);
@@ -255,16 +272,30 @@ impl Recovery {
             return false;
         }
         let saved_at = unix_now();
-        // PDF-flikar (sidändringar) och presentationer har ingen text att återställa.
-        for doc in docs.iter().filter(|d| d.dirty && d.pdfv.is_none() && d.pptx.is_none()) {
-            let hash = content_hash(doc);
+        // PDF-flikar (sidändringar) har ingen text att återställa; en presentation sparas som hel .pptx.
+        for doc in docs.iter().filter(|d| d.dirty && d.pdfv.is_none()) {
+            let hash = match &doc.pptx {
+                Some(tab) => match tab.recovery_rev() {
+                    Some(rev) => rev ^ (1 << 63),
+                    None => continue,
+                },
+                None => content_hash(doc),
+            };
             if self.written.get(&doc.id) == Some(&hash) {
                 continue;
             }
             let (snap, images) = Snapshot::from_doc(doc, self.pid, saved_at);
+            let deck = match &doc.pptx {
+                Some(tab) => match tab.recovery_bytes() {
+                    Ok(b) => Some(b),
+                    // Går presentationen inte att skriva nu försöker nästa varv igen.
+                    Err(_) => continue,
+                },
+                None => None,
+            };
             self.busy.fetch_add(1, Ordering::SeqCst);
             if let Some(tx) = &self.tx {
-                if tx.send(Job::Write(Box::new(snap), images)).is_err() {
+                if tx.send(Job::Write(Box::new(snap), images, deck)).is_err() {
                     self.busy.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
@@ -344,6 +375,19 @@ impl Found {
             .collect()
     }
 
+    /// En presentation ur säkerhetskopian: öppnad som ändrad, med originalets sökväg (Spara skriver dit).
+    fn pptx_document(&self, id: u64) -> Option<Document> {
+        let bytes = std::fs::read(deck_path(&self.json)).ok()?;
+        let deck = crate::pptx::Deck::open(&bytes).ok()?;
+        let mut tab = crate::pptx::view::PptxTab::with_source(deck, bytes);
+        tab.mark_recovered();
+        let path = self.snap.path.clone();
+        let mut doc = Document::pptx_tab(id, path.as_deref().unwrap_or(Path::new("namnlös.pptx")), tab);
+        doc.path = path;
+        doc.dirty = true;
+        Some(doc)
+    }
+
     pub fn discard(&self) {
         delete_files(&self.json);
     }
@@ -352,6 +396,11 @@ impl Found {
     /// så att det förlustfria paketet och bilderna finns kvar; därefter ersätts texten.
     pub fn into_document(&self, id: u64, untitled_index: usize) -> Document {
         let s = &self.snap;
+        if s.pptx {
+            if let Some(doc) = self.pptx_document(id) {
+                return doc;
+            }
+        }
         let loaded = s
             .path
             .as_ref()
@@ -637,7 +686,7 @@ mod tests {
         for (pid, id) in [(mine, 1u64), (999_999, 2)] {
             let (mut snap, _) = Snapshot::from_doc(&dirty_doc(id, "x"), pid, 5);
             snap.pid = pid;
-            write_snapshot(&dir, &snap, &[]).unwrap();
+            write_snapshot(&dir, &snap, &[], None).unwrap();
         }
         assert!(pid_alive(mine));
         assert!(!pid_alive(999_999));

@@ -56,6 +56,8 @@ pub mod edit_text;
 pub mod edit_view;
 pub mod edit_xml;
 pub mod save;
+pub mod recover;
+pub mod par;
 // Omgång 3, bildspelet (w-panim): övergångar, animeringar och föredragsvy.
 pub mod anim;
 pub mod anim_expr;
@@ -98,6 +100,9 @@ pub mod edit_chart_ui;
 pub mod edit_chart_xlsx;
 #[cfg(test)]
 mod edit_chart_tests;
+// Omgång 8, stora presentationer (w-precov).
+#[cfg(test)]
+mod big_tests;
 
 pub use model::Deck;
 

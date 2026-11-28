@@ -177,8 +177,7 @@ Sammanställt efter omgång 7 (detaljer i respektive avsnitt nedan):
   diagramdata: flernivåkategorier skrivs som en nivå, bubbelstorlekar och diagramtypen ändras inte (se
   *Redigera diagramdata*);
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
-  autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
-  automatisk sparning).
+  autoanpassning efter storleksändring av flera former eller en grupp; (återställning efter krasch gjordes i omgång 8).
 - **Visning:** föredragsvyns skärmval saknar skärmlista på Wayland utan XWayland och är inte prövat med två
   riktiga skärmar (se *Föredragsvyn väljer skärm (omgång 7, w-pshow3)*); markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
@@ -577,8 +576,7 @@ Presentationen kan ändras i redigeringsläget och sparas källbevarande. Module
   innehållstyperna) tas bort vid första ändringen. En `.ppt` som konverterats kräver *Spara som* (`needs_save_as`).
   Automatisk sparning går genom `save_to`; `autosave.rs` mäter tystnad med textens kontrollsumma, som för en
   presentation alltid är tom, så den sparar ~3 s efter att fliken blivit ändrad (också mitt i skrivandet; man kan
-  fortsätta skriva, sparningen avslutar bara ångra-sammanslagningen). Återställning efter krasch (`recovery.rs`)
-  sparar text och hoppar över presentationer.
+  fortsätta skriva, sparningen avslutar bara ångra-sammanslagningen). Återställning efter krasch: se *Återställning och stora presentationer (omgång 8)*.
 - **Markören:** `text::layout_carets` är samma utläggning som `text::layout` och ger dessutom markörlägen (klustrens
   början, radbrytningar och styckenas slut; `Seg` vet vilken körning och vilket tecken det börjar i).
   `TextModel::carets` bygger textramen som `render::Builder::text_body`/`place_text` (arv, `bodyPr`, geometrins
@@ -1367,3 +1365,29 @@ också ångra/gör om).
 - **Inte gjort:** flernivåkategorier (`multiLvlStrRef`) skrivs som en nivå; bubbelstorlekar (`c:bubbleSize`);
   byta diagramtyp; datum som kategorier skrivs som text om de ändras; nya serier i ett punktdiagram får samma
   x-värden som tabellens kategorier.
+
+## Återställning och stora presentationer (omgång 8, w-precov)
+
+- **Säkerhetskopia (`recovery.rs`, `recover.rs`):** `Recovery::sync` tar nu med presentationsflikar som är ändrade. Kopian är en
+  fullständig `.pptx` (`Session::recovery_bytes` = `save::write_zip(base, pkg, touched)`, samma källbevarande skrivning som
+  *Spara* men utan att röra sessionen) i `återställning/<pid>-<flik>.pptx` bredvid `…json` (`Snapshot::pptx`, texten tom). Den
+  skrivs av skrivtråden via `write_atomic` (tmp + rename), `.pptx` före `.json`, så `.json` är det som visar att en kopia
+  finns. Den skrivs bara när `Session::rev()` ändrats sedan sist. `find_orphans` är oförändrad (bara `.json`, halva
+  `.tmp`-filer räknas inte). `Found::into_document` öppnar kopian (`Deck::open`), `PptxTab::mark_recovered` räknar den som
+  ändrad (`Session::mark_dirty`) och dokumentets sökväg är originalets; Spara skriver dit. Ångra-historiken återställs inte.
+  Kopian rensas som för text (sparad, stängd eller ren flik).
+- **Stora presentationer (`big_tests.rs`, ignorerat):** `KLADD_PBIG=600 cargo test stora_presentationer -- --ignored --nocapture`
+  bygger en syntetisk presentation (rubrik och sex punkter på varje bild, bild på var annan, tabell på var femte) och mäter
+  öppning, första bild, miniatyrer, sökregister, PDF, en redigering, säkerhetskopian och `VmHWM`. Mått i debugbygge (inget
+  `--release`), 4 kärnor delade med andra körningar, 600 bilder, före → efter: öppna 345 → 156 ms, redigering 270 → 51 ms,
+  minnestopp 154 MB (oförändrat). Per bild kostar visningslistan ca 25–50 ms och rastreringen av en miniatyr ca 30–45 ms
+  (debug), jämnt fördelat: ingen enskild flaskhals, så vinsterna kommer av att fördela bilderna på trådar (200 bilder, samma
+  körning: sökregister 6,1 s med en tråd → 1,9 s med tre, miniatyrer 6,4 s med två trådar → 4,0 s med tre; PDF 28 → 22 s
+  vid 600 bilder, eftersom krilla-skrivningen av sidorna är i följd och ca 40 % av tiden).
+- **Gjort för stora presentationer:** `par.rs` (`workers()` = kärnor − 1, högst 6; `map` ger resultat i ordning);
+  `Deck::from_package` tolkar bilderna parallellt och tar över en bild ur `reuse` när både bildens del och dess relationsdel
+  är samma `Arc` (en redigering rör en eller två bilder); sökregistret byggs av `workers()` trådar; `max_jobs()` (miniatyrer)
+  är `workers().max(2)`; `pdf::write` bygger visningslistorna parallellt i omgångar om `2 × workers()`.
+- **Kvar:** PDF-skrivningen av sidorna är i följd (krilla); en redigering bygger fortfarande om bilderna som ändrats och
+  klonar övriga (`Node::clone`); första bildens första rendering laddar typsnitt (ca 0,4 s i debug); avkodade bilder i
+  cachen delas redan mellan ombyggnader.

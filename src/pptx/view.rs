@@ -28,7 +28,10 @@ use crate::tf;
 use crate::theme::{self, Palette};
 
 /// Högst så många bilder renderas samtidigt.
-const MAX_JOBS: usize = 2;
+/// Högst så många bilder renderas samtidigt (alla kärnor utom en, minst två).
+pub(super) fn max_jobs() -> usize {
+    super::par::workers().max(2)
+}
 /// Mellanrum mellan bilderna (punkter på skärmen).
 const GAP: f32 = 18.0;
 /// Läget sparas för så många presentationer.
@@ -215,7 +218,7 @@ impl Pool {
         let mut wants = std::mem::take(&mut self.wants);
         wants.sort_by_key(|w| w.0);
         for (kind, slide, width) in wants {
-            if self.pending.len() >= MAX_JOBS {
+            if self.pending.len() >= max_jobs() {
                 break;
             }
             if self.pending.contains(&(kind, slide)) {
@@ -511,15 +514,24 @@ impl PptxTab {
         let (tx, rx) = channel::<IndexMsg>();
         self.find.index_rx = Some(rx);
         let deck = self.deck.clone();
-        let _ = std::thread::Builder::new().name("pptx-sok".into()).stack_size(8 << 20).spawn(move || {
-            for i in 0..n {
-                let st = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| find::slide_text(&super::render::slide_scene(&deck, i)))).unwrap_or_default();
-                let notes = super::notes::notes_text(&deck, i);
-                if tx.send((i, st, notes)).is_err() {
-                    return;
+        // Flera trådar tar bilderna i tur och ordning; resultaten kommer i ungefär bildordning.
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..super::par::workers() {
+            let (deck, tx, next) = (deck.clone(), tx.clone(), next.clone());
+            let _ = std::thread::Builder::new().name("pptx-sok".into()).stack_size(8 << 20).spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i >= n {
+                        return;
+                    }
+                    let st = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| find::slide_text(&super::render::slide_scene(&deck, i)))).unwrap_or_default();
+                    let notes = super::notes::notes_text(&deck, i);
+                    if tx.send((i, st, notes)).is_err() {
+                        return;
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Tar emot registret och räknar om träffarna när frågan eller registret ändrats.

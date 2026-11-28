@@ -505,6 +505,23 @@ impl Session {
         Ok((bytes, rebuilt))
     }
 
+    /// Ändringsräknaren: ändras vid varje ändring, ångra och gör om (för säkerhetskopian).
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// Filens innehåll som det ser ut nu, utan att röra sessionen: en fullständig zip byggd med samma
+    /// källbevarande skrivning som sparningen (`recovery.rs` skriver den som säkerhetskopia).
+    pub fn recovery_bytes(&self, deck: &Deck) -> Result<Vec<u8>, String> {
+        super::save::write_zip(&self.base, &deck.pkg, &self.touched)
+    }
+
+    /// Räknar presentationen som ändrad (en återställd säkerhetskopia ska sparas över originalet).
+    pub fn mark_dirty(&mut self) {
+        self.rev = self.next_rev;
+        self.next_rev += 1;
+    }
+
     /// Efter en lyckad sparning: det sparade blir utgångsläget.
     pub fn mark_saved(&mut self, bytes: Vec<u8>) {
         self.base = Arc::new(bytes);
