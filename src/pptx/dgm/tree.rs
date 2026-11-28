@@ -65,6 +65,10 @@ pub struct Tree<'a> {
     pub m: &'a Model<'a>,
     def: &'a Node,
     seen: HashMap<(usize, String), usize>,
+    /// Kopplingar som brutna linjer: nod → punkter (ramens koordinater).
+    pub paths: HashMap<usize, Vec<(f64, f64)>>,
+    /// Böjda kopplingar som ritas som cirkelbågspilar.
+    pub arcs: std::collections::HashSet<usize>,
 }
 
 fn alg_type<'a>(n: &LNode<'a>) -> &'a str {
@@ -83,7 +87,7 @@ fn param_f(n: &LNode<'_>, name: &str) -> Option<f64> {
 fn is_length(t: &str) -> bool {
     matches!(
         t,
-        "w" | "h" | "l" | "t" | "r" | "b" | "ctrX" | "ctrY" | "diam" | "sp" | "sibSp" | "secSibSp" | "connDist" | "begPad" | "endPad" | "stemThick" | "bendDist" | "lMarg" | "rMarg" | "tMarg" | "bMarg" | "begMarg" | "endMarg" | "lOff" | "tOff" | "rOff" | "bOff" | "wOff" | "hOff" | "ctrXOff" | "ctrYOff" | "alignOff"
+        "w" | "h" | "l" | "t" | "r" | "b" | "ctrX" | "ctrY" | "diam" | "sp" | "sibSp" | "secSibSp" | "connDist" | "begPad" | "endPad" | "stemThick" | "bendDist" | "lMarg" | "rMarg" | "tMarg" | "bMarg" | "begMarg" | "endMarg" | "lOff" | "tOff" | "rOff" | "bOff" | "wOff" | "hOff" | "ctrXOff" | "ctrYOff"
     )
 }
 
@@ -92,7 +96,7 @@ impl<'a> Tree<'a> {
     pub fn build(m: &'a Model<'a>, def: &'a Node) -> Option<Tree<'a>> {
         let root_def = def.child("dgm:layoutNode")?;
         let root_pt = m.root?;
-        let mut t = Tree { nodes: Vec::new(), m, def, seen: HashMap::new() };
+        let mut t = Tree { nodes: Vec::new(), m, def, seen: HashMap::new(), paths: HashMap::new(), arcs: Default::default() };
         let id = t.new_node(root_def, root_pt, None);
         t.process(id, &root_def.children, root_pt, 1, 1, 0);
         Some(t)
@@ -521,6 +525,38 @@ impl<'a> Tree<'a> {
             let h = h + g("hOff").unwrap_or(0.0);
             self.layout(k, Rect { x: r.x + x, y: r.y + y, w, h }, depth + 1);
         }
+        self.curves(id);
+    }
+
+    /// Böjda kopplingar (`connRout="curve"`, t.ex. kugghjulens pilar): en cirkelbågspil runt formen
+    /// som källnoden hör till (`gear1srcNode` → `gear1`), med diametern `diam` (negativ = moturs,
+    /// `leftCircularArrow`), från källans till målets vinkel. Tjockleken är kopplingens `h`.
+    fn curves(&mut self, id: usize) {
+        let kids = self.nodes[id].kids.clone();
+        let rect_of = |t: &Tree<'_>, name: &str| kids.iter().find(|k| t.nodes[**k].name == name).map(|k| t.nodes[*k].rect);
+        for &c in &kids {
+            let n = &self.nodes[c];
+            if !(self.is_conn(c) && param(n, "connRout") == Some("curve")) {
+                continue;
+            }
+            let (Some(src), Some(dst)) = (param(n, "srcNode"), param(n, "dstNode")) else { continue };
+            let (Some(s), Some(d)) = (rect_of(self, src), rect_of(self, dst)) else { continue };
+            // Runt formen källnoden hör till (`gear1srcNode` → `gear1`). Andra böjda kopplingar (t.ex.
+            // `cycle8`:s pilar mellan hjälpnoder) ritas inte än.
+            let Some(around) = src.strip_suffix("srcNode").filter(|b| !b.is_empty()).and_then(|b| rect_of(self, b)) else { continue };
+            let Some(diam) = n.vals.get("diam").copied().filter(|d| d.abs() > 0.0) else { continue };
+            let thick = n.vals.get("h").copied().unwrap_or(diam.abs() * 0.05).abs();
+            let (cx, cy) = (around.x + around.w / 2.0, around.y + around.h / 2.0);
+            let ang = |r: Rect| ((r.y + r.h / 2.0 - cy).atan2(r.x + r.w / 2.0 - cx).to_degrees()).rem_euclid(360.0);
+            let size = diam.abs();
+            let v = &mut self.nodes[c].vals;
+            v.insert("kladdArcSt".into(), ang(s));
+            v.insert("kladdArcEnd".into(), ang(d));
+            v.insert("kladdArcW".into(), (thick / size).min(0.25));
+            v.insert("kladdArcLeft".into(), if diam < 0.0 { 1.0 } else { 0.0 });
+            self.nodes[c].rect = Rect { x: cx - size / 2.0, y: cy - size / 2.0, w: size, h: size };
+            self.arcs.insert(c);
+        }
     }
 
     /// Lägger ut barnen i rutor av storleken `sizes × s` (från origo) och ger deras utbredningar.
@@ -780,69 +816,203 @@ impl<'a> Tree<'a> {
             .map(|c| c.attr_f64("fact").unwrap_or(1.0))
     }
 
-    /// Hierarkins barn (`hierChild`): undernoderna sida vid sida (eller under varandra), toppjusterade.
+    /// Lägger ut barnet från origo och ger dess utbredning.
+    fn lay_alone(&mut self, k: usize, def: (f64, f64), depth: usize) -> Rect {
+        let (w, h) = self.size_of(k, def);
+        self.layout(k, Rect { x: 0.0, y: 0.0, w, h }, depth + 1);
+        self.extent(k)
+    }
+
+    fn is_conn(&self, id: usize) -> bool {
+        alg_type(&self.nodes[id]) == "conn"
+    }
+
+    /// Hierarkins barn (`hierChild`): undernoderna efter varandra längs `linDir` (standard `fromL`)
+    /// med `sibSp` emellan (`secSibSp` lodrätt), justerade tvärs över efter `chAlign`. Kopplingarna
+    /// läggs efteråt (`connect`).
     fn hier_child(&mut self, id: usize, depth: usize) {
         let n = &self.nodes[id];
         let r = n.rect;
-        let vertical = matches!(param(n, "linDir"), Some("fromT") | Some("fromB"));
-        let kids: Vec<usize> = n.kids.iter().copied().filter(|k| alg_type(&self.nodes[*k]) != "conn").collect();
-        let gap = self.nodes[id].vals.get("sibSp").copied().unwrap_or(0.0);
+        let dir = param(n, "linDir").unwrap_or("fromL");
+        let vertical = matches!(dir, "fromT" | "fromB");
+        let rev = matches!(dir, "fromR" | "fromB");
+        let align = param(n, "chAlign").unwrap_or(if vertical { "l" } else { "t" });
+        let kids: Vec<usize> = n.kids.iter().copied().filter(|k| !self.is_conn(*k)).collect();
+        let v = &self.nodes[id].vals;
+        let gap = if vertical { v.get("secSibSp").or(v.get("sibSp")) } else { v.get("sibSp") }.copied().unwrap_or(0.0);
+        let ext: Vec<Rect> = kids.iter().map(|&k| self.lay_alone(k, (r.w, r.h), depth)).collect();
+        let cross = ext.iter().map(|e| if vertical { e.w } else { e.h }).fold(0.0, f64::max);
+        let order: Vec<usize> = if rev { (0..kids.len()).rev().collect() } else { (0..kids.len()).collect() };
         let mut cursor = 0.0;
-        for &k in &kids {
-            let (w, h) = self.size_of(k, (r.w, r.h));
-            self.layout(k, Rect { x: 0.0, y: 0.0, w, h }, depth + 1);
-            let e = self.extent(k);
-            if vertical {
-                self.shift(k, r.x - e.x, r.y + cursor - e.y);
-                cursor += e.h + gap;
-            } else {
-                self.shift(k, r.x + cursor - e.x, r.y - e.y);
-                cursor += e.w + gap;
-            }
+        for i in order {
+            let e = ext[i];
+            let (a, c) = if vertical { (e.h, e.w) } else { (e.w, e.h) };
+            let off = match align {
+                "r" | "b" => cross - c,
+                "ctr" | "mid" => (cross - c) / 2.0,
+                _ => 0.0,
+            };
+            let (x, y) = if vertical { (r.x + off, r.y + cursor) } else { (r.x + cursor, r.y + off) };
+            self.shift(kids[i], x - e.x, y - e.y);
+            cursor += a + gap;
         }
     }
 
-    /// Hierarkins rot (`hierRoot`): rotens form centrerad över barnens rad.
+    /// Är det en rad med assistenter (`hierChild` vars barn hör till `asst`-punkter)?
+    fn is_asst_row(&self, id: usize) -> bool {
+        let kids = &self.nodes[id].kids;
+        !kids.is_empty() && kids.iter().all(|k| self.is_conn(*k) || self.m.pts[self.nodes[*k].pt].kind == Kind::Asst)
+    }
+
+    /// Hierarkins rot (`hierRoot`): rotens form, under den assistenterna (växelvis vänster och höger
+    /// om den lodräta linjen) och sedan barnens rad, `sp` emellan. `hierAlign`: `tCtrCh` (standard)
+    /// centrerar roten över raden, `tL`/`tR` låter raden hänga under roten förskjuten `alignOff` av
+    /// rotens bredd, `lCtrCh`/`lT` m.fl. lägger raden till höger om roten (vågrät hierarki).
     fn hier_root(&mut self, id: usize, depth: usize) {
         let n = &self.nodes[id];
         let r = n.rect;
-        let kids: Vec<usize> = n.kids.iter().copied().filter(|k| alg_type(&self.nodes[*k]) != "conn").collect();
-        let gap = self.nodes[id].vals.get("secSibSp").copied().or_else(|| self.nodes[id].vals.get("sp").copied()).unwrap_or(0.0);
-        let (heads, rows): (Vec<usize>, Vec<usize>) = kids.iter().partition(|k| !matches!(alg_type(&self.nodes[**k]), "hierChild"));
+        let align = param(n, "hierAlign").unwrap_or("tCtrCh").to_owned();
+        let align_off = self.nodes[id].vals.get("alignOff").copied().unwrap_or(0.0);
+        let kids: Vec<usize> = n.kids.iter().copied().filter(|k| !self.is_conn(*k)).collect();
+        let v = &self.nodes[id].vals;
+        let gap = v.get("sp").copied().unwrap_or(0.0);
+        let sib = v.get("sibSp").copied().unwrap_or(gap);
+        let sec = v.get("secSibSp").copied().unwrap_or(gap);
+        let (heads, rows): (Vec<usize>, Vec<usize>) = kids.iter().partition(|k| alg_type(&self.nodes[**k]) != "hierChild");
+        let (assts, mains): (Vec<usize>, Vec<usize>) = rows.iter().partition(|k| self.is_asst_row(**k));
+        // Roten (normalt en form) i origo.
+        let mut head = Rect::default();
         let mut y = 0.0;
-        let mut head_w: f64 = 0.0;
-        for &k in &heads {
-            let (w, h) = self.size_of(k, (r.w, r.h));
-            self.layout(k, Rect { x: 0.0, y: 0.0, w, h }, depth + 1);
-            let e = self.extent(k);
+        for (i, &k) in heads.iter().enumerate() {
+            let e = self.lay_alone(k, (r.w, r.h), depth);
             self.shift(k, -e.x, y - e.y);
-            head_w = head_w.max(e.w);
+            let e = self.extent(k);
+            head = if i == 0 { e } else { head.union(e) };
             y += e.h;
         }
-        let mut row_w: f64 = 0.0;
-        let mut row_h: f64 = 0.0;
-        for &k in &rows {
-            self.layout(k, Rect { x: 0.0, y: 0.0, w: r.w, h: r.h }, depth + 1);
-            let e = self.extent(k);
-            row_w = row_w.max(e.w);
-            row_h = row_h.max(e.h);
+        let horizontal = align.starts_with('l') || align.starts_with('r');
+        let cx = head.x + head.w / 2.0;
+        let mut bottom = head.y + head.h;
+        // Assistenterna två och två under roten, på var sin sida om linjen.
+        for &row in &assts {
+            let items: Vec<usize> = self.nodes[row].kids.iter().copied().filter(|k| !self.is_conn(*k)).collect();
+            let mut line_y = bottom + gap;
+            let mut line_h: f64 = 0.0;
+            for (i, &k) in items.iter().enumerate() {
+                let e = self.lay_alone(k, (r.w, r.h), depth);
+                let x = if i % 2 == 0 { cx - sib / 2.0 - e.w } else { cx + sib / 2.0 };
+                self.shift(k, x - e.x, line_y - e.y);
+                line_h = line_h.max(e.h);
+                if i % 2 == 1 || i + 1 == items.len() {
+                    line_y += line_h + sec;
+                    line_h = 0.0;
+                }
+            }
+            bottom = line_y - sec;
+            self.nodes[row].rect = self.extent(row);
         }
-        let width = head_w.max(row_w);
-        for &k in &heads {
-            let e = self.extent(k);
-            self.shift(k, r.x + (width - e.w) / 2.0 - e.x, r.y);
+        for &row in &mains {
+            self.layout(row, Rect { x: 0.0, y: 0.0, w: r.w, h: r.h }, depth + 1);
+            let e = self.extent(row);
+            if e.w <= 0.0 && e.h <= 0.0 {
+                continue;
+            }
+            let (x, y) = if horizontal {
+                let x = if align.starts_with('l') { head.x + head.w + gap } else { head.x - gap - e.w };
+                let y = match &align[1..] {
+                    "T" => head.y,
+                    "B" => head.y + head.h - e.h,
+                    _ => head.y + head.h / 2.0 - e.h / 2.0,
+                };
+                (x, y)
+            } else {
+                let x = match align.as_str() {
+                    "tL" | "bL" => head.x + align_off * head.w,
+                    "tR" | "bR" => head.x + head.w - align_off * head.w - e.w,
+                    _ => cx - e.w / 2.0,
+                };
+                (x, bottom + gap)
+            };
+            self.shift(row, x - e.x, y - e.y);
+            if !horizontal {
+                bottom = y + e.h;
+            }
         }
-        let ry = y + if rows.iter().any(|k| !self.nodes[*k].kids.is_empty()) { gap.max(0.0) } else { 0.0 };
-        for &k in &rows {
-            let e = self.extent(k);
-            self.shift(k, r.x + (width - e.w) / 2.0 - e.x, r.y + ry - e.y);
-        }
-        let _ = row_h;
+        // Allt till nodens ruta.
+        let e = self.extent(id);
+        self.shift(id, r.x - e.x, r.y - e.y);
     }
 
-    /// Används hierarkialgoritmerna (`hierRoot`/`hierChild`)?
-    pub fn uses_hierarchy(&self) -> bool {
-        self.nodes.iter().any(|n| matches!(alg_type(n), "hierRoot" | "hierChild"))
+    /// Kopplingarna med `dim="1D"` eller `connRout="bend"` i hierarkier: en bruten linje från källans
+    /// `begPts` till målets `endPts` (`bCtr` → `tCtr` med knäet `bendDist` före målet, eller till
+    /// närmaste sida `midL`/`midR`). Källa och mål är formerna för övergångens förälder och barn
+    /// (`srcNode`/`dstNode` väljer en namngiven nod för samma punkt).
+    fn connect(&mut self) {
+        let conns: Vec<usize> = (0..self.nodes.len()).filter(|i| self.is_conn(*i) && param(&self.nodes[*i], "dim") == Some("1D")).collect();
+        for c in conns {
+            let n = &self.nodes[c];
+            let Some((par, ch)) = self.m.trans_ends(n.pt) else { continue };
+            let find = |pt: usize, name: Option<&str>| -> Option<Rect> {
+                let by_name = name.and_then(|nm| (0..self.nodes.len()).find(|i| self.nodes[*i].pt == pt && self.nodes[*i].name == nm));
+                let by_text = || (0..self.nodes.len()).find(|i| self.nodes[*i].pt == pt && alg_type(&self.nodes[*i]) == "tx" && self.nodes[*i].rect.w > 0.0);
+                by_name.or_else(by_text).map(|i| self.nodes[i].rect)
+            };
+            let (Some(s), Some(d)) = (find(par, param(n, "srcNode")), find(ch, param(n, "dstNode"))) else { continue };
+            // Punkterna på en ruta (`ST_ConnectorPoint`).
+            let at = |r: Rect, p: &str| -> (f64, f64) {
+                match p {
+                    "tCtr" => (r.x + r.w / 2.0, r.y),
+                    "midL" => (r.x, r.y + r.h / 2.0),
+                    "midR" => (r.x + r.w, r.y + r.h / 2.0),
+                    "tL" => (r.x, r.y),
+                    "tR" => (r.x + r.w, r.y),
+                    "bL" => (r.x, r.y + r.h),
+                    "bR" => (r.x + r.w, r.y + r.h),
+                    "ctr" => (r.x + r.w / 2.0, r.y + r.h / 2.0),
+                    _ => (r.x + r.w / 2.0, r.y + r.h),
+                }
+            };
+            let dist = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2);
+            let begs: Vec<&str> = param(n, "begPts").unwrap_or("bCtr").split_whitespace().collect();
+            let ends: Vec<&str> = param(n, "endPts").unwrap_or("tCtr").split_whitespace().collect();
+            // Av flera möjliga punkter de som ligger närmast varandra.
+            let mut best = None;
+            for bp in &begs {
+                for ep in &ends {
+                    let (b, e) = (at(s, bp), at(d, ep));
+                    if best.as_ref().is_none_or(|(_, _, _, _, dd)| dist(b, e) < *dd) {
+                        best = Some((b, e, *bp, *ep, dist(b, e)));
+                    }
+                }
+            }
+            let Some((beg, end, bp, ep, _)) = best else { continue };
+            let from_end = param(n, "bendPt") == Some("end");
+            let horiz_beg = matches!(bp, "midL" | "midR");
+            let horiz_end = matches!(ep, "midL" | "midR");
+            let pts = if horiz_beg && horiz_end {
+                // Vågrätt ut och in: knä på mitten (eller `bendDist` före målet).
+                let bx = match n.vals.get("bendDist") {
+                    Some(b) if from_end => end.0 - b.copysign(end.0 - beg.0),
+                    _ => (beg.0 + end.0) / 2.0,
+                };
+                vec![beg, (bx, beg.1), (bx, end.1), end]
+            } else if horiz_end {
+                // Lodrätt ned längs linjen, sedan vågrätt in i målets sida.
+                vec![beg, (beg.0, end.1), end]
+            } else if horiz_beg {
+                vec![beg, (end.0, beg.1), end]
+            } else {
+                let bend = n.vals.get("bendDist").copied().unwrap_or(((end.1 - beg.1) / 2.0).abs());
+                let by = if from_end { end.1 - bend.copysign(end.1 - beg.1) } else { beg.1 + bend.copysign(end.1 - beg.1) };
+                vec![beg, (beg.0, by), (end.0, by), end]
+            };
+            let x0 = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let y0 = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let x1 = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let y1 = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+            self.nodes[c].rect = Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+            self.paths.insert(c, pts);
+        }
     }
 
     /// Hela trädet i ramen `w`×`h`: utläggning och sedan krympning och centrering om det inte
@@ -852,6 +1022,7 @@ impl<'a> Tree<'a> {
             return;
         }
         self.layout(0, Rect { x: 0.0, y: 0.0, w, h }, 0);
+        self.connect();
         let e = self.shapes_extent();
         if let Some(e) = e {
             if e.w > w + 0.5 || e.h > h + 0.5 {
@@ -865,6 +1036,11 @@ impl<'a> Tree<'a> {
                     n.rect.x += dx;
                     n.rect.y += dy;
                 }
+                for pts in self.paths.values_mut() {
+                    for p in pts.iter_mut() {
+                        *p = ((p.0 - e.x) * s + dx, (p.1 - e.y) * s + dy);
+                    }
+                }
             }
         }
     }
@@ -873,7 +1049,8 @@ impl<'a> Tree<'a> {
     fn shapes_extent(&self) -> Option<Rect> {
         let mut r: Option<Rect> = None;
         for (i, n) in self.nodes.iter().enumerate() {
-            if !self.draws(i) || n.rect.w <= 0.0 || n.rect.h <= 0.0 {
+            // Bågpilarna får sticka ut ur ramen (som i PowerPoint).
+            if !self.draws(i) || n.rect.w <= 0.0 || n.rect.h <= 0.0 || self.arcs.contains(&i) {
                 continue;
             }
             r = Some(match r {
@@ -891,8 +1068,14 @@ impl<'a> Tree<'a> {
         if sh.attr_bool("hideGeom").unwrap_or(false) {
             return None;
         }
-        // Böjda kopplingar (kugghjulens pilar) ritas inte.
+        // Böjda kopplingar som cirkelbågspilar; linjer (`dim="1D"`) bara med en bana.
         if alg_type(n) == "conn" && param(n, "connRout") == Some("curve") {
+            if !self.arcs.contains(&id) {
+                return None;
+            }
+            return Some(if n.vals.get("kladdArcLeft").is_some_and(|v| *v > 0.5) { "leftCircularArrow" } else { "circularArrow" });
+        }
+        if alg_type(n) == "conn" && param(n, "dim") == Some("1D") {
             return None;
         }
         match sh.attr("type") {
@@ -903,7 +1086,7 @@ impl<'a> Tree<'a> {
 
     /// Ritas noden (form eller text)?
     pub fn draws(&self, id: usize) -> bool {
-        self.geometry(id).is_some() || !self.text_points(id).is_empty()
+        self.geometry(id).is_some() || self.paths.contains_key(&id) || !self.text_points(id).is_empty()
     }
 
     /// Datapunkterna vars text noden visar (`presOf`), med nivå (0 = punkten själv).
@@ -913,7 +1096,11 @@ impl<'a> Tree<'a> {
         if alg_type(n) != "tx" {
             return Vec::new();
         }
-        let Some(po) = n.pres_of else { return Vec::new() };
+        // Utan `presOf` (äldre layouter, t.ex. `orgChart1#2`) visar textnoden sin egen punkt; ett tomt
+        // `<presOf/>` visar ingenting.
+        let Some(po) = n.pres_of else {
+            return self.m.text(n.pt).filter(|_| self.m.is_type(n.pt, "node")).map(|_| vec![(n.pt, 0)]).unwrap_or_default();
+        };
         if po.attr("axis").is_none() {
             return Vec::new();
         }

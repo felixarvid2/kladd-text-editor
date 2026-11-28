@@ -326,13 +326,16 @@ impl Emitter<'_, '_, '_, '_> {
     fn insets(&self, id: usize, f: Fonts) -> (f64, f64, f64, f64) {
         let n = &self.tree.nodes[id];
         let size = self.fixed_size(id).unwrap_or(f.prim);
-        let m = |k: &str| -> f64 {
+        // Utan villkor för marginalen: textrutans vanliga insättningar (7,2 pt vid sidorna, 3,6 pt upptill
+        // och nedtill), högst en tiondel av rutan (organisationsschemats rutor har inga egna).
+        let m = |k: &str, def: f64| -> f64 {
             match n.vals.get(&format!("{k}%")) {
                 Some(fact) => fact * size,
-                None => n.vals.get(k).copied().unwrap_or(0.0),
+                None => n.vals.get(k).copied().unwrap_or(def),
             }
         };
-        (m("lMarg"), m("tMarg"), m("rMarg"), m("bMarg"))
+        let (dw, dh) = ((n.rect.w * 0.1).min(7.2), (n.rect.h * 0.1).min(3.6));
+        (m("lMarg", dw), m("tMarg", dh), m("rMarg", dw), m("bMarg", dh))
     }
 
     /// Ryms texten i rutan?
@@ -348,6 +351,20 @@ impl Emitter<'_, '_, '_, '_> {
         let laid = text::layout(&fr, w as f32, h as f32, fonts);
         if (laid.height + bp.insets.1 + bp.insets.3) as f64 > h + 0.25 {
             return false;
+        }
+        // Inte heller bredare än rutan innanför insättningarna (ett ord som inte kan brytas sticker
+        // annars ut åt sidan).
+        let (left, right) = (bp.insets.0 as f64 - 0.5, w - bp.insets.2 as f64 + 0.5);
+        for it in &laid.items {
+            if let super::super::scene::Item::Glyphs(g) = it {
+                for gl in &g.glyphs {
+                    let (x0, _) = g.t.apply(gl.x, 0.0);
+                    let (x1, _) = g.t.apply(gl.x + gl.advance, 0.0);
+                    if (x0.min(x1) as f64) < left || (x0.max(x1) as f64) > right {
+                        return false;
+                    }
+                }
+            }
         }
         // Inget ord får brytas mitt i: de längsta orden ska rymmas på en rad var.
         let mut words: Vec<(&str, &Node)> = Vec::new();
@@ -410,14 +427,47 @@ impl Emitter<'_, '_, '_, '_> {
     }
 
     /// Ritdelens formträd (`p:spTree`).
+    /// En bruten linje (koppling i en hierarki) som `a:custGeom` utan fyllning.
+    fn polyline(&self, id: usize, pts: &[(f64, f64)], sr: Option<&StyleRef>) -> Node {
+        let t = self.tree;
+        let x0 = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let y0 = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let w = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max) - x0;
+        let h = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) - y0;
+        let pe = |v: f64| ((v * EMU).round() as i64).max(1).to_string();
+        let pt = |p: (f64, f64)| el("a:pt", &[("x", emu(p.0 - x0)), ("y", emu(p.1 - y0))], Vec::new());
+        let mut path = el("a:path", &[("w", pe(w)), ("h", pe(h)), ("fill", "none".into())], vec![el("a:moveTo", &[], vec![pt(pts[0])])]);
+        for p in &pts[1..] {
+            path.children.push(el("a:lnTo", &[], vec![pt(*p)]));
+        }
+        let geom = el(
+            "a:custGeom",
+            &[],
+            vec![
+                el("a:avLst", &[], Vec::new()),
+                el("a:gdLst", &[], Vec::new()),
+                el("a:rect", &[("l", "0".into()), ("t", "0".into()), ("r", "r".into()), ("b", "b".into())], Vec::new()),
+                el("a:pathLst", &[], vec![path]),
+            ],
+        );
+        let xfrm = el("a:xfrm", &[], vec![el("a:off", &[("x", emu(x0)), ("y", emu(y0))], Vec::new()), el("a:ext", &[("cx", emu(w)), ("cy", emu(h))], Vec::new())]);
+        let sppr = el("p:spPr", &[], vec![xfrm, geom, el("a:noFill", &[], Vec::new())]);
+        let model_id = t.nodes[id].pres.map(|p| t.m.pts[p].id.to_owned()).unwrap_or_default();
+        el(
+            "p:sp",
+            &[("modelId", model_id)],
+            vec![el("p:nvSpPr", &[], vec![el("p:cNvPr", &[("id", "0".into()), ("name", String::new())], Vec::new()), el("p:cNvSpPr", &[], Vec::new())]), sppr, self.style(sr)],
+        )
+    }
+
     /// Ritdelens formträd, eller `None` om resultatet inte går att läsa: någon text fick krympas
     /// under 5 punkter eller får inte plats, eller mer än hälften av datamodellens text hamnade inte
     /// i någon form (då är reserven, datamodellens text som punktlista, bättre).
     pub fn emit(&self) -> Option<Node> {
         let t = self.tree;
-        let mut drawn: Vec<usize> = (0..t.nodes.len()).filter(|i| t.draws(*i) && t.nodes[*i].rect.w > 0.01 && t.nodes[*i].rect.h > 0.01).collect();
-        // `zOrderOff` flyttar formen framåt eller bakåt i ritordningen.
-        let z = |i: usize| t.nodes[i].shape.and_then(|s| s.attr_i64("zOrderOff")).unwrap_or(0);
+        let mut drawn: Vec<usize> = (0..t.nodes.len()).filter(|i| t.paths.contains_key(i) || (t.draws(*i) && t.nodes[*i].rect.w > 0.01 && t.nodes[*i].rect.h > 0.01)).collect();
+        // Linjerna först (under formerna); `zOrderOff` flyttar formen framåt eller bakåt.
+        let z = |i: usize| if t.paths.contains_key(&i) { i64::MIN } else { t.nodes[i].shape.and_then(|s| s.attr_i64("zOrderOff")).unwrap_or(0) };
         drawn.sort_by_key(|i| z(*i));
         let refs = self.style_refs(&drawn);
         let mut pending: Vec<Pending> = Vec::new();
@@ -426,6 +476,10 @@ impl Emitter<'_, '_, '_, '_> {
             let n = &t.nodes[id];
             let r = n.rect;
             let sr = refs.get(&id);
+            if let Some(pts) = t.paths.get(&id) {
+                out.push((id, self.polyline(id, pts, sr), None));
+                continue;
+            }
             let shape = n.shape;
             let pres_sppr = n.pres.and_then(|p| t.m.pts[p].node.child("dgm:spPr"));
             let mut prst = t.geometry(id).map(str::to_owned);
@@ -466,6 +520,17 @@ impl Emitter<'_, '_, '_, '_> {
             }
             let mut sppr = el("p:spPr", &[], vec![xfrm]);
             let mut extra = Vec::new();
+            if let (Some(st), Some(end), Some(w)) = (n.vals.get("kladdArcSt"), n.vals.get("kladdArcEnd"), n.vals.get("kladdArcW")) {
+                // Cirkelbågspilen: tjocklek och pilspets i förhållande till storleken, vinklar i
+                // 60 000-dels grader (medurs från x-axeln); `leftCircularArrow` har spetsen i början.
+                let left = n.vals.get("kladdArcLeft").is_some_and(|v| *v > 0.5);
+                let (a3, a4) = if left { (*st, *end) } else { (*end, *st) };
+                extra.push(("adj1".to_owned(), w * 100_000.0));
+                extra.push(("adj2".to_owned(), 6.0 * 60_000.0));
+                extra.push(("adj3".to_owned(), a3 * 60_000.0));
+                extra.push(("adj4".to_owned(), a4 * 60_000.0));
+                extra.push(("adj5".to_owned(), w * 1.2 * 100_000.0));
+            }
             if let Some(inset) = n.vals.get("kladdPyra") {
                 // Trapetsens sidor i linje med pyramidens: insättningen i förhållande till min(b, h).
                 extra.push(("adj".to_owned(), inset / ew.min(eh).max(1e-6) * 100_000.0));

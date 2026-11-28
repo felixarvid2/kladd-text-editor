@@ -254,7 +254,7 @@ fn tree_mut(doc: &mut XDoc) -> Result<&mut XElem, String> {
 }
 
 /// Kör `f` på formen (alla grenar om den ligger i ett `mc:AlternateContent`).
-fn with_shape(txn: &mut Txn, slide: usize, index: usize, id: u32, f: &mut dyn FnMut(&mut XElem, &XDoc) -> Result<(), String>) -> Result<(), String> {
+pub(super) fn with_shape(txn: &mut Txn, slide: usize, index: usize, id: u32, f: &mut dyn FnMut(&mut XElem, &XDoc) -> Result<(), String>) -> Result<(), String> {
     let part = slide_part(txn.deck, slide)?;
     let doc = txn.doc(&part)?;
     let scope = doc.root_scope();
@@ -304,7 +304,7 @@ pub fn set_xf(txn: &mut Txn, slide: usize, index: usize, id: u32, xf: Xf) -> Res
     with_shape(txn, slide, index, id, &mut |e, doc| write_xf(e, doc, xf))
 }
 
-fn write_xf(e: &mut XElem, doc: &XDoc, xf: Xf) -> Result<(), String> {
+pub(super) fn write_xf(e: &mut XElem, doc: &XDoc, xf: Xf) -> Result<(), String> {
     let a = doc.prefix_for(NS_A).unwrap_or_else(|| "a".into());
     let p = doc.prefix_for(NS_P).unwrap_or_else(|| "p".into());
     let q = |pre: &str, l: &str| if pre.is_empty() { l.to_owned() } else { format!("{pre}:{l}") };
@@ -356,7 +356,7 @@ fn write_xf(e: &mut XElem, doc: &XDoc, xf: Xf) -> Result<(), String> {
     Ok(())
 }
 
-fn doc_fragment(doc: &XDoc, xml: &str) -> Result<XElem, String> {
+pub(super) fn doc_fragment(doc: &XDoc, xml: &str) -> Result<XElem, String> {
     doc.fragment(xml).into_iter().next().ok_or_else(|| format!("ogiltig XML: {xml}"))
 }
 

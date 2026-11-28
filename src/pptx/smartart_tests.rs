@@ -390,35 +390,23 @@ fn pyramidens_nivaer_vaxer_nedat() {
 }
 
 #[test]
-fn hierarki_med_roten_over_barnen() {
+fn hierarki_med_roten_over_barnen_och_linjer() {
     let l = layout(
         r#"<dgm:layoutNode name="root"><dgm:alg type="hierChild"/><dgm:shape/><dgm:presOf/>
-<dgm:constrLst><dgm:constr type="w" for="des" forName="box" val="50"/><dgm:constr type="h" for="des" forName="box" val="25"/><dgm:constr type="sibSp" for="des" forName="kids" val="10"/><dgm:constr type="sp" for="des" forName="hr" val="10"/></dgm:constrLst>
+<dgm:constrLst><dgm:constr type="w" for="des" forName="box" val="50"/><dgm:constr type="h" for="des" forName="box" val="25"/><dgm:constr type="sibSp" for="des" forName="kids" val="10"/><dgm:constr type="sp" for="des" forName="hr" val="10"/><dgm:constr type="bendDist" for="des" ptType="parTrans" val="5"/></dgm:constrLst>
 <dgm:forEach name="f" axis="ch" ptType="node"><dgm:layoutNode name="hr"><dgm:alg type="hierRoot"/><dgm:shape/><dgm:presOf/>
 <dgm:layoutNode name="box" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="rect"/><dgm:presOf axis="self"/></dgm:layoutNode>
 <dgm:layoutNode name="kids"><dgm:alg type="hierChild"/><dgm:shape/><dgm:presOf/>
-<dgm:forEach name="g" axis="ch" ptType="node"><dgm:layoutNode name="hr2"><dgm:alg type="hierRoot"/><dgm:shape/><dgm:presOf/><dgm:layoutNode name="box" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="rect"/><dgm:presOf axis="self"/></dgm:layoutNode></dgm:layoutNode></dgm:forEach>
+<dgm:forEach name="g" axis="ch" ptType="nonAsst">
+<dgm:forEach name="p" axis="precedSib" ptType="parTrans" st="-1" cnt="1"><dgm:layoutNode name="line" styleLbl="node1"><dgm:alg type="conn"><dgm:param type="connRout" val="bend"/><dgm:param type="dim" val="1D"/><dgm:param type="begPts" val="bCtr"/><dgm:param type="endPts" val="tCtr"/><dgm:param type="bendPt" val="end"/></dgm:alg><dgm:shape type="conn"/><dgm:presOf axis="self"/></dgm:layoutNode></dgm:forEach>
+<dgm:layoutNode name="hr2"><dgm:alg type="hierRoot"/><dgm:shape/><dgm:presOf/><dgm:layoutNode name="box" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="rect"/><dgm:presOf axis="self"/></dgm:layoutNode></dgm:layoutNode></dgm:forEach>
 </dgm:layoutNode></dgm:layoutNode></dgm:forEach></dgm:layoutNode>"#,
     );
-    // Hierarkierna används ännu inte för ritningen (reserven), så trädet provas direkt.
     let d = data(&[("a", "Chef", &[("b", "Ett"), ("c", "Två")])], "", "");
     let deck = Deck::open(&pptx(&frame(0.0, 0.0, 600.0, 400.0), &d, &l, None)).unwrap();
-    assert!(!deck.drawings.keys().any(|k| k.ends_with("#kladd")));
-    let (dn, ln) = (super::xml::parse(d.as_bytes()).unwrap(), super::xml::parse(l.as_bytes()).unwrap());
-    let m = super::dgm::data::Model::new(&dn);
-    let mut t = super::dgm::tree::Tree::build(&m, &ln).unwrap();
-    assert!(t.uses_hierarchy());
-    t.run(600.0, 400.0);
-    let text_of = |i: usize| t.text_points(i).first().and_then(|(p, _)| m.text(*p)).map(|n| {
-        let mut s = String::new();
-        n.walk(&mut |x| if x.name == "a:t" { s.push_str(&x.text) });
-        s
-    });
-    let by = |want: &str| {
-        let i = (0..t.nodes.len()).find(|i| text_of(*i).as_deref() == Some(want)).unwrap();
-        let r = t.nodes[i].rect;
-        (r.x, r.y, r.w, r.h)
-    };
+    assert!(deck.drawings.keys().any(|k| k.ends_with("#kladd")));
+    let s = laid_out(&deck);
+    let by = |t: &str| s.iter().find(|x| x.3 == t).unwrap().1;
     let (a, b, c) = (by("Chef"), by("Ett"), by("Två"));
     let mm = 72.0 / 25.4;
     assert!(close(a.2, 50.0 * mm) && close(a.3, 25.0 * mm), "{a:?}");
@@ -426,6 +414,47 @@ fn hierarki_med_roten_over_barnen() {
     assert!(close(b.1, c.1) && close(b.1, a.1 + a.3 + 10.0 * mm), "{a:?} {b:?} {c:?}");
     assert!(close(c.0 - (b.0 + b.2), 10.0 * mm));
     assert!(close(a.0 + a.2 / 2.0, (b.0 + c.0 + c.2) / 2.0), "{a:?} {b:?} {c:?}");
+    // En bruten linje per barn: från rotens underkant mitt till barnets överkant mitt.
+    let lines: Vec<_> = s.iter().filter(|x| x.2.is_empty()).map(|x| x.1).collect();
+    assert_eq!(lines.len(), 2, "{s:?}");
+    for (l, k) in lines.iter().zip([b, c]) {
+        assert!(close(l.1, a.1 + a.3) && close(l.1 + l.3, k.1), "{l:?} {k:?}");
+        assert!(close(l.0.min(l.0 + l.2), (a.0 + a.2 / 2.0).min(k.0 + k.2 / 2.0)), "{l:?}");
+    }
+}
+
+#[test]
+fn bojd_koppling_blir_en_cirkelbagspil() {
+    // Som kugghjulen: pilen runt `g` från källnodens till målnodens vinkel, diametern 1,2 × g.
+    let l = layout(
+        r#"<dgm:layoutNode name="root"><dgm:alg type="composite"/><dgm:shape/><dgm:presOf/>
+<dgm:constrLst><dgm:constr type="l" for="ch" forName="g" val="50"/><dgm:constr type="t" for="ch" forName="g" val="20"/><dgm:constr type="w" for="ch" forName="g" val="40"/><dgm:constr type="h" for="ch" forName="g" val="40"/>
+<dgm:constr type="ctrX" for="ch" forName="gsrcNode" val="70"/><dgm:constr type="t" for="ch" forName="gsrcNode" val="20"/><dgm:constr type="w" for="ch" forName="gsrcNode" val="1"/><dgm:constr type="h" for="ch" forName="gsrcNode" val="1"/>
+<dgm:constr type="r" for="ch" forName="gdstNode" val="90"/><dgm:constr type="ctrY" for="ch" forName="gdstNode" val="40"/><dgm:constr type="w" for="ch" forName="gdstNode" val="1"/><dgm:constr type="h" for="ch" forName="gdstNode" val="1"/>
+<dgm:constr type="diam" for="des" forName="arc" refType="w" refFor="ch" refForName="g" fact="1.2"/><dgm:constr type="h" for="des" forName="arc" refType="w" refFor="ch" refForName="g" fact="0.1"/></dgm:constrLst>
+<dgm:forEach name="f" axis="ch" ptType="node" cnt="1"><dgm:layoutNode name="g" styleLbl="node1"><dgm:alg type="tx"/><dgm:shape type="ellipse"/><dgm:presOf axis="self"/></dgm:layoutNode>
+<dgm:layoutNode name="gsrcNode"><dgm:alg type="sp"/><dgm:shape type="rect" hideGeom="1"/></dgm:layoutNode><dgm:layoutNode name="gdstNode"><dgm:alg type="sp"/><dgm:shape type="rect" hideGeom="1"/></dgm:layoutNode></dgm:forEach>
+<dgm:forEach name="s" axis="ch" ptType="sibTrans" hideLastTrans="0" cnt="1"><dgm:layoutNode name="arc" styleLbl="node1"><dgm:alg type="conn"><dgm:param type="connRout" val="curve"/><dgm:param type="srcNode" val="gsrcNode"/><dgm:param type="dstNode" val="gdstNode"/></dgm:alg><dgm:shape type="conn"/></dgm:layoutNode></dgm:forEach>
+</dgm:layoutNode>"#,
+    );
+    let deck = Deck::open(&pptx(&frame(0.0, 0.0, 400.0, 300.0), &data(&[("a", "A", &[])], "", ""), &l, None)).unwrap();
+    let (gf, sx, sy) = smartart::diagram_frames(&deck, 0)[0];
+    let (_, root) = smartart::lay_out_frame(&deck, 0, gf, sx, sy).unwrap();
+    let mut arc = None;
+    root.walk(&mut |n| {
+        if n.name == "p:sp" && n.path(&["p:spPr", "a:prstGeom"]).and_then(|g| g.attr("prst")) == Some("circularArrow") {
+            arc = Some(n.clone());
+        }
+    });
+    let arc = arc.expect("cirkelbågspil");
+    let mm = 72.0 / 25.4;
+    let b = visual_box(&arc).unwrap();
+    // Mitten i g:s mitt (70, 40 mm), storleken 48 mm.
+    assert!(close(b.0 + b.2 / 2.0, 70.0 * mm) && close(b.1 + b.3 / 2.0, 40.0 * mm) && close(b.2, 48.0 * mm), "{b:?}");
+    let adj = |name: &str| arc.path(&["p:spPr", "a:prstGeom", "a:avLst"]).and_then(|l| l.children.iter().find(|g| g.attr("name") == Some(name))).and_then(|g| g.attr("fmla")).map(str::to_owned);
+    // Från källan överst (270°) medurs till målet till höger (0°).
+    assert_eq!(adj("adj4").as_deref(), Some("val 16200000"));
+    assert_eq!(adj("adj3").as_deref(), Some("val 0"));
 }
 
 #[test]
@@ -519,4 +548,25 @@ fn ritdel_i_skalad_grupp_ritas_i_visad_storlek() {
     assert_eq!(pixel(&deck, 60, 60), [255, 0, 0]);
     assert_ne!(pixel(&deck, 275, 110), [255, 0, 0]);
     assert_ne!(pixel(&deck, 150, 130), [255, 0, 0]);
+}
+
+#[test]
+fn langt_ord_krymps_inom_rutan_och_gruppen_far_samma_storlek() {
+    // Ett ord som inte kan brytas ("Vattenmelonerna") krymps tills det ryms innanför insättningarna
+    // i den smala rutan; de andra noderna i gruppen (`op="equ"`) får samma storlek.
+    let d = data(&[("a", "Vattenmelonerna", &[]), ("b", "Ett", &[]), ("c", "Två", &[])], "", "");
+    let deck = Deck::open(&pptx(&frame(100.0, 100.0, 100.0, 300.0), &d, &layout(LIN_T), None)).unwrap();
+    let s = laid_out(&deck);
+    let sizes: Vec<i64> = s.iter().filter_map(|x| x.4).collect();
+    assert_eq!(sizes.len(), 3);
+    assert!(sizes.iter().all(|z| *z == sizes[0]), "{sizes:?}");
+    for it in render::slide_scene(&deck, 0).items {
+        if let super::scene::Item::Glyphs(g) = it {
+            for gl in &g.glyphs {
+                let (x0, _) = g.t.apply(gl.x, 0.0);
+                let (x1, _) = g.t.apply(gl.x + gl.advance, 0.0);
+                assert!(x0 >= 100.0 && x1 <= 200.0, "{} {x0}–{x1}", g.text);
+            }
+        }
+    }
 }

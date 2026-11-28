@@ -191,6 +191,9 @@ pub enum TxKind {
     Title,
     Body,
     Other,
+    /// Form utan platshållare: teckenstorleken kommer ur presentationens `defaultTextStyle`, inte mallens
+    /// `otherStyle` (covid-infographic-*: mallen säger 15,3 pt, PowerPoint ritar 18 pt).
+    Free,
 }
 
 pub fn tx_kind(shape: &Node) -> TxKind {
@@ -200,7 +203,7 @@ pub fn tx_kind(shape: &Node) -> TxKind {
             "dt" | "ftr" | "sldNum" | "hdr" => TxKind::Other,
             _ => TxKind::Body,
         },
-        None => TxKind::Other,
+        None => TxKind::Free,
     }
 }
 
@@ -216,9 +219,12 @@ pub fn list_styles<'a>(sheets: &Sheets<'a>, chain: &[&'a Node], kind: TxKind) ->
         let name = match kind {
             TxKind::Title => "p:titleStyle",
             TxKind::Body => "p:bodyStyle",
-            TxKind::Other => "p:otherStyle",
+            TxKind::Other | TxKind::Free => "p:otherStyle",
         };
-        if let Some(s) = m.root.path(&["p:txStyles", name]) {
+        // Former utan platshållare tar bara teckenstorleken ur `defaultTextStyle`; övriga värden (tabbstopp …)
+        // kommer fortfarande ur mallens `otherStyle` (`ms-workshop-dlcv` blev sämre när hela stilen hoppades över).
+        let style = if kind == TxKind::Free { m.other_free.as_ref() } else { m.root.path(&["p:txStyles", name]) };
+        if let Some(s) = style {
             out.push(s);
         }
     }

@@ -170,30 +170,34 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 5 (detaljer i respektive avsnitt nedan):
 
-- **Redigering:** gjord i omgång 3 (se *Redigering och sparande* nedan). Kvar: text i tabellceller, grupper och
-  SmartArt; duplicera diagram/SmartArt som enskilda former; flervalsmarkering; textformat utöver fet/kursiv/
-  understruken; `spAutoFit` räknas inte om när texten växer; återställning efter krasch (bara automatisk sparning).
-- **Visning:** länkar och åtgärdsknappar i bildspelet, föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
+- **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
+  text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
+  teckensnitt, marginaler, radavstånd och numrerade listor i formatraden; markering över flera tabellceller;
+  autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
+  automatisk sparning).
+- **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
-- **Diagram:** sekundäraxlar, datatabeller, trendlinjer, felstaplar, radar, yt-3D (`surface3DChart`), chartex (`cx:`);
+- **Diagram:** yt-3D (`surface3DChart`), chartex (`cx:`), sekundär x-axel i punktdiagram, datumaxelns
+  `majorTimeUnit` i månader/år som exakta månadsgränser; sekundäraxlar, trendlinjer, felstaplar,
+  radar och datatabeller finns men saknar referensbilder från PowerPoint (se *Sekundäraxlar, trendlinjer,
+  felstaplar, radar och datatabeller*);
   3D-diagrammen utan referensbilder (stapel/linje/yta) är inte kalibrerade (se *3D i diagram och former*).
 - **EMF/WMF:** `ExcludeClipRect`, fler regionoperationer, streckade/mönstrade penslar, `ETO_GLYPH_INDEX`, EMF+.
 - **Tabeller:** lodrät text i celler låter inte raden växa; några val är inte prövade mot referensbilder (se
   avsnittet).
-- **SmartArt:** layouter som PowerPoint lägger om (kugghjulen i `msrc-win32k` bild 4/22) kräver en layoutmotor.
 - **Effekter:** oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en; 3D-text (`sp3d` på
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
-- **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)*) används bara när ritdelen saknas eller är tom;
-  hierarkier (`hierRoot`/`hierChild`, organisationsscheman) ger ännu reserven, och böjda kopplingar
-  (kugghjulens pilar), linjer i hierarkier, text som får rutan att växa (`rule type="h" val="INF"`), ikoner
-  (`blipPhldr`) och egna förskjutningar i `composite` saknas.
-- **Effekter:** 3D-fasning (`sp3d`), oskärpa i spegling; tunna vikter, inre skugga och mjuka kanter i PDF:en.
+- **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)* och *SmartArt: hierarkier och böjda kopplingar
+  (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: text som får rutan att växa
+  (`rule type="h" val="INF"`, `vList2`), ikoner i platshållare (`blipPhldr` ritas som en tom form), egna
+  förskjutningar i `composite` (kugghjul med ett och två hjul), hierarkins `hang` i två spalter (`secLinDir`),
+  nivåetiketterna i `hierarchy5` och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
-  (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum`, `duotone` m.fl.
+  (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum` m.fl. (`duotone` gjordes i omgång 5)
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
 - **Minne:** avkodade bilder hålls i en cache på högst 256 MB per presentation och skalas ner till högst
   2560 bildpunkter.
@@ -244,8 +248,7 @@ Presentationsvyn i appen (`view.rs`, `glue.rs`) och de rena delarna den bygger p
 - **Prov:** `view_tests.rs` (egen presentation med anteckningar, tabell, bild och dold bild byggd i provet),
   enhetsprov i `slideshow.rs`, `find.rs`, `notes.rs` och `view.rs`. Det ignorerade
   `soffice_konverterar_ppt` gör en `.ppt` av en korpusfil med LibreOffice och öppnar den.
-- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3, ljud och video i omgång 4) länkar och åtgärdsknappar i bildspelet, hoppa till bildnummer med siffror + Enter i
-  bildspelet, markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
+- **Kvar:** (övergångar, animeringar och föredragsvy gjordes i omgång 3, ljud och video i omgång 4, länkar och bildnummer i omgång 5) markering och kopiering av text på bilden, engelsk handbok (handboken finns bara på svenska).
 - **Visning:** miniatyrlist, bildspelsläge, sök, PDF-export i menyn, lägesminne, *Redigera en kopia*,
   anteckningar, `.ppt` via LibreOffice, handboken.
 
@@ -749,8 +752,8 @@ färg- och stildefinitionerna tillämpas också rätt (ingen skillnad hittad).
 former. Saknas den eller är `dsp:spTree` tom (PowerPoint sparar ibland en tom ritdel; `owasp-top10-2017-he`
 bild 20–21, där PowerPoint lägger ut diagrammet ur datamodellen) lägger layoutmotorn ut diagrammet när
 presentationen läses in (`smartart::lay_out_missing`, efter typsnitten) i ramens visade storlek, och resultatet
-ritas som en ritdel (nyckel `<datadel>#kladd` i `Deck::drawings`). Saknas layoutdefinitionen, används
-hierarkialgoritmerna, eller går resultatet inte att läsa (text under 5 punkter, text som inte får plats ens i
+ritas som en ritdel (nyckel `<datadel>#kladd` i `Deck::drawings`). Saknas layoutdefinitionen eller går
+resultatet inte att läsa (text under 5 punkter, text som inte får plats ens i
 regelns minsta storlek, eller mer än hälften av datamodellens text utan form) blir det som förut datamodellens
 text som punktlista. Ett panik i motorn ger också reserven (`catch_unwind`).
 
@@ -766,8 +769,9 @@ tvärs över bara storlekar räknade ur flödesriktningen; ihop centrerade läng
 justerade tvärs över efter rutan; uppmätt mot `vList5`, `vList2`, `hProcess9`), `composite` (`l`/`t`/`r`/`b`/
 `ctrX`/`ctrY`/`w`/`h` och förskjutningar, `ar`), `snake` (det antal per rad som ger störst noder, sista raden
 centrerad), `cycle` (lika vinkelsteg från `stAng`, radien så att noderna inte överlappar), `pyra` (nivåer som
-trapetser med pyramidens sidor; `fromT` = omvänd pyramid), `hierRoot`/`hierChild` (roten centrerad över barnens
-rad), `tx`, `sp`, `conn` (pil i sin ruta; böjda kopplingar ritas inte). Bara noder med `tx` visar text. En
+trapetser med pyramidens sidor; `fromT` = omvänd pyramid), `hierRoot`/`hierChild` (se omgång 5), `tx`, `sp`,
+`conn` (pil i sin ruta; linjer och böjda kopplingar: se omgång 5). Bara noder med `tx` visar text (utan
+`presOf` sin egen punkts). En
 nods egna villkor är standardvärden: förälderns villkor för den går före. Får helheten inte plats krymps och
 centreras den.
 
@@ -917,10 +921,9 @@ cpal-utmatning), `media_video.rs` (ffmpeg), `media_play.rs` (`MediaHub`, ägd av
 gjorda med ffmpeg `sine`/`testsrc`).
 
 - **Källa:** `p14:media/@r:embed` före `r:link` (länken är ofta en död extern `Target="NULL"`). Länkade filer spelas om de
-  finns som sökväg eller `file:`-adress (relativa sökvägar mot presentationen är inte kopplade: `Deck` känner inte
-  filens plats). `p14:trim/@st` och `@end` är millisekunder som klipps i början respektive slutet (`end` mot
+  finns som sökväg eller `file:`-adress (relativa sökvägar läses från presentationens mapp, omgång 5). `p14:trim/@st` och `@end` är millisekunder som klipps i början respektive slutet (`end` mot
   materialet: `end="113.45"` på en ca 0,3 s lång WAV). `p:cMediaNode`: `vol` (100000 = full), `mute`, `numSld`
-  (antal bildbyten mediet överlever, standard 1), `showWhenStopped` (tolkas, men stillbilden döljs inte efter slutet).
+  (antal bildbyten mediet överlever, standard 1), `showWhenStopped` (döljer formen när mediet inte spelas, omgång 5).
 - **Ljud:** `media_audio::spawn` avkodar i en egen tråd med symphonia (`mp3`, `wav`, `pcm`, `isomp4`, `aac`) och skickar
   stereoblock i en begränsad kö (32 block). Sökning till startpunkten med `SeekMode::Accurate`, annars avkodning och
   kassering. `Mixer` omsamplar linjärt till enhetens takt och kanaler och räknar utmatade bildrutor per röst: det är
@@ -950,6 +953,229 @@ gjorda med ffmpeg `sine`/`testsrc`).
 - **Vid sammanslagning med w-ptrig:** byt `media_model::MediaCmd`/`CmdKind`/`step_commands` mot uppspelningens
   `take_media()` (mata `MediaHub::apply(ctx, slide, cmd)` och ta bort `step_commands`-delen i `on_position`), och låt
   en utlösare som förbrukat ett klick gå före `MediaHub::click`.
+- **Kvar:** ffmpeg i flatpak; spolning av video med ljud utan ffmpeg (lager, rotation, beskärning, `showWhenStopped` och relativa
+  länkar gjordes i omgång 5, se nedan).
+
+## Länkar, bildnummer och video i lager (omgång 5, w-pshow2)
+
+- **`show_links.rs`** (rent): `of_slide(deck, i) -> SlideLinks`. Områden: formens egen länk (`p:cNvPr/a:hlinkClick|hlinkHover`, träff med
+  `ShapeInfo::hit`, översta formen vinner) och textlänkar (`a:rPr/a:hlinkClick`). Glyfkörningarna känner inte till länkar, så
+  formens körningar paras ihop med dem: körningstexten utan blanktecken letas upp i ordning bland glyfkörningarna vars mitt
+  ligger i formen (`find::slide_text`, `find::hit_rects` ger rektanglarna per körning, exakta per tecken när glyferna går ett
+  till ett). Punkttecken och fält som inte finns i XML-texten hoppas över. Textlänkar går före formlänkar. Bara toppnivåformer
+  (och deras gruppbarns/tabellcellers text) får områden; en länk på ett gruppbarn själv gör det inte.
+- **Åtgärder (`Action`):** `ppaction://hlinkshowjump?jump=` (`nextslide`, `previousslide`, `firstslide`, `lastslide`,
+  `lastslideviewed`, `endshow`), `hlinksldjump` + relation av slag `slide` (mål via delnamn), annars en extern relation: bara
+  `http:`, `https:` och `mailto:` (en presentation ska inte kunna starta filer), öppnas med `platform::open`. `hlinkfile`,
+  `hlinkpres`, `program`, `macro` utförs inte.
+- **`ShowView`:** `click_slide_in` kollar utlösare, media, sedan länk, sedan nästa steg. `hover_trigger` ger handen och utför
+  `hlinkHover` en gång när pekaren kommer in (spärr tills pekaren rört sig, så att två bilder med knappar på samma plats inte
+  studsar). En animerad form som inte syns (`media_opacity` = 0) går inte att klicka. `Playback::goto` hoppar med bildens
+  övergång och animeringar, och `Show::goto` tar med en dold bild i ordningen; `Playback::last_viewed` minns föregående bild.
+- **Bildnummer:** siffror samlas i `ShowView::digits` (högst 5, glöms efter 4 s, ritas nere till vänster); `Enter` hoppar till
+  nummer 1..=antal (position i presentationen, inte `firstSlideNum`), `Backsteg` tar bort en siffra, annan navigering avbryter.
+- **Video i lager:** videoformer får eget lager (`ShowView::layer_targets` lägger dem till de animerade målen, även i morph),
+  så videobilden ritas i `draw_layer` ovanpå formens stillbild i formens ritordning och med dess animeringstillstånd,
+  övergångens flyttning/klippning och morphens förflyttning (`draw_video`: formens rektangel vriden och speglad, beskuren
+  som `Crop::Rect|Ellipse|RoundRect`, andra geometrier ritas som rektangel). `MediaHub::paint` ritar bara kontroller och notis
+  nu. `showWhenStopped="0"`: `hidden_when_stopped` döljer hela lagret när mediet inte spelas (före start, efter slutet; paus
+  räknas som spelande). Mediaformer i grupper får ingen videobild (som förut: `rect_pt` saknas).
+- **Länkade mediefiler:** `media_model::resolve_file` (percent-avkodning, `file:`, Windows-snedstreck, relativt `base_dir`).
+  `PptxTab::media_dir` sätts av `pptx_start_show` ur dokumentets sökväg.
+- **Prov:** `show_links_tests.rs` (länkdäck byggt i provet; åtgärder, textlänkens träffyta, klick, senast visade, siffror +
+  Enter), `media_model::tests`, `media_tests`. Ignorerade `skriv_provfil` (`KLADD_PLINK_OUT`, `KLADD_PMEDIA_OUT`) skriver
+  provpresentationer att titta på för hand.
+- **Kvar:** föredragsvyns val av skärm (winit ger ingen skärmlista via egui här: inte gjort); länkar på gruppbarn och i
+  SmartArt; `hlinkfile`/`hlinkpres`; markering av länkar vid tangentbordsnavigering (Tab); `p:quickTimeFile` som video utan
+  `rect_pt` i grupper; videoformer med andra geometrier än rektangel, rundad rektangel och ellips beskärs som rektangel.
 - **Kvar:** videons lager ska följa formens animeringstillstånd (dold, tonad) och klippas under övergångar (nu ritas
   videon bara när ingen övergång pågår och ovanpå lagren); rotation och formens geometri (rundade hörn) för videon;
   `showWhenStopped`; länkar relativa mot presentationen; ffmpeg i flatpak; spolning av video med ljud utan ffmpeg.
+
+## SmartArt: hierarkier och böjda kopplingar (omgång 5)
+
+Organisationsscheman och andra hierarkier (`orgChart1`, `hierarchy2`, `hierarchy5`, `hierarchy6` i provsamlingarna,
+alla utan ritdel) läggs nu ut av layoutmotorn i stället för att visas som punktlista, med linjer mellan rutorna.
+Det finns inga PowerPoint-referenser för dem i materialet; reglerna nedan följer layoutdefinitionerna och
+PowerPoints kända utseende (standardschemat, hängande lägsta nivå, assistenter).
+
+- **`hierChild`** (`tree.rs`): barnen efter varandra längs `linDir` (`fromL` standard, `fromR`, `fromT`, `fromB`) med
+  `sibSp` emellan (`secSibSp` lodrätt), justerade tvärs över efter `chAlign`.
+- **`hierRoot`**: roten först, under den assistentraden (assistenterna två och två på var sin sida om den lodräta
+  linjen, `sibSp` från linjen) och sedan barnens rad, `sp` emellan. `hierAlign`: `tCtrCh` (standard) centrerar
+  roten över raden; `tL`/`tR` låter raden hänga under roten förskjuten `alignOff` av rotens bredd (`alignOff` är en
+  bråkdel, inte millimeter); `lCtrCh`, `lT`, `lB`, `r…` lägger raden bredvid roten (vågräta hierarkier).
+  `orgChart1` väljer själv: rotens barn som standardrad, föräldrar till löv (`maxDepth` ≤ 1, `hierBranch="init"`)
+  med en hängande spalt.
+- **Linjer** (`connect`): kopplingar med `dim="1D"` blir brutna linjer (`a:custGeom` utan fyllning, under
+  formerna, med stilen ur färg- och stildefinitionen) från formen för övergångens förälder till barnets
+  (`srcNode`/`dstNode` väljer en namngiven nod för samma punkt, t.ex. `rootConnector`). Av `begPts`/`endPts`
+  används de två punkter som ligger närmast varandra; `bCtr` → `tCtr` ger knäet `bendDist` före målet
+  (`bendPt="end"`), `midL`/`midR` ett lodrätt ben längs linjen och sedan in i sidan, vågrätt ut och in ett knä
+  på mitten.
+- **Text utan `presOf`:** äldre layouter (`orgChart1#2` i `O12Typical`) har textnoder utan `presOf`; de visar sin
+  egen punkts text (förut föll diagrammet tillbaka till punktlistan eftersom ingen text syntes).
+- **Rättelser i datamodellen:** `ptType="nonAsst"` är bara vanliga noder (övergångarna räknades förut, så varje
+  barn fick tre rutor), och `precedSib` är i dokumentordning så att `st="-1"` ger närmaste föregående syskon
+  (kopplingarna hamnade förut alla på första barnets övergång).
+- **Böjda kopplingar** (`connRout="curve"` i `composite`, kugghjulens pilar): en cirkelbågspil
+  (`circularArrow`, `leftCircularArrow` när `diam` är negativ) runt formen som källnoden hör till
+  (`gear1srcNode` → `gear1`) med diametern `diam`, från källnodens till målnodens vinkel; tjockleken är
+  kopplingens `h`. Bågarna räknas inte när helheten krymps för att få plats (de får sticka ut, som i PowerPoint).
+  Andra böjda kopplingar (t.ex. `cycle8`:s pilar mellan hjälpnoder) ritas inte än. Alla kugghjul i
+  referensmaterialet har en ritdel, så bågarna ändrar ingen bild där; bara jämförelsen mot ritdelarna.
+
+- **Text i rutorna:** texten krymps också tills den ryms på bredden innanför insättningarna (ett ord som inte
+  kan brytas, t.ex. "Watermelon", stack förut ut), och noder utan marginalvillkor (organisationsschemats rutor)
+  får textrutans vanliga insättningar (7,2 pt vid sidorna, 3,6 pt upptill och nedtill, högst en tiondel av
+  rutan). Gruppen med `op="equ"` på `primFontSz` får den minsta storleken som ryms i alla.
+- **Assistenter:** `Mid-Left`/`Mid-Right` i `SmartArt_OrgChart1` är `type="asst"` i datamodellen och ritas därför
+  vid sidan av linjen; i `SmartArt_OrgChart1_3D` är de vanliga noder och hänger från den vågräta linjen.
+
+Av de 15 hierarkierna utan ritdel i provsamlingarna ritas nu alla som diagram (ingen faller tillbaka till
+punktlistan). Det finns ingen PowerPoint-referens för dem, så utseendet är inte uppmätt.
+
+**Jämförelse mot ritdelarna** (`oracle`, 57 diagram): `gear1` med tre kugghjul 0,44 → 0,82, med ett och två
+0,03–0,25 → 0,09–0,49 (PowerPoints egna förskjutningar saknas), medel 0,638 → 0,662. Övriga layouter oförändrade.
+
+**Prov:** `hierarki_med_roten_over_barnen_och_linjer` (rutor, avstånd, centrering och linjernas ändpunkter),
+`bojd_koppling_blir_en_cirkelbagspil` (läge, storlek och vinklar), `langt_ord_krymps_inom_rutan_och_gruppen_far_samma_storlek`.
+
+
+## Textformat och autoanpassning (omgång 5)
+
+Moduler: `edit_format.rs` (modellens formatfunktioner), `edit_fit.rs` (autoanpassning), `edit_bar.rs` (formatraden,
+`PptxTab::format_text`); tangenterna står i `text_keys` i `edit_view.rs`.
+
+- **Formatfunktioner** på `TextModel` mellan två lägen (`edit_runs` delar körningarna vid gränserna som `toggle`
+  gör): `set_size`/`step_size`, `set_color`, `set_align`, `set_bullet`. Utan markering gäller ordet vid markören;
+  ett intervall som når styckets slut sätter formatet också på `a:endParaRPr` (som tomma stycken och nästa skrivna
+  tecken ärver). `sz` skrivs i hundradels punkt; storlekssteget utgår från körningens ärvda storlek
+  (`Carets::paras[..].runs`, utan autoanpassningens `fontScale`, annars skulle krympningen skrivas in i filen) och
+  följer PowerPoints lista (8 … 96). Färgen byter ut alla fyllningar i `a:rPr` mot `a:solidFill` med `a:schemeClr`
+  (temats `tx1`, `bg1`, `accent1` …) eller `a:srgbClr`, placerad efter `a:ln` och före effekter, markering,
+  understrykningar, typsnitt och länkar (schemats ordning; prov i `edit_format.rs`). Justering sätter `algn` på
+  varje stycke i intervallet (`l` skrivs alltid ut, eftersom layouter ofta centrerar). Punkter på: `marL`/`indent`,
+  `a:buFont` + `a:buChar` före `a:tabLst`/`a:defRPr`; av: `a:buNone` med `marL="0" indent="0"`.
+- **Formatraden** syns när formen är markerad eller man skriver i den och formen är en vanlig textform
+  (`Kind::Shape`, inte `mc:AlternateContent`). Visat format kommer från `Carets::paras` (ärvt värde ur samma
+  utläggning som ritar bilden); när bara formen är markerad cachas det per presentation och form. Storleksfältet
+  lämnar tillbaka tangentbordsfokus till redigeringslagret efter `Enter`. `Ctrl+E` är bara redigeringsläget på/av
+  när man inte skriver (annars centrerar det). `Ctrl+Skift+>`/`<` kommer som `Key::Period`/`Key::Comma` med Skift
+  (US) respektive `Key::IntlBackslash` (nordiskt `<>`: `>` med Skift); `Ctrl+]`/`Ctrl+[` fungerar på alla
+  layouter.
+- **Autoanpassning** (`edit_fit::TextModel::autofit`, anropas bara av `commit_text`, alltså när texten ändras):
+  `Carets::carets_fit(.., Some((skala, minskning)))` lägger ut texten med ett prövat steg och ger textens höjd mot
+  rutans (`text_h`/`avail_h`). Stegen (`LADDER`): (100 %, 0), (100 %, 10 %), (100 %, 20 %), 92,5 %, 85 %, … 25 % med
+  20 % minskning. Värdet på formen behålls om det ryms och inget mjukare steg ryms; ryms det inte väljs första
+  steget som är kraftigare och ryms (annars det sista); ryms ett mjukare steg växer texten tillbaka (binärsökning,
+  eftersom "ryms" är monotont). Normalfallet kostar ett–två utläggningar per tecken. `a:normAutofit` skapas på
+  formens egen `a:bodyPr` (före `a:scene3d`/`a:sp3d`/`a:flatTx`/`a:extLst`) om den ärvdes; vid 100 % skrivs ett
+  tomt `<a:normAutofit/>`. Vertikal text, flera spalter och `wrap="none"` hoppas över (`Carets::fit_ok`).
+  `a:spAutoFit`: höjden blir textens höjd + övre och nedre insättning när texten inte ryms; krymper texten
+  minskar höjden lika mycket som texten men aldrig under det som behövs; ankaret (`ctr`, `b`) flyttar `y` så att
+  mitten respektive nederkanten står kvar (vridna former behåller överkanten). Allt skrivs i samma transaktion som
+  texten (`set_text_fit`, ett ångra-steg).
+- **Jämförelse mot PowerPoint** (`autoanpassning_mot_materialet`, ignorerat prov): av 357 former i materialet med
+  lagrad `fontScale`/`lnSpcReduction` ger en omräkning från grunden exakt samma steg i 128 (36 %), ett mildare i
+  115 och ett kraftigare i 114; det lagrade steget ryms i vår utläggning i 216 (60 %). Skillnaderna är lika många
+  åt båda hållen, så det är inget systematiskt fel i stegen utan skillnader i utläggningen (typsnitt som saknas,
+  radavstånd, att PowerPoint inte räknar om förrän man redigerar). Därför räknas värdet bara om vid textändring och
+  behålls annars om det ryms.
+- **Prov:** `edit_format.rs` (varje funktion, schemaordning), `edit_tests.rs`: `autoanpassning_*` (steg ryms/ryms
+  inte, monotont, tillbaka till 100 %, behåll värde som ryms), `spautofit_*`, `textformat_tur_och_retur_*`
+  (sparad fil går genom `validate`, öppnas igen och ritas med nya storlek, färg, justering och punkter);
+  `redigera_alla` gör också ett textformatssteg med autoanpassning.
+- **Tabellceller** (`edit_table.rs`): `geometry` räknar om rutnätet ur `a:tblGrid`, `a:tr/@h` och cellernas text
+  (raden växer som i `tables.rs`, men utan tabellformatets textstil: bara presentationens grundstilar och cellens
+  `a:lstStyle`, så markören kan stå någon punkt fel i en rubrikrad med fetstil ur formatet); `cell_at` ger cellen
+  under en punkt, `next_cell` läsordningen, `TextModel::cell_carets` markörlägena (delar `carets_core` med
+  formerna) och `set_cell_text` skriver `a:txBody` i `a:tc` (`write_cell_body`, skapas före `a:tcPr`). `TextState::cell`
+  pekar ut cellen; `commit_text` väljer `set_cell_text` och hoppar över autoanpassningen. Dubbelklick, klick på en
+  markerad tabell, `Enter` (cell 0,0) och klick i en annan cell börjar redigera; `Tab`/`Skift+Tab` går mellan celler
+  (efter sista cellen läggs ingen rad till). Tabeller som är vridna, speglade, höger-till-vänster eller har lodrät
+  celltext redigeras inte. Prov: `text_i_tabellcell_tur_och_retur`.
+- **Flera former** (`Editor::more` utöver `sel`, `selection()`): Skift/Ctrl+klick växlar, dragruta (`band`) markerar
+  det den rör, `Ctrl+A` allt. Dra en markerad form flyttar alla (`Drag::others`, ett steg); pilarna, `Delete`
+  (bakifrån), `Ctrl+D` (bakifrån, dubbletterna markeras via nya id) och ordna (en form i taget med återslagning ur id,
+  sammanslagna till ett ångra-steg) gäller alla. Storlek och vridning bara för en form (handtagen visas inte).
+  Formatraden gäller alla markerade former med text och står kvar hela redigeringsläget. Prov:
+  `flera_former_flyttas_dupliceras_och_tas_bort_i_ett_steg`.
+- **Grupper** (`edit_group.rs`): ett barn adresseras med gruppens toppnivåläge och barnets `p:cNvPr/@id`
+  (`TextState::child`). `find_child` ger barnets nod och föräldratransformen (`child_transform` är samma uträkning som
+  `render::group`: `chOff`/`chExt` mot `off`/`ext`, också för undergrupper), som `TextModel::in_parent` ger
+  `carets_fit`; `child_at` träffar översta formen under en punkt; `set_child_text` skriver `p:txBody` (och
+  `a:normAutofit`) i barnet i XML:en (söks utan att gå in i `mc:AlternateContent`). Klick markerar gruppen som förut,
+  dubbelklick går in i barnet och ett klick på ett annat barn byter. `spAutoFit` räknas inte om för grupper.
+- **Ny tabellrad:** `Tab` i sista cellen (`is_last_cell`) anropar `edit_table::add_row`: en kopia av sista raden med
+  `a:tcPr` och `a:endParaRPr` kvar, tom text, utan `a:extLst` (`a16:rowId`) och `rowSpan`/`vMerge`; formens höjd växer
+  med radens `h`. Markören går till den nya radens första cell.
+- **Tabellformatets textstil:** `tables::cell_style_list` (enda ändringen i `tables.rs`: en funktion på slutet) ger
+  formatets textstil för en cell som nivålista; `edit_table` lägger den mellan cellens `a:lstStyle` och grundstilarna,
+  som `draw_table`, både för radhöjderna och markören.
+- **Autoanpassning efter storleksändring:** `refit_after_resize` (efter en handtagsdragning av en textform): ny
+  autoanpassning ur den nya storleken (`spAutoFit`: exakt textens höjd, `f32::MAX` som tidigare höjd; `normAutofit`:
+  stegen) skrivs med `set_fit_only` och samma sammanslagningsnyckel som storleksändringen, så ett ångra-steg.
+- **Prov:** `text_i_form_i_grupp_med_skalning`, `ny_tabellrad_kopierar_sista_raden_tom`,
+  `tabellformatets_fetstil_ger_markor_som_texten`, `autoanpassning_efter_storleksandring`.
+- **Kvar:** `spAutoFit` i grupper; text i tabeller i grupper; teckensnitt, radavstånd, nivåspecifika punkttecken och
+  numrerade listor i formatraden; format på markeringen som visas blandat (raden visar värdet i körningen vid
+  markören); redigering och markering över flera tabellceller; autoanpassning efter storleksändring av flera former
+  eller en grupp.
+
+## Närmare PowerPoint på de sämsta bilderna (omgång 5, w-pfid)
+
+Utgångsläge: `integ4/scores.csv`, medel 0,8848 över 1 124 bilder. De ~40 lägsta bilderna (och de sämsta
+presentationernas medel) sågs sida vid sida med PowerPoints PDF och grupperades efter orsak.
+
+**Orsaker, rättade**
+- **`a:clrChange` saknades** (`covid-infographic-*`, 3 presentationer, dessutom `cppcon14-cheap-logging` och
+  `-parallel-overview`, `owasp-top10-2010-es`, `msrc-eko19`). Teckningar med vit botten som PowerPoint gör genomskinlig
+  täckte texten bakom sig. `apply_clr_change` i `render.rs` byter bildpunkter nära `clrFrom` (±24 per kanal, JPEG-brus)
+  mot `clrTo` med dess alfa.
+- **Formar utan platshållare använde mallens `otherStyle`.** PowerPoint använder presentationens `defaultTextStyle`
+  för sådana former (`covid-infographic-*`: mallen säger 15,3 pt, PowerPoint ritar 18 pt). `TxKind::Free` i
+  `inherit.rs` hoppar över mallens stil; tabellceller och `dt`/`ftr`/`sldNum` använder `otherStyle` som förut.
+  Presentationsmedel: covid 0,64/0,73/0,79 → 0,95/0,96/0,97.
+- **Bilder i temats fyllningsstilar** (`bgRef idx=1003` → `a:blipFill` i `a:bgFillStyleLst`) letades upp i bildens
+  relationer i stället för temats (`Theme::rels`), så bakgrunden föll tillbaka på en ensfärgad yta
+  (`cppcon16-iterator-haiku`, 0,798 → 0,875). `a:duotone` (ljushet → blandning mellan två färger) görs i
+  `Builder::duotone`, både för fyllningar och för bilder.
+- **`a:br` utan `sz`** ärver 18 pt och gjorde raden för hög i tabellceller med 9 pt text (`owasp-top10-2017-en` bild 23,
+  0,58 → 0,91). En radbrytning som är större än radens text räknas inte; en lika stor räknas som förut (att hoppa över
+  alla gjorde `cncf-overview-ja` sämre).
+
+**Orsaker som inte går att rätta (typsnitt som saknas här)**
+- Koreanska, japanska och hebreiska bilder i `owasp-top10-2017-*` (de lägsta presentationerna efter covid): PowerPoint
+  ritade med Malgun Gothic/Meiryo/Arial, här finns bara WenQuanYi/IPA/Unifont. Ändrad radbrytning och glyfformer ger
+  det låga värdet, inte layouten.
+- `ms-copilot-workshop` bild 30 (Aptos), `cppcon14-parallel-overview` bild 10 (Segoe-lik brödtext), `cppcon20`/`cppcon19`
+  (Verdana → DejaVu Sans är ~6 % bredare än typsnittet i PDF:en).
+
+**Prövat och förkastat**
+- Räkna om `normAutofit` vid ritning (nästa steg i PowerPoints stege när texten inte ryms med de sparade
+  värdena): sämre i `cppcon15-stl-algorithms-mac` (0,815 → 0,811), `cppcon19-charconv` (0,849 → 0,809) och
+  `cppcon20-stl-features` (0,857 → 0,814). PowerPoints PDF krymper ibland mer än filens värden, men inte i de fall där
+  våra typsnitt är bredare. Orsaken är inte klarlagd; `cppcon20` bild 33 och `cppcon16-iterator-haiku` bild 45 visar
+  fenomenet (PowerPoint ~92 % teckenstorlek, filen har bara `lnSpcReduction`).
+
+**Andra passet (w-pfid)**
+- **Temafyllningar via `fillRef`:** `Builder::paint` slår upp bilden i temats relationer för alla noder som ligger i
+  temats `fillStyleLst`/`bgFillStyleLst` (pekarjämförelse), inte bara för bakgrunden. `lnRef`/`effectRef` har inga
+  bildfyllningar och behövde inget.
+- **`TxKind::Free` var för grov:** att hoppa över hela `otherStyle` gjorde sex bilder sämre (`ms-workshop-dlcv` 24/25 på
+  grund av `defTabSz`, `msrc-win32k` 1/5/11/12). Nu gäller mallens `otherStyle` utom textfärgen (formens `fontRef` ska
+  gå före, `msrc-win32k` bild 5 har vit text) och teckenstorleken när den avviker mer än 10 % från `defaultTextStyle`
+  (`Master::other_free`). Tumregeln passar alla referensbilder men är inte en känd PowerPoint-regel: 15,3 mot 18 pt
+  (covid) ignoreras, 17,65 mot 18 pt (win32k) gäller.
+- **Punkt i centrerat/högerställt stycke** hänger nu lika långt före texten som i vänsterställt stycke, i stället för
+  att stå kvar vid vänstermarginalen. Referensmaterialet har inga bilder med centrerad punktlista, så ändringen är
+  prövad bara mot en minimal fixtur (`punkt_hanger_fore_centrerad_text`) och bygger på hur PowerPoint ritar sådana
+  stycken enligt minnet, inte på en referensbild.
+- **Fler av de lägsta bilderna** (`cppcon19-charconv` 8, `owasp-top10-2017-ru` 4, `cncf-overview-ja` 21): typsnittsskillnader.
+  Brödtexten är ~1 % bredare här än i PowerPoints PDF (Verdana-ersättning), vilket ger en extra radbrytning mot
+  rutans kant; ru: rubrikerna bryts annorlunda av samma skäl; ja: japanska typsnitt.
+
+**Kvar**
+- `a:clrChange` med annan färg än vitt har ingen egen provbild; toleransen är uppmätt bara på vitt.
+- `owasp-top10-2017-he` bild 21 och 4 (0,35 respektive 0,41 för LibreOffice, Kladd 0,59/0,67): inte undersökta utöver typsnitten.

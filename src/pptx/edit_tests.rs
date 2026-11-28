@@ -795,6 +795,47 @@ fn redigera_alla() {
                     step(&mut s, &mut deck, "text", &|t| edit_ops::set_text(t, 0, sh.index, sh.id, &m))?;
                 }
             }
+            // Textformat: större text, färg, justering och punkt i första formen med text, och
+            // autoanpassningen räknas om som när man skriver (samma transaktion).
+            if let Some(sh) = edit_ops::shapes(&deck, 0).into_iter().find(|s| s.kind == edit_ops::Kind::Shape && !s.alternate) {
+                let part0 = deck.slides[0].part.clone();
+                let doc = edit_xml::parse(deck.pkg.read(&part0).unwrap_or_default()).ok_or("bild 1 kan inte tolkas")?;
+                if let Some(sp) = edit_ops::raw_shape(&doc, sh.index) {
+                    let a = doc.prefix_for(edit::NS_A).unwrap_or_else(|| "a".into());
+                    let mut m = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), &a);
+                    let node = edit_ops::node(&deck, 0, sh.index);
+                    let c = node.and_then(|n| m.carets(&deck, 0, n));
+                    let fmts = c.as_ref().map(|c| c.paras.clone()).unwrap_or_default();
+                    let before = c.as_ref().map(|c| c.text_h);
+                    let end = m.end();
+                    m.step_size(Pos::default(), end, true, &fmts);
+                    m.set_color(Pos::default(), end, Some(super::edit_format::TextColor::Scheme("accent1")));
+                    m.set_align(Pos::default(), end, "ctr");
+                    m.set_bullet(Pos::default(), end, true);
+                    let fit = node.and_then(|n| m.autofit(&deck, 0, n, sh.xf, before));
+                    step(&mut s, &mut deck, "textformat", &|t| super::edit_fit::set_text_fit(t, 0, sh.index, sh.id, &m, fit, sh.xf))?;
+                }
+            }
+            // Text i första tabellcellen (första tabellen på bild 1) och flera former flyttas i ett steg.
+            if let Some(sh) = edit_ops::shapes(&deck, 0).into_iter().find(|s| super::edit_table::is_editable_table(&deck, 0, s.index)) {
+                let part0 = deck.slides[0].part.clone();
+                let doc = edit_xml::parse(deck.pkg.read(&part0).unwrap_or_default()).ok_or("bild 1 kan inte tolkas")?;
+                let a = doc.prefix_for(edit::NS_A).unwrap_or_else(|| "a".into());
+                if let Some(mut m) = super::edit_table::cell_model(&doc, sh.index, (0, 0), &a) {
+                    let end = m.end();
+                    m.insert(end, " ändrad");
+                    step(&mut s, &mut deck, "tabellcell", &|t| super::edit_table::set_cell_text(t, 0, sh.index, sh.id, (0, 0), &m))?;
+                }
+            }
+            let many: Vec<_> = edit_ops::shapes(&deck, 0).into_iter().take(3).collect();
+            if many.len() > 1 {
+                step(&mut s, &mut deck, "flytta flera", &|t| {
+                    for sh in &many {
+                        edit_ops::set_xf(t, 0, sh.index, sh.id, Xf { y: sh.xf.y + 12_700, ..sh.xf })?;
+                    }
+                    Ok(())
+                })?;
+            }
             let layout = deck.slides.first().and_then(|s| s.layout).unwrap_or(0);
             if !deck.layouts.is_empty() {
                 let after = (n > 0).then_some(0);
@@ -832,4 +873,468 @@ fn redigera_alla() {
         println!("FEL  {p}");
     }
     assert!(problems.is_empty());
+}
+
+// ------------------------------------------------------------------ textformat och autoanpassning
+
+/// Bild 1:s brödtextplatshållare (F3) med `a:normAutofit` på formen och `n` rader text.
+fn autofit_fixture(n: usize) -> (Ed, TextModel, edit_ops::ShapeInfo) {
+    let mut ed = Ed::new(fixture(true));
+    let part0 = ed.deck.slides[0].part.clone();
+    let sh = ed.shape(0, "F3");
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let frag = doc.fragment("<a:normAutofit/>").into_iter().next().unwrap();
+        let sp = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap().elems_mut().filter(|e| e.name == "p:sp").nth(1).unwrap();
+        sp.path_mut(&["p:txBody", "a:bodyPr"]).unwrap().children.push(edit_xml::XNode::Elem(frag));
+        Ok(())
+    });
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let sp = edit_ops::raw_shape(&doc, sh.index).unwrap();
+    let mut m = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), "a");
+    let rows: String = (0..n).map(|i| format!("Rad {i}\n")).collect();
+    let end = m.end();
+    m.insert(end, &format!("\n{}", rows.trim_end()));
+    (ed, m, sh)
+}
+
+/// Textens höjd och rutans höjd (punkter) med autoanpassningens värden.
+fn heights(ed: &Ed, m: &TextModel, sh: &edit_ops::ShapeInfo, fit: (f32, f32)) -> (f32, f32) {
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let c = m.carets_fit(&ed.deck, 0, node, Some(fit)).unwrap();
+    (c.text_h, c.avail_h)
+}
+
+#[test]
+fn autoanpassning_krymper_till_rutan_och_vaxer_tillbaka() {
+    use super::edit_fit::{set_text_fit, Fit, LADDER};
+    let (mut ed, mut m, sh) = autofit_fixture(30);
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let fit = m.autofit(&ed.deck, 0, node, sh.xf, None).expect("texten ryms inte: ska krympas");
+    let Fit::Norm { scale, red } = fit else { panic!("{fit:?}") };
+    assert!(scale < 1.0 && (red - 0.2).abs() < 1e-4, "{fit:?}");
+    // Texten ryms med steget och ryms inte med steget före (om det finns).
+    let (h, avail) = heights(&ed, &m, &sh, (scale, red));
+    assert!(h <= avail + 0.5, "ryms: {h} <= {avail}");
+    let at = LADDER.iter().position(|&(s, r)| (s - scale).abs() < 1e-4 && (r - red).abs() < 1e-4).unwrap();
+    if at > 0 {
+        let (h, avail) = heights(&ed, &m, &sh, LADDER[at - 1]);
+        assert!(h > avail + 0.5, "föregående steg ryms inte: {h} > {avail}");
+    }
+    // Skrivs i en transaktion; värdena hamnar på formens egen `a:normAutofit` och filen är giltig.
+    ed.apply(|t| set_text_fit(t, 0, sh.index, sh.id, &m, Some(fit), sh.xf));
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    let pct = |v: f32| (v * 100_000.0).round() as i64;
+    assert!(x.contains(&format!(r#"<a:normAutofit fontScale="{}" lnSpcReduction="20000"/>"#, pct(scale))), "{x}");
+    // Stegen är monotona: mer text ger aldrig ett mildare steg.
+    let mut m2 = m.clone();
+    let end = m2.end();
+    m2.insert(end, "\nEn rad till\nOch en till");
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    if let Some(Fit::Norm { scale: s2, .. }) = m2.autofit(&ed.deck, 0, node, sh.xf, None) {
+        assert!(s2 <= scale + 1e-4, "{s2} <= {scale}");
+    }
+    // Kortas texten ned ryms den i full storlek: värdena nollställs (`<a:normAutofit/>`).
+    m.delete(Pos { para: 1, ch: 0 }, m.end());
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let back = m.autofit(&ed.deck, 0, node, sh.xf, None);
+    assert_eq!(back, Some(Fit::Norm { scale: 1.0, red: 0.0 }));
+    ed.apply(|t| set_text_fit(t, 0, sh.index, sh.id, &m, back, sh.xf));
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert!(x.contains("<a:normAutofit/>") && !x.contains("fontScale"), "{x}");
+    // Oförändrad text ger inget nytt värde.
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    assert_eq!(m.autofit(&ed.deck, 0, node, sh.xf, None), None);
+}
+
+#[test]
+fn autoanpassning_behaller_ett_varde_som_ryms() {
+    use super::edit_fit::Fit;
+    // 90 % ur en gammal PowerPoint-fil, och texten ryms: ingenting ändras när man skriver.
+    let (mut ed, m, sh) = autofit_fixture(1);
+    let part0 = ed.deck.slides[0].part.clone();
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let sp = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap().elems_mut().filter(|e| e.name == "p:sp").nth(1).unwrap();
+        sp.path_mut(&["p:txBody", "a:bodyPr", "a:normAutofit"]).unwrap().set_attr("fontScale", "90000");
+        Ok(())
+    });
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let c = m.carets(&ed.deck, 0, node).unwrap();
+    assert!(matches!(c.autofit, super::edit_text::AutoFit::Norm { scale, .. } if (scale - 0.9).abs() < 1e-4));
+    let r = m.autofit(&ed.deck, 0, node, sh.xf, None);
+    // Mjukare steg som också ryms får användas (texten är kort), annars behålls värdet.
+    assert!(matches!(r, None | Some(Fit::Norm { .. })), "{r:?}");
+}
+
+#[test]
+fn spautofit_gor_formen_hogre_och_kortare_igen() {
+    use super::edit_fit::{set_text_fit, Fit};
+    let mut ed = Ed::new(fixture(true));
+    let xf = Xf { x: 914_400, y: 914_400, cx: 3_000_000, cy: 400_000, rot: 0, flip_h: false, flip_v: false };
+    ed.apply(|t| edit_ops::insert_textbox(t, 0, xf).map(|_| ()));
+    let sh = edit_ops::shapes(&ed.deck, 0).into_iter().find(|s| s.name.starts_with("Textruta")).unwrap();
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let sp = edit_ops::raw_shape(&doc, sh.index).unwrap();
+    let mut m = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), "a");
+    m.insert(Pos::default(), "Rad ett\nRad två\nRad tre\nRad fyra\nRad fem");
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let before = m.carets(&ed.deck, 0, node).unwrap().text_h;
+    let fit = m.autofit(&ed.deck, 0, node, sh.xf, Some(before)).expect("rutan ska växa");
+    let Fit::Shape { y, cy } = fit else { panic!("{fit:?}") };
+    assert!(cy > sh.xf.cy && y == sh.xf.y, "{fit:?}");
+    ed.apply(|t| set_text_fit(t, 0, sh.index, sh.id, &m, Some(fit), sh.xf));
+    let grown = ed.shape(0, &sh.name).xf;
+    assert_eq!(grown.cy, cy);
+    // Höjden är textens höjd plus insättningarna (45720 EMU över och under).
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let c = m.carets(&ed.deck, 0, node).unwrap();
+    let need = ((c.text_h + c.ins_tb.0 + c.ins_tb.1) as f64 * 12_700.0).round() as i64;
+    assert!((grown.cy - need).abs() < 2, "{} / {need}", grown.cy);
+    assert_valid(&ed.save());
+    // Färre rader: formen krymper (men inte under det som behövs).
+    let before = c.text_h;
+    m.delete(Pos { para: 1, ch: 0 }, m.end());
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let Some(Fit::Shape { cy: cy2, .. }) = m.autofit(&ed.deck, 0, node, grown, Some(before)) else { panic!("rutan ska krympa") };
+    assert!(cy2 < grown.cy && cy2 >= 12_700, "{cy2} < {}", grown.cy);
+    // Utan förändring av textens höjd rör sig formen inte.
+    assert_eq!(m.autofit(&ed.deck, 0, node, Xf { cy: cy2, ..grown }, Some(m.carets(&ed.deck, 0, node).unwrap().text_h)).map(|_| ()), None);
+}
+
+#[test]
+fn textformat_tur_och_retur_med_giltig_fil() {
+    use super::edit_format::TextColor;
+    let mut ed = Ed::new(fixture(true));
+    let part0 = ed.deck.slides[0].part.clone();
+    let sh = ed.shape(0, "F3");
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let sp = edit_ops::raw_shape(&doc, sh.index).unwrap();
+    let mut m = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), "a");
+    let end = m.end();
+    // Storlek ur den ärvda (32 pt på nivå 1, 28 pt på nivå 2).
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let fmts = m.carets(&ed.deck, 0, node).unwrap().paras;
+    assert!((fmts[0].runs[0].2 - 32.0).abs() < 0.01 && (fmts[1].runs[0].2 - 28.0).abs() < 0.01, "{fmts:?}");
+    assert!(fmts[0].bullet && fmts[1].bullet);
+    m.step_size(Pos::default(), end, true, &fmts);
+    m.set_color(Pos::default(), end, Some(TextColor::Scheme("accent2")));
+    m.set_align(Pos::default(), end, "ctr");
+    m.set_bullet(Pos { para: 1, ch: 0 }, Pos { para: 1, ch: 0 }, false);
+    ed.apply(|t| edit_ops::set_text(t, 0, sh.index, sh.id, &m));
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert!(x.contains(r#"sz="3600""#) && x.contains(r#"sz="3200""#) && x.contains(r#"<a:schemeClr val="accent2"/>"#) && x.contains(r#"algn="ctr""#) && x.contains("<a:buNone/>"), "{x}");
+    // Ritas igen: första stycket utan punkt får nya storleken, andra stycket saknar punkt.
+    let d = Deck::open(&out).unwrap();
+    let node = edit_ops::node(&d, 0, sh.index).unwrap();
+    let c = m.carets(&d, 0, node).unwrap();
+    assert!((c.paras[0].runs[0].2 - 36.0).abs() < 0.01 && (c.paras[1].runs[0].2 - 32.0).abs() < 0.01, "{:?}", c.paras);
+    assert_eq!(c.paras[0].align, super::text::Align::Center);
+    assert!(c.paras[0].bullet && !c.paras[1].bullet);
+    assert_eq!(c.paras[0].runs[0].3, [0xC0, 0x50, 0x4D]);
+}
+
+/// Räknar om autoanpassningen från grunden för varje form med `a:normAutofit` (med värden) i
+/// materialet under `KLADD_PPTX_SWEEP` och jämför med de lagrade värdena från PowerPoint:
+/// `KLADD_PPTX_SWEEP=mapp cargo test pptx::edit_tests::autoanpassning_mot_materialet -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn autoanpassning_mot_materialet() {
+    use super::edit_fit::LADDER;
+    let Some(root) = std::env::var_os("KLADD_PPTX_SWEEP") else { return };
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pptx")) {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new(&root), &mut files);
+    files.sort();
+    // (form, samma steg, lagrat steg ryms hos oss, vårt steg är mildare, vårt steg är hårdare)
+    let (mut n, mut same, mut stored_fits, mut milder, mut harder) = (0, 0, 0, 0, 0);
+    for f in &files {
+        let Ok(bytes) = std::fs::read(f) else { continue };
+        let Ok(deck) = Deck::open(&bytes) else { continue };
+        for slide in 0..deck.slides.len() {
+            let Some(raw) = deck.pkg.read(&deck.slides[slide].part) else { continue };
+            let Some(doc) = edit_xml::parse(raw) else { continue };
+            for sh in edit_ops::shapes(&deck, slide) {
+                if sh.kind != edit_ops::Kind::Shape || sh.alternate {
+                    continue;
+                }
+                let Some(sp) = edit_ops::raw_shape(&doc, sh.index) else { continue };
+                let Some(fit) = sp.path(&["p:txBody", "a:bodyPr", "a:normAutofit"]) else { continue };
+                let stored = (fit.attr_i64("fontScale").map_or(1.0, |v| v as f32 / 100_000.0), fit.attr_i64("lnSpcReduction").map_or(0.0, |v| v as f32 / 100_000.0));
+                if stored == (1.0, 0.0) {
+                    continue;
+                }
+                let a = doc.prefix_for(edit::NS_A).unwrap_or_else(|| "a".into());
+                let m = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), &a);
+                let Some(node) = edit_ops::node(&deck, slide, sh.index) else { continue };
+                let Some(base) = m.carets_fit(&deck, slide, node, None) else { continue };
+                if !base.fit_ok {
+                    continue;
+                }
+                n += 1;
+                let fits = |s: (f32, f32)| m.carets_fit(&deck, slide, node, Some(s)).is_some_and(|c| c.text_h <= c.avail_h + 0.5);
+                let ours = LADDER.iter().copied().find(|&s| fits(s)).unwrap_or(LADDER[LADDER.len() - 1]);
+                let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.02 && (a.1 - b.1).abs() < 0.02;
+                if near(ours, stored) {
+                    same += 1;
+                } else if ours.0 > stored.0 + 0.02 || (near((ours.0, 0.0), (stored.0, 0.0)) && ours.1 < stored.1) {
+                    milder += 1;
+                } else {
+                    harder += 1;
+                }
+                if fits(stored) {
+                    stored_fits += 1;
+                }
+            }
+        }
+    }
+    println!("{n} former med lagrad autoanpassning: samma steg {same}, vårt mildare {milder}, vårt hårdare {harder}; lagrat steg ryms hos oss i {stored_fits}");
+}
+
+// ------------------------------------------------------------------ tabellceller
+
+/// Bild 1 med en tabell (2 rader × 2 kolumner, cell (0,0) med text) längst fram.
+fn table_fixture() -> (Ed, edit_ops::ShapeInfo) {
+    let mut ed = Ed::new(fixture(true));
+    let part0 = ed.deck.slides[0].part.clone();
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let cell = |txt: &str| format!(r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p>{}</a:p></a:txBody><a:tcPr/></a:tc>"#, if txt.is_empty() { String::new() } else { format!(r#"<a:r><a:rPr lang="sv-SE"/><a:t>{txt}</a:t></a:r>"#) });
+        let xml = format!(
+            r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="40" name="Tabell"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="1000000" y="1000000"/><a:ext cx="4000000" cy="800000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr/><a:tblGrid><a:gridCol w="2000000"/><a:gridCol w="2000000"/></a:tblGrid><a:tr h="400000">{}{}</a:tr><a:tr h="400000">{}{}</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#,
+            cell("Hej"),
+            cell(""),
+            cell(""),
+            cell("")
+        );
+        let el = doc.fragment(&xml).into_iter().next().unwrap();
+        let tree = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap();
+        let at = tree.index_of("p:extLst").unwrap_or(tree.children.len());
+        tree.children.insert(at, edit_xml::XNode::Elem(el));
+        Ok(())
+    });
+    let sh = ed.shape(0, "Tabell");
+    (ed, sh)
+}
+
+#[test]
+fn text_i_tabellcell_tur_och_retur() {
+    use super::edit_table::{cell_at, cell_model, next_cell, set_cell_text};
+    let (mut ed, sh) = table_fixture();
+    // Träff: punkterna i bildens punkter (EMU / 12700).
+    let (x0, y0) = (1_000_000.0 / 12_700.0, 1_000_000.0 / 12_700.0);
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 + 10.0, y0 + 10.0), Some((0, 0)));
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 + 200.0, y0 + 10.0), Some((0, 1)));
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 + 10.0, y0 + 40.0), Some((1, 0)));
+    assert_eq!(cell_at(&ed.deck, 0, sh.index, x0 - 5.0, y0 + 10.0), None);
+    assert_eq!(next_cell(&ed.deck, 0, sh.index, (0, 1), false), Some((1, 0)));
+    assert_eq!(next_cell(&ed.deck, 0, sh.index, (1, 1), false), None);
+    assert_eq!(next_cell(&ed.deck, 0, sh.index, (0, 0), true), None);
+    // Cell (1,1): skriv text; markören står i cellen.
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let mut m = cell_model(&doc, sh.index, (1, 1), "a").unwrap();
+    m.insert(Pos::default(), "Cell text");
+    let c = m.cell_carets(&ed.deck, 0, sh.index, (1, 1)).unwrap();
+    let (a, b) = c.caret(m.end()).unwrap();
+    assert!(a.0 > x0 + 157.0 && a.0 < x0 + 315.0 && a.1 > y0 + 31.5 && b.1 < y0 + 63.0, "markör {a:?} {b:?}");
+    ed.apply(|t| set_cell_text(t, 0, sh.index, sh.id, (1, 1), &m));
+    assert!(ed.text(0).contains("Cell text"));
+    // Cell (0,0) orörd; filen giltig och oförändrad utanför tabellen.
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert!(x.contains(r#"<a:t>Hej</a:t></a:r></a:p></a:txBody><a:tcPr/>"#) && x.contains("<a:t>Cell text</a:t>"), "{x}");
+    // Texten ger raden mer höjd när den bryts: cellens markör följer den nya geometrin.
+    let mut m2 = m.clone();
+    let end = m2.end();
+    m2.insert(end, " som är så lång att den måste brytas över flera rader i cellen");
+    ed.apply(|t| set_cell_text(t, 0, sh.index, sh.id, (1, 1), &m2));
+    let c2 = m2.cell_carets(&ed.deck, 0, sh.index, (1, 1)).unwrap();
+    assert!(c2.text_h > c.text_h + 5.0, "{} > {}", c2.text_h, c.text_h);
+    assert_valid(&ed.save());
+}
+
+// ------------------------------------------------------------------ flera former
+
+#[test]
+fn flera_former_flyttas_dupliceras_och_tas_bort_i_ett_steg() {
+    let mut ed = Ed::new(fixture(true));
+    let before = edit_ops::shapes(&ed.deck, 0);
+    let pick: Vec<_> = ["Ruta", "Bild"].iter().map(|n| ed.shape(0, n)).collect();
+    // Flytta båda i en transaktion.
+    ed.apply(|t| {
+        for s in &pick {
+            edit_ops::set_xf(t, 0, s.index, s.id, Xf { x: s.xf.x + 254_000, y: s.xf.y + 127_000, ..s.xf })?;
+        }
+        Ok(())
+    });
+    for s in &pick {
+        let now = ed.shape(0, &s.name);
+        assert_eq!((now.xf.x, now.xf.y), (s.xf.x + 254_000, s.xf.y + 127_000));
+    }
+    // Duplicera bakifrån: båda får nya id, lägena före står kvar.
+    let pick: Vec<_> = ["Ruta", "Bild"].iter().map(|n| ed.shape(0, n)).collect();
+    ed.apply(|t| {
+        for s in pick.iter().rev() {
+            edit_ops::duplicate_shape(t, 0, s.index, s.id)?;
+        }
+        Ok(())
+    });
+    assert_eq!(edit_ops::shapes(&ed.deck, 0).len(), before.len() + 2);
+    assert_valid(&ed.save());
+    // Ta bort alla fyra (originalen och dubbletterna) bakifrån i ett steg.
+    let all: Vec<_> = edit_ops::shapes(&ed.deck, 0).into_iter().filter(|s| s.name == "Ruta" || s.name == "Bild" || s.name.starts_with("Ruta ") || s.name.starts_with("Bild ")).collect();
+    assert!(all.len() >= 4, "{:?}", all.iter().map(|s| &s.name).collect::<Vec<_>>());
+    ed.apply(|t| {
+        for s in all.iter().rev() {
+            edit_ops::delete_shape(t, 0, s.index, s.id)?;
+        }
+        Ok(())
+    });
+    assert_eq!(edit_ops::shapes(&ed.deck, 0).len(), before.len() - 2);
+    assert_valid(&ed.save());
+}
+
+// ------------------------------------------------------------------ grupper, ny tabellrad, tabellformat, storleksändring
+
+/// Ändrar gruppens `a:ext` så att barnen skalas (provar gruppens `chOff`/`chExt`).
+fn scale_group(ed: &mut Ed, cx: i64, cy: i64) {
+    let part0 = ed.deck.slides[0].part.clone();
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let g = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap().elems_mut().find(|e| e.name == "p:grpSp").unwrap();
+        let ext = g.path_mut(&["p:grpSpPr", "a:xfrm", "a:ext"]).unwrap();
+        ext.set_attr("cx", &cx.to_string());
+        ext.set_attr("cy", &cy.to_string());
+        Ok(())
+    });
+}
+
+#[test]
+fn text_i_form_i_grupp_med_skalning() {
+    use super::edit_group::{child_at, child_model, find_child, set_child_text};
+    let mut ed = Ed::new(fixture(true));
+    scale_group(&mut ed, 2_000_000, 1_000_000); // barnen skalas 2 × 1
+    let g = ed.shape(0, "Grupp");
+    let (gx, gy) = (5_000_000.0 / 12_700.0, 4_000_000.0 / 12_700.0);
+    // Barnet "Inre" (id 6) ligger i barnkoordinaterna 0..500000: på bilden 0..1000000 × 0..500000 från gruppens hörn.
+    assert_eq!(child_at(&ed.deck, 0, g.index, gx + 20.0, gy + 10.0), Some(6));
+    assert_eq!(child_at(&ed.deck, 0, g.index, gx + 500_000.0 * 2.0 / 12_700.0 + 20.0, gy + 10.0), None);
+    let (_, parent) = find_child(&ed.deck, 0, g.index, 6).unwrap();
+    let (px, _) = parent.apply(500_000.0 / 12_700.0, 0.0);
+    assert!((px - (gx + 2.0 * 500_000.0 / 12_700.0)).abs() < 0.01, "{px}");
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let mut m = child_model(&ed.deck, &doc, 0, g.index, 6, "a").unwrap();
+    m.insert(Pos::default(), "Gruppens text");
+    let (node, _) = find_child(&ed.deck, 0, g.index, 6).unwrap();
+    let c = m.carets(&ed.deck, 0, node).unwrap();
+    let (a, b) = c.caret(Pos::default()).unwrap();
+    // Markören står i barnets ruta på bilden (x 393,7–472,4 pt, y 314,96–354,3 pt).
+    assert!(a.0 > gx && a.0 < gx + 79.0 && a.1 >= gy - 0.5 && b.1 <= gy + 40.0, "{a:?} {b:?}");
+    ed.apply(|t| set_child_text(t, 0, g.index, g.id, 6, &m, None));
+    // Ellipsens textruta är smal, så texten bryts (tecken för tecken).
+    assert!(ed.text(0).replace(' ', "").contains("Gruppenstext"), "{}", ed.text(0));
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert!(x.contains("<a:t>Gruppens text</a:t>"), "{x}");
+    // Allt utanför barnets text är orört: gruppens xfrm har bara den ändring provet gjorde.
+    assert!(x.contains(r#"<a:ext cx="2000000" cy="1000000"/><a:chOff x="0" y="0"/><a:chExt cx="1000000" cy="1000000"/>"#), "{x}");
+}
+
+#[test]
+fn ny_tabellrad_kopierar_sista_raden_tom() {
+    use super::edit_table::{add_row, cell_model, is_last_cell};
+    let (mut ed, sh) = table_fixture();
+    assert!(is_last_cell(&ed.deck, 0, sh.index, (1, 1)) && !is_last_cell(&ed.deck, 0, sh.index, (0, 1)));
+    let mut row = 0;
+    ed.apply(|t| {
+        row = add_row(t, 0, sh.index, sh.id)?;
+        Ok(())
+    });
+    assert_eq!(row, 2);
+    assert!(is_last_cell(&ed.deck, 0, sh.index, (2, 1)));
+    let now = ed.shape(0, "Tabell");
+    assert_eq!(now.xf.cy, sh.xf.cy + 400_000);
+    let doc = edit_xml::parse(ed.deck.pkg.read(&ed.deck.slides[0].part).unwrap()).unwrap();
+    assert_eq!(cell_model(&doc, sh.index, (2, 0), "a").unwrap().text(), "");
+    let out = ed.save();
+    let x = s(part(&entries(&out), "ppt/slides/slide1.xml"));
+    assert_eq!(x.matches("<a:tr ").count(), 3, "{x}");
+    assert!(x.contains(r#"<a:tr h="400000"><a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>"#), "{x}");
+}
+
+#[test]
+fn tabellformatets_fetstil_ger_markor_som_texten() {
+    use super::edit_table::cell_model;
+    let (mut ed, sh) = table_fixture();
+    let part0 = ed.deck.slides[0].part.clone();
+    let caret_end = |ed: &Ed| {
+        let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+        let m = cell_model(&doc, sh.index, (0, 0), "a").unwrap();
+        let c = m.cell_carets(&ed.deck, 0, sh.index, (0, 0)).unwrap();
+        c.caret(m.end()).unwrap().0 .0
+    };
+    let plain = caret_end(&ed);
+    // Formatet "Medium Style 2 – Accent 1" med rubrikrad: fetstil i första raden.
+    ed.apply(|t| {
+        let doc = t.doc(&part0)?;
+        let pr = doc.fragment(r#"<a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr>"#).into_iter().next().unwrap();
+        let tbl = doc.root.path_mut(&["p:cSld", "p:spTree"]).unwrap().elems_mut().find(|e| e.name == "p:graphicFrame").unwrap().path_mut(&["a:graphic", "a:graphicData", "a:tbl"]).unwrap();
+        tbl.remove_children("a:tblPr");
+        tbl.children.insert(0, edit_xml::XNode::Elem(pr));
+        Ok(())
+    });
+    let bold = caret_end(&ed);
+    assert!(bold > plain + 0.5, "fetstil är bredare: {bold} > {plain}");
+    // Markören stämmer med den ritade texten: glyfkörningens slut.
+    let scene = super::render::slide_scene(&ed.deck, 0);
+    let run = scene.items.iter().find_map(|i| if let super::scene::Item::Glyphs(g) = i { (g.text == "Hej").then_some(g) } else { None }).expect("glyfkörning");
+    let last = run.glyphs.last().unwrap();
+    let (gx, _) = run.t.apply(last.x, 0.0);
+    assert!((bold - gx).abs() < 14.0, "markör {bold}, sista glyfens start {gx}");
+}
+
+#[test]
+fn autoanpassning_efter_storleksandring() {
+    use super::edit_fit::Fit;
+    // spAutoFit: en uttänjd ruta får tillbaka textens höjd.
+    let mut ed = Ed::new(fixture(true));
+    let xf = Xf { x: 914_400, y: 914_400, cx: 3_000_000, cy: 400_000, rot: 0, flip_h: false, flip_v: false };
+    ed.apply(|t| edit_ops::insert_textbox(t, 0, xf).map(|_| ()));
+    let sh = edit_ops::shapes(&ed.deck, 0).into_iter().find(|s| s.name.starts_with("Textruta")).unwrap();
+    let part0 = ed.deck.slides[0].part.clone();
+    let doc = edit_xml::parse(ed.deck.pkg.read(&part0).unwrap()).unwrap();
+    let mut m = TextModel::from_body(edit_ops::raw_shape(&doc, sh.index).unwrap().child("p:txBody"), &doc.root_scope(), "a");
+    m.insert(Pos::default(), "En rad");
+    let big = Xf { cy: 3_000_000, ..sh.xf };
+    ed.apply(|t| edit_ops::set_xf(t, 0, sh.index, sh.id, big));
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let Some(Fit::Shape { cy, .. }) = m.autofit(&ed.deck, 0, node, big, Some(f32::MAX)) else { panic!("ska krympa") };
+    assert!(cy < 1_000_000, "{cy}");
+    // normAutofit: en smalare ruta ger ett kraftigare steg.
+    let (mut ed, mut m, sh) = autofit_fixture(4);
+    let end = m.end();
+    m.insert(end, "\nEtt ganska långt stycke med mycket text i en enda rad");
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let wide = m.autofit(&ed.deck, 0, node, sh.xf, None);
+    let narrow = Xf { cx: sh.xf.cx / 4, ..sh.xf };
+    ed.apply(|t| edit_ops::set_xf(t, 0, sh.index, sh.id, narrow));
+    let node = edit_ops::node(&ed.deck, 0, sh.index).unwrap();
+    let Some(Fit::Norm { scale: s_narrow, .. }) = m.autofit(&ed.deck, 0, node, narrow, None) else { panic!("smal ruta ska krympa texten") };
+    let s_wide = if let Some(Fit::Norm { scale, .. }) = wide { scale } else { 1.0 };
+    assert!(s_narrow < s_wide, "{s_narrow} < {s_wide}");
 }

@@ -41,6 +41,8 @@ enum Grip {
 struct Drag {
     grip: Grip,
     shape: ShapeInfo,
+    /// De andra markerade formerna som flyttas med (bara vid `Grip::Move`).
+    others: Vec<ShapeInfo>,
     start: (f32, f32),
     cur: Xf,
 }
@@ -51,7 +53,11 @@ pub struct TextState {
     pub model: TextModel,
     pub caret: Pos,
     pub anchor: Pos,
-    carets: Option<Carets>,
+    pub(super) carets: Option<Carets>,
+    /// Cellen i en tabell när texten är en cells.
+    pub cell: Option<super::edit_table::CellAddr>,
+    /// Formen i gruppen (`p:cNvPr/@id`) när texten är en gruppforms; `sel` är då gruppen.
+    pub child: Option<u32>,
     /// Dras en markering med musen?
     selecting: bool,
 }
@@ -64,6 +70,10 @@ pub struct Editor {
     pub sel: Option<Sel>,
     drag: Option<Drag>,
     pub text: Option<TextState>,
+    /// Fler markerade former förutom `sel` (flervalsmarkering).
+    pub more: Vec<Sel>,
+    /// Dragrutan som markerar former: (start, nu) i bildens punkter.
+    band: Option<((f32, f32), (f32, f32))>,
     /// Anteckningarna under redigering (bild, text).
     notes: Option<(usize, String)>,
     /// Meddelanden till appen (text, fel?).
@@ -76,11 +86,13 @@ pub struct Editor {
     /// Redigeringslagrets id: det har tangentbordsfokus medan en form är markerad, så att Tab och
     /// pilarna går till redigeringen och inte flyttar fokus mellan knapparna.
     overlay: Option<Id>,
+    /// Formatraden (storleksfält, senast använd färg, formatet för markerad form).
+    pub(super) fmt: super::edit_bar::FormatBar,
 }
 
 impl Editor {
     pub fn new(source: Vec<u8>, deck: &Deck) -> Editor {
-        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None }
+        Editor { session: Session::new(source, deck), on: false, sel: None, drag: None, text: None, more: Vec::new(), band: None, notes: None, notices: Vec::new(), picture: None, thumb_drag: None, shapes: None, overlay: None, fmt: Default::default() }
     }
 }
 
@@ -117,8 +129,14 @@ impl PptxTab {
         if !self.edit.on {
             self.end_text();
             self.edit.sel = None;
+            self.edit.more.clear();
             self.edit.drag = None;
         }
+    }
+
+    /// Alla markerade former på aktuell bild (den första markerade först).
+    pub fn selection(&self) -> Vec<Sel> {
+        self.edit.sel.into_iter().chain(self.edit.more.iter().copied()).filter(|s| s.slide == self.current).collect()
     }
 
     /// Redigeringslagrets id (för att skilja dess fokus från textfältens).
@@ -195,7 +213,11 @@ impl PptxTab {
         }
         // Markörlägena gäller den nya presentationen.
         if let Some(ts) = &mut self.edit.text {
-            ts.carets = edit_ops::node(&self.deck, ts.sel.slide, ts.sel.index).and_then(|node| ts.model.carets(&self.deck, ts.sel.slide, node));
+            ts.carets = match (ts.cell, ts.child) {
+                (_, Some(child)) => Self::child_carets(&self.deck, ts.sel, child, &ts.model),
+                (Some(addr), _) => ts.model.cell_carets(&self.deck, ts.sel.slide, ts.sel.index, addr),
+                _ => edit_ops::node(&self.deck, ts.sel.slide, ts.sel.index).and_then(|node| ts.model.carets(&self.deck, ts.sel.slide, node)),
+            };
         }
     }
 
@@ -238,21 +260,27 @@ impl PptxTab {
 
     // ---------------------------------------------------------------- text
 
-    /// Börjar skriva i formen (markören sist, eller vid punkten).
-    pub fn begin_text(&mut self, sel: Sel, at: Option<(f32, f32)>) {
-        let Some(info) = self.shape_of(sel) else { return };
+    /// Formens text som modell, och dess markörlägen. `None` om formen inte kan få text.
+    pub(super) fn text_of(&mut self, sel: Sel) -> Option<(TextModel, Option<Carets>)> {
+        let info = self.shape_of(sel)?;
         if info.kind != Kind::Shape || info.alternate {
-            return;
+            return None;
         }
-        let Some(bytes) = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec) else { return };
+        let bytes = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec)?;
         let Some(doc) = edit_xml::parse(&bytes) else {
             self.edit.notices.push((t("Bilden kan inte ändras (XML som inte är UTF-8).").to_owned(), true));
-            return;
+            return None;
         };
-        let Some(sp) = edit_ops::raw_shape(&doc, sel.index) else { return };
+        let sp = edit_ops::raw_shape(&doc, sel.index)?;
         let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
         let model = TextModel::from_body(sp.child("p:txBody"), &doc.root_scope(), &a);
         let carets = edit_ops::node(&self.deck, sel.slide, sel.index).and_then(|n| model.carets(&self.deck, sel.slide, n));
+        Some((model, carets))
+    }
+
+    /// Börjar skriva i formen (markören sist, eller vid punkten).
+    pub fn begin_text(&mut self, sel: Sel, at: Option<(f32, f32)>) {
+        let Some((model, carets)) = self.text_of(sel) else { return };
         let mut caret = model.end();
         if let (Some(c), Some((x, y))) = (&carets, at) {
             if let Some(p) = c.hit(x, y) {
@@ -260,7 +288,86 @@ impl PptxTab {
             }
         }
         self.edit.sel = Some(sel);
-        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false });
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: None });
+    }
+
+    /// Börjar skriva i en form i en grupp (`child` = formens `p:cNvPr/@id`).
+    pub fn begin_child(&mut self, sel: Sel, child: u32, at: Option<(f32, f32)>) {
+        let Some(bytes) = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec) else { return };
+        let Some(doc) = edit_xml::parse(&bytes) else { return };
+        let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
+        let Some(model) = super::edit_group::child_model(&self.deck, &doc, sel.slide, sel.index, child, &a) else { return };
+        let carets = Self::child_carets(&self.deck, sel, child, &model);
+        self.end_text();
+        let mut caret = model.end();
+        if let (Some(c), Some((x, y))) = (&carets, at) {
+            if let Some(p) = c.hit(x, y) {
+                caret = p;
+            }
+        }
+        self.edit.sel = Some(sel);
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: None, child: Some(child) });
+    }
+
+    fn child_carets(deck: &Deck, sel: Sel, child: u32, model: &TextModel) -> Option<Carets> {
+        let (node, parent) = super::edit_group::find_child(deck, sel.slide, sel.index, child)?;
+        model.clone().in_parent(parent).carets(deck, sel.slide, node)
+    }
+
+    /// Börjar skriva i en tabellcell (markören vid punkten, annars sist).
+    pub fn begin_cell(&mut self, sel: Sel, addr: super::edit_table::CellAddr, at: Option<(f32, f32)>) {
+        if !super::edit_table::is_editable_table(&self.deck, sel.slide, sel.index) {
+            return;
+        }
+        let Some(bytes) = self.deck.pkg.read(&self.deck.slides[sel.slide].part).map(<[u8]>::to_vec) else { return };
+        let Some(doc) = edit_xml::parse(&bytes) else { return };
+        let a = doc.prefix_for(super::edit::NS_A).unwrap_or_else(|| "a".into());
+        let Some(model) = super::edit_table::cell_model(&doc, sel.index, addr, &a) else { return };
+        let carets = model.cell_carets(&self.deck, sel.slide, sel.index, addr);
+        // Bara en cell åt gången: det som skrevs i den förra är redan skrivet.
+        self.end_text();
+        let mut caret = model.end();
+        if let (Some(c), Some((x, y))) = (&carets, at) {
+            if let Some(p) = c.hit(x, y) {
+                caret = p;
+            }
+        }
+        self.edit.sel = Some(sel);
+        self.edit.text = Some(TextState { sel, model, caret, anchor: caret, carets, selecting: false, cell: Some(addr), child: None });
+    }
+
+    /// Räknar om `normAutofit`/`spAutoFit` för formen efter att den fått ny storlek (`xf`); skrivs med
+    /// samma sammanslagningsnyckel som storleksändringen så att det blir ett ångra-steg.
+    fn refit_after_resize(&mut self, slide: usize, index: usize, id: u32, xf: Xf, key: String) {
+        let Some((model, _)) = self.text_of(Sel { slide, index, id }) else { return };
+        let Some(node) = edit_ops::node(&self.deck, slide, index) else { return };
+        // `f32::MAX` som tidigare höjd: en `spAutoFit`-form får exakt textens höjd (också när den blev för hög).
+        let Some(fit) = model.autofit(&self.deck, slide, node, xf, Some(f32::MAX)) else { return };
+        self.apply(Some(key), |txn| super::edit_fit::set_fit_only(txn, slide, index, id, fit, xf));
+        self.edit.session.break_merge();
+    }
+
+    /// Står man i en tabellcell och klickar i en annan i samma tabell börjar den cellen redigeras.
+    fn switch_cell(&mut self, x: f32, y: f32) -> bool {
+        let Some(ts) = &self.edit.text else { return false };
+        let sel = ts.sel;
+        if let Some(cur) = ts.child {
+            return match super::edit_group::child_at(&self.deck, sel.slide, sel.index, x, y) {
+                Some(c) if c != cur => {
+                    self.begin_child(sel, c, Some((x, y)));
+                    true
+                }
+                _ => false,
+            };
+        }
+        let Some(cur) = ts.cell else { return false };
+        match super::edit_table::cell_at(&self.deck, sel.slide, sel.index, x, y) {
+            Some(a) if a != cur => {
+                self.begin_cell(sel, a, Some((x, y)));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Slutar skriva (formen förblir markerad).
@@ -271,17 +378,36 @@ impl PptxTab {
     }
 
     /// Skriver modellen till bilden (ett ångra-steg per textruta och skrivstund).
-    fn commit_text(&mut self) {
+    pub(super) fn commit_text(&mut self) {
         let Some(ts) = &self.edit.text else { return };
-        let (sel, model) = (ts.sel, ts.model.clone());
-        let ok = self.apply(Some(format!("text:{}:{}", sel.slide, sel.id)), |txn| edit_ops::set_text(txn, sel.slide, sel.index, sel.id, &model));
-        let _ = ok;
+        let (sel, model, before) = (ts.sel, ts.model.clone(), ts.carets.as_ref().map(|c| c.text_h));
+        if let Some(addr) = ts.cell {
+            self.apply(Some(format!("text:{}:{}:{}:{}", sel.slide, sel.id, addr.0, addr.1)), |txn| super::edit_table::set_cell_text(txn, sel.slide, sel.index, sel.id, addr, &model));
+            return;
+        }
+        if let Some(child) = ts.child {
+            // Autoanpassning (bara `a:normAutofit`) räknas om som för vanliga former.
+            let fit = super::edit_group::find_child(&self.deck, sel.slide, sel.index, child).and_then(|(n, parent)| {
+                let xf = edit_ops::shapes(&self.deck, sel.slide).into_iter().find(|s| s.index == sel.index).map(|s| s.xf)?;
+                match model.clone().in_parent(parent).autofit(&self.deck, sel.slide, n, xf, before) {
+                    Some(f @ super::edit_fit::Fit::Norm { .. }) => Some(f),
+                    _ => None,
+                }
+            });
+            self.apply(Some(format!("text:{}:{}:g{child}", sel.slide, sel.id)), |txn| super::edit_group::set_child_text(txn, sel.slide, sel.index, sel.id, child, &model, fit));
+            return;
+        }
+        let Some(info) = self.shape_of(sel) else { return };
+        // Autoanpassningen räknas om här och bara här: när texten ändras (inte när filen öppnas eller sparas).
+        let fit = edit_ops::node(&self.deck, sel.slide, sel.index).and_then(|n| model.autofit(&self.deck, sel.slide, n, info.xf, before));
+        self.apply(Some(format!("text:{}:{}", sel.slide, sel.id)), |txn| super::edit_fit::set_text_fit(txn, sel.slide, sel.index, sel.id, &model, fit, info.xf));
     }
 
     /// Tangenter och text medan man skriver i en form. Händelserna som hanteras tas bort ur kön.
     fn text_keys(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|i| i.events.clone());
         let mut handled = Vec::new();
+        let mut tab_cell = None;
         for (k, ev) in events.iter().enumerate() {
             let Some(ts) = &mut self.edit.text else { break };
             let mut changed = false;
@@ -373,6 +499,11 @@ impl PptxTab {
                             changed = true;
                             handled.push(k);
                         }
+                        Key::Tab if !m.command && ts.cell.is_some() => {
+                            // I en tabell går Tab till nästa cell och Skift+Tab till föregående.
+                            tab_cell = Some((ts.sel, ts.cell.unwrap_or_default(), shift));
+                            handled.push(k);
+                        }
                         Key::Tab if !m.command => {
                             // Nivå i punktlistor när markören står först i stycket eller flera stycken är markerade.
                             if shift || has_sel && sel_range.0.para != sel_range.1.para || ts.caret.ch == 0 {
@@ -381,6 +512,27 @@ impl PptxTab {
                                 ts.caret = ts.model.insert(ts.caret, "\t");
                                 ts.anchor = ts.caret;
                             }
+                            changed = true;
+                            handled.push(k);
+                        }
+                        Key::L | Key::E | Key::R | Key::J if m.command && !shift && !m.alt => {
+                            let algn = match key {
+                                Key::L => "l",
+                                Key::E => "ctr",
+                                Key::R => "r",
+                                _ => "just",
+                            };
+                            ts.model.set_align(ts.anchor, ts.caret, algn);
+                            changed = true;
+                            handled.push(k);
+                        }
+                        // Större/mindre text: Ctrl+Skift+> och Ctrl+Skift+< (och Ctrl+] och Ctrl+[, som
+                        // också finns i PowerPoint och inte beror på tangentbordslayouten).
+                        Key::Period | Key::Comma | Key::IntlBackslash | Key::CloseBracket | Key::OpenBracket if m.command && (shift || matches!(key, Key::CloseBracket | Key::OpenBracket | Key::IntlBackslash)) => {
+                            // `<>`-tangenten på nordiska tangentbord är IntlBackslash: `>` med Skift, `<` utan.
+                            let up = matches!(key, Key::Period | Key::CloseBracket) || *key == Key::IntlBackslash && shift;
+                            let fmts = ts.carets.as_ref().map(|c| c.paras.clone()).unwrap_or_default();
+                            ts.model.step_size(ts.anchor, ts.caret, up, &fmts);
                             changed = true;
                             handled.push(k);
                         }
@@ -418,6 +570,23 @@ impl PptxTab {
                 });
             });
         }
+        if let Some((sel, from, back)) = tab_cell {
+            if let Some(next) = super::edit_table::next_cell(&self.deck, sel.slide, sel.index, from, back) {
+                self.begin_cell(sel, next, None);
+            } else if !back && super::edit_table::is_last_cell(&self.deck, sel.slide, sel.index, from) {
+                // Tab i sista cellen lägger till en rad (som i PowerPoint) och går till dess första cell.
+                self.end_text();
+                let mut row = None;
+                if self.apply(None, |txn| {
+                    row = Some(super::edit_table::add_row(txn, sel.slide, sel.index, sel.id)?);
+                    Ok(())
+                }) {
+                    if let Some(r) = row {
+                        self.begin_cell(sel, (r, 0), None);
+                    }
+                }
+            }
+        }
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         if key(Modifiers::NONE, Key::Escape) {
             self.end_text();
@@ -430,7 +599,8 @@ impl PptxTab {
     pub(super) fn edit_keys(&mut self, ctx: &egui::Context) {
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let cmd = Modifiers::COMMAND;
-        if key(cmd, Key::E) {
+        // Ctrl+E centrerar när man skriver i en form.
+        if self.edit.text.is_none() && key(cmd, Key::E) {
             self.toggle_edit();
             return;
         }
@@ -471,12 +641,21 @@ impl PptxTab {
                 };
                 let s = &shapes[next];
                 self.edit.sel = Some(Sel { slide: self.current, index: s.index, id: s.id });
+                self.edit.more.clear();
             }
+            return;
+        }
+        if key(cmd, Key::A) {
+            // Markera alla former på bilden.
+            let all: Vec<Sel> = shapes.iter().map(|s| Sel { slide: self.current, index: s.index, id: s.id }).collect();
+            self.edit.sel = all.first().copied();
+            self.edit.more = all.iter().skip(1).copied().collect();
             return;
         }
         let Some(sel) = sel else { return };
         if key(Modifiers::NONE, Key::Escape) {
             self.edit.sel = None;
+            self.edit.more.clear();
             return;
         }
         if key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace) {
@@ -488,6 +667,10 @@ impl PptxTab {
             return;
         }
         if key(Modifiers::NONE, Key::Enter) || key(Modifiers::NONE, Key::F2) {
+            if super::edit_table::is_editable_table(&self.deck, sel.slide, sel.index) {
+                self.begin_cell(sel, (0, 0), None);
+                return;
+            }
             self.begin_text(sel, None);
             return;
         }
@@ -500,47 +683,84 @@ impl PptxTab {
             }
         }
         if d != (0, 0) {
-            if let Some(info) = self.shape_of(sel) {
-                let xf = Xf { x: info.xf.x + d.0 * NUDGE, y: info.xf.y + d.1 * NUDGE, ..info.xf };
-                self.apply(Some(format!("nudge:{}:{}", sel.slide, sel.id)), |txn| edit_ops::set_xf(txn, sel.slide, sel.index, sel.id, xf));
+            let infos = self.selected_infos();
+            if !infos.is_empty() {
+                self.apply(Some(format!("nudge:{}:{}", sel.slide, sel.id)), |txn| {
+                    for i in &infos {
+                        let xf = Xf { x: i.xf.x + d.0 * NUDGE, y: i.xf.y + d.1 * NUDGE, ..i.xf };
+                        edit_ops::set_xf(txn, sel.slide, i.index, i.id, xf)?;
+                    }
+                    Ok(())
+                });
             }
         }
     }
 
     // ---------------------------------------------------------------- åtgärder
 
+    /// De markerade formernas nuvarande läge (index kan ha ändrats): (form, index) i bildordning.
+    fn selected_infos(&mut self) -> Vec<ShapeInfo> {
+        let sel = self.selection();
+        let Some(slide) = sel.first().map(|s| s.slide) else { return Vec::new() };
+        self.shapes_on(slide).into_iter().filter(|i| sel.iter().any(|s| s.id == i.id && s.index == i.index)).collect()
+    }
+
     pub fn delete_selected(&mut self) {
-        let Some(sel) = self.edit.sel else { return };
+        let infos = self.selected_infos();
+        let Some(slide) = self.selection().first().map(|s| s.slide) else { return };
         self.end_text();
-        if self.apply(None, |txn| edit_ops::delete_shape(txn, sel.slide, sel.index, sel.id)) {
+        // Bakifrån: ett borttaget index flyttar bara formerna efter det.
+        if self.apply(None, |txn| {
+            for i in infos.iter().rev() {
+                edit_ops::delete_shape(txn, slide, i.index, i.id)?;
+            }
+            Ok(())
+        }) {
             self.edit.sel = None;
+            self.edit.more.clear();
         }
     }
 
     pub fn duplicate_selected(&mut self) {
-        let Some(sel) = self.edit.sel else { return };
+        let infos = self.selected_infos();
+        let Some(slide) = self.selection().first().map(|s| s.slide) else { return };
         self.end_text();
-        let mut new = None;
+        let mut new = Vec::new();
+        let before_ids: std::collections::HashSet<u32> = self.shapes_on(slide).iter().map(|s| s.id).collect();
         if self.apply(None, |txn| {
-            new = Some(edit_ops::duplicate_shape(txn, sel.slide, sel.index, sel.id)?);
+            // Bakifrån, så att lägena före de som dupliceras står kvar.
+            for i in infos.iter().rev() {
+                new.push(edit_ops::duplicate_shape(txn, slide, i.index, i.id)?);
+            }
             Ok(())
         }) {
-            if let Some(i) = new {
-                let s = self.shapes_on(sel.slide).into_iter().find(|s| s.index == i);
-                self.edit.sel = s.map(|s| Sel { slide: sel.slide, index: s.index, id: s.id });
-            }
+            // Dubbletterna (de nya id:n) blir markerade; lägena räknas om ur ritmodellen.
+            let shapes = self.shapes_on(slide);
+            let fresh: Vec<Sel> = shapes.iter().filter(|s| !before_ids.contains(&s.id)).map(|s| Sel { slide, index: s.index, id: s.id }).collect();
+            self.edit.sel = fresh.first().copied();
+            self.edit.more = fresh.iter().skip(1).copied().collect();
         }
     }
 
     pub fn reorder_selected(&mut self, order: Order) {
-        let Some(sel) = self.edit.sel else { return };
+        let mut infos = self.selected_infos();
+        let Some(slide) = self.selection().first().map(|s| s.slide) else { return };
         self.end_text();
-        let before: Vec<u32> = self.shapes_on(sel.slide).iter().map(|s| s.id).collect();
-        if self.apply(None, |txn| edit_ops::reorder_shape(txn, sel.slide, sel.index, sel.id, order)) {
-            let _ = before;
-            let s = self.shapes_on(sel.slide).into_iter().find(|s| s.id == sel.id);
-            self.edit.sel = s.map(|s| Sel { slide: sel.slide, index: s.index, id: s.id });
+        // Längst fram och bakåt: nedersta först; framåt och längst bak: översta först. Då behåller
+        // formerna sin ordning sinsemellan.
+        if matches!(order, Order::Forward | Order::Back) {
+            infos.reverse();
         }
+        let ids: Vec<u32> = infos.iter().map(|i| i.id).collect();
+        for id in &ids {
+            let Some(cur) = self.shapes_on(slide).into_iter().find(|s| s.id == *id) else { continue };
+            self.apply(Some(format!("order:{slide}")), |txn| edit_ops::reorder_shape(txn, slide, cur.index, cur.id, order));
+        }
+        let shapes = self.shapes_on(slide);
+        let now: Vec<Sel> = ids.iter().filter_map(|id| shapes.iter().find(|s| s.id == *id)).map(|s| Sel { slide, index: s.index, id: s.id }).collect();
+        self.edit.sel = now.first().copied();
+        self.edit.more = now.iter().skip(1).copied().collect();
+        self.edit.session.break_merge();
     }
 
     /// Ny bild efter aktuell med layouten.
@@ -678,6 +898,10 @@ impl PptxTab {
                         self.edit.sel = Some(sel);
                         if s.kind == Kind::Shape && !s.alternate {
                             self.begin_text(sel, Some((x, y)));
+                        } else if let Some(addr) = super::edit_table::cell_at(&self.deck, slide, s.index, x, y) {
+                            self.begin_cell(sel, addr, Some((x, y)));
+                        } else if let Some(c) = super::edit_group::child_at(&self.deck, slide, s.index, x, y) {
+                            self.begin_child(sel, c, Some((x, y)));
                         }
                     }
                 }
@@ -721,7 +945,7 @@ impl PptxTab {
 
         // Pekaren.
         if let Some(pt) = pointer.filter(|pt| rect.expand(ROT_GAP + HANDLE).contains(*pt)) {
-            let cursor = match sel_info.as_ref().and_then(|i| grip_at(pt, i)) {
+            let cursor = match sel_info.as_ref().filter(|_| self.edit.more.is_empty()).and_then(|i| grip_at(pt, i)) {
                 Some(Grip::Rotate) => Some(CursorIcon::Alias),
                 Some(Grip::Handle(h)) => Some(handle_cursor(h, sel_info.as_ref().map_or(0.0, |i| i.xf.rot_deg()))),
                 _ => match hit_shape(pt) {
@@ -740,7 +964,9 @@ impl PptxTab {
             if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
                 let start = to_slide(origin);
                 let in_text = text_sel.and_then(|ts| shapes.iter().find(|s| s.index == ts.index)).is_some_and(|s| s.hit(start.0, start.1, 0.0));
-                if in_text {
+                if in_text && self.switch_cell(start.0, start.1) {
+                    // Ett klick i en annan cell: den börjar redigeras.
+                } else if in_text {
                     if let Some(ts) = &mut self.edit.text {
                         if let Some(p) = ts.carets.as_ref().and_then(|c| c.hit(start.0, start.1)) {
                             ts.anchor = p;
@@ -749,7 +975,7 @@ impl PptxTab {
                         ts.selecting = true;
                     }
                 } else {
-                    let grip = sel_info.as_ref().and_then(|i| grip_at(origin, i).map(|g| (g, i.clone())));
+                    let grip = sel_info.as_ref().filter(|_| self.edit.more.is_empty()).and_then(|i| grip_at(origin, i).map(|g| (g, i.clone())));
                     let target = match grip {
                         Some(g) => Some(g),
                         None => hit_shape(origin).map(|s| (Grip::Move, s)),
@@ -759,12 +985,25 @@ impl PptxTab {
                             if grip == Grip::Move {
                                 self.end_text();
                             }
-                            self.edit.sel = Some(Sel { slide, index: shape.index, id: shape.id });
-                            self.edit.drag = Some(Drag { grip, cur: shape.xf, shape, start });
+                            let me = Sel { slide, index: shape.index, id: shape.id };
+                            let group: Vec<Sel> = self.selection();
+                            // Dras en av flera markerade former flyttas alla; annars gäller bara den.
+                            let mut others = Vec::new();
+                            if grip == Grip::Move && group.len() > 1 && group.contains(&me) {
+                                others = shapes.iter().filter(|i| i.id != shape.id && group.iter().any(|g| g.id == i.id && g.index == i.index)).cloned().collect();
+                            } else {
+                                self.edit.sel = Some(me);
+                                self.edit.more.clear();
+                            }
+                            self.edit.drag = Some(Drag { grip, cur: shape.xf, shape, others, start });
                         }
                         None => {
                             self.end_text();
-                            self.edit.sel = None;
+                            if !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+                                self.edit.sel = None;
+                                self.edit.more.clear();
+                            }
+                            self.edit.band = Some((start, start));
                         }
                     }
                 }
@@ -780,6 +1019,8 @@ impl PptxTab {
                     }
                 } else if let Some(d) = &mut self.edit.drag {
                     d.cur = drag_xf(d, (x, y), shift);
+                } else if let Some((_, end)) = &mut self.edit.band {
+                    *end = (x, y);
                 }
             }
         }
@@ -790,7 +1031,43 @@ impl PptxTab {
             if let Some(d) = self.edit.drag.take() {
                 if d.cur != d.shape.xf {
                     let (index, id, xf) = (d.shape.index, d.shape.id, d.cur);
-                    self.apply(None, |txn| edit_ops::set_xf(txn, slide, index, id, xf));
+                    let (dx, dy) = (xf.x - d.shape.xf.x, xf.y - d.shape.xf.y);
+                    let others = d.others;
+                    let resize = matches!(d.grip, Grip::Handle(_)) && d.shape.kind == Kind::Shape && !d.shape.alternate && d.shape.text;
+                    let key = resize.then(|| format!("resize:{slide}:{id}"));
+                    self.apply(key.clone(), |txn| {
+                        edit_ops::set_xf(txn, slide, index, id, xf)?;
+                        for o in &others {
+                            edit_ops::set_xf(txn, slide, o.index, o.id, Xf { x: o.xf.x + dx, y: o.xf.y + dy, ..o.xf })?;
+                        }
+                        Ok(())
+                    });
+                    // Textens autoanpassning räknas om för den nya storleken, i samma ångra-steg.
+                    if let Some(key) = key {
+                        self.refit_after_resize(slide, index, id, xf, key);
+                    }
+                }
+            }
+            if let Some(((ax, ay), (bx, by))) = self.edit.band.take() {
+                let (l, r, t, b) = (ax.min(bx), ax.max(bx), ay.min(by), ay.max(by));
+                if (r - l) > 2.0 || (b - t) > 2.0 {
+                    let hit: Vec<Sel> = shapes
+                        .iter()
+                        .filter(|s| {
+                            let [x, y, w, h] = s.xf.rect_pt();
+                            x < r && x + w > l && y < b && y + h > t
+                        })
+                        .map(|s| Sel { slide, index: s.index, id: s.id })
+                        .collect();
+                    let keep = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                    let mut all: Vec<Sel> = if keep { self.selection() } else { Vec::new() };
+                    for h in hit {
+                        if !all.contains(&h) {
+                            all.push(h);
+                        }
+                    }
+                    self.edit.sel = all.first().copied();
+                    self.edit.more = all.iter().skip(1).copied().collect();
                 }
             }
         }
@@ -800,7 +1077,9 @@ impl PptxTab {
                 let shift = ui.input(|i| i.modifiers.shift);
                 match hit_shape(pt) {
                     Some(s) if Some(Sel { slide, index: s.index, id: s.id }) == text_sel => {
-                        if let Some(ts) = &mut self.edit.text {
+                        if self.switch_cell(x, y) {
+                            // Ny cell.
+                        } else if let Some(ts) = &mut self.edit.text {
                             if let Some(p) = ts.carets.as_ref().and_then(|c| c.hit(x, y)) {
                                 ts.caret = p;
                                 if !shift {
@@ -809,19 +1088,41 @@ impl PptxTab {
                             }
                         }
                     }
+                    Some(s) if ui.input(|i| i.modifiers.shift || i.modifiers.command) => {
+                        // Skift/Ctrl+klick lägger till eller tar bort formen i markeringen.
+                        let me = Sel { slide, index: s.index, id: s.id };
+                        let mut all = self.selection();
+                        match all.iter().position(|a| *a == me) {
+                            Some(i) => {
+                                all.remove(i);
+                            }
+                            None => all.push(me),
+                        }
+                        self.end_text();
+                        self.edit.sel = all.first().copied();
+                        self.edit.more = all.iter().skip(1).copied().collect();
+                    }
                     Some(s) => {
                         let new = Sel { slide, index: s.index, id: s.id };
-                        let again = self.edit.sel == Some(new);
+                        let again = self.edit.sel == Some(new) && self.edit.more.is_empty();
                         self.end_text();
                         self.edit.sel = Some(new);
+                        self.edit.more.clear();
                         // Ett andra klick på en markerad form med text börjar skriva.
                         if again && s.kind == Kind::Shape && !s.alternate && (s.text || s.empty_ph) {
                             self.begin_text(new, Some((x, y)));
+                        } else if again && s.kind == Kind::Frame {
+                            if let Some(addr) = super::edit_table::cell_at(&self.deck, slide, s.index, x, y) {
+                                self.begin_cell(new, addr, Some((x, y)));
+                            }
                         }
                     }
                     None => {
                         self.end_text();
-                        self.edit.sel = None;
+                        if !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+                            self.edit.sel = None;
+                            self.edit.more.clear();
+                        }
                     }
                 }
             }
@@ -829,10 +1130,23 @@ impl PptxTab {
         if resp.double_clicked() {
             if let Some(pt) = resp.interact_pointer_pos() {
                 let (x, y) = to_slide(pt);
-                if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate) {
+                let table = |me: &Self, s: &ShapeInfo| s.kind == Kind::Frame && super::edit_table::is_editable_table(&me.deck, slide, s.index) || s.kind == Kind::Group && !s.alternate && super::edit_group::is_group(&me.deck, slide, s.index);
+                if let Some(s) = hit_shape(pt).filter(|s| s.kind == Kind::Shape && !s.alternate || table(self, s)) {
                     let sel = Sel { slide, index: s.index, id: s.id };
                     if text_sel != Some(sel) {
-                        self.begin_text(sel, Some((x, y)));
+                        if s.kind == Kind::Frame {
+                            if let Some(addr) = super::edit_table::cell_at(&self.deck, slide, s.index, x, y) {
+                                self.begin_cell(sel, addr, Some((x, y)));
+                            }
+                        } else if s.kind == Kind::Group {
+                            if let Some(c) = super::edit_group::child_at(&self.deck, slide, s.index, x, y) {
+                                self.begin_child(sel, c, Some((x, y)));
+                            }
+                        } else {
+                            self.begin_text(sel, Some((x, y)));
+                        }
+                    } else if self.switch_cell(x, y) {
+                        // Ny cell.
                     } else if let Some(ts) = &mut self.edit.text {
                         // Dubbelklick i texten markerar ordet.
                         let a = ts.model.word(ts.caret, false);
@@ -916,13 +1230,21 @@ impl PptxTab {
                 outline(&painter, &h, h.xf, Stroke::new(1.0, accent.gamma_multiply(0.6)));
             }
         }
+        // De andra markerade formerna (flervalsmarkering): bara kontur, och de flyttas med den som dras.
+        let moved = self.edit.drag.as_ref().filter(|d| d.grip == Grip::Move).map(|d| (d.cur.x - d.shape.xf.x, d.cur.y - d.shape.xf.y));
+        for m in self.edit.more.iter().filter(|m| m.slide == slide) {
+            if let Some(i) = shapes.iter().find(|i| i.id == m.id && i.index == m.index) {
+                let xf = moved.map_or(i.xf, |(dx, dy)| Xf { x: i.xf.x + dx, y: i.xf.y + dy, ..i.xf });
+                outline(&painter, i, xf, Stroke::new(1.5, accent));
+            }
+        }
         // Markeringen med handtag (eller konturen som dras).
         let show = self.edit.drag.as_ref().map(|d| (d.shape.clone(), d.cur)).or(sel_info.clone().map(|s| (s.clone(), s.xf)));
         if let Some((info, xf)) = show {
             let in_text = text_sel.is_some_and(|t| t.index == info.index);
             let shown = ShapeInfo { xf, ..info.clone() };
             outline(&painter, &shown, xf, Stroke::new(if in_text { 1.0 } else { 1.5 }, accent));
-            if !in_text {
+            if !in_text && self.edit.more.is_empty() {
                 for (i, (x, y)) in handle_points(&shown).into_iter().enumerate() {
                     if info.kind == Kind::Connector && i % 2 == 1 {
                         continue;
@@ -938,6 +1260,11 @@ impl PptxTab {
                     painter.circle(to_screen(rx, ry), HANDLE / 2.0 + 1.0, Color32::WHITE, Stroke::new(1.2, accent));
                 }
             }
+        }
+        if let Some(((ax, ay), (bx, by))) = self.edit.band {
+            let r = Rect::from_two_pos(to_screen(ax, ay), to_screen(bx, by));
+            painter.rect_filled(r, 0.0, accent.gamma_multiply(0.12));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0, accent), egui::StrokeKind::Middle);
         }
         // Texten: markering och markör.
         if let Some(ts) = self.edit.text.as_ref().filter(|t| t.sel.slide == slide) {
@@ -1199,7 +1526,7 @@ mod tests {
 
     fn drag(grip: Grip, xf: Xf) -> Drag {
         let shape = ShapeInfo { index: 0, id: 1, name: String::new(), kind: Kind::Shape, xf, ph: None, text: true, empty_ph: false, alternate: false };
-        Drag { grip, shape, start: (0.0, 0.0), cur: xf }
+        Drag { grip, shape, others: Vec::new(), start: (0.0, 0.0), cur: xf }
     }
 
     const PT: i64 = 12_700;

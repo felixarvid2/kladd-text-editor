@@ -34,13 +34,7 @@ pub fn lay_out(sheets: &Sheets<'_>, parts: &Parts<'_>, w: f64, h: f64) -> Option
     // Ett fel i motorn får aldrig hindra presentationen från att öppnas: då används reserven.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let model = data::Model::new(parts.data);
-        let t = tree::Tree::build(&model, parts.layout)?;
-        // Hierarkierna (organisationsschema) stämmer ännu inte med PowerPoint (se `docs/dev/pptx.md`):
-        // där är reserven bättre.
-        if t.uses_hierarchy() {
-            return None;
-        }
-        let mut t = t;
+        let mut t = tree::Tree::build(&model, parts.layout)?;
         t.run(w, h);
         let em = emit::Emitter { tree: &t, sheets, styles: emit::Styles { quick: parts.quick_style, colors: parts.colors } };
         let sp_tree = em.emit()?;

@@ -147,6 +147,21 @@ impl Show {
         self.step = 0;
     }
 
+    /// Hoppar till bilden `slide` (index i presentationen), från dess början. En dold bild visas om man
+    /// hoppar dit (som en länk eller ett bildnummer i PowerPoint) och tas då med i ordningen.
+    pub fn goto(&mut self, slide: usize) {
+        self.blank = None;
+        self.end = false;
+        self.pos = match self.order.binary_search(&slide) {
+            Ok(p) => p,
+            Err(p) => {
+                self.order.insert(p, slide);
+                p
+            }
+        };
+        self.step = 0;
+    }
+
     /// Bildspelets plats i ordningen (för föredragsvyns "bild 3 av 12").
     pub fn position(&self) -> (usize, usize) {
         (self.pos, self.order.len())
@@ -265,6 +280,8 @@ pub struct Playback {
     media: VecDeque<MediaCmd>,
     /// Mediakommandon som ska ges vid en viss tid (bild, tid, kommando).
     sched: Vec<(usize, f64, MediaCmd)>,
+    /// Bilden som visades före den aktuella (åtgärden "senast visade bilden").
+    viewed: Option<usize>,
 }
 
 impl Playback {
@@ -272,7 +289,7 @@ impl Playback {
     pub fn new(show: Show, timing: Vec<SlideTiming>, now: f64) -> Playback {
         let steps = timing.iter().map(SlideTiming::clicks).collect();
         let show = show.with_steps(steps);
-        let mut p = Playback { show, timing, phase: Phase::Rest, step_start: now, trig_slide: None, trig_runs: Vec::new(), media: VecDeque::new(), sched: Vec::new() };
+        let mut p = Playback { show, timing, phase: Phase::Rest, step_start: now, trig_slide: None, trig_runs: Vec::new(), media: VecDeque::new(), sched: Vec::new(), viewed: None };
         p.enter_slide(None, now);
         p
     }
@@ -386,6 +403,20 @@ impl Playback {
 
     /// Framåt (`click` = musklick; `advClick="0"` gör att klick inte byter bild). Falskt = avsluta.
     pub fn next(&mut self, now: f64, click: bool) -> bool {
+        let from = self.show.slide();
+        let keep = self.next_inner(now, click);
+        self.note_move(from);
+        keep
+    }
+
+    /// Minns bilden vi lämnade (för "senast visade bilden").
+    fn note_move(&mut self, from: usize) {
+        if self.show.slide() != from {
+            self.viewed = Some(from);
+        }
+    }
+
+    fn next_inner(&mut self, now: f64, click: bool) -> bool {
         let before = (self.show.screen(), self.show.step());
         if click && self.show.blank.is_none() && !self.show.end {
             let s = self.show.slide();
@@ -416,7 +447,9 @@ impl Playback {
 
     /// Bakåt: föregående steg i vila (ingen animering eller övergång).
     pub fn prev(&mut self, now: f64) {
+        let from = self.show.slide();
         self.show.prev();
+        self.note_move(from);
         self.sched.clear();
         self.phase = Phase::Rest;
         self.step_start = now;
@@ -424,10 +457,31 @@ impl Playback {
 
     /// Hoppar (Home/End, svart/vit skärm …) utan övergång.
     pub fn jump(&mut self, now: f64, f: impl FnOnce(&mut Show)) {
+        let from = self.show.slide();
         f(&mut self.show);
+        self.note_move(from);
         self.sched.clear();
         self.phase = Phase::Rest;
         self.step_start = now;
+    }
+
+    /// Hoppar till bilden `slide` (länk eller bildnummer): bildens övergång och animeringar spelas som
+    /// vid ett vanligt bildbyte.
+    pub fn goto(&mut self, now: f64, slide: usize) {
+        let from = (self.show.screen(), self.show.step());
+        let was = self.show.slide();
+        self.show.goto(slide);
+        self.note_move(was);
+        self.sched.clear();
+        match from {
+            (Screen::Slide(a), sa) if a != slide => self.enter_slide(Some((a, sa)), now),
+            _ => self.enter_slide(None, now),
+        }
+    }
+
+    /// Bilden som visades före den aktuella.
+    pub fn last_viewed(&self) -> Option<usize> {
+        self.viewed
     }
 
     /// Flyttar fram tiden: övergång → självstartande animeringar → vila, och automatisk övergång efter

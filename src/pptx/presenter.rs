@@ -22,10 +22,12 @@ use egui::{Align2, Color32, CursorIcon, FontFamily, FontId, Key, Modifiers, Pain
 
 use super::anim::{MediaCmd, MediaShape, State, Target, Timeline};
 use super::anim_layers::{self, LayerKind};
-use super::media_play::MediaHub;
+use super::media_model::Crop;
+use super::media_play::{MediaHub, VideoDraw};
 use super::scene::Affine;
 use super::edit_ops::{self, ShapeInfo};
 use super::morph;
+use super::show_links::{self, Action, SlideLinks};
 use super::slideshow::{Blank, Frame, Playback, Screen, Show, SlideState, SlideTiming, Timer, TriggerTiming, clock_text};
 use super::transition::{self, Kind, Layer, Transition};
 use super::Deck;
@@ -36,6 +38,22 @@ use crate::tf;
 const MAX_JOBS: usize = 2;
 /// Pekaren göms när musen stått still så här länge.
 const HIDE_POINTER: Duration = Duration::from_secs(2);
+
+/// Så länge en påbörjad bildnummerinmatning väntar på Enter.
+const DIGITS_TIMEOUT: Duration = Duration::from_secs(4);
+
+const DIGIT_KEYS: [(Key, char); 10] = [
+    (Key::Num0, '0'),
+    (Key::Num1, '1'),
+    (Key::Num2, '2'),
+    (Key::Num3, '3'),
+    (Key::Num4, '4'),
+    (Key::Num5, '5'),
+    (Key::Num6, '6'),
+    (Key::Num7, '7'),
+    (Key::Num8, '8'),
+    (Key::Num9, '9'),
+];
 
 /// Ett renderat lager som textur.
 struct Tex {
@@ -117,6 +135,16 @@ pub struct ShowView {
     last_real: f64,
     /// Ljud och video (`media_play.rs`).
     hub: MediaHub,
+    /// Länkar och åtgärdsknappar per bild (byggs första gången bilden klickas eller hålls över).
+    links: HashMap<usize, Arc<SlideLinks>>,
+    /// Länkområdet som pekaren är över (bild, område), så att `hlinkHover` bara utförs när pekaren kommer in.
+    hover_link: Option<(usize, usize)>,
+    /// En `hlinkHover`-åtgärd har just utförts: ingen ny förrän pekaren rört sig (annars kan två bilder med
+    /// knappar på samma plats skicka fram och tillbaka).
+    hover_hold: bool,
+    /// Siffror som skrivits för att hoppa till en bild (Enter hoppar) och när den senaste skrevs.
+    digits: String,
+    digits_at: Instant,
 }
 
 impl ShowView {
@@ -170,12 +198,24 @@ impl ShowView {
             wheel: 0.0,
             stalled: 0.0,
             last_real: 0.0,
+            links: HashMap::new(),
+            hover_link: None,
+            hover_hold: false,
+            digits: String::new(),
+            digits_at: Instant::now(),
         }
     }
 
     /// Startar med föredragsvyn (Alt+F5 i vyn, som i PowerPoint).
     pub fn with_presenter(mut self, on: bool) -> ShowView {
         self.presenter = on;
+        self
+    }
+
+    /// Presentationens katalog: länkade mediafiler med relativ sökväg läses därifrån.
+    pub fn with_media_dir(mut self, dir: Option<std::path::PathBuf>) -> ShowView {
+        let hub = std::mem::replace(&mut self.hub, MediaHub::new(self.deck.clone(), false));
+        self.hub = hub.with_base_dir(dir);
         self
     }
 
@@ -247,17 +287,88 @@ impl ShowView {
         if ctx.is_some_and(|c| self.media_click(c, rect, pos)) {
             return true;
         }
+        // En länk eller åtgärdsknapp (utlösare och media går före).
+        if let Some(a) = pos.and_then(|p| self.link_at(rect, p)).and_then(|(_, l)| l.click) {
+            return self.run_action(a, now);
+        }
         self.play.next(now, true)
     }
 
-    /// Handen över en utlösare.
-    fn hover_trigger(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) {
+    /// Länkarna på bild `slide`.
+    fn links_of(&mut self, slide: usize) -> Arc<SlideLinks> {
+        let deck = self.deck.clone();
+        self.links.entry(slide).or_insert_with(|| Arc::new(show_links::of_slide(&deck, slide))).clone()
+    }
+
+    /// Länken under `pos` (skärmläge) när bilden ritas i `rect`: (bild, område) och dess åtgärder. En form som
+    /// en animering döljer går inte att klicka på.
+    fn link_at(&mut self, rect: Rect, pos: Pos2) -> Option<((usize, usize), show_links::Link)> {
+        let frame = self.play.frame(self.now());
+        let (slide, cur) = (self.media_slide(&frame)?, frame.cur.as_ref()?);
+        if rect.width() <= 0.0 || !rect.contains(pos) {
+            return None;
+        }
+        let links = self.links_of(slide);
+        let k = self.deck.size_pt().0 / rect.width();
+        let (px, py) = ((pos.x - rect.left()) * k, (pos.y - rect.top()) * k);
+        let tls = &self.timelines;
+        let (n, area) = links.at(px, py, &|id| Self::media_opacity(tls, cur, id) > 0.0)?;
+        Some(((slide, n), area.link.clone()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_action_for_test(&mut self, a: Action, now: f64) -> bool {
+        self.run_action(a, now)
+    }
+
+    /// Utför en länkåtgärd. Falskt = avsluta bildspelet.
+    fn run_action(&mut self, a: Action, now: f64) -> bool {
+        match a {
+            Action::Next => return self.play.next(now, false),
+            Action::Prev => self.play.prev(now),
+            Action::First => self.play.jump(now, Show::first),
+            Action::Last => self.play.jump(now, Show::last),
+            Action::LastViewed => {
+                if let Some(s) = self.play.last_viewed() {
+                    self.play.goto(now, s);
+                }
+            }
+            Action::End => return false,
+            Action::Slide(i) => self.play.goto(now, i),
+            Action::Url(u) => {
+                if let Err(e) = crate::platform::open(std::path::Path::new(&u)) {
+                    eprintln!("Kladd: kunde inte öppna länken {u}: {e}");
+                }
+            }
+        }
+        true
+    }
+
+    /// Handen över en utlösare eller länk; en länk med `hlinkHover` utförs när pekaren kommer in. Falskt = avsluta.
+    fn hover_trigger(&mut self, ctx: &egui::Context, rect: Rect, pos: Option<Pos2>) -> bool {
+        let mut keep = true;
         if pos.and_then(|p| self.trigger_at(rect, p)).is_some() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let over = pos.and_then(|p| self.link_at(rect, p));
+        if over.is_some() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let key = over.as_ref().map(|(k, _)| *k);
+        if ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+            self.hover_hold = false;
+        }
+        if key != self.hover_link {
+            self.hover_link = key;
+            if let Some(a) = over.and_then(|(_, l)| l.hover).filter(|_| !self.hover_hold) {
+                self.hover_hold = true;
+                keep = self.run_action(a, self.now());
+            }
         }
         if let Some(s) = self.media_slide(&self.play.frame(self.now())) {
             self.hub.hover(ctx, s, rect, self.deck.size_pt().0, pos);
         }
+        keep
     }
 
     /// Tangenterna (från publikens fönster och föredragsvyns). Falskt = avsluta.
@@ -269,6 +380,36 @@ impl ShowView {
         }
         if key(Modifiers::ALT, Key::F5) {
             self.presenter = !self.presenter;
+        }
+        // Siffror + Enter hoppar till bildnumret (som PowerPoint); en gammal inmatning glöms efter några sekunder.
+        if !self.digits.is_empty() && self.digits_at.elapsed() > DIGITS_TIMEOUT {
+            self.digits.clear();
+        }
+        for (k, d) in DIGIT_KEYS {
+            if key(Modifiers::NONE, k) {
+                if self.digits.len() < 5 {
+                    self.digits.push(d);
+                }
+                self.digits_at = Instant::now();
+            }
+        }
+        if !self.digits.is_empty() {
+            if key(Modifiers::NONE, Key::Enter) {
+                let n: usize = std::mem::take(&mut self.digits).parse().unwrap_or(0);
+                if n >= 1 && n <= self.deck.slides.len() {
+                    self.play.goto(now, n - 1);
+                }
+                return true;
+            }
+            if key(Modifiers::NONE, Key::Backspace) {
+                self.digits.pop();
+                return true;
+            }
+            // Annan navigering avbryter inmatningen.
+            let nav = [Key::ArrowRight, Key::ArrowDown, Key::ArrowLeft, Key::ArrowUp, Key::PageDown, Key::PageUp, Key::Space, Key::Home, Key::End, Key::N, Key::P];
+            if nav.iter().any(|k| ctx.input(|i| i.key_pressed(*k))) {
+                self.digits.clear();
+            }
         }
         // Skift-varianterna först: `consume_key` bryr sig inte om extra Skift.
         let prev = key(Modifiers::SHIFT, Key::Space)
@@ -324,6 +465,11 @@ impl ShowView {
             _ => None,
         };
         self.hub.on_position(at);
+        // Mediaformerna på bilder som ritas (för `showWhenStopped` och videobilden i formens lager).
+        let frame = self.play.frame(now);
+        for s in [frame.cur.as_ref().map(|c| c.slide), frame.transition.as_ref().and_then(|(o, _, _)| o.as_ref().map(|o| o.slide)), self.play.show.peek_next().map(|n| n.0)].into_iter().flatten() {
+            self.hub.ensure(s);
+        }
         let slide = self.play.show.slide();
         for c in self.take_media() {
             self.hub.apply(&ctx, slide, c);
@@ -380,9 +526,9 @@ impl ShowView {
         // Mus: klick framåt (på en mediaform utan utlösare: spela/paus), högerklick bakåt, hjulet bläddrar.
         let now = self.now();
         let mut keep = true;
-        self.hover_trigger(&ctx, slide_rect, resp.hover_pos());
+        keep &= self.hover_trigger(&ctx, slide_rect, resp.hover_pos());
         if resp.clicked_by(PointerButton::Primary) {
-            keep = self.click_slide_in(Some(&ctx), slide_rect, resp.interact_pointer_pos(), now);
+            keep &= self.click_slide_in(Some(&ctx), slide_rect, resp.interact_pointer_pos(), now);
         } else if resp.clicked_by(PointerButton::Secondary) {
             self.play.prev(now);
         }
@@ -393,6 +539,14 @@ impl ShowView {
         } else if self.wheel >= 60.0 {
             self.wheel = 0.0;
             self.play.prev(now);
+        }
+        // Inskrivet bildnummer nere till vänster (som PowerPoint).
+        if !self.digits.is_empty() {
+            let pos = pos2(rect.left() + 16.0, rect.bottom() - 16.0);
+            let g = painter.text(pos, Align2::LEFT_BOTTOM, &self.digits, FontId::proportional(28.0), Color32::WHITE);
+            painter.rect_filled(g.expand(6.0), 6.0, Color32::from_black_alpha(160));
+            painter.text(pos, Align2::LEFT_BOTTOM, &self.digits, FontId::proportional(28.0), Color32::WHITE);
+            ctx.request_repaint_after(DIGITS_TIMEOUT);
         }
         // Pekaren göms när musen står still.
         if ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed()) {
@@ -492,7 +646,7 @@ impl ShowView {
         let plan = anim_layers::plan(&kinds, &|i| self.layer_state(st, prep.layers[i].kind, prep.layers[i].geom));
         for (l, state) in prep.layers.iter().zip(plan) {
             let Some(state) = state else { continue };
-            self.draw_layer(&cv, l, &state, &Affine::IDENTITY, alpha);
+            self.draw_layer(&cv, st.slide, l, &state, &Affine::IDENTITY, alpha);
         }
     }
 
@@ -514,8 +668,16 @@ impl ShowView {
     }
 
     /// Ritar ett lager i tillståndet `state`; `extra` (punkter på bilden) flyttar det ytterligare (morph).
-    fn draw_layer(&self, cv: &Canvas, l: &Tex, state: &State, extra: &Affine, alpha: f32) {
+    fn draw_layer(&self, cv: &Canvas, slide: usize, l: &Tex, state: &State, extra: &Affine, alpha: f32) {
         if !state.drawn() {
+            return;
+        }
+        // En videoform med `showWhenStopped="0"` syns bara medan videon spelas.
+        let video_id = match l.kind {
+            LayerKind::Target(Target { shape, para: None }) => Some(shape),
+            _ => None,
+        };
+        if video_id.is_some_and(|id| self.hub.hidden_when_stopped(slide, id)) {
             return;
         }
         let (kx, ky, rect, scr) = (cv.kx, cv.ky, cv.rect, cv.scr);
@@ -556,6 +718,61 @@ impl ShowView {
         if !mesh.is_empty() {
             cv.painter.add(egui::Shape::mesh(mesh));
         }
+        // Videons bildruta ovanpå stillbilden: samma lager, så den följer formens animering, övergångens
+        // flyttning och klippning, morph och vridning, och ligger under formerna ovanför.
+        if let Some(v) = video_id.and_then(|id| self.hub.video_draw(slide, id)) {
+            self.draw_video(cv, &v, state, &anim, extra, alpha);
+        }
+    }
+
+    /// Ritar videobilden `v` som formens rektangel (vriden och speglad som formen, beskuren som dess geometri).
+    fn draw_video(&self, cv: &Canvas, v: &VideoDraw, state: &State, anim: &Affine, extra: &Affine, alpha: f32) {
+        let [x, y, w, h] = v.rect;
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let base = Affine::scale(w, h).then(&Affine::rotate_at(v.rot_deg, w / 2.0, h / 2.0)).then(&Affine::translate(x, y));
+        let a = base.then(anim).then(extra);
+        let Some(inv) = a.invert() else { return };
+        let square = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let reveal = match state.reveal {
+            Some((r, p)) => transition::reveal(r, p, w / h.max(0.01)),
+            None => vec![square],
+        };
+        let crop = crop_polygon(v.crop, w, h);
+        let color = Color32::from_white_alpha((state.opacity * alpha * 255.0).round().clamp(0.0, 255.0) as u8);
+        let mut mesh = egui::Mesh::with_texture(v.tex);
+        for poly in reveal {
+            let poly = match &crop {
+                Some(c) => clip_convex(&poly, c),
+                None => poly,
+            };
+            let mut pts: Vec<[f32; 2]> = poly.iter().map(|q| { let (px, py) = a.apply(q[0], q[1]); [px, py] }).collect();
+            if let Some(c) = &cv.clip {
+                pts = clip_convex(&pts, c);
+            }
+            if pts.len() < 3 {
+                continue;
+            }
+            let first = mesh.vertices.len() as u32;
+            for p in &pts {
+                let (mut u, mut vv) = inv.apply(p[0], p[1]);
+                if v.flip_h {
+                    u = 1.0 - u;
+                }
+                if v.flip_v {
+                    vv = 1.0 - vv;
+                }
+                let (dx, dy) = cv.to_dst.apply(p[0], p[1]);
+                mesh.vertices.push(egui::epaint::Vertex { pos: pos2(cv.rect.left() + dx * cv.scr, cv.rect.top() + dy * cv.scr), uv: pos2(u, vv), color });
+            }
+            for k in 1..pts.len() as u32 - 1 {
+                mesh.add_triangle(first, first + k, first + k + 1);
+            }
+        }
+        if !mesh.is_empty() {
+            cv.painter.add(egui::Shape::mesh(mesh));
+        }
     }
 
     /// Ritar en morph-bildruta (förloppet `p`): `false` om lagren inte är renderade än.
@@ -569,7 +786,7 @@ impl ShowView {
             let (prep, st) = if op.which == morph::Which::Old { (&m.old, old) } else { (&m.new, cur) };
             for l in prep.layers.iter().filter(|l| morph::belongs(l.kind, op.shape)) {
                 let state = self.layer_state(st, l.kind, l.geom);
-                self.draw_layer(&cv, l, &state, &op.map, op.alpha);
+                self.draw_layer(&cv, st.slide, l, &state, &op.map, op.alpha);
             }
         }
         true
@@ -701,7 +918,7 @@ impl ShowView {
         }
         // Klick på aktuell bild går framåt.
         let resp = ui.interact(cur_rect, ui.scope_id().with("kladd-pptx-presenter-cur"), Sense::click());
-        self.hover_trigger(&ctx, cur_rect, resp.hover_pos());
+        keep &= self.hover_trigger(&ctx, cur_rect, resp.hover_pos());
         if resp.clicked() {
             keep &= self.click_slide_in(Some(&ctx), cur_rect, resp.interact_pointer_pos(), now);
         }
@@ -785,6 +1002,16 @@ impl ShowView {
         }
     }
 
+    /// Lagermålen för bild `i`: de animerade och videoformerna (som får eget lager så att videobilden hamnar i
+    /// formens ritordning och följer dess animering).
+    fn layer_targets(&self, i: usize) -> Vec<Target> {
+        let mut v = self.timelines.get(i).map(|t| t.targets()).unwrap_or_default();
+        v.extend(self.media.get(i).into_iter().flatten().filter(|m| m.video).map(|m| Target { shape: m.id, para: None }));
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// Släpper bilder som inte behövs och startar renderingar av de som saknas (aktuell bild först).
     fn retain_and_dispatch(&mut self, ctx: &egui::Context) {
         let frame = self.play.frame(self.now());
@@ -821,7 +1048,7 @@ impl ShowView {
             }
             self.morph_pending.insert(key);
             let deck = self.deck.clone();
-            let (to, tn) = (self.timelines.get(key.0).cloned().unwrap_or_default(), self.timelines.get(key.1).cloned().unwrap_or_default());
+            let (to, tn) = (self.layer_targets(key.0), self.layer_targets(key.1));
             let tx = self.morph_tx.clone();
             let ctx = ctx.clone();
             let (sw, sh) = deck.size_pt();
@@ -829,8 +1056,8 @@ impl ShowView {
             let height = ((width as f32) * sh / sw.max(1.0)).round().clamp(1.0, 8192.0) as u32;
             let _ = std::thread::Builder::new().name("pptx-morph".into()).stack_size(8 << 20).spawn(move || {
                 let ready = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let a = morph::Side::build(&deck, key.0, &to.targets(), width, height);
-                    let b = morph::Side::build(&deck, key.1, &tn.targets(), width, height);
+                    let a = morph::Side::build(&deck, key.0, &to, width, height);
+                    let b = morph::Side::build(&deck, key.1, &tn, width, height);
                     (morph::plan(&a, &b), a.layers, b.layers)
                 }))
                 .ok();
@@ -849,6 +1076,7 @@ impl ShowView {
             self.pending.insert(i);
             let deck = self.deck.clone();
             let tl = self.timelines.get(i).cloned().unwrap_or_default();
+            let targets = self.layer_targets(i);
             let tx = self.tx.clone();
             let ctx = ctx.clone();
             let (sw, sh) = deck.size_pt();
@@ -857,7 +1085,7 @@ impl ShowView {
             let _ = std::thread::Builder::new().name("pptx-bildspel".into()).stack_size(8 << 20).spawn(move || {
                 let layers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let scene = super::render::slide_scene(&deck, i);
-                    let split = anim_layers::split_units(&scene, &tl.targets(), &tl.unit_scopes());
+                    let split = anim_layers::split_units(&scene, &targets, &tl.unit_scopes());
                     anim_layers::render(&scene, &split, width, height)
                 }))
                 .ok();
@@ -884,6 +1112,33 @@ pub fn timings(deck: &Deck, timelines: &[Arc<Timeline>], animate: bool) -> Vec<S
             SlideTiming { chains, transition, cmds, triggers }
         })
         .collect()
+}
+
+/// Formens kontur som konvex månghörning i enhetskvadraten (för att beskära videon som formen); `None` = hela
+/// rektangeln. `w` och `h` är formens mått i punkter (rundade hörn är cirklar, inte ellipser).
+fn crop_polygon(crop: Crop, w: f32, h: f32) -> Option<Vec<[f32; 2]>> {
+    const N: usize = 10;
+    match crop {
+        Crop::Rect => None,
+        Crop::Ellipse => Some((0..64).map(|i| { let t = i as f32 / 64.0 * std::f32::consts::TAU; [0.5 + 0.5 * t.cos(), 0.5 + 0.5 * t.sin()] }).collect()),
+        Crop::RoundRect(adj) => {
+            let r = adj * w.min(h);
+            let (rx, ry) = ((r / w).clamp(0.0, 0.5), (r / h).clamp(0.0, 0.5));
+            if rx <= 0.0 || ry <= 0.0 {
+                return None;
+            }
+            // Hörnens medelpunkter medurs från övre vänstra.
+            let corners = [([rx, ry], 180.0f32), ([1.0 - rx, ry], 270.0), ([1.0 - rx, 1.0 - ry], 0.0), ([rx, 1.0 - ry], 90.0)];
+            let mut out = Vec::new();
+            for (c, start) in corners {
+                for i in 0..=N {
+                    let t = (start + 90.0 * i as f32 / N as f32).to_radians();
+                    out.push([c[0] + rx * t.cos(), c[1] + ry * t.sin()]);
+                }
+            }
+            Some(out)
+        }
+    }
 }
 
 fn unit_to_screen(rect: Rect, q: [f32; 2]) -> Pos2 {

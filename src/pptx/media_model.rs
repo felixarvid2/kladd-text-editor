@@ -28,6 +28,16 @@ pub enum Source {
     File(String),
 }
 
+/// Formens utskärning: videon beskärs som formen (`a:prstGeom`).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Crop {
+    #[default]
+    Rect,
+    Ellipse,
+    /// Rundade hörn; radien som andel av kortaste sidan.
+    RoundRect(f32),
+}
+
 /// En mediaform på en bild.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaShape {
@@ -48,12 +58,42 @@ pub struct MediaShape {
     pub show_when_stopped: bool,
     /// Placeringen på bilden i punkter (x, y, bredd, höjd), för toppnivåformer.
     pub rect_pt: Option<[f32; 4]>,
+    /// Formens vridning (grader, medurs) och spegling.
+    pub rot_deg: f32,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub crop: Crop,
 }
 
 impl MediaShape {
     /// Mediets spelbara längd efter urklipp, om hela längden `total_s` är känd.
     pub fn trimmed_len(&self, total_s: f64) -> f64 {
         (total_s - (self.trim_start_ms + self.trim_end_ms) / 1000.0).max(0.0)
+    }
+}
+
+/// Sökvägen till en länkad mediafil: `file:`-adresser avkodas, en relativ sökväg (eller en som bara är ett
+/// filnamn) läses relativt presentationens katalog `base`, och Windows-snedstreck görs om där det behövs.
+pub fn resolve_file(link: &str, base: Option<&std::path::Path>) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let l = link.trim();
+    let raw = match l.get(..5).filter(|p| p.eq_ignore_ascii_case("file:")) {
+        Some(_) => {
+            let rest = l[5..].trim_start_matches('/');
+            let dec = crate::epub::read::percent_decode(rest);
+            // `file:///C:/x` → `C:/x`; `file:///home/x` → `/home/x`.
+            if dec.as_bytes().get(1) == Some(&b':') { dec } else { format!("/{dec}") }
+        }
+        None => crate::epub::read::percent_decode(l),
+    };
+    let sep = if cfg!(windows) { raw } else { raw.replace('\\', "/") };
+    let p = PathBuf::from(&sep);
+    if p.is_absolute() || sep.as_bytes().get(1) == Some(&b':') {
+        return p;
+    }
+    match base {
+        Some(b) => b.join(p),
+        None => p,
     }
 }
 
@@ -176,8 +216,20 @@ fn shape_of(pic: &Node, top: bool, rels: &[Rel], cfg: &Settings) -> Option<Media
     } else {
         None
     };
+    let xfrm = if top { pic.path(&["p:spPr", "a:xfrm"]) } else { None };
+    let geom = pic.path(&["p:spPr", "a:prstGeom"]);
+    let adj = geom.and_then(|g| g.find("a:gd")).and_then(|gd| gd.attr("fmla")).and_then(|f| f.strip_prefix("val ")).and_then(|v| v.trim().parse::<f32>().ok());
+    let crop = match geom.and_then(|g| g.attr("prst")) {
+        Some("ellipse") => Crop::Ellipse,
+        Some("roundRect") => Crop::RoundRect((adj.unwrap_or(16667.0) / 100_000.0).clamp(0.0, 0.5)),
+        _ => Crop::Rect,
+    };
     Some(MediaShape {
         id,
+        rot_deg: xfrm.and_then(|x| x.attr_f64("rot")).map_or(0.0, |r| (r / 60000.0) as f32),
+        flip_h: xfrm.and_then(|x| x.attr_bool("flipH")).unwrap_or(false),
+        flip_v: xfrm.and_then(|x| x.attr_bool("flipV")).unwrap_or(false),
+        crop,
         name: cnv.attr("name").unwrap_or("").to_owned(),
         kind,
         source,
@@ -241,7 +293,32 @@ mod tests {
         assert!((v.volume - 0.5).abs() < 1e-6 && v.num_slides == 3 && !v.show_when_stopped);
         assert_eq!(v.rect_pt, Some([10.0, 20.0, 100.0, 50.0]));
         assert!((v.trimmed_len(10.0) - 8.0).abs() < 1e-9);
+        assert_eq!((v.rot_deg, v.flip_h, v.crop), (0.0, false, Crop::Rect));
         assert_eq!(m.sound, Some(TransitionSound { part: "ppt/media/klick.wav".into(), name: "klick.wav".into(), looping: false }));
+    }
+
+    #[test]
+    fn länkad_fil_relativt_presentationen() {
+        use std::path::Path;
+        let base = Path::new("/mapp/talet");
+        assert_eq!(resolve_file("film.mp4", Some(base)), Path::new("/mapp/talet/film.mp4"));
+        assert_eq!(resolve_file("media/min%20film.mp4", Some(base)), Path::new("/mapp/talet/media/min film.mp4"));
+        assert_eq!(resolve_file("../film.mp4", Some(base)), Path::new("/mapp/talet/../film.mp4"));
+        assert_eq!(resolve_file("file:///home/x/a%20b.mp4", Some(base)), Path::new("/home/x/a b.mp4"));
+        assert_eq!(resolve_file("/abs/film.mp4", Some(base)), Path::new("/abs/film.mp4"));
+        assert_eq!(resolve_file("film.mp4", None), Path::new("film.mp4"));
+        #[cfg(not(windows))]
+        assert_eq!(resolve_file("media\\film.mp4", Some(base)), Path::new("/mapp/talet/media/film.mp4"));
+        assert_eq!(resolve_file("file:///C:/film.mp4", Some(base)), Path::new("C:/film.mp4"));
+    }
+
+    #[test]
+    fn rundad_och_vriden_videoform() {
+        let xml = r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:pic><p:nvPicPr><p:cNvPr id="4" name="v"/><p:cNvPicPr/><p:nvPr><a:videoFile r:link="rId1"/></p:nvPr></p:nvPicPr><p:blipFill/><p:spPr><a:xfrm rot="1800000" flipH="1"><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 25000"/></a:avLst></a:prstGeom></p:spPr></p:pic></p:spTree></p:cSld></p:sld>"#;
+        let slide = Slide { part: "ppt/slides/slide1.xml".into(), root: xml::parse(xml.as_bytes()).unwrap(), rels: vec![rel("rId1", "ppt/media/a.mp4", false)], layout: None, hidden: false, notes: None };
+        let m = parse(&slide, &package::Package::from_parts(Default::default()));
+        let v = m.shape(4).unwrap();
+        assert_eq!((v.rot_deg, v.flip_h, v.flip_v, v.crop), (30.0, true, false, Crop::RoundRect(0.25)));
     }
 
     #[test]

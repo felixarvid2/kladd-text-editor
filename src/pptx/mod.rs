@@ -44,7 +44,12 @@ pub mod fills;
 pub mod mtx;
 // Redigering och sparande (w-pedit).
 pub mod edit;
+pub mod edit_bar;
+pub mod edit_fit;
+pub mod edit_group;
+pub mod edit_format;
 pub mod edit_ops;
+pub mod edit_table;
 pub mod edit_text;
 pub mod edit_view;
 pub mod edit_xml;
@@ -55,6 +60,7 @@ pub mod anim_expr;
 pub mod anim_layers;
 pub mod morph;
 pub mod presenter;
+pub mod show_links;
 pub mod transition;
 // Omgång 3, 3D i diagram och former (w-p3d).
 pub mod bevel;
@@ -78,6 +84,9 @@ mod smartart_tests;
 // Omgång 4, utlösare och bokstav för bokstav (w-ptrig).
 #[cfg(test)]
 mod anim_pieces_tests;
+// Omgång 5, länkar och video i bildspelet (w-pshow2).
+#[cfg(test)]
+mod show_links_tests;
 
 pub use model::Deck;
 

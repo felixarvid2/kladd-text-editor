@@ -71,7 +71,7 @@ impl TPara {
         s
     }
 
-    fn touch(&mut self) {
+    pub(super) fn touch(&mut self) {
         self.orig = None;
     }
 
@@ -87,6 +87,8 @@ pub struct TextModel {
     /// Prefixet för DrawingML (`a`) i bildens XML och rotens namnrymder (för nya element).
     a: String,
     scope: Vec<(String, String)>,
+    /// Transformen från formens förälder (gruppens barnkoordinater) till bilden; enhet för toppnivåformer.
+    parent: Affine,
 }
 
 fn q(a: &str, l: &str) -> String {
@@ -120,10 +122,16 @@ impl TextModel {
         if paras.is_empty() {
             paras.push(TPara { ppr: None, items: Vec::new(), end: None, orig: None });
         }
-        TextModel { paras, a: a.to_owned(), scope: scope.to_vec() }
+        TextModel { paras, a: a.to_owned(), scope: scope.to_vec(), parent: Affine::IDENTITY }
     }
 
-    fn frag(&self, xml: &str) -> Option<XElem> {
+    /// Sätter transformen för en form i en grupp (se `edit_group.rs`).
+    pub fn in_parent(mut self, parent: Affine) -> TextModel {
+        self.parent = parent;
+        self
+    }
+
+    pub(super) fn frag(&self, xml: &str) -> Option<XElem> {
         edit_xml::fragment_in(&self.scope, xml).into_iter().next()
     }
 
@@ -148,7 +156,7 @@ impl TextModel {
     }
 
     /// Delar körningen vid tecknet `ch` så att ett item börjar där; ger itemets index.
-    fn split_at(&mut self, para: usize, ch: usize) -> usize {
+    pub(super) fn split_at(&mut self, para: usize, ch: usize) -> usize {
         let items = &mut self.paras[para].items;
         let mut at = 0;
         for i in 0..items.len() {
@@ -456,7 +464,7 @@ impl TextModel {
         value
     }
 
-    fn word_start(&self, p: Pos) -> Pos {
+    pub(super) fn word_start(&self, p: Pos) -> Pos {
         let chars: Vec<char> = self.paras[p.para].text().chars().collect();
         let mut i = p.ch.min(chars.len());
         while i > 0 && chars[i - 1].is_alphanumeric() {
@@ -465,7 +473,7 @@ impl TextModel {
         Pos { para: p.para, ch: i }
     }
 
-    fn word_end(&self, p: Pos) -> Pos {
+    pub(super) fn word_end(&self, p: Pos) -> Pos {
         let chars: Vec<char> = self.paras[p.para].text().chars().collect();
         let mut i = p.ch.min(chars.len());
         while i < chars.len() && chars[i].is_alphanumeric() {
@@ -475,7 +483,7 @@ impl TextModel {
     }
 
     /// Styckena som XML (`a:p`). Orörda stycken skrivs som de var.
-    fn paras_xml(&self) -> Vec<XElem> {
+    pub(super) fn paras_xml(&self) -> Vec<XElem> {
         let mut out = Vec::new();
         for p in &self.paras {
             if let Some(o) = &p.orig {
@@ -513,6 +521,24 @@ impl TextModel {
             }
         }
         out
+    }
+
+    /// Skriver styckena in i cellens `a:txBody` (skapas före `a:tcPr`/`a:extLst` om den saknas).
+    pub fn write_cell_body(&self, tc: &mut XElem) {
+        if tc.child("a:txBody").is_none() {
+            let a = &self.a;
+            let tag = q(a, "txBody");
+            let Some(body) = self.frag(&format!("<{tag}><{}/><{}/></{tag}>", q(a, "bodyPr"), q(a, "lstStyle"))) else { return };
+            tc.insert_before(body, &["a:tcPr", "a:extLst"]);
+        }
+        let paras = self.paras_xml();
+        let Some(body) = tc.child_mut("a:txBody") else { return };
+        let at = body.index_of("a:p").unwrap_or(body.children.len());
+        body.remove_children("a:p");
+        let at = at.min(body.children.len());
+        for (k, p) in paras.into_iter().enumerate() {
+            body.children.insert(at + k, XNode::Elem(p));
+        }
     }
 
     /// Skriver styckena in i formens `p:txBody` (skapas om den saknas; `bodyPr` och `lstStyle` behålls).
@@ -566,6 +592,39 @@ pub struct Carets {
     pub stops: Vec<Vec<(usize, f32, usize, f32, f32, f32)>>,
     /// Textrutan → bilden (punkter).
     pub t: Affine,
+    /// Per stycke: den ärvda formateringen (justering, punkt, körningarnas storlek och färg).
+    pub paras: Vec<ParaFmt>,
+    /// Textens höjd och höjden som ryms (punkter, utan respektive med insättningar).
+    pub text_h: f32,
+    pub avail_h: f32,
+    /// Insättningarna ovan och under (punkter).
+    pub ins_tb: (f32, f32),
+    /// Autoanpassningen som gäller formen.
+    pub autofit: AutoFit,
+    /// Lodrät text, flera spalter eller ingen radbrytning: textens höjd går inte att jämföra med rutan.
+    pub fit_ok: bool,
+    /// Textankaret (`t`, `ctr`, `b`).
+    pub anchor: &'static str,
+}
+
+/// Formens autoanpassning av texten.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AutoFit {
+    None,
+    /// `a:normAutofit`: texten krymps till rutan (`fontScale`, `lnSpcReduction`).
+    Norm { scale: f32, red: f32 },
+    /// `a:spAutoFit`: rutan följer texten.
+    Shape,
+}
+
+/// Formateringen i ett stycke, ur samma arv som ritningen.
+#[derive(Clone, Debug)]
+pub struct ParaFmt {
+    pub align: text::Align,
+    pub bullet: bool,
+    /// Körningarna: första tecknet, sist tecknet (exklusivt), storlek (punkter, utan autoanpassningens
+    /// krympning) och färg.
+    pub runs: Vec<(usize, usize, f32, [u8; 3])>,
 }
 
 /// Tolkar ett element ur den förlustfria XML:en som ritmodellens `Node`.
@@ -579,10 +638,16 @@ impl TextModel {
     /// Lägger ut texten i formen (bild `slide`, formen `sp` i ritmodellen) som `render.rs` gör och ger
     /// markörlägena. `None` om formen saknar placering.
     pub fn carets(&self, deck: &Deck, slide: usize, sp: &Node) -> Option<Carets> {
+        self.carets_fit(deck, slide, sp, None)
+    }
+
+    /// Som `carets`, men med `fit` (teckenskala, radavståndsminskning) i stället för formens egna
+    /// värden (för att pröva autoanpassningens steg, se `edit_fit.rs`).
+    pub fn carets_fit(&self, deck: &Deck, slide: usize, sp: &Node, fit: Option<(f32, f32)>) -> Option<Carets> {
         let sheets = Sheets::for_slide(deck, slide);
         let chain = inherit::shape_chain(&sheets, sp, Owner::Slide);
         let xfrm = chain.iter().find_map(|s| s.path(&["p:spPr", "a:xfrm"]))?;
-        let f = frame_of(xfrm, &Affine::IDENTITY)?;
+        let f = frame_of(xfrm, &self.parent)?;
         let geom = match chain.iter().find_map(|s| s.child("p:spPr").and_then(|p| p.children.iter().find(|c| c.name == "a:prstGeom" || c.name == "a:custGeom"))) {
             Some(n) if n.name == "a:prstGeom" => geom::preset(n.attr("prst").unwrap_or("rect"), n.child("a:avLst"), f.w as f64, f.h as f64),
             Some(n) => Some(geom::evaluate(n, None, f.w as f64, f.h as f64)),
@@ -591,13 +656,29 @@ impl TextModel {
         let rect = geom.map(|g| g.text_rect).unwrap_or((0.0, 0.0, f.w, f.h));
         let style = chain.iter().find_map(|s| s.child("p:style"));
         let bodies: Vec<&Node> = chain.iter().filter_map(|s| s.path(&["p:txBody", "a:bodyPr"])).collect();
-        let bp = richtext::body_props(&bodies);
+        let mut bp = richtext::body_props(&bodies);
+        let autofit = match inherit::first_child_of(&bodies, &["a:normAutofit", "a:spAutoFit", "a:noAutofit"]).map(|n| n.name.as_str()) {
+            Some("a:normAutofit") => AutoFit::Norm { scale: bp.font_scale, red: bp.ln_spc_reduction },
+            Some("a:spAutoFit") => AutoFit::Shape,
+            _ => AutoFit::None,
+        };
+        if let Some((s, r)) = fit {
+            bp.font_scale = s;
+            bp.ln_spc_reduction = r;
+        }
         let lists = inherit::list_styles(&sheets, &chain, inherit::tx_kind(sp));
         let (font_ref, font_color) = inherit::style_font(&sheets, style);
         let env = TextEnv { sheets: &sheets, lists, font_ref, font_color, font_scale: bp.font_scale, slide_no: deck.slide_number(slide) };
+        self.carets_core(deck, &env, &bp, rect, &f, autofit)
+    }
+
+    /// Utläggningen och markörlägena för texten i en ruta `rect` (l, t, r, b) i en placering `f`;
+    /// delas av former och tabellceller.
+    pub(super) fn carets_core(&self, deck: &Deck, env: &TextEnv<'_, '_>, bp: &richtext::BodyProps, rect: (f32, f32, f32, f32), f: &super::render::Frame, autofit: AutoFit) -> Option<Carets> {
         // Styckena ur modellen (samma XML som skrivs in i bilden), en körning per item.
         let mut body_xml = String::from("<a:txBody>");
         let mut run_map: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut fmts: Vec<ParaFmt> = Vec::new();
         for p in &self.paras_xml() {
             body_xml.push_str(&p.to_xml());
         }
@@ -606,7 +687,7 @@ impl TextModel {
             &edit_xml::fragment_in(&self.scope, &body_xml.replace("<a:txBody>", &format!("<{}>", q(&self.a, "txBody"))).replace("</a:txBody>", &format!("</{}>", q(&self.a, "txBody")))).into_iter().next()?,
             &self.scope,
         )?;
-        let mut fr = richtext::frame(&env, &body, &bp);
+        let mut fr = richtext::frame(env, &body, bp);
         for (pi, para) in fr.paras.iter_mut().enumerate() {
             let Some(tp) = self.paras.get(pi) else { break };
             let lvl = tp.level().clamp(0, 8) as usize;
@@ -614,11 +695,14 @@ impl TextModel {
             let mut runs = Vec::new();
             let mut map = Vec::new();
             let mut start = 0;
+            let mut fmt = ParaFmt { align: para.align, bullet: para.bullet.is_some(), runs: Vec::new() };
             for it in &tp.items {
                 match it {
                     Item::Run { rpr, text } => {
                         let rn = rpr.as_ref().and_then(|r| to_node(r, &self.scope));
                         let (st, _) = env.run_style(rn.as_ref(), &levels);
+                        let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+                        fmt.runs.push((start, start + text.chars().count(), st.size / env.font_scale.max(0.01), [c(st.color.r), c(st.color.g), c(st.color.b)]));
                         runs.push(text::Run { text: text.clone(), style: st, line_break: false });
                         map.push((start, 0));
                     }
@@ -642,6 +726,14 @@ impl TextModel {
                 }
                 start += it.len();
             }
+            // Ett tomt stycke: slutformatet.
+            if fmt.runs.is_empty() {
+                let en = tp.end.as_ref().and_then(|r| to_node(r, &self.scope));
+                let (st, _) = env.run_style(en.as_ref(), &levels);
+                let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+                fmt.runs.push((0, 0, st.size / env.font_scale.max(0.01), [c(st.color.r), c(st.color.g), c(st.color.b)]));
+            }
+            fmts.push(fmt);
             para.runs = runs;
             run_map.push(map);
         }
@@ -661,7 +753,15 @@ impl TextModel {
             extra += v;
             std::mem::swap(&mut tw, &mut th);
         }
-        let (_, stops) = text::layout_carets(&fr, tw, th, &deck.fonts);
+        let (laid, stops) = text::layout_carets(&fr, tw, th, &deck.fonts);
+        let (text_h, ins_tb) = (laid.height, (fr.insets.1, fr.insets.3));
+        let avail_h = (th - ins_tb.0 - ins_tb.1).max(0.0);
+        let fit_ok = vertical.is_none() && bp.columns.0 <= 1 && bp.wrap;
+        let anchor = match bp.anchor {
+            text::Anchor::Top => "t",
+            text::Anchor::Middle => "ctr",
+            text::Anchor::Bottom => "b",
+        };
         let (cx, cy) = (l + (r - l) / 2.0, t + (b - t) / 2.0);
         let local = Affine::translate(-tw / 2.0, -th / 2.0).then(&Affine::rotate(extra)).then(&Affine::translate(cx, cy));
         let mut rot = f.rot;
@@ -684,7 +784,7 @@ impl TextModel {
             };
             list.push((pos, x, line, base, asc, desc));
         }
-        Some(Carets { stops: per, t: local.then(&ta) })
+        Some(Carets { stops: per, t: local.then(&ta), paras: fmts, text_h, avail_h, ins_tb, autofit, fit_ok, anchor })
     }
 }
 

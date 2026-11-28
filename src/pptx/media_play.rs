@@ -22,7 +22,7 @@ use egui::{Color32, CursorIcon, FontId, Painter, Pos2, Rect, Stroke, TextureHand
 
 use super::media_audio::{AudioOut, Device, Input, Params, Voice, VoiceShared};
 use super::anim::{MediaCmd, MediaKind};
-use super::media_model::{self, Kind, MediaShape, SlideMedia, Source};
+use super::media_model::{self, Crop, Kind, MediaShape, SlideMedia, Source};
 use super::media_video::{self, TempFile, VideoPlayer};
 use super::model::Deck;
 use crate::i18n::t;
@@ -113,6 +113,19 @@ pub struct MediaHub {
     scale: f32,
     notice: Option<(String, Instant)>,
     notified: bool,
+    /// Presentationens katalog: länkade mediafiler med relativ sökväg läses härifrån.
+    base_dir: Option<PathBuf>,
+}
+
+/// En videobildruta att rita i formens lager (`presenter.rs`).
+pub struct VideoDraw {
+    pub tex: egui::TextureId,
+    /// Formens läge och storlek (x, y, bredd, höjd) i punkter på bilden, före vridning.
+    pub rect: [f32; 4],
+    pub rot_deg: f32,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub crop: Crop,
 }
 
 impl MediaHub {
@@ -130,7 +143,35 @@ impl MediaHub {
             scale: 2.0,
             notice: None,
             notified: false,
+            base_dir: None,
         }
+    }
+
+    /// Katalogen som länkade mediafiler med relativ sökväg läses ifrån (presentationens egen).
+    pub fn with_base_dir(mut self, dir: Option<PathBuf>) -> MediaHub {
+        self.base_dir = dir;
+        self
+    }
+
+    /// Läser in bildens mediaformer (så att `hidden_when_stopped` och `video_draw` kan svara för bilden).
+    pub fn ensure(&mut self, slide: usize) {
+        if slide < self.deck.slides.len() {
+            self.info_of(slide);
+        }
+    }
+
+    /// Videons bildruta för formen om den spelas och en bildruta har kommit.
+    pub fn video_draw(&self, slide: usize, id: u32) -> Option<VideoDraw> {
+        let a = self.active_of(slide, id)?;
+        let tex = a.tex.as_ref()?;
+        let rect = a.shape.rect_pt?;
+        Some(VideoDraw { tex: tex.id(), rect, rot_deg: a.shape.rot_deg, flip_h: a.shape.flip_h, flip_v: a.shape.flip_v, crop: a.shape.crop })
+    }
+
+    /// `showWhenStopped="0"`: formen döljs medan mediet inte spelas (före start och efter slutet).
+    pub fn hidden_when_stopped(&self, slide: usize, id: u32) -> bool {
+        let Some(s) = self.info.get(&slide).and_then(|i| i.shape(id)) else { return false };
+        !s.show_when_stopped && self.active_of(slide, id).is_none()
     }
 
     /// Prov: egen ljudutmatning och ffmpeg-sökväg (`None` = saknas).
@@ -297,7 +338,7 @@ impl MediaHub {
                 None => return,
             },
             Source::File(f) => {
-                let path = PathBuf::from(f.strip_prefix("file:///").map(|r| format!("/{r}")).unwrap_or_else(|| f.clone()));
+                let path = media_model::resolve_file(f, self.base_dir.as_deref());
                 if !path.is_file() {
                     eprintln!("Kladd: den länkade mediafilen finns inte: {f}");
                     return;
@@ -452,7 +493,7 @@ impl MediaHub {
         self.active.iter().find(|a| a.slide == slide && a.shape.id == id)
     }
 
-    /// Ritar videobildrutorna, kontrollerna för formen under pekaren och notisen. `slide_rect` är bildens yta.
+    /// Ritar kontrollerna för formen under pekaren och notisen (videobilden ritas i formens lager). `slide_rect` är bildens yta.
     /// `opacity(id)` ger formens genomskinlighet ur animeringen (0 = dold: då ritas varken video eller kontroller).
     pub fn paint(&self, painter: &Painter, slide: usize, slide_rect: Rect, slide_w_pt: f32, hover: Option<Pos2>, opacity: &dyn Fn(u32) -> f32) {
         for (shape, rect) in self.shapes_on(slide, slide_rect, slide_w_pt) {
@@ -460,10 +501,8 @@ impl MediaHub {
             if alpha <= 0.0 {
                 continue;
             }
+            // Videobilden ritas i formens eget lager (`ShowView::draw_layer`); här bara kontrollerna.
             let act = self.active_of(slide, shape.id);
-            if let Some(tex) = act.and_then(|a| a.tex.as_ref()) {
-                painter.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
-            }
             if hover.is_some_and(|p| rect.contains(p)) {
                 self.paint_controls(painter, rect, act, hover);
             }

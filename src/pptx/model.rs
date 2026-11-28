@@ -29,6 +29,8 @@ pub struct Theme {
     pub bg_fill_styles: Vec<Node>,
     /// `a:objectDefaults` (`spDef`, `lnDef`, `txDef`).
     pub object_defaults: Option<Node>,
+    /// Temadelens relationer (bilder i `a:bgFillStyleLst`/`a:fillStyleLst`).
+    pub rels: Vec<Rel>,
 }
 
 /// Ett typsnittsschema (`a:majorFont`/`a:minorFont`).
@@ -49,6 +51,8 @@ pub struct Master {
     pub root: Node,
     pub rels: Vec<Rel>,
     pub theme: Option<usize>,
+    /// Mallens `otherStyle` utan teckenstorlekarna (för former utan platshållare, se `TxKind::Free`).
+    pub other_free: Option<Node>,
 }
 
 /// En layout (`p:sldLayout`).
@@ -264,7 +268,8 @@ impl Deck {
             return Some(i);
         }
         let root = self.pkg.xml(part)?;
-        let theme = parse_theme(&root);
+        let mut theme = parse_theme(&root);
+        theme.rels = self.pkg.rels(part);
         self.themes.push(theme);
         let i = self.themes.len() - 1;
         theme_index.insert(part.to_owned(), i);
@@ -279,7 +284,32 @@ impl Deck {
         let rels = self.pkg.rels(part);
         let theme = rel_target(&rels, "theme").map(str::to_owned).and_then(|t| self.load_theme(&t, theme_index));
         let layout_parts: Vec<String> = rels.iter().filter(|r| r.kind == "slideLayout").map(|r| r.target.clone()).collect();
-        self.masters.push(Master { part: part.to_owned(), root, rels, theme });
+        // `otherStyle` för former utan platshållare: textfärgen ignoreras som PowerPoint gör (msrc-win32k bild 5:
+        // formens `fontRef`-färg vit, inte `tx1`), och en teckenstorlek som avviker mer än 10 % från
+        // `defaultTextStyle` också (covid-infographic: 15,3 mot 18 pt); en liten avvikelse (msrc-win32k: 17,65
+        // mot 18 pt) gäller. Det är en tumregel som passar referensbilderna, inte en känd PowerPoint-regel.
+        // Övrigt (tabbstopp …) gäller (`ms-workshop-dlcv` blev sämre när hela stilen hoppades över).
+        let lvl1_sz = |n: Option<&Node>| n.and_then(|n| n.path(&["a:lvl1pPr", "a:defRPr"])).and_then(|d| d.attr_i64("sz")).map(|v| v as f64);
+        let other = root.path(&["p:txStyles", "p:otherStyle"]);
+        let strip_sz = match (lvl1_sz(other), lvl1_sz(self.default_text_style.as_ref())) {
+            (Some(o), Some(d)) => (o - d).abs() > 0.1 * d,
+            _ => false,
+        };
+        let other_free = other.map(|o| {
+            fn strip(n: &mut Node, sz: bool) {
+                if n.name == "a:defRPr" {
+                    if sz {
+                        n.attrs.retain(|(k, _)| k != "sz");
+                    }
+                    n.children.retain(|c| c.name != "a:solidFill");
+                }
+                n.children.iter_mut().for_each(|c| strip(c, sz));
+            }
+            let mut o = o.clone();
+            strip(&mut o, strip_sz);
+            o
+        });
+        self.masters.push(Master { part: part.to_owned(), root, rels, theme, other_free });
         let mi = self.masters.len() - 1;
         for lp in layout_parts {
             if layout_index.contains_key(&lp) {
