@@ -97,6 +97,32 @@ fn strip_brackets(s: &str) -> String {
     out
 }
 
+/// Excels inbyggda korta datumformat (`m/d/yyyy`, format 14) visas i användarens språk. Diagrammets
+/// språk (`c:lang`) avgör, som i PowerPoints PDF-export (`cs-CZ` ger `02.09.2020`). Okänt språk: oförändrat.
+pub fn localized_short_date(code: &str, lang: Option<&str>) -> String {
+    if !code.eq_ignore_ascii_case("m/d/yyyy") {
+        return code.to_owned();
+    }
+    let l = lang.unwrap_or("en-US");
+    let base = l.split('-').next().unwrap_or("").to_ascii_lowercase();
+    let pat = match l {
+        "en-US" | "en" => "m/d/yyyy",
+        "en-GB" | "en-AU" | "en-NZ" | "en-IE" | "en-IN" => "dd/mm/yyyy",
+        _ => match base.as_str() {
+            "cs" | "sk" | "de" | "pl" | "ru" | "uk" | "tr" | "ro" | "hr" | "et" | "lv" | "nb" | "no" => "dd.mm.yyyy",
+            "fi" | "sl" => "d.m.yyyy",
+            "da" => "dd-mm-yyyy",
+            "hu" => "yyyy.mm.dd.",
+            "sv" | "lt" | "ko" => "yyyy-mm-dd",
+            "fr" | "es" | "it" | "pt" | "el" | "vi" => "dd/mm/yyyy",
+            "nl" => "d-m-yyyy",
+            "ja" | "zh" => "yyyy/m/d",
+            _ => "m/d/yyyy",
+        },
+    };
+    pat.to_owned()
+}
+
 fn is_date(s: &str) -> bool {
     let mut quoted = false;
     let mut prev = '\0';
@@ -228,7 +254,7 @@ fn fixed(v: f64, decimals: usize, min_frac: usize, thousands: bool, min_int: usi
 }
 
 /// Serienummer (dagar sedan 1899-12-30) → år, månad, dag, sekunder in på dagen.
-fn civil(serial: f64) -> (i64, u32, u32, f64) {
+pub fn civil(serial: f64) -> (i64, u32, u32, f64) {
     let days = serial.floor() as i64;
     let secs = (serial - serial.floor()) * 86400.0;
     // 1899-12-30 är dag 0; räkna om till dagar sedan 1970-01-01 (25569).

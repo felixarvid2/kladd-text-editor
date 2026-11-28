@@ -440,6 +440,12 @@ fn trendlinjer_med_ekvation_och_r2() {
     // y = 0,8x + 0,6 och R² = 0,64 (som Excel).
     assert!(t.contains("y = 0.8x + 0.6"), "{t}");
     assert!(t.contains("R² = 0.64"), "{t}");
+    // Etiketten står helt inne i diagrammet (ramen 72–472 pt), inte vid eller utanför kanten.
+    for g in scene.items.iter().filter_map(|i| if let Item::Glyphs(g) = i { Some(g) } else { None }).filter(|g| g.text.contains("0.6") || g.text.contains("R²")) {
+        let last = g.glyphs.last().unwrap();
+        let right = g.t.apply(last.x + last.advance, 0.0).0;
+        assert!(right < 472.0 - 4.0 && g.t.apply(0.0, 0.0).0 > 72.0, "{:?} slutar vid {right}", g.text);
+    }
     // Den röda streckade linjen ritas, klippt till ritytan.
     assert!(scene.items.iter().any(|i| matches!(i, Item::Stroke { stroke, .. } if matches!(stroke.paint, Paint::Solid(c) if c == Rgba::rgb8(255, 0, 0)) && !stroke.dash.is_empty())));
     assert!(scene.items.iter().any(|i| matches!(i, Item::PushClip { .. })));
@@ -520,4 +526,38 @@ fn datatabell_under_ritytan() {
     // Förklaringsnycklarna i tabellen (två extra rutor i seriefärgerna).
     let keys = fills(&scene.items).iter().filter(|(b, c)| *c == Rgba::rgb8(0x44, 0x72, 0xC4) && (b.2 - b.0) < 8.0).count();
     assert!(keys >= 2, "{keys}");
+}
+
+#[test]
+fn datumaxel_som_tidsskala_med_vridna_etiketter() {
+    // Fem punkter 2–10 september 2020 (luckor), `ptCount` 20 som i PowerPoint-sparade filer med tomma
+    // rader, basenhet dagar, etikett var annan dag, vridna −90°, diagrammets språk tjeckiska.
+    let days = [44076.0, 44077.0, 44080.0, 44082.0, 44084.0];
+    let cat = format!(
+        r#"<c:numRef><c:numCache><c:formatCode>m/d/yyyy</c:formatCode><c:ptCount val="20"/>{}</c:numCache></c:numRef>"#,
+        days.iter().enumerate().map(|(i, v)| format!(r#"<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>"#)).collect::<String>()
+    );
+    let ser = format!(r#"<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>Podíl</c:v></c:tx><c:cat>{cat}</c:cat><c:val>{}</c:val></c:ser>"#, num_lit(&[1.0, 3.0, 2.0, 5.0, 4.0]));
+    let plot = format!(
+        r#"<c:lineChart><c:grouping val="standard"/>{ser}<c:marker val="1"/><c:axId val="1"/><c:axId val="2"/></c:lineChart><c:dateAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:numFmt formatCode="m/d/yyyy" sourceLinked="1"/><c:txPr><a:bodyPr rot="-5400000"/><a:p><a:pPr><a:defRPr sz="1000"/></a:pPr></a:p></c:txPr><c:crossAx val="2"/><c:auto val="1"/><c:baseTimeUnit val="days"/><c:majorUnit val="2"/><c:majorTimeUnit val="days"/></c:dateAx>{}"#,
+        axes("9", "2", "l", "autoZero", false).split("</c:catAx>").nth(1).unwrap()
+    );
+    let xml = chart_xml(&plot).replace("<c:chart>", r#"<c:lang val="cs-CZ"/><c:chart>"#);
+    let scene = render_chart(&xml, "datumaxel");
+    let t = texts(&scene.items);
+    // Etiketterna: 2, 4, 6, 8 och 10 september i tjeckiskt kort datum; inte dagarna emellan.
+    for want in ["02.09.2020", "04.09.2020", "06.09.2020", "08.09.2020", "10.09.2020"] {
+        assert!(t.iter().any(|x| x == want), "saknar {want:?} i {t:?}");
+    }
+    assert!(!t.iter().any(|x| x == "03.09.2020" || x.contains("9/2/2020")), "{t:?}");
+    // Vridna 90°: glyfkörningens transform har ingen vågrät komponent.
+    let g = scene.items.iter().find_map(|i| if let Item::Glyphs(g) = i { (g.text.trim() == "02.09.2020").then_some(g) } else { None }).unwrap();
+    assert!(g.t.a.abs() < 1e-3 && g.t.b.abs() > 0.5, "{:?}", g.t);
+    // Tidsskalan: nio dagar, punkterna på sina dagar. Den sista punkten (10/9) ligger i den sista av nio
+    // platser, inte i den femte av tjugo.
+    let line = scene.items.iter().filter_map(|i| if let Item::Stroke { path, stroke } = i { (stroke.width > 2.0).then(|| path.bounds()).flatten() } else { None }).max_by(|a, b| (a.2 - a.0).total_cmp(&(b.2 - b.0))).unwrap();
+    let x_first = g.t.apply(0.0, 0.0).0;
+    let span = line.2 - line.0;
+    let last_label = scene.items.iter().find_map(|i| if let Item::Glyphs(g) = i { (g.text.trim() == "10.09.2020").then(|| g.t.apply(0.0, 0.0).0) } else { None }).unwrap();
+    assert!((line.2 - last_label).abs() < 12.0 && span > 250.0, "linjen {line:?}, etiketter {x_first}..{last_label}");
 }

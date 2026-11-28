@@ -298,6 +298,7 @@ impl Draw<'_, '_> {
             let mut path = Path::default();
             let mut started = false;
             let mut last: Option<(f32, f32)> = None;
+            let mut before_last: Option<(f32, f32)> = None;
             let mut fitted: Option<(Model, f64)> = None;
             if let TrendKind::MovingAvg(p) = t.kind {
                 for (x, y) in moving_average(&data, p) {
@@ -322,6 +323,7 @@ impl Draw<'_, '_> {
                     }
                     if started { path.line_to(q.0, q.1) } else { path.move_to(q.0, q.1) }
                     started = true;
+                    before_last = last;
                     last = Some(q);
                 }
                 fitted = Some((m, r2));
@@ -334,13 +336,13 @@ impl Draw<'_, '_> {
             // Ekvation och R².
             if let (Some((m, r2)), Some(end)) = (fitted, last) {
                 if t.disp_eq || t.disp_r2 {
-                    self.trend_label(t, &m, r2, end, inner);
+                    self.trend_label(t, &m, r2, end, before_last.unwrap_or(end), inner);
                 }
             }
         }
     }
 
-    fn trend_label(&mut self, t: &Trendline<'_>, m: &Model, r2: f64, end: (f32, f32), inner: R) {
+    fn trend_label(&mut self, t: &Trendline<'_>, m: &Model, r2: f64, end: (f32, f32), prev: (f32, f32), inner: R) {
         let chain = [t.label.and_then(|l| l.child("c:txPr"))];
         let style = self.style(&chain, 1000);
         let mut runs: Vec<Run> = Vec::new();
@@ -363,9 +365,22 @@ impl Draw<'_, '_> {
             }
         }
         let l = self.lay(paras, f32::INFINITY);
-        // Vid linjens slut, inom ritytan.
-        let x = (end.0 - l.w).clamp(inner.x, (inner.right() - l.w).max(inner.x));
-        let y = (end.1 - l.h - 4.0).clamp(inner.y, (inner.bottom() - l.h).max(inner.y));
+        // Vid linjens slut, inåt (till vänster) och på den sida av linjen där den inte går: ovanför en
+        // stigande linje, under en fallande. Hela etiketten inom ritytan, med lite luft.
+        let pad = 0.3 * style.size;
+        let rising = prev.1 >= end.1;
+        let want_y = if rising { end.1 - l.h - pad } else { end.1 + pad };
+        let y = want_y.clamp(inner.y + pad, (inner.bottom() - l.h - pad).max(inner.y + pad));
+        // Får etiketten inte plats ovanför (under) slutet flyttas den åt vänster tills linjen har sjunkit
+        // (stigit) under (över) den: linjens lutning ur de två sista punkterna.
+        let mut right = end.0 - pad;
+        let dx = (end.0 - prev.0).abs().max(1e-3);
+        let k = (prev.1 - end.1) / dx;
+        if (y - want_y).abs() > 0.5 && k.abs() > 1e-3 {
+            let need = if rising { (y + l.h + pad) - end.1 } else { end.1 - (y - pad) };
+            right = right.min(end.0 - need / k.abs());
+        }
+        let x = (right - l.w).clamp(inner.x + pad, (inner.right() - l.w - pad).max(inner.x + pad));
         self.place(l, x, y, 0.0, 0.0, 0.0);
     }
 }

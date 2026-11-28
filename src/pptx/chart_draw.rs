@@ -28,6 +28,8 @@ mod analysis;
 mod radar;
 #[path = "chart_table.rs"]
 mod table;
+#[path = "chart_dates.rs"]
+mod dates;
 
 /// Yttre marginal (punkter).
 const PAD: f32 = 7.0;
@@ -660,6 +662,10 @@ impl<'b, 'a> Draw<'b, 'a> {
     // ---- Axeldiagram ----
 
     fn axes_plot<'n>(&mut self, c: &Chart<'n>, outer: R, inner_fixed: Option<R>) {
+        // Datumaxel: en kategori per tidsenhet (`chart_dates.rs`).
+        let dated = dates::remap(c);
+        let date_step = dated.as_ref().and_then(|d| d.1);
+        let c: &Chart<'n> = dated.as_ref().map_or(c, |d| &d.0);
         let first = &c.plots[0];
         let horizontal = matches!(first.kind, Kind::Bar { horizontal: true });
         let scatter = matches!(first.kind, Kind::Scatter);
@@ -792,6 +798,7 @@ impl<'b, 'a> Draw<'b, 'a> {
         // Datatabell (stående kategoridiagram med kategorierna i band).
         let dtable = c.dtable.filter(|_| !horizontal && !scatter && between).map(|t| table::Table { t, cats: cats.clone(), style: self.style(&[t.txpr, c.space_txpr], 1000) });
         let show_cat_lbl = show_cat_lbl && dtable.is_none();
+        let cat_rot = cat_ax.and_then(|a| a.rot);
         // Ritytans inre rektangel.
         let inner = inner_fixed.unwrap_or_else(|| {
             let val_w = if show_val_lbl { scale.ticks().iter().map(|v| measure(self, &val_fmt(*v), &val_style).0).fold(0.0, f32::max) } else { 0.0 };
@@ -800,6 +807,11 @@ impl<'b, 'a> Draw<'b, 'a> {
             } else {
                 (if show_val_lbl { val_w + 0.92 * vs } else { 0.0 }, if show_cat_lbl || scatter { 1.81 * cs } else { 0.0 })
             };
+            // Vridna kategorietiketter (`bodyPr rot`): höjden är den vridna etikettens.
+            if let (Some(rot), false, true) = (cat_rot, horizontal, show_cat_lbl && !scatter) {
+                let (sn, cn) = rot.to_radians().sin_cos();
+                bottom_h = cat_w * sn.abs() + cat_line_h * cn.abs() + 0.6 * cs;
+            }
             // Datatabellen tar kategorietiketternas plats under ritytan och har seriernas namn till vänster.
             if let Some((name_w, table_h)) = dtable.as_ref().map(|t| t.size(self, c)) {
                 bottom_h = table_h + 0.3 * cs;
@@ -968,17 +980,28 @@ impl<'b, 'a> Draw<'b, 'a> {
                         self.place(l, x, inner.bottom() + 0.61 * cs, 0.5, 0.0, 0.0);
                     }
                 } else {
-                    // Etiketter som inte får plats hoppas över (var k:te).
+                    // Etiketter som inte får plats hoppas över (var k:te); datumaxelns `majorUnit` och
+                    // `tickLblSkip` anger steget själva.
                     let max_w = band * 0.98;
-                    let step = if horizontal {
+                    let step = if let Some(k) = date_step.or(cat_ax.and_then(|a| a.tick_skip)) {
+                        k.max(1)
+                    } else if horizontal {
                         ((cat_line_h / band).ceil() as usize).max(1)
+                    } else if let Some(rot) = cat_rot {
+                        // Vridna etiketter tar radhöjden / sin(vinkeln) i bredd.
+                        let need = cat_line_h / rot.to_radians().sin().abs().max(0.2);
+                        ((need / band).ceil() as usize).max(1)
                     } else {
                         let w = cats.iter().map(|t| measure(self, t, &cat_style).0).fold(0.0, f32::max);
                         if w <= max_w { 1 } else { ((w / band).ceil() as usize).max(1) }
                     };
                     for (i, t) in cats.iter().enumerate().step_by(step) {
                         let p = cpos(i as f32);
-                        if horizontal {
+                        if let (Some(rot), false) = (cat_rot, horizontal) {
+                            // Vriden: etikettens slut (moturs) eller början (medurs) vid strecket, texten nedåt.
+                            let l = self.lay(Self::plain_paras(t, &cat_style, Align::Right), f32::INFINITY);
+                            self.place(l, p, inner.bottom() + 0.3 * cs, if rot < 0.0 { 1.0 } else { 0.0 }, 0.5, rot);
+                        } else if horizontal {
                             let l = self.lay(Self::plain_paras(t, &cat_style, Align::Right), f32::INFINITY);
                             self.place(l, inner.x - 0.92 * cs, p - 0.1 * cs, 1.0, 0.5, 0.0);
                         } else {
@@ -1225,7 +1248,8 @@ impl<'b, 'a> Draw<'b, 'a> {
                     Some(Stroke { width: w.unwrap_or(2.25), ..def })
                 });
                 if let Some(st) = st {
-                    let path = polyline(&pts, ser.smooth);
+                    // `dispBlanksAs span` (och datumaxelns dagar utan värde): linjen går över luckorna.
+                    let path = if c.blanks == "span" { polyline(&pts.iter().filter(|p| p.is_some()).copied().collect::<Vec<_>>(), ser.smooth) } else { polyline(&pts, ser.smooth) };
                     self.stroke(path, st);
                 }
             }

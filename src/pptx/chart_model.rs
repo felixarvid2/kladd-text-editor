@@ -143,6 +143,8 @@ pub struct Series<'n> {
     pub labels: Labels<'n>,
     /// Etiketter för enskilda punkter (`c:dLbl`).
     pub point_labels: Vec<(usize, Labels<'n>)>,
+    /// Kategoriernas talformat i cachen (`c:cat/…/c:formatCode`).
+    pub cat_format: Option<String>,
     pub trendlines: Vec<Trendline<'n>>,
     pub err_bars: Vec<ErrBars<'n>>,
 }
@@ -204,6 +206,15 @@ pub struct Axis<'n> {
     /// `between` (kategorierna mitt i sina band) eller `midCat` (på strecken).
     pub cross_between: Option<String>,
     pub crosses: String,
+    /// Etiketternas vridning i grader (`c:txPr/a:bodyPr/@rot`; 0 eller PowerPoints "automatiskt"
+    /// −60 000 000 ger `None`).
+    pub rot: Option<f32>,
+    /// Datumaxelns basenhet (`c:baseTimeUnit`: `days`, `months`, `years`).
+    pub base_time_unit: Option<String>,
+    /// Steget mellan etiketterna och dess enhet (`c:majorUnit`, `c:majorTimeUnit`) på en datumaxel.
+    pub major_time_unit: Option<String>,
+    /// Var n:te etikett (`c:tickLblSkip`).
+    pub tick_skip: Option<usize>,
 }
 
 /// Manuell layout (`c:manualLayout`), andelar av diagrammets yta.
@@ -283,11 +294,13 @@ pub struct Chart<'n> {
     pub plot_sppr: Option<&'n Node>,
     /// Datatabellen under ritytan (`c:dTable`).
     pub dtable: Option<DataTable<'n>>,
+    /// Diagrammets språk (`c:lang`), för Excels inbyggda datumformat.
+    pub lang: Option<String>,
     pub view3d: Option<View3D>,
     /// Golvets och väggarnas `c:spPr`.
     pub walls: Walls<'n>,
     /// Tomma celler (`c:dispBlanksAs`): `gap`, `zero` eller `span`. Saknas elementet gäller
-    /// standardvärdet i ECMA-376, `zero` (Office skriver alltid ut det). Används bara i 3D-linjer och -ytor.
+    /// standardvärdet i ECMA-376, `zero` (Office skriver alltid ut det). Används i 3D-linjer och -ytor; 2D-linjer följer `span`.
     pub blanks: String,
 }
 
@@ -397,7 +410,7 @@ fn merge_labels<'n>(own: &'n Node, base: &Labels<'n>) -> Labels<'n> {
     l
 }
 
-fn series<'n>(s: &'n Node, plot_labels: &Labels<'n>) -> Series<'n> {
+fn series<'n>(s: &'n Node, plot_labels: &Labels<'n>, lang: Option<&str>) -> Series<'n> {
     let idx = s.child("c:idx").and_then(|c| c.attr_i64("val")).unwrap_or(0).clamp(0, 10_000) as usize;
     let order = s.child("c:order").and_then(|c| c.attr_i64("val")).unwrap_or(idx as i64).clamp(0, 10_000) as usize;
     let name = s.child("c:tx").map(|t| {
@@ -410,7 +423,11 @@ fn series<'n>(s: &'n Node, plot_labels: &Labels<'n>) -> Series<'n> {
     let (vals_s, fmt) = val_node.map(cache_strings).unwrap_or_default();
     // Kategorier som är tal med talformat (t.ex. datum) visas formaterade.
     let cats_fmt: Vec<String> = match &cat_fmt {
-        Some(f) if !f.eq_ignore_ascii_case("general") => cats.iter().map(|c| parse_num(c).map_or_else(|| c.clone(), |v| super::chart_fmt::format(v, f))).collect(),
+        Some(f) if !f.eq_ignore_ascii_case("general") => {
+            // Excels korta datumformat i diagrammets språk.
+            let f = super::chart_fmt::localized_short_date(f, lang);
+            cats.iter().map(|c| parse_num(c).map_or_else(|| c.clone(), |v| super::chart_fmt::format(v, &f))).collect()
+        }
         _ => cats.clone(),
     };
     let base = match s.child("c:dLbls") {
@@ -446,6 +463,7 @@ fn series<'n>(s: &'n Node, plot_labels: &Labels<'n>) -> Series<'n> {
         smooth: flag(s, "c:smooth", false),
         labels: base,
         point_labels,
+        cat_format: cat_fmt.clone(),
         trendlines: s.children_named("c:trendline").map(trendline).collect(),
         err_bars: s.children_named("c:errBars").map(err_bars).collect(),
     }
@@ -509,10 +527,14 @@ fn axis(a: &Node) -> Axis<'_> {
         title: a.child("c:title").map(title),
         cross_between: val(a, "c:crossBetween").map(str::to_owned),
         crosses: val(a, "c:crosses").unwrap_or("autoZero").to_owned(),
+        rot: a.path(&["c:txPr", "a:bodyPr"]).and_then(|b| b.attr_i64("rot")).filter(|r| *r != 0 && r.abs() <= 5_400_000).map(|r| r as f32 / 60000.0),
+        base_time_unit: val(a, "c:baseTimeUnit").map(str::to_owned),
+        major_time_unit: val(a, "c:majorTimeUnit").map(str::to_owned),
+        tick_skip: num(a, "c:tickLblSkip").filter(|v| *v >= 1.0).map(|v| v.min(10_000.0) as usize),
     }
 }
 
-fn plot(n: &Node) -> Option<Plot<'_>> {
+fn plot<'n>(n: &'n Node, lang: Option<&str>) -> Option<Plot<'n>> {
     let kind = match n.local() {
         "barChart" | "bar3DChart" => Kind::Bar { horizontal: val(n, "c:barDir") == Some("bar") },
         "lineChart" | "line3DChart" | "stockChart" => Kind::Line,
@@ -530,7 +552,7 @@ fn plot(n: &Node) -> Option<Plot<'_>> {
         _ => Grouping::Clustered,
     };
     let plot_labels = n.child("c:dLbls").map(labels).unwrap_or_default();
-    let mut series: Vec<Series<'_>> = n.children_named("c:ser").map(|s| series(s, &plot_labels)).collect();
+    let mut series: Vec<Series<'_>> = n.children_named("c:ser").map(|s| series(s, &plot_labels, lang)).collect();
     series.sort_by_key(|s| s.order);
     let pie = matches!(kind, Kind::Pie { .. });
     Some(Plot {
@@ -554,7 +576,8 @@ fn plot(n: &Node) -> Option<Plot<'_>> {
 pub fn parse(root: &Node) -> Option<Chart<'_>> {
     let chart = root.child("c:chart")?;
     let pa = chart.child("c:plotArea")?;
-    let plots: Vec<Plot<'_>> = pa.children.iter().filter_map(plot).collect();
+    let lang = val(root, "c:lang");
+    let plots: Vec<Plot<'_>> = pa.children.iter().filter_map(|n| plot(n, lang)).collect();
     if plots.is_empty() {
         return None;
     }
@@ -582,6 +605,7 @@ pub fn parse(root: &Node) -> Option<Chart<'_>> {
         space_sppr: root.child("c:spPr"),
         space_txpr: root.child("c:txPr"),
         plot_sppr: pa.child("c:spPr"),
+        lang: val(root, "c:lang").map(str::to_owned),
         dtable: pa.child("c:dTable").map(|d| DataTable {
             horz: flag(d, "c:showHorzBorder", false),
             vert: flag(d, "c:showVertBorder", false),

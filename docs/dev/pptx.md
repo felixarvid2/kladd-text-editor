@@ -182,8 +182,8 @@ Sammanställt efter omgång 3 (detaljer i respektive avsnitt nedan):
   markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
-- **Diagram:** yt-3D (`surface3DChart`), chartex (`cx:`), sekundär x-axel i punktdiagram, datumaxlar med tidsskala
-  (`baseTimeUnit`: i `cand/uzis-souhrn` bild 28 hamnar dagarna för tätt); sekundäraxlar, trendlinjer, felstaplar,
+- **Diagram:** yt-3D (`surface3DChart`), chartex (`cx:`), sekundär x-axel i punktdiagram, datumaxelns
+  `majorTimeUnit` i månader/år som exakta månadsgränser; sekundäraxlar, trendlinjer, felstaplar,
   radar och datatabeller finns men saknar referensbilder från PowerPoint (se *Sekundäraxlar, trendlinjer,
   felstaplar, radar och datatabeller*);
   3D-diagrammen utan referensbilder (stapel/linje/yta) är inte kalibrerade (se *3D i diagram och former*).
@@ -1147,3 +1147,28 @@ felstaplar, matematiken som rena funktioner), `chart_radar.rs` och `chart_table.
 medel, ekvationerna, felstaplarnas belopp), `chart_radar.rs` (ekrarnas lägen), `chart_tests.rs` (sekundäraxel
 med egen skala till höger, trendlinje med ekvation och R² som Excel, polynom och glidande medel, felstaplar på
 staplar, radar med markörer och fylld radar, datatabell med kantlinjer och nycklar, alla även till PDF).
+
+### Datumaxlar, vridna kategorietiketter och trendlinjens etikett (omgång 5, uppföljning)
+
+- **Datumaxel** (`c:dateAx`, `chart_dates.rs`): axeln är en tidsskala från det tidigaste till det senaste
+  datumet i `baseTimeUnit` (dagar, månader, år), en plats per enhet; punkterna hamnar på sina datum, dagar
+  utan värde blir tomma platser som linjen går över, och cachens `ptCount` (PowerPoint-sparade filer har
+  tomma rader: `uzis-souhrn` bild 28 har 493 men 315 punkter) räknas inte. Etiketterna står på var
+  `majorUnit`:e plats (i `majorTimeUnit`, omräknat till basenheten). Diagrammet görs om till ett vanligt
+  kategoridiagram (`dates::remap`), så staplar, linjer, etiketter och trendlinjer ritas som förut. En
+  `c:catAx` med datum är en textaxel (Office skriver `dateAx` när axeln är en datumaxel).
+- **Excels korta datum** (`m/d/yyyy`, format 14) visas i diagrammets språk (`c:lang`; `cs-CZ` →
+  `dd.mm.yyyy`, `sv` → `yyyy-mm-dd`, `en-GB` → `dd/mm/yyyy` …, `chart_fmt::localized_short_date`), som i
+  PowerPoints PDF-export; gäller både datumaxlar och kategorier med datumformat.
+- **Vridna kategorietiketter** (`c:txPr/a:bodyPr/@rot`; 0 och PowerPoints "automatiskt" −60 000 000 vrider
+  inte): etikettens slut vid strecket och texten nedåt längs vinkeln (moturs, som −45° och −90°), höjden
+  under ritytan efter den vridna etikettens storlek, steget efter radhöjden / sin(vinkeln). `tickLblSkip`
+  anger steget.
+- **`dispBlanksAs span`** gäller nu också 2D-linjer (linjen går över tomma celler); inget av
+  referensdiagrammen har `span`.
+- **Trendlinjens etikett** står vid linjens slut men inåt: till vänster om slutet, ovanför en stigande linje
+  och under en fallande, helt inom ritytan; får den inte plats flyttas den åt vänster tills linjen gått undan.
+- **Resultat:** jämförelseprovets 33 presentationer är oförändrade (ingen av dem har datumaxlar eller vridna
+  kategorietiketter). `cand/uzis-souhrn` (utanför urvalet; PowerPoints utskrift till A4 beskuren och skalad
+  till bildens storlek för mätningen) 0,843 → 0,857: bild 26–29 med datumaxlar 0,64–0,80 → 0,83–0,88, bild
+  3–5 och 23 (−45° vridna etiketter) 0,001–0,012 sämre trots att etiketterna står som i PowerPoint.
