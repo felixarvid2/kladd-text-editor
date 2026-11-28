@@ -138,7 +138,7 @@ fn epub_drm_and_broken_files_show_an_error() {
     // Ingen flik öppnas (felet visas som notis och står i `Book::load`-testerna).
     assert!(ui.app().docs.is_empty());
     assert!(ui.app().settings.recent.iter().all(|p| !p.ends_with("drm.epub")));
-    let junk = ui.dir.write("trasig.epub", b"inte en zip".to_vec());
+    let junk = ui.dir.write("trasig.epub", b"inte en zip");
     ui.open(&junk);
     ui.settle();
     assert!(ui.app().docs.is_empty());

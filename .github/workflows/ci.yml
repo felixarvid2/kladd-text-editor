@@ -40,6 +40,29 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # Statisk analys: bara lintgrupperna som hittar fel (correctness, suspicious, perf), inte stil.
+  clippy:
+    name: statisk analys (clippy)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - name: Installera ALSA (ljudet i bildspelet)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -A clippy::all -D clippy::correctness -D clippy::suspicious -D clippy::perf
+
   # Sparade Word- och ODT-filer från korpusen ska gå att öppna i LibreOffice (tests/corpus).
   libreoffice:
     name: korpus i LibreOffice

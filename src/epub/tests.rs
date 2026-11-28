@@ -262,7 +262,10 @@ fn stora_kapitel_delas_vid_styckegränser_och_länkmålen_följer_med() {
 #[test]
 fn delning_vid_tomma_rader_utanför_kodblock() {
     let md = format!("{}\n\n```\nx\n\ny\n```\n\n{}\n", "a".repeat(50), "b".repeat(50));
-    assert_eq!(split_ranges(&md, 10_000), [0..md.len()]);
+    #[allow(clippy::single_range_in_vec_init)] // ett enda intervall är väntat resultat
+    {
+        assert_eq!(split_ranges(&md, 10_000), [0..md.len()]);
+    }
     let r = split_ranges(&md, 60);
     let joined: String = r.iter().map(|r| &md[r.clone()]).collect();
     assert_eq!(joined, md);

@@ -151,7 +151,7 @@ fn box_in_heading_list_and_table_cell_is_shown() {
     // Rutan i cellen ligger ovanför tabellen (i flödet), före tabellraden.
     let tb = md.rfind("<!--k:tb ").unwrap();
     assert!(tb < md.find("| Cell").unwrap_or(usize::MAX) || !md.contains("Cell"), "{md}");
-    let last_open = md.lines().filter(|l| l.starts_with("<!--k:tb ")).last().unwrap();
+    let last_open = md.lines().rfind(|l| l.starts_with("<!--k:tb ")).unwrap();
     assert!(docx_tbox::parse_head(last_open).unwrap().1.anchor.is_none(), "{last_open}");
     // Orörda rutor sparas som förut.
     let out = write(md, "x", &|_| None, l.source.as_ref()).unwrap().bytes;

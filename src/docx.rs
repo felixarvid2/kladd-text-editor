@@ -6761,7 +6761,6 @@ fn write_patched(src: &Source, defaults: DocDefaults, markdown: &str, (boxes, ne
     doc_rel_add.push_str(&extras.rels);
     let mut type_add = std::mem::take(&mut extras.types);
     let mut new_parts = std::mem::take(&mut extras.parts);
-    let mut ids = ids;
     let mut fresh_part = |name: &str, kind: &str, mime: &str, xml: String, doc_rel_add: &mut String, type_add: &mut String| {
         let mut n = 0;
         let part = loop {

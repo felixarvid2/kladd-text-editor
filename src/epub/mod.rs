@@ -111,6 +111,8 @@ fn is_image_path(path: &str) -> bool {
 /// Delar Markdown vid styckegränser (tomma rader utanför kodblock) i delar om högst `limit` byte, där det går.
 pub fn split_ranges(md: &str, limit: usize) -> Vec<Range<usize>> {
     if md.len() <= limit {
+        // Ett enda intervall över hela texten är avsikten, inte en `vec![0; n]`-förväxling.
+        #[allow(clippy::single_range_in_vec_init)]
         return vec![0..md.len()];
     }
     let mut cands = Vec::new();

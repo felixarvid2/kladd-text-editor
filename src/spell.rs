@@ -860,6 +860,7 @@ mod tests {
         assert!(s2.check_word("Zork"));
         s2.add_to_dictionary("kväll");
         assert!(s2.check_word("Kväll"));
+        #[allow(clippy::single_range_in_vec_init)] // en enda textsträcka
         let r = s2.misspelled("hej blorp värld", &[0..16]);
         assert_eq!(r, vec![4..9]);
         assert!(s2.suggest("hjej").len() <= 6);

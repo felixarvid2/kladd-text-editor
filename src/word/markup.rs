@@ -4553,6 +4553,8 @@ mod tests {
         assert!(e.text.is_char_boundary(e.sel.start) && e.text.is_char_boundary(e.sel.end));
         let e = tog(t, 50..60, Inline::Bold);
         assert!(!e.text.is_empty());
+        // Avsiktligt omvänt intervall: start efter slut ska tålas.
+        #[allow(clippy::reversed_empty_ranges)]
         let e = tog(t, 4..0, Inline::Italic);
         assert!(e.text.contains('*'));
     }
