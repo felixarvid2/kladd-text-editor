@@ -549,3 +549,24 @@ fn ritdel_i_skalad_grupp_ritas_i_visad_storlek() {
     assert_ne!(pixel(&deck, 275, 110), [255, 0, 0]);
     assert_ne!(pixel(&deck, 150, 130), [255, 0, 0]);
 }
+
+#[test]
+fn langt_ord_krymps_inom_rutan_och_gruppen_far_samma_storlek() {
+    // Ett ord som inte kan brytas ("Vattenmelonerna") krymps tills det ryms innanför insättningarna
+    // i den smala rutan; de andra noderna i gruppen (`op="equ"`) får samma storlek.
+    let d = data(&[("a", "Vattenmelonerna", &[]), ("b", "Ett", &[]), ("c", "Två", &[])], "", "");
+    let deck = Deck::open(&pptx(&frame(100.0, 100.0, 100.0, 300.0), &d, &layout(LIN_T), None)).unwrap();
+    let s = laid_out(&deck);
+    let sizes: Vec<i64> = s.iter().filter_map(|x| x.4).collect();
+    assert_eq!(sizes.len(), 3);
+    assert!(sizes.iter().all(|z| *z == sizes[0]), "{sizes:?}");
+    for it in render::slide_scene(&deck, 0).items {
+        if let super::scene::Item::Glyphs(g) = it {
+            for gl in &g.glyphs {
+                let (x0, _) = g.t.apply(gl.x, 0.0);
+                let (x1, _) = g.t.apply(gl.x + gl.advance, 0.0);
+                assert!(x0 >= 100.0 && x1 <= 200.0, "{} {x0}–{x1}", g.text);
+            }
+        }
+    }
+}

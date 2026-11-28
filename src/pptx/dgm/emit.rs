@@ -326,13 +326,16 @@ impl Emitter<'_, '_, '_, '_> {
     fn insets(&self, id: usize, f: Fonts) -> (f64, f64, f64, f64) {
         let n = &self.tree.nodes[id];
         let size = self.fixed_size(id).unwrap_or(f.prim);
-        let m = |k: &str| -> f64 {
+        // Utan villkor för marginalen: textrutans vanliga insättningar (7,2 pt vid sidorna, 3,6 pt upptill
+        // och nedtill), högst en tiondel av rutan (organisationsschemats rutor har inga egna).
+        let m = |k: &str, def: f64| -> f64 {
             match n.vals.get(&format!("{k}%")) {
                 Some(fact) => fact * size,
-                None => n.vals.get(k).copied().unwrap_or(0.0),
+                None => n.vals.get(k).copied().unwrap_or(def),
             }
         };
-        (m("lMarg"), m("tMarg"), m("rMarg"), m("bMarg"))
+        let (dw, dh) = ((n.rect.w * 0.1).min(7.2), (n.rect.h * 0.1).min(3.6));
+        (m("lMarg", dw), m("tMarg", dh), m("rMarg", dw), m("bMarg", dh))
     }
 
     /// Ryms texten i rutan?
@@ -348,6 +351,20 @@ impl Emitter<'_, '_, '_, '_> {
         let laid = text::layout(&fr, w as f32, h as f32, fonts);
         if (laid.height + bp.insets.1 + bp.insets.3) as f64 > h + 0.25 {
             return false;
+        }
+        // Inte heller bredare än rutan innanför insättningarna (ett ord som inte kan brytas sticker
+        // annars ut åt sidan).
+        let (left, right) = (bp.insets.0 as f64 - 0.5, w - bp.insets.2 as f64 + 0.5);
+        for it in &laid.items {
+            if let super::super::scene::Item::Glyphs(g) = it {
+                for gl in &g.glyphs {
+                    let (x0, _) = g.t.apply(gl.x, 0.0);
+                    let (x1, _) = g.t.apply(gl.x + gl.advance, 0.0);
+                    if (x0.min(x1) as f64) < left || (x0.max(x1) as f64) > right {
+                        return false;
+                    }
+                }
+            }
         }
         // Inget ord får brytas mitt i: de längsta orden ska rymmas på en rad var.
         let mut words: Vec<(&str, &Node)> = Vec::new();

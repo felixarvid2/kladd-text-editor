@@ -1021,6 +1021,13 @@ PowerPoints kända utseende (standardschemat, hängande lägsta nivå, assistent
   Andra böjda kopplingar (t.ex. `cycle8`:s pilar mellan hjälpnoder) ritas inte än. Alla kugghjul i
   referensmaterialet har en ritdel, så bågarna ändrar ingen bild där; bara jämförelsen mot ritdelarna.
 
+- **Text i rutorna:** texten krymps också tills den ryms på bredden innanför insättningarna (ett ord som inte
+  kan brytas, t.ex. "Watermelon", stack förut ut), och noder utan marginalvillkor (organisationsschemats rutor)
+  får textrutans vanliga insättningar (7,2 pt vid sidorna, 3,6 pt upptill och nedtill, högst en tiondel av
+  rutan). Gruppen med `op="equ"` på `primFontSz` får den minsta storleken som ryms i alla.
+- **Assistenter:** `Mid-Left`/`Mid-Right` i `SmartArt_OrgChart1` är `type="asst"` i datamodellen och ritas därför
+  vid sidan av linjen; i `SmartArt_OrgChart1_3D` är de vanliga noder och hänger från den vågräta linjen.
+
 Av de 15 hierarkierna utan ritdel i provsamlingarna ritas nu alla som diagram (ingen faller tillbaka till
 punktlistan). Det finns ingen PowerPoint-referens för dem, så utseendet är inte uppmätt.
 
@@ -1028,4 +1035,4 @@ punktlistan). Det finns ingen PowerPoint-referens för dem, så utseendet är in
 0,03–0,25 → 0,09–0,49 (PowerPoints egna förskjutningar saknas), medel 0,638 → 0,662. Övriga layouter oförändrade.
 
 **Prov:** `hierarki_med_roten_over_barnen_och_linjer` (rutor, avstånd, centrering och linjernas ändpunkter),
-`bojd_koppling_blir_en_cirkelbagspil` (läge, storlek och vinklar).
+`bojd_koppling_blir_en_cirkelbagspil` (läge, storlek och vinklar), `langt_ord_krymps_inom_rutan_och_gruppen_far_samma_storlek`.
