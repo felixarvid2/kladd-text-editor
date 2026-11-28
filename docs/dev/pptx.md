@@ -170,15 +170,15 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 7 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
   text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
   marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
   autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
   automatisk sparning).
-- **Visning:** (föredragsvyns val av skärm gjordes i omgång 7),
-  markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
+- **Visning:** föredragsvyns skärmval saknar skärmlista på Wayland utan XWayland och är inte prövat med två
+  riktiga skärmar (se *Föredragsvyn väljer skärm (omgång 7, w-pshow3)*); markering av text på bilden; ljud och video: se *Ljud och video i bildspelet (omgång 4)*;
   sökmarkeringen täcker hela glyfkörningen vid ligaturer och höger-till-vänster (klusteroffset per glyf saknas
   i `GlyphRun`).
 - **Diagram:** yt-3D (`surface3DChart`), chartex (`cx:`), sekundär x-axel i punktdiagram, datumaxelns
@@ -201,6 +201,9 @@ Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum` m.fl. (`duotone` gjordes i omgång 5)
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
+- **Typsnitt:** utan Microsofts typsnitt ligger Verdana-presentationerna ~0,05 lägre i jämförelsen (mätt i omgång 7);
+  PowerPoints extra krympning utöver filens `fontScale` (cppcon20 bild 33) är oförklarad (se *Textkrympning och
+  typsnittsmått (omgång 7, w-pfid3)*).
 - **Minne:** avkodade bilder hålls i en cache på högst 256 MB per presentation och skalas ner till högst
   2560 bildpunkter.
 
