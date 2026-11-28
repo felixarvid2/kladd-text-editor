@@ -493,8 +493,8 @@ pub fn duplicate_shape(txn: &mut Txn, slide: usize, index: usize, id: u32) -> Re
         };
         if let Some(off) = xfrm.and_then(|x| x.child_mut("a:off")) {
             let (x, y) = (off.attr_i64("x").unwrap_or(0), off.attr_i64("y").unwrap_or(0));
-            off.set_attr("x", &(x + STEP).to_string());
-            off.set_attr("y", &(y + STEP).to_string());
+            off.set_attr("x", &x.saturating_add(STEP).to_string());
+            off.set_attr("y", &y.saturating_add(STEP).to_string());
         }
     };
     if is_ac(&copy) {

@@ -13,6 +13,10 @@ Den fullständiga beskrivningen av Kladds funktioner. En kort översikt finns i 
 
 - **PowerPoint: text i SmartArt kan redigeras.** Dubbelklicka på en form i ett SmartArt-diagram i redigeringsläget för att skriva i nodens text; ändringen sparas både i diagrammets data och i PowerPoints sparade ritning. `Enter` sist i en nod lägger till en nod efter den, `Tab`/`Skift+Tab` flyttar noden en nivå ned/upp och `Backsteg` i en tom nod tar bort den; då lägger Kladd ut diagrammet på nytt (och PowerPoint gör det när filen öppnas). Se `docs/handbok.md`.
 
+### Rättat
+
+- **PowerPoint: tåligare mot trasiga filer.** Slumpprov (≈3 000 förvrängda presentationer) hittade två overflow-fel, nu rättade: orimliga anteckningsmått och duplicering av en form nära talområdets kant. Se `docs/dev/pptx.md`.
+
 ## [2.16.0] – 2026-11-28
 
 ### Nytt

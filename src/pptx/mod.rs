@@ -108,6 +108,10 @@ pub mod edit_smartart;
 #[cfg(test)]
 mod edit_smartart_tests;
 
+// Omgång 8, slumpprov (w-pfuzz).
+#[cfg(test)]
+mod fuzz_tests;
+
 pub use model::Deck;
 
 /// Filändelser som öppnas i presentationsvyn: presentation, bildspel, mall och deras varianter med

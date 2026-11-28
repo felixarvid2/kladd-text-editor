@@ -160,6 +160,8 @@ impl Deck {
         let size_emu = (size_emu.0.clamp(12_700, 51_206_400), size_emu.1.clamp(12_700, 51_206_400));
         let notes_size_emu =
             pres.child("p:notesSz").map(|s| (s.attr_i64("cx").unwrap_or(6_858_000), s.attr_i64("cy").unwrap_or(9_144_000))).unwrap_or((6_858_000, 9_144_000));
+        // Som bildstorleken: orimliga mått (negativa, enorma) ger overflow i anteckningsmallens uträkningar.
+        let notes_size_emu = (notes_size_emu.0.clamp(12_700, 51_206_400), notes_size_emu.1.clamp(12_700, 51_206_400));
         let first_slide_num = pres.attr_i64("firstSlideNum").unwrap_or(1);
         let default_text_style = pres.child("p:defaultTextStyle").cloned();
 

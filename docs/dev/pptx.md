@@ -1424,3 +1424,28 @@ markörlägena i `set_deck`, tangenterna i `text_keys`).
   varje diagram i materialet, sparar, validerar och öppnar igen: 54 diagram, inga fel.
 - **Kvar:** SmartArt-text där en form visar flera noder (t.ex. `vList5`:s underpunkter); presentationspunkter och
   egen skala (`custScaleX`/`custScaleY`) för nya noder; SmartArt i grupper.
+
+## Slumpprov (omgång 8, w-pfuzz)
+
+`src/pptx/fuzz_tests.rs`: en egen seedad mutator (xorshift, stabil Rust) som förstör korpusfiler på tre nivåer —
+zip (ta bort och byta namn på poster, trunkera, byta byte), XML (ta bort/duplicera/byta element, ta bort attribut,
+extrema och negativa tal, tomma texter, ogiltig UTF-8, okända namnrymder, upprepade öppningstaggar) och relationer
+(mål på sig själv, på en annan del eller på en del som saknas). Varje fall körs i en egen tråd med `catch_unwind` och
+40 s tidsgräns: öppna, rita/rastrera de första bilderna, sök, PDF, tidslinje och bildspelets tider, sedan redigering
+(flytta med extrema mått, duplicera/ta bort form, text och format, tabellcell, textruta, anteckningar, duplicera/
+flytta/dölj/ny/ta bort bild), spara, `validate` av den sparade filen (när originalet godkänns) och öppna igen.
+Kör `KLADD_PPTX_FUZZ=<antal> KLADD_PPTX_FUZZ_SEED=<n> KLADD_PPTX_REFS=<mapp> [KLADD_PPTX_FUZZ_OUT=<mapp>]
+cargo test slumpprov_av -- --ignored --nocapture` (helst under `ulimit -v` så att en minnesbomb avbryter i stället för
+att fälla maskinen; loggraden `fall N seed S fil` skrivs före varje fall). `slumpprov_ett_fall` kör en fil och tar
+tid på stegen. Minnet mäts som ökning av `VmHWM` per fall (störst sett: ~230 MB).
+
+Resultat (≈3 000 fall, 522 korpusfiler under 3 MB): två klasser av paniker, båda aritmetiska overflow (bara i
+debugbygge; i release hade de gett tysta felvärden): (1) `p:notesSz` med orimliga mått gav overflow när
+anteckningsmallen skapades (`create_notes_master`), rättat vid roten genom att läsa in måtten med samma gränser som
+`p:sldSz`; (2) `duplicate_shape` lade till 228 600 på en position nära `i64::MAX`, nu `saturating_add`. Ingen hängning,
+ingen minnesbomb och ingen sparad fil som `validate` underkänner när originalet godkänns. En tidig "hängning" var
+mutatorn själv (en tagg upprepad 400 gånger i `presentation.xml` gav 757 bilder, och redigering av så många bilder tar
+~150 s i debugbygge); upprepningen är nu begränsad. Provets egen `validate` (`edit_tests.rs`) packar upp med `unwrap`
+och paniker på trasig zip; det är ett fel i provhjälpen, inte i produkten, och fuzzprovet räknar trasig zip som
+underkänd. Före/efter: seed 2 (400 fall) 1 klass → 0; seed 3/4 (500 vardera) 0 produktklasser; efter rättelserna seed
+2/5/6 (500 vardera) 0 klasser.
