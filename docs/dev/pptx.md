@@ -1161,7 +1161,23 @@ presentationernas medel) sågs sida vid sida med PowerPoints PDF och grupperades
   våra typsnitt är bredare. Orsaken är inte klarlagd; `cppcon20` bild 33 och `cppcon16-iterator-haiku` bild 45 visar
   fenomenet (PowerPoint ~92 % teckenstorlek, filen har bara `lnSpcReduction`).
 
+**Andra passet (w-pfid)**
+- **Temafyllningar via `fillRef`:** `Builder::paint` slår upp bilden i temats relationer för alla noder som ligger i
+  temats `fillStyleLst`/`bgFillStyleLst` (pekarjämförelse), inte bara för bakgrunden. `lnRef`/`effectRef` har inga
+  bildfyllningar och behövde inget.
+- **`TxKind::Free` var för grov:** att hoppa över hela `otherStyle` gjorde sex bilder sämre (`ms-workshop-dlcv` 24/25 på
+  grund av `defTabSz`, `msrc-win32k` 1/5/11/12). Nu gäller mallens `otherStyle` utom textfärgen (formens `fontRef` ska
+  gå före, `msrc-win32k` bild 5 har vit text) och teckenstorleken när den avviker mer än 10 % från `defaultTextStyle`
+  (`Master::other_free`). Tumregeln passar alla referensbilder men är inte en känd PowerPoint-regel: 15,3 mot 18 pt
+  (covid) ignoreras, 17,65 mot 18 pt (win32k) gäller.
+- **Punkt i centrerat/högerställt stycke** hänger nu lika långt före texten som i vänsterställt stycke, i stället för
+  att stå kvar vid vänstermarginalen. Referensmaterialet har inga bilder med centrerad punktlista, så ändringen är
+  prövad bara mot en minimal fixtur (`punkt_hanger_fore_centrerad_text`) och bygger på hur PowerPoint ritar sådana
+  stycken enligt minnet, inte på en referensbild.
+- **Fler av de lägsta bilderna** (`cppcon19-charconv` 8, `owasp-top10-2017-ru` 4, `cncf-overview-ja` 21): typsnittsskillnader.
+  Brödtexten är ~1 % bredare här än i PowerPoints PDF (Verdana-ersättning), vilket ger en extra radbrytning mot
+  rutans kant; ru: rubrikerna bryts annorlunda av samma skäl; ja: japanska typsnitt.
+
 **Kvar**
 - `a:clrChange` med annan färg än vitt har ingen egen provbild; toleransen är uppmätt bara på vitt.
-- Temafyllningar via `fillRef` (former) har samma relationsfel som bakgrunden hade; bara `bgRef` är rättad.
 - `owasp-top10-2017-he` bild 21 och 4 (0,35 respektive 0,41 för LibreOffice, Kladd 0,59/0,67): inte undersökta utöver typsnitten.

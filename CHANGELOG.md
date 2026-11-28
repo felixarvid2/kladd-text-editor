@@ -15,6 +15,7 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 ### Rättat
 
 - **PowerPoint: närmare PowerPoints egen ritning på de sämsta bilderna.** Bilder med *Gör färg genomskinlig* (`a:clrChange`, vitt blir genomskinligt) ritas inte längre med vit botten över texten bakom; former utan platshållare får sin textstorlek ur presentationens `defaultTextStyle` i stället för mallens `otherStyle` (PowerPoint ritar 18 pt där mallen säger 15,3 pt); temats bakgrundsbild med dubbelton (`a:duotone`) hittas och färgas; en radbrytning utan storlek höjer inte längre raden i tabellceller. Bildernas medel för `covid-infographic-*` går från 0,64–0,79 till 0,95–0,97 och `owasp-top10-2017-en` från 0,884 till 0,898. Se `docs/dev/pptx.md`.
+- **PowerPoint: punkten i centrerad eller högerställd text** hänger före texten i stället för att stå vid vänstermarginalen, och bilder i temats fyllningsstilar hittas också för former (`fillRef`).
 
 ## [2.13.0] – 2026-11-27
 

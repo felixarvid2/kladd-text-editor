@@ -869,7 +869,16 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
         // Punkten.
         if line.first {
             if let Some((bseg, bglyphs, bw)) = &pl.bullet {
-                let bx = if p.rtl { col_x + col_w - (p.mar_l + p.indent).max(0.0) - bw } else { col_x + (p.mar_l + p.indent).max(0.0) };
+                let first_x = (p.mar_l + p.indent).max(0.0);
+                let bx = if p.rtl {
+                    col_x + col_w - first_x - bw
+                } else if matches!(p.align, Align::Center | Align::Right) {
+                    // Centrerad/högerställd text: punkten hänger det vanliga avståndet före texten i stället för
+                    // att stå kvar vid vänstermarginalen.
+                    x - (line.start_x - first_x)
+                } else {
+                    col_x + first_x
+                };
                 emit_glyphs(&mut items, bseg, bglyphs.iter().map(|&(id, x, y, a)| (id, x, y, a, NO_CHAR, NO_CHAR)), bx, base_y, &bseg.text);
             }
         }
@@ -1196,6 +1205,26 @@ mod tests {
         let bullet = x_of(&r, "•");
         assert!(bullet > 280.0, "punkten vid högerkanten: {r:?}");
         assert!(x_of(&r, "שלום") < bullet - 5.0, "{r:?}");
+    }
+
+    #[test]
+    fn punkt_hanger_fore_centrerad_text() {
+        let book = FontBook::default();
+        let mk = |align| {
+            let mut p = para("Mitten", false);
+            p.align = align;
+            p.mar_l = 20.0;
+            p.indent = -20.0;
+            p.bullet = Some(Bullet { text: "•".into(), style: p.runs[0].style.clone() });
+            runs(&layout(&frame(vec![p]), 400.0, 100.0, &book))
+        };
+        let (l, c) = (mk(Align::Left), mk(Align::Center));
+        // Vänsterställt: punkten vid marginalen (x = 0), texten efter indraget.
+        assert!(x_of(&l, "•") < 1.0 && (x_of(&l, "Mitten") - 20.0).abs() < 1.0, "{l:?}");
+        // Centrerat: punkten hänger lika långt före texten, och texten ligger i mitten.
+        let (bx, tx) = (x_of(&c, "•"), x_of(&c, "Mitten"));
+        assert!(((tx - bx) - 20.0).abs() < 1.0, "{c:?}");
+        assert!(bx > 100.0, "punkten stod kvar vid vänstermarginalen: {c:?}");
     }
 
     #[test]

@@ -131,11 +131,7 @@ impl<'a> Builder<'a> {
         } else if let Some(r) = bg.child("p:bgRef") {
             let ph = color::first_color(r).and_then(|c| self.sheets.color(c, None));
             if let Some(sr) = inherit::theme_fill(&self.sheets, r.attr_i64("idx").unwrap_or(0), ph) {
-                // Bilden i en temafyllning hör till temats relationer, inte bildens.
-                let saved = self.rels_override.replace(&self.sheets.theme.rels);
-                let painted = self.paint(sr.node, sr.ph, &frame, owner);
-                self.rels_override = saved;
-                if let Some(p) = painted {
+                if let Some(p) = self.paint(sr.node, sr.ph, &frame, owner) {
                     self.bg_paint = Some(p.clone());
                     self.fill_paint(page, p);
                 } else if let Some(c) = ph {
@@ -436,7 +432,10 @@ impl<'a> Builder<'a> {
             "a:solidFill" => color::first_color(n).and_then(|c| self.sheets.color(c, ph)).map(Paint::Solid),
             "a:gradFill" => self.gradient(n, ph, f),
             "a:blipFill" => {
-                let rels = self.rels(owner);
+                // Bilden i en temafyllning (`fillRef`/`bgRef`) hör till temats relationer, inte bildens.
+                let theme = self.sheets.theme;
+                let in_theme = theme.fill_styles.iter().chain(&theme.bg_fill_styles).any(|t| std::ptr::eq(t, n));
+                let rels = if in_theme { &theme.rels[..] } else { self.rels(owner) };
                 let id = n.child("a:blip").and_then(|b| b.attr("r:embed"))?;
                 let r = package::rel(rels, id)?;
                 let img = self.sheets.deck.image(&r.target)?;
