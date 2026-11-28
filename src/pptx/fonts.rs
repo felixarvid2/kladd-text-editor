@@ -326,9 +326,13 @@ fn substitutes(name: &str) -> &'static [(&'static str, f32, f32)] {
         "arialblack" => &[(LS, 1.154, 1.154), ("Arial", 1.154, 1.154), ("DejaVu Sans", 1.0, 1.0)],
         "twcenmt" | "twcenmtcondensed" | "corbel" | "candara" => &[("Carlito", 0.98, 0.98)],
         "opensanscondensed" | "opensanscondensedbold" | "opensanscondensedlight" => &[("Carlito", 0.97, 0.952)],
-        "garamond" | "bookantiqua" | "palatinolinotype" | "constantia" | "georgia" | "centuryschoolbook" => {
-            &[("Liberation Serif", 1.0, 1.0), ("Caladea", 1.0, 1.0)]
-        }
+        "garamond" | "bookantiqua" | "palatinolinotype" | "constantia" | "centuryschoolbook" => &[("Liberation Serif", 1.0, 1.0), ("Caladea", 1.0, 1.0)],
+        // Georgia är 8,5 % (fet 20 %) bredare än Liberation Serif; Comic Sans 3,8 % bredare än Liberation Sans
+        // (fet 1,1 %). Egna mätningar av medelbredden i löptext
+        // (Microsofts Core Fonts, bara aggregerade tal), inte prövade mot någon referensbild (inget sådant
+        // typsnitt finns i materialet).
+        "georgia" => &[("Liberation Serif", 1.085, 1.204), ("Caladea", 1.085, 1.204)],
+        "comicsansms" => &[(LS, 1.038, 1.011), ("Arial", 1.038, 1.011)],
         "meiryo" | "meiryoui" | "mspgothic" | "msgothic" | "ｍｓｐゴシック" | "ｍｓゴシック" | "yugothic" | "yugothicui" | "yumincho" | "msmincho"
         | "mspmincho" | "hiraginokakugothicpro" | "gungsuh" | "malgungothic" | "batang" | "gulim" | "dengxian" | "simsun" | "microsoftyahei"
         | "mingliu" | "pmingliu" | "microsoftjhenghei" => &[("IPAPGothic", 1.0, 1.0), ("Noto Sans CJK JP", 1.0, 1.0), ("WenQuanYi Zen Hei", 1.0, 1.0)],
@@ -790,6 +794,13 @@ pub fn decode_embedded(bytes: &[u8], part: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn georgia_ersatts_av_bredare_serif() {
+        let g = substitutes("Georgia");
+        assert!(g[0].1 > 1.08 && g[0].2 > 1.2, "{g:?}");
+        assert_eq!(substitutes("Comic Sans MS")[0].0, "Liberation Sans");
+    }
+
     use super::*;
 
     #[test]

@@ -1275,3 +1275,25 @@ Samtidigt, uppmätt mot PowerPoints ritdelar för `vList2` i msrc-identity:
 
 **Jämförelse mot ritdelarna** (`oracle`): `vList2` 0,50/0,64/0,74 → 0,59/0,96/0,96, `list1` 0,40 → 0,62, medel
 0,662 → 0,677; övriga layouter oförändrade. Prov: `rutor_vaxer_med_texten_och_storleken_krymps_tills_allt_ryms`.
+
+## Textkrympning och typsnittsmått (omgång 7, w-pfid3)
+
+Mätt med Microsofts Core Fonts (Verdana, Arial, Georgia, Trebuchet, Courier New, Comic Sans, Impact; Calibri, Segoe UI
+och Aptos ingår inte) installerade tillfälligt i behållaren, aldrig i repot, och borttagna efteråt.
+
+- **Typsnittens del av felet:** jämförelsen mot PowerPoint med typsnitten installerade ger totalmedel 0,8895 → 0,8988.
+  `cppcon15-functional` 0,854 → 0,908, `cppcon19-charconv` 0,849 → 0,895, `cppcon20-stl-features` 0,857 → 0,902,
+  `owasp-top10-2017-he` 0,712 → 0,725, covid-bilderna +0,003–0,005, övriga oförändrade. Det som återstår i dessa
+  presentationer beror alltså inte på Verdana/Arial.
+- **Krympregeln finns inte:** även med riktiga typsnitt gör varje villkor för att räkna om `normAutofit` vid ritning
+  (ingen `fontScale` men texten ryms inte; med eller utan krav på `lnSpcReduction`) bilder 0,3–0,4 sämre
+  (`cppcon20-stl-features` 19/41, `cppcon19-charconv` 20/51; presentationsmedel −0,02 till −0,04). Bild 41 överskrider
+  rutan med 88 pt men ritas av PowerPoint utan krympning, medan bild 33 (överskott 20 pt) krymps; PDF-exporten räknar
+  alltså inte om. Det sparade värdet gäller. Bild 33 förblir oförklarad (0,49).
+- **Fynd:** `a:sym typeface="Wingdings"` på privata tecken (U+F020–F0FF) ignorerades; tecknet blev en tom ruta
+  (cppcon20 bild 33, "→"; reserven var Unifont, som ritar en hex-ruta). Nu ritas sådana tecken, när ingen annan reserv än Unifont finns, i `a:sym`-typsnittet (Wingdings-pilen blir ➔ ur DejaVu Sans), smileyn 15 % smalare eftersom Wingdings-smileyn är mindre (`msrc-identity` 33: 0,953 → 0,963; med full storlek blev bilden sämre än rutan), pilen oskalad (`cppcon20-stl-features` 22 blev sämre med skalning).
+- **Ersättare:** Verdana → DejaVu Sans har redan rätt bredd (mätt 71,54 mot 71,27 em per provtext, skalning 1,004;
+  bold 0,998), så uppgiften om att DejaVu är ~6 % bredare stämmer inte. Arial/Courier New/Times/Calibri har
+  metrikkompatibla ersättare, Trebuchet ≈ Liberation Sans (1,005). Nytt i `substitutes`: Georgia → Liberation
+  Serif ×1,085 (fet ×1,204) och Comic Sans → Liberation Sans ×1,038 (fet ×1,011). Inget sådant typsnitt finns i
+  referensmaterialet, så skalningen är mätt men inte prövad mot någon bild.
