@@ -1449,3 +1449,19 @@ mutatorn själv (en tagg upprepad 400 gånger i `presentation.xml` gav 757 bilde
 och paniker på trasig zip; det är ett fel i provhjälpen, inte i produkten, och fuzzprovet räknar trasig zip som
 underkänd. Före/efter: seed 2 (400 fall) 1 klass → 0; seed 3/4 (500 vardera) 0 produktklasser; efter rättelserna seed
 2/5/6 (500 vardera) 0 klasser.
+
+### Slumpprov, andra passet: redigering av diagram, SmartArt, nya presentationer och säkerhetskopia
+
+Provet (`fuzz_tests.rs`) kör nu också: diagramdata (värde, namn, kategori, ny/borttagen serie och kategori, rubriker,
+orimliga tal, tomma tabeller) via `edit_chart::write` på förvrängda diagram, de inbäddade arbetsböckerna direkt
+(`edit_chart_xlsx::edit` med orimliga celler, även `u32::MAX`, och blad som saknas), SmartArt-text och nodoperationer
+(`edit_smartart`), nya presentationer (`new_deck::build`, alla varianter) och diagramfixturen som utgångsfiler, och
+`recovery_bytes` efter redigeringarna (måste godkännas av `validate` när originalet gör det). Förvrängningarna går nu
+också in i arbetsböckernas zip (blad, delade strängar, tabeller, beräkningskedja) och riktas hälften av gångerna mot
+`charts/` och `diagrams/`. 89 av korpusfilerna har diagram eller SmartArt.
+
+Resultat (1 500 fall före rättelsen, seed 11–13; 1 500 efter, seed 11/14/15): en klass, ett fall: en relationsfil med
+ogiltig UTF-8 lästes av ritningen (mild tolk) men inte av redigeringens källbevarande tolk, så `copy_part` (duplicera
+bild) kopierade ett diagram utan relationer och `r:id` pekade på ingenting. `Txn::raw_rels` faller nu tillbaka på den
+milda tolken. Diagram-, arbetsboks-, SmartArt- och säkerhetskopieringsstegen gav inga paniker, hängningar eller ogiltiga
+filer. Provets `validate` returnerar nu ett fel för en trasig zip-post i stället för att panika.

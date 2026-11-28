@@ -201,6 +201,33 @@ fn mutate_xml(r: &mut Rng, b: &mut Vec<u8>) {
     }
 }
 
+/// Förvränger posterna i en arbetsbok (zip): ta bort, byta namn, XML-förvrängning, trunkera en post.
+fn mutate_inner(r: &mut Rng, inner: &mut Vec<(String, Vec<u8>)>) {
+    for _ in 0..1 + r.below(3) {
+        if inner.is_empty() {
+            return;
+        }
+        let i = r.below(inner.len());
+        match r.below(5) {
+            0 => {
+                inner.remove(i);
+            }
+            1 => inner[i].0 = format!("{}x", inner[i].0),
+            2 => {
+                let at = r.below(inner[i].1.len().max(1));
+                inner[i].1.truncate(at);
+            }
+            _ => {
+                let mut b = std::mem::take(&mut inner[i].1);
+                for _ in 0..1 + r.below(3) {
+                    mutate_xml(r, &mut b);
+                }
+                inner[i].1 = b;
+            }
+        }
+    }
+}
+
 /// Muterar en presentation (zip-bytes) och ger nya zip-bytes.
 pub fn mutate(r: &mut Rng, orig: &[u8]) -> Vec<u8> {
     let Some(mut parts) = read_zip(orig) else { return orig.to_vec() };
@@ -243,8 +270,25 @@ pub fn mutate(r: &mut Rng, orig: &[u8]) -> Vec<u8> {
                     }
                 }
             }
+            3 | 4 => {
+                // Inuti en inbäddad arbetsbok: blad, delade strängar, tabeller, beräkningskedja, relationer.
+                let books: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].0.ends_with(".xlsx")).collect();
+                if !books.is_empty() {
+                    let i = books[r.below(books.len())];
+                    if let Some(mut inner) = read_zip(&parts[i].1) {
+                        mutate_inner(r, &mut inner);
+                        parts[i].1 = write_zip(&inner);
+                    }
+                }
+            }
             _ => {
-                let xmls: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].0.ends_with(".xml") || parts[i].0.ends_with(".rels")).collect();
+                // Hälften av XML-förvrängningarna riktas mot diagram, SmartArt och deras relationer.
+                let focus = r.below(2) == 0;
+                let xmls: Vec<usize> = (0..parts.len())
+                    .filter(|&i| parts[i].0.ends_with(".xml") || parts[i].0.ends_with(".rels"))
+                    .filter(|&i| !focus || parts[i].0.contains("charts/") || parts[i].0.contains("diagrams/"))
+                    .collect();
+                let xmls = if xmls.is_empty() { (0..parts.len()).filter(|&i| parts[i].0.ends_with(".xml") || parts[i].0.ends_with(".rels")).collect() } else { xmls };
                 if !xmls.is_empty() {
                     let i = xmls[r.below(xmls.len())];
                     let mut b = std::mem::take(&mut parts[i].1);
@@ -287,8 +331,7 @@ fn vm_hwm_kb() -> u64 {
 
 /// Kör alla steg på en (muterad) presentation. `Err` = ett fel som provet ska rapportera.
 pub fn exercise(bytes: Vec<u8>) -> Result<(), String> {
-    // `validate` (provets hjälpfunktion) packar upp med unwrap: en trasig zip räknas som underkänd i stället för panik.
-    let safe_validate = |b: &[u8]| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validate(b))).unwrap_or_else(|_| vec!["zip kan inte packas upp".into()]);
+    let safe_validate = validate;
     let pre = safe_validate(&bytes);
     let Ok(deck) = Deck::open(&bytes) else { return Ok(()) };
     let n = deck.slides.len().min(6);
@@ -369,6 +412,16 @@ pub fn exercise(bytes: Vec<u8>) -> Result<(), String> {
         let last = deck.slides.len() - 1;
         step(&mut s, &mut deck, &|t| edit_ops::delete_slide(t, last));
     }
+    // Diagramdata, arbetsböcker, SmartArt-text och säkerhetskopia.
+    extra_edits(&mut s, &mut deck, n, &bytes);
+    if let Ok(rb) = s.recovery_bytes(&deck) {
+        if pre.is_empty() {
+            let errs = safe_validate(&rb);
+            if !errs.is_empty() {
+                return Err(format!("recovery_bytes validate: {errs:?}"));
+            }
+        }
+    }
     let Ok((out, _)) = s.save_bytes(&deck, "pptx", "pptx") else { return Ok(()) };
     if pre.is_empty() {
         let errs: Vec<String> = safe_validate(&out);
@@ -382,6 +435,110 @@ pub fn exercise(bytes: Vec<u8>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Redigering av diagramdata (värden, namn, kategorier, serier, rubriker), de inbäddade arbetsböckerna direkt och
+/// text och noder i SmartArt.
+fn extra_edits(s: &mut Session, deck: &mut Deck, n: usize, orig: &[u8]) {
+    use super::edit_chart::{self, Cat, SeriesData};
+    let apply = |s: &mut Session, deck: &mut Deck, f: &dyn Fn(&mut super::edit::Txn) -> Result<(), String>| {
+        if let Ok(Some(a)) = s.apply(deck, None, f) {
+            *deck = a.deck;
+        }
+    };
+    for slide in 0..n.min(deck.slides.len()) {
+        for sh in edit_ops::shapes(deck, slide) {
+            if !edit_chart::is_chart(deck, slide, sh.index) {
+                continue;
+            }
+            let Some((_, data)) = edit_chart::read_shape(deck, slide, sh.index) else { continue };
+            let mut variants: Vec<edit_chart::ChartData> = Vec::new();
+            let mut d = data.clone();
+            if let Some(v) = d.series.first_mut().and_then(|s| s.vals.first_mut()) {
+                *v = Some(f64::MAX);
+            }
+            variants.push(d);
+            let mut d = data.clone();
+            if let Some(sr) = d.series.first_mut() {
+                sr.name = "<&\"'>\u{0}ä".repeat(3);
+                sr.vals.push(Some(-1e300));
+            }
+            if let Some(c) = d.cats.first_mut() {
+                c.text = "Ny kategori".into();
+                c.num = Some(f64::NAN);
+            }
+            variants.push(d);
+            let mut d = data.clone();
+            d.cats.push(Cat { text: "Q9".into(), num: None });
+            let len = d.cats.len();
+            d.series.push(SeriesData { name: "Ny".into(), vals: vec![Some(1.0); len], orig: None });
+            variants.push(d);
+            let mut d = data.clone();
+            d.cats.clear();
+            variants.push(d);
+            let mut d = data.clone();
+            d.series.clear();
+            variants.push(d);
+            let mut d = data.clone();
+            d.series.pop();
+            d.cats.pop();
+            for t in &mut d.titles {
+                t.text = Some("Rubrik & <ny>".into());
+            }
+            variants.push(d);
+            let mut d = data.clone();
+            for t in &mut d.titles {
+                t.text = None;
+            }
+            for sr in &mut d.series {
+                sr.vals.truncate(1);
+            }
+            variants.push(d);
+            for d in variants {
+                apply(s, deck, &|t| edit_chart::write(t, slide, sh.index, &d).map(|_| ()));
+            }
+        }
+    }
+    // Arbetsböckerna direkt: celler (även orimliga) i alla `ppt/embeddings/*.xlsx`.
+    let books: Vec<Vec<u8>> = read_zip(orig).unwrap_or_default().into_iter().filter(|(n, _)| n.ends_with(".xlsx")).map(|(_, b)| b).collect();
+    for bytes in books {
+        use super::edit_chart_xlsx::{self as xl, CellVal, Write as W};
+        let w = |col, row, val| W { sheet: "Sheet1".into(), col, row, val };
+        for writes in [
+            vec![w(1, 1, CellVal::Str("x".into())), w(2, 2, CellVal::Num(1.5)), w(3, 3, CellVal::Empty)],
+            vec![w(u32::MAX, u32::MAX, CellVal::Num(1.0)), w(0, 0, CellVal::Str("n".into()))],
+            vec![w(16_384, 1_048_576, CellVal::Str("<&>".into())), w(1, 5, CellVal::Num(f64::INFINITY))],
+            vec![W { sheet: "Saknas".into(), col: 1, row: 1, val: CellVal::Num(2.0) }],
+        ] {
+            let _ = xl::edit(&bytes, &writes);
+        }
+    }
+    // SmartArt: text i en nod och nodoperationer.
+    for slide in 0..n.min(deck.slides.len()) {
+        if super::smartart::diagram_frames(deck, slide).is_empty() {
+            continue;
+        }
+        let (w, h) = deck.size_pt();
+        let mut found = None;
+        'outer: for gy in (10..h.max(10.0) as i32).step_by(30) {
+            for gx in (10..w.max(10.0) as i32).step_by(30) {
+                if let Some(t) = super::edit_smartart::target_at(deck, slide, gx as f32, gy as f32) {
+                    found = Some(t);
+                    break 'outer;
+                }
+            }
+        }
+        let Some(t) = found else { continue };
+        if let Some(mut m) = super::edit_smartart::model(deck, &t) {
+            let end = m.end();
+            m.insert(end, " Kladd <&>");
+            apply(s, deck, &|tx| super::edit_smartart::set_text(tx, &t, &m));
+        }
+        use super::edit_smartart::Op;
+        for op in [Op::After, Op::Demote, Op::Promote, Op::After, Op::Remove] {
+            apply(s, deck, &|tx| super::edit_smartart::restructure(tx, &t, op).map(|_| ()));
+        }
+    }
 }
 
 /// Resultat för ett fall: klassnyckel (panikplats, "hängning", "validate") och text.
@@ -424,6 +581,29 @@ fn corpus(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     v
 }
 
+/// Väljer utgångsfil: korpusen, filer med diagram/SmartArt, egna fixturer (nya presentationer och ett diagram med
+/// arbetsbok). Ger (namn, innehåll).
+fn pick_seed(r: &mut Rng, files: &[std::path::PathBuf], special: &[std::path::PathBuf]) -> (String, Vec<u8>) {
+    match r.below(10) {
+        0 => {
+            let v = super::new_deck::Variant::ALL[r.below(3)];
+            (format!("ny presentation {v:?}"), super::new_deck::build(v))
+        }
+        1 | 2 => {
+            let ext = r.below(2) == 0;
+            (format!("diagramfixtur extern={ext}"), super::edit_chart_tests::deck_bytes(ext))
+        }
+        3 | 4 | 5 if !special.is_empty() => {
+            let f = &special[r.below(special.len())];
+            (f.display().to_string(), std::fs::read(f).unwrap_or_default())
+        }
+        _ => {
+            let f = &files[r.below(files.len())];
+            (f.display().to_string(), std::fs::read(f).unwrap_or_default())
+        }
+    }
+}
+
 /// Slumpprovet. `KLADD_PPTX_FUZZ=<antal>` fall över korpusen i `KLADD_PPTX_REFS`.
 #[test]
 #[ignore]
@@ -434,6 +614,12 @@ fn slumpprov_av_presentationer() {
     let out_dir = std::env::var_os("KLADD_PPTX_FUZZ_OUT").map(std::path::PathBuf::from);
     let files = corpus(std::path::Path::new(&root));
     assert!(!files.is_empty(), "ingen korpus");
+    // Filer med diagram, SmartArt eller arbetsböcker (riktas mot de nya redigeringsfunktionerna).
+    let special: Vec<std::path::PathBuf> = files
+        .iter()
+        .filter(|f| std::fs::read(f).is_ok_and(|b| b.windows(10).any(|w| w == b"charts/cha" || w == b"diagrams/d" || w == b"embedding")))
+        .cloned()
+        .collect();
     std::panic::set_hook(Box::new(|info| {
         let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
         let msg = info.payload().downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
@@ -448,8 +634,8 @@ fn slumpprov_av_presentationer() {
     for case in 0..n {
         let case_seed = seed.wrapping_mul(1_000_003).wrapping_add(case as u64);
         let mut r = Rng::new(case_seed);
-        let f = &files[r.below(files.len())];
-        let Ok(orig) = std::fs::read(f) else { continue };
+        let (name, orig) = pick_seed(&mut r, &files, &special);
+        let f = std::path::PathBuf::from(name);
         let bytes = mutate(&mut r, &orig);
         // Loggraden skrivs före körningen: en avbruten process (minnesbrist) pekar ut fallet.
         println!("fall {case} seed {case_seed} {}", f.display());
@@ -568,4 +754,39 @@ fn duplicera_form_vid_ytterkant_ger_inte_overflow() {
     let mut s = Session::new(bytes, &deck);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.apply(&deck, None, |t| edit_ops::duplicate_shape(t, 0, sh.index, sh.id).map(|_| ())).map(|_| ())));
     assert!(r.is_ok(), "panik i duplicate_shape");
+}
+
+/// Klass 3 (slumpprov): en relationsfil med ogiltig UTF-8 lästes av ritningen men inte av den källbevarande
+/// tolken, så `copy_part` kopierade ett diagram utan relationer (`r:id` som pekar på ingenting).
+#[test]
+fn kopierat_diagram_behaller_relationerna_trots_trasig_relationsfil() {
+    let mut parts = read_zip(&super::edit_chart_tests::deck_bytes(false)).unwrap();
+    let rels = parts.iter_mut().find(|(n, _)| n == "ppt/charts/_rels/chart1.xml.rels").unwrap();
+    let at = rels.1.windows(13).position(|w| w == b"relationships").unwrap();
+    rels.1[at + 3] = 0xFF;
+    let bytes = write_zip(&parts);
+    let pre = validate(&bytes);
+    let deck = Deck::open(&bytes).unwrap();
+    let mut s = Session::new(bytes, &deck);
+    let a = s.apply(&deck, None, |t| edit_ops::duplicate_slide(t, 0).map(|_| ())).unwrap().unwrap();
+    let (out, _) = s.save_bytes(&a.deck, "pptx", "pptx").unwrap();
+    let errs: Vec<String> = validate(&out).into_iter().filter(|e| !pre.contains(e)).collect();
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+/// Fixturerna (nya presentationer, diagram med och utan arbetsbok) går igenom hela kedjan utan fel, omuterade
+/// och muterade: diagram-, arbetsboks-, SmartArt- och säkerhetskopieringsstegen körs på riktigt.
+#[test]
+fn fixturerna_klarar_hela_kedjan() {
+    let mut seeds: Vec<Vec<u8>> = super::new_deck::Variant::ALL.iter().map(|v| super::new_deck::build(*v)).collect();
+    seeds.push(super::edit_chart_tests::deck_bytes(false));
+    seeds.push(super::edit_chart_tests::deck_bytes(true));
+    for (k, b) in seeds.iter().enumerate() {
+        assert_eq!(exercise(b.clone()), Ok(()), "omuterad fixtur {k}");
+        for seed in 0..15 {
+            let m = mutate(&mut Rng::new(seed + 100 * k as u64), b);
+            let r = std::panic::catch_unwind(|| exercise(m));
+            assert!(r.is_ok(), "panik: fixtur {k}, seed {seed}");
+        }
+    }
 }

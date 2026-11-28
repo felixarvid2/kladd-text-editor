@@ -16,6 +16,7 @@ Den fullständiga beskrivningen av Kladds funktioner. En kort översikt finns i 
 ### Rättat
 
 - **PowerPoint: tåligare mot trasiga filer.** Slumpprov (≈3 000 förvrängda presentationer) hittade två overflow-fel, nu rättade: orimliga anteckningsmått och duplicering av en form nära talområdets kant. Se `docs/dev/pptx.md`.
+- **PowerPoint: kopierade diagram behåller sina relationer** även när relationsfilen har ogiltiga tecken som ritningen tolererar (andra slumpprovet: redigering av diagram, arbetsböcker, SmartArt och säkerhetskopia).
 
 ## [2.16.0] – 2026-11-28
 

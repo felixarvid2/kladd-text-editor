@@ -198,7 +198,18 @@ impl<'a> Txn<'a> {
     /// Relationerna som de står (id, typ, mål som det står, extern).
     pub fn raw_rels(&self, owner: &str) -> Vec<(String, String, String, bool)> {
         let Some(bytes) = self.read(&rels_name(owner)) else { return Vec::new() };
-        let Some(d) = edit_xml::parse(&bytes) else { return Vec::new() };
+        let Some(d) = edit_xml::parse(&bytes) else {
+            // Den källbevarande tolken vägrar t.ex. ogiltig UTF-8, men läsningen (som ritar bilden) är mildare:
+            // en relationsfil som den förra läser ska inte tappa sina relationer vid kopiering (slumpprov: en
+            // kopierad diagramdel utan relationer, med `r:id` som pekar på ingenting).
+            let Some(root) = super::xml::parse(&bytes) else { return Vec::new() };
+            return root
+                .children
+                .iter()
+                .filter(|e| e.local() == "Relationship")
+                .filter_map(|e| Some((e.attr("Id")?.to_owned(), e.attr("Type").unwrap_or_default().to_owned(), e.attr("Target")?.to_owned(), e.attr("TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External")))))
+                .collect();
+        };
         d.root
             .elems()
             .filter(|e| e.local() == "Relationship")
