@@ -1179,3 +1179,17 @@ presentationernas medel) sågs sida vid sida med PowerPoints PDF och grupperades
 **Kvar**
 - `a:clrChange` med annan färg än vitt har ingen egen provbild; toleransen är uppmätt bara på vitt.
 - `owasp-top10-2017-he` bild 21 och 4 (0,35 respektive 0,41 för LibreOffice, Kladd 0,59/0,67): inte undersökta utöver typsnitten.
+
+## Typsnitt, radavstånd och numrerade listor (omgång 6)
+
+- `edit_format.rs`: `set_font` (byter `a:latin` på plats eller lägger det efter fyllning/effekter/understrykning och före
+  `a:ea`/`a:cs`/`a:sym`/länkar; panose och teckenuppsättning hör till det gamla typsnittet och försvinner; `a:ea`/`a:cs`
+  får samma namn bara om de redan finns, och ett temanamn `+mj-lt`/`+mn-lt` ger `+mj-ea`/`+mj-cs` resp. `+mn-…`),
+  `set_line_spacing` (`a:lnSpc` som `a:pPr`:s första barn, `spcPct` i hundratusendelar) och `set_numbered`
+  (`a:buFont +mj-lt` + `a:buAutoNum type="arabicPeriod"`, `marL` 342900 + 457200 per nivå, `indent` −342900; av = punkter av).
+  Prov för schemaordningen finns för alla tre.
+- Formatraden (`edit_bar.rs`): `ParaFmt` har nu `font`, `ln_spc` och `numbered` ur samma utläggning som ritar bilden.
+  Typsnittsmenyn listar temats två typsnitt (namnen upplöses med `inherit::theme_font`) och `fonts::system_db()`s familjer
+  (sorterade, lästa en gång per flik). Numrerad lista skiljs från punkt på om punkttexten börjar med en bokstav eller siffra.
+- Kvar: radavstånd i punkter (`spcPts`) visas inte i menyn, avstånd före/efter, `buAutoNum` med andra scheman
+  (romerska, bokstäver) och startnummer, sökruta i typsnittsmenyn.

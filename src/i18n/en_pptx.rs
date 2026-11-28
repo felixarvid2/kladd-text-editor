@@ -138,4 +138,7 @@ pub const EN: &[(&str, &str)] = &[
     ("Ljusgrön", "Light green"),
     ("Ljusblå", "Light blue"),
     ("Lila", "Purple"),
+    // Typsnitt, radavstånd och numrerad lista i formatraden (w-pedit4).
+    ("Rubrik ({font})", "Heading ({font})"),
+    ("Brödtext ({font})", "Body ({font})"),
 ];

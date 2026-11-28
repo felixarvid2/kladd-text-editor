@@ -4,6 +4,10 @@ Här står vad som är nytt i varje version av Kladd, med den senaste överst.
 
 ## [Ej släppt]
 
+### Nytt
+
+- **PowerPoint: typsnitt, radavstånd och numrerade listor i formatraden.** Typsnittsmenyn har temats rubrik- och brödtextfont överst och därefter systemets typsnitt (`a:latin`; `a:ea`/`a:cs` följer med bara om de redan finns), radavståndet väljs bland 1, 1,15, 1,5 och 2 (`a:lnSpc/a:spcPct`), och en ny knapp gör numrerad lista (`a:buAutoNum`, `arabicPeriod`). Allt skrivs med barnen i schemats ordning. Se `docs/dev/pptx.md`.
+
 ## [2.14.0] – 2026-11-28
 
 ### Nytt

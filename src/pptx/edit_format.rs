@@ -6,7 +6,7 @@
 //! ändringen ordet vid markören; ett tomt stycke får formatet på `a:endParaRPr`, som nästa
 //! skrivna tecken ärver.
 
-use super::edit_text::{ParaFmt, Pos, TextModel, Item};
+use super::edit_text::{Item, ParaFmt, Pos, TextModel};
 use super::edit_xml::XElem;
 
 /// Textfärgen som skrivs: en temafärg (`accent1`, `tx1` …) eller en RGB-färg.
@@ -201,6 +201,84 @@ impl TextModel {
             }
         }
     }
+
+    /// Sätter typsnittet (`a:latin typeface`) mellan lägena. `a:ea`/`a:cs` ändras bara om de redan finns
+    /// (ett temanamn `+mj-lt`/`+mn-lt` ger `+mj-ea`/`+mj-cs` resp. `+mn-…`). Andra attribut på det gamla
+    /// `a:latin` (panose, teckenuppsättning) hör till det gamla typsnittet och tas bort.
+    pub fn set_font(&mut self, a: Pos, b: Pos, face: &str) -> bool {
+        let pre = self.prefix().to_owned();
+        let q = |l: &str| if pre.is_empty() { l.to_owned() } else { format!("{pre}:{l}") };
+        let esc = super::edit_xml::escape(face);
+        let theme = |slot: &str| face.strip_prefix("+m").and_then(|r| r.get(..1)).map(|mj| format!("+m{mj}-{}", if slot == "latin" { "lt" } else { slot }));
+        let mk = |slot: &str| self.frag(&format!("<{} typeface=\"{}\"/>", q(slot), theme(slot).map_or_else(|| esc.clone(), |t| super::edit_xml::escape(&t))));
+        let (latin, ea, cs) = (mk("latin"), mk("ea"), mk("cs"));
+        self.edit_runs(a, b, &mut |r, _, _| {
+            for (name, el, before) in [
+                ("a:latin", &latin, &["a:ea", "a:cs", "a:sym", "a:hlinkClick", "a:hlinkMouseOver", "a:rtl", "a:extLst"][..]),
+                ("a:ea", &ea, &[][..]),
+                ("a:cs", &cs, &[][..]),
+            ] {
+                let Some(el) = el else { continue };
+                if let Some(i) = r.index_of(name) {
+                    r.children[i] = super::edit_xml::XNode::Elem(el.clone());
+                } else if name == "a:latin" {
+                    r.insert_before(el.clone(), before);
+                }
+            }
+        })
+    }
+
+    /// Sätter radavståndet (`a:lnSpc/a:spcPct`, 1.0 = enkelt) i styckena mellan lägena.
+    pub fn set_line_spacing(&mut self, a: Pos, b: Pos, factor: f32) {
+        let (a, b) = if a <= b { (self.clamp(a), self.clamp(b)) } else { (self.clamp(b), self.clamp(a)) };
+        let pre = self.prefix().to_owned();
+        let q = |l: &str| if pre.is_empty() { l.to_owned() } else { format!("{pre}:{l}") };
+        let val = ((factor * 100_000.0).round() as i64).to_string();
+        for pi in a.para..=b.para {
+            if self.paras[pi].ppr.is_none() {
+                self.paras[pi].ppr = self.frag(&format!("<{}/>", q("pPr")));
+            }
+            let el = self.frag(&format!("<{}><{} val=\"{val}\"/></{}>", q("lnSpc"), q("spcPct"), q("lnSpc")));
+            let para = &mut self.paras[pi];
+            para.touch();
+            if let (Some(p), Some(el)) = (&mut para.ppr, el) {
+                p.remove_children("a:lnSpc");
+                // `a:lnSpc` är pPr:s första barn.
+                p.insert_before(el, &["a:spcBef", "a:spcAft", "a:buClrTx", "a:buClr", "a:buSzTx", "a:buSzPct", "a:buSzPts", "a:buFontTx", "a:buFont", "a:buNone", "a:buAutoNum", "a:buChar", "a:buBlip", "a:tabLst", "a:defRPr", "a:extLst"]);
+            }
+        }
+    }
+
+    /// Numrerad lista på/av i styckena mellan lägena. På: `a:buFont` (+mj-lt) + `a:buAutoNum
+    /// type="arabicPeriod"` med indrag; av: som punkterna av.
+    pub fn set_numbered(&mut self, a: Pos, b: Pos, on: bool) {
+        if !on {
+            return self.set_bullet(a, b, false);
+        }
+        let (a, b) = if a <= b { (self.clamp(a), self.clamp(b)) } else { (self.clamp(b), self.clamp(a)) };
+        let pre = self.prefix().to_owned();
+        let q = |l: &str| if pre.is_empty() { l.to_owned() } else { format!("{pre}:{l}") };
+        for pi in a.para..=b.para {
+            if self.paras[pi].ppr.is_none() {
+                self.paras[pi].ppr = self.frag(&format!("<{}/>", q("pPr")));
+            }
+            let lvl = self.paras[pi].level();
+            let font = self.frag(&format!("<{} typeface=\"+mj-lt\"/>", q("buFont")));
+            let num = self.frag(&format!("<{} type=\"arabicPeriod\"/>", q("buAutoNum")));
+            let para = &mut self.paras[pi];
+            para.touch();
+            let Some(p) = &mut para.ppr else { continue };
+            for n in BULLETS.iter().chain(&["a:buFont", "a:buFontTx"]) {
+                p.remove_children(n);
+            }
+            p.set_attr("marL", &(342_900 + 457_200 * lvl).to_string());
+            p.set_attr("indent", "-342900");
+            if let (Some(f), Some(n)) = (font, num) {
+                p.insert_before(f, &[BULLETS, PPR_AFTER_BULLET].concat());
+                p.insert_before(n, PPR_AFTER_BULLET);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -254,7 +332,7 @@ mod tests {
     #[test]
     fn storlekssteg_utgar_fran_arvd_storlek() {
         let (mut m, doc) = model(r#"<a:p><a:r><a:rPr lang="sv-SE"/><a:t>Hej</a:t></a:r><a:r><a:rPr sz="1400"/><a:t>då</a:t></a:r></a:p>"#);
-        let fmts = vec![ParaFmt { align: Default::default(), bullet: false, runs: vec![(0, 3, 24.0, [0; 3]), (3, 5, 14.0, [0; 3])] }];
+        let fmts = vec![ParaFmt { runs: vec![(0, 3, 24.0, [0; 3]), (3, 5, 14.0, [0; 3])], ..Default::default() }];
         m.step_size(Pos::default(), m.end(), true, &fmts);
         let out = write(&m, &doc);
         assert!(out.contains(r#"<a:rPr lang="sv-SE" sz="2800"/><a:t>Hej</a:t>"#), "{out}");
@@ -306,5 +384,45 @@ mod tests {
         let out = write(&m, &doc);
         assert!(out.contains(r#"<a:pPr marL="0" indent="0"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:buNone/><a:tabLst/><a:defRPr/></a:pPr>"#), "{out}");
         assert!(!out.contains("buChar") && !out.contains("buFont"), "{out}");
+    }
+
+    #[test]
+    fn typsnitt_ersatter_latin_i_schemats_ordning_och_ror_ea_cs_bara_om_de_finns() {
+        let (mut m, doc) = model(r#"<a:p><a:r><a:rPr lang="sv-SE"><a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:latin typeface="Calibri" panose="020F0502020204030204"/><a:cs typeface="Arial"/><a:hlinkClick/></a:rPr><a:t>a</a:t></a:r><a:r><a:rPr/><a:t>b</a:t></a:r><a:r><a:rPr><a:ea typeface="X"/><a:extLst/></a:rPr><a:t>c</a:t></a:r></a:p>"#);
+        m.set_font(Pos::default(), m.end(), "+mj-lt");
+        let out = write(&m, &doc);
+        assert!(out.contains(r#"<a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:latin typeface="+mj-lt"/><a:cs typeface="+mj-cs"/><a:hlinkClick/></a:rPr>"#), "{out}");
+        assert!(out.contains(r#"<a:rPr><a:latin typeface="+mj-lt"/></a:rPr><a:t>b</a:t>"#), "{out}");
+        assert!(out.contains(r#"<a:rPr><a:latin typeface="+mj-lt"/><a:ea typeface="+mj-ea"/><a:extLst/></a:rPr><a:t>c</a:t>"#), "{out}");
+        m.set_font(Pos::default(), m.end(), "Liberation Serif");
+        let out = write(&m, &doc);
+        assert!(out.contains(r#"<a:latin typeface="Liberation Serif"/><a:cs typeface="Liberation Serif"/>"#) && !out.contains("panose"), "{out}");
+    }
+
+    #[test]
+    fn radavstand_hamnar_forst_i_ppr() {
+        let (mut m, doc) = model(r#"<a:p><a:pPr algn="ctr"><a:spcBef><a:spcPts val="600"/></a:spcBef><a:buNone/><a:defRPr/></a:pPr><a:r><a:t>a</a:t></a:r></a:p><a:p><a:r><a:t>b</a:t></a:r></a:p>"#);
+        m.set_line_spacing(Pos::default(), m.end(), 1.15);
+        let out = write(&m, &doc);
+        assert!(out.contains(r#"<a:pPr algn="ctr"><a:lnSpc><a:spcPct val="115000"/></a:lnSpc><a:spcBef><a:spcPts val="600"/></a:spcBef><a:buNone/><a:defRPr/></a:pPr>"#), "{out}");
+        assert!(out.contains(r#"<a:p><a:pPr><a:lnSpc><a:spcPct val="115000"/></a:lnSpc></a:pPr><a:r><a:t>b</a:t>"#), "{out}");
+        m.set_line_spacing(Pos::default(), m.end(), 2.0);
+        let out = write(&m, &doc);
+        assert!(out.matches("<a:lnSpc>").count() == 2 && out.contains(r#"val="200000""#) && !out.contains("115000"), "{out}");
+    }
+
+    #[test]
+    fn numrerad_lista_pa_och_av_i_schemats_ordning() {
+        let (mut m, doc) = model(r#"<a:p><a:pPr><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:buChar char="•"/><a:tabLst/></a:pPr><a:r><a:t>a</a:t></a:r></a:p>"#);
+        m.set_numbered(Pos::default(), Pos::default(), true);
+        let out = write(&m, &doc);
+        assert!(out.contains(r#"<a:pPr marL="342900" indent="-342900"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:buFont typeface="+mj-lt"/><a:buAutoNum type="arabicPeriod"/><a:tabLst/></a:pPr>"#), "{out}");
+        assert!(!out.contains("buChar"), "{out}");
+        m.set_bullet(Pos::default(), Pos::default(), true);
+        let out = write(&m, &doc);
+        assert!(!out.contains("buAutoNum") && out.contains("buChar"), "{out}");
+        m.set_numbered(Pos::default(), Pos::default(), false);
+        let out = write(&m, &doc);
+        assert!(out.contains("<a:buNone/>") && !out.contains("buAutoNum"), "{out}");
     }
 }
