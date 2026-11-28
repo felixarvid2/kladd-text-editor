@@ -579,8 +579,13 @@ impl Emitter<'_, '_, '_, '_> {
                 &[("modelId", model_id)],
                 vec![el("p:nvSpPr", &[], vec![el("p:cNvPr", &[("id", "0".into()), ("name", String::new())], Vec::new()), el("p:cNvSpPr", &[], Vec::new())]), sppr, self.style(sr)],
             );
+            // Platshållare för en bild (`blipPhldr`): PowerPoints bildsymbol mitt i formen.
+            let picture = prst.is_some() && shape.is_some_and(|s| s.attr_bool("blipPhldr").unwrap_or(false));
             if t.text_points(id).is_empty() {
                 out.push((id, sp, None));
+                if picture {
+                    out.push((id, picture_glyph(r), None));
+                }
                 continue;
             }
             // Textrutan: formens textrektangel i den ovridna rutan.
@@ -664,4 +669,45 @@ impl Emitter<'_, '_, '_, '_> {
         }
         Some(tree)
     }
+}
+
+/// Bildsymbolen i en tom bildplatshållare (som PowerPoints): en ram med berg och sol i grått, en
+/// kvadrat på 40 % av rutans kortaste sida i dess mitt.
+fn picture_glyph(r: Rect) -> Node {
+    let g = r.w.min(r.h) * 0.4;
+    let (x, y) = (r.x + (r.w - g) / 2.0, r.y + (r.h - g) / 2.0);
+    let pt = |px: i64, py: i64| el("a:pt", &[("x", px.to_string()), ("y", py.to_string())], Vec::new());
+    let mv = |px, py| el("a:moveTo", &[], vec![pt(px, py)]);
+    let ln = |px, py| el("a:lnTo", &[], vec![pt(px, py)]);
+    let close = || el("a:close", &[], Vec::new());
+    let path = |attrs: &[(&str, String)], kids: Vec<Node>| {
+        let mut a = vec![("w", "1000".to_owned()), ("h", "1000".to_owned())];
+        a.extend(attrs.iter().cloned());
+        el("a:path", &a, kids)
+    };
+    let frame = path(&[("fill", "none".into())], vec![mv(0, 0), ln(1000, 0), ln(1000, 1000), ln(0, 1000), close()]);
+    let hills = path(&[("stroke", "0".into())], vec![mv(100, 860), ln(380, 470), ln(560, 700), ln(700, 560), ln(900, 860), close()]);
+    let sun = path(
+        &[("stroke", "0".into())],
+        vec![mv(840, 250), el("a:arcTo", &[("wR", "100".into()), ("hR", "100".into()), ("stAng", "0".into()), ("swAng", "21600000".into())], Vec::new()), close()],
+    );
+    let geom = el(
+        "a:custGeom",
+        &[],
+        vec![
+            el("a:avLst", &[], Vec::new()),
+            el("a:gdLst", &[], Vec::new()),
+            el("a:rect", &[("l", "0".into()), ("t", "0".into()), ("r", "r".into()), ("b", "b".into())], Vec::new()),
+            el("a:pathLst", &[], vec![frame, hills, sun]),
+        ],
+    );
+    let gray = || el("a:srgbClr", &[("val", "A6A6A6".into())], Vec::new());
+    let xfrm = el("a:xfrm", &[], vec![el("a:off", &[("x", emu(x)), ("y", emu(y))], Vec::new()), el("a:ext", &[("cx", emu(g)), ("cy", emu(g))], Vec::new())]);
+    let width = ((g * 0.04).clamp(0.5, 2.0) * EMU).round() as i64;
+    let sppr = el(
+        "p:spPr",
+        &[],
+        vec![xfrm, geom, el("a:solidFill", &[], vec![gray()]), el("a:ln", &[("w", width.to_string())], vec![el("a:solidFill", &[], vec![gray()])])],
+    );
+    el("p:sp", &[("modelId", String::new())], vec![el("p:nvSpPr", &[], vec![el("p:cNvPr", &[("id", "0".into()), ("name", String::new())], Vec::new()), el("p:cNvSpPr", &[], Vec::new())]), sppr])
 }

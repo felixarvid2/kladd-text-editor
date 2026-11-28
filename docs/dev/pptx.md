@@ -170,11 +170,11 @@ ersättningstypsnitt). LibreOffice 24.2 är renderad i samma behållare och har 
 
 ## Kvar
 
-Sammanställt efter omgång 5 (detaljer i respektive avsnitt nedan):
+Sammanställt efter omgång 6 (detaljer i respektive avsnitt nedan):
 
 - **Redigering:** gjord i omgång 3 och 5 (se *Redigering och sparande* och avsnitten för omgång 5 nedan). Kvar:
   text i SmartArt och i tabeller i grupper; `spAutoFit` i grupper; duplicera diagram/SmartArt som enskilda former;
-  teckensnitt, marginaler, radavstånd och numrerade listor i formatraden; markering över flera tabellceller;
+  marginaler, avstånd före/efter, radavstånd i punkter och andra numreringsscheman i formatraden; markering över flera tabellceller;
   autoanpassning efter storleksändring av flera former eller en grupp; återställning efter krasch (bara
   automatisk sparning).
 - **Visning:** föredragsvyns automatiska val av skärm (se *Bildspel* nedan),
@@ -193,9 +193,10 @@ Sammanställt efter omgång 5 (detaljer i respektive avsnitt nedan):
   `a:bodyPr`), perspektiv och extrudering bortom en enkel affin förvrängning (se *3D i diagram och former*).
 - **SmartArt:** layoutmotorn (se *SmartArt-layout (omgång 3)* och *SmartArt: hierarkier och böjda kopplingar
   (omgång 5)*) används bara när ritdelen saknas eller är tom. Saknas: text som får rutan att växa
-  (`rule type="h" val="INF"`, `vList2`), ikoner i platshållare (`blipPhldr` ritas som en tom form), egna
-  förskjutningar i `composite` (kugghjul med ett och två hjul), hierarkins `hang` i två spalter (`secLinDir`),
-  nivåetiketterna i `hierarchy5` och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
+  (`rule type="h" val="INF"`, `vList2`), egna förskjutningar i `composite` (kugghjul med ett och två hjul),
+  hierarkins `hang` i två spalter (`secLinDir`), nivåetiketterna i `hierarchy5` (bakgrundskolumnerna i
+  `bgShapesFlow` följer inte hierarkin när den krymps; ett försök att krympa `hierFlow` till sin ruta gjorde
+  släktträdet sämre och togs bort) och böjda kopplingar utan `…srcNode`-namn (`VerticalCurvedList`).
 - **Fyllningar:** `rotWithShape` för linjära övertoningar; stoppordningen i banövertoningar är inte verifierad
   (diagrambakgrunden i `msrc-eko19` blir för ljus); bildeffekterna `lum` m.fl. (`duotone` gjordes i omgång 5)
 - **Text:** `fontAlgn`, `buBlip`, WordArt (`prstTxWarp`), bindestreck, `buChar` med flera tecken (owasp-2010-es).
@@ -1179,3 +1180,44 @@ presentationernas medel) sågs sida vid sida med PowerPoints PDF och grupperades
 **Kvar**
 - `a:clrChange` med annan färg än vitt har ingen egen provbild; toleransen är uppmätt bara på vitt.
 - `owasp-top10-2017-he` bild 21 och 4 (0,35 respektive 0,41 för LibreOffice, Kladd 0,59/0,67): inte undersökta utöver typsnitten.
+
+## Typsnitt, radavstånd och numrerade listor (omgång 6)
+
+- `edit_format.rs`: `set_font` (byter `a:latin` på plats eller lägger det efter fyllning/effekter/understrykning och före
+  `a:ea`/`a:cs`/`a:sym`/länkar; panose och teckenuppsättning hör till det gamla typsnittet och försvinner; `a:ea`/`a:cs`
+  får samma namn bara om de redan finns, och ett temanamn `+mj-lt`/`+mn-lt` ger `+mj-ea`/`+mj-cs` resp. `+mn-…`),
+  `set_line_spacing` (`a:lnSpc` som `a:pPr`:s första barn, `spcPct` i hundratusendelar) och `set_numbered`
+  (`a:buFont +mj-lt` + `a:buAutoNum type="arabicPeriod"`, `marL` 342900 + 457200 per nivå, `indent` −342900; av = punkter av).
+  Prov för schemaordningen finns för alla tre.
+- Formatraden (`edit_bar.rs`): `ParaFmt` har nu `font`, `ln_spc` och `numbered` ur samma utläggning som ritar bilden.
+  Typsnittsmenyn listar temats två typsnitt (namnen upplöses med `inherit::theme_font`) och `fonts::system_db()`s familjer
+  (sorterade, lästa en gång per flik). Numrerad lista skiljs från punkt på om punkttexten börjar med en bokstav eller siffra.
+- Kvar: radavstånd i punkter (`spcPts`) visas inte i menyn, avstånd före/efter, `buAutoNum` med andra scheman
+  (romerska, bokstäver) och startnummer, sökruta i typsnittsmenyn.
+
+## SmartArt: bildplatshållare (omgång 6)
+
+Tomma bildplatshållare i SmartArt (`dgm:shape blipPhldr="1"`, t.ex. `vList4`, `pList1`, `vList3` i
+mallarna i provsamlingarna) ritas som formen med PowerPoints bildsymbol i mitten (`emit.rs`, `picture_glyph`):
+en grå ram med berg och sol, en kvadrat på 40 % av formens kortaste sida, som en egen form ovanpå
+(`a:custGeom` med tre banor). Prov: `bildplatshallare_far_en_bildsymbol`. Text som får rutan att växa och
+nivåetiketterna i `hierarchy5` hanns inte med (se *Kvar*).
+
+## Autoanpassning och textfall (omgång 6, w-pfid2)
+
+Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastades, så att ingen behöver göra om det.
+
+- **`prstTxWarp`/WordArt:** alla träffar i materialet är `textNoShape` (ingen förvridning) utom en `textPlain`
+  (`psconf22-chasing-seconds`, också utan synlig effekt). Ingen verklig WordArt finns att jämföra mot. **`buBlip`**
+  förekommer inte. **`fontAlgn`** är `base`/`auto`/`b`/`ctr`; det spelar bara roll med olika teckenstorlek på samma rad
+  och är inte prövat.
+- **Autoanpassningens gåta (`cppcon20-stl-features` 33, `cppcon16-iterator-haiku` 45):** PowerPoint ritar texten med ~92,5 %
+  teckenstorlek fast filen bara har `lnSpcReduction="10000"`. Villkoret "ingen `fontScale`, men texten ryms inte med de
+  sparade värdena" (steg ur PowerPoints stege, med vår egen utläggning som mått) prövades: bild 33 blev +0,03 men elva
+  andra bilder i `cppcon19-charconv`/`cppcon20` blev 0,16–0,30 sämre (presentationsmedel −0,019/−0,020). Alla fem
+  bilder i `cppcon20` har identisk `bodyPr` och vår text är för hög (322–369 mot 281 pt) i alla; PowerPoint krymper bara
+  bild 33. Slutsats: PowerPoint räknar om med typsnittets verkliga mått (Verdana) när PDF:en görs, och våra mått med
+  DejaVu Sans räcker inte för att avgöra när. Går inte att rätta utan Verdanas bredder.
+- **`lnSpcReduction` på radavståndet:** att dra av bara en del (0,5 eller 0,75 av värdet) i stället för hela gjorde
+  `cppcon15`/`cppcon19`/`cppcon20` 0,02–0,06 sämre; den nuvarande avdragsregeln (hela värdet av procenttalet) är rätt.
+  `cppcon15-stl-algorithms-mac` bild 9 (110 % radavstånd, 77,5 %/20 %) har ändå ~6 % för tät text; orsaken är inte klarlagd.

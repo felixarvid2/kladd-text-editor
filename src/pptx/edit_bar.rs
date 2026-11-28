@@ -19,12 +19,16 @@ use crate::pdfview::chrome::{BAR_H, G, bar_divider, tool_btn};
 use crate::theme::Palette;
 
 /// Formatet vid markören (eller i första körningen när bara formen är markerad).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Format {
+    pub font: String,
     pub size: f32,
     pub color: [u8; 3],
     pub align: TAlign,
     pub bullet: bool,
+    pub numbered: bool,
+    /// Radavstånd (1.0 = enkelt) om det är i procent.
+    pub ln_spc: Option<f32>,
 }
 
 impl Format {
@@ -32,7 +36,7 @@ impl Format {
     pub fn at(c: &Carets, at: Pos) -> Option<Format> {
         let p = c.paras.get(at.para.min(c.paras.len().checked_sub(1)?))?;
         let r = p.runs.iter().find(|r| r.0 < at.ch && at.ch <= r.1).or_else(|| p.runs.iter().find(|r| r.0 <= at.ch && at.ch < r.1)).or(p.runs.last())?;
-        Some(Format { size: r.2, color: r.3, align: p.align, bullet: p.bullet })
+        Some(Format { size: r.2, color: r.3, align: p.align, bullet: p.bullet, numbered: p.numbered, ln_spc: p.ln_spc, font: p.font.clone() })
     }
 }
 
@@ -45,6 +49,8 @@ pub struct FormatBar {
     last: Option<(TextColor, [u8; 3])>,
     /// Formen som inte skrivs i: (presentationens adress, form) → format.
     cache: Option<(usize, Sel, Option<Format>)>,
+    /// Systemets typsnittsfamiljer (sorterade, lästa en gång).
+    fonts: Option<Vec<String>>,
 }
 
 /// Temats färger (namn, schemanamn) i PowerPoints ordning, och vanliga färger.
@@ -108,11 +114,11 @@ impl PptxTab {
         let key = std::sync::Arc::as_ptr(&self.deck) as usize;
         if let Some((k, s, f)) = &self.edit.fmt.cache {
             if *k == key && *s == sel {
-                return *f;
+                return f.clone();
             }
         }
         let f = self.text_of(sel).and_then(|(_, c)| c).and_then(|c| Format::at(&c, Pos::default()));
-        self.edit.fmt.cache = Some((key, sel, f));
+        self.edit.fmt.cache = Some((key, sel, f.clone()));
         f
     }
 
@@ -154,6 +160,24 @@ impl PptxTab {
         });
     }
 
+    pub(super) fn apply_font(&mut self, face: String) {
+        self.format_text(&mut |m, a, b, _| m.set_font(a, b, &face));
+    }
+
+    pub(super) fn apply_spacing(&mut self, factor: f32) {
+        self.format_text(&mut |m, a, b, _| {
+            m.set_line_spacing(a, b, factor);
+            true
+        });
+    }
+
+    pub(super) fn apply_numbered(&mut self, on: bool) {
+        self.format_text(&mut |m, a, b, _| {
+            m.set_numbered(a, b, on);
+            true
+        });
+    }
+
     pub(super) fn apply_color(&mut self, c: Option<TextColor>) {
         self.format_text(&mut |m, a, b, _| m.set_color(a, b, c));
     }
@@ -167,6 +191,19 @@ impl PptxTab {
         let fmt = self.format_now();
         let overlay = self.edit_focus_id();
         let entries = self.color_entries();
+        let families: Vec<String> = self.edit.fmt.fonts.get_or_insert_with(|| {
+            let mut v: Vec<String> = super::fonts::system_db().faces().filter_map(|f| f.families.first().map(|(n, _)| n.clone())).collect();
+            v.sort_by_key(|n| n.to_lowercase());
+            v.dedup();
+            v
+        }).clone();
+        let theme_fonts: Vec<(String, String)> = {
+            let theme = Sheets::for_slide(&self.deck, self.current).theme;
+            vec![
+                (crate::tf!("Rubrik ({font})", font = super::inherit::theme_font(theme, "+mj-lt", None)), "+mj-lt".to_owned()),
+                (crate::tf!("Brödtext ({font})", font = super::inherit::theme_font(theme, "+mn-lt", None)), "+mn-lt".to_owned()),
+            ]
+        };
         let mut act: Vec<Act> = Vec::new();
         Panel::top("kladd-pptx-format")
             .exact_size(BAR_H)
@@ -178,13 +215,32 @@ impl PptxTab {
                 ui.painter().hline((r.left() - 12.0)..=(r.right() + 12.0), r.bottom() + 5.0, Stroke::new(1.0, p.line));
                 ui.spacing_mut().item_spacing.x = 2.0;
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    // Typsnitt: temats rubrik- och brödtextfonter först, sedan systemets.
+                    let current = fmt.as_ref().map(|f| f.font.clone()).unwrap_or_default();
+                    egui::ComboBox::from_id_salt("kladd-pptx-font").width(150.0).selected_text(current.clone()).show_ui(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        for (label, name) in &theme_fonts {
+                            if ui.selectable_label(false, label).clicked() {
+                                act.push(Act::Font(name.clone()));
+                            }
+                        }
+                        ui.separator();
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for name in &families {
+                                if ui.selectable_label(*name == current, name).clicked() {
+                                    act.push(Act::Font(name.clone()));
+                                }
+                            }
+                        });
+                    });
+                    bar_divider(ui, p);
                     // Storlek.
                     if tool_btn(ui, p, G::Std(Icon::Minus), false, true, t("Mindre text (Ctrl+Skift+<)")).clicked() {
                         act.push(Act::Step(false));
                     }
                     let id = Id::unique("kladd-pptx-size");
                     if !ui.ctx().memory(|m| m.has_focus(id)) {
-                        self.edit.fmt.size_buf = fmt.map(|f| size_text(f.size)).unwrap_or_default();
+                        self.edit.fmt.size_buf = fmt.as_ref().map(|f| size_text(f.size)).unwrap_or_default();
                     }
                     let field = ui.add(TextEdit::singleline(&mut self.edit.fmt.size_buf).id(id).desired_width(40.0).align(egui::Align2::CENTER_CENTER).margin(Margin::symmetric(4, 4)));
                     field.clone().on_hover_text(t("Teckenstorlek (punkter)"));
@@ -214,7 +270,7 @@ impl PptxTab {
                         let theme: Vec<(String, [u8; 3])> = entries.iter().filter(|e| matches!(e.1, TextColor::Scheme(_))).map(|e| (e.0.clone(), e.2)).collect();
                         let std: Vec<(String, [u8; 3])> = entries.iter().filter(|e| matches!(e.1, TextColor::Rgb(_))).map(|e| (e.0.clone(), e.2)).collect();
                         let rows = vec![theme, std];
-                        match crate::word::view::color_popup(ui, p, t("Automatisk"), &rows, fmt.map(|f| f.color)) {
+                        match crate::word::view::color_popup(ui, p, t("Automatisk"), &rows, fmt.as_ref().map(|f| f.color)) {
                             Some(None) => act.push(Act::Color(None)),
                             Some(Some(rgb)) => {
                                 if let Some(e) = entries.iter().find(|e| e.2 == rgb) {
@@ -232,15 +288,31 @@ impl PptxTab {
                         (Icon::AlignRight, TAlign::Right, "r", t("Högerjustera (Ctrl+R)")),
                         (Icon::AlignJustify, TAlign::Justify, "just", t("Marginaljustera (Ctrl+J)")),
                     ] {
-                        if icons::toggle_button(ui, p, icon, fmt.is_some_and(|f| f.align == al), tip).clicked() {
+                        if icons::toggle_button(ui, p, icon, fmt.as_ref().is_some_and(|f| f.align == al), tip).clicked() {
                             act.push(Act::Align(algn));
                         }
                     }
                     bar_divider(ui, p);
-                    let bul = fmt.is_some_and(|f| f.bullet);
-                    if icons::toggle_button(ui, p, Icon::BulletList, bul, t("Punktlista")).clicked() {
-                        act.push(Act::Bullet(!bul));
+                    let bul = fmt.as_ref().is_some_and(|f| f.bullet);
+                    if icons::toggle_button(ui, p, Icon::BulletList, bul && !fmt.as_ref().is_some_and(|f| f.numbered), t("Punktlista")).clicked() {
+                        act.push(Act::Bullet(!bul || fmt.as_ref().is_some_and(|f| f.numbered)));
                     }
+                    let num = fmt.as_ref().is_some_and(|f| f.numbered);
+                    if icons::toggle_button(ui, p, Icon::NumberedList, num, t("Numrerad lista")).clicked() {
+                        act.push(Act::Numbered(!num));
+                    }
+                    bar_divider(ui, p);
+                    // Radavstånd.
+                    let cur_sp = fmt.as_ref().and_then(|f| f.ln_spc);
+                    egui::ComboBox::from_id_salt("kladd-pptx-lnspc").width(56.0).selected_text(cur_sp.map_or_else(String::new, |v| crate::i18n::num(v as f64, 2).trim_end_matches('0').trim_end_matches([',', '.']).to_owned())).show_ui(ui, |ui| {
+                        ui.label(t("Radavstånd"));
+                        for v in [1.0f32, 1.15, 1.5, 2.0] {
+                            let label = crate::i18n::num(v as f64, 2).trim_end_matches('0').trim_end_matches([',', '.']).to_owned();
+                            if ui.selectable_label(cur_sp.is_some_and(|c| (c - v).abs() < 0.01), label).clicked() {
+                                act.push(Act::Spacing(v));
+                            }
+                        }
+                    });
                 });
             });
         for a in act {
@@ -249,6 +321,9 @@ impl PptxTab {
                 Act::Step(up) => self.apply_size_step(up),
                 Act::Align(a) => self.apply_align(a),
                 Act::Bullet(on) => self.apply_bullet(on),
+                Act::Font(f) => self.apply_font(f),
+                Act::Spacing(v) => self.apply_spacing(v),
+                Act::Numbered(on) => self.apply_numbered(on),
                 Act::Color(c) => {
                     if let Some(c) = c {
                         let rgb = entries.iter().find(|e| e.1 == c).map(|e| e.2).unwrap_or([0, 0, 0]);
@@ -266,5 +341,8 @@ enum Act {
     Step(bool),
     Align(&'static str),
     Bullet(bool),
+    Font(String),
+    Spacing(f32),
+    Numbered(bool),
     Color(Option<TextColor>),
 }

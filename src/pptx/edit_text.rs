@@ -618,10 +618,16 @@ pub enum AutoFit {
 }
 
 /// Formateringen i ett stycke, ur samma arv som ritningen.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ParaFmt {
     pub align: text::Align,
     pub bullet: bool,
+    /// Numrerad lista (punkten är en siffra eller bokstav).
+    pub numbered: bool,
+    /// Radavstånd som faktor (1.0 = enkelt), om det är i procent.
+    pub ln_spc: Option<f32>,
+    /// Typsnittet (upplöst namn) i styckets första körning.
+    pub font: String,
     /// Körningarna: första tecknet, sist tecknet (exklusivt), storlek (punkter, utan autoanpassningens
     /// krympning) och färg.
     pub runs: Vec<(usize, usize, f32, [u8; 3])>,
@@ -695,13 +701,23 @@ impl TextModel {
             let mut runs = Vec::new();
             let mut map = Vec::new();
             let mut start = 0;
-            let mut fmt = ParaFmt { align: para.align, bullet: para.bullet.is_some(), runs: Vec::new() };
+            let mut fmt = ParaFmt {
+                align: para.align,
+                bullet: para.bullet.is_some(),
+                numbered: para.bullet.as_ref().is_some_and(|b| b.text.chars().next().is_some_and(char::is_alphanumeric)),
+                ln_spc: if let text::Spacing::Pct(p) = para.ln_spc { Some(p) } else { None },
+                font: String::new(),
+                runs: Vec::new(),
+            };
             for it in &tp.items {
                 match it {
                     Item::Run { rpr, text } => {
                         let rn = rpr.as_ref().and_then(|r| to_node(r, &self.scope));
                         let (st, _) = env.run_style(rn.as_ref(), &levels);
                         let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+                        if fmt.font.is_empty() {
+                            fmt.font = st.latin.clone();
+                        }
                         fmt.runs.push((start, start + text.chars().count(), st.size / env.font_scale.max(0.01), [c(st.color.r), c(st.color.g), c(st.color.b)]));
                         runs.push(text::Run { text: text.clone(), style: st, line_break: false });
                         map.push((start, 0));
@@ -731,6 +747,9 @@ impl TextModel {
                 let en = tp.end.as_ref().and_then(|r| to_node(r, &self.scope));
                 let (st, _) = env.run_style(en.as_ref(), &levels);
                 let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+                if fmt.font.is_empty() {
+                    fmt.font = st.latin.clone();
+                }
                 fmt.runs.push((0, 0, st.size / env.font_scale.max(0.01), [c(st.color.r), c(st.color.g), c(st.color.b)]));
             }
             fmts.push(fmt);
