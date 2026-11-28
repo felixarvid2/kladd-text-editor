@@ -1124,3 +1124,44 @@ Moduler: `edit_format.rs` (modellens formatfunktioner), `edit_fit.rs` (autoanpas
   numrerade listor i formatraden; format på markeringen som visas blandat (raden visar värdet i körningen vid
   markören); redigering och markering över flera tabellceller; autoanpassning efter storleksändring av flera former
   eller en grupp.
+
+## Närmare PowerPoint på de sämsta bilderna (omgång 5, w-pfid)
+
+Utgångsläge: `integ4/scores.csv`, medel 0,8848 över 1 124 bilder. De ~40 lägsta bilderna (och de sämsta
+presentationernas medel) sågs sida vid sida med PowerPoints PDF och grupperades efter orsak.
+
+**Orsaker, rättade**
+- **`a:clrChange` saknades** (`covid-infographic-*`, 3 presentationer, dessutom `cppcon14-cheap-logging` och
+  `-parallel-overview`, `owasp-top10-2010-es`, `msrc-eko19`). Teckningar med vit botten som PowerPoint gör genomskinlig
+  täckte texten bakom sig. `apply_clr_change` i `render.rs` byter bildpunkter nära `clrFrom` (±24 per kanal, JPEG-brus)
+  mot `clrTo` med dess alfa.
+- **Formar utan platshållare använde mallens `otherStyle`.** PowerPoint använder presentationens `defaultTextStyle`
+  för sådana former (`covid-infographic-*`: mallen säger 15,3 pt, PowerPoint ritar 18 pt). `TxKind::Free` i
+  `inherit.rs` hoppar över mallens stil; tabellceller och `dt`/`ftr`/`sldNum` använder `otherStyle` som förut.
+  Presentationsmedel: covid 0,64/0,73/0,79 → 0,95/0,96/0,97.
+- **Bilder i temats fyllningsstilar** (`bgRef idx=1003` → `a:blipFill` i `a:bgFillStyleLst`) letades upp i bildens
+  relationer i stället för temats (`Theme::rels`), så bakgrunden föll tillbaka på en ensfärgad yta
+  (`cppcon16-iterator-haiku`, 0,798 → 0,875). `a:duotone` (ljushet → blandning mellan två färger) görs i
+  `Builder::duotone`, både för fyllningar och för bilder.
+- **`a:br` utan `sz`** ärver 18 pt och gjorde raden för hög i tabellceller med 9 pt text (`owasp-top10-2017-en` bild 23,
+  0,58 → 0,91). En radbrytning som är större än radens text räknas inte; en lika stor räknas som förut (att hoppa över
+  alla gjorde `cncf-overview-ja` sämre).
+
+**Orsaker som inte går att rätta (typsnitt som saknas här)**
+- Koreanska, japanska och hebreiska bilder i `owasp-top10-2017-*` (de lägsta presentationerna efter covid): PowerPoint
+  ritade med Malgun Gothic/Meiryo/Arial, här finns bara WenQuanYi/IPA/Unifont. Ändrad radbrytning och glyfformer ger
+  det låga värdet, inte layouten.
+- `ms-copilot-workshop` bild 30 (Aptos), `cppcon14-parallel-overview` bild 10 (Segoe-lik brödtext), `cppcon20`/`cppcon19`
+  (Verdana → DejaVu Sans är ~6 % bredare än typsnittet i PDF:en).
+
+**Prövat och förkastat**
+- Räkna om `normAutofit` vid ritning (nästa steg i PowerPoints stege när texten inte ryms med de sparade
+  värdena): sämre i `cppcon15-stl-algorithms-mac` (0,815 → 0,811), `cppcon19-charconv` (0,849 → 0,809) och
+  `cppcon20-stl-features` (0,857 → 0,814). PowerPoints PDF krymper ibland mer än filens värden, men inte i de fall där
+  våra typsnitt är bredare. Orsaken är inte klarlagd; `cppcon20` bild 33 och `cppcon16-iterator-haiku` bild 45 visar
+  fenomenet (PowerPoint ~92 % teckenstorlek, filen har bara `lnSpcReduction`).
+
+**Kvar**
+- `a:clrChange` med annan färg än vitt har ingen egen provbild; toleransen är uppmätt bara på vitt.
+- Temafyllningar via `fillRef` (former) har samma relationsfel som bakgrunden hade; bara `bgRef` är rättad.
+- `owasp-top10-2017-he` bild 21 och 4 (0,35 respektive 0,41 för LibreOffice, Kladd 0,59/0,67): inte undersökta utöver typsnitten.

@@ -728,9 +728,13 @@ fn layout_impl(frame: &Frame, w: f32, h: f32, book: &FontBook, mut carets: Optio
             width += xx;
             // Radens mått.
             let (mut asc, mut desc, mut size, mut single) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-            for c in &cls[i..end.max(i)] {
+            // En radbrytning större än radens text (`a:br` utan `sz` ger 18 pt) höjer inte raden: PowerPoint
+            // ritar `owasp-top10-2017-en` bild 23 med tät radhöjd trots det. En lika stor eller mindre
+            // radbrytning räknas som förut (`cncf-overview-ja` blev sämre när den hoppades över).
+            let text_size = cls[i..end.max(i)].iter().filter(|c| c.kind != Kind::Break).map(|c| segs[c.seg].style.size).fold(0.0f32, f32::max);
+            for c in cls[i..end.max(i)].iter().filter(|c| !(c.kind == Kind::Break && text_size > 0.0 && segs[c.seg].style.size > text_size)) {
                 let s = &segs[c.seg];
-                let (a, d, sg) = face_metrics(&s.face, s.style.size);
+            let (a, d, sg) = face_metrics(&s.face, s.style.size);
                 asc = asc.max(a);
                 desc = desc.max(d);
                 single = single.max(sg);

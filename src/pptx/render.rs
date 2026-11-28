@@ -131,7 +131,11 @@ impl<'a> Builder<'a> {
         } else if let Some(r) = bg.child("p:bgRef") {
             let ph = color::first_color(r).and_then(|c| self.sheets.color(c, None));
             if let Some(sr) = inherit::theme_fill(&self.sheets, r.attr_i64("idx").unwrap_or(0), ph) {
-                if let Some(p) = self.paint(sr.node, sr.ph, &frame, owner) {
+                // Bilden i en temafyllning hör till temats relationer, inte bildens.
+                let saved = self.rels_override.replace(&self.sheets.theme.rels);
+                let painted = self.paint(sr.node, sr.ph, &frame, owner);
+                self.rels_override = saved;
+                if let Some(p) = painted {
                     self.bg_paint = Some(p.clone());
                     self.fill_paint(page, p);
                 } else if let Some(c) = ph {
@@ -436,6 +440,10 @@ impl<'a> Builder<'a> {
                 let id = n.child("a:blip").and_then(|b| b.attr("r:embed"))?;
                 let r = package::rel(rels, id)?;
                 let img = self.sheets.deck.image(&r.target)?;
+                let img = match n.child("a:blip") {
+                    Some(b) => self.duotone(b, img, ph),
+                    None => img,
+                };
                 let alpha = n.path(&["a:blip", "a:alphaModFix"]).and_then(|a| a.attr("amt").and_then(super::xml::parse_i64)).map_or(1.0, |v| v as f32 / 100000.0);
                 if let Some(tile) = n.child("a:tile") {
                     return Some(super::fills::tile_paint(tile, img, f.w, f.h, &f.t, alpha));
@@ -457,6 +465,23 @@ impl<'a> Builder<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `a:duotone`: bildens ljushet blir en blandning mellan de två färgerna (mörkast till ljusast).
+    /// `ph` är platshållarfärgen när bilden kommer ur temats stilmatris (färgerna är då `phClr`-varianter).
+    fn duotone(&self, blip: &Node, img: Arc<super::scene::ImageData>, ph: Option<Rgba>) -> Arc<super::scene::ImageData> {
+        let Some(d) = blip.child("a:duotone") else { return img };
+        let cols: Vec<Rgba> = d.children.iter().filter(|c| color::is_color(c)).filter_map(|c| self.sheets.color(c, ph)).collect();
+        let [c0, c1] = cols[..] else { return img };
+        let mut rgba = img.rgba.clone();
+        for p in rgba.chunks_exact_mut(4) {
+            let l = (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0;
+            let mix = |a: f32, b: f32| ((a + (b - a) * l) * 255.0).round().clamp(0.0, 255.0) as u8;
+            p[0] = mix(c0.r, c1.r);
+            p[1] = mix(c0.g, c1.g);
+            p[2] = mix(c0.b, c1.b);
+        }
+        Arc::new(super::scene::ImageData::new(img.width, img.height, rgba, None))
     }
 
     fn gradient(&self, n: &Node, ph: Option<Rgba>, f: &Frame) -> Option<Paint> {
@@ -620,7 +645,7 @@ impl<'a> Builder<'a> {
                 if low.ends_with(".emf") || low.ends_with(".wmf") {
                     super::media::metafile(self, &r.target, f, crop);
                 } else if let Some(img) = self.sheets.deck.image(&r.target) {
-                    let img = apply_blip_effects(blip, img);
+                    let img = apply_blip_effects(blip, self.duotone(blip, img, None));
                     self.scene.items.push(Item::Image { image: img, t, crop, alpha });
                 } else if low.ends_with(".svg") {
                     if let Some(tree) = self.sheets.deck.svg(&r.target) {
@@ -679,6 +704,7 @@ impl<'a> Builder<'a> {
 
 /// Bildeffekter på `a:blip` som är billiga: gråskala och dubbelton görs inte än; `lum` (ljusstyrka/kontrast) inte.
 fn apply_blip_effects(blip: &Node, img: Arc<super::scene::ImageData>) -> Arc<super::scene::ImageData> {
+    let img = apply_clr_change(blip, img);
     if blip.child("a:grayscl").is_some() {
         let mut rgba = img.rgba.clone();
         for p in rgba.chunks_exact_mut(4) {
@@ -690,6 +716,37 @@ fn apply_blip_effects(blip: &Node, img: Arc<super::scene::ImageData>) -> Arc<sup
         return Arc::new(super::scene::ImageData::new(img.width, img.height, rgba, None));
     }
     img
+}
+
+/// Hur långt (per kanal, 0–255) en bildpunkt får ligga från `clrFrom` och ändå bytas av `a:clrChange`.
+/// JPEG-brus gör att "vitt" sällan är exakt FFFFFF; PowerPoint släpper igenom ungefär det intervallet.
+const CLR_CHANGE_TOLERANS: i32 = 24;
+
+/// `a:clrChange`: bildpunkter i färgen `clrFrom` får färgen och genomskinligheten i `clrTo`
+/// (vanligen vitt till genomskinligt, "Gör färg genomskinlig").
+fn apply_clr_change(blip: &Node, img: Arc<super::scene::ImageData>) -> Arc<super::scene::ImageData> {
+    let Some(cc) = blip.child("a:clrChange") else { return img };
+    let rgb = |n: &Node| -> Option<([u8; 3], u8)> {
+        let c = n.children.first()?;
+        let hex = c.attr("val").or_else(|| c.attr("lastClr"))?;
+        if hex.len() != 6 {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        let a = c.child("a:alpha").and_then(|a| a.attr("val").and_then(super::xml::parse_i64)).map_or(255.0, |v| v as f32 / 100000.0 * 255.0);
+        Some(([(v >> 16) as u8, (v >> 8) as u8, v as u8], a.round().clamp(0.0, 255.0) as u8))
+    };
+    let (Some((from, _)), Some((to, to_a))) = (cc.child("a:clrFrom").and_then(rgb), cc.child("a:clrTo").and_then(rgb)) else { return img };
+    let mut rgba = img.rgba.clone();
+    for p in rgba.chunks_exact_mut(4) {
+        if (0..3).all(|i| (p[i] as i32 - from[i] as i32).abs() <= CLR_CHANGE_TOLERANS) {
+            p[0] = to[0];
+            p[1] = to[1];
+            p[2] = to[2];
+            p[3] = (p[3] as u32 * to_a as u32 / 255) as u8;
+        }
+    }
+    Arc::new(super::scene::ImageData::new(img.width, img.height, rgba, None))
 }
 
 fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
@@ -763,5 +820,69 @@ mod tests {
             // Vridna −90° (motsols): x-axeln pekar uppåt.
             assert!(g.t.a.abs() < 1e-4 && (g.t.b + 1.0).abs() < 1e-4, "{:?}", g.t);
         }
+    }
+    fn blip_med(xml: &str) -> Node {
+        super::super::xml::parse(xml.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn clrchange_gor_nastan_vitt_genomskinligt() {
+        let blip = blip_med(r#"<a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:clrChange><a:clrFrom><a:srgbClr val="FFFFFF"/></a:clrFrom><a:clrTo><a:srgbClr val="FFFFFF"><a:alpha val="0"/></a:srgbClr></a:clrTo></a:clrChange></a:blip>"#);
+        // Exakt vitt, JPEG-vitt (FA FB FC) och svart.
+        let rgba = vec![255, 255, 255, 255, 250, 251, 252, 255, 0, 0, 0, 255];
+        let img = Arc::new(super::super::scene::ImageData::new(3, 1, rgba, None));
+        let out = apply_clr_change(&blip, img);
+        assert_eq!([out.rgba[3], out.rgba[7], out.rgba[11]], [0, 0, 255]);
+        // Utan `a:clrChange` lämnas bilden orörd.
+        let plain = blip_med(r#"<a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>"#);
+        let img = Arc::new(super::super::scene::ImageData::new(1, 1, vec![255, 255, 255, 255], None));
+        assert_eq!(apply_clr_change(&plain, img).rgba[3], 255);
+    }
+
+    /// Glyfkörningarnas (storlek, y) i bild 0.
+    fn korningar(bytes: &[u8]) -> Vec<(f32, f32)> {
+        let deck = super::super::Deck::open(bytes).unwrap();
+        slide_scene(&deck, 0)
+            .items
+            .into_iter()
+            .filter_map(|it| if let Item::Glyphs(g) = it { Some((g.size, g.t.apply(0.0, 0.0).1)) } else { None })
+            .collect()
+    }
+
+    fn ruta(body: &str) -> String {
+        format!(r#"<p:sp><p:nvSpPr><p:cNvPr id="9" name="T"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5080000" cy="2540000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>{body}</p:txBody></p:sp>"#)
+    }
+
+    #[test]
+    fn radbrytningens_storlek_hojer_inte_raden() {
+        use super::super::tests::Builder;
+        // `a:br` utan `sz` ärver 18 pt; raden har text i 9 pt, så radavståndet ska följa 9 pt.
+        let br = r#"<a:p><a:r><a:rPr sz="900"/><a:t>aaa</a:t></a:r><a:br><a:rPr lang="en-US"/></a:br><a:r><a:rPr sz="900"/><a:t>bbb</a:t></a:r></a:p>"#;
+        let k = korningar(&Builder::new().slide("", &ruta(br)).build());
+        let (a, b) = (k.iter().find(|x| x.0 == 9.0).unwrap(), k.iter().rev().find(|x| x.0 == 9.0).unwrap());
+        assert!(b.1 - a.1 < 13.0, "radavstånd {}", b.1 - a.1);
+    }
+
+    #[test]
+    fn form_utan_platshallare_anvander_defaulttextstyle_inte_otherstyle() {
+        use std::io::{Read, Write};
+        use super::super::tests::Builder;
+        let bytes = Builder::new().slide("", &ruta(r#"<a:p><a:r><a:t>Hej</a:t></a:r></a:p>"#)).build();
+        // Mallens `otherStyle` sätts till 15,3 pt; `defaultTextStyle` är 18 pt.
+        let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut zout = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).unwrap();
+            let name = f.name().to_owned();
+            let mut data = Vec::new();
+            f.read_to_end(&mut data).unwrap();
+            if name == "ppt/slideMasters/slideMaster1.xml" {
+                data = String::from_utf8(data).unwrap().replace(r#"<p:otherStyle><a:lvl1pPr><a:defRPr sz="1800""#, r#"<p:otherStyle><a:lvl1pPr><a:defRPr sz="1530""#).into_bytes();
+            }
+            zout.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zout.write_all(&data).unwrap();
+        }
+        let k = korningar(&zout.finish().unwrap().into_inner());
+        assert_eq!(k[0].0, 18.0);
     }
 }

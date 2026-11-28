@@ -29,6 +29,8 @@ pub struct Theme {
     pub bg_fill_styles: Vec<Node>,
     /// `a:objectDefaults` (`spDef`, `lnDef`, `txDef`).
     pub object_defaults: Option<Node>,
+    /// Temadelens relationer (bilder i `a:bgFillStyleLst`/`a:fillStyleLst`).
+    pub rels: Vec<Rel>,
 }
 
 /// Ett typsnittsschema (`a:majorFont`/`a:minorFont`).
@@ -264,7 +266,8 @@ impl Deck {
             return Some(i);
         }
         let root = self.pkg.xml(part)?;
-        let theme = parse_theme(&root);
+        let mut theme = parse_theme(&root);
+        theme.rels = self.pkg.rels(part);
         self.themes.push(theme);
         let i = self.themes.len() - 1;
         theme_index.insert(part.to_owned(), i);

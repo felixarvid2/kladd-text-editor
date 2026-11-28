@@ -191,6 +191,9 @@ pub enum TxKind {
     Title,
     Body,
     Other,
+    /// Form utan platshållare: PowerPoint använder presentationens `defaultTextStyle`, inte mallens
+    /// `otherStyle` (covid-infographic-*: mallen säger 15,3 pt, PowerPoint ritar 18 pt).
+    Free,
 }
 
 pub fn tx_kind(shape: &Node) -> TxKind {
@@ -200,7 +203,7 @@ pub fn tx_kind(shape: &Node) -> TxKind {
             "dt" | "ftr" | "sldNum" | "hdr" => TxKind::Other,
             _ => TxKind::Body,
         },
-        None => TxKind::Other,
+        None => TxKind::Free,
     }
 }
 
@@ -212,11 +215,11 @@ pub fn list_styles<'a>(sheets: &Sheets<'a>, chain: &[&'a Node], kind: TxKind) ->
             out.push(ls);
         }
     }
-    if let Some(m) = sheets.master {
+    if let Some(m) = sheets.master.filter(|_| kind != TxKind::Free) {
         let name = match kind {
             TxKind::Title => "p:titleStyle",
             TxKind::Body => "p:bodyStyle",
-            TxKind::Other => "p:otherStyle",
+            TxKind::Other | TxKind::Free => "p:otherStyle",
         };
         if let Some(s) = m.root.path(&["p:txStyles", name]) {
             out.push(s);
