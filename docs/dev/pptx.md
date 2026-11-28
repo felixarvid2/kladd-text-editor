@@ -1202,3 +1202,22 @@ mallarna i provsamlingarna) ritas som formen med PowerPoints bildsymbol i mitten
 en grå ram med berg och sol, en kvadrat på 40 % av formens kortaste sida, som en egen form ovanpå
 (`a:custGeom` med tre banor). Prov: `bildplatshallare_far_en_bildsymbol`. Text som får rutan att växa och
 nivåetiketterna i `hierarchy5` hanns inte med (se *Kvar*).
+
+## Autoanpassning och textfall (omgång 6, w-pfid2)
+
+Ingen kodändring i ritmotorn; det här är det som undersöktes och förkastades, så att ingen behöver göra om det.
+
+- **`prstTxWarp`/WordArt:** alla träffar i materialet är `textNoShape` (ingen förvridning) utom en `textPlain`
+  (`psconf22-chasing-seconds`, också utan synlig effekt). Ingen verklig WordArt finns att jämföra mot. **`buBlip`**
+  förekommer inte. **`fontAlgn`** är `base`/`auto`/`b`/`ctr`; det spelar bara roll med olika teckenstorlek på samma rad
+  och är inte prövat.
+- **Autoanpassningens gåta (`cppcon20-stl-features` 33, `cppcon16-iterator-haiku` 45):** PowerPoint ritar texten med ~92,5 %
+  teckenstorlek fast filen bara har `lnSpcReduction="10000"`. Villkoret "ingen `fontScale`, men texten ryms inte med de
+  sparade värdena" (steg ur PowerPoints stege, med vår egen utläggning som mått) prövades: bild 33 blev +0,03 men elva
+  andra bilder i `cppcon19-charconv`/`cppcon20` blev 0,16–0,30 sämre (presentationsmedel −0,019/−0,020). Alla fem
+  bilder i `cppcon20` har identisk `bodyPr` och vår text är för hög (322–369 mot 281 pt) i alla; PowerPoint krymper bara
+  bild 33. Slutsats: PowerPoint räknar om med typsnittets verkliga mått (Verdana) när PDF:en görs, och våra mått med
+  DejaVu Sans räcker inte för att avgöra när. Går inte att rätta utan Verdanas bredder.
+- **`lnSpcReduction` på radavståndet:** att dra av bara en del (0,5 eller 0,75 av värdet) i stället för hela gjorde
+  `cppcon15`/`cppcon19`/`cppcon20` 0,02–0,06 sämre; den nuvarande avdragsregeln (hela värdet av procenttalet) är rätt.
+  `cppcon15-stl-algorithms-mac` bild 9 (110 % radavstånd, 77,5 %/20 %) har ändå ~6 % för tät text; orsaken är inte klarlagd.
